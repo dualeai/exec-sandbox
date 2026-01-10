@@ -1,0 +1,37 @@
+name: Build VM images
+description: Build kernel and qcow2 images for specified architecture
+
+inputs:
+  arch:
+    description: Target architecture (x86_64 or aarch64)
+    required: true
+  variant:
+    description: Image variant (python, node, raw, or all)
+    required: false
+    default: "all"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Restore build cache
+      uses: actions/cache/restore@v4
+      with:
+        path: images/dist/
+        key: build-cache-vm-${{ inputs.arch }}-${{ inputs.variant }}-${{ hashFiles('scripts/extract-kernel.sh', 'scripts/build-qcow2.sh', 'images/**') }}
+
+    - name: Extract kernel
+      shell: bash
+      run: ./scripts/extract-kernel.sh ${{ inputs.arch }}
+
+    - name: Build qcow2
+      shell: bash
+      run: ./scripts/build-qcow2.sh ${{ inputs.variant }} ${{ inputs.arch }}
+
+    - name: Save build cache
+      uses: actions/cache/save@v4
+      with:
+        path: images/dist/
+        key: build-cache-vm-${{ inputs.arch }}-${{ inputs.variant }}-${{ hashFiles('scripts/extract-kernel.sh', 'scripts/build-qcow2.sh', 'images/**') }}

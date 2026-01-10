@@ -1,0 +1,122 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }} (${{ matrix.arch }})
+    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - arch: x64
+            image_arch: x86_64
+          - arch: arm64
+            image_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Build gvproxy-wrapper
+        uses: ./.github/actions/build-gvproxy-wrapper
+
+      - name: Build guest-agent
+        uses: ./.github/actions/build-guest-agent
+        with:
+          arch: ${{ matrix.image_arch }}
+
+      - name: Build VM images
+        uses: ./.github/actions/build-vm-images
+        with:
+          arch: ${{ matrix.image_arch }}
+
+      - name: Lint (ruff)
+        if: matrix.python-version == '3.12' && matrix.arch == 'x64'
+        run: uv run ruff check src/
+
+      - name: Format (ruff)
+        if: matrix.python-version == '3.12' && matrix.arch == 'x64'
+        run: uv run ruff format --check src/
+
+      - name: Type check (pyright)
+        if: matrix.python-version == '3.12' && matrix.arch == 'x64'
+        run: uv run pyright src/
+
+      - name: Test (pytest)
+        run: uv run pytest tests/ --cov=src/exec_sandbox --cov-report=xml
+
+  rust:
+    name: Rust (guest-agent)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guest-agent
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: guest-agent
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint (clippy)
+        run: cargo clippy -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+  go:
+    name: Go (gvproxy-wrapper)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gvproxy-wrapper
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: gvproxy-wrapper/go.sum
+
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -v -race ./...

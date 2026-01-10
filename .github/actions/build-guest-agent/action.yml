@@ -1,0 +1,29 @@
+name: Build guest-agent
+description: Build guest-agent Rust binary for specified architecture
+
+inputs:
+  arch:
+    description: Target architecture (x86_64 or aarch64)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Restore build cache
+      uses: actions/cache/restore@v4
+      with:
+        path: images/dist/
+        key: build-cache-guest-agent-${{ inputs.arch }}-${{ hashFiles('guest-agent/Cargo.lock', 'guest-agent/Cargo.toml', 'guest-agent/src/**') }}
+
+    - name: Build guest-agent
+      shell: bash
+      run: ./scripts/build-guest-agent.sh ${{ inputs.arch }}
+
+    - name: Save build cache
+      uses: actions/cache/save@v4
+      with:
+        path: images/dist/
+        key: build-cache-guest-agent-${{ inputs.arch }}-${{ hashFiles('guest-agent/Cargo.lock', 'guest-agent/Cargo.toml', 'guest-agent/src/**') }}
