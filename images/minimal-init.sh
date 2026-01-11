@@ -28,6 +28,11 @@ load_module() {
 load_module "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko.gz" "virtio_mmio"
 # virtio_blk is needed for /dev/vda
 load_module "/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko.gz" "virtio_blk"
+# virtio_net is needed for network device (gvproxy networking)
+# Dependencies: failover, net_failover (must be loaded first)
+load_module "/lib/modules/$KVER/kernel/net/core/failover.ko.gz" "failover"
+load_module "/lib/modules/$KVER/kernel/drivers/net/net_failover.ko.gz" "net_failover"
+load_module "/lib/modules/$KVER/kernel/drivers/net/virtio_net.ko.gz" "virtio_net"
 # virtio_balloon is needed for memory reclamation before snapshots
 load_module "/lib/modules/$KVER/kernel/drivers/virtio/virtio_balloon.ko.gz" "virtio_balloon"
 

@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::process::Command as StdCommand;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -1029,12 +1030,66 @@ async fn reap_zombies() {
     }
 }
 
+/// Setup environment when running as PID 1 (init).
+///
+/// Handles userspace-only initialization after minimal-init.sh:
+/// - minimal-init.sh: kernel modules, zram, mounts (has access to initramfs modules)
+/// - guest-agent: PATH, env vars, network IP config (userspace only)
+///
+/// Note: modprobe/insmod won't work here - kernel modules are only in initramfs
+/// which is unmounted after switch_root.
+fn setup_init_environment() {
+    // Set PATH for child processes (uv, python3, bun, etc.)
+    std::env::set_var("PATH", "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    eprintln!("Set PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
+    // Disable uv cache (ephemeral VMs)
+    std::env::set_var("UV_NO_CACHE", "1");
+    eprintln!("Set UV_NO_CACHE=1");
+
+    // Wait for network interface (up to 1 second, 20ms intervals)
+    // virtio_net loaded by minimal-init.sh, eth0 appears shortly after
+    for _ in 0..50 {
+        if std::path::Path::new("/sys/class/net/eth0").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Configure network for gvproxy mode
+    // gvproxy gateway at 192.168.127.1 provides DNS
+    // Static IP (DHCP unavailable - AF_PACKET not supported)
+    if std::path::Path::new("/sys/class/net/eth0").exists() {
+        eprintln!("Configuring network...");
+
+        let _ = StdCommand::new("ip")
+            .args(["link", "set", "eth0", "up"])
+            .status();
+        let _ = StdCommand::new("ip")
+            .args(["addr", "add", "192.168.127.2/24", "dev", "eth0"])
+            .status();
+        let _ = StdCommand::new("ip")
+            .args(["route", "add", "default", "via", "192.168.127.1"])
+            .status();
+
+        eprintln!("Network configured: 192.168.127.2/24 via 192.168.127.1");
+    } else {
+        eprintln!("Warning: eth0 not found, network unavailable");
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // When running as PID 1, setup zombie reaping before anything else
-    // This must be done early to catch SIGCHLD from any orphaned processes
+    // When running as PID 1, setup environment and zombie reaping
+    // This must be done early before any child processes are spawned
     if std::process::id() == 1 {
-        eprintln!("Guest agent running as PID 1 (init), enabling zombie reaper...");
+        eprintln!("Guest agent running as PID 1 (init)...");
+
+        // Setup environment (PATH, UV_NO_CACHE, network)
+        setup_init_environment();
+
+        // Enable zombie reaper
+        eprintln!("Enabling zombie reaper...");
         tokio::spawn(reap_zombies());
     }
 

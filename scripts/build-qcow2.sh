@@ -125,12 +125,8 @@ compute_qcow2_hash() {
                 ;;
         esac
 
-        # Guest agent binary hash
+        # Guest agent binary hash (includes init logic)
         sha256sum "$guest_agent" 2>/dev/null | cut -d' ' -f1 || echo "no-agent"
-
-        # Init scripts hash
-        cat "$IMAGES_DIR/init-wrapper.sh" 2>/dev/null || true
-        cat "$IMAGES_DIR/network-init.start" 2>/dev/null || true
 
         # Build script itself (invalidate cache when build logic changes)
         cat "$SCRIPT_DIR/build-qcow2.sh" 2>/dev/null || true
@@ -347,15 +343,8 @@ build_qcow2() {
     cp "$guest_agent" "$rootfs_dir/usr/local/bin/guest-agent"
     chmod 755 "$rootfs_dir/usr/local/bin/guest-agent"
 
-    # Copy init scripts
-    cp "$IMAGES_DIR/init-wrapper.sh" "$rootfs_dir/init"
-    chmod 755 "$rootfs_dir/init"
-
-    mkdir -p "$rootfs_dir/etc/local.d"
-    cp "$IMAGES_DIR/network-init.start" "$rootfs_dir/etc/local.d/network.start"
-    chmod 755 "$rootfs_dir/etc/local.d/network.start"
-
     # Configure DNS (gvproxy gateway) - duplicate for Alpine musl quirk
+    # Note: init-wrapper.sh and network-init.start removed - logic moved to guest-agent
     echo "nameserver 192.168.127.1" > "$rootfs_dir/etc/resolv.conf"
     echo "nameserver 192.168.127.1" >> "$rootfs_dir/etc/resolv.conf"
 

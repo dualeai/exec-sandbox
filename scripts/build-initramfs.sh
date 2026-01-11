@@ -74,6 +74,7 @@ mknod -m 666 "$INITRAMFS_DIR/dev/null" c 1 3 2>/dev/null || true
 # Modules needed:
 # - virtio_blk: for virtio block device (/dev/vda)
 # - virtio_mmio: for virtio-serial on virt machine type (aarch64)
+# - virtio_net: for network device (gvproxy networking)
 # - virtio_balloon: for memory balloon (snapshot size optimization)
 # - ext4 + dependencies (jbd2, mbcache, crc16, crc32c): for ext4 filesystem
 # - zram + lz4: for compressed swap (memory optimization)
@@ -88,6 +89,9 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
         kernel/drivers/block/virtio_blk.ko.gz \
         kernel/drivers/virtio/virtio_mmio.ko.gz \
         kernel/drivers/virtio/virtio_balloon.ko.gz \
+        kernel/net/core/failover.ko.gz \
+        kernel/drivers/net/net_failover.ko.gz \
+        kernel/drivers/net/virtio_net.ko.gz \
         kernel/fs/ext4/ext4.ko.gz \
         kernel/fs/jbd2/jbd2.ko.gz \
         kernel/fs/mbcache.ko.gz \
