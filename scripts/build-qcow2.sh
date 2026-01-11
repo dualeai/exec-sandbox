@@ -99,6 +99,9 @@ compute_qcow2_hash() {
         # Init scripts hash
         cat "$IMAGES_DIR/init-wrapper.sh" 2>/dev/null || true
         cat "$IMAGES_DIR/network-init.start" 2>/dev/null || true
+
+        # Build script itself (invalidate cache when build logic changes)
+        cat "$SCRIPT_DIR/build-qcow2.sh" 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }
 
