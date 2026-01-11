@@ -386,9 +386,7 @@ class Scheduler:
                     context={"package": name, "language": language.value},
                 )
 
-    async def _get_or_create_snapshot(
-        self, language: str, packages: list[str]
-    ) -> tuple[Path | None, bool]:
+    async def _get_or_create_snapshot(self, language: str, packages: list[str]) -> tuple[Path | None, bool]:
         """Get cached snapshot or create new one with packages.
 
         Checks L0 (memory snapshot) and L3 (S3) caches before building.

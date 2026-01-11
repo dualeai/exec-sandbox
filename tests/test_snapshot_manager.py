@@ -190,7 +190,7 @@ class TestSnapshotManagerIntegration:
         assert has_memory_snapshot is False
 
         # Second call should hit L0 cache
-        cached_path, cached_has_memory = await snapshot_manager.get_or_create_snapshot(
+        cached_path, _cached_has_memory = await snapshot_manager.get_or_create_snapshot(
             language=Language.PYTHON,
             packages=["requests==2.31.0"],
             tenant_id="test",
@@ -639,13 +639,11 @@ class TestL3Cache:
 
         # Verify semaphore limited concurrency
         assert max_concurrent_observed <= 2, (
-            f"Expected max 2 concurrent uploads (semaphore limit), "
-            f"but observed {max_concurrent_observed}"
+            f"Expected max 2 concurrent uploads (semaphore limit), but observed {max_concurrent_observed}"
         )
         # Also verify uploads actually ran concurrently (not serialized to 1)
         assert max_concurrent_observed == 2, (
-            f"Expected exactly 2 concurrent uploads (semaphore should allow 2), "
-            f"but observed {max_concurrent_observed}"
+            f"Expected exactly 2 concurrent uploads (semaphore should allow 2), but observed {max_concurrent_observed}"
         )
 
 
@@ -968,7 +966,7 @@ class TestCacheHierarchy:
 
             # First call: L0 miss → L3 hit
             with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-                result1_path, result1_has_memory = await snapshot_manager.get_or_create_snapshot(
+                _result1_path, _result1_has_memory = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["scipy==1.11.0"],
                     tenant_id="test",
@@ -991,7 +989,7 @@ class TestCacheHierarchy:
                 return await original_download(*args, **kwargs)
 
             with patch.object(snapshot_manager, "_download_from_s3", side_effect=spy_download):
-                result2_path, result2_has_memory = await snapshot_manager.get_or_create_snapshot(
+                result2_path, _result2_has_memory = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["scipy==1.11.0"],
                     tenant_id="test",
@@ -1051,13 +1049,13 @@ class TestCacheHierarchy:
 
         # Both orderings should return same path
         with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-            result1_path, result1_has_memory = await snapshot_manager.get_or_create_snapshot(
+            result1_path, _result1_has_memory = await snapshot_manager.get_or_create_snapshot(
                 language=Language.PYTHON,
                 packages=["pandas==2.0.0", "numpy==1.25.0"],
                 tenant_id="test",
                 task_id="test-5a",
             )
-            result2_path, result2_has_memory = await snapshot_manager.get_or_create_snapshot(
+            result2_path, _result2_has_memory = await snapshot_manager.get_or_create_snapshot(
                 language=Language.PYTHON,
                 packages=["numpy==1.25.0", "pandas==2.0.0"],
                 tenant_id="test",
