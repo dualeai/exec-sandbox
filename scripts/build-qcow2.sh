@@ -61,6 +61,38 @@ check_deps() {
 }
 
 # =============================================================================
+# APK cache helpers - BuildKit cache mounts for faster package installs
+# =============================================================================
+
+# Create Alpine rootfs with packages using BuildKit cache mounts
+# Replaces separate docker create + docker run apk add steps
+# Usage: create_alpine_rootfs <rootfs_dir> <docker_platform> <packages...>
+create_alpine_rootfs() {
+    local rootfs_dir=$1
+    local docker_platform=$2
+    shift 2
+    local packages="$*"
+
+    # Use docker buildx with BuildKit cache mounts for APK
+    # This caches both APK index and downloaded packages across builds
+    DOCKER_BUILDKIT=1 docker buildx build \
+        --platform "$docker_platform" \
+        --output "type=local,dest=$rootfs_dir" \
+        --build-arg PACKAGES="$packages" \
+        --build-arg ALPINE_VERSION="$ALPINE_VERSION" \
+        --quiet \
+        -f - . <<'DOCKERFILE'
+# syntax=docker/dockerfile:1.4
+ARG ALPINE_VERSION
+FROM alpine:${ALPINE_VERSION}
+ARG PACKAGES
+# Use BuildKit cache mount for APK (persists across builds)
+RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
+    apk update && apk add --no-progress $PACKAGES
+DOCKERFILE
+}
+
+# =============================================================================
 # Cache helpers - content-addressable build caching via .hash sidecar files
 # =============================================================================
 
@@ -172,41 +204,17 @@ create_python_rootfs() {
             ;;
     esac
 
-    echo "  Creating Alpine base..."
+    # Create Alpine rootfs with packages (BuildKit cached)
+    echo "  Creating Alpine base + installing packages: $PYTHON_PKGS"
+    create_alpine_rootfs "$rootfs_dir" "$docker_platform" $PYTHON_PKGS
 
-    # Start with Alpine base
-    local container_id
-    container_id=$(docker create --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        /bin/true)
-    docker export "$container_id" | tar -xf - -C "$rootfs_dir"
-    docker rm "$container_id" >/dev/null
+    echo "  Downloading Python $PYTHON_VERSION + uv $UV_VERSION in parallel..."
 
-    # Install packages
-    echo "  Installing packages: $PYTHON_PKGS"
-    docker run --rm \
-        -v "$rootfs_dir:/rootfs" \
-        --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        sh -c "apk add --no-cache --root /rootfs $PYTHON_PKGS >/dev/null 2>&1"
-
-    echo "  Downloading Python $PYTHON_VERSION from python-build-standalone..."
-
-    # Download and extract python-build-standalone
+    # Download python-build-standalone and uv in parallel
     # Format: cpython-{version}+{date}-{arch}-unknown-linux-musl-install_only_stripped.tar.gz
     # Using musl variant for Alpine Linux compatibility
     local python_url="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_BUILD_DATE}/cpython-${PYTHON_VERSION}%2B${PYTHON_BUILD_DATE}-${python_arch}-unknown-linux-musl-install_only_stripped.tar.gz"
 
-    mkdir -p "$rootfs_dir/opt"
-    if ! curl -sfL "$python_url" | tar -xzf - -C "$rootfs_dir/opt"; then
-        echo "Failed to download Python. Check PYTHON_VERSION ($PYTHON_VERSION) and PYTHON_BUILD_DATE ($PYTHON_BUILD_DATE)" >&2
-        echo "URL: $python_url" >&2
-        exit 1
-    fi
-
-    echo "  Installing uv $UV_VERSION..."
-
-    # Download uv standalone binary from astral-sh
     local uv_arch
     case "$target_arch" in
         x86_64)  uv_arch="x86_64" ;;
@@ -214,11 +222,34 @@ create_python_rootfs() {
     esac
     local uv_url="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_arch}-unknown-linux-musl.tar.gz"
 
-    mkdir -p "$rootfs_dir/usr/local/bin"
-    if ! curl -sfL "$uv_url" | tar -xzf - -C "$rootfs_dir/usr/local/bin" --strip-components=1; then
-        echo "Failed to download uv from: $uv_url" >&2
-        exit 1
+    # Create temp files for parallel downloads
+    local tmp_python="$rootfs_dir/../python.tar.gz"
+    local tmp_uv="$rootfs_dir/../uv.tar.gz"
+
+    # Download both in parallel
+    curl -sfL "$python_url" -o "$tmp_python" &
+    local pid_python=$!
+    curl -sfL "$uv_url" -o "$tmp_uv" &
+    local pid_uv=$!
+
+    # Wait for downloads and check results
+    local failed=0
+    if ! wait $pid_python; then
+        echo "Failed to download Python. Check PYTHON_VERSION ($PYTHON_VERSION) and PYTHON_BUILD_DATE ($PYTHON_BUILD_DATE)" >&2
+        echo "URL: $python_url" >&2
+        failed=1
     fi
+    if ! wait $pid_uv; then
+        echo "Failed to download uv from: $uv_url" >&2
+        failed=1
+    fi
+    [ $failed -ne 0 ] && exit 1
+
+    # Extract both
+    mkdir -p "$rootfs_dir/opt" "$rootfs_dir/usr/local/bin"
+    tar -xzf "$tmp_python" -C "$rootfs_dir/opt"
+    tar -xzf "$tmp_uv" -C "$rootfs_dir/usr/local/bin" --strip-components=1
+    rm -f "$tmp_python" "$tmp_uv"
     chmod 755 "$rootfs_dir/usr/local/bin/uv" "$rootfs_dir/usr/local/bin/uvx"
 
     # Create symlinks for Python
@@ -238,30 +269,17 @@ create_node_rootfs() {
         aarch64) docker_platform="linux/arm64" ;;
     esac
 
-    echo "  Installing bun runtime..."
-
-    # Start with Alpine base
-    local container_id
-    container_id=$(docker create --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        /bin/true)
-    docker export "$container_id" | tar -xf - -C "$rootfs_dir"
-    docker rm "$container_id" >/dev/null
+    # Create Alpine rootfs with packages (BuildKit cached)
+    echo "  Creating Alpine base + installing packages: $NODE_PKGS"
+    create_alpine_rootfs "$rootfs_dir" "$docker_platform" $NODE_PKGS
 
     # Copy bun from official image
+    echo "  Installing bun runtime..."
     docker run --rm \
         -v "$rootfs_dir:/rootfs" \
         --platform "$docker_platform" \
         "oven/bun:1.3-alpine" \
         sh -c "cp /usr/local/bin/bun /rootfs/usr/local/bin/bun"
-
-    # Install packages
-    echo "  Installing packages: $NODE_PKGS"
-    docker run --rm \
-        -v "$rootfs_dir:/rootfs" \
-        --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        sh -c "apk add --no-cache --root /rootfs $NODE_PKGS >/dev/null 2>&1"
 }
 
 # Create raw Alpine rootfs (no runtime)
@@ -275,22 +293,9 @@ create_raw_rootfs() {
         aarch64) docker_platform="linux/arm64" ;;
     esac
 
-    echo "  Creating raw Alpine rootfs..."
-
-    local container_id
-    container_id=$(docker create --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        /bin/true)
-    docker export "$container_id" | tar -xf - -C "$rootfs_dir"
-    docker rm "$container_id" >/dev/null
-
-    # Install packages
-    echo "  Installing packages: $RAW_PKGS"
-    docker run --rm \
-        -v "$rootfs_dir:/rootfs" \
-        --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        sh -c "apk add --no-cache --root /rootfs $RAW_PKGS >/dev/null 2>&1"
+    # Create Alpine rootfs with packages (BuildKit cached)
+    echo "  Creating Alpine base + installing packages: $RAW_PKGS"
+    create_alpine_rootfs "$rootfs_dir" "$docker_platform" $RAW_PKGS
 }
 
 build_qcow2() {
@@ -367,16 +372,34 @@ build_qcow2() {
     rootfs_size=$(du -sm "$rootfs_dir" | cut -f1)
     local img_size=$((rootfs_size + 100))
 
-    # Run virt-make-fs + qemu-img in Docker (debian:sid has working guestfs-tools)
+    # Build guestfs image with BuildKit cache (caches apt-get install across builds)
+    local guestfs_image="exec-sandbox-guestfs:latest"
+    local host_platform="linux/$([ "$(uname -m)" = "arm64" ] && echo "arm64" || echo "amd64")"
+
+    DOCKER_BUILDKIT=1 docker buildx build \
+        --platform "$host_platform" \
+        --load \
+        --tag "$guestfs_image" \
+        --quiet \
+        -f - . <<'DOCKERFILE'
+# syntax=docker/dockerfile:1.4
+FROM debian:sid-slim
+# Use BuildKit cache mount for apt (persists across builds)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache && \
+    apt-get update -qq && \
+    apt-get install -y -qq guestfs-tools qemu-utils >/dev/null 2>&1
+DOCKERFILE
+
+    # Run virt-make-fs + qemu-img using cached image
     docker run --rm \
         -v "$tmp_dir:/build" \
         -v "$OUTPUT_DIR:/output" \
-        --platform linux/$([ "$(uname -m)" = "arm64" ] && echo "arm64" || echo "amd64") \
-        debian:sid-slim \
+        --platform "$host_platform" \
+        "$guestfs_image" \
         bash -c "
-            rm -rf /var/lib/apt/lists/*
-            apt-get update -qq
-            apt-get install -y -qq guestfs-tools qemu-utils >/dev/null 2>&1
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
             qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
         "
