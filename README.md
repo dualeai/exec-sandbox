@@ -16,7 +16,7 @@ Secure code execution in isolated QEMU microVMs. Drop-in Python library for runn
 - **Streaming output** - Real-time stdout/stderr via callbacks
 - **Smart caching** - L1 local + L3 S3 snapshot cache for package installation
 - **Network control** - Disabled by default, optional DNS-based domain whitelisting
-- **Memory optimization** - zram compression + balloon for 25-60% more usable memory
+- **Memory optimization** - zram compression + balloon for ~30% more usable memory, ~80% smaller snapshots
 
 ## Installation
 
@@ -156,18 +156,28 @@ VMs include automatic memory optimization that requires **no configuration**:
 
 | Feature | What It Does | Benefit |
 |---------|--------------|---------|
-| **zram** | Compressed swap in RAM (lz4) | 256MB VM can run 320MB+ workloads |
-| **virtio-balloon** | Reclaims unused pages before snapshots | 70% smaller snapshot files |
+| **zram** | Compressed swap in RAM (lz4) | +10-30% usable memory |
+| **virtio-balloon** | Reclaims unused pages before snapshots | 70-90% smaller snapshots |
 
 **Effective memory (scales with configured RAM):**
 
 | Configured | Available | zram | Effective Capacity |
 |------------|-----------|------|-------------------|
 | 256MB | ~175MB | 108MB | ~280-320MB |
-| 512MB | ~420MB | 233MB | ~550-650MB |
-| 1024MB | ~890MB | 484MB | ~1100-1350MB |
+| 512MB | ~420MB | 233MB | ~600-700MB |
+| 1024MB | ~890MB | 484MB | ~1200-1400MB |
 
 zram is always 50% of total RAM, so larger VMs get proportionally more expansion.
+
+**Balloon savings (before snapshots):**
+
+| Configured | Reclaimable | Snapshot Size |
+|------------|-------------|---------------|
+| 256MB | ~180MB | ~70MB |
+| 512MB | ~430MB | ~80MB |
+| 1024MB | ~900MB | ~120MB |
+
+Balloon deflates to 64MB minimum, so larger VMs see bigger snapshot reductions.
 
 **What this means for users:**
 
