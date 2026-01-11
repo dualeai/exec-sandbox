@@ -37,17 +37,18 @@ load_module "/lib/modules/$KVER/kernel/fs/mbcache.ko.gz" "mbcache"
 load_module "/lib/modules/$KVER/kernel/fs/jbd2/jbd2.ko.gz" "jbd2"
 load_module "/lib/modules/$KVER/kernel/fs/ext4/ext4.ko.gz" "ext4"
 
-# Wait for virtio block device to appear (up to 1 second)
-for i in 1 2 3 4 5 6 7 8 9 10; do
+# Wait for virtio block device to appear (up to 400ms with 20ms intervals)
+# Devices typically appear within 10-30ms with virtio-mmio
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     [ -b /dev/vda ] && break
-    /bin/busybox sleep 0.1
+    /bin/busybox usleep 20000
 done
 
-# Wait for virtio-serial ports to appear (up to 2 seconds)
+# Wait for virtio-serial ports to appear (up to 400ms with 20ms intervals)
 # These appear after virtio_mmio is loaded
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     [ -d /sys/class/virtio-ports ] && [ "$(ls /sys/class/virtio-ports/ 2>/dev/null)" ] && break
-    /bin/busybox sleep 0.1
+    /bin/busybox usleep 20000
 done
 
 # Create virtio-ports symlinks (normally done by udev/mdev)

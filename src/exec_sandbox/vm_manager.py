@@ -1741,8 +1741,8 @@ class VmManager:
             "-initrd",
             str(initramfs_path),
             "-append",
-            # Optimized boot params: quiet console, no logging, skip PS/2 probing
-            "console=hvc0 loglevel=0 quiet root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t preempt=none nomodules i8042.noaux i8042.nomux i8042.nopnp init=/init",
+            # Optimized boot params: quiet console, no logging, skip PS/2 probing, trust CPU RNG, skip RAID, disable mitigations
+            "console=hvc0 loglevel=0 quiet root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t preempt=none nomodules i8042.noaux i8042.nomux i8042.nopnp init=/init random.trust_cpu=on raid=noautodetect mitigations=off",
         ]
 
         # Platform-specific memory configuration

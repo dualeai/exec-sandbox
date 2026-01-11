@@ -56,7 +56,7 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
 chmod 755 "$INITRAMFS_DIR/bin/busybox"
 
 # Create busybox symlinks for commands used in init script
-for cmd in sh mount umount switch_root sleep insmod modprobe gzip uname rm ls cat mkdir basename ln head; do
+for cmd in sh mount umount switch_root sleep usleep insmod modprobe gzip uname rm ls cat mkdir basename ln head; do
     ln -s busybox "$INITRAMFS_DIR/bin/$cmd"
 done
 
@@ -101,10 +101,11 @@ if [ -d "$INITRAMFS_DIR/lib/modules/kernel" ]; then
     mv "$INITRAMFS_DIR/lib/modules/modules."* "$INITRAMFS_DIR/lib/modules/$KVER/" 2>/dev/null || true
 fi
 
-# Create cpio archive with gzip compression
-# (LZ4 would be faster but needs CONFIG_RD_LZ4 in kernel, using gzip for compatibility)
+# Create cpio archive with LZ4 compression (5x faster decompression than gzip)
+# Alpine's linux-virt kernel has CONFIG_RD_LZ4=y built-in
+# -l flag creates legacy LZ4 format required by Linux kernel
 cd "$INITRAMFS_DIR"
-find . | cpio -o -H newc --quiet 2>/dev/null | gzip -9 > "$OUTPUT_DIR/initramfs-$ARCH_NAME"
+find . | cpio -o -H newc --quiet 2>/dev/null | lz4 -9 -l > "$OUTPUT_DIR/initramfs-$ARCH_NAME"
 
 # Report size comparison
 NEW_SIZE=$(ls -lh "$OUTPUT_DIR/initramfs-$ARCH_NAME" | awk '{print $5}')
