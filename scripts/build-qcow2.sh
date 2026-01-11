@@ -378,7 +378,7 @@ build_qcow2() {
             apt-get update -qq
             apt-get install -y -qq guestfs-tools qemu-utils >/dev/null 2>&1
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
-            qemu-img convert -f raw -O qcow2 -c /build/rootfs.raw /output/$output_name.qcow2
+            qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
         "
 
     rm -rf "$tmp_dir"
