@@ -276,7 +276,7 @@ class Scheduler:
 
         # Validate packages against allowlist
         if packages and self.config.enable_package_validation:
-            self._validate_packages(packages, language)
+            await self._validate_packages(packages, language)
 
         # Determine snapshot path (if packages specified)
         snapshot_path: Path | None = None
@@ -376,7 +376,7 @@ class Scheduler:
             max_concurrent_s3_uploads=self.config.max_concurrent_s3_uploads,
         )
 
-    def _validate_packages(self, packages: list[str], language: Language) -> None:
+    async def _validate_packages(self, packages: list[str], language: Language) -> None:
         """Validate packages against allowlist.
 
         Args:
@@ -388,7 +388,7 @@ class Scheduler:
         """
         from exec_sandbox.package_validator import PackageValidator  # noqa: PLC0415
 
-        validator = PackageValidator()
+        validator = await PackageValidator.create()
         for package in packages:
             # Extract package name (strip version specifier)
             name = package.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0].split("[")[0]

@@ -10,6 +10,8 @@ import json
 import re
 from pathlib import Path
 
+import aiofiles
+
 from exec_sandbox.exceptions import PackageNotAllowedError
 from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
 
@@ -24,33 +26,47 @@ class PackageValidator:
     This validator only checks allow-list membership.
 
     Catalogs are built at dev time and bundled in container (no runtime fetching).
+
+    Use the async factory method `create()` to instantiate.
     """
 
-    def __init__(
-        self,
+    def __init__(self, allow_lists: dict[str, set[str]]):
+        """Private constructor - use create() instead.
+
+        Args:
+            allow_lists: Pre-loaded allow-lists dict mapping language to package sets
+        """
+        self._allow_lists = allow_lists
+
+    @classmethod
+    async def create(
+        cls,
         pypi_allow_list_path: Path | None = None,
         npm_allow_list_path: Path | None = None,
-    ):
-        """Initialize validator with bundled allow-list catalogs.
+    ) -> PackageValidator:
+        """Async factory method to create a PackageValidator.
 
         Args:
             pypi_allow_list_path: Path to JSON file with PyPI package names (bundled).
                 Defaults to bundled catalogs/pypi_top_10k.json
             npm_allow_list_path: Path to JSON file with npm package names (bundled).
                 Defaults to bundled catalogs/npm_top_10k.json
+
+        Returns:
+            Initialized PackageValidator instance
         """
-        # Default to bundled catalogs
         catalogs_dir = Path(__file__).parent / "catalogs"
         pypi_path = pypi_allow_list_path or catalogs_dir / "pypi_top_10k.json"
         npm_path = npm_allow_list_path or catalogs_dir / "npm_top_10k.json"
 
-        self._allow_lists = {
-            "python": self._load_allow_list(pypi_path),
-            "javascript": self._load_allow_list(npm_path),
+        allow_lists = {
+            "python": await cls._load_allow_list(pypi_path),
+            "javascript": await cls._load_allow_list(npm_path),
         }
+        return cls(allow_lists)
 
     @staticmethod
-    def _load_allow_list(path: Path) -> set[str]:
+    async def _load_allow_list(path: Path) -> set[str]:
         """Load allow-list from bundled JSON file.
 
         Args:
@@ -59,8 +75,9 @@ class PackageValidator:
         Returns:
             Set of allowed package names (lowercase for case-insensitive matching)
         """
-        with path.open() as f:
-            packages: list[str] = json.load(f)
+        async with aiofiles.open(path) as f:
+            content = await f.read()
+        packages: list[str] = json.loads(content)
         return {pkg.lower() for pkg in packages}
 
     def validate(self, packages: list[str], language: Language) -> None:

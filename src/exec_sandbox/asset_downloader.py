@@ -328,7 +328,7 @@ class AsyncPooch:
             processor=processor,
         )
 
-    def load_registry_from_file(self, registry_file: Path) -> None:
+    async def load_registry_from_file(self, registry_file: Path) -> None:
         """
         Load registry from a file (filename hash per line).
 
@@ -337,14 +337,15 @@ class AsyncPooch:
             python-base.qcow2.zst sha256:def456...
         """
         min_parts = 2
-        with registry_file.open() as f:
-            for raw_line in f:
-                stripped_line = raw_line.strip()
-                if not stripped_line or stripped_line.startswith("#"):
-                    continue
-                parts = stripped_line.split()
-                if len(parts) >= min_parts:
-                    self.registry[parts[0]] = parts[1]
+        async with aiofiles.open(registry_file) as f:
+            content = await f.read()
+        for raw_line in content.splitlines():
+            stripped_line = raw_line.strip()
+            if not stripped_line or stripped_line.startswith("#"):
+                continue
+            parts = stripped_line.split()
+            if len(parts) >= min_parts:
+                self.registry[parts[0]] = parts[1]
 
     async def load_registry_from_github(self, owner: str, repo: str, tag: str) -> None:
         """

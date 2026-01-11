@@ -26,16 +26,16 @@ def temp_catalogs(tmp_path: Path) -> tuple[Path, Path]:
 
 
 @pytest.fixture
-def validator(temp_catalogs: tuple[Path, Path]) -> PackageValidator:
+async def validator(temp_catalogs: tuple[Path, Path]) -> PackageValidator:
     """Create validator instance with test catalogs."""
     pypi_path, npm_path = temp_catalogs
-    return PackageValidator(
+    return await PackageValidator.create(
         pypi_allow_list_path=pypi_path,
         npm_allow_list_path=npm_path,
     )
 
 
-def test_valid_packages_python(validator: PackageValidator) -> None:
+async def test_valid_packages_python(validator: PackageValidator) -> None:
     """Test validation passes for allowed Python packages with version pins."""
     packages = [
         "pandas==2.0.0",
@@ -47,7 +47,7 @@ def test_valid_packages_python(validator: PackageValidator) -> None:
     validator.validate(packages, language=Language.PYTHON)
 
 
-def test_valid_packages_javascript(validator: PackageValidator) -> None:
+async def test_valid_packages_javascript(validator: PackageValidator) -> None:
     """Test validation passes for allowed JavaScript packages with version pins."""
     packages = [
         "lodash@4.17.21",
@@ -59,7 +59,7 @@ def test_valid_packages_javascript(validator: PackageValidator) -> None:
     validator.validate(packages, language=Language.JAVASCRIPT)
 
 
-def test_not_in_allowlist_raises(validator: PackageValidator) -> None:
+async def test_not_in_allowlist_raises(validator: PackageValidator) -> None:
     """Test validation fails for packages not in allow-list."""
     packages = ["malicious-package==1.0.0"]
 
@@ -70,7 +70,7 @@ def test_not_in_allowlist_raises(validator: PackageValidator) -> None:
     assert "not in python allow-list" in str(exc_info.value)
 
 
-def test_no_version_pinning_raises(validator: PackageValidator) -> None:
+async def test_no_version_pinning_raises(validator: PackageValidator) -> None:
     """Test validation fails for packages without version pinning."""
     # Python without version - validator requires version specifier
     with pytest.raises(PackageNotAllowedError) as exc_info:
@@ -85,7 +85,7 @@ def test_no_version_pinning_raises(validator: PackageValidator) -> None:
     assert "Invalid package spec" in str(exc_info.value)
 
 
-def test_multiple_packages_first_fails(validator: PackageValidator) -> None:
+async def test_multiple_packages_first_fails(validator: PackageValidator) -> None:
     """Test validation stops at first invalid package."""
     packages = [
         "pandas==2.0.0",  # Valid
@@ -99,7 +99,7 @@ def test_multiple_packages_first_fails(validator: PackageValidator) -> None:
     assert "malicious" in str(exc_info.value)
 
 
-def test_version_pinning_checked_before_allowlist(validator: PackageValidator) -> None:
+async def test_version_pinning_checked_before_allowlist(validator: PackageValidator) -> None:
     """Test that both allow-list and version pinning are enforced."""
     # Package in allow-list but no version
     with pytest.raises(PackageNotAllowedError) as exc_info:
@@ -114,14 +114,14 @@ def test_version_pinning_checked_before_allowlist(validator: PackageValidator) -
     assert "not in python allow-list" in str(exc_info.value)
 
 
-def test_empty_package_list(validator: PackageValidator) -> None:
+async def test_empty_package_list(validator: PackageValidator) -> None:
     """Test validation passes for empty package list."""
     # Should not raise
     validator.validate([], language=Language.PYTHON)
     validator.validate([], language=Language.JAVASCRIPT)
 
 
-def test_case_insensitive_package_names(validator: PackageValidator) -> None:
+async def test_case_insensitive_package_names(validator: PackageValidator) -> None:
     """Test package name matching is case-insensitive."""
     # Uppercase version of allowed package should pass (case-insensitive)
     validator.validate(["PANDAS==2.0.0"], language=Language.PYTHON)
@@ -129,7 +129,7 @@ def test_case_insensitive_package_names(validator: PackageValidator) -> None:
     validator.validate(["pAnDaS==2.0.0"], language=Language.PYTHON)  # Mixed case
 
 
-def test_load_allow_list_from_real_catalogs() -> None:
+async def test_load_allow_list_from_real_catalogs() -> None:
     """Test loading allow-lists from actual catalog files."""
     # Use relative path from test file to catalogs
     catalog_dir = Path(__file__).parent.parent / "catalogs"
@@ -137,7 +137,7 @@ def test_load_allow_list_from_real_catalogs() -> None:
     pypi_catalog = catalog_dir / "pypi_top_10k.json"
     npm_catalog = catalog_dir / "npm_top_10k.json"
 
-    validator = PackageValidator(
+    validator = await PackageValidator.create(
         pypi_allow_list_path=pypi_catalog,
         npm_allow_list_path=npm_catalog,
     )

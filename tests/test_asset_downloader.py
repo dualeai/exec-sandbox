@@ -132,7 +132,6 @@ class TestGetGvproxySuffix:
 class TestRetrieve:
     """Tests for retrieve function."""
 
-    @pytest.mark.asyncio
     async def test_downloads_and_caches(self, tmp_path: Path):
         """Should download file and cache it locally."""
         content = b"hello world"
@@ -153,7 +152,6 @@ class TestRetrieve:
             assert path.exists()
             assert path.read_bytes() == content
 
-    @pytest.mark.asyncio
     async def test_uses_cache_on_second_call(self, tmp_path: Path):
         """Should use cached file on second call without re-downloading."""
         content = b"cached content"
@@ -180,7 +178,6 @@ class TestRetrieve:
             # aioresponses should only have been called once
             m.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_checksum_verification_fails(self, tmp_path: Path):
         """Should raise AssetDownloadError (wrapping AssetChecksumError) on hash mismatch after retries."""
         with aioresponses() as m:
@@ -195,7 +192,6 @@ class TestRetrieve:
                     path=tmp_path,
                 )
 
-    @pytest.mark.asyncio
     @pytest.mark.skip(reason="aioresponses doesn't properly support sequential error-then-success mocking")
     async def test_retries_on_failure(self, tmp_path: Path):
         """Should retry on network failure."""
@@ -203,7 +199,6 @@ class TestRetrieve:
         # mocking sequential responses where the first fails and subsequent succeed.
         # The retry logic is tested implicitly by test_checksum_verification_fails.
 
-    @pytest.mark.asyncio
     async def test_http_404_error(self, tmp_path: Path):
         """Should raise AssetDownloadError on HTTP 404."""
         with aioresponses() as m:
@@ -217,7 +212,6 @@ class TestRetrieve:
                     path=tmp_path,
                 )
 
-    @pytest.mark.asyncio
     async def test_http_500_error(self, tmp_path: Path):
         """Should raise AssetDownloadError on HTTP 500."""
         with aioresponses() as m:
@@ -231,7 +225,6 @@ class TestRetrieve:
                     path=tmp_path,
                 )
 
-    @pytest.mark.asyncio
     async def test_connection_error(self, tmp_path: Path):
         """Should raise AssetDownloadError on connection failure."""
         with aioresponses() as m:
@@ -248,7 +241,6 @@ class TestRetrieve:
                     path=tmp_path,
                 )
 
-    @pytest.mark.asyncio
     async def test_empty_hash_skips_verification(self, tmp_path: Path):
         """Should skip hash verification when hash is empty."""
         content = b"any content"
@@ -266,7 +258,6 @@ class TestRetrieve:
             assert path.exists()
             assert path.read_bytes() == content
 
-    @pytest.mark.asyncio
     async def test_processor_is_called(self, tmp_path: Path):
         """Should call processor function after download."""
         content = b"original content"
@@ -299,7 +290,6 @@ class TestRetrieve:
             assert processor_input == tmp_path / "process.txt"
             assert result_path == tmp_path / "process.processed"
 
-    @pytest.mark.asyncio
     async def test_redownloads_on_hash_mismatch(self, tmp_path: Path):
         """Should re-download when cached file has wrong hash."""
         content = b"correct content"
@@ -321,7 +311,6 @@ class TestRetrieve:
             # Should have re-downloaded and now have correct content
             assert path.read_bytes() == content
 
-    @pytest.mark.asyncio
     async def test_streaming_memory_usage(self, tmp_path: Path):
         """Should use bounded memory (~64KB chunks) regardless of file size.
 
@@ -391,7 +380,6 @@ class TestAsyncPooch:
             )
             assert pooch.path == Path("/custom/path")
 
-    @pytest.mark.asyncio
     async def test_fetch_downloads_file(self, tmp_path: Path):
         """Should download file from registry."""
         content = b"registry content"
@@ -412,7 +400,6 @@ class TestAsyncPooch:
             assert path.exists()
             assert path.read_bytes() == content
 
-    @pytest.mark.asyncio
     async def test_fetch_not_in_registry(self, tmp_path: Path):
         """Should raise AssetNotFoundError for unknown file."""
         pooch = AsyncPooch(
@@ -425,7 +412,7 @@ class TestAsyncPooch:
         with pytest.raises(AssetNotFoundError):
             await pooch.fetch("unknown.txt")
 
-    def test_load_registry_from_file(self, tmp_path: Path):
+    async def test_load_registry_from_file(self, tmp_path: Path):
         """Should load registry from file."""
         registry_file = tmp_path / "registry.txt"
         registry_file.write_text("file1.txt sha256:hash1\nfile2.txt sha256:hash2\n")
@@ -435,12 +422,11 @@ class TestAsyncPooch:
             base_url="https://example.com",
             version="1.0.0",
         )
-        pooch.load_registry_from_file(registry_file)
+        await pooch.load_registry_from_file(registry_file)
 
         assert pooch.registry["file1.txt"] == "sha256:hash1"
         assert pooch.registry["file2.txt"] == "sha256:hash2"
 
-    @pytest.mark.asyncio
     async def test_load_registry_from_github(self, tmp_path: Path):
         """Should load registry from GitHub release API."""
         pooch = AsyncPooch(
@@ -468,7 +454,7 @@ class TestAsyncPooch:
             assert pooch.registry["file1.txt"] == "sha256:hash1"
             assert pooch.registry["file2.txt"] == "sha256:hash2"
 
-    def test_load_registry_with_comments_and_empty_lines(self, tmp_path: Path):
+    async def test_load_registry_with_comments_and_empty_lines(self, tmp_path: Path):
         """Should skip comments and empty lines in registry file."""
         registry_file = tmp_path / "registry.txt"
         registry_file.write_text(
@@ -480,13 +466,13 @@ class TestAsyncPooch:
             base_url="https://example.com",
             version="1.0.0",
         )
-        pooch.load_registry_from_file(registry_file)
+        await pooch.load_registry_from_file(registry_file)
 
         assert len(pooch.registry) == 2
         assert pooch.registry["file1.txt"] == "sha256:hash1"
         assert pooch.registry["file2.txt"] == "sha256:hash2"
 
-    def test_load_registry_with_malformed_lines(self, tmp_path: Path):
+    async def test_load_registry_with_malformed_lines(self, tmp_path: Path):
         """Should skip malformed lines (less than 2 parts) in registry file."""
         registry_file = tmp_path / "registry.txt"
         registry_file.write_text("file1.txt sha256:hash1\nmalformed_line_no_hash\nfile2.txt sha256:hash2\n")
@@ -496,12 +482,11 @@ class TestAsyncPooch:
             base_url="https://example.com",
             version="1.0.0",
         )
-        pooch.load_registry_from_file(registry_file)
+        await pooch.load_registry_from_file(registry_file)
 
         assert len(pooch.registry) == 2
         assert "malformed_line_no_hash" not in pooch.registry
 
-    @pytest.mark.asyncio
     async def test_github_api_404_error(self, tmp_path: Path):
         """Should raise AssetNotFoundError when GitHub release not found."""
         pooch = AsyncPooch(
@@ -519,7 +504,6 @@ class TestAsyncPooch:
             with pytest.raises(AssetNotFoundError):
                 await pooch.load_registry_from_github("owner", "repo", "v1.0.0")
 
-    @pytest.mark.asyncio
     async def test_github_assets_without_digest(self, tmp_path: Path):
         """Should handle assets without digest (older releases)."""
         pooch = AsyncPooch(
@@ -547,7 +531,6 @@ class TestAsyncPooch:
             assert pooch.registry["file1.txt"] == "sha256:hash1"
             assert pooch.registry["file2.txt"] == ""  # Empty hash for missing digest
 
-    @pytest.mark.asyncio
     async def test_github_latest_tag(self, tmp_path: Path):
         """Should use /releases/latest endpoint for 'latest' tag."""
         pooch = AsyncPooch(
@@ -571,7 +554,6 @@ class TestAsyncPooch:
 
             assert pooch.registry["file.txt"] == "sha256:hash"
 
-    @pytest.mark.asyncio
     async def test_fetch_with_dev_version(self, tmp_path: Path):
         """Should use version_dev when version ends with .dev0."""
         content = b"dev content"
@@ -598,7 +580,6 @@ class TestAsyncPooch:
 class TestDecompressZstd:
     """Tests for decompress_zstd function."""
 
-    @pytest.mark.asyncio
     async def test_decompresses_file(self, tmp_path: Path):
         """Should decompress .zst file and remove original."""
         # Use native zstd or backports.zstd
@@ -623,7 +604,6 @@ class TestDecompressZstd:
         assert result_path.read_bytes() == original_content
         assert not compressed_file.exists()  # Original should be deleted
 
-    @pytest.mark.asyncio
     async def test_corrupted_zstd_file(self, tmp_path: Path):
         """Should raise error on corrupted zstd file."""
         # Use native zstd or backports.zstd to get the error type
@@ -639,7 +619,6 @@ class TestDecompressZstd:
         with pytest.raises(ZstdError):
             await decompress_zstd(corrupted_file)
 
-    @pytest.mark.asyncio
     async def test_empty_zstd_file(self, tmp_path: Path):
         """Should handle empty compressed file."""
         # Use native zstd or backports.zstd
@@ -665,7 +644,6 @@ class TestDecompressZstd:
 class TestUntar:
     """Tests for untar function."""
 
-    @pytest.mark.asyncio
     async def test_extracts_tar_archive(self, tmp_path: Path):
         """Should extract tar archive and remove original."""
         import tarfile
@@ -690,7 +668,6 @@ class TestUntar:
         assert (result_dir / "file2.txt").read_text() == "content2"
         assert not tar_path.exists()  # Original should be deleted
 
-    @pytest.mark.asyncio
     async def test_extracts_tar_gz_archive(self, tmp_path: Path):
         """Should extract .tar.gz archive and remove original."""
         import tarfile

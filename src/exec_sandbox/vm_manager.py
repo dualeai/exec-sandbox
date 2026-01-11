@@ -501,7 +501,7 @@ class QemuVM:
                     break
 
             # Measure external resources from host (cgroup v2)
-            external_cpu_ms, external_mem_mb = self._read_cgroup_stats()
+            external_cpu_ms, external_mem_mb = await self._read_cgroup_stats()
 
             # Concatenate collected chunks
             stdout_full = "".join(stdout_chunks)
@@ -572,14 +572,14 @@ class QemuVM:
                 },
             ) from e
 
-    def _read_cgroup_stats(self) -> tuple[int | None, int | None]:
+    async def _read_cgroup_stats(self) -> tuple[int | None, int | None]:
         """Read external CPU time and peak memory from cgroup v2.
 
         Returns:
             Tuple of (cpu_time_ms, peak_memory_mb)
             Returns (None, None) if cgroup not available or read fails
         """
-        if not self.cgroup_path or not self.cgroup_path.exists():
+        if not self.cgroup_path or not await aiofiles.os.path.exists(self.cgroup_path):
             return (None, None)
 
         cpu_time_ms: int | None = None
@@ -588,8 +588,9 @@ class QemuVM:
         try:
             # Read cpu.stat for usage_usec (microseconds)
             cpu_stat_file = self.cgroup_path / "cpu.stat"
-            if cpu_stat_file.exists():
-                cpu_stat = cpu_stat_file.read_text()
+            if await aiofiles.os.path.exists(cpu_stat_file):
+                async with aiofiles.open(cpu_stat_file) as f:
+                    cpu_stat = await f.read()
                 for line in cpu_stat.splitlines():
                     if line.startswith("usage_usec"):
                         usage_usec = int(line.split()[1])
@@ -598,8 +599,9 @@ class QemuVM:
 
             # Read memory.peak for peak memory usage (bytes)
             memory_peak_file = self.cgroup_path / "memory.peak"
-            if memory_peak_file.exists():
-                peak_bytes = int(memory_peak_file.read_text().strip())
+            if await aiofiles.os.path.exists(memory_peak_file):
+                async with aiofiles.open(memory_peak_file) as f:
+                    peak_bytes = int((await f.read()).strip())
                 peak_memory_mb = peak_bytes // (1024 * 1024)  # Convert to MB
 
         except (OSError, ValueError) as e:
