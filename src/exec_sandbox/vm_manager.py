@@ -168,7 +168,7 @@ class QemuVM:
 
     Security:
     - Layer 1: Hardware isolation (KVM) or TCG software emulation
-    - Layer 2: Unprivileged user (UID 1000, no root)
+    - Layer 2: Unprivileged user (qemu-vm if available, optional)
     - Layer 3: Seccomp syscall filtering
     - Layer 4: cgroup v2 resource limits
     - Layer 5: Linux namespaces (PID, net, mount, UTS, IPC)
@@ -728,6 +728,9 @@ class VmManager:
         # Probe io_uring support ONCE at startup
         self._io_uring_available = self._probe_io_uring_support()
 
+        # qemu-vm user availability checked lazily on first VM creation (optional hardening)
+        self._qemu_vm_available: bool | None = None
+
         self._vms: dict[str, QemuVM] = {}  # vm_id → VM object
         self._vms_lock = asyncio.Lock()  # Protect registry access
 
@@ -737,6 +740,7 @@ class VmManager:
             extra={
                 "max_concurrent_vms": self.settings.max_concurrent_vms,
                 "io_uring_available": self._io_uring_available,
+                "qemu_vm_user_available": self._qemu_vm_available,
                 "note": "Any zombie QEMU processes from crashes will timeout naturally (max 2min)",
             },
         )
@@ -860,8 +864,9 @@ class VmManager:
                 if isinstance(gvproxy_result, BaseException):
                     raise gvproxy_result
 
-                # Type narrowing: after BaseException checks, cgroup_result is Path
+                # Type narrowing: after BaseException checks
                 cgroup_path = cgroup_result
+                use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
                 # Unpack tuple from _start_gvproxy
                 gvproxy_proc, gvproxy_socket, gvproxy_log_task = gvproxy_result
@@ -880,8 +885,9 @@ class VmManager:
                 if isinstance(cgroup_result, BaseException):
                     raise cgroup_result
 
-                # Type narrowing: after BaseException checks, cgroup_result is Path
+                # Type narrowing: after BaseException checks
                 cgroup_path = cgroup_result
+                use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
             # Step 5: Build QEMU command (always Linux in container)
             qemu_cmd = self._build_linux_cmd(
@@ -892,6 +898,7 @@ class VmManager:
                 allow_network,
                 enable_dns_filtering,
                 gvproxy_socket,
+                use_qemu_vm_user=use_qemu_vm_user,
             )
 
             # Step 6: Create dual-port Unix socket communication channel for guest agent
@@ -1189,7 +1196,7 @@ class VmManager:
                 },
             )
 
-        # Fix socket permissions for qemu-vm user (UID 1000) to connect
+        # Fix socket permissions so qemu-vm user can connect
         chmod_proc = ProcessWrapper(
             await asyncio.create_subprocess_exec(
                 "chmod",
@@ -1464,12 +1471,16 @@ class VmManager:
         # Return first match (sorted for determinism)
         return sorted(matches)[0]
 
-    async def _create_overlay(self, base_image: Path, overlay_image: Path) -> None:
+    async def _create_overlay(self, base_image: Path, overlay_image: Path) -> bool:
         """Create ephemeral qcow2 overlay with CoW backing file.
 
         Args:
             base_image: Base qcow2 image (backing file)
             overlay_image: Ephemeral overlay to create
+
+        Returns:
+            True if overlay was chowned to qemu-vm (QEMU should run as qemu-vm),
+            False if overlay is owned by current user (QEMU should run as current user)
 
         Raises:
             VmError: qemu-img command failed
@@ -1501,13 +1512,15 @@ class VmManager:
         if proc.returncode != 0:
             raise VmError(f"qemu-img create failed: {stderr.decode()}")
 
-        # Change ownership to qemu-vm user (UID 1000) so QEMU process can read it
-        # Skip on macOS (local development) where this isn't needed
-        if detect_host_os() != HostOS.MACOS:
+        # Change ownership to qemu-vm user for process isolation (optional hardening)
+        # Only if: Linux + qemu-vm user exists + have sudo access
+        # Returns whether QEMU should run as qemu-vm user (based on chown success)
+        if detect_host_os() != HostOS.MACOS and await self._qemu_vm_user_available():
             chown_proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
+                    "sudo",
                     "chown",
-                    "1000:1000",
+                    "qemu-vm:qemu-vm",
                     str(overlay_image),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -1515,8 +1528,12 @@ class VmManager:
                 )
             )
             await chown_proc.communicate()
-            if chown_proc.returncode != 0:
-                raise VmError("Failed to chown overlay image to qemu-vm user")
+            if chown_proc.returncode == 0:
+                return True  # Overlay chowned to qemu-vm, QEMU should run as qemu-vm
+            logger.debug("Could not chown overlay to qemu-vm user (optional hardening)")
+            return False  # Chown failed, QEMU should run as current user
+
+        return False  # qemu-vm not available, QEMU should run as current user
 
     async def _setup_cgroup(self, vm_id: str, tenant_id: str) -> Path:
         """Set up cgroup v2 resource limits.
@@ -1655,6 +1672,44 @@ class VmManager:
             )
             return False
 
+    async def _probe_qemu_vm_user(self) -> bool:
+        """Check if qemu-vm user exists for process isolation (optional hardening).
+
+        Returns:
+            True if qemu-vm user exists, False otherwise
+        """
+        # Skip on macOS - not applicable
+        if detect_host_os() == HostOS.MACOS:
+            return False
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "id",
+                "qemu-vm",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            available = proc.returncode == 0
+            if available:
+                logger.info("qemu-vm user available (process isolation enabled)")
+            else:
+                logger.debug("qemu-vm user not found (process isolation disabled)")
+            return available
+        except (OSError, TimeoutError) as e:
+            logger.debug(f"qemu-vm user probe failed: {e}")
+            return False
+
+    async def _qemu_vm_user_available(self) -> bool:
+        """Check if qemu-vm user is available for process isolation.
+
+        Lazily probes on first call and caches the result.
+        """
+        if self._qemu_vm_available is not None:
+            return self._qemu_vm_available
+        self._qemu_vm_available = await self._probe_qemu_vm_user()
+        return self._qemu_vm_available
+
     def _wrap_with_ulimit(self, qemu_cmd: list[str], memory_mb: int) -> list[str]:
         """Wrap QEMU command with ulimit for resource control (cgroups alternative).
 
@@ -1690,6 +1745,7 @@ class VmManager:
         enable_dns_filtering: bool = False,  # noqa: ARG002
         gvproxy_socket: Path | None = None,
         loadvm_snapshot: str | None = None,
+        use_qemu_vm_user: bool = False,
     ) -> list[str]:
         """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -1702,6 +1758,7 @@ class VmManager:
             enable_dns_filtering: Enable DNS filtering via gvisor-tap-vsock
             gvproxy_socket: QEMU stream socket path for gvproxy connection
             loadvm_snapshot: Optional snapshot name to restore from (for fast VM boot)
+            use_qemu_vm_user: Run QEMU as qemu-vm user (optional hardening)
 
         Returns:
             QEMU command as list of strings
@@ -1904,8 +1961,9 @@ class VmManager:
         if loadvm_snapshot:
             qemu_args.extend(["-loadvm", loadvm_snapshot])
 
-        # Run QEMU as unprivileged user (Linux production) or directly (macOS development)
-        if detect_host_os() != HostOS.MACOS:
+        # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
+        # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
+        if use_qemu_vm_user:
             cmd.extend(["sudo", "-u", "qemu-vm"])
 
         cmd.extend(qemu_args)
