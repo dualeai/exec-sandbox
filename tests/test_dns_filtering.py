@@ -7,17 +7,10 @@ Tests that gvproxy-wrapper DNS filtering actually works in VMs:
 4. Edge cases: subdomains, case sensitivity, IP bypass attempts
 """
 
-from pathlib import Path
-
 import pytest
 
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
 
 # =============================================================================
 # Normal cases: Basic allow/block behavior
@@ -185,6 +178,7 @@ const lookup = promisify(dns.lookup);
     DNS_FILTER_TEST_CASES,
 )
 async def test_dns_filtering(
+    scheduler: Scheduler,
     language: Language,
     allowed_domains: list[str] | None,
     test_domain: str,
@@ -196,46 +190,41 @@ async def test_dns_filtering(
     - Allowed domains: resolve to real IP
     - Blocked domains: always return 0.0.0.0 (sinkhole)
     """
-    config = SchedulerConfig(images_dir=images_dir)
-
     code = get_dns_test_code(language, test_domain)
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=language,
-            allow_network=True,
-            allowed_domains=allowed_domains,
+    result = await scheduler.run(
+        code=code,
+        language=language,
+        allow_network=True,
+        allowed_domains=allowed_domains,
+    )
+
+    if should_resolve:
+        # Domain should resolve to a real IP (not 0.0.0.0)
+        assert "RESOLVED:" in result.stdout, (
+            f"Expected {test_domain} to resolve but got blocked.\n"
+            f"allowed_domains={allowed_domains}\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+        # Verify it's not the sinkhole IP
+        assert "0.0.0.0" not in result.stdout, (
+            f"Expected {test_domain} to resolve to real IP but got sinkhole.\n"
+            f"allowed_domains={allowed_domains}\n"
+            f"stdout: {result.stdout}"
+        )
+    else:
+        # Blocked domains always return 0.0.0.0 (DNS sinkhole)
+        assert "RESOLVED:0.0.0.0" in result.stdout, (
+            f"Expected {test_domain} to be blocked (0.0.0.0) but got different result.\n"
+            f"allowed_domains={allowed_domains}\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
         )
 
-        if should_resolve:
-            # Domain should resolve to a real IP (not 0.0.0.0)
-            assert "RESOLVED:" in result.stdout, (
-                f"Expected {test_domain} to resolve but got blocked.\n"
-                f"allowed_domains={allowed_domains}\n"
-                f"stdout: {result.stdout}\n"
-                f"stderr: {result.stderr}"
-            )
-            # Verify it's not the sinkhole IP
-            assert "0.0.0.0" not in result.stdout, (
-                f"Expected {test_domain} to resolve to real IP but got sinkhole.\n"
-                f"allowed_domains={allowed_domains}\n"
-                f"stdout: {result.stdout}"
-            )
-        else:
-            # Blocked domains always return 0.0.0.0 (DNS sinkhole)
-            assert "RESOLVED:0.0.0.0" in result.stdout, (
-                f"Expected {test_domain} to be blocked (0.0.0.0) but got different result.\n"
-                f"allowed_domains={allowed_domains}\n"
-                f"stdout: {result.stdout}\n"
-                f"stderr: {result.stderr}"
-            )
 
-
-async def test_dns_filtering_http_allowed() -> None:
+async def test_dns_filtering_http_allowed(scheduler: Scheduler) -> None:
     """Test that allowed domain is accessible via HTTP."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     code = """
 import urllib.request
 try:
@@ -245,23 +234,20 @@ except Exception as e:
     print(f"ERROR:{e}")
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["pypi.org"],
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+        allow_network=True,
+        allowed_domains=["pypi.org"],
+    )
 
-        assert "STATUS:200" in result.stdout, (
-            f"HTTP to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "STATUS:200" in result.stdout, (
+        f"HTTP to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
-async def test_dns_filtering_http_blocked() -> None:
+async def test_dns_filtering_http_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails via HTTP."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     code = """
 import urllib.request
 try:
@@ -271,23 +257,20 @@ except Exception as e:
     print(f"BLOCKED:{type(e).__name__}")
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["pypi.org"],  # Only pypi allowed
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+        allow_network=True,
+        allowed_domains=["pypi.org"],  # Only pypi allowed
+    )
 
-        assert "BLOCKED:" in result.stdout, (
-            f"Expected HTTP to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "BLOCKED:" in result.stdout, (
+        f"Expected HTTP to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
-async def test_dns_filtering_javascript() -> None:
+async def test_dns_filtering_javascript(scheduler: Scheduler) -> None:
     """Test DNS filtering with JavaScript/Bun."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     # Bun's fetch will fail if DNS is blocked
     code = """
 try {
@@ -298,23 +281,20 @@ try {
 }
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-            allow_network=True,
-            allowed_domains=["registry.npmjs.org"],
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.JAVASCRIPT,
+        allow_network=True,
+        allowed_domains=["registry.npmjs.org"],
+    )
 
-        assert "STATUS:200" in result.stdout, (
-            f"Fetch to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "STATUS:200" in result.stdout, (
+        f"Fetch to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
-async def test_network_disabled_no_resolution() -> None:
+async def test_network_disabled_no_resolution(scheduler: Scheduler) -> None:
     """Test that allow_network=False prevents all network access."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     code = """
 import socket
 try:
@@ -326,62 +306,53 @@ except OSError as e:
     print(f"NO_NETWORK:{e}")
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=False,  # Network disabled
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+        allow_network=False,  # Network disabled
+    )
 
-        assert "NO_NETWORK:" in result.stdout or "RESOLVED:" not in result.stdout, (
-            f"Expected network to be disabled.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "NO_NETWORK:" in result.stdout or "RESOLVED:" not in result.stdout, (
+        f"Expected network to be disabled.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
 # =============================================================================
 # RAW language tests (using curl instead of Python)
 # =============================================================================
-async def test_dns_filtering_raw_allowed() -> None:
+async def test_dns_filtering_raw_allowed(scheduler: Scheduler) -> None:
     """Test DNS filtering with RAW language using curl."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code="curl -sf --max-time 10 https://example.com/ && echo 'SUCCESS' || echo 'FAILED'",
+        language=Language.RAW,
+        allow_network=True,
+        allowed_domains=["example.com"],
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code="curl -sf --max-time 10 https://example.com/ && echo 'SUCCESS' || echo 'FAILED'",
-            language=Language.RAW,
-            allow_network=True,
-            allowed_domains=["example.com"],
-        )
-
-        assert "SUCCESS" in result.stdout, (
-            f"curl to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "SUCCESS" in result.stdout, (
+        f"curl to allowed domain failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
-async def test_dns_filtering_raw_blocked() -> None:
+async def test_dns_filtering_raw_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails with RAW language."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code="curl -sf --max-time 5 https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
+        language=Language.RAW,
+        allow_network=True,
+        allowed_domains=["example.com"],  # google.com not allowed
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code="curl -sf --max-time 5 https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
-            language=Language.RAW,
-            allow_network=True,
-            allowed_domains=["example.com"],  # google.com not allowed
-        )
-
-        assert "BLOCKED" in result.stdout, (
-            f"Expected curl to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "BLOCKED" in result.stdout, (
+        f"Expected curl to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
 # =============================================================================
 # JavaScript blocked domain test
 # =============================================================================
-async def test_dns_filtering_javascript_blocked() -> None:
+async def test_dns_filtering_javascript_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails with JavaScript."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     code = """
 try {
     const res = await fetch("https://google.com/", { signal: AbortSignal.timeout(5000) });
@@ -391,26 +362,23 @@ try {
 }
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-            allow_network=True,
-            allowed_domains=["registry.npmjs.org"],  # google.com not allowed
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.JAVASCRIPT,
+        allow_network=True,
+        allowed_domains=["registry.npmjs.org"],  # google.com not allowed
+    )
 
-        assert "BLOCKED:" in result.stdout, (
-            f"Expected fetch to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "BLOCKED:" in result.stdout, (
+        f"Expected fetch to google.com to fail but it succeeded.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
 # =============================================================================
 # Boundary / weird input tests
 # =============================================================================
-async def test_dns_filtering_many_domains() -> None:
+async def test_dns_filtering_many_domains(scheduler: Scheduler) -> None:
     """Test with many allowed domains (stress test)."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     # 50 domains in allowlist
     many_domains = [f"domain{i}.com" for i in range(50)]
     many_domains.append("example.com")  # Add a real one
@@ -424,23 +392,18 @@ except socket.gaierror as e:
     print(f"BLOCKED:{e}")
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=many_domains,
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+        allow_network=True,
+        allowed_domains=many_domains,
+    )
 
-        assert "RESOLVED:" in result.stdout, (
-            f"Large allowlist failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    assert "RESOLVED:" in result.stdout, f"Large allowlist failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
 
-async def test_dns_filtering_unicode_domain() -> None:
+async def test_dns_filtering_unicode_domain(scheduler: Scheduler) -> None:
     """Test with internationalized domain name (IDN)."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     # IDN domain - should either work or fail gracefully
     code = """
 import socket
@@ -454,24 +417,21 @@ except UnicodeError as e:
     print(f"UNICODE_ERROR:{e}")
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["xn--nxasmq5b.com"],
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+        allow_network=True,
+        allowed_domains=["xn--nxasmq5b.com"],
+    )
 
-        # Should either resolve or be blocked, not crash
-        assert "RESOLVED:" in result.stdout or "BLOCKED:" in result.stdout, (
-            f"IDN domain handling failed unexpectedly.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    # Should either resolve or be blocked, not crash
+    assert "RESOLVED:" in result.stdout or "BLOCKED:" in result.stdout, (
+        f"IDN domain handling failed unexpectedly.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
-async def test_dns_filtering_special_tld() -> None:
+async def test_dns_filtering_special_tld(scheduler: Scheduler) -> None:
     """Test with special TLDs (.local, .internal)."""
-    config = SchedulerConfig(images_dir=images_dir)
-
     code = """
 import socket
 try:
@@ -481,16 +441,15 @@ except socket.gaierror as e:
     print(f"BLOCKED:{e}")
 """
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["example.com"],  # .local not in allowlist
-        )
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+        allow_network=True,
+        allowed_domains=["example.com"],  # .local not in allowlist
+    )
 
-        # .local should be blocked (not in allowlist)
-        # Blocked domains always return 0.0.0.0 (DNS sinkhole)
-        assert "RESOLVED:0.0.0.0" in result.stdout, (
-            f"Expected .local to be blocked (0.0.0.0).\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    # .local should be blocked (not in allowlist)
+    # Blocked domains always return 0.0.0.0 (DNS sinkhole)
+    assert "RESOLVED:0.0.0.0" in result.stdout, (
+        f"Expected .local to be blocked (0.0.0.0).\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )

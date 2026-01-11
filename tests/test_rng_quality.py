@@ -17,16 +17,10 @@ References:
 - https://github.com/firecracker-microvm/firecracker/blob/main/docs/entropy.md
 """
 
-from pathlib import Path
-
 import pytest
 
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
 
 
 # =============================================================================
@@ -55,22 +49,17 @@ class TestKernelEntropyHealth:
             ),
         ],
     )
-    async def test_entropy_pool_seeded(self, language: Language, code: str) -> None:
+    async def test_entropy_pool_seeded(self, scheduler: Scheduler, language: Language, code: str) -> None:
         """CRNG has 256 bits entropy (random.trust_cpu=on working)."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(code=code, language=language)
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=language)
+        assert result.exit_code == 0
+        entropy = int(result.stdout.strip())
+        # Modern kernels with CONFIG_RANDOM_TRUST_CPU maintain 256 bits
+        assert entropy >= 256, f"Entropy starvation: only {entropy} bits"
 
-            assert result.exit_code == 0
-            entropy = int(result.stdout.strip())
-            # Modern kernels with CONFIG_RANDOM_TRUST_CPU maintain 256 bits
-            assert entropy >= 256, f"Entropy starvation: only {entropy} bits"
-
-    async def test_urandom_nonblocking(self) -> None:
+    async def test_urandom_nonblocking(self, scheduler: Scheduler) -> None:
         """getrandom() doesn't block - CRNG ready at boot."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import time
@@ -84,11 +73,10 @@ print(f"TIME_MS:{elapsed_ms:.2f}")
 # Should complete in <100ms, blocking would take seconds
 print("PASS" if elapsed_ms < 100 else "FAIL_BLOCKED")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout, "getrandom() blocked - entropy starvation"
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout, "getrandom() blocked - entropy starvation"
 
 
 # =============================================================================
@@ -100,14 +88,12 @@ class TestEntStatistics:
     Reference: https://www.fourmilab.ch/random/
     """
 
-    async def test_chi_square_byte_distribution(self) -> None:
+    async def test_chi_square_byte_distribution(self, scheduler: Scheduler) -> None:
         """Chi-square test for uniform byte distribution.
 
         Chi-square is extremely sensitive to RNG errors.
         For 255 DOF: values 200-310 are normal (p=0.01 to p=0.99)
         """
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 
@@ -136,16 +122,13 @@ elif chi_sq > 310:
 else:
     print("PASS")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_entropy_bits_per_byte(self) -> None:
+    async def test_entropy_bits_per_byte(self, scheduler: Scheduler) -> None:
         """Shannon entropy should be ~7.99 bits/byte for random data."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import math
@@ -167,16 +150,13 @@ print(f"ENTROPY:{entropy:.6f}")
 # Perfect random = 8.0 bits/byte, >7.9 is excellent
 print("PASS" if entropy > 7.9 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_serial_correlation(self) -> None:
+    async def test_serial_correlation(self, scheduler: Scheduler) -> None:
         """Serial correlation coefficient should be near zero."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 
@@ -204,16 +184,13 @@ print(f"SERIAL_CORR:{corr:.6f}")
 # Should be very close to 0 (< 0.01 in absolute value)
 print("PASS" if abs(corr) < 0.01 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_compression_ratio(self) -> None:
+    async def test_compression_ratio(self, scheduler: Scheduler) -> None:
         """Random data should be incompressible (ratio > 0.99)."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import zlib
@@ -227,16 +204,13 @@ print(f"COMPRESS_RATIO:{ratio:.4f}")
 # Weak RNG may have patterns that compress better
 print("PASS" if ratio > 0.99 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_monte_carlo_pi(self) -> None:
+    async def test_monte_carlo_pi(self, scheduler: Scheduler) -> None:
         """Monte Carlo pi estimation - tests 2D uniformity."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import struct
@@ -261,11 +235,10 @@ print(f"ERROR:{error:.6f}")
 # Error should be < 0.01 with 100k samples
 print("PASS" if error < 0.01 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
 
 # =============================================================================
@@ -274,10 +247,8 @@ print("PASS" if error < 0.01 else "FAIL")
 class TestCryptoAPIs:
     """Verify crypto APIs work correctly on each runtime."""
 
-    async def test_python_secrets_module(self) -> None:
+    async def test_python_secrets_module(self, scheduler: Scheduler) -> None:
         """Python secrets module (CSPRNG) works."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import secrets
 
@@ -299,16 +270,13 @@ for _ in range(100):
 
 print("PASS")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_python_hashlib_random(self) -> None:
+    async def test_python_hashlib_random(self, scheduler: Scheduler) -> None:
         """Python hashlib with random data produces unique hashes."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import hashlib
@@ -323,16 +291,13 @@ for _ in range(100):
 print(f"UNIQUE_HASHES:{len(hashes)}")
 print("PASS" if len(hashes) == 100 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_javascript_crypto_random(self) -> None:
+    async def test_javascript_crypto_random(self, scheduler: Scheduler) -> None:
         """Node/Bun crypto.randomBytes works."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 const crypto = require("crypto");
 
@@ -351,16 +316,13 @@ console.log(`UUID_LEN:${uuid.length}`);
 
 console.log(buf1.length === 1024 && !same && uuid.length === 36 ? "PASS" : "FAIL");
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_javascript_compression_test(self) -> None:
+    async def test_javascript_compression_test(self, scheduler: Scheduler) -> None:
         """JavaScript random data is incompressible."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 const crypto = require("crypto");
 const zlib = require("zlib");
@@ -375,16 +337,13 @@ const ratio = compressed.length / data.length;
 console.log(`RATIO:${ratio.toFixed(4)}`);
 console.log(ratio > 0.99 ? "PASS" : "FAIL");
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_raw_dev_urandom(self) -> None:
+    async def test_raw_dev_urandom(self, scheduler: Scheduler) -> None:
         """Shell access to /dev/urandom works."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 # Test /dev/urandom read (256KB)
 BYTES=$(dd if=/dev/urandom bs=1024 count=256 2>/dev/null | wc -c)
@@ -397,11 +356,10 @@ else
     echo "FAIL"
 fi
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.RAW)
+        result = await scheduler.run(code=code, language=Language.RAW)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
 
 # =============================================================================
@@ -414,11 +372,9 @@ class TestCrossVMUniqueness:
     where all clones would generate identical keys.
     """
 
-    async def test_different_vms_different_random(self) -> None:
+    async def test_different_vms_different_random(self, scheduler: Scheduler) -> None:
         """Two VMs must produce different random outputs."""
         import asyncio
-
-        config = SchedulerConfig(images_dir=images_dir)
 
         code = """
 import os
@@ -427,23 +383,20 @@ import hashlib
 data = os.urandom(1024)
 print(hashlib.sha256(data).hexdigest())
 """
-        async with Scheduler(config) as scheduler:
-            # Run same code in two separate VMs
-            results = await asyncio.gather(
-                scheduler.run(code=code, language=Language.PYTHON),
-                scheduler.run(code=code, language=Language.PYTHON),
-            )
+        # Run same code in two separate VMs
+        results = await asyncio.gather(
+            scheduler.run(code=code, language=Language.PYTHON),
+            scheduler.run(code=code, language=Language.PYTHON),
+        )
 
-            hashes = [r.stdout.strip() for r in results]
-            assert len(hashes) == 2
-            assert all(len(h) == 64 for h in hashes), "Invalid SHA256 output"
-            assert hashes[0] != hashes[1], "CRITICAL: VMs produced identical random!"
+        hashes = [r.stdout.strip() for r in results]
+        assert len(hashes) == 2
+        assert all(len(h) == 64 for h in hashes), "Invalid SHA256 output"
+        assert hashes[0] != hashes[1], "CRITICAL: VMs produced identical random!"
 
-    async def test_multiple_vms_all_unique(self) -> None:
+    async def test_multiple_vms_all_unique(self, scheduler: Scheduler) -> None:
         """Five VMs must all produce unique random outputs."""
         import asyncio
-
-        config = SchedulerConfig(images_dir=images_dir)
 
         code = """
 import os
@@ -451,13 +404,12 @@ import hashlib
 data = os.urandom(1024)
 print(hashlib.sha256(data).hexdigest())
 """
-        async with Scheduler(config) as scheduler:
-            # Run in 5 VMs concurrently
-            results = await asyncio.gather(*[scheduler.run(code=code, language=Language.PYTHON) for _ in range(5)])
+        # Run in 5 VMs concurrently
+        results = await asyncio.gather(*[scheduler.run(code=code, language=Language.PYTHON) for _ in range(5)])
 
-            hashes = [r.stdout.strip() for r in results]
-            assert len(hashes) == 5
-            assert len(set(hashes)) == 5, f"Duplicate hashes found: {hashes}"
+        hashes = [r.stdout.strip() for r in results]
+        assert len(hashes) == 5
+        assert len(set(hashes)) == 5, f"Duplicate hashes found: {hashes}"
 
 
 # =============================================================================
@@ -469,10 +421,8 @@ class TestNistStyle:
     Reference: https://github.com/usnistgov/SP800-90B_EntropyAssessment
     """
 
-    async def test_repetition_count(self) -> None:
+    async def test_repetition_count(self, scheduler: Scheduler) -> None:
         """No long runs of identical bytes (IID assumption)."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 
@@ -493,16 +443,13 @@ print(f"MAX_RUN:{max_run}")
 # Runs > 6 indicate a broken RNG
 print("PASS" if max_run <= 6 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_adaptive_proportion(self) -> None:
+    async def test_adaptive_proportion(self, scheduler: Scheduler) -> None:
         """No single byte value dominates (checks for stuck bits)."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 
@@ -521,16 +468,13 @@ print(f"MAX_PROPORTION:{proportion:.6f}")
 # Allow up to 2x expected (0.0078) for statistical variation
 print("PASS" if proportion < 0.008 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout
 
-    async def test_bit_balance(self) -> None:
+    async def test_bit_balance(self, scheduler: Scheduler) -> None:
         """Bits should be roughly 50% zeros and 50% ones."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 
@@ -547,8 +491,7 @@ print(f"ONES_RATIO:{ratio:.6f}")
 # Should be very close to 0.5 (within 0.001 for 8M samples)
 print("PASS" if 0.499 < ratio < 0.501 else "FAIL")
 """
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "PASS" in result.stdout
+        assert result.exit_code == 0
+        assert "PASS" in result.stdout

@@ -10,17 +10,11 @@ Uses dynamic fixtures to test various payload sizes.
 """
 
 import hashlib
-from pathlib import Path
 
 import pytest
 
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
 
 # =============================================================================
 # Payload size fixtures - from tiny to max stdout limit
@@ -166,10 +160,9 @@ TIMEOUT_SECONDS = 60
 class TestPythonPayloadIntegrity:
     """Python payload integrity tests across all sizes."""
 
-    async def test_payload_integrity(self, payload_size: tuple[str, int]) -> None:
+    async def test_payload_integrity(self, scheduler: Scheduler, payload_size: tuple[str, int]) -> None:
         """Verify payload integrity for given size."""
         size_name, size_bytes = payload_size
-        config = SchedulerConfig(images_dir=images_dir)
 
         # Pre-compute expected
         expected_data = generate_ascii_pattern(size_bytes)
@@ -178,34 +171,32 @@ class TestPythonPayloadIntegrity:
         # Generate code
         code = python_code_for_ascii_pattern(size_bytes)
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=TIMEOUT_SECONDS,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=TIMEOUT_SECONDS,
+        )
 
-            assert result.exit_code == 0, f"[{size_name}] Execution failed: {result.stderr}"
+        assert result.exit_code == 0, f"[{size_name}] Execution failed: {result.stderr}"
 
-            # Strip trailing newline (runtime may add one)
-            stdout = result.stdout.rstrip("\n")
-            actual_data = stdout.encode("utf-8")
-            actual_hash = compute_hash(actual_data)
+        # Strip trailing newline (runtime may add one)
+        stdout = result.stdout.rstrip("\n")
+        actual_data = stdout.encode("utf-8")
+        actual_hash = compute_hash(actual_data)
 
-            assert len(actual_data) == size_bytes, f"[{size_name}] Size mismatch: {len(actual_data)} vs {size_bytes}"
+        assert len(actual_data) == size_bytes, f"[{size_name}] Size mismatch: {len(actual_data)} vs {size_bytes}"
 
-            assert actual_hash == expected_hash, (
-                f"[{size_name}] HASH MISMATCH - DATA CORRUPTION!\nExpected: {expected_hash}\nActual: {actual_hash}"
-            )
+        assert actual_hash == expected_hash, (
+            f"[{size_name}] HASH MISMATCH - DATA CORRUPTION!\nExpected: {expected_hash}\nActual: {actual_hash}"
+        )
 
 
 class TestPythonStreamingIntegrity:
     """Test streaming callback integrity."""
 
-    async def test_streaming_integrity(self, medium_payload_size: tuple[str, int]) -> None:
+    async def test_streaming_integrity(self, scheduler: Scheduler, medium_payload_size: tuple[str, int]) -> None:
         """Verify streaming receives uncorrupted data."""
         size_name, size_bytes = medium_payload_size
-        config = SchedulerConfig(images_dir=images_dir)
 
         expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
         code = python_code_for_ascii_pattern(size_bytes)
@@ -215,31 +206,28 @@ class TestPythonStreamingIntegrity:
         def on_stdout(chunk: str) -> None:
             streamed_chunks.append(chunk)
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=TIMEOUT_SECONDS,
-                on_stdout=on_stdout,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=TIMEOUT_SECONDS,
+            on_stdout=on_stdout,
+        )
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
 
-            # Verify streamed data (strip trailing newline)
-            streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
-            streamed_hash = compute_hash(streamed_data)
+        # Verify streamed data (strip trailing newline)
+        streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
+        streamed_hash = compute_hash(streamed_data)
 
-            assert len(streamed_data) == size_bytes, (
-                f"[{size_name}] Streamed size: {len(streamed_data)} vs {size_bytes}"
-            )
+        assert len(streamed_data) == size_bytes, f"[{size_name}] Streamed size: {len(streamed_data)} vs {size_bytes}"
 
-            assert streamed_hash == expected_hash, (
-                f"[{size_name}] Streamed data corrupted!\nExpected: {expected_hash}\nStreamed: {streamed_hash}"
-            )
+        assert streamed_hash == expected_hash, (
+            f"[{size_name}] Streamed data corrupted!\nExpected: {expected_hash}\nStreamed: {streamed_hash}"
+        )
 
-            # Verify final result matches streamed
-            final_hash = compute_hash(result.stdout.rstrip("\n").encode("utf-8"))
-            assert final_hash == streamed_hash, f"[{size_name}] Final vs streamed mismatch!"
+        # Verify final result matches streamed
+        final_hash = compute_hash(result.stdout.rstrip("\n").encode("utf-8"))
+        assert final_hash == streamed_hash, f"[{size_name}] Final vs streamed mismatch!"
 
 
 # =============================================================================
@@ -250,30 +238,28 @@ class TestPythonStreamingIntegrity:
 class TestJavaScriptPayloadIntegrity:
     """JavaScript payload integrity tests."""
 
-    async def test_payload_integrity(self, small_payload_size: tuple[str, int]) -> None:
+    async def test_payload_integrity(self, scheduler: Scheduler, small_payload_size: tuple[str, int]) -> None:
         """Verify JavaScript payload integrity."""
         size_name, size_bytes = small_payload_size
-        config = SchedulerConfig(images_dir=images_dir)
 
         expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
         code = javascript_code_for_ascii_pattern(size_bytes)
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.JAVASCRIPT,
-                timeout_seconds=TIMEOUT_SECONDS,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+            timeout_seconds=TIMEOUT_SECONDS,
+        )
 
-            assert result.exit_code == 0, f"[JS-{size_name}] Execution failed: {result.stderr}"
+        assert result.exit_code == 0, f"[JS-{size_name}] Execution failed: {result.stderr}"
 
-            # Strip trailing newline (runtime may add one)
-            stdout = result.stdout.rstrip("\n")
-            actual_hash = compute_hash(stdout.encode("utf-8"))
+        # Strip trailing newline (runtime may add one)
+        stdout = result.stdout.rstrip("\n")
+        actual_hash = compute_hash(stdout.encode("utf-8"))
 
-            assert len(stdout) == size_bytes, f"[JS-{size_name}] Size: {len(stdout)} vs {size_bytes}"
+        assert len(stdout) == size_bytes, f"[JS-{size_name}] Size: {len(stdout)} vs {size_bytes}"
 
-            assert actual_hash == expected_hash, f"[JS-{size_name}] Hash mismatch - corruption!"
+        assert actual_hash == expected_hash, f"[JS-{size_name}] Hash mismatch - corruption!"
 
 
 # =============================================================================
@@ -284,10 +270,9 @@ class TestJavaScriptPayloadIntegrity:
 class TestBinaryPayloadIntegrity:
     """Binary data integrity tests using base64 encoding."""
 
-    async def test_binary_integrity(self, small_payload_size: tuple[str, int]) -> None:
+    async def test_binary_integrity(self, scheduler: Scheduler, small_payload_size: tuple[str, int]) -> None:
         """Verify binary data integrity via base64."""
         size_name, size_bytes = small_payload_size
-        config = SchedulerConfig(images_dir=images_dir)
 
         expected_binary = generate_sequential_bytes(size_bytes)
         expected_hash = compute_hash(expected_binary)
@@ -303,23 +288,22 @@ sys.stdout.write(encoded)
 sys.stdout.flush()
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=TIMEOUT_SECONDS,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=TIMEOUT_SECONDS,
+        )
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
 
-            import base64
+        import base64
 
-            actual_binary = base64.b64decode(result.stdout)
-            actual_hash = compute_hash(actual_binary)
+        actual_binary = base64.b64decode(result.stdout)
+        actual_hash = compute_hash(actual_binary)
 
-            assert len(actual_binary) == size_bytes, f"[Binary-{size_name}] Size: {len(actual_binary)} vs {size_bytes}"
+        assert len(actual_binary) == size_bytes, f"[Binary-{size_name}] Size: {len(actual_binary)} vs {size_bytes}"
 
-            assert actual_hash == expected_hash, f"[Binary-{size_name}] Binary data corrupted!"
+        assert actual_hash == expected_hash, f"[Binary-{size_name}] Binary data corrupted!"
 
 
 # =============================================================================
@@ -330,10 +314,9 @@ sys.stdout.flush()
 class TestVMHashVerification:
     """Verify VM can compute matching hashes."""
 
-    async def test_vm_hash_matches_host(self, small_payload_size: tuple[str, int]) -> None:
+    async def test_vm_hash_matches_host(self, scheduler: Scheduler, small_payload_size: tuple[str, int]) -> None:
         """VM computes same hash as host for same data."""
         size_name, size_bytes = small_payload_size
-        config = SchedulerConfig(images_dir=images_dir)
 
         expected_data = generate_ascii_pattern(size_bytes)
         expected_hash = compute_hash(expected_data)
@@ -353,30 +336,29 @@ sys.stdout.write(data)
 sys.stdout.flush()
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=TIMEOUT_SECONDS,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=TIMEOUT_SECONDS,
+        )
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
 
-            lines = result.stdout.split("\n", 2)
-            assert len(lines) >= 3
+        lines = result.stdout.split("\n", 2)
+        assert len(lines) >= 3
 
-            vm_hash = lines[0].split(":")[1]
-            # Strip trailing newline from data portion
-            received_data = lines[2].rstrip("\n")
+        vm_hash = lines[0].split(":")[1]
+        # Strip trailing newline from data portion
+        received_data = lines[2].rstrip("\n")
 
-            # VM computed same hash as us?
-            assert vm_hash == expected_hash, (
-                f"[{size_name}] VM hash differs from expected!\nVM: {vm_hash}\nExpected: {expected_hash}"
-            )
+        # VM computed same hash as us?
+        assert vm_hash == expected_hash, (
+            f"[{size_name}] VM hash differs from expected!\nVM: {vm_hash}\nExpected: {expected_hash}"
+        )
 
-            # Data we received matches?
-            host_hash = compute_hash(received_data.encode("utf-8"))
-            assert host_hash == expected_hash, f"[{size_name}] Received data corrupted in transit!"
+        # Data we received matches?
+        host_hash = compute_hash(received_data.encode("utf-8"))
+        assert host_hash == expected_hash, f"[{size_name}] Received data corrupted in transit!"
 
 
 # =============================================================================
@@ -396,32 +378,29 @@ class TestRawPayloadIntegrity:
             ("X", 50 * 1024),
         ],
     )
-    async def test_raw_repeated_char(self, repeat_char: str, count: int) -> None:
+    async def test_raw_repeated_char(self, scheduler: Scheduler, repeat_char: str, count: int) -> None:
         """Verify RAW shell can output repeated characters correctly."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         expected_data = (repeat_char * count).encode("utf-8")
         expected_hash = compute_hash(expected_data)
 
         # Use head -c for exact byte count
         code = f"yes '{repeat_char}' | tr -d '\\n' | head -c {count}"
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.RAW,
-                timeout_seconds=60,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.RAW,
+            timeout_seconds=60,
+        )
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
 
-            # Strip trailing newline (shell may add one)
-            stdout = result.stdout.rstrip("\n")
-            actual_hash = compute_hash(stdout.encode("utf-8"))
+        # Strip trailing newline (shell may add one)
+        stdout = result.stdout.rstrip("\n")
+        actual_hash = compute_hash(stdout.encode("utf-8"))
 
-            assert len(stdout) == count, f"[RAW-{count}] Size: {len(stdout)} vs {count}"
+        assert len(stdout) == count, f"[RAW-{count}] Size: {len(stdout)} vs {count}"
 
-            assert actual_hash == expected_hash, f"[RAW-{count}] Shell output corrupted!"
+        assert actual_hash == expected_hash, f"[RAW-{count}] Shell output corrupted!"
 
 
 # =============================================================================
@@ -436,10 +415,9 @@ class TestLargePayloadStreaming:
     These tests use streaming callbacks because stdout is limited to 1MB.
     """
 
-    async def test_streaming_integrity(self, streaming_payload_size: tuple[str, int]) -> None:
+    async def test_streaming_integrity(self, scheduler: Scheduler, streaming_payload_size: tuple[str, int]) -> None:
         """Verify streaming receives all data for large payloads."""
         size_name, size_bytes = streaming_payload_size
-        config = SchedulerConfig(images_dir=images_dir)
 
         expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
         code = python_code_for_ascii_pattern(size_bytes)
@@ -449,26 +427,25 @@ class TestLargePayloadStreaming:
         def on_stdout(chunk: str) -> None:
             streamed_chunks.append(chunk)
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=TIMEOUT_SECONDS,
-                on_stdout=on_stdout,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=TIMEOUT_SECONDS,
+            on_stdout=on_stdout,
+        )
 
-            assert result.exit_code == 0, f"[{size_name}] Execution failed: {result.stderr}"
+        assert result.exit_code == 0, f"[{size_name}] Execution failed: {result.stderr}"
 
-            # Strip trailing newline (runtime may add one)
-            streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
-            streamed_hash = compute_hash(streamed_data)
+        # Strip trailing newline (runtime may add one)
+        streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
+        streamed_hash = compute_hash(streamed_data)
 
-            assert len(streamed_data) == size_bytes, (
-                f"[{size_name}] Streamed size mismatch!\n"
-                f"Expected: {size_bytes:,} bytes\n"
-                f"Streamed: {len(streamed_data):,} bytes"
-            )
+        assert len(streamed_data) == size_bytes, (
+            f"[{size_name}] Streamed size mismatch!\n"
+            f"Expected: {size_bytes:,} bytes\n"
+            f"Streamed: {len(streamed_data):,} bytes"
+        )
 
-            assert streamed_hash == expected_hash, (
-                f"[{size_name}] Streamed data corrupted!\nExpected: {expected_hash}\nActual: {streamed_hash}"
-            )
+        assert streamed_hash == expected_hash, (
+            f"[{size_name}] Streamed data corrupted!\nExpected: {expected_hash}\nActual: {streamed_hash}"
+        )

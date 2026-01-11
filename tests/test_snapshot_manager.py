@@ -12,10 +12,6 @@ import pytest
 from exec_sandbox.models import Language
 from exec_sandbox.settings import Settings
 
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
-
 # ============================================================================
 # Unit Tests - Cache Key Computation
 # ============================================================================
@@ -113,7 +109,7 @@ class TestSettings:
 class TestSnapshotManagerIntegration:
     """Integration tests for SnapshotManager with real QEMU VMs."""
 
-    async def test_l1_cache_miss(self, tmp_path: Path) -> None:
+    async def test_l1_cache_miss(self, images_dir: Path, tmp_path: Path) -> None:
         """L1 cache miss returns None for non-existent snapshot."""
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
@@ -132,7 +128,7 @@ class TestSnapshotManagerIntegration:
         result = await snapshot_manager._check_l1_cache("nonexistent-abc123")
         assert result is None
 
-    async def test_compute_cache_key(self, tmp_path: Path) -> None:
+    async def test_compute_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Test actual _compute_cache_key method."""
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
@@ -156,7 +152,7 @@ class TestSnapshotManagerIntegration:
         # Full SHA256 hash (64 chars)
         assert len(key.split("-")[1]) == 64
 
-    async def test_create_snapshot(self, tmp_path: Path) -> None:
+    async def test_create_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
         """Create snapshot with packages (slow, requires VM)."""
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
@@ -201,7 +197,7 @@ class TestSnapshotManagerIntegration:
 class TestL1Cache:
     """Tests for L1 (local disk) cache operations."""
 
-    async def test_l1_cache_hit_returns_path(self, tmp_path: Path) -> None:
+    async def test_l1_cache_hit_returns_path(self, images_dir: Path, tmp_path: Path) -> None:
         """L1 cache returns path when valid qcow2 snapshot exists."""
         import asyncio
 
@@ -239,7 +235,7 @@ class TestL1Cache:
         result = await snapshot_manager._check_l1_cache(cache_key)
         assert result == snapshot_path
 
-    async def test_l1_cache_nonexistent_returns_none(self, tmp_path: Path) -> None:
+    async def test_l1_cache_nonexistent_returns_none(self, images_dir: Path, tmp_path: Path) -> None:
         """L1 cache returns None for non-existent snapshot."""
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
@@ -258,7 +254,7 @@ class TestL1Cache:
         result = await snapshot_manager._check_l1_cache("nonexistent-key")
         assert result is None
 
-    async def test_l1_evict_oldest_snapshot(self, tmp_path: Path) -> None:
+    async def test_l1_evict_oldest_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
         """_evict_oldest_snapshot removes oldest file by atime."""
         import asyncio
         import time
@@ -576,7 +572,7 @@ class TestCacheHierarchy:
     Uses moto server for real S3 client and mocks _create_snapshot to avoid QEMU.
     """
 
-    async def test_l1_hit_returns_immediately_no_s3(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_l1_hit_returns_immediately_no_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
         """L1 cache hit returns path immediately without touching S3.
 
         Flow: L1 HIT → return (no S3 call, no creation)
@@ -606,7 +602,12 @@ class TestCacheHierarchy:
 
         # Create actual qcow2 using qemu-img
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", str(snapshot_path), "1M",
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            str(snapshot_path),
+            "1M",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -632,15 +633,16 @@ class TestCacheHierarchy:
         # Verify creation was NOT called (L1 hit skips creation)
         mock_create.assert_not_called()
 
-    async def test_l1_miss_l3_hit_downloads_from_s3(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_l1_miss_l3_hit_downloads_from_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
         """L1 miss with L3 hit downloads from S3 and returns path.
 
         Flow: L1 MISS → L3 HIT → download → return (no creation)
         """
+        from unittest.mock import AsyncMock, patch
+
         import boto3
         import zstandard as zstd
         from moto.server import ThreadedMotoServer
-        from unittest.mock import AsyncMock, patch
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -711,15 +713,16 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_l1_miss_l3_miss_creates_snapshot(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_l1_miss_l3_miss_creates_snapshot(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
         """L1 miss and L3 miss triggers snapshot creation.
 
         Flow: L1 MISS → L3 MISS → create → return (and upload to S3)
         """
         import asyncio
+        from unittest.mock import patch
+
         import boto3
         from moto.server import ThreadedMotoServer
-        from unittest.mock import AsyncMock, patch
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -763,7 +766,12 @@ class TestCacheHierarchy:
             async def fake_create_snapshot(language, packages, key, tenant_id, task_id):
                 # Simulate creating a qcow2 file
                 proc = await asyncio.create_subprocess_exec(
-                    "qemu-img", "create", "-f", "qcow2", str(expected_path), "1M",
+                    "qemu-img",
+                    "create",
+                    "-f",
+                    "qcow2",
+                    str(expected_path),
+                    "1M",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -796,16 +804,17 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_l1_populated_after_l3_download(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_l1_populated_after_l3_download(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
         """After L3 download, L1 cache is populated for next call.
 
         Flow: L1 MISS → L3 HIT → download → L1 populated
         Then: L1 HIT → return immediately
         """
+        from unittest.mock import AsyncMock, patch
+
         import boto3
         import zstandard as zstd
         from moto.server import ThreadedMotoServer
-        from unittest.mock import AsyncMock, patch
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -897,7 +906,7 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_same_packages_same_cache_key(self, tmp_path: Path) -> None:
+    async def test_same_packages_same_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Same packages (regardless of order) produce same cache key and path.
 
         Verifies deterministic cache key computation.
@@ -930,7 +939,12 @@ class TestCacheHierarchy:
         # Pre-populate L1 with snapshot for these packages
         snapshot_path = settings.snapshot_cache_dir / f"{key1}.qcow2"
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", str(snapshot_path), "1M",
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            str(snapshot_path),
+            "1M",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -954,7 +968,7 @@ class TestCacheHierarchy:
         assert result1 == result2 == snapshot_path
         mock_create.assert_not_called()  # Both hit L1 cache
 
-    async def test_different_packages_different_cache_key(self, tmp_path: Path) -> None:
+    async def test_different_packages_different_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Different packages produce different cache keys.
 
         Verifies cache isolation between different package sets.
@@ -982,7 +996,7 @@ class TestCacheHierarchy:
         assert key1 != key3
         assert key2 != key3
 
-    async def test_different_languages_different_cache_key(self, tmp_path: Path) -> None:
+    async def test_different_languages_different_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Same packages with different languages produce different cache keys.
 
         Verifies cache isolation between languages.
@@ -1007,13 +1021,13 @@ class TestCacheHierarchy:
 
         assert key_python != key_node
 
-    async def test_l3_disabled_skips_s3_entirely(self, tmp_path: Path) -> None:
+    async def test_l3_disabled_skips_s3_entirely(self, images_dir: Path, tmp_path: Path) -> None:
         """When S3 is not configured, L3 is skipped entirely.
 
         Flow: L1 MISS → (skip L3) → create
         """
         import asyncio
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -1036,7 +1050,12 @@ class TestCacheHierarchy:
         # Mock creation
         async def fake_create_snapshot(language, packages, key, tenant_id, task_id):
             proc = await asyncio.create_subprocess_exec(
-                "qemu-img", "create", "-f", "qcow2", str(expected_path), "1M",
+                "qemu-img",
+                "create",
+                "-f",
+                "qcow2",
+                str(expected_path),
+                "1M",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1056,7 +1075,7 @@ class TestCacheHierarchy:
         assert result == expected_path
         assert result.exists()
 
-    async def test_creation_failure_propagates_error(self, tmp_path: Path) -> None:
+    async def test_creation_failure_propagates_error(self, images_dir: Path, tmp_path: Path) -> None:
         """When snapshot creation fails, error is propagated.
 
         Verifies error handling in the cache hierarchy.

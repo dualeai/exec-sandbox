@@ -4,17 +4,10 @@ Verifies each image has the expected tools installed and working.
 Uses a parameterized matrix for easy maintenance.
 """
 
-from pathlib import Path
-
 import pytest
 
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
 
 # =============================================================================
 # Tool availability tests using Language.RAW (shell commands)
@@ -36,23 +29,20 @@ RAW_IMAGE_TOOLS = [
 
 
 @pytest.mark.parametrize("tool,command", RAW_IMAGE_TOOLS, ids=[t[0] for t in RAW_IMAGE_TOOLS])
-async def test_raw_tool_available(tool: str, command: str) -> None:
+async def test_raw_tool_available(scheduler: Scheduler, tool: str, command: str) -> None:
     """Tool is installed in RAW image and returns exit code 0."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code=command,
+        language=Language.RAW,
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=command,
-            language=Language.RAW,
-        )
-
-        assert result.exit_code == 0, (
-            f"Tool '{tool}' failed in raw image.\n"
-            f"Command: {command}\n"
-            f"Exit code: {result.exit_code}\n"
-            f"Stdout: {result.stdout}\n"
-            f"Stderr: {result.stderr}"
-        )
+    assert result.exit_code == 0, (
+        f"Tool '{tool}' failed in raw image.\n"
+        f"Command: {command}\n"
+        f"Exit code: {result.exit_code}\n"
+        f"Stdout: {result.stdout}\n"
+        f"Stderr: {result.stderr}"
+    )
 
 
 # Python image tool tests - use Python subprocess to verify tools
@@ -78,23 +68,20 @@ PYTHON_IMAGE_TOOLS = [
 
 
 @pytest.mark.parametrize("tool,code", PYTHON_IMAGE_TOOLS, ids=[t[0] for t in PYTHON_IMAGE_TOOLS])
-async def test_python_tool_available(tool: str, code: str) -> None:
+async def test_python_tool_available(scheduler: Scheduler, tool: str, code: str) -> None:
     """Tool is installed in Python image."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, (
-            f"Tool '{tool}' failed in python image.\n"
-            f"Code: {code}\n"
-            f"Exit code: {result.exit_code}\n"
-            f"Stdout: {result.stdout}\n"
-            f"Stderr: {result.stderr}"
-        )
+    assert result.exit_code == 0, (
+        f"Tool '{tool}' failed in python image.\n"
+        f"Code: {code}\n"
+        f"Exit code: {result.exit_code}\n"
+        f"Stdout: {result.stdout}\n"
+        f"Stderr: {result.stderr}"
+    )
 
 
 # JavaScript image tool tests - use Bun to verify tools
@@ -106,23 +93,20 @@ JAVASCRIPT_IMAGE_TOOLS = [
 
 
 @pytest.mark.parametrize("tool,code", JAVASCRIPT_IMAGE_TOOLS, ids=[t[0] for t in JAVASCRIPT_IMAGE_TOOLS])
-async def test_javascript_tool_available(tool: str, code: str) -> None:
+async def test_javascript_tool_available(scheduler: Scheduler, tool: str, code: str) -> None:
     """Tool is installed in JavaScript image."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code=code,
+        language=Language.JAVASCRIPT,
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
-
-        assert result.exit_code == 0, (
-            f"Tool '{tool}' failed in javascript image.\n"
-            f"Code: {code}\n"
-            f"Exit code: {result.exit_code}\n"
-            f"Stdout: {result.stdout}\n"
-            f"Stderr: {result.stderr}"
-        )
+    assert result.exit_code == 0, (
+        f"Tool '{tool}' failed in javascript image.\n"
+        f"Code: {code}\n"
+        f"Exit code: {result.exit_code}\n"
+        f"Stdout: {result.stdout}\n"
+        f"Stderr: {result.stderr}"
+    )
 
 
 # =============================================================================
@@ -137,22 +121,17 @@ RAW_FUNCTIONAL_TESTS = [
 
 
 @pytest.mark.parametrize("name,command,expected", RAW_FUNCTIONAL_TESTS, ids=[t[0] for t in RAW_FUNCTIONAL_TESTS])
-async def test_raw_functional(name: str, command: str, expected: str) -> None:
+async def test_raw_functional(scheduler: Scheduler, name: str, command: str, expected: str) -> None:
     """Shell command works correctly in RAW image."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code=command,
+        language=Language.RAW,
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=command,
-            language=Language.RAW,
-        )
-
-        assert result.exit_code == 0, (
-            f"Command failed: {name}\nCommand: {command}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
-        )
-        assert expected in result.stdout, (
-            f"Expected '{expected}' in output.\nCommand: {command}\nStdout: {result.stdout}"
-        )
+    assert result.exit_code == 0, (
+        f"Command failed: {name}\nCommand: {command}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
+    )
+    assert expected in result.stdout, f"Expected '{expected}' in output.\nCommand: {command}\nStdout: {result.stdout}"
 
 
 # Python functional tests (native Python code)
@@ -163,20 +142,17 @@ PYTHON_FUNCTIONAL_TESTS = [
 
 
 @pytest.mark.parametrize("name,code,expected", PYTHON_FUNCTIONAL_TESTS, ids=[t[0] for t in PYTHON_FUNCTIONAL_TESTS])
-async def test_python_functional(name: str, code: str, expected: str) -> None:
+async def test_python_functional(scheduler: Scheduler, name: str, code: str, expected: str) -> None:
     """Python code works correctly in Python image."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code=code,
+        language=Language.PYTHON,
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
-
-        assert result.exit_code == 0, (
-            f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
-        )
-        assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
+    assert result.exit_code == 0, (
+        f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
+    )
+    assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
 
 
 # JavaScript functional tests (native Bun/JS code)
@@ -189,17 +165,14 @@ JAVASCRIPT_FUNCTIONAL_TESTS = [
 @pytest.mark.parametrize(
     "name,code,expected", JAVASCRIPT_FUNCTIONAL_TESTS, ids=[t[0] for t in JAVASCRIPT_FUNCTIONAL_TESTS]
 )
-async def test_javascript_functional(name: str, code: str, expected: str) -> None:
+async def test_javascript_functional(scheduler: Scheduler, name: str, code: str, expected: str) -> None:
     """JavaScript code works correctly in JavaScript image."""
-    config = SchedulerConfig(images_dir=images_dir)
+    result = await scheduler.run(
+        code=code,
+        language=Language.JAVASCRIPT,
+    )
 
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
-
-        assert result.exit_code == 0, (
-            f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
-        )
-        assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"
+    assert result.exit_code == 0, (
+        f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
+    )
+    assert expected in result.stdout, f"Expected '{expected}' in output.\nCode: {code}\nStdout: {result.stdout}"

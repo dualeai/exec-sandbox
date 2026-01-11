@@ -13,10 +13,6 @@ from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 from exec_sandbox.vm_manager import VALID_STATE_TRANSITIONS, VmState, _check_kvm_available
 
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
-
 # ============================================================================
 # Unit Tests - VM State Machine
 # ============================================================================
@@ -150,7 +146,7 @@ IMAGE_TEST_CASES = [
 class TestVmManagerIntegration:
     """Integration tests for VmManager with real QEMU VMs."""
 
-    async def test_vm_manager_init(self) -> None:
+    async def test_vm_manager_init(self, images_dir: Path) -> None:
         """VmManager initializes correctly."""
         from exec_sandbox.settings import Settings
         from exec_sandbox.vm_manager import VmManager
@@ -164,7 +160,7 @@ class TestVmManagerIntegration:
 
         assert vm_manager.settings == settings
 
-    async def test_create_and_destroy_vm(self) -> None:
+    async def test_create_and_destroy_vm(self, images_dir: Path) -> None:
         """Create and destroy a VM."""
         from exec_sandbox.settings import Settings
         from exec_sandbox.vm_manager import VmManager
@@ -193,7 +189,7 @@ class TestVmManagerIntegration:
             await vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
 
-    async def test_vm_execute_code(self) -> None:
+    async def test_vm_execute_code(self, images_dir: Path) -> None:
         """Execute code in a VM."""
         from exec_sandbox.settings import Settings
         from exec_sandbox.vm_manager import VmManager
@@ -230,7 +226,7 @@ class TestVmManagerIntegration:
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def test_multiple_vms(self) -> None:
+    async def test_multiple_vms(self, images_dir: Path) -> None:
         """Create multiple VMs concurrently."""
         import asyncio
 
@@ -281,6 +277,7 @@ class TestAllImageTypes:
     @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
     async def test_vm_health_check_all_images(
         self,
+        images_dir: Path,
         language: Language,
         code: str,
         expected_output: str,
@@ -321,6 +318,7 @@ class TestAllImageTypes:
     @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
     async def test_vm_execute_code_all_images(
         self,
+        images_dir: Path,
         language: Language,
         code: str,
         expected_output: str,

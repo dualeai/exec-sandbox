@@ -15,14 +15,8 @@ continues running. To create an orphan, we need a double-fork pattern:
 Integration tests require QEMU + images (run 'make build-images').
 """
 
-from pathlib import Path
-
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
 
 
 class TestPid1ZombieReaping:
@@ -32,14 +26,12 @@ class TestPid1ZombieReaping:
     to prevent zombie accumulation in the VM.
     """
 
-    async def test_orphan_reparented_to_pid1(self) -> None:
+    async def test_orphan_reparented_to_pid1(self, scheduler: Scheduler) -> None:
         """Verify orphan processes are actually reparented to PID 1.
 
         This test confirms our double-fork pattern creates real orphans.
         Without this verification, we can't be sure we're testing PID 1 reaping.
         """
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import time
@@ -69,21 +61,18 @@ with open('/tmp/orphan_ppid.txt') as f:
 print(f'ORPHAN_PPID:{orphan_ppid}')
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=30,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=30,
+        )
 
-            assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-            # Orphan should be reparented to PID 1 (guest-agent)
-            assert "ORPHAN_PPID:1" in result.stdout, f"Orphan not reparented to PID 1, got: {result.stdout}"
+        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
+        # Orphan should be reparented to PID 1 (guest-agent)
+        assert "ORPHAN_PPID:1" in result.stdout, f"Orphan not reparented to PID 1, got: {result.stdout}"
 
-    async def test_single_orphan_reaped(self) -> None:
+    async def test_single_orphan_reaped(self, scheduler: Scheduler) -> None:
         """Single orphan process is reaped and doesn't become a zombie."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         # Double-fork to create orphan: A forks B, A exits, B is orphan
         code = """
 import os
@@ -129,20 +118,17 @@ for entry in os.listdir('/proc'):
 print(f'ZOMBIE_COUNT:{zombie_count}')
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=30,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=30,
+        )
 
-            assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-            assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies, got: {result.stdout}"
+        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
+        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies, got: {result.stdout}"
 
-    async def test_multiple_orphans_reaped(self) -> None:
+    async def test_multiple_orphans_reaped(self, scheduler: Scheduler) -> None:
         """Multiple orphan processes are all reaped."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import time
@@ -192,20 +178,17 @@ print(f'ZOMBIE_COUNT:{zombie_count}')
 print('ORPHANS_CREATED:10')
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=30,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=30,
+        )
 
-            assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-            assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after 10 orphans, got: {result.stdout}"
+        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
+        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after 10 orphans, got: {result.stdout}"
 
-    async def test_rapid_orphan_spawning(self) -> None:
+    async def test_rapid_orphan_spawning(self, scheduler: Scheduler) -> None:
         """Rapid spawning of orphans doesn't overwhelm the reaper."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 import time
@@ -250,24 +233,21 @@ print(f'ZOMBIE_COUNT:{zombie_count}')
 print('RAPID_SPAWNS:50')
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=60,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=60,
+        )
 
-            assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-            assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after rapid spawning, got: {result.stdout}"
+        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
+        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after rapid spawning, got: {result.stdout}"
 
 
 class TestZombieReapingShell:
     """Shell-based tests for zombie reaping."""
 
-    async def test_shell_orphan_reaped(self) -> None:
+    async def test_shell_orphan_reaped(self, scheduler: Scheduler) -> None:
         """Shell-created orphan processes are reaped by PID 1."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         # Shell script that creates actual orphans via double-fork pattern
         # Simple background jobs (&) are NOT orphans - they're children of the shell
         code = """
@@ -300,12 +280,11 @@ done
 echo "ZOMBIE_COUNT:$zombie_count"
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.RAW,
-                timeout_seconds=30,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.RAW,
+            timeout_seconds=30,
+        )
 
-            assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-            assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies from shell orphans, got: {result.stdout}"
+        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
+        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies from shell orphans, got: {result.stdout}"

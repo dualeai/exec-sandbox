@@ -13,10 +13,6 @@ from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
-
 # ============================================================================
 # Unit Tests - No QEMU needed
 # ============================================================================
@@ -62,10 +58,10 @@ class TestSchedulerContextManager:
 
     async def test_double_start_raises(self, tmp_path: Path) -> None:
         """Starting already-started scheduler raises SandboxError."""
-        images_dir = tmp_path / "images"
-        images_dir.mkdir()
+        test_images_dir = tmp_path / "images"
+        test_images_dir.mkdir()
 
-        config = SchedulerConfig(images_dir=images_dir)
+        config = SchedulerConfig(images_dir=test_images_dir)
         scheduler = Scheduler(config)
 
         # Manually set _started to simulate already started
@@ -147,20 +143,20 @@ class TestSchedulerSnapshotInit:
 
     async def test_snapshot_manager_initialized_without_s3(self, tmp_path: Path) -> None:
         """SnapshotManager is created even without S3 config (L1 cache works)."""
-        images_dir = tmp_path / "images"
-        images_dir.mkdir()
+        test_images_dir = tmp_path / "images"
+        test_images_dir.mkdir()
 
-        config = SchedulerConfig(images_dir=images_dir, s3_bucket=None)
+        config = SchedulerConfig(images_dir=test_images_dir, s3_bucket=None)
         async with Scheduler(config) as scheduler:
             assert scheduler._snapshot_manager is not None
 
     async def test_snapshot_manager_initialized_with_s3(self, tmp_path: Path) -> None:
         """SnapshotManager is created with S3 config."""
-        images_dir = tmp_path / "images"
-        images_dir.mkdir()
+        test_images_dir = tmp_path / "images"
+        test_images_dir.mkdir()
 
         config = SchedulerConfig(
-            images_dir=images_dir,
+            images_dir=test_images_dir,
             s3_bucket="test-bucket",
             s3_region="us-east-1",
         )
@@ -169,10 +165,10 @@ class TestSchedulerSnapshotInit:
 
     async def test_snapshot_manager_has_vm_manager(self, tmp_path: Path) -> None:
         """SnapshotManager receives vm_manager reference."""
-        images_dir = tmp_path / "images"
-        images_dir.mkdir()
+        test_images_dir = tmp_path / "images"
+        test_images_dir.mkdir()
 
-        config = SchedulerConfig(images_dir=images_dir)
+        config = SchedulerConfig(images_dir=test_images_dir)
         async with Scheduler(config) as scheduler:
             assert scheduler._snapshot_manager is not None
             assert scheduler._snapshot_manager.vm_manager is scheduler._vm_manager
@@ -191,11 +187,9 @@ class TestSchedulerIntegration:
     - VM images built (run 'make build-images')
     """
 
-    async def test_scheduler_lifecycle(self) -> None:
+    async def test_scheduler_lifecycle(self, scheduler_config: SchedulerConfig) -> None:
         """Scheduler starts and stops cleanly."""
-        config = SchedulerConfig(images_dir=images_dir)
-
-        async with Scheduler(config) as scheduler:
+        async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._started is True
             assert scheduler._vm_manager is not None
             assert scheduler._semaphore is not None
@@ -203,101 +197,81 @@ class TestSchedulerIntegration:
         # After exit
         assert scheduler._started is False
 
-    async def test_run_simple_python(self) -> None:
+    async def test_run_simple_python(self, scheduler: Scheduler) -> None:
         """Run simple Python code."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code="print('hello from python')",
+            language=Language.PYTHON,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code="print('hello from python')",
-                language=Language.PYTHON,
-            )
+        assert result.exit_code == 0
+        assert "hello from python" in result.stdout
 
-            assert result.exit_code == 0
-            assert "hello from python" in result.stdout
-
-    async def test_run_python_calculation(self) -> None:
+    async def test_run_python_calculation(self, scheduler: Scheduler) -> None:
         """Run Python code with calculation."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code="print(2 + 2)",
+            language=Language.PYTHON,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code="print(2 + 2)",
-                language=Language.PYTHON,
-            )
+        assert result.exit_code == 0
+        assert "4" in result.stdout
 
-            assert result.exit_code == 0
-            assert "4" in result.stdout
-
-    async def test_run_python_multiline(self) -> None:
+    async def test_run_python_multiline(self, scheduler: Scheduler) -> None:
         """Run multiline Python code."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 for i in range(3):
     print(f"line {i}")
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "line 0" in result.stdout
-            assert "line 1" in result.stdout
-            assert "line 2" in result.stdout
+        assert result.exit_code == 0
+        assert "line 0" in result.stdout
+        assert "line 1" in result.stdout
+        assert "line 2" in result.stdout
 
-    async def test_run_python_exit_code(self) -> None:
+    async def test_run_python_exit_code(self, scheduler: Scheduler) -> None:
         """Python code with non-zero exit."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code="import sys; sys.exit(42)",
+            language=Language.PYTHON,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code="import sys; sys.exit(42)",
-                language=Language.PYTHON,
-            )
+        assert result.exit_code == 42
 
-            assert result.exit_code == 42
-
-    async def test_run_python_stderr(self) -> None:
+    async def test_run_python_stderr(self, scheduler: Scheduler) -> None:
         """Python code that writes to stderr."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import sys
 print("stdout message")
 print("stderr message", file=sys.stderr)
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await scheduler.run(code=code, language=Language.PYTHON)
 
-            assert result.exit_code == 0
-            assert "stdout message" in result.stdout
-            assert "stderr message" in result.stderr
+        assert result.exit_code == 0
+        assert "stdout message" in result.stdout
+        assert "stderr message" in result.stderr
 
-    async def test_run_with_env_vars(self) -> None:
+    async def test_run_with_env_vars(self, scheduler: Scheduler) -> None:
         """Run with custom environment variables."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         code = """
 import os
 print(os.environ.get('MY_VAR', 'not set'))
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                env_vars={"MY_VAR": "hello"},
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            env_vars={"MY_VAR": "hello"},
+        )
 
-            assert result.exit_code == 0
-            assert "hello" in result.stdout
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
 
-    async def test_run_with_streaming(self) -> None:
+    async def test_run_with_streaming(self, scheduler: Scheduler) -> None:
         """Run with streaming output callbacks."""
-        config = SchedulerConfig(images_dir=images_dir)
-
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
@@ -308,19 +282,18 @@ print("err1", file=sys.stderr)
 print("out2")
 """
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                on_stdout=stdout_chunks.append,
-                on_stderr=stderr_chunks.append,
-            )
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            on_stdout=stdout_chunks.append,
+            on_stderr=stderr_chunks.append,
+        )
 
-            assert result.exit_code == 0
-            # Chunks should have been received
-            assert len(stdout_chunks) > 0 or "out1" in result.stdout
+        assert result.exit_code == 0
+        # Chunks should have been received
+        assert len(stdout_chunks) > 0 or "out1" in result.stdout
 
-    async def test_run_timeout(self) -> None:
+    async def test_run_timeout(self, scheduler_config: SchedulerConfig) -> None:
         """Execution timeout works.
 
         Timeout can be enforced at two levels:
@@ -330,7 +303,7 @@ print("out2")
         The test accepts either behavior - both indicate the timeout worked.
         """
         config = SchedulerConfig(
-            images_dir=images_dir,
+            images_dir=scheduler_config.images_dir,
             default_timeout_seconds=2,
         )
 
@@ -357,69 +330,57 @@ time.sleep(30)
                 # Host timeout kicked in - also valid
                 pass
 
-    async def test_run_multiple_sequential(self) -> None:
+    async def test_run_multiple_sequential(self, scheduler: Scheduler) -> None:
         """Multiple sequential runs work (VMs not reused)."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result1 = await scheduler.run(
+            code="print('first')",
+            language=Language.PYTHON,
+        )
+        result2 = await scheduler.run(
+            code="print('second')",
+            language=Language.PYTHON,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result1 = await scheduler.run(
-                code="print('first')",
-                language=Language.PYTHON,
-            )
-            result2 = await scheduler.run(
-                code="print('second')",
-                language=Language.PYTHON,
-            )
+        assert result1.exit_code == 0
+        assert "first" in result1.stdout
+        assert result2.exit_code == 0
+        assert "second" in result2.stdout
 
-            assert result1.exit_code == 0
-            assert "first" in result1.stdout
-            assert result2.exit_code == 0
-            assert "second" in result2.stdout
-
-    async def test_execution_result_metrics(self) -> None:
+    async def test_execution_result_metrics(self, scheduler: Scheduler) -> None:
         """ExecutionResult contains timing metrics."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code="print('hello')",
-                language=Language.PYTHON,
-            )
-
-            assert result.exit_code == 0
-            # Metrics should be populated
-            if result.execution_time_ms is not None:
-                assert result.execution_time_ms >= 0
+        assert result.exit_code == 0
+        # Metrics should be populated
+        if result.execution_time_ms is not None:
+            assert result.execution_time_ms >= 0
 
 
 class TestSchedulerJavaScript:
     """JavaScript execution tests."""
 
-    async def test_run_simple_javascript(self) -> None:
+    async def test_run_simple_javascript(self, scheduler: Scheduler) -> None:
         """Run simple JavaScript code."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code="console.log('hello from javascript')",
+            language=Language.JAVASCRIPT,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code="console.log('hello from javascript')",
-                language=Language.JAVASCRIPT,
-            )
+        assert result.exit_code == 0
+        assert "hello from javascript" in result.stdout
 
-            assert result.exit_code == 0
-            assert "hello from javascript" in result.stdout
-
-    async def test_run_javascript_calculation(self) -> None:
+    async def test_run_javascript_calculation(self, scheduler: Scheduler) -> None:
         """Run JavaScript with calculation."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code="console.log(2 + 2)",
+            language=Language.JAVASCRIPT,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code="console.log(2 + 2)",
-                language=Language.JAVASCRIPT,
-            )
-
-            assert result.exit_code == 0
-            assert "4" in result.stdout
+        assert result.exit_code == 0
+        assert "4" in result.stdout
 
 
 # ============================================================================
@@ -461,18 +422,16 @@ class TestSchedulerAllImages:
     @pytest.mark.parametrize("language,code,expected_output", SCHEDULER_IMAGE_TEST_CASES)
     async def test_scheduler_execute_all_images(
         self,
+        scheduler: Scheduler,
         language: Language,
         code: str,
         expected_output: str,
     ) -> None:
         """Scheduler executes code for all image types."""
-        config = SchedulerConfig(images_dir=images_dir)
+        result = await scheduler.run(
+            code=code,
+            language=language,
+        )
 
-        async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=language,
-            )
-
-            assert result.exit_code == 0, f"Exit code {result.exit_code}, stderr: {result.stderr}"
-            assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
+        assert result.exit_code == 0, f"Exit code {result.exit_code}, stderr: {result.stderr}"
+        assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"

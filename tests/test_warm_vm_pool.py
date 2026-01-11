@@ -9,10 +9,6 @@ from pathlib import Path
 from exec_sandbox import constants
 from exec_sandbox.models import Language
 
-# Images directory - relative to repo root
-images_dir = Path(__file__).parent.parent / "images" / "dist"
-
-
 # ============================================================================
 # Unit Tests - No QEMU needed
 # ============================================================================
@@ -66,7 +62,7 @@ class TestLanguageEnum:
 class TestWarmVMPoolIntegration:
     """Integration tests for WarmVMPool with real QEMU VMs."""
 
-    async def test_pool_startup_shutdown(self) -> None:
+    async def test_pool_startup_shutdown(self, images_dir: Path) -> None:
         """Pool starts and shuts down cleanly."""
         from exec_sandbox.settings import Settings
         from exec_sandbox.vm_manager import VmManager
@@ -93,7 +89,7 @@ class TestWarmVMPoolIntegration:
         assert pool.pools[Language.PYTHON].qsize() == 0
         assert pool.pools[Language.JAVASCRIPT].qsize() == 0
 
-    async def test_get_vm_from_pool(self) -> None:
+    async def test_get_vm_from_pool(self, images_dir: Path) -> None:
         """Get VM from warm pool."""
         from exec_sandbox.settings import Settings
         from exec_sandbox.vm_manager import VmManager
@@ -124,7 +120,7 @@ class TestWarmVMPoolIntegration:
         finally:
             await pool.shutdown()
 
-    async def test_get_vm_with_packages_returns_none(self) -> None:
+    async def test_get_vm_with_packages_returns_none(self, images_dir: Path) -> None:
         """Get VM with packages returns None (not eligible for warm pool)."""
         from exec_sandbox.settings import Settings
         from exec_sandbox.vm_manager import VmManager

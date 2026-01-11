@@ -2,10 +2,47 @@
 
 import os
 import uuid
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
+from exec_sandbox.config import SchedulerConfig
+from exec_sandbox.scheduler import Scheduler
+
+# ============================================================================
+# Common Paths and Config Fixtures
+# ============================================================================
+
+
+@pytest.fixture
+def images_dir() -> Path:
+    """Path to built VM images directory."""
+    return Path(__file__).parent.parent / "images" / "dist"
+
+
+@pytest.fixture
+def scheduler_config(images_dir: Path) -> SchedulerConfig:
+    """SchedulerConfig with default test settings."""
+    return SchedulerConfig(images_dir=images_dir)
+
+
+@pytest.fixture
+async def scheduler(scheduler_config: SchedulerConfig) -> AsyncGenerator[Scheduler, None]:
+    """Scheduler instance for integration tests.
+
+    Usage:
+        async def test_something(scheduler: Scheduler) -> None:
+            result = await scheduler.run(code="print(1)", language=Language.PYTHON)
+    """
+    async with Scheduler(scheduler_config) as sched:
+        yield sched
+
+
+# ============================================================================
+# Test Utilities
+# ============================================================================
 
 
 async def async_iter(items):
