@@ -1731,16 +1731,13 @@ class VmManager:
             "-initrd",
             str(initramfs_path),
             "-append",
-            "console=ttyAMA0 loglevel=7 root=/dev/vda rootflags=rw rootfstype=ext4 rootwait fsck.mode=skip reboot=t preempt=none init=/init",
+            # Optimized boot params: quiet console, no logging, skip PS/2 probing
+            "console=hvc0 loglevel=0 quiet root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t preempt=none nomodules i8042.noaux i8042.nomux i8042.nopnp init=/init",
         ]
 
-        # Platform-specific: macOS HVF doesn't support -mem-prealloc
+        # Platform-specific memory configuration
+        # Note: -mem-prealloc removed for faster boot (demand-paging is fine for ephemeral VMs)
         host_os = detect_host_os()
-        match host_os:
-            case HostOS.LINUX:
-                qemu_args.append("-mem-prealloc")
-            case HostOS.MACOS | HostOS.UNKNOWN:
-                pass
 
         # Layer 3: Seccomp sandbox - Linux only
         if detect_host_os() != HostOS.MACOS:
@@ -1826,7 +1823,8 @@ class VmManager:
                 "-chardev",
                 f"socket,id=event0,path={event_socket_path},server=on,wait=off",
                 "-device",
-                "virtio-serial-device,max_ports=31",
+                # Reduced from 31 to 4: only using 2 ports (cmd+event), saves ~4KB/port + virtqueue init time
+                "virtio-serial-device,max_ports=4",
                 "-device",
                 "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
                 "-device",
@@ -1930,7 +1928,8 @@ class VmManager:
                     retry=retry_if_exception_type(
                         (TimeoutError, OSError, json.JSONDecodeError, RuntimeError, asyncio.IncompleteReadError)
                     ),
-                    wait=wait_random_exponential(multiplier=1, min=0.1, max=2.0),
+                    # Reduced min from 0.1s to 0.01s for faster guest detection (agent ready in ~200-300ms)
+                    wait=wait_random_exponential(multiplier=0.05, min=0.01, max=1.0),
                     before_sleep=before_sleep_log(logger, logging.DEBUG),
                 ):
                     with attempt:

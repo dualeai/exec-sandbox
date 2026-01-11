@@ -11,7 +11,7 @@
 //! - /dev/virtio-ports/org.dualeai.cmd (host → guest, read-only)
 //! - /dev/virtio-ports/org.dualeai.event (guest → host, write-only)
 
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,82 +50,82 @@ const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300; // 5 min timeout for package i
 const FLUSH_INTERVAL_MS: u64 = 50; // 50ms flush interval (not 1s - too slow for real-time)
 const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB max buffer before forced flush
 
-lazy_static! {
-    /// Regex for validating package names with version specifiers (required).
-    ///
-    /// Pattern: Package name + version operator (required) + version spec
-    /// - Package name: [a-zA-Z0-9_\-\.]+
-    /// - Version operator: [@=<>~] (at least one required)
-    /// - Version spec: [a-zA-Z0-9_\-\.@/=<>~\^\*\[\], ]*
-    ///
-    /// Supports:
-    /// - npm: lodash@4.17.21, lodash@~4.17, lodash@^4.0.0
-    /// - Python: pandas==2.0.0, pandas~=2.0, pandas>=2.0,<3.0
-    ///
-    /// Rejects packages without version: "pandas", "lodash"
-    static ref PACKAGE_NAME_REGEX: Regex = Regex::new(r"^[a-zA-Z0-9_\-\.]+[@=<>~][a-zA-Z0-9_\-\.@/=<>~\^\*\[\], ]*$").unwrap();
+/// Regex for validating package names with version specifiers (required).
+///
+/// Pattern: Package name + version operator (required) + version spec
+/// - Package name: [a-zA-Z0-9_\-\.]+
+/// - Version operator: [@=<>~] (at least one required)
+/// - Version spec: [a-zA-Z0-9_\-\.@/=<>~\^\*\[\], ]*
+///
+/// Supports:
+/// - npm: lodash@4.17.21, lodash@~4.17, lodash@^4.0.0
+/// - Python: pandas==2.0.0, pandas~=2.0, pandas>=2.0,<3.0
+///
+/// Rejects packages without version: "pandas", "lodash"
+static PACKAGE_NAME_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^[a-zA-Z0-9_\-\.]+[@=<>~][a-zA-Z0-9_\-\.@/=<>~\^\*\[\], ]*$").unwrap()
+});
 
-    /// Blacklist of dangerous environment variables.
-    ///
-    /// Security rationale:
-    /// - LD_PRELOAD/LD_LIBRARY_PATH/LD_AUDIT: Arbitrary code execution via library injection
-    /// - BASH_ENV/ENV: Execute arbitrary file on shell startup
-    /// - PATH: Executable search path manipulation (could bypass sandboxing)
-    /// - GCONV_PATH: glibc converter modules (code injection)
-    /// - HOSTALIASES: DNS resolution manipulation
-    /// - PROMPT_COMMAND: Execute arbitrary commands in bash
-    /// - MALLOC_*: Memory allocator hooks (potential exploitation)
-    /// - NODE_OPTIONS: Node.js runtime options (can execute arbitrary code)
-    /// - PYTHONWARNINGS/PYTHONSTARTUP: Python module injection
-    /// - GLIBC_TUNABLES: CVE-2023-4911 buffer overflow
-    static ref BLOCKED_ENV_VARS: Vec<&'static str> = vec![
-        // Dynamic linker (arbitrary code execution)
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "LD_AUDIT",
-        "LD_BIND_NOW",
-        "LD_DEBUG",
-        "LD_DEBUG_OUTPUT",
-        "LD_USE_LOAD_BIAS",
-        "LD_PROFILE",
-        "LD_ORIGIN_PATH",
-        "LD_AOUT_LIBRARY_PATH",
-        "LD_AOUT_PRELOAD",
+/// Blacklist of dangerous environment variables.
+///
+/// Security rationale:
+/// - LD_PRELOAD/LD_LIBRARY_PATH/LD_AUDIT: Arbitrary code execution via library injection
+/// - BASH_ENV/ENV: Execute arbitrary file on shell startup
+/// - PATH: Executable search path manipulation (could bypass sandboxing)
+/// - GCONV_PATH: glibc converter modules (code injection)
+/// - HOSTALIASES: DNS resolution manipulation
+/// - PROMPT_COMMAND: Execute arbitrary commands in bash
+/// - MALLOC_*: Memory allocator hooks (potential exploitation)
+/// - NODE_OPTIONS: Node.js runtime options (can execute arbitrary code)
+/// - PYTHONWARNINGS/PYTHONSTARTUP: Python module injection
+/// - GLIBC_TUNABLES: CVE-2023-4911 buffer overflow
+static BLOCKED_ENV_VARS: &[&str] = &[
+    // Dynamic linker (arbitrary code execution)
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_BIND_NOW",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_USE_LOAD_BIAS",
+    "LD_PROFILE",
+    "LD_ORIGIN_PATH",
+    "LD_AOUT_LIBRARY_PATH",
+    "LD_AOUT_PRELOAD",
 
-        // glibc tunables - CVE-2023-4911
-        "GLIBC_TUNABLES",
+    // glibc tunables - CVE-2023-4911
+    "GLIBC_TUNABLES",
 
-        // Node.js runtime
-        "NODE_OPTIONS",
-        "NODE_REPL_HISTORY",
+    // Node.js runtime
+    "NODE_OPTIONS",
+    "NODE_REPL_HISTORY",
 
-        // Python runtime
-        "PYTHONWARNINGS",
-        "PYTHONSTARTUP",
-        "PYTHONHOME",
+    // Python runtime
+    "PYTHONWARNINGS",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
 
-        // Shell environment execution
-        "BASH_ENV",
-        "ENV",
-        "PROMPT_COMMAND",
+    // Shell environment execution
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
 
-        // Path manipulation
-        "PATH",
+    // Path manipulation
+    "PATH",
 
-        // glibc/system hooks
-        "GCONV_PATH",
-        "HOSTALIASES",
-        "LOCPATH",
-        "NLSPATH",
-        "RESOLV_HOST_CONF",
-        "RES_OPTIONS",
-        "TMPDIR",
-        "TZDIR",
-        "MALLOC_CHECK_",
-        "MALLOC_TRACE",
-        "MALLOC_PERTURB_",
-    ];
-}
+    // glibc/system hooks
+    "GCONV_PATH",
+    "HOSTALIASES",
+    "LOCPATH",
+    "NLSPATH",
+    "RESOLV_HOST_CONF",
+    "RES_OPTIONS",
+    "TMPDIR",
+    "TZDIR",
+    "MALLOC_CHECK_",
+    "MALLOC_TRACE",
+    "MALLOC_PERTURB_",
+];
 
 
 #[derive(Debug, Deserialize)]
@@ -842,10 +842,11 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 eprintln!(
-                    "Failed to open command port: {}, retrying in 1s...",
+                    "Failed to open command port: {}, retrying in 100ms...",
                     e
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Reduced from 1s to 100ms: virtio ports available shortly after kernel boot
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -862,10 +863,11 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 eprintln!(
-                    "Failed to open event port: {}, retrying in 1s...",
+                    "Failed to open event port: {}, retrying in 100ms...",
                     e
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Reduced from 1s to 100ms: virtio ports available shortly after kernel boot
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };

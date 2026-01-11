@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 regex = "1.10"
-lazy_static = "1.4"
+once_cell = "1.19"  # Replaced lazy_static for faster initialization
 
 [profile.release]
 opt-level = "z"     # Optimize for size

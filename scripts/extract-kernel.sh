@@ -85,7 +85,7 @@ extract_for_arch() {
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Use Alpine container with apk to get both vmlinuz AND initramfs
+    # Extract only kernel from Alpine (we build our own minimal initramfs)
     docker run --rm \
         -v "$OUTPUT_DIR:/output" \
         --platform "$docker_platform" \
@@ -93,16 +93,18 @@ extract_for_arch() {
         sh -c "
             apk add --no-cache linux-virt >/dev/null 2>&1
             cp /boot/vmlinuz-virt /output/vmlinuz-$target_arch
-            cp /boot/initramfs-virt /output/initramfs-$target_arch
-            chmod 644 /output/vmlinuz-$target_arch /output/initramfs-$target_arch
+            chmod 644 /output/vmlinuz-$target_arch
         "
+
+    # Build custom minimal initramfs (2MB vs 9MB Alpine stock)
+    # This includes only essential modules: virtio_blk, ext4 + dependencies
+    "$SCRIPT_DIR/build-initramfs.sh" "$target_arch" "$OUTPUT_DIR"
 
     save_hash "$vmlinuz_file" "$current_hash"
 
     local vmlinuz_size initramfs_size
     vmlinuz_size=$(du -h "$vmlinuz_file" | cut -f1)
     initramfs_size=$(du -h "$initramfs_file" | cut -f1)
-
     echo "Extracted: vmlinuz-$target_arch ($vmlinuz_size), initramfs-$target_arch ($initramfs_size)"
 }
 
