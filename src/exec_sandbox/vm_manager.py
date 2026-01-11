@@ -237,6 +237,9 @@ class QemuVM:
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
         self._creation_time = asyncio.get_event_loop().time()
+        # Timing instrumentation (set by VmManager.create_vm)
+        self._setup_ms: int | None = None  # Resource setup time
+        self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
 
     async def __aenter__(self) -> "QemuVM":
         """Enter async context manager.
@@ -835,6 +838,7 @@ class VmManager:
 
             # Wait for all setup tasks to complete
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            setup_complete_time = asyncio.get_event_loop().time()
 
             # Extract results and check for failures
             overlay_result = results[0]
@@ -992,6 +996,10 @@ class VmManager:
 
             try:
                 await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
+                boot_complete_time = asyncio.get_event_loop().time()
+                # Store timing on VM for scheduler to use
+                vm._setup_ms = int((setup_complete_time - start_time) * 1000)
+                vm._boot_ms = int((boot_complete_time - setup_complete_time) * 1000)
                 # Transition to READY state after boot completes
                 await vm._transition_state(VmState.READY)
             except TimeoutError as e:
@@ -1021,14 +1029,16 @@ class VmManager:
                     },
                 ) from e
 
-            # Log boot time
-            boot_time_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            # Log boot time with breakdown
+            total_boot_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
             logger.info(
                 "VM created",
                 extra={
                     "vm_id": vm_id,
                     "language": language,
-                    "boot_time_ms": boot_time_ms,
+                    "setup_ms": vm._setup_ms,
+                    "boot_ms": vm._boot_ms,
+                    "total_boot_ms": total_boot_ms,
                 },
             )
 

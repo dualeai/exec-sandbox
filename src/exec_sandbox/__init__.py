@@ -60,7 +60,7 @@ from exec_sandbox.exceptions import (
     VmError,
     VmTimeoutError,
 )
-from exec_sandbox.models import ExecutionResult, Language
+from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
 
 __all__ = [
@@ -69,6 +69,7 @@ __all__ = [
     "SchedulerConfig",
     "ExecutionResult",
     "Language",
+    "TimingBreakdown",
     # Exceptions (for user error handling)
     "SandboxError",
     "SandboxDependencyError",

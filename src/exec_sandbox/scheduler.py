@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import PackageNotAllowedError, SandboxError
-from exec_sandbox.models import ExecutionResult, Language
+from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.settings import Settings
 
 if TYPE_CHECKING:
@@ -281,6 +281,8 @@ class Scheduler:
         # Acquire semaphore (backpressure)
         async with self._semaphore:
             vm: QemuVM | None = None
+            run_start_time = asyncio.get_event_loop().time()
+            is_cold_boot = False
             try:
                 # Try warm pool first (instant allocation)
                 if self._warm_pool and not packages:
@@ -289,6 +291,7 @@ class Scheduler:
 
                 # Cold boot if no warm VM available
                 if vm is None:
+                    is_cold_boot = True
                     vm = await self._vm_manager.create_vm(
                         language=language,
                         tenant_id="exec-sandbox",
@@ -300,6 +303,7 @@ class Scheduler:
                     )
 
                 # Execute code
+                execute_start_time = asyncio.get_event_loop().time()
                 result = await vm.execute(
                     code=code,
                     language=language,
@@ -308,6 +312,26 @@ class Scheduler:
                     on_stdout=on_stdout,
                     on_stderr=on_stderr,
                 )
+                execute_end_time = asyncio.get_event_loop().time()
+
+                # Attach timing breakdown for cold boots
+                if is_cold_boot and vm._setup_ms is not None and vm._boot_ms is not None:
+                    execute_ms = int((execute_end_time - execute_start_time) * 1000)
+                    total_ms = int((execute_end_time - run_start_time) * 1000)
+                    result = ExecutionResult(
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                        exit_code=result.exit_code,
+                        execution_time_ms=result.execution_time_ms,
+                        external_cpu_time_ms=result.external_cpu_time_ms,
+                        external_memory_peak_mb=result.external_memory_peak_mb,
+                        timing=TimingBreakdown(
+                            setup_ms=vm._setup_ms,
+                            boot_ms=vm._boot_ms,
+                            execute_ms=execute_ms,
+                            total_ms=total_ms,
+                        ),
+                    )
 
                 return result
 
