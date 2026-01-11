@@ -5,11 +5,20 @@ No mocks - spawns actual processes.
 """
 
 import asyncio
+import platform
 import sys
 
 import pytest
 
-from exec_sandbox.platform_utils import HostOS, ProcessWrapper, detect_host_os
+from exec_sandbox.platform_utils import (
+    HostArch,
+    HostOS,
+    ProcessWrapper,
+    detect_host_arch,
+    detect_host_os,
+    get_arch_name,
+    get_os_name,
+)
 
 # ============================================================================
 # OS Detection
@@ -55,6 +64,96 @@ class TestHostOSEnum:
         assert HostOS.LINUX != HostOS.MACOS
         assert HostOS.LINUX != HostOS.UNKNOWN
         assert HostOS.MACOS != HostOS.UNKNOWN
+
+
+# ============================================================================
+# Architecture Detection
+# ============================================================================
+
+
+class TestDetectHostArch:
+    """Tests for detect_host_arch function."""
+
+    def test_detect_current_architecture(self) -> None:
+        """detect_host_arch returns valid HostArch for current platform."""
+        result = detect_host_arch()
+        assert isinstance(result, HostArch)
+        assert result in (HostArch.X86_64, HostArch.AARCH64, HostArch.UNKNOWN)
+
+    def test_detect_matches_platform_machine(self) -> None:
+        """detect_host_arch matches platform.machine()."""
+        result = detect_host_arch()
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64"):
+            assert result == HostArch.X86_64
+        elif machine in ("arm64", "aarch64"):
+            assert result == HostArch.AARCH64
+
+    def test_detect_is_cached(self) -> None:
+        """detect_host_arch is cached (same instance returned)."""
+        result1 = detect_host_arch()
+        result2 = detect_host_arch()
+        # Same enum value (cached via @cache)
+        assert result1 is result2
+
+
+class TestHostArchEnum:
+    """Tests for HostArch enum."""
+
+    def test_enum_values(self) -> None:
+        """HostArch has expected values."""
+        assert HostArch.X86_64 is not None
+        assert HostArch.AARCH64 is not None
+        assert HostArch.UNKNOWN is not None
+
+    def test_enum_distinct(self) -> None:
+        """HostArch values are distinct."""
+        assert HostArch.X86_64 != HostArch.AARCH64
+        assert HostArch.X86_64 != HostArch.UNKNOWN
+        assert HostArch.AARCH64 != HostArch.UNKNOWN
+
+
+class TestGetOsName:
+    """Tests for get_os_name helper function."""
+
+    def test_returns_string(self) -> None:
+        """get_os_name returns a string."""
+        result = get_os_name()
+        assert isinstance(result, str)
+
+    def test_returns_valid_os_name(self) -> None:
+        """get_os_name returns valid OS name for current platform."""
+        host_os = detect_host_os()
+        if host_os == HostOS.MACOS:
+            assert get_os_name() == "darwin"
+        elif host_os == HostOS.LINUX:
+            assert get_os_name() == "linux"
+
+
+class TestGetArchName:
+    """Tests for get_arch_name helper function."""
+
+    def test_kernel_convention(self) -> None:
+        """get_arch_name returns kernel-style names by default."""
+        result = get_arch_name("kernel")
+        host_arch = detect_host_arch()
+        if host_arch == HostArch.X86_64:
+            assert result == "x86_64"
+        elif host_arch == HostArch.AARCH64:
+            assert result == "aarch64"
+
+    def test_go_convention(self) -> None:
+        """get_arch_name returns Go-style names with convention='go'."""
+        result = get_arch_name("go")
+        host_arch = detect_host_arch()
+        if host_arch == HostArch.X86_64:
+            assert result == "amd64"
+        elif host_arch == HostArch.AARCH64:
+            assert result == "arm64"
+
+    def test_default_convention_is_kernel(self) -> None:
+        """get_arch_name defaults to kernel convention."""
+        assert get_arch_name() == get_arch_name("kernel")
 
 
 # ============================================================================

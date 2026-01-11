@@ -159,7 +159,8 @@ class SchedulerConfig(BaseModel):
             FileNotFoundError: Images directory does not exist and check_exists=True
         """
         import os  # noqa: PLC0415
-        import sys  # noqa: PLC0415
+
+        from exec_sandbox.platform_utils import HostOS, detect_host_os  # noqa: PLC0415
 
         if self.images_dir is not None:
             path = self.images_dir
@@ -169,13 +170,13 @@ class SchedulerConfig(BaseModel):
             # Use cache directory for auto-downloaded assets
             if cache_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
                 path = Path(cache_path)
-            elif sys.platform == "darwin":
+            elif detect_host_os() == HostOS.MACOS:
                 path = Path.home() / "Library" / "Caches" / "exec-sandbox"
             else:
                 # XDG_CACHE_HOME takes precedence if set
                 xdg_cache = os.environ.get("XDG_CACHE_HOME")
                 path = Path(xdg_cache) / "exec-sandbox" if xdg_cache else Path.home() / ".cache" / "exec-sandbox"
-        elif sys.platform == "darwin":
+        elif detect_host_os() == HostOS.MACOS:
             path = Path.home() / "Library" / "Application Support" / "exec-sandbox" / "images"
         else:
             path = Path.home() / ".local" / "share" / "exec-sandbox" / "images"

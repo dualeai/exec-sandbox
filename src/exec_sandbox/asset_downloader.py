@@ -11,7 +11,6 @@ import asyncio
 import hashlib
 import http
 import os
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +22,7 @@ if TYPE_CHECKING:
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import AssetChecksumError, AssetDownloadError, AssetNotFoundError
+from exec_sandbox.platform_utils import HostOS, detect_host_os, get_arch_name, get_os_name
 
 logger = get_logger(__name__)
 
@@ -36,7 +36,7 @@ DEFAULT_RETRY_DELAY = 1.0  # seconds
 
 def get_cache_dir(app_name: str = "exec-sandbox") -> Path:
     """
-    Get platform-specific cache directory (zero dependencies).
+    Get platform-specific cache directory.
 
     Returns:
         - macOS: ~/Library/Caches/<app_name>/
@@ -47,10 +47,10 @@ def get_cache_dir(app_name: str = "exec-sandbox") -> Path:
     if env_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
         return Path(env_path)
 
-    match sys.platform:
-        case "darwin":
+    match detect_host_os():
+        case HostOS.MACOS:
             return Path.home() / "Library" / "Caches" / app_name
-        case "linux":
+        case HostOS.LINUX:
             # XDG_CACHE_HOME takes precedence if set
             xdg_cache = os.environ.get("XDG_CACHE_HOME")
             if xdg_cache:
@@ -482,16 +482,7 @@ def get_current_arch() -> str:
     Returns:
         Architecture string: "x86_64" or "aarch64"
     """
-    import platform  # noqa: PLC0415
-
-    machine = platform.machine().lower()
-
-    # Normalize architecture names
-    if machine in ("x86_64", "amd64"):
-        return "x86_64"
-    if machine in ("arm64", "aarch64"):
-        return "aarch64"
-    return machine
+    return get_arch_name("kernel")
 
 
 def get_gvproxy_suffix() -> str:
@@ -501,25 +492,4 @@ def get_gvproxy_suffix() -> str:
     Returns:
         Suffix like "darwin-arm64", "darwin-amd64", "linux-arm64", "linux-amd64"
     """
-    import platform  # noqa: PLC0415
-
-    os_name = sys.platform
-    machine = platform.machine().lower()
-
-    # Map OS
-    if os_name == "darwin":
-        os_suffix = "darwin"
-    elif os_name == "linux":
-        os_suffix = "linux"
-    else:
-        os_suffix = os_name
-
-    # Map architecture (Go naming convention)
-    if machine in ("x86_64", "amd64"):
-        arch_suffix = "amd64"
-    elif machine in ("arm64", "aarch64"):
-        arch_suffix = "arm64"
-    else:
-        arch_suffix = machine
-
-    return f"{os_suffix}-{arch_suffix}"
+    return f"{get_os_name()}-{get_arch_name('go')}"

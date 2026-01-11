@@ -23,6 +23,7 @@ from exec_sandbox.asset_downloader import (
     untar,
 )
 from exec_sandbox.exceptions import AssetDownloadError, AssetNotFoundError
+from exec_sandbox.platform_utils import HostOS
 
 
 class TestGetCacheDir:
@@ -51,28 +52,28 @@ class TestGetCacheDir:
 
     def test_darwin_platform(self):
         """Should use Library/Caches on macOS."""
-        with patch("sys.platform", "darwin"):
+        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.MACOS):
             with patch.dict("os.environ", {}, clear=True):
                 result = get_cache_dir()
                 assert "Library/Caches" in str(result)
 
     def test_linux_platform(self):
         """Should use .cache on Linux."""
-        with patch("sys.platform", "linux"):
+        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {}, clear=True):
                 result = get_cache_dir()
                 assert ".cache" in str(result)
 
     def test_linux_xdg_cache_home(self):
         """Should respect XDG_CACHE_HOME on Linux."""
-        with patch("sys.platform", "linux"):
+        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg/cache"}):
                 result = get_cache_dir()
                 assert result == Path("/xdg/cache/exec-sandbox")
 
     def test_unknown_platform_fallback(self):
         """Should fall back to .cache on unknown platforms."""
-        with patch("sys.platform", "freebsd"):
+        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.UNKNOWN):
             with patch.dict("os.environ", {}, clear=True):
                 result = get_cache_dir()
                 assert ".cache" in str(result)
@@ -90,28 +91,14 @@ class TestGetCurrentArch:
     """Tests for get_current_arch function."""
 
     def test_x86_64(self):
-        """Should return x86_64 for amd64/x86_64 machines."""
-        with patch("platform.machine", return_value="x86_64"):
-            assert get_current_arch() == "x86_64"
-
-        with patch("platform.machine", return_value="amd64"):
+        """Should return x86_64 for x86_64 architecture."""
+        with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="x86_64"):
             assert get_current_arch() == "x86_64"
 
     def test_aarch64(self):
-        """Should return aarch64 for arm64/aarch64 machines."""
-        with patch("platform.machine", return_value="arm64"):
+        """Should return aarch64 for ARM64 architecture."""
+        with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="aarch64"):
             assert get_current_arch() == "aarch64"
-
-        with patch("platform.machine", return_value="aarch64"):
-            assert get_current_arch() == "aarch64"
-
-    def test_unknown_arch_passthrough(self):
-        """Should pass through unknown architectures unchanged."""
-        with patch("platform.machine", return_value="ppc64le"):
-            assert get_current_arch() == "ppc64le"
-
-        with patch("platform.machine", return_value="i386"):
-            assert get_current_arch() == "i386"
 
 
 class TestGetGvproxySuffix:
@@ -119,33 +106,27 @@ class TestGetGvproxySuffix:
 
     def test_darwin_arm64(self):
         """Should return darwin-arm64 for macOS ARM."""
-        with patch("sys.platform", "darwin"):
-            with patch("platform.machine", return_value="arm64"):
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="darwin"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="arm64"):
                 assert get_gvproxy_suffix() == "darwin-arm64"
 
     def test_darwin_amd64(self):
         """Should return darwin-amd64 for macOS Intel."""
-        with patch("sys.platform", "darwin"):
-            with patch("platform.machine", return_value="x86_64"):
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="darwin"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="amd64"):
                 assert get_gvproxy_suffix() == "darwin-amd64"
 
     def test_linux_arm64(self):
         """Should return linux-arm64 for Linux ARM."""
-        with patch("sys.platform", "linux"):
-            with patch("platform.machine", return_value="aarch64"):
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="linux"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="arm64"):
                 assert get_gvproxy_suffix() == "linux-arm64"
 
     def test_linux_amd64(self):
         """Should return linux-amd64 for Linux x86."""
-        with patch("sys.platform", "linux"):
-            with patch("platform.machine", return_value="x86_64"):
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="linux"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="amd64"):
                 assert get_gvproxy_suffix() == "linux-amd64"
-
-    def test_unknown_platform_passthrough(self):
-        """Should pass through unknown OS and architecture."""
-        with patch("sys.platform", "freebsd"):
-            with patch("platform.machine", return_value="riscv64"):
-                assert get_gvproxy_suffix() == "freebsd-riscv64"
 
 
 class TestRetrieve:

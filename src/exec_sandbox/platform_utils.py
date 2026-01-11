@@ -6,8 +6,10 @@ Provides PID-reuse safe process management wrappers.
 
 import asyncio
 import contextlib
+import platform
 from enum import Enum, auto
 from functools import cache
+from typing import Literal
 
 import psutil
 
@@ -50,6 +52,90 @@ def detect_host_os() -> HostOS:
     if psutil.MACOS:
         return HostOS.MACOS
     return HostOS.UNKNOWN
+
+
+class HostArch(Enum):
+    """Supported host CPU architectures."""
+
+    X86_64 = auto()
+    """x86_64/amd64 architecture."""
+
+    AARCH64 = auto()
+    """ARM64/aarch64 architecture."""
+
+    UNKNOWN = auto()
+    """Unsupported or unrecognized architecture."""
+
+
+@cache
+def detect_host_arch() -> HostArch:
+    """Detect current host CPU architecture.
+
+    Returns:
+        HostArch enum indicating current architecture
+
+    Example:
+        >>> from exec_sandbox.platform_utils import detect_host_arch, HostArch
+        >>> arch = detect_host_arch()
+        >>> match arch:
+        ...     case HostArch.X86_64:
+        ...         qemu_bin = "qemu-system-x86_64"
+        ...     case HostArch.AARCH64:
+        ...         qemu_bin = "qemu-system-aarch64"
+        ...     case HostArch.UNKNOWN:
+        ...         raise RuntimeError("Unsupported architecture")
+    """
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return HostArch.X86_64
+    if machine in ("arm64", "aarch64"):
+        return HostArch.AARCH64
+    return HostArch.UNKNOWN
+
+
+def get_os_name() -> str:
+    """Get OS name string for binary naming conventions.
+
+    Returns:
+        "darwin" for macOS, "linux" for Linux
+
+    Raises:
+        ValueError: If running on unsupported OS
+    """
+    match detect_host_os():
+        case HostOS.MACOS:
+            return "darwin"
+        case HostOS.LINUX:
+            return "linux"
+        case _:
+            raise ValueError("Unsupported OS")
+
+
+def get_arch_name(convention: Literal["kernel", "go"] = "kernel") -> str:
+    """Get architecture string for naming conventions.
+
+    Args:
+        convention: "kernel" for x86_64/aarch64 (Linux kernel style),
+                   "go" for amd64/arm64 (Go toolchain style)
+
+    Returns:
+        Architecture string in requested convention
+
+    Raises:
+        ValueError: If running on unsupported architecture
+    """
+    arch = detect_host_arch()
+    match (convention, arch):
+        case ("go", HostArch.X86_64):
+            return "amd64"
+        case ("go", HostArch.AARCH64):
+            return "arm64"
+        case ("kernel", HostArch.X86_64):
+            return "x86_64"
+        case ("kernel", HostArch.AARCH64):
+            return "aarch64"
+        case _:
+            raise ValueError(f"Unsupported architecture: {arch}")
 
 
 class ProcessWrapper:

@@ -49,7 +49,7 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.models import ExecutionResult, Language
-from exec_sandbox.platform_utils import HostOS, ProcessWrapper, detect_host_os
+from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
 from exec_sandbox.resource_cleanup import (
     cleanup_cgroup,
     cleanup_file,
@@ -85,13 +85,14 @@ def _get_gvproxy_wrapper_path() -> Path:
         raise VmError("Unsupported OS for gvproxy-wrapper")
 
     # Detect architecture
-    machine = platform.machine().lower()
-    if machine in ("arm64", "aarch64"):
-        arch = "arm64"
-    elif machine in ("x86_64", "amd64"):
-        arch = "amd64"
-    else:
-        raise VmError(f"Unsupported architecture for gvproxy-wrapper: {machine}")
+    host_arch = detect_host_arch()
+    match host_arch:
+        case HostArch.AARCH64:
+            arch = "arm64"
+        case HostArch.X86_64:
+            arch = "amd64"
+        case _:
+            raise VmError(f"Unsupported architecture for gvproxy-wrapper: {host_arch}")
 
     binary_name = f"gvproxy-wrapper-{os_name}-{arch}"
 
@@ -737,7 +738,7 @@ class VmManager:
             - Orphaned VMs timeout naturally (max runtime: 2 min)
         """
         self.settings = settings
-        self.machine = platform.machine()  # "x86_64", "arm64", "aarch64"
+        self.arch = detect_host_arch()
 
         # Probe io_uring support ONCE at startup
         self._io_uring_available = self._probe_io_uring_support()
@@ -1780,7 +1781,7 @@ class VmManager:
         # Determine QEMU binary, machine type, and kernel based on architecture
         is_macos = detect_host_os() == HostOS.MACOS
 
-        if self.machine in ("arm64", "aarch64"):
+        if self.arch == HostArch.AARCH64:
             arch_suffix = "aarch64"
             qemu_bin = "qemu-system-aarch64"
             machine_type = "virt,mem-merge=off" if is_macos else "virt,mem-merge=off,dump-guest-core=off"
@@ -1823,7 +1824,7 @@ class VmManager:
             "-accel",
             accel,
             "-cpu",
-            ("host" if accel in ("hvf", "kvm") else "cortex-a57" if self.machine in ("arm64", "aarch64") else "qemu64"),
+            ("host" if accel in ("hvf", "kvm") else "cortex-a57" if self.arch == HostArch.AARCH64 else "qemu64"),
             "-M",
             machine_type,
             "-no-reboot",
