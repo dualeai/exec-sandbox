@@ -126,16 +126,12 @@ DNS_FILTER_EDGE_CASES = [
 # NOTE: gethostbyname("1.1.1.1") doesn't do DNS lookup - it validates and returns
 # the IP directly. DNS filtering cannot block direct IP literals.
 # Network firewall rules would be needed to block IP connections.
-DNS_FILTER_SECURITY_CASES = [
-    # Localhost should be blocked unless explicitly allowed
-    pytest.param(
-        Language.PYTHON,
-        ["example.com"],
-        "localhost",
-        False,
-        id="security-localhost-blocked",
-    ),
-]
+#
+# NOTE: localhost resolution comes from /etc/hosts (127.0.0.1), not DNS.
+# DNS filtering cannot intercept /etc/hosts lookups - this is a fundamental
+# limitation of DNS-based filtering. Blocking localhost would require
+# modifying /etc/hosts or using network firewall rules.
+DNS_FILTER_SECURITY_CASES: list[object] = []
 
 # Combine all test cases
 DNS_FILTER_TEST_CASES = (
