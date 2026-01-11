@@ -885,8 +885,52 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Reap zombie processes when running as PID 1.
+///
+/// PID 1 is responsible for reaping orphaned child processes.
+/// This async task listens for SIGCHLD signals and calls waitpid()
+/// to clean up zombie processes.
+///
+/// Reference: https://github.com/fpco/pid1-rs
+async fn reap_zombies() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // Create signal stream BEFORE any children are spawned to avoid race conditions
+    let mut sigchld = match signal(SignalKind::child()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: Failed to register SIGCHLD handler: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        // Wait for SIGCHLD (cancel-safe)
+        sigchld.recv().await;
+
+        // Reap all available zombies in a non-blocking loop
+        // Multiple children may have exited before we get here
+        loop {
+            // SAFETY: waitpid with WNOHANG is safe and returns immediately
+            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            match pid {
+                p if p > 0 => continue, // Reaped one zombie, check for more
+                0 => break,             // No more zombies waiting
+                _ => break,             // Error (ECHILD = no children)
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // When running as PID 1, setup zombie reaping before anything else
+    // This must be done early to catch SIGCHLD from any orphaned processes
+    if std::process::id() == 1 {
+        eprintln!("Guest agent running as PID 1 (init), enabling zombie reaper...");
+        tokio::spawn(reap_zombies());
+    }
+
     eprintln!(
         "Guest agent starting (dual ports: cmd={}, event={})...",
         CMD_PORT_PATH, EVENT_PORT_PATH

@@ -16,6 +16,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 regex = "1.10"
 once_cell = "1.19"  # Replaced lazy_static for faster initialization
+libc = "0.2"  # For PID 1 zombie reaping (waitpid)
 
 [profile.release]
 opt-level = "z"     # Optimize for size
