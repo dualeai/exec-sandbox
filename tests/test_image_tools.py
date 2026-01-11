@@ -59,8 +59,8 @@ async def test_raw_tool_available(tool: str, command: str) -> None:
 PYTHON_IMAGE_TOOLS = [
     ("python", "import sys; print(sys.version)"),
     (
-        "pip",
-        "import subprocess; r = subprocess.run(['pip', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
+        "uv",
+        "import subprocess; r = subprocess.run(['uv', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
     ),
     (
         "curl",
@@ -159,11 +159,6 @@ async def test_raw_functional(name: str, command: str, expected: str) -> None:
 PYTHON_FUNCTIONAL_TESTS = [
     ("print", "print(2 + 2)", "4"),
     ("json", 'import json; print(json.loads(\'{"name": "test"}\')["name"])', "test"),
-    (
-        "pip-list",
-        "import subprocess; r = subprocess.run(['pip', 'list', '--format=columns'], capture_output=True, text=True); print(r.stdout.splitlines()[0])",
-        "Package",
-    ),
 ]
 
 

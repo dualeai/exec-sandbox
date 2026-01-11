@@ -219,10 +219,9 @@ create_python_rootfs() {
     chmod 755 "$rootfs_dir/usr/local/bin/uv" "$rootfs_dir/usr/local/bin/uvx"
 
     # Create symlinks for Python
+    # Note: install_only_stripped doesn't include pip - use 'uv pip' instead
     ln -sf /opt/python/bin/python3 "$rootfs_dir/usr/local/bin/python3"
     ln -sf /opt/python/bin/python3 "$rootfs_dir/usr/local/bin/python"
-    ln -sf /opt/python/bin/pip3 "$rootfs_dir/usr/local/bin/pip3"
-    ln -sf /opt/python/bin/pip3 "$rootfs_dir/usr/local/bin/pip"
 }
 
 # Create rootfs with Node/bun runtime using Docker
