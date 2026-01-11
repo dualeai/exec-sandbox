@@ -125,6 +125,14 @@ async with Scheduler() as scheduler:
         print(f"Sandbox error: {e}")
 ```
 
+## Documentation
+
+- [QEMU Documentation](https://www.qemu.org/docs/master/) - Virtual machine emulator
+- [KVM](https://www.linux-kvm.org/page/Documents) - Linux kernel virtualization
+- [HVF](https://developer.apple.com/documentation/hypervisor) - macOS Hypervisor.framework
+- [cgroups v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) - Resource isolation
+- [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) - Syscall filtering
+
 ## Configuration
 
 | Parameter | Default | Description |
@@ -267,6 +275,7 @@ Build from source:
 ## Security
 
 - [Security Policy](./SECURITY.md) - Vulnerability reporting
+- [SBOM](https://github.com/dualeai/exec-sandbox/releases) - Software Bill of Materials (SPDX format) attached to releases
 
 ## Contributing
 
