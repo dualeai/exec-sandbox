@@ -43,9 +43,9 @@ Example:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from pathlib import Path
-from typing import TYPE_CHECKING
+from collections.abc import Callable  # noqa: TC003 - Used at runtime for on_stdout/on_stderr parameters
+from pathlib import Path  # noqa: TC003 - Used at runtime
+from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
@@ -100,7 +100,7 @@ class Scheduler:
         self._started = False
         self._semaphore: asyncio.Semaphore | None = None
 
-    async def __aenter__(self) -> Scheduler:
+    async def __aenter__(self) -> Self:
         """Start scheduler and initialize resources.
 
         Startup sequence:
@@ -134,33 +134,29 @@ class Scheduler:
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent_vms)
 
         # Initialize VmManager
-        from exec_sandbox.vm_manager import VmManager
+        from exec_sandbox.vm_manager import VmManager  # noqa: PLC0415
 
         self._vm_manager = VmManager(self._settings)
 
         # Initialize SnapshotManager (L1 local cache always available, L3 S3 optional)
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.snapshot_manager import SnapshotManager  # noqa: PLC0415
 
         self._snapshot_manager = SnapshotManager(self._settings, self._vm_manager)
 
         # Initialize WarmVMPool (optional)
         if self.config.warm_pool_size > 0:
-            # Create scheduler config for warm pool
-            from exec_sandbox.warm_vm_pool import WarmVMPool
+            from exec_sandbox.warm_vm_pool import WarmVMPool  # noqa: PLC0415
 
-            warm_pool_config = type(
-                "WarmPoolConfig",
-                (),
-                {"max_concurrent_vms": self.config.max_concurrent_vms},
-            )()
-            self._warm_pool = WarmVMPool(self._vm_manager, warm_pool_config)
+            self._warm_pool = WarmVMPool(self._vm_manager, self.config)
             await self._warm_pool.startup()
 
         self._started = True
         logger.info("Scheduler started successfully")
         return self
 
-    async def __aexit__(self, exc_type: type | None, exc_val: Exception | None, exc_tb: object) -> None:
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
         """Shutdown scheduler and clean up all resources.
 
         Shutdown sequence:
@@ -176,7 +172,7 @@ class Scheduler:
         if self._warm_pool:
             try:
                 await self._warm_pool.shutdown()
-            except Exception as e:
+            except (OSError, RuntimeError, TimeoutError) as e:
                 logger.error("WarmVMPool shutdown error", extra={"error": str(e)})
 
         # Destroy any remaining VMs
@@ -259,9 +255,9 @@ class Scheduler:
         if not self._started:
             raise SandboxError("Scheduler not started. Use: async with Scheduler() as scheduler:")
 
-        assert self._vm_manager is not None
-        assert self._semaphore is not None
-        assert self._settings is not None
+        # Type narrowing (guaranteed by _started check)
+        if self._vm_manager is None or self._semaphore is None or self._settings is None:
+            raise SandboxError("Scheduler resources not initialized")
 
         # Apply defaults
         timeout = timeout_seconds or self.config.default_timeout_seconds
@@ -315,7 +311,7 @@ class Scheduler:
                 execute_end_time = asyncio.get_event_loop().time()
 
                 # Attach timing breakdown for cold boots
-                if is_cold_boot and vm._setup_ms is not None and vm._boot_ms is not None:
+                if is_cold_boot and vm.setup_ms is not None and vm.boot_ms is not None:
                     execute_ms = int((execute_end_time - execute_start_time) * 1000)
                     total_ms = int((execute_end_time - run_start_time) * 1000)
                     result = ExecutionResult(
@@ -326,8 +322,8 @@ class Scheduler:
                         external_cpu_time_ms=result.external_cpu_time_ms,
                         external_memory_peak_mb=result.external_memory_peak_mb,
                         timing=TimingBreakdown(
-                            setup_ms=vm._setup_ms,
-                            boot_ms=vm._boot_ms,
+                            setup_ms=vm.setup_ms,
+                            boot_ms=vm.boot_ms,
                             execute_ms=execute_ms,
                             total_ms=total_ms,
                         ),
@@ -364,7 +360,7 @@ class Scheduler:
             s3_region=self.config.s3_region,
         )
 
-    def _validate_packages(self, packages: list[str], language: str) -> None:
+    def _validate_packages(self, packages: list[str], language: Language) -> None:
         """Validate packages against allowlist.
 
         Args:
@@ -374,16 +370,16 @@ class Scheduler:
         Raises:
             PackageNotAllowedError: Package not in allowlist
         """
-        from exec_sandbox.package_validator import PackageValidator
+        from exec_sandbox.package_validator import PackageValidator  # noqa: PLC0415
 
         validator = PackageValidator()
         for package in packages:
             # Extract package name (strip version specifier)
             name = package.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0].split("[")[0]
-            if not validator.is_allowed(name, language):
+            if not validator.is_allowed(name, language.value):
                 raise PackageNotAllowedError(
-                    f"Package '{name}' not in allowlist for {language}",
-                    context={"package": name, "language": language},
+                    f"Package '{name}' not in allowlist for {language.value}",
+                    context={"package": name, "language": language.value},
                 )
 
     async def _get_or_create_snapshot(self, language: str, packages: list[str]) -> Path | None:
@@ -413,7 +409,7 @@ class Scheduler:
                 extra={"language": language, "packages": packages, "path": str(snapshot_path)},
             )
             return snapshot_path
-        except Exception as e:
+        except (OSError, RuntimeError, TimeoutError, ConnectionError) as e:
             # Graceful degradation: log error, continue without snapshot
             logger.warning(
                 "Snapshot creation failed, continuing without cache",

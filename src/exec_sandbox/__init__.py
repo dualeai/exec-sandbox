@@ -64,22 +64,20 @@ from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
 
 __all__ = [
-    # Core API
+    "CommunicationError",
+    "ExecutionResult",
+    "GuestAgentError",
+    "Language",
+    "PackageNotAllowedError",
+    "SandboxDependencyError",
+    "SandboxError",
     "Scheduler",
     "SchedulerConfig",
-    "ExecutionResult",
-    "Language",
+    "SnapshotError",
     "TimingBreakdown",
-    # Exceptions (for user error handling)
-    "SandboxError",
-    "SandboxDependencyError",
+    "VmBootError",
     "VmError",
     "VmTimeoutError",
-    "VmBootError",
-    "CommunicationError",
-    "GuestAgentError",
-    "PackageNotAllowedError",
-    "SnapshotError",
 ]
 
 __version__ = "0.1.0"

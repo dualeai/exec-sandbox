@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.12"
-# dependencies = [
-#   "aiohttp~=3.13",
-#   "tenacity~=9.1",
-# ]
-# ///
 """Build package allow-lists from PyPI and npm registries.
 
 Fetches top N packages by download count to create security allow-lists.
@@ -37,19 +30,20 @@ async def fetch_pypi_top_packages(limit: int = 10_000) -> list[str]:
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type(aiohttp.ClientError),
     )
-    async def fetch_pypi_data() -> dict:
+    async def fetch_pypi_data() -> dict[str, list[dict[str, str]]]:
         """Fetch PyPI top packages with retry on transient errors."""
         url = "https://hugovk.github.io/top-pypi-packages/top-pypi-packages-30-days.min.json"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp,
+        ):
+            resp.raise_for_status()
+            return await resp.json()
 
     data = await fetch_pypi_data()
 
     # Extract package names from rows
-    packages = [row["project"] for row in data["rows"][:limit]]
-    return packages
+    return [row["project"] for row in data["rows"][:limit]]
 
 
 async def fetch_npm_top_packages(limit: int = 10_000) -> list[str]:
@@ -74,17 +68,21 @@ async def fetch_npm_top_packages(limit: int = 10_000) -> list[str]:
     )
     async def fetch_list() -> list[str]:
         """Fetch package list with retry."""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                resp.raise_for_status()
-                text = await resp.text()
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp,
+        ):
+            resp.raise_for_status()
+            text = await resp.text()
 
         # Parse JSON from text (GitHub serves as text/plain)
-        data = json.loads(text)
+        data: list[list[str | int]] = json.loads(text)
 
         # Extract package names from format: [["package-name", downloads], ...]
-        if isinstance(data, list) and data and isinstance(data[0], list):
-            return [pkg[0] for pkg in data if len(pkg) > 0]
+        # Type guard: data is already typed as list[list[str | int]] from the annotation
+        # We check structure for runtime safety, not for type narrowing
+        if data and len(data[0]) > 0:
+            return [str(pkg[0]) for pkg in data if len(pkg) > 0]
         return []
 
     packages = await fetch_list()

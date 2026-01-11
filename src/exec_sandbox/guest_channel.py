@@ -7,6 +7,7 @@ Supports multiple transports using JSON newline-delimited protocol:
 """
 
 import asyncio
+import contextlib
 import socket
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -393,18 +394,14 @@ class UnixSocketChannel:
         self._shutdown_event.set()
 
         # Wait for queue to drain (max 5s)
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._write_queue.join(), timeout=5.0)
-        except TimeoutError:
-            pass  # Force close if drain timeout
 
         # Cancel write worker
         if self._write_task and not self._write_task.done():
             self._write_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._write_task
-            except asyncio.CancelledError:
-                pass
 
         # Close connection
         if self._writer:
@@ -412,6 +409,29 @@ class UnixSocketChannel:
             await self._writer.wait_closed()
             self._writer = None
             self._reader = None
+
+    async def enqueue_write(self, data: bytes, timeout: float = 5.0) -> None:
+        """Enqueue data for writing with timeout.
+
+        Args:
+            data: Bytes to write
+            timeout: Queue timeout in seconds
+
+        Raises:
+            RuntimeError: If queue is full and timeout expires
+        """
+        try:
+            await asyncio.wait_for(self._write_queue.put(data), timeout=timeout)
+        except TimeoutError as e:
+            raise RuntimeError("Write queue full - guest agent not draining") from e
+
+    def is_connected(self) -> bool:
+        """Check if channel is connected."""
+        return self._reader is not None and self._writer is not None
+
+    def get_reader(self) -> asyncio.StreamReader | None:
+        """Get the stream reader (for direct access when needed)."""
+        return self._reader
 
 
 class DualPortChannel:
@@ -503,14 +523,7 @@ class DualPortChannel:
         # Use UnixSocketChannel's queued write mechanism
         # Serialize and enqueue the command
         request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-
-        try:
-            await asyncio.wait_for(
-                self._cmd_channel._write_queue.put(request_json.encode()),
-                timeout=float(timeout),
-            )
-        except TimeoutError as e:
-            raise RuntimeError("Command write queue full - guest agent not draining") from e
+        await self._cmd_channel.enqueue_write(request_json.encode(), timeout=float(timeout))
 
     async def stream_events(
         self,
@@ -532,17 +545,20 @@ class DualPortChannel:
             asyncio.TimeoutError: If no message received within timeout
         """
         # Validate event channel is connected
-        if not self._event_channel._reader or not self._event_channel._writer:
+        if not self._event_channel.is_connected():
             raise RuntimeError("Event channel not connected")
 
         # Type adapter for discriminated union
         streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
 
+        reader = self._event_channel.get_reader()
+        if not reader:
+            raise RuntimeError("Event channel reader not available")
+
         # Read and yield messages until completion or error
         while True:
             # Read next JSON line from event channel
-            # Accessing _reader directly since we need to read without sending
-            response_data = await asyncio.wait_for(self._event_channel._reader.readuntil(b"\n"), timeout=float(timeout))
+            response_data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=float(timeout))
             raw_json = response_data.decode().strip()
 
             # Parse as streaming message

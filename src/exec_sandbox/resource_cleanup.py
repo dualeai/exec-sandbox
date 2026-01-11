@@ -5,6 +5,7 @@ Used by VmManager for VM lifecycle management.
 """
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import aiofiles
@@ -95,10 +96,8 @@ async def cleanup_process(
 
             # Still try to reap in background to prevent zombie
             async def drain_and_wait() -> None:
-                try:
+                with contextlib.suppress(OSError, TimeoutError, asyncio.CancelledError):
                     await proc.wait_with_timeout(timeout=999999)  # Infinite-like timeout
-                except Exception:
-                    pass
 
             _ = asyncio.create_task(drain_and_wait())  # noqa: RUF006
             return False
@@ -150,7 +149,7 @@ async def cleanup_cgroup(
                 if await aiofiles.os.path.exists(procs_file):
                     async with aiofiles.open(procs_file, "w") as f:
                         await f.write("")
-            except Exception as e:
+            except OSError as e:
                 logger.warning(
                     "Failed to empty cgroup",
                     extra={"context_id": context_id, "error": str(e)},

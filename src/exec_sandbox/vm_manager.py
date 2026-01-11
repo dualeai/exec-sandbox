@@ -19,6 +19,7 @@ Performance Optimizations (QEMU 10.0+):
 """
 
 import asyncio
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -27,9 +28,10 @@ import logging
 import os
 import platform
 import signal
-import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import TextIO
 from uuid import uuid4
 
 import aiofiles
@@ -121,9 +123,9 @@ VALID_STATE_TRANSITIONS: dict[VmState, set[VmState]] = {
 }
 
 # Validate all states have transition rules defined
-assert set(VmState) == set(VALID_STATE_TRANSITIONS.keys()), (
-    f"Missing states in transition table: {set(VmState) - set(VALID_STATE_TRANSITIONS.keys())}"
-)
+if set(VmState) != set(VALID_STATE_TRANSITIONS.keys()):
+    _missing = set(VmState) - set(VALID_STATE_TRANSITIONS.keys())
+    raise RuntimeError(f"Missing states in transition table: {_missing}")
 
 
 def _check_kvm_available() -> bool:
@@ -205,7 +207,7 @@ class QemuVM:
         gvproxy_socket: Path | None = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
-        console_log: object | None = None,
+        console_log: TextIO | None = None,
     ):
         """Initialize VM handle.
 
@@ -232,7 +234,7 @@ class QemuVM:
         self.gvproxy_socket = gvproxy_socket
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
-        self.console_log = console_log
+        self.console_log: TextIO | None = console_log
         self._destroyed = False
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
@@ -240,6 +242,26 @@ class QemuVM:
         # Timing instrumentation (set by VmManager.create_vm)
         self._setup_ms: int | None = None  # Resource setup time
         self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
+
+    @property
+    def setup_ms(self) -> int | None:
+        """Get resource setup time in milliseconds."""
+        return self._setup_ms
+
+    @setup_ms.setter
+    def setup_ms(self, value: int) -> None:
+        """Set resource setup time in milliseconds."""
+        self._setup_ms = value
+
+    @property
+    def boot_ms(self) -> int | None:
+        """Get VM boot time in milliseconds."""
+        return self._boot_ms
+
+    @boot_ms.setter
+    def boot_ms(self, value: int) -> None:
+        """Set VM boot time in milliseconds."""
+        self._boot_ms = value
 
     async def __aenter__(self) -> "QemuVM":
         """Enter async context manager.
@@ -251,16 +273,11 @@ class QemuVM:
 
     async def __aexit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: object,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: object,
     ) -> bool:
         """Exit async context manager - ensure cleanup.
-
-        Args:
-            exc_type: Exception type if exception occurred
-            exc_val: Exception value if exception occurred
-            exc_tb: Exception traceback if exception occurred
 
         Returns:
             False to propagate exceptions
@@ -275,7 +292,7 @@ class QemuVM:
         """Current VM state."""
         return self._state
 
-    async def _transition_state(self, new_state: VmState) -> None:
+    async def transition_state(self, new_state: VmState) -> None:
         """Transition VM to new state with validation.
 
         Validates state transition against VALID_STATE_TRANSITIONS to prevent
@@ -313,14 +330,14 @@ class QemuVM:
                 },
             )
 
-    async def execute(
+    async def execute(  # noqa: PLR0912, PLR0915
         self,
         code: str,
         language: Language,
         timeout_seconds: int,
         env_vars: dict[str, str] | None = None,
-        on_stdout: callable | None = None,
-        on_stderr: callable | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+        on_stderr: Callable[[str], None] | None = None,
     ) -> ExecutionResult:
         """Execute code via TCP guest agent communication.
 
@@ -393,9 +410,6 @@ class QemuVM:
                 },
             )
 
-        # Start timing
-        exec_start_time = time.time()
-
         # Prepare execution request
         request = ExecuteCodeRequest(
             language=language,
@@ -421,7 +435,7 @@ class QemuVM:
 
             async for msg in self.channel.stream_messages(request, timeout=hard_timeout):
                 # Type-safe message handling
-                from exec_sandbox.guest_agent_protocol import (
+                from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
                     ExecutionCompleteMessage,
                     OutputChunkMessage,
                     StreamingErrorMessage,
@@ -505,7 +519,7 @@ class QemuVM:
 
             # Success - transition back to READY for reuse (if not destroyed)
             try:
-                await self._transition_state(VmState.READY)
+                await self.transition_state(VmState.READY)
             except VmError as e:
                 # VM destroyed while executing, skip transition
                 logger.debug(
@@ -631,10 +645,8 @@ class QemuVM:
 
         # Cleanup operations outside lock (blocking I/O)
         # Step 1: Close communication channel
-        try:
+        with contextlib.suppress(OSError, RuntimeError):
             await self.channel.close()
-        except (OSError, RuntimeError):
-            pass
 
         # Step 3-4: Parallel cleanup (cgroup + overlay)
         # After QEMU terminates, cleanup tasks are independent
@@ -663,10 +675,8 @@ class QemuVM:
         async def cleanup_overlay_fn():
             """Delete overlay image asynchronously."""
             if self.overlay_image.exists():
-                try:
+                with contextlib.suppress(OSError):
                     await aiofiles.os.remove(self.overlay_image)
-                except OSError:
-                    pass
 
         # Run cleanup tasks in parallel
         await asyncio.gather(
@@ -676,7 +686,7 @@ class QemuVM:
         )
 
         # Final state transition (acquires lock again - safe for same task)
-        await self._transition_state(VmState.DESTROYED)
+        await self.transition_state(VmState.DESTROYED)
 
 
 class VmManager:
@@ -736,7 +746,7 @@ class VmManager:
         """
         return dict(self._vms)
 
-    async def create_vm(
+    async def create_vm(  # noqa: PLR0912, PLR0915
         self,
         language: str,
         tenant_id: str,
@@ -794,8 +804,8 @@ class VmManager:
 
         # Step 2-4: Parallel resource setup (overlay + cgroup + gvproxy)
         # These operations are independent and can run concurrently
-        overlay_image = Path(f"/tmp/qemu-{vm_id}.qcow2")
-        base_image = snapshot_path or self._get_base_image(language)
+        overlay_image = Path(f"/tmp/qemu-{vm_id}.qcow2")  # noqa: S108
+        base_image = snapshot_path or self.get_base_image(language)
 
         # Initialize ALL tracking variables before try block for finally cleanup
         cgroup_path: Path | None = None
@@ -811,11 +821,6 @@ class VmManager:
 
         try:
             # Run independent setup tasks in parallel
-            tasks = [
-                self._create_overlay(base_image, overlay_image),
-                self._setup_cgroup(vm_id, tenant_id),
-            ]
-
             # Add gvproxy startup to parallel tasks if network enabled
             logger.debug(
                 "Checking gvproxy condition",
@@ -827,6 +832,7 @@ class VmManager:
                     "domains_count": len(allowed_domains) if allowed_domains else 0,
                 },
             )
+
             if allow_network:
                 # Always use gvproxy for network-enabled VMs
                 # Pass allowed_domains to gvproxy - None means use language defaults
@@ -834,39 +840,45 @@ class VmManager:
                     "Adding gvproxy-wrapper to parallel tasks",
                     extra={"vm_id": vm_id, "allowed_domains": allowed_domains},
                 )
-                tasks.append(self._start_gvproxy(vm_id, allowed_domains, language))
+                # Run all tasks in parallel including gvproxy
+                overlay_result, cgroup_result, gvproxy_result = await asyncio.gather(
+                    self._create_overlay(base_image, overlay_image),
+                    self._setup_cgroup(vm_id, tenant_id),
+                    self._start_gvproxy(vm_id, allowed_domains, language),
+                    return_exceptions=True,
+                )
+                setup_complete_time = asyncio.get_event_loop().time()
 
-            # Wait for all setup tasks to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            setup_complete_time = asyncio.get_event_loop().time()
-
-            # Extract results and check for failures
-            overlay_result = results[0]
-            cgroup_result = results[1]
-
-            # Check for overlay/cgroup failures
-            if isinstance(overlay_result, Exception):
-                raise overlay_result
-            if isinstance(cgroup_result, Exception):
-                raise cgroup_result
-
-            # Type assertion for cgroup_result
-            assert isinstance(cgroup_result, Path)
-            cgroup_path = cgroup_result
-
-            if len(results) == 3:  # gvproxy was started
-                gvproxy_result = results[2]
-                if isinstance(gvproxy_result, Exception):
+                # Check for failures
+                if isinstance(overlay_result, BaseException):
+                    raise overlay_result
+                if isinstance(cgroup_result, BaseException):
+                    raise cgroup_result
+                if isinstance(gvproxy_result, BaseException):
                     raise gvproxy_result
+
+                # Type narrowing: after BaseException checks, cgroup_result is Path
+                cgroup_path = cgroup_result
+
                 # Unpack tuple from _start_gvproxy
-                assert isinstance(gvproxy_result, tuple) and len(gvproxy_result) == 3
-                proc_item, socket_item, task_item = gvproxy_result
-                assert isinstance(proc_item, ProcessWrapper)
-                assert isinstance(socket_item, Path)
-                assert isinstance(task_item, asyncio.Task)
-                gvproxy_proc = proc_item
-                gvproxy_socket = socket_item
-                gvproxy_log_task = task_item
+                gvproxy_proc, gvproxy_socket, gvproxy_log_task = gvproxy_result
+            else:
+                # Run overlay and cgroup setup in parallel (no gvproxy)
+                overlay_result, cgroup_result = await asyncio.gather(
+                    self._create_overlay(base_image, overlay_image),
+                    self._setup_cgroup(vm_id, tenant_id),
+                    return_exceptions=True,
+                )
+                setup_complete_time = asyncio.get_event_loop().time()
+
+                # Check for failures
+                if isinstance(overlay_result, BaseException):
+                    raise overlay_result
+                if isinstance(cgroup_result, BaseException):
+                    raise cgroup_result
+
+                # Type narrowing: after BaseException checks, cgroup_result is Path
+                cgroup_path = cgroup_result
 
             # Step 5: Build QEMU command (always Linux in container)
             qemu_cmd = self._build_linux_cmd(
@@ -894,7 +906,7 @@ class VmManager:
             try:
                 # DEBUG: Log the exact command
                 last_arg = qemu_cmd[-1]
-                last_arg_preview = last_arg[:200] if len(last_arg) > 200 else last_arg
+                last_arg_preview = last_arg[:200] if len(last_arg) > 200 else last_arg  # noqa: PLR2004
                 logger.debug(
                     "QEMU command with network",
                     extra={
@@ -916,14 +928,14 @@ class VmManager:
                 )
 
                 # Background task to drain QEMU output (prevent 64KB pipe deadlock)
-                console_log_path = Path(f"/tmp/vm-{vm_id}-console.log")
-                console_log = console_log_path.open("w", buffering=1)  # Line buffering
+                console_log_path = Path(f"/tmp/vm-{vm_id}-console.log")  # noqa: S108
+                console_log = console_log_path.open("w", buffering=1)  # noqa: ASYNC230 - Line buffering for sync writes
 
                 def write_to_console(line: str) -> None:
                     """Write line to console log file and structured logs."""
                     try:
                         console_log.write(f"[{vm_id}] {line}\n")
-                    except Exception as e:
+                    except OSError as e:
                         logger.error(f"Console write failed: {e}", extra={"context_id": vm_id})
 
                 qemu_log_task = asyncio.create_task(
@@ -956,7 +968,7 @@ class VmManager:
                             "exit_code": qemu_proc.returncode,
                             "memory_mb": memory_mb,
                             "allow_network": allow_network,
-                            "qemu_cmd_preview": qemu_cmd[:5] if len(qemu_cmd) > 5 else qemu_cmd,
+                            "qemu_cmd_preview": qemu_cmd[:5] if len(qemu_cmd) > 5 else qemu_cmd,  # noqa: PLR2004
                         },
                     )
 
@@ -992,16 +1004,16 @@ class VmManager:
                 self._vms[vm.vm_id] = vm
 
             # Transition to BOOTING state
-            await vm._transition_state(VmState.BOOTING)
+            await vm.transition_state(VmState.BOOTING)
 
             try:
                 await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
                 boot_complete_time = asyncio.get_event_loop().time()
                 # Store timing on VM for scheduler to use
-                vm._setup_ms = int((setup_complete_time - start_time) * 1000)
-                vm._boot_ms = int((boot_complete_time - setup_complete_time) * 1000)
+                vm.setup_ms = int((setup_complete_time - start_time) * 1000)
+                vm.boot_ms = int((boot_complete_time - setup_complete_time) * 1000)
                 # Transition to READY state after boot completes
-                await vm._transition_state(VmState.READY)
+                await vm.transition_state(VmState.READY)
             except TimeoutError as e:
                 # Capture QEMU output for debugging
                 stdout_text, stderr_text = await self._capture_qemu_output(qemu_proc)
@@ -1036,8 +1048,8 @@ class VmManager:
                 extra={
                     "vm_id": vm_id,
                     "language": language,
-                    "setup_ms": vm._setup_ms,
-                    "boot_ms": vm._boot_ms,
+                    "setup_ms": vm.setup_ms,
+                    "boot_ms": vm.boot_ms,
                     "total_boot_ms": total_boot_ms,
                 },
             )
@@ -1310,25 +1322,19 @@ class VmManager:
         try:
             # Close console log file before cancelling tasks
             if vm.console_log:
-                try:
+                with contextlib.suppress(OSError):
                     vm.console_log.close()
-                except Exception:
-                    pass
 
             # Cancel output reader tasks (prevent pipe deadlock during cleanup)
             if vm.qemu_log_task and not vm.qemu_log_task.done():
                 vm.qemu_log_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await vm.qemu_log_task
-                except asyncio.CancelledError:
-                    pass  # Expected when cancelling
 
             if vm.gvproxy_log_task and not vm.gvproxy_log_task.done():
                 vm.gvproxy_log_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await vm.gvproxy_log_task
-                except asyncio.CancelledError:
-                    pass  # Expected when cancelling
 
             # Destroy VM (transitions state, closes channel)
             await vm.destroy()
@@ -1377,7 +1383,7 @@ class VmManager:
             Path to socket file with hashed vm_id
         """
         hash_hex = hashlib.sha256(vm_id.encode()).hexdigest()
-        return Path(f"/tmp/{prefix}-{hash_hex}.sock")
+        return Path(f"/tmp/{prefix}-{hash_hex}.sock")  # noqa: S108
 
     def _get_cmd_socket_path(self, vm_id: str) -> str:
         """Get path to virtio-serial Unix socket for command channel (host → guest).
@@ -1401,7 +1407,7 @@ class VmManager:
         """
         return str(self._get_socket_path(vm_id, prefix="event"))
 
-    def _get_base_image(self, language: str) -> Path:
+    def get_base_image(self, language: str) -> Path:
         """Get base image path for language via auto-discovery.
 
         Auto-discovers images matching patterns:
@@ -1533,14 +1539,13 @@ class VmManager:
 
         except OSError as e:
             # Gracefully degrade if cgroups unavailable (e.g., Docker Desktop)
+            # Note: PermissionError is a subclass of OSError, so this handles both
             if e.errno == constants.ERRNO_READ_ONLY_FILESYSTEM:
                 logger.warning(
                     "cgroup v2 unavailable (read-only filesystem), resource limits disabled",
                     extra={"vm_id": vm_id, "path": str(cgroup_path)},
                 )
-                return Path(f"/tmp/cgroup-{vm_id}")
-            raise VmError(f"Failed to setup cgroup: {e}") from e
-        except PermissionError as e:
+                return Path(f"/tmp/cgroup-{vm_id}")  # noqa: S108
             raise VmError(f"Failed to setup cgroup: {e}") from e
 
         return cgroup_path
@@ -1572,7 +1577,8 @@ class VmManager:
         if sysctl_path.exists():
             try:
                 disabled_value = int(sysctl_path.read_text().strip())
-                if disabled_value == 2:
+                # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
+                if disabled_value == 2:  # noqa: PLR2004
                     logger.info(
                         "io_uring disabled via sysctl",
                         extra={"sysctl_value": disabled_value},
@@ -1591,10 +1597,10 @@ class VmManager:
             libc = ctypes.CDLL(None, use_errno=True)
 
             # __NR_io_uring_setup syscall number: 425
-            NR_io_uring_setup = 425
+            nr_io_uring_setup = 425
 
             # Call io_uring_setup(0, NULL) - should fail with EINVAL if supported
-            result = libc.syscall(NR_io_uring_setup, 0, None)
+            result = libc.syscall(nr_io_uring_setup, 0, None)
 
             if result == -1:
                 err = ctypes.get_errno()
@@ -1624,7 +1630,7 @@ class VmManager:
 
             return True
 
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError) as e:
             logger.warning(
                 "io_uring syscall probe failed",
                 extra={"error": str(e), "error_type": type(e).__name__},
@@ -1641,7 +1647,7 @@ class VmManager:
         Returns:
             Command wrapped with ulimit via sh -c
         """
-        import shlex
+        import shlex  # noqa: PLC0415
 
         qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
 
@@ -1656,14 +1662,14 @@ class VmManager:
 
         return ["sh", "-c", shell_cmd]
 
-    def _build_linux_cmd(
+    def _build_linux_cmd(  # noqa: PLR0912, PLR0915
         self,
-        language: str,
+        language: str,  # noqa: ARG002
         vm_id: str,
         overlay_image: Path,
         memory_mb: int,
         allow_network: bool,
-        enable_dns_filtering: bool = False,
+        enable_dns_filtering: bool = False,  # noqa: ARG002
         gvproxy_socket: Path | None = None,
     ) -> list[str]:
         """Build QEMU command for Linux (KVM + unshare + namespaces).
@@ -1686,24 +1692,22 @@ class VmManager:
         if self.machine in ("arm64", "aarch64"):
             arch_suffix = "aarch64"
             qemu_bin = "qemu-system-aarch64"
-            if is_macos:
-                machine_type = "virt,mem-merge=off"
-            else:
-                machine_type = "virt,mem-merge=off,dump-guest-core=off"
+            machine_type = "virt,mem-merge=off" if is_macos else "virt,mem-merge=off,dump-guest-core=off"
         else:
             arch_suffix = "x86_64"
             qemu_bin = "qemu-system-x86_64"
-            if is_macos:
-                machine_type = "microvm,x-option-roms=off,pit=off,pic=off,rtc=off,mem-merge=off"
-            else:
-                machine_type = "microvm,x-option-roms=off,pit=off,pic=off,rtc=off,mem-merge=off,dump-guest-core=off"
+            machine_type = (
+                "microvm,x-option-roms=off,pit=off,pic=off,rtc=off,mem-merge=off"
+                if is_macos
+                else "microvm,x-option-roms=off,pit=off,pic=off,rtc=off,mem-merge=off,dump-guest-core=off"
+            )
 
         # Auto-discover kernel and initramfs based on architecture
         kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
         initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
 
         # Layer 5: Linux namespaces
-        cmd = []
+        cmd: list[str] = []
         if detect_host_os() != HostOS.MACOS:
             if allow_network:
                 unshare_args = ["unshare", "--pid", "--mount", "--uts", "--ipc", "--fork"]
@@ -1863,7 +1867,7 @@ class VmManager:
 
         return cmd
 
-    async def _wait_for_guest(self, vm: QemuVM, timeout: float) -> None:
+    async def _wait_for_guest(self, vm: QemuVM, timeout: float) -> None:  # noqa: PLR0915
         """Wait for guest agent using event-driven racing.
 
         Races QEMU process death monitor against guest readiness checks with retry logic.
@@ -1946,7 +1950,7 @@ class VmManager:
                         guest_task = asyncio.create_task(check_guest_ready())
 
                         # Race: first one wins
-                        done, pending = await asyncio.wait(
+                        done, _pending = await asyncio.wait(
                             {death_task, guest_task},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
@@ -1955,10 +1959,8 @@ class VmManager:
                         if death_task in done:
                             # QEMU died - cancel guest and retrieve exception
                             guest_task.cancel()
-                            try:
+                            with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
                                 await guest_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
                             await death_task  # Re-raise VmError
 
                         # Guest task completed - check result (raises if failed, triggering retry)
@@ -1966,10 +1968,8 @@ class VmManager:
 
                 # Success - cancel death monitor
                 death_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await death_task
-                except asyncio.CancelledError:
-                    pass
 
         except TimeoutError:
             # Clean up in-flight tasks
@@ -1978,16 +1978,14 @@ class VmManager:
                     task.cancel()
             for task in (death_task, guest_task):
                 if task is not None:
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
                         await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-            console_log_path = Path(f"/tmp/vm-{vm.vm_id}-console.log")
+            console_log_path = Path(f"/tmp/vm-{vm.vm_id}-console.log")  # noqa: S108
             console_output = "none"
             if console_log_path.exists():
                 try:
                     console_output = console_log_path.read_text()[: constants.CONSOLE_LOG_MAX_BYTES]
-                except Exception:
+                except OSError:
                     console_output = "failed to read console log"
 
             logger.error(
@@ -2000,4 +1998,4 @@ class VmManager:
                 },
             )
 
-            raise TimeoutError(f"Guest agent not ready after {timeout}s")
+            raise TimeoutError(f"Guest agent not ready after {timeout}s") from None

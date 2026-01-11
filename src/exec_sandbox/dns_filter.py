@@ -22,7 +22,7 @@ class DNSZone(BaseModel):
 
     name: str = Field(description="Zone name")
     records: list[DNSRecord] = Field(description="DNS records to allow")
-    defaultIP: str = Field(default="0.0.0.0", description="IP for blocked domains (0.0.0.0 = NXDOMAIN)")
+    defaultIP: str = Field(default="0.0.0.0", description="IP for blocked domains (0.0.0.0 = NXDOMAIN)")  # noqa: N815, S104
 
 
 # Default package registry domains
@@ -90,7 +90,7 @@ def create_dns_zone(
     return DNSZone(
         name=zone_name,
         records=create_dns_records(domains),
-        defaultIP="0.0.0.0" if block_others else "8.8.8.8",
+        defaultIP="0.0.0.0" if block_others else "8.8.8.8",  # noqa: S104
     )
 
 

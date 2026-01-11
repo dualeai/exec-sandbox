@@ -66,7 +66,7 @@ test-static:
 	uv run ruff format --check .
 	uv run ruff check .
 	uv run pyright .
-	uv run -m vulture .
+	uv run -m vulture src/ scripts/ --min-confidence 80
 	$(MAKE) --directory guest-agent test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 

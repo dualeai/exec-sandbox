@@ -13,7 +13,7 @@ def require_aioboto3():
         SandboxDependencyError: If aioboto3 is not installed.
     """
     try:
-        import aioboto3
+        import aioboto3  # type: ignore[import-untyped]  # noqa: PLC0415
 
         return aioboto3
     except ImportError as e:

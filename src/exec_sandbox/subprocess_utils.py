@@ -79,8 +79,8 @@ async def drain_subprocess_output(
                         decoded = line.decode().rstrip()
                         if decoded:
                             stdout_handler(decoded)
-                    except Exception:
-                        pass  # Ignore decode errors
+                    except (UnicodeDecodeError, ValueError):
+                        pass  # Ignore decode errors - non-UTF8 output is silently skipped
 
         async def read_stderr() -> None:
             """Read stderr until EOF."""
@@ -90,8 +90,8 @@ async def drain_subprocess_output(
                         decoded = line.decode().rstrip()
                         if decoded:
                             stderr_handler(decoded)
-                    except Exception:
-                        pass  # Ignore decode errors
+                    except (UnicodeDecodeError, ValueError):
+                        pass  # Ignore decode errors - non-UTF8 output is silently skipped
 
         # Launch concurrent readers (prevent deadlock)
         if process.stdout:

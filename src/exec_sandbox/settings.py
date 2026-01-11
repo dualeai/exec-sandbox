@@ -33,7 +33,7 @@ class Settings(BaseSettings):
 
     # Execution
     max_concurrent_vms: int = 10
-    snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-snapshots")
+    snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-snapshots")  # noqa: S108
 
     # Snapshot cache (2-tier: L1=local, L3=S3)
     snapshot_cache_ttl_days: int = 14  # AWS Lambda SnapStart pattern

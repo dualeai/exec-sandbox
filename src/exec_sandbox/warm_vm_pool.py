@@ -12,7 +12,7 @@ Architecture:
 Performance:
 - Default image (packages=[]): 1-2ms allocation (vs 400ms cold boot)
 - Custom packages: Fallback to cold boot (no change)
-- Memory overhead: ~1GB for 4 VMs (256MB × 4, based on 25% of max_concurrent_vms=10)
+- Memory overhead: ~1GB for 4 VMs (256MB x 4, based on 25% of max_concurrent_vms=10)
 
 Example:
     ```python
@@ -32,13 +32,16 @@ Example:
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import contextlib
+from typing import TYPE_CHECKING, Any
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.models import Language
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from exec_sandbox.config import SchedulerConfig
     from exec_sandbox.vm_manager import QemuVM, VmManager
 
@@ -85,10 +88,10 @@ class WarmVMPool:
         }
 
         # Track background replenish tasks (prevent GC)
-        self._replenish_tasks: set[asyncio.Task] = set()
+        self._replenish_tasks: set[asyncio.Task[None]] = set()
 
         # Health check task
-        self._health_task: asyncio.Task | None = None
+        self._health_task: asyncio.Task[None] | None = None
         self._shutdown_event = asyncio.Event()
 
         logger.info(
@@ -117,14 +120,13 @@ class WarmVMPool:
         boot_start = asyncio.get_event_loop().time()
 
         # Build list of all VMs to boot (parallel execution)
-        boot_tasks = []
+        boot_coroutines: list[Coroutine[Any, Any, None]] = []
         for language in constants.WARM_POOL_LANGUAGES:
             logger.info(f"Pre-booting {self.pool_size_per_language} {language.value} VMs (parallel)")
-            for i in range(self.pool_size_per_language):
-                boot_tasks.append(self._boot_and_add_vm(language, index=i))
+            boot_coroutines.extend(self._boot_and_add_vm(language, index=i) for i in range(self.pool_size_per_language))
 
         # Boot all VMs in parallel
-        results = await asyncio.gather(*boot_tasks, return_exceptions=True)
+        results: list[None | BaseException] = await asyncio.gather(*boot_coroutines, return_exceptions=True)
 
         # Log failures (graceful degradation)
         for i, result in enumerate(results):
@@ -188,9 +190,9 @@ class WarmVMPool:
             )
 
             # Trigger background replenishment (fire-and-forget)
-            replenish_task = asyncio.create_task(self._replenish_pool(language))
+            replenish_task: asyncio.Task[None] = asyncio.create_task(self._replenish_pool(language))
             self._replenish_tasks.add(replenish_task)
-            replenish_task.add_done_callback(self._replenish_tasks.discard)
+            replenish_task.add_done_callback(lambda t: self._replenish_tasks.discard(t))
 
             return vm
 
@@ -218,7 +220,7 @@ class WarmVMPool:
             await self._health_task
 
         # Drain and destroy all VMs in parallel
-        destroy_tasks = []
+        destroy_tasks: list[asyncio.Task[bool]] = []
         destroyed_count = 0
         for language, pool in self.pools.items():
             while not pool.empty():
@@ -231,17 +233,15 @@ class WarmVMPool:
 
         # Wait for all destructions to complete
         if destroy_tasks:
-            results = await asyncio.gather(*destroy_tasks, return_exceptions=True)
+            results: list[bool | BaseException] = await asyncio.gather(*destroy_tasks, return_exceptions=True)
             destroyed_count = sum(1 for r in results if r is True)
 
         # Cancel pending replenish tasks (wait for cancellation to complete)
         # Copy set to avoid "Set changed size during iteration" error
         for task in list(self._replenish_tasks):
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass  # Expected during shutdown
+            with contextlib.suppress(asyncio.CancelledError):
+                await task  # Expected during shutdown
 
         logger.info("Warm VM pool shutdown complete", extra={"destroyed_vms": destroyed_count})
 
@@ -320,7 +320,7 @@ class WarmVMPool:
         tenant_id = constants.WARM_POOL_TENANT_ID
         task_id = f"warm-{language.value}-{index}"
 
-        vm = await self.vm_manager.create_vm(
+        return await self.vm_manager.create_vm(
             language=language.value,
             tenant_id=tenant_id,
             task_id=task_id,
@@ -329,8 +329,6 @@ class WarmVMPool:
             allow_network=False,  # Complete isolation
             allowed_domains=None,
         )
-
-        return vm
 
     async def _replenish_pool(self, language: Language) -> None:
         """Replenish pool in background (non-blocking).
@@ -386,90 +384,117 @@ class WarmVMPool:
             except TimeoutError:
                 pass  # Continue health check
 
-            # Check all VMs in all pools (parallel with aiojobs)
-            # Strategy: Remove VMs, check in parallel, restore only healthy ones
-            # This ensures pool never has unhealthy VMs, even if some exhaustion during check
+            # Check all VMs in all pools
             for language, pool in self.pools.items():
-                pool_size = pool.qsize()
-                if pool_size == 0:
-                    continue
-
-                # Log health check iteration start
-                check_start = asyncio.get_event_loop().time()
-                logger.info(
-                    "Health check iteration starting",
-                    extra={"language": language.value, "pool_size": pool_size},
-                )
-
-                # Remove all VMs from pool (atomic snapshot)
-                vms_to_check: list[QemuVM] = []
-                for _ in range(pool_size):
-                    try:
-                        vm = pool.get_nowait()
-                        vms_to_check.append(vm)
-                    except asyncio.QueueEmpty:
-                        break
-
-                logger.debug(
-                    "Pool drained for health check",
-                    extra={"language": language.value, "vms_removed": len(vms_to_check)},
-                )
-
-                # Health check all VMs in parallel (pool is empty during check)
-                # Accept temporary exhaustion for correctness
-                if vms_to_check:
-                    results = await asyncio.gather(
-                        *[self._check_vm_health(vm) for vm in vms_to_check],
-                        return_exceptions=True,
-                    )
-
-                    # Restore only healthy VMs
-                    healthy_count = 0
-                    unhealthy_count = 0
-                    for vm, result in zip(vms_to_check, results):
-                        if isinstance(result, Exception):
-                            # Health check failed with exception
-                            logger.error(
-                                "Health check exception",
-                                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(result)},
-                                exc_info=result,
-                            )
-                            healthy = False
-                        else:
-                            healthy = result
-
-                        if healthy:
-                            # Restore healthy VM
-                            await pool.put(vm)
-                            healthy_count += 1
-                        else:
-                            # Destroy unhealthy VM and trigger replenish
-                            logger.warning(
-                                "Unhealthy warm VM detected",
-                                extra={"language": language.value, "vm_id": vm.vm_id},
-                            )
-                            unhealthy_count += 1
-                            try:
-                                await self.vm_manager.destroy_vm(vm)
-                            except Exception:
-                                pass  # Already dead
-
-                            # Trigger replenishment
-                            asyncio.create_task(self._replenish_pool(language))
-
-                    check_duration = asyncio.get_event_loop().time() - check_start
-                    logger.info(
-                        "Health check iteration complete",
-                        extra={
-                            "language": language.value,
-                            "duration_ms": f"{check_duration * 1000:.1f}",
-                            "healthy": healthy_count,
-                            "unhealthy": unhealthy_count,
-                            "pool_size": pool.qsize(),
-                        },
-                    )
+                await self._health_check_pool(language, pool)
 
         logger.info("Warm pool health check stopped")
+
+    async def _health_check_pool(self, language: Language, pool: asyncio.Queue[QemuVM]) -> None:
+        """Perform health check on a single pool.
+
+        Strategy: Remove VMs, check in parallel, restore only healthy ones.
+        This ensures pool never has unhealthy VMs, even if some exhaustion during check.
+        """
+        pool_size = pool.qsize()
+        if pool_size == 0:
+            return
+
+        check_start = asyncio.get_event_loop().time()
+        logger.info(
+            "Health check iteration starting",
+            extra={"language": language.value, "pool_size": pool_size},
+        )
+
+        # Remove all VMs from pool (atomic snapshot)
+        vms_to_check = self._drain_pool_for_check(pool, pool_size, language)
+        if not vms_to_check:
+            return
+
+        # Health check all VMs in parallel
+        results = await asyncio.gather(
+            *[self._check_vm_health(vm) for vm in vms_to_check],
+            return_exceptions=True,
+        )
+
+        # Process results and restore healthy VMs
+        healthy_count, unhealthy_count = await self._process_health_results(language, pool, vms_to_check, results)
+
+        check_duration = asyncio.get_event_loop().time() - check_start
+        logger.info(
+            "Health check iteration complete",
+            extra={
+                "language": language.value,
+                "duration_ms": f"{check_duration * 1000:.1f}",
+                "healthy": healthy_count,
+                "unhealthy": unhealthy_count,
+                "pool_size": pool.qsize(),
+            },
+        )
+
+    def _drain_pool_for_check(self, pool: asyncio.Queue[QemuVM], pool_size: int, language: Language) -> list[QemuVM]:
+        """Drain VMs from pool for health checking."""
+        vms_to_check: list[QemuVM] = []
+        for _ in range(pool_size):
+            try:
+                vm = pool.get_nowait()
+                vms_to_check.append(vm)
+            except asyncio.QueueEmpty:
+                break
+
+        logger.debug(
+            "Pool drained for health check",
+            extra={"language": language.value, "vms_removed": len(vms_to_check)},
+        )
+        return vms_to_check
+
+    async def _process_health_results(
+        self,
+        language: Language,
+        pool: asyncio.Queue[QemuVM],
+        vms: list[QemuVM],
+        results: list[bool | BaseException],
+    ) -> tuple[int, int]:
+        """Process health check results and restore healthy VMs."""
+        healthy_count = 0
+        unhealthy_count = 0
+
+        for vm, result in zip(vms, results, strict=True):
+            healthy = self._evaluate_health_result(result, language, vm)
+
+            if healthy:
+                await pool.put(vm)
+                healthy_count += 1
+            else:
+                await self._handle_unhealthy_vm(vm, language)
+                unhealthy_count += 1
+
+        return healthy_count, unhealthy_count
+
+    def _evaluate_health_result(self, result: bool | BaseException, language: Language, vm: QemuVM) -> bool:
+        """Evaluate health check result for a single VM."""
+        if isinstance(result, BaseException):
+            logger.error(
+                "Health check exception",
+                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(result)},
+                exc_info=result,
+            )
+            return False
+        return result
+
+    async def _handle_unhealthy_vm(self, vm: QemuVM, language: Language) -> None:
+        """Handle an unhealthy VM by destroying and triggering replenishment."""
+        logger.warning(
+            "Unhealthy warm VM detected",
+            extra={"language": language.value, "vm_id": vm.vm_id},
+        )
+        with contextlib.suppress(Exception):
+            await self.vm_manager.destroy_vm(vm)
+
+        # Trigger replenishment
+        task: asyncio.Task[None] = asyncio.create_task(self._replenish_pool(language))
+        self._replenish_tasks.add(task)
+        task.add_done_callback(lambda t: self._replenish_tasks.discard(t))
 
     async def _check_vm_health(self, vm: QemuVM) -> bool:
         """Check if VM is healthy (guest agent responsive).
@@ -493,7 +518,7 @@ class WarmVMPool:
             True if healthy, False otherwise
         """
         try:
-            from exec_sandbox.guest_agent_protocol import (
+            from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
                 PingRequest,
                 PongMessage,
             )
@@ -514,8 +539,8 @@ class WarmVMPool:
             )
             return isinstance(response, PongMessage)
 
-        except Exception as e:
-            # Log exception for debugging
+        except (OSError, TimeoutError, asyncio.CancelledError, ConnectionError) as e:
+            # Log exception for debugging - specific exceptions for health check failures
             logger.warning(
                 "Health check ping failed",
                 extra={"vm_id": vm.vm_id, "error": str(e), "error_type": type(e).__name__},

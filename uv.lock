@@ -596,6 +596,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "aiohttp" },
     { name = "moto", extra = ["s3", "server"] },
     { name = "pyright" },
     { name = "pytest" },
@@ -605,6 +606,7 @@ dev = [
     { name = "pytest-xdist" },
     { name = "ruff" },
     { name = "twine" },
+    { name = "vulture" },
 ]
 s3 = [
     { name = "aioboto3" },
@@ -614,6 +616,7 @@ s3 = [
 requires-dist = [
     { name = "aioboto3", marker = "extra == 's3'", specifier = "~=13.0" },
     { name = "aiofiles", specifier = "~=24.0" },
+    { name = "aiohttp", marker = "extra == 'dev'", specifier = "~=3.11" },
     { name = "aiojobs", specifier = "~=1.3" },
     { name = "moto", extras = ["s3", "server"], marker = "extra == 'dev'", specifier = "~=5.0" },
     { name = "psutil", specifier = "~=5.9" },
@@ -628,6 +631,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "~=0.7" },
     { name = "tenacity", specifier = "~=8.0" },
     { name = "twine", marker = "extra == 'dev'", specifier = "~=6.1" },
+    { name = "vulture", marker = "extra == 'dev'", specifier = "~=2.14" },
     { name = "zstandard", specifier = "~=0.23" },
 ]
 provides-extras = ["s3", "dev"]
@@ -2172,6 +2176,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c7/24/5f1b3bdffd70275f6661c76461e25f024d5a38a46f04aaca912426a2b1d3/urllib3-2.6.3.tar.gz", hash = "sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed", size = 435556, upload-time = "2026-01-07T16:24:43.925Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/39/08/aaaad47bc4e9dc8c725e68f9d04865dbcb2052843ff09c97b08904852d84/urllib3-2.6.3-py3-none-any.whl", hash = "sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4", size = 131584, upload-time = "2026-01-07T16:24:42.685Z" },
+]
+
+[[package]]
+name = "vulture"
+version = "2.14"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8e/25/925f35db758a0f9199113aaf61d703de891676b082bd7cf73ea01d6000f7/vulture-2.14.tar.gz", hash = "sha256:cb8277902a1138deeab796ec5bef7076a6e0248ca3607a3f3dee0b6d9e9b8415", size = 58823, upload-time = "2024-12-08T17:39:43.319Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/56/0cc15b8ff2613c1d5c3dc1f3f576ede1c43868c1bc2e5ccaa2d4bcd7974d/vulture-2.14-py2.py3-none-any.whl", hash = "sha256:d9a90dba89607489548a49d557f8bac8112bd25d3cbc8aeef23e860811bd5ed9", size = 28915, upload-time = "2024-12-08T17:39:40.573Z" },
 ]
 
 [[package]]

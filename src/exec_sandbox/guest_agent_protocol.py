@@ -8,11 +8,12 @@ Security: All fields validated by guest agent (see guest-agent/src/main.rs).
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-from exec_sandbox.models import Language
+if TYPE_CHECKING:
+    from exec_sandbox.models import Language
 
 # ============================================================================
 # Request Models

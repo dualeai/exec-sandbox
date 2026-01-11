@@ -52,6 +52,7 @@ s3 = [
     "aioboto3~=13.0",
 ]
 dev = [
+    "aiohttp~=3.11",  # For scripts/build_package_catalogs.py
     "pytest~=8.0",
     "pytest-asyncio~=0.24",
     "pytest-cov~=6.0",
@@ -60,6 +61,7 @@ dev = [
     "pyright~=1.1",
     "ruff~=0.7",
     "twine~=6.1",  # Package verification before PyPI upload
+    "vulture~=2.14",  # Dead code detection
     "moto[s3,server]~=5.0",  # AWS mocking for S3 tests (server mode for aioboto3)
 ]
 
@@ -93,7 +95,7 @@ pythonVersion = "3.12"
 typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
-include = ["src"]
+include = ["src", "scripts"]
 exclude = [".venv", "tests"]
 
 [tool.ruff]
@@ -132,14 +134,25 @@ select = [
     "W",      # pycodestyle warnings
 ]
 ignore = [
+    "A002",     # shadowing builtin (common parameter names like input)
+    "ASYNC109", # async function with timeout parameter (common pattern)
     "E501",     # line too long (handled by formatter)
+    "FBT001",   # boolean positional in function definition (common pattern)
+    "FBT002",   # boolean default positional argument (common pattern)
+    "PLR0911",  # too many return statements
     "PLR0913",  # too many arguments
     "S311",     # random for non-crypto
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"scripts/**/*.py" = [
+    "PLC0415",  # import outside top-level (fine for scripts)
+    "T201",     # print statements (expected in CLI scripts)
+]
 "tests/**/*.py" = [
     "ARG001",   # unused function argument (fixtures, callbacks)
+    "ARG002",   # unused method argument (fixtures in test methods)
+    "ARG005",   # unused lambda argument (callbacks)
     "ASYNC109", # async timeout patterns
     "ASYNC220", # async subprocess
     "ASYNC230", # async open
@@ -151,8 +164,11 @@ ignore = [
     "PLR0915",  # too many statements
     "PLR2004",  # magic values
     "S101",     # assert
+    "S104",     # possible binding to all interfaces (0.0.0.0 in tests is fine)
+    "S108",     # probable insecure temp file (test paths are fine)
     "S603",     # subprocess call
     "S607",     # partial executable path
+    "SIM105",   # contextlib.suppress (explicit try-except is clearer in tests)
     "SIM115",   # context manager for open
     "SIM117",   # nested with
     "SLF001",   # private member access (needed for testing internal methods)

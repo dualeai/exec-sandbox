@@ -92,27 +92,21 @@ static BLOCKED_ENV_VARS: &[&str] = &[
     "LD_ORIGIN_PATH",
     "LD_AOUT_LIBRARY_PATH",
     "LD_AOUT_PRELOAD",
-
     // glibc tunables - CVE-2023-4911
     "GLIBC_TUNABLES",
-
     // Node.js runtime
     "NODE_OPTIONS",
     "NODE_REPL_HISTORY",
-
     // Python runtime
     "PYTHONWARNINGS",
     "PYTHONSTARTUP",
     "PYTHONHOME",
-
     // Shell environment execution
     "BASH_ENV",
     "ENV",
     "PROMPT_COMMAND",
-
     // Path manipulation
     "PATH",
-
     // glibc/system hooks
     "GCONV_PATH",
     "HOSTALIASES",
@@ -126,7 +120,6 @@ static BLOCKED_ENV_VARS: &[&str] = &[
     "MALLOC_TRACE",
     "MALLOC_PERTURB_",
 ];
-
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
@@ -200,7 +193,10 @@ async fn send_streaming_error(
     response.push(b'\n');
 
     // Queue write (blocks if queue full - backpressure)
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
     Ok(())
 }
 
@@ -229,7 +225,12 @@ async fn install_packages(
 
     // Validation: check packages list is not empty
     if packages.is_empty() {
-        send_streaming_error(write_tx, "No packages specified for installation".to_string(), "validation_error").await?;
+        send_streaming_error(
+            write_tx,
+            "No packages specified for installation".to_string(),
+            "validation_error",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -237,9 +238,14 @@ async fn install_packages(
     if packages.len() > MAX_PACKAGES {
         send_streaming_error(
             write_tx,
-            format!("Too many packages: {} (max {})", packages.len(), MAX_PACKAGES),
+            format!(
+                "Too many packages: {} (max {})",
+                packages.len(),
+                MAX_PACKAGES
+            ),
             "validation_error",
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -247,7 +253,12 @@ async fn install_packages(
     for pkg in packages {
         // Check empty
         if pkg.is_empty() {
-            send_streaming_error(write_tx, "Package name cannot be empty".to_string(), "validation_error").await?;
+            send_streaming_error(
+                write_tx,
+                "Package name cannot be empty".to_string(),
+                "validation_error",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -255,9 +266,14 @@ async fn install_packages(
         if pkg.len() > MAX_PACKAGE_NAME_LENGTH {
             send_streaming_error(
                 write_tx,
-                format!("Package name too long: {} bytes (max {})", pkg.len(), MAX_PACKAGE_NAME_LENGTH),
+                format!(
+                    "Package name too long: {} bytes (max {})",
+                    pkg.len(),
+                    MAX_PACKAGE_NAME_LENGTH
+                ),
                 "validation_error",
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
 
@@ -265,15 +281,24 @@ async fn install_packages(
         if pkg.contains("..") || pkg.contains("/") || pkg.contains("\\") {
             send_streaming_error(
                 write_tx,
-                format!("Invalid package name: '{}' (path characters not allowed)", pkg),
+                format!(
+                    "Invalid package name: '{}' (path characters not allowed)",
+                    pkg
+                ),
                 "validation_error",
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
 
         // Check for null bytes
         if pkg.contains('\0') {
-            send_streaming_error(write_tx, "Package name contains null byte".to_string(), "validation_error").await?;
+            send_streaming_error(
+                write_tx,
+                "Package name contains null byte".to_string(),
+                "validation_error",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -281,9 +306,13 @@ async fn install_packages(
         if pkg.chars().any(|c| c.is_control()) {
             send_streaming_error(
                 write_tx,
-                format!("Invalid package name: '{}' (control characters not allowed)", pkg),
+                format!(
+                    "Invalid package name: '{}' (control characters not allowed)",
+                    pkg
+                ),
                 "validation_error",
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
 
@@ -291,9 +320,13 @@ async fn install_packages(
         if !PACKAGE_NAME_REGEX.is_match(pkg) {
             send_streaming_error(
                 write_tx,
-                format!("Invalid package name: '{}' (contains invalid characters)", pkg),
+                format!(
+                    "Invalid package name: '{}' (contains invalid characters)",
+                    pkg
+                ),
                 "validation_error",
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -303,7 +336,10 @@ async fn install_packages(
     let mut cmd = match language {
         "python" => {
             let mut c = Command::new("uv");
-            c.arg("pip").arg("install").arg("--system").arg("--break-system-packages");
+            c.arg("pip")
+                .arg("install")
+                .arg("--system")
+                .arg("--break-system-packages");
             for pkg in packages {
                 c.arg(pkg);
             }
@@ -328,7 +364,12 @@ async fn install_packages(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Failed to execute package manager for {}: {}", language, e), "execution_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Failed to execute package manager for {}: {}", language, e),
+                "execution_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -350,7 +391,10 @@ async fn install_packages(
                 if remaining > 0 {
                     lines.push(line[..remaining.min(line.len())].to_string());
                 }
-                lines.push(format!("[truncated: output limit {}KB exceeded]", MAX_PACKAGE_OUTPUT_BYTES / 1024));
+                lines.push(format!(
+                    "[truncated: output limit {}KB exceeded]",
+                    MAX_PACKAGE_OUTPUT_BYTES / 1024
+                ));
                 break;
             }
             total_bytes += line.len() + 1;
@@ -370,7 +414,10 @@ async fn install_packages(
                 if remaining > 0 {
                     lines.push(line[..remaining.min(line.len())].to_string());
                 }
-                lines.push(format!("[truncated: output limit {}KB exceeded]", MAX_PACKAGE_OUTPUT_BYTES / 1024));
+                lines.push(format!(
+                    "[truncated: output limit {}KB exceeded]",
+                    MAX_PACKAGE_OUTPUT_BYTES / 1024
+                ));
                 break;
             }
             total_bytes += line.len() + 1;
@@ -382,19 +429,33 @@ async fn install_packages(
     // Wait for process with timeout
     let wait_result = tokio::time::timeout(
         Duration::from_secs(PACKAGE_INSTALL_TIMEOUT_SECONDS),
-        child.wait()
-    ).await;
+        child.wait(),
+    )
+    .await;
 
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             let _ = child.kill().await;
-            send_streaming_error(write_tx, format!("Process wait error: {}", e), "execution_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Process wait error: {}", e),
+                "execution_error",
+            )
+            .await?;
             return Ok(());
         }
         Err(_) => {
             let _ = child.kill().await;
-            send_streaming_error(write_tx, format!("Package installation timeout after {}s", PACKAGE_INSTALL_TIMEOUT_SECONDS), "timeout_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!(
+                    "Package installation timeout after {}s",
+                    PACKAGE_INSTALL_TIMEOUT_SECONDS
+                ),
+                "timeout_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -415,7 +476,10 @@ async fn install_packages(
         let json = serde_json::to_string(&chunk)?;
         let mut response = json.into_bytes();
         response.push(b'\n');
-        write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+        write_tx
+            .send(response)
+            .await
+            .map_err(|_| "Write queue closed")?;
     }
 
     if !stderr_lines.is_empty() {
@@ -426,7 +490,10 @@ async fn install_packages(
         let json = serde_json::to_string(&chunk)?;
         let mut response = json.into_bytes();
         response.push(b'\n');
-        write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+        write_tx
+            .send(response)
+            .await
+            .map_err(|_| "Write queue closed")?;
     }
 
     // Send completion message
@@ -438,7 +505,10 @@ async fn install_packages(
     let json = serde_json::to_string(&complete)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
 
     Ok(())
 }
@@ -452,7 +522,10 @@ fn validate_execute_params(
 ) -> Result<(), String> {
     // Check language
     if language != "python" && language != "javascript" && language != "raw" {
-        return Err(format!("Unsupported language '{}' (supported: python, javascript, raw)", language));
+        return Err(format!(
+            "Unsupported language '{}' (supported: python, javascript, raw)",
+            language
+        ));
     }
 
     // Check code not empty
@@ -462,31 +535,53 @@ fn validate_execute_params(
 
     // Check code size
     if code.len() > MAX_CODE_SIZE_BYTES {
-        return Err(format!("Code too large: {} bytes (max {} bytes)", code.len(), MAX_CODE_SIZE_BYTES));
+        return Err(format!(
+            "Code too large: {} bytes (max {} bytes)",
+            code.len(),
+            MAX_CODE_SIZE_BYTES
+        ));
     }
 
     // Check timeout
     if timeout > MAX_TIMEOUT_SECONDS {
-        return Err(format!("Timeout too large: {}s (max {}s)", timeout, MAX_TIMEOUT_SECONDS));
+        return Err(format!(
+            "Timeout too large: {}s (max {}s)",
+            timeout, MAX_TIMEOUT_SECONDS
+        ));
     }
 
     // Check environment variables count
     if env_vars.len() > MAX_ENV_VARS {
-        return Err(format!("Too many environment variables: {} (max {})", env_vars.len(), MAX_ENV_VARS));
+        return Err(format!(
+            "Too many environment variables: {} (max {})",
+            env_vars.len(),
+            MAX_ENV_VARS
+        ));
     }
 
     // Check each env var
     for (key, value) in env_vars {
         if BLOCKED_ENV_VARS.contains(&key.to_uppercase().as_str()) {
-            return Err(format!("Blocked environment variable: '{}' (security risk)", key));
+            return Err(format!(
+                "Blocked environment variable: '{}' (security risk)",
+                key
+            ));
         }
 
         if key.is_empty() || key.len() > MAX_ENV_VAR_NAME_LENGTH {
-            return Err(format!("Invalid environment variable name length: {} (max {})", key.len(), MAX_ENV_VAR_NAME_LENGTH));
+            return Err(format!(
+                "Invalid environment variable name length: {} (max {})",
+                key.len(),
+                MAX_ENV_VAR_NAME_LENGTH
+            ));
         }
 
         if value.len() > MAX_ENV_VAR_VALUE_LENGTH {
-            return Err(format!("Environment variable value too large: {} bytes (max {})", value.len(), MAX_ENV_VAR_VALUE_LENGTH));
+            return Err(format!(
+                "Environment variable value too large: {} bytes (max {})",
+                value.len(),
+                MAX_ENV_VAR_VALUE_LENGTH
+            ));
         }
 
         if key.contains('\0') || value.contains('\0') {
@@ -514,7 +609,10 @@ async fn flush_output_buffer(
     let json = serde_json::to_string(&chunk)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
     Ok(())
 }
 
@@ -571,7 +669,12 @@ async fn execute_code_streaming(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Failed to execute {} code: {}", language, e), "execution_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Failed to execute {} code: {}", language, e),
+                "execution_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -658,13 +761,23 @@ async fn execute_code_streaming(
         Ok(Err(e)) => {
             let _ = child.kill().await;
             streaming_task.abort();
-            send_streaming_error(write_tx, format!("Process wait error: {}", e), "execution_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Process wait error: {}", e),
+                "execution_error",
+            )
+            .await?;
             return Ok(());
         }
         Err(_) => {
             let _ = child.kill().await;
             streaming_task.abort();
-            send_streaming_error(write_tx, format!("Execution timeout after {}s", timeout), "timeout_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Execution timeout after {}s", timeout),
+                "timeout_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -684,12 +797,18 @@ async fn execute_code_streaming(
     let json = serde_json::to_string(&complete)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
 
     Ok(())
 }
 
-async fn handle_connection<R, W>(mut reader: R, write_half: W) -> Result<(), Box<dyn std::error::Error>>
+async fn handle_connection<R, W>(
+    mut reader: R,
+    write_half: W,
+) -> Result<(), Box<dyn std::error::Error>>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -772,7 +891,10 @@ where
                     language,
                     packages.len()
                 );
-                if install_packages(&language, &packages, &write_tx).await.is_err() {
+                if install_packages(&language, &packages, &write_tx)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -817,7 +939,6 @@ where
     Ok(())
 }
 
-
 async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::fs::OpenOptions;
 
@@ -831,20 +952,13 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         // Open command port (host → guest, read-only)
-        let cmd_file = match OpenOptions::new()
-            .read(true)
-            .open(CMD_PORT_PATH)
-            .await
-        {
+        let cmd_file = match OpenOptions::new().read(true).open(CMD_PORT_PATH).await {
             Ok(f) => {
                 eprintln!("Guest agent connected to command port (read)");
                 f
             }
             Err(e) => {
-                eprintln!(
-                    "Failed to open command port: {}, retrying in 100ms...",
-                    e
-                );
+                eprintln!("Failed to open command port: {}, retrying in 100ms...", e);
                 // Reduced from 1s to 100ms: virtio ports available shortly after kernel boot
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
@@ -852,20 +966,13 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Open event port (guest → host, write-only)
-        let event_file = match OpenOptions::new()
-            .write(true)
-            .open(EVENT_PORT_PATH)
-            .await
-        {
+        let event_file = match OpenOptions::new().write(true).open(EVENT_PORT_PATH).await {
             Ok(f) => {
                 eprintln!("Guest agent connected to event port (write)");
                 f
             }
             Err(e) => {
-                eprintln!(
-                    "Failed to open event port: {}, retrying in 100ms...",
-                    e
-                );
+                eprintln!("Failed to open event port: {}, retrying in 100ms...", e);
                 // Reduced from 1s to 100ms: virtio ports available shortly after kernel boot
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;

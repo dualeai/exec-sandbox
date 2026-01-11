@@ -23,6 +23,7 @@ Snapshot structure on disk:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import hashlib
 import time
@@ -49,7 +50,7 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingErrorMessage,
 )
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.settings import Settings
+from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 from exec_sandbox.subprocess_utils import drain_subprocess_output
 
 logger = get_logger(__name__)
@@ -92,7 +93,7 @@ class SnapshotManager:
         self._creation_semaphore = asyncio.Semaphore(1)
 
         # Track background S3 upload tasks to prevent GC
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def get_or_create_snapshot(
         self,
@@ -129,8 +130,7 @@ class SnapshotManager:
 
         # L3 cache check
         try:
-            snapshot_path = await self._download_from_s3(cache_key)
-            return snapshot_path
+            return await self._download_from_s3(cache_key)
         except SnapshotError:
             pass  # Cache miss, create new
 
@@ -138,9 +138,9 @@ class SnapshotManager:
         snapshot_path = await self._create_snapshot(language, packages, cache_key, tenant_id, task_id)
 
         # Upload to S3 (async, fire-and-forget, tracked to prevent GC)
-        upload_task = asyncio.create_task(self._upload_to_s3(cache_key, snapshot_path))
+        upload_task: asyncio.Task[None] = asyncio.create_task(self._upload_to_s3(cache_key, snapshot_path))
         self._background_tasks.add(upload_task)
-        upload_task.add_done_callback(self._background_tasks.discard)
+        upload_task.add_done_callback(lambda t: self._background_tasks.discard(t))
         upload_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         return snapshot_path
@@ -198,7 +198,7 @@ class SnapshotManager:
 
         return snapshot_path
 
-    async def _create_snapshot(
+    async def _create_snapshot(  # noqa: PLR0912, PLR0915
         self,
         language: str,
         packages: list[str],
@@ -238,7 +238,7 @@ class SnapshotManager:
         """
         start_time = time.time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
-        base_image = self.vm_manager._get_base_image(language)
+        base_image = self.vm_manager.get_base_image(language)
 
         # Acquire semaphore to limit concurrent snapshot creation
         async with self._creation_semaphore:
@@ -271,7 +271,7 @@ class SnapshotManager:
                 # Race: Install vs VM death - if VM crashes, instant detection
                 # Use FIRST_COMPLETED to exit immediately when either task finishes
                 death_task = asyncio.create_task(self._monitor_vm_death(vm, cache_key))
-                install_task = asyncio.create_task(self._install_packages(vm, language, packages))
+                install_task = asyncio.create_task(self._install_packages(vm, Language(language), packages))
 
                 try:
                     done, pending = await asyncio.wait(
@@ -282,10 +282,8 @@ class SnapshotManager:
                     # Cancel pending task
                     for task in pending:
                         task.cancel()
-                        try:
+                        with contextlib.suppress(asyncio.CancelledError):
                             await task
-                        except asyncio.CancelledError:
-                            pass
 
                     # Check which task completed
                     completed_task = done.pop()
@@ -301,10 +299,8 @@ class SnapshotManager:
                     for task in [death_task, install_task]:
                         if not task.done():
                             task.cancel()
-                            try:
+                            with contextlib.suppress(asyncio.CancelledError):
                                 await task
-                            except asyncio.CancelledError:
-                                pass
                     raise
 
                 # Step 5: Shutdown QEMU process (but keep overlay for commit)
@@ -443,7 +439,7 @@ class SnapshotManager:
             str(base_image),
             "-o",
             # Performance Optimization: Extended L2 Entries (QEMU 5.2+)
-            # Divides 128KB clusters into 32 × 4KB subclusters for granular allocation
+            # Divides 128KB clusters into 32 x 4KB subclusters for granular allocation
             # Benefits:
             # - 10-15x faster IOPS during package install (CoW with backing files)
             # - Reduces write amplification (partial cluster updates)
@@ -627,7 +623,6 @@ class SnapshotManager:
                 hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
 
                 exit_code = -1
-                execution_time_ms = None
                 stderr_chunks: list[str] = []
 
                 async for msg in vm.channel.stream_messages(request, timeout=hard_timeout):
@@ -643,7 +638,7 @@ class SnapshotManager:
 
                     elif isinstance(msg, ExecutionCompleteMessage):
                         exit_code = msg.exit_code
-                        execution_time_ms = msg.execution_time_ms
+                        # Note: msg.execution_time_ms available but not needed for package install
 
                     elif isinstance(msg, StreamingErrorMessage):
                         logger.error(
@@ -739,10 +734,10 @@ class SnapshotManager:
         compressed_path = self.cache_dir / f"{cache_key}.qcow2.zst"
 
         try:
-            async with await self._get_s3_client() as s3:
+            async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
                 # Download compressed qcow2
                 s3_key = f"snapshots/{cache_key}.qcow2.zst"
-                await s3.download_file(
+                await s3.download_file(  # type: ignore[union-attr]
                     self.settings.s3_bucket,
                     s3_key,
                     str(compressed_path),
@@ -752,7 +747,7 @@ class SnapshotManager:
             dctx = zstd.ZstdDecompressor()
 
             def _decompress():
-                with open(compressed_path, "rb") as src, open(snapshot_path, "wb") as dst:
+                with Path(compressed_path).open("rb") as src, Path(snapshot_path).open("wb") as dst:
                     dctx.copy_stream(src, dst)
 
             await asyncio.to_thread(_decompress)
@@ -785,15 +780,15 @@ class SnapshotManager:
             cctx = zstd.ZstdCompressor(level=3)
 
             def _compress():
-                with open(snapshot_path, "rb") as src, open(compressed_path, "wb") as dst:
+                with Path(snapshot_path).open("rb") as src, Path(compressed_path).open("wb") as dst:
                     cctx.copy_stream(src, dst)
 
             await asyncio.to_thread(_compress)
 
-            async with await self._get_s3_client() as s3:
+            async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
                 # Upload compressed qcow2
                 s3_key = f"snapshots/{cache_key}.qcow2.zst"
-                await s3.upload_file(
+                await s3.upload_file(  # type: ignore[union-attr]
                     str(compressed_path),
                     self.settings.s3_bucket,
                     s3_key,
@@ -805,16 +800,19 @@ class SnapshotManager:
             # Cleanup compressed file
             await aiofiles.os.remove(compressed_path)
 
-        except Exception:
+        except (OSError, RuntimeError, ConnectionError):
             # Silent failure (L1 cache still works)
             if compressed_path.exists():
                 await aiofiles.os.remove(compressed_path)
 
-    async def _get_s3_client(self):
+    async def _get_s3_client(self):  # type: ignore[no-untyped-def]
         """Get S3 client (lazy init).
 
         Raises:
             SnapshotError: If S3 backup not configured
+
+        Returns:
+            S3 client context manager from aioboto3 (untyped library)
         """
         if not self.settings.s3_bucket:
             raise SnapshotError("S3 backup disabled (s3_bucket not configured)")
@@ -823,7 +821,7 @@ class SnapshotManager:
             aioboto3 = require_aioboto3()
             self._s3_session = aioboto3.Session()
 
-        return self._s3_session.client(
+        return self._s3_session.client(  # type: ignore[no-any-return]
             "s3",
             region_name=self.settings.s3_region,
             endpoint_url=self.settings.s3_endpoint_url,

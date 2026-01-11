@@ -5,6 +5,7 @@ Provides PID-reuse safe process management wrappers.
 """
 
 import asyncio
+import contextlib
 from enum import Enum, auto
 from functools import cache
 
@@ -69,11 +70,9 @@ class ProcessWrapper:
 
         # Wrap with psutil for PID-reuse safe monitoring
         if async_proc.pid:
-            try:
-                self.psutil_proc = psutil.Process(async_proc.pid)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 # Process already died or inaccessible
-                pass
+                self.psutil_proc = psutil.Process(async_proc.pid)
 
     async def is_running(self) -> bool:
         """Check if process is still running (PID-reuse safe).
@@ -129,10 +128,8 @@ class ProcessWrapper:
         Uses asyncio.to_thread() for blocking psutil operations.
         """
         if self.psutil_proc and await self.is_running():
-            try:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 await asyncio.to_thread(self.psutil_proc.terminate)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
         else:
             self.async_proc.terminate()
 
@@ -143,10 +140,8 @@ class ProcessWrapper:
         Uses asyncio.to_thread() for blocking psutil operations.
         """
         if self.psutil_proc and await self.is_running():
-            try:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 await asyncio.to_thread(self.psutil_proc.kill)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
         else:
             self.async_proc.kill()
 

@@ -98,7 +98,7 @@ class SchedulerConfig(BaseModel):
         description="Directory containing VM images (auto-detect if None)",
     )
     snapshot_cache_dir: Path = Field(
-        default=Path("/tmp/exec-sandbox-cache"),
+        default=Path("/tmp/exec-sandbox-cache"),  # noqa: S108
         description="Local snapshot cache directory (L1 cache)",
     )
 
@@ -138,8 +138,8 @@ class SchedulerConfig(BaseModel):
         Raises:
             FileNotFoundError: Images directory does not exist
         """
-        import os
-        import sys
+        import os  # noqa: PLC0415
+        import sys  # noqa: PLC0415
 
         if self.images_dir is not None:
             path = self.images_dir
