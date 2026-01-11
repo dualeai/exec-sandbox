@@ -1,24 +1,113 @@
 name: Test
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
     branches: [main]
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  actions: read
+  contents: read
 
 jobs:
-  python:
-    name: Python ${{ matrix.python-version }} (${{ matrix.arch }})
+  # ==========================================================================
+  # Static Analysis - Run immediately, no dependencies
+  # ==========================================================================
+
+  static-python:
+    name: Static / Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: make install-deps
+
+      - name: Static checks
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run pyright .
+          uv run -m vulture src/ scripts/ --min-confidence 80
+
+  static-rust:
+    name: Static / Rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guest-agent
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache-workspaces: guest-agent
+
+      - name: Static checks
+        run: make test-static
+
+  static-go:
+    name: Static / Go
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gvproxy-wrapper
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: gvproxy-wrapper/go.sum
+
+      - name: Static checks
+        run: make test-static
+
+  # ==========================================================================
+  # Build - Run in parallel, once per architecture
+  # ==========================================================================
+
+  build-gvproxy-wrapper:
+    name: Build / gvproxy-wrapper (${{ matrix.arch }})
     runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
     strategy:
-      fail-fast: false
       matrix:
         arch: [x64, arm64]
-        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build
+        uses: ./.github/actions/build-gvproxy-wrapper
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvproxy-wrapper-${{ matrix.arch }}
+          path: gvproxy-wrapper/bin/
+          retention-days: 1
+
+  build-guest-agent:
+    name: Build / guest-agent (${{ matrix.arch }})
+    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    strategy:
+      matrix:
+        arch: [x64, arm64]
         include:
           - arch: x64
             image_arch: x86_64
@@ -27,50 +116,65 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7.1.6
-        with:
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6.1.0
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: make install-deps
-
-      - name: Build gvproxy-wrapper
-        uses: ./.github/actions/build-gvproxy-wrapper
-
-      - name: Build guest-agent
+      - name: Build
         uses: ./.github/actions/build-guest-agent
         with:
           arch: ${{ matrix.image_arch }}
 
-      - name: Build VM images
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-agent-${{ matrix.arch }}
+          path: |
+            images/dist/guest-agent-linux-${{ matrix.image_arch }}
+            images/dist/guest-agent-linux-${{ matrix.image_arch }}.hash
+          retention-days: 7
+
+  build-vm-images:
+    name: Build / VM images (${{ matrix.arch }})
+    # Use large runners: qcow2 builds are multithreaded (-m 8) and resource-intensive
+    runs-on: linux-${{ matrix.arch }}-ubuntu2404-large-private
+    needs: build-guest-agent
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            image_arch: x86_64
+          - arch: arm64
+            image_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Download guest-agent
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-agent-${{ matrix.arch }}
+          path: images/dist/
+
+      - name: Build
         uses: ./.github/actions/build-vm-images
         with:
           arch: ${{ matrix.image_arch }}
 
-      - name: Lint (ruff)
-        if: matrix.python-version == '3.12' && matrix.arch == 'x64'
-        run: uv run ruff check src/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-${{ matrix.arch }}
+          path: |
+            images/dist/vmlinuz-${{ matrix.image_arch }}
+            images/dist/vmlinuz-${{ matrix.image_arch }}.hash
+            images/dist/initramfs-${{ matrix.image_arch }}
+            images/dist/*-${{ matrix.image_arch }}.qcow2
+            images/dist/*-${{ matrix.image_arch }}.qcow2.hash
+          retention-days: 7
 
-      - name: Format (ruff)
-        if: matrix.python-version == '3.12' && matrix.arch == 'x64'
-        run: uv run ruff format --check src/
+  # ==========================================================================
+  # Unit Tests - Run in parallel with builds
+  # ==========================================================================
 
-      - name: Type check (pyright)
-        if: matrix.python-version == '3.12' && matrix.arch == 'x64'
-        run: uv run pyright src/
-
-      - name: Test (pytest)
-        run: uv run pytest tests/ --cov=src/exec_sandbox --cov-report=xml
-
-  rust:
-    name: Rust (guest-agent)
+  test-rust:
+    name: Test / Rust
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -78,27 +182,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: rustfmt, clippy
+          cache-workspaces: guest-agent
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: guest-agent
+      - name: Unit tests
+        run: make test-unit
 
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Lint (clippy)
-        run: cargo clippy -- -D warnings
-
-      - name: Test
-        run: cargo test --release
-
-  go:
-    name: Go (gvproxy-wrapper)
+  test-go:
+    name: Test / Go
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -106,17 +199,95 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
-      - name: Install Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.24"
           cache-dependency-path: gvproxy-wrapper/go.sum
 
-      - name: Format
-        run: test -z "$(gofmt -l .)"
+      - name: Unit tests
+        run: make test-unit
 
-      - name: Vet
-        run: go vet ./...
+  # ==========================================================================
+  # Integration Tests - Run after builds complete
+  # ==========================================================================
 
-      - name: Test
-        run: go test -v -race ./...
+  test-python:
+    name: Test / Python ${{ matrix.python-version }} (${{ matrix.arch }})
+    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    needs: [build-gvproxy-wrapper, build-vm-images]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Download gvproxy-wrapper
+        uses: actions/download-artifact@v4
+        with:
+          name: gvproxy-wrapper-${{ matrix.arch }}
+          path: gvproxy-wrapper/bin/
+
+      - name: Download VM images
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-images-${{ matrix.arch }}
+          path: images/dist/
+
+      - name: Make binaries executable
+        run: chmod +x gvproxy-wrapper/bin/gvproxy-wrapper-*
+
+      - name: Make images readable
+        run: |
+          # Make files readable and directories traversable for qemu-vm user
+          # Need to make parent directories traversable too (home dirs are often 700)
+          chmod a+x /home/runner /home/runner/work
+          chmod -R a+rX .
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils ${{ matrix.arch == 'x64' && 'qemu-system-x86' || 'qemu-system-arm' }}
+
+      - name: Create qemu-vm user
+        run: |
+          # Create unprivileged user for QEMU process isolation
+          # Don't specify UID - let the system assign one to avoid conflicts
+          if ! id qemu-vm &>/dev/null; then
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin qemu-vm
+          fi
+          # Add qemu-vm to kvm group for hardware acceleration access
+          sudo usermod -aG kvm qemu-vm
+          # Allow runner to run commands AS qemu-vm (for QEMU process)
+          # Note: runner already has full sudo via GitHub Actions, so chown works
+          echo "runner ALL=(qemu-vm) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/qemu-vm
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: make install-deps
+
+      - name: Setup cgroup delegation
+        run: |
+          # Create cgroup directory for VM resource limits
+          sudo mkdir -p /sys/fs/cgroup/code-exec
+          # Enable required controllers (memory, cpu, pids) at root and code-exec levels
+          # This allows nested cgroups like /sys/fs/cgroup/code-exec/{tenant}/{vm}
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/code-exec/cgroup.subtree_control
+          # Delegate ownership to runner user so tests can create sub-cgroups
+          sudo chown -R runner:runner /sys/fs/cgroup/code-exec
+
+      - name: Functional tests
+        run: make test-func

@@ -29,6 +29,12 @@ UV_VERSION="${UV_VERSION:-0.9.24}"  # From astral-sh/uv
 BUN_VERSION="${BUN_VERSION:-1.3.5}"
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
 
+# Buildx cache configuration (for CI)
+# Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
+# Example: BUILDX_CACHE_FROM="type=gha" BUILDX_CACHE_TO="type=gha,mode=max"
+BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
+BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
+
 # Package lists for each variant
 # Common: essential tools for AI agent workflows
 COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file"
@@ -75,11 +81,19 @@ create_alpine_rootfs() {
 
     # Use docker buildx with BuildKit cache mounts for APK
     # This caches both APK index and downloaded packages across builds
+    # Scope includes arch and Alpine version to avoid cache collisions
+    local platform_arch="${docker_platform#linux/}"  # Extract arch from linux/arm64 -> arm64
+    local cache_scope="alpine-${ALPINE_VERSION}-${platform_arch}"
+    local cache_args=()
+    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
+    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
+
     DOCKER_BUILDKIT=1 docker buildx build \
         --platform "$docker_platform" \
         --output "type=local,dest=$rootfs_dir" \
         --build-arg PACKAGES="$packages" \
         --build-arg ALPINE_VERSION="$ALPINE_VERSION" \
+        "${cache_args[@]+"${cache_args[@]}"}" \
         --quiet \
         -f - . <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
@@ -363,12 +377,25 @@ build_qcow2() {
 
     # Build guestfs image with BuildKit cache (caches apt-get install across builds)
     local guestfs_image="exec-sandbox-guestfs:latest"
-    local host_platform="linux/$([ "$(uname -m)" = "arm64" ] && echo "arm64" || echo "amd64")"
+    # Handle both macOS (arm64) and Linux (aarch64)
+    local host_arch
+    case "$(uname -m)" in
+        arm64|aarch64) host_arch="arm64" ;;
+        *) host_arch="amd64" ;;
+    esac
+    local host_platform="linux/${host_arch}"
+
+    # Scope includes host arch to avoid cache collisions in multi-arch CI
+    local cache_scope="guestfs-${host_arch}"
+    local cache_args=()
+    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
+    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
 
     DOCKER_BUILDKIT=1 docker buildx build \
         --platform "$host_platform" \
         --load \
         --tag "$guestfs_image" \
+        "${cache_args[@]+"${cache_args[@]}"}" \
         --quiet \
         -f - . <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4

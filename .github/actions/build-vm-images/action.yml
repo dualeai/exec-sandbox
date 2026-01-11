@@ -16,11 +16,41 @@ runs:
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
 
-    - name: Restore build cache
-      uses: actions/cache/restore@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Expose GitHub Actions cache variables
+      uses: actions/github-script@v7
       with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env['ACTIONS_CACHE_URL'] || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env['ACTIONS_RUNTIME_TOKEN'] || '');
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env['ACTIONS_RESULTS_URL'] || '');
+
+    # Try to restore from latest run on same branch (hash-based caching in build script will skip if unchanged)
+    - name: Get latest run ID
+      id: latest-run
+      shell: bash
+      run: |
+        RUN_ID=$(gh run list \
+          --workflow=test.yml \
+          --branch="${{ github.ref_name }}" \
+          --limit=100 \
+          --json databaseId,conclusion \
+          --jq '[.[] | select(.conclusion == "success" or .conclusion == "failure")] | .[0].databaseId // empty')
+        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Download previous build
+      if: steps.latest-run.outputs.run_id != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: vm-images-${{ inputs.arch == 'x86_64' && 'x64' || 'arm64' }}
         path: images/dist/
-        key: build-cache-vm-${{ inputs.arch }}-${{ inputs.variant }}-${{ hashFiles('scripts/extract-kernel.sh', 'scripts/build-qcow2.sh', 'images/**') }}
+        github-token: ${{ github.token }}
+        run-id: ${{ steps.latest-run.outputs.run_id }}
+      continue-on-error: true
 
     - name: Extract kernel
       shell: bash
@@ -28,10 +58,7 @@ runs:
 
     - name: Build qcow2
       shell: bash
+      env:
+        BUILDX_CACHE_FROM: type=gha,ignore-error=true
+        BUILDX_CACHE_TO: type=gha,mode=max,ignore-error=true
       run: ./scripts/build-qcow2.sh ${{ inputs.variant }} ${{ inputs.arch }}
-
-    - name: Save build cache
-      uses: actions/cache/save@v4
-      with:
-        path: images/dist/
-        key: build-cache-vm-${{ inputs.arch }}-${{ inputs.variant }}-${{ hashFiles('scripts/extract-kernel.sh', 'scripts/build-qcow2.sh', 'images/**') }}

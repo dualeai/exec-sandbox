@@ -17,6 +17,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
 RUST_VERSION="${RUST_VERSION:-1.83}"
 
+# Buildx cache configuration (for CI)
+# Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
+# Example: BUILDX_CACHE_FROM="type=gha" BUILDX_CACHE_TO="type=gha,mode=max"
+BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
+BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
+
 detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64) echo "x86_64" ;;
@@ -86,16 +92,39 @@ build_for_arch() {
 
     mkdir -p "$OUTPUT_DIR"
 
-    docker run --rm \
-        -v "$REPO_ROOT:/workspace" \
-        -w /workspace/guest-agent \
-        --platform linux/$([ "$arch" = "aarch64" ] && echo "arm64" || echo "amd64") \
-        rust:$RUST_VERSION-slim \
-        bash -c "
-            rustup target add $rust_target
-            cargo build --release --target $rust_target
-            cp target/$rust_target/release/guest-agent /workspace/images/dist/guest-agent-linux-$arch
-        "
+    local docker_platform="linux/$([ "$arch" = "aarch64" ] && echo "arm64" || echo "amd64")"
+    # Scope includes arch and Rust version to avoid cache collisions
+    local cache_scope="guest-agent-rust${RUST_VERSION}-${arch}"
+    local cache_args=()
+    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
+    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
+
+    # Use buildx with cache mounts for cargo registry and target
+    DOCKER_BUILDKIT=1 docker buildx build \
+        --platform "$docker_platform" \
+        --output "type=local,dest=$OUTPUT_DIR" \
+        --build-arg RUST_VERSION="$RUST_VERSION" \
+        --build-arg RUST_TARGET="$rust_target" \
+        --build-arg ARCH="$arch" \
+        ${cache_args[@]+"${cache_args[@]}"} \
+        -f - "$REPO_ROOT" <<'DOCKERFILE'
+# syntax=docker/dockerfile:1.4
+ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-slim
+ARG RUST_TARGET
+ARG ARCH
+WORKDIR /workspace
+COPY guest-agent/ ./guest-agent/
+RUN rustup target add ${RUST_TARGET}
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/workspace/guest-agent/target,sharing=locked \
+    cd guest-agent && \
+    cargo build --release --target ${RUST_TARGET} && \
+    cp target/${RUST_TARGET}/release/guest-agent /guest-agent-linux-${ARCH}
+FROM scratch
+ARG ARCH
+COPY --from=0 /guest-agent-linux-* .
+DOCKERFILE
 
     save_hash "$output_file" "$current_hash"
 
