@@ -205,6 +205,7 @@ class QemuVM:
         language: str,
         gvproxy_proc: ProcessWrapper | None = None,
         gvproxy_socket: Path | None = None,
+        qmp_socket_path: Path | None = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
         console_log: TextIO | None = None,
@@ -220,6 +221,7 @@ class QemuVM:
             language: Programming language for this VM
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
             gvproxy_socket: Optional QEMU stream socket path
+            qmp_socket_path: Optional QMP (QEMU Monitor Protocol) socket path for memory snapshots
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
             console_log: Optional file handle for QEMU console log
@@ -232,6 +234,7 @@ class QemuVM:
         self.language = language
         self.gvproxy_proc = gvproxy_proc
         self.gvproxy_socket = gvproxy_socket
+        self.qmp_socket_path = qmp_socket_path
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
         self.console_log: TextIO | None = console_log
@@ -894,6 +897,7 @@ class VmManager:
             # Step 6: Create dual-port Unix socket communication channel for guest agent
             cmd_socket = self._get_cmd_socket_path(vm_id)
             event_socket = self._get_event_socket_path(vm_id)
+            qmp_socket_path = self._get_qmp_socket_path(vm_id)
             channel: GuestChannel = DualPortChannel(cmd_socket, event_socket)
 
             # If cgroups unavailable, wrap with ulimit for host resource control
@@ -992,6 +996,7 @@ class VmManager:
                 language,
                 gvproxy_proc,
                 gvproxy_socket,
+                qmp_socket_path,
                 qemu_log_task,
                 gvproxy_log_task,
                 console_log,
@@ -1407,6 +1412,19 @@ class VmManager:
         """
         return str(self._get_socket_path(vm_id, prefix="event"))
 
+    def _get_qmp_socket_path(self, vm_id: str) -> Path:
+        """Get path to QMP (QEMU Monitor Protocol) Unix socket.
+
+        Used for memory snapshot operations (savevm/loadvm).
+
+        Args:
+            vm_id: Unique VM identifier
+
+        Returns:
+            /tmp/qmp-{hash}.sock
+        """
+        return self._get_socket_path(vm_id, prefix="qmp")
+
     def get_base_image(self, language: str) -> Path:
         """Get base image path for language via auto-discovery.
 
@@ -1671,6 +1689,7 @@ class VmManager:
         allow_network: bool,
         enable_dns_filtering: bool = False,  # noqa: ARG002
         gvproxy_socket: Path | None = None,
+        loadvm_snapshot: str | None = None,
     ) -> list[str]:
         """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -1682,6 +1701,7 @@ class VmManager:
             allow_network: Enable network access
             enable_dns_filtering: Enable DNS filtering via gvisor-tap-vsock
             gvproxy_socket: QEMU stream socket path for gvproxy connection
+            loadvm_snapshot: Optional snapshot name to restore from (for fast VM boot)
 
         Returns:
             QEMU command as list of strings
@@ -1858,6 +1878,21 @@ class VmManager:
                     "virtio-net-device,netdev=net0,mq=off,csum=off,gso=off,host_tso4=off,host_tso6=off,mrg_rxbuf=off,ctrl_rx=off,guest_announce=off",
                 ]
             )
+
+        # QMP (QEMU Monitor Protocol) socket for memory snapshot operations
+        # Used for savevm/loadvm commands to create/restore memory snapshots
+        qmp_socket_path = self._get_qmp_socket_path(vm_id)
+        qemu_args.extend(
+            [
+                "-qmp",
+                f"unix:{qmp_socket_path},server=on,wait=off",
+            ]
+        )
+
+        # Restore from memory snapshot if specified
+        # This provides fast VM boot (~50-200ms vs ~300-400ms cold boot)
+        if loadvm_snapshot:
+            qemu_args.extend(["-loadvm", loadvm_snapshot])
 
         # Run QEMU as unprivileged user (Linux production) or directly (macOS development)
         if detect_host_os() != HostOS.MACOS:

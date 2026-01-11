@@ -43,6 +43,7 @@ dependencies = [
     "aiofiles~=24.0",
     "aiojobs~=1.3",
     "psutil~=5.9",
+    "qemu-qmp~=0.0.5",  # Async QMP client for QEMU memory snapshots
     "tenacity~=8.0",
     "zstandard~=0.23",
 ]

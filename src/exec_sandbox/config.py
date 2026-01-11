@@ -49,7 +49,7 @@ class SchedulerConfig(BaseModel):
             - Linux: ~/.local/share/exec-sandbox/images/
             - macOS: ~/Library/Application Support/exec-sandbox/images/
             - Env: EXEC_SANDBOX_IMAGES_DIR
-        snapshot_cache_dir: Local directory for snapshot cache (L1 cache).
+        snapshot_cache_dir: Local directory for snapshot cache (L0 cache).
             Default: /tmp/exec-sandbox-cache
         s3_bucket: S3 bucket name for snapshot backup (L3 cache).
             If None, S3 backup is disabled. Requires aioboto3 optional dependency.
@@ -99,7 +99,7 @@ class SchedulerConfig(BaseModel):
     )
     snapshot_cache_dir: Path = Field(
         default=Path("/tmp/exec-sandbox-cache"),  # noqa: S108
-        description="Local snapshot cache directory (L1 cache)",
+        description="Local snapshot cache directory (L0 cache)",
     )
 
     # S3 snapshot backup (optional)
@@ -114,6 +114,12 @@ class SchedulerConfig(BaseModel):
     s3_prefix: str = Field(
         default="snapshots/",
         description="Prefix for S3 keys",
+    )
+    max_concurrent_s3_uploads: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Max concurrent background S3 uploads",
     )
 
     # Features

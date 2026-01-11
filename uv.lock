@@ -590,6 +590,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "qemu-qmp" },
     { name = "tenacity" },
     { name = "zstandard" },
 ]
@@ -628,6 +629,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = "~=6.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = "~=2.3" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = "~=3.5" },
+    { name = "qemu-qmp", specifier = "~=0.0.5" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "~=0.7" },
     { name = "tenacity", specifier = "~=8.0" },
     { name = "twine", marker = "extra == 'dev'", specifier = "~=6.1" },
@@ -1774,6 +1776,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/da/92/1446574745d74df0c92e6aa4a7b0b3130706a4142b2d1a5869f2eaa423c6/pyyaml-6.0.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65", size = 829923, upload-time = "2025-09-25T21:32:54.537Z" },
     { url = "https://files.pythonhosted.org/packages/f0/7a/1c7270340330e575b92f397352af856a8c06f230aa3e76f86b39d01b416a/pyyaml-6.0.3-cp314-cp314t-win_amd64.whl", hash = "sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9", size = 174062, upload-time = "2025-09-25T21:32:55.767Z" },
     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },
+]
+
+[[package]]
+name = "qemu-qmp"
+version = "0.0.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/53/a7668df6a6051ecf714b3831526a8a754a3dae9a5ddea3e4f99a09547234/qemu_qmp-0.0.5.tar.gz", hash = "sha256:1d1b9a9a5d57edfe2de3a1d888612823b09aff946951a902e79e9655a2aabbfd", size = 81450, upload-time = "2025-10-02T18:29:57.945Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/93/ed/821ef7e85d19fa2a72f13c1df98aa857fae321e9cef05bb55dae2d8b89e8/qemu_qmp-0.0.5-py3-none-any.whl", hash = "sha256:e05782d6df5844b34e0d2f7c68693525da074deef7b641c1401dda6e4e3d6303", size = 72263, upload-time = "2025-10-02T18:29:56.4Z" },
 ]
 
 [[package]]

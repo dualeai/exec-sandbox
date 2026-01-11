@@ -8,12 +8,11 @@ Security: All fields validated by guest agent (see guest-agent/src/main.rs).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-if TYPE_CHECKING:
-    from exec_sandbox.models import Language
+from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
 
 # ============================================================================
 # Request Models

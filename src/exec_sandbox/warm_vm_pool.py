@@ -14,6 +14,11 @@ Performance:
 - Custom packages: Fallback to cold boot (no change)
 - Memory overhead: ~1GB for 4 VMs (256MB x 4, based on 25% of max_concurrent_vms=10)
 
+L0 Memory Snapshots (Future Enhancement):
+- First boot: cold boot → save L0 snapshot (python-base, javascript-base)
+- Subsequent boots: restore from L0 via -loadvm (~50-200ms)
+- Requires create_vm_from_snapshot() method in VmManager
+
 Example:
     ```python
     # In Scheduler

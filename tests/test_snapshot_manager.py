@@ -21,12 +21,13 @@ class TestCacheKeyComputation:
     """Tests for cache key computation logic."""
 
     def test_cache_key_format(self) -> None:
-        """Cache key format: {language}-{packages_hash}."""
+        """Cache key format: {language}-{16char_packages_hash}."""
         # Simulate _compute_cache_key logic
         language = "python"
         packages = ["pandas==2.0.0", "numpy==1.24.0"]
 
-        packages_str = "|".join(sorted(packages))
+        # L0 format: sorted packages joined without separator, 16-char hash
+        packages_str = "".join(sorted(packages))
         packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
         cache_key = f"{language}-{packages_hash}"
 
@@ -37,7 +38,8 @@ class TestCacheKeyComputation:
         """Same inputs produce same cache key."""
         packages = ["pandas==2.0.0", "numpy==1.24.0"]
 
-        packages_str = "|".join(sorted(packages))
+        # L0 format: joined without separator
+        packages_str = "".join(sorted(packages))
         hash1 = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
         hash2 = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
 
@@ -48,8 +50,9 @@ class TestCacheKeyComputation:
         packages1 = ["pandas==2.0.0", "numpy==1.24.0"]
         packages2 = ["numpy==1.24.0", "pandas==2.0.0"]
 
-        hash1 = hashlib.sha256("|".join(sorted(packages1)).encode()).hexdigest()[:16]
-        hash2 = hashlib.sha256("|".join(sorted(packages2)).encode()).hexdigest()[:16]
+        # L0 format: joined without separator
+        hash1 = hashlib.sha256("".join(sorted(packages1)).encode()).hexdigest()[:16]
+        hash2 = hashlib.sha256("".join(sorted(packages2)).encode()).hexdigest()[:16]
 
         assert hash1 == hash2
 
@@ -57,22 +60,19 @@ class TestCacheKeyComputation:
         """Different languages produce different cache keys."""
         packages = ["lodash@4.17.21"]
 
-        key1 = f"python-{hashlib.sha256('|'.join(sorted(packages)).encode()).hexdigest()[:16]}"
-        key2 = f"javascript-{hashlib.sha256('|'.join(sorted(packages)).encode()).hexdigest()[:16]}"
+        # L0 format: joined without separator
+        key1 = f"python-{hashlib.sha256(''.join(sorted(packages)).encode()).hexdigest()[:16]}"
+        key2 = f"javascript-{hashlib.sha256(''.join(sorted(packages)).encode()).hexdigest()[:16]}"
 
         assert key1 != key2
 
     def test_cache_key_empty_packages(self) -> None:
-        """Empty packages list produces valid cache key."""
-        packages: list[str] = []
-
-        packages_str = "|".join(sorted(packages))
-        packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
-        cache_key = f"python-{packages_hash}"
+        """Empty packages list produces '{language}-base' key."""
+        # L0 format: empty packages = "{language}-base"
+        cache_key = "python-base"
 
         assert cache_key.startswith("python-")
-        # Empty string hash is deterministic
-        assert packages_hash == hashlib.sha256(b"").hexdigest()[:16]
+        assert cache_key == "python-base"
 
 
 class TestSettings:
@@ -109,8 +109,8 @@ class TestSettings:
 class TestSnapshotManagerIntegration:
     """Integration tests for SnapshotManager with real QEMU VMs."""
 
-    async def test_l1_cache_miss(self, images_dir: Path, tmp_path: Path) -> None:
-        """L1 cache miss returns None for non-existent snapshot."""
+    async def test_l0_cache_miss(self, images_dir: Path, tmp_path: Path) -> None:
+        """L0 cache miss returns (None, False) for non-existent snapshot."""
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
 
@@ -125,8 +125,9 @@ class TestSnapshotManagerIntegration:
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
-        result = await snapshot_manager._check_l1_cache("nonexistent-abc123")
-        assert result is None
+        path, has_memory_snapshot = await snapshot_manager._check_l0_cache("nonexistent-abc123")
+        assert path is None
+        assert has_memory_snapshot is False
 
     async def test_compute_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Test actual _compute_cache_key method."""
@@ -143,17 +144,29 @@ class TestSnapshotManagerIntegration:
         vm_manager = VmManager(settings)
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
+        # Test with packages
         key = snapshot_manager._compute_cache_key(
             language=Language.PYTHON,
             packages=["pandas==2.0.0", "numpy==1.24.0"],
         )
 
         assert key.startswith("python-")
-        # Full SHA256 hash (64 chars)
-        assert len(key.split("-")[1]) == 64
+        # L0 format: 16-char hash
+        assert len(key.split("-")[1]) == 16
+
+        # Test without packages (base)
+        base_key = snapshot_manager._compute_cache_key(
+            language=Language.PYTHON,
+            packages=[],
+        )
+        assert base_key == "python-base"
 
     async def test_create_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
         """Create snapshot with packages (slow, requires VM)."""
+        # Skip if images not built
+        if not (images_dir / "python.qcow2").exists():
+            pytest.skip("VM images not built - run ./scripts/build-images.sh")
+
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
 
@@ -168,7 +181,7 @@ class TestSnapshotManagerIntegration:
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create snapshot (this boots a VM and installs packages)
-        snapshot_path = await snapshot_manager.get_or_create_snapshot(
+        snapshot_path, has_memory_snapshot = await snapshot_manager.get_or_create_snapshot(
             language=Language.PYTHON,
             packages=["requests==2.31.0"],
             tenant_id="test",
@@ -177,9 +190,11 @@ class TestSnapshotManagerIntegration:
 
         assert snapshot_path.exists()
         assert snapshot_path.suffix == ".qcow2"
+        # New snapshot has no memory state yet (disk-only)
+        assert has_memory_snapshot is False
 
-        # Second call should hit L1 cache
-        cached_path = await snapshot_manager.get_or_create_snapshot(
+        # Second call should hit L0 cache
+        cached_path, cached_has_memory = await snapshot_manager.get_or_create_snapshot(
             language=Language.PYTHON,
             packages=["requests==2.31.0"],
             tenant_id="test",
@@ -190,15 +205,15 @@ class TestSnapshotManagerIntegration:
 
 
 # ============================================================================
-# L1 Cache Tests - Local Disk
+# L0 Cache Tests - Memory Snapshots
 # ============================================================================
 
 
-class TestL1Cache:
-    """Tests for L1 (local disk) cache operations."""
+class TestL0Cache:
+    """Tests for L0 (memory snapshot) cache operations."""
 
-    async def test_l1_cache_hit_returns_path(self, images_dir: Path, tmp_path: Path) -> None:
-        """L1 cache returns path when valid qcow2 snapshot exists."""
+    async def test_l0_cache_hit_returns_path(self, images_dir: Path, tmp_path: Path) -> None:
+        """L0 cache returns (path, has_memory) when valid qcow2 snapshot exists."""
         import asyncio
 
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -232,11 +247,13 @@ class TestL1Cache:
         await proc.communicate()
         assert proc.returncode == 0
 
-        result = await snapshot_manager._check_l1_cache(cache_key)
-        assert result == snapshot_path
+        path, has_memory_snapshot = await snapshot_manager._check_l0_cache(cache_key)
+        assert path == snapshot_path
+        # No internal snapshot named "ready" yet
+        assert has_memory_snapshot is False
 
-    async def test_l1_cache_nonexistent_returns_none(self, images_dir: Path, tmp_path: Path) -> None:
-        """L1 cache returns None for non-existent snapshot."""
+    async def test_l0_cache_nonexistent_returns_none(self, images_dir: Path, tmp_path: Path) -> None:
+        """L0 cache returns (None, False) for non-existent snapshot."""
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
 
@@ -251,8 +268,9 @@ class TestL1Cache:
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
-        result = await snapshot_manager._check_l1_cache("nonexistent-key")
-        assert result is None
+        path, has_memory_snapshot = await snapshot_manager._check_l0_cache("nonexistent-key")
+        assert path is None
+        assert has_memory_snapshot is False
 
     async def test_l1_evict_oldest_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
         """_evict_oldest_snapshot removes oldest file by atime."""
@@ -555,9 +573,88 @@ class TestL3Cache:
         finally:
             server.stop()
 
+    async def test_upload_semaphore_limits_concurrency(self, tmp_path: Path) -> None:
+        """Upload semaphore limits concurrent S3 uploads to configured max.
+
+        Verifies that max_concurrent_s3_uploads actually bounds parallel uploads.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.vm_manager import VmManager
+
+        # Configure semaphore to allow only 2 concurrent uploads
+        settings = Settings(
+            base_images_dir=tmp_path,
+            kernel_path=tmp_path,
+            snapshot_cache_dir=tmp_path / "cache",
+            s3_bucket="test-bucket",
+            max_concurrent_s3_uploads=2,
+        )
+        settings.snapshot_cache_dir.mkdir(parents=True)
+
+        vm_manager = VmManager(settings)
+        snapshot_manager = SnapshotManager(settings, vm_manager)
+
+        # Track concurrent uploads
+        concurrent_count = 0
+        max_concurrent_observed = 0
+        upload_started = asyncio.Event()
+
+        async def mock_s3_upload(*args, **kwargs):
+            """Mock S3 upload that tracks concurrency."""
+            nonlocal concurrent_count, max_concurrent_observed
+            concurrent_count += 1
+            max_concurrent_observed = max(max_concurrent_observed, concurrent_count)
+            upload_started.set()
+            await asyncio.sleep(0.05)  # Simulate upload time
+            concurrent_count -= 1
+
+        # Create test snapshot files
+        for i in range(5):
+            (settings.snapshot_cache_dir / f"test-{i}.qcow2").write_bytes(b"test")
+
+        # Mock the S3 client and compression to isolate semaphore behavior
+        with (
+            patch.object(snapshot_manager, "_get_s3_client") as mock_client,
+            patch("exec_sandbox.snapshot_manager.zstd.ZstdCompressor") as mock_zstd,
+        ):
+            # Mock S3 client context manager
+            mock_s3 = AsyncMock()
+            mock_s3.upload_file = mock_s3_upload
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_s3)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            # Mock compression (instant, no-op)
+            mock_compressor = mock_zstd.return_value
+            mock_compressor.copy_stream = lambda src, dst: dst.write(src.read())
+
+            # Start 5 uploads simultaneously
+            tasks = [
+                asyncio.create_task(
+                    snapshot_manager._upload_to_s3(f"test-{i}", settings.snapshot_cache_dir / f"test-{i}.qcow2")
+                )
+                for i in range(5)
+            ]
+
+            # Wait for all uploads to complete
+            await asyncio.gather(*tasks)
+
+        # Verify semaphore limited concurrency
+        assert max_concurrent_observed <= 2, (
+            f"Expected max 2 concurrent uploads (semaphore limit), "
+            f"but observed {max_concurrent_observed}"
+        )
+        # Also verify uploads actually ran concurrently (not serialized to 1)
+        assert max_concurrent_observed == 2, (
+            f"Expected exactly 2 concurrent uploads (semaphore should allow 2), "
+            f"but observed {max_concurrent_observed}"
+        )
+
 
 # ============================================================================
-# Cache Hierarchy Tests - Full L1 → L3 → Create Flow
+# Cache Hierarchy Tests - Full L0 → L3 → Create Flow
 # ============================================================================
 
 
@@ -572,10 +669,10 @@ class TestCacheHierarchy:
     Uses moto server for real S3 client and mocks _create_snapshot to avoid QEMU.
     """
 
-    async def test_l1_hit_returns_immediately_no_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
-        """L1 cache hit returns path immediately without touching S3.
+    async def test_l0_hit_returns_immediately_no_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+        """L0 cache hit returns (path, has_memory) immediately without touching S3.
 
-        Flow: L1 HIT → return (no S3 call, no creation)
+        Flow: L0 HIT → return (no S3 call, no creation)
         """
         import asyncio
         from unittest.mock import AsyncMock, patch
@@ -617,26 +714,28 @@ class TestCacheHierarchy:
         # Mock S3 and creation to track if they're called
         with patch.object(snapshot_manager, "_download_from_s3", new_callable=AsyncMock) as mock_s3:
             with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-                result = await snapshot_manager.get_or_create_snapshot(
+                result_path, has_memory_snapshot = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["requests==2.31.0"],
                     tenant_id="test",
                     task_id="test-1",
                 )
 
-        # Verify L1 hit: returned correct path
-        assert result == snapshot_path
+        # Verify L0 hit: returned correct path
+        assert result_path == snapshot_path
+        # L0 cache hit without internal snapshot returns False
+        assert has_memory_snapshot is False
 
-        # Verify S3 was NOT called (L1 hit skips S3)
+        # Verify S3 was NOT called (L0 hit skips S3)
         mock_s3.assert_not_called()
 
-        # Verify creation was NOT called (L1 hit skips creation)
+        # Verify creation was NOT called (L0 hit skips creation)
         mock_create.assert_not_called()
 
-    async def test_l1_miss_l3_hit_downloads_from_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
-        """L1 miss with L3 hit downloads from S3 and returns path.
+    async def test_l0_miss_l3_hit_downloads_from_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+        """L0 miss with L3 hit downloads from S3 and returns path.
 
-        Flow: L1 MISS → L3 HIT → download → return (no creation)
+        Flow: L0 MISS → L3 HIT → download → return (no creation)
         """
         from unittest.mock import AsyncMock, patch
 
@@ -691,12 +790,12 @@ class TestCacheHierarchy:
                 Body=compressed,
             )
 
-            # L1 is empty (no file on disk)
+            # L0 is empty (no file on disk)
             assert not (settings.snapshot_cache_dir / f"{cache_key}.qcow2").exists()
 
             # Mock creation to verify it's NOT called
             with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-                result = await snapshot_manager.get_or_create_snapshot(
+                result_path, has_memory_snapshot = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["numpy==1.26.0"],
                     tenant_id="test",
@@ -704,8 +803,10 @@ class TestCacheHierarchy:
                 )
 
             # Verify returned path exists and has correct content (decompressed from S3)
-            assert result.exists()
-            assert result.read_bytes() == original_content
+            assert result_path.exists()
+            assert result_path.read_bytes() == original_content
+            # Downloaded from S3 = no memory snapshot
+            assert has_memory_snapshot is False
 
             # Verify creation was NOT called (L3 hit skips creation)
             mock_create.assert_not_called()
@@ -713,10 +814,10 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_l1_miss_l3_miss_creates_snapshot(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
-        """L1 miss and L3 miss triggers snapshot creation.
+    async def test_l0_miss_l3_miss_creates_snapshot(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+        """L0 miss and L3 miss triggers snapshot creation.
 
-        Flow: L1 MISS → L3 MISS → create → return (and upload to S3)
+        Flow: L0 MISS → L3 MISS → create → return (and upload to S3)
         """
         import asyncio
         from unittest.mock import patch
@@ -779,7 +880,7 @@ class TestCacheHierarchy:
                 return expected_path
 
             with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot) as mock_create:
-                result = await snapshot_manager.get_or_create_snapshot(
+                result_path, has_memory_snapshot = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["pandas==2.1.0"],
                     tenant_id="test",
@@ -790,8 +891,10 @@ class TestCacheHierarchy:
             mock_create.assert_called_once()
 
             # Verify returned path
-            assert result == expected_path
-            assert result.exists()
+            assert result_path == expected_path
+            assert result_path.exists()
+            # Newly created snapshot has no memory state yet
+            assert has_memory_snapshot is False
 
             # Wait briefly for background S3 upload task
             await asyncio.sleep(0.5)
@@ -804,11 +907,11 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_l1_populated_after_l3_download(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
-        """After L3 download, L1 cache is populated for next call.
+    async def test_l0_populated_after_l3_download(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+        """After L3 download, L0 cache is populated for next call.
 
-        Flow: L1 MISS → L3 HIT → download → L1 populated
-        Then: L1 HIT → return immediately
+        Flow: L0 MISS → L3 HIT → download → L0 populated
+        Then: L0 HIT → return immediately
         """
         from unittest.mock import AsyncMock, patch
 
@@ -852,7 +955,7 @@ class TestCacheHierarchy:
 
             # Compute cache key
             cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["scipy==1.11.0"])
-            l1_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+            l0_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
 
             # Pre-populate S3 only
             original_content = b"scipy snapshot content"
@@ -864,12 +967,12 @@ class TestCacheHierarchy:
                 Body=compressed,
             )
 
-            # Verify L1 is empty before first call
-            assert not l1_path.exists()
+            # Verify L0 is empty before first call
+            assert not l0_path.exists()
 
-            # First call: L1 miss → L3 hit
+            # First call: L0 miss → L3 hit
             with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-                result1 = await snapshot_manager.get_or_create_snapshot(
+                result1_path, result1_has_memory = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["scipy==1.11.0"],
                     tenant_id="test",
@@ -877,11 +980,11 @@ class TestCacheHierarchy:
                 )
                 mock_create.assert_not_called()
 
-            # Verify L1 is NOW populated
-            assert l1_path.exists()
-            assert l1_path.read_bytes() == original_content
+            # Verify L0 is NOW populated
+            assert l0_path.exists()
+            assert l0_path.read_bytes() == original_content
 
-            # Second call: should hit L1 (no S3 download)
+            # Second call: should hit L0 (no S3 download)
             # We'll spy on _download_from_s3 to verify it's not called
             original_download = snapshot_manager._download_from_s3
             download_called = False
@@ -892,16 +995,16 @@ class TestCacheHierarchy:
                 return await original_download(*args, **kwargs)
 
             with patch.object(snapshot_manager, "_download_from_s3", side_effect=spy_download):
-                result2 = await snapshot_manager.get_or_create_snapshot(
+                result2_path, result2_has_memory = await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["scipy==1.11.0"],
                     tenant_id="test",
                     task_id="test-4b",
                 )
 
-            # Verify L1 hit on second call
-            assert result2 == l1_path
-            assert not download_called, "S3 download should NOT be called on L1 hit"
+            # Verify L0 hit on second call
+            assert result2_path == l0_path
+            assert not download_called, "S3 download should NOT be called on L0 hit"
 
         finally:
             server.stop()
@@ -952,21 +1055,21 @@ class TestCacheHierarchy:
 
         # Both orderings should return same path
         with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
-            result1 = await snapshot_manager.get_or_create_snapshot(
+            result1_path, result1_has_memory = await snapshot_manager.get_or_create_snapshot(
                 language=Language.PYTHON,
                 packages=["pandas==2.0.0", "numpy==1.25.0"],
                 tenant_id="test",
                 task_id="test-5a",
             )
-            result2 = await snapshot_manager.get_or_create_snapshot(
+            result2_path, result2_has_memory = await snapshot_manager.get_or_create_snapshot(
                 language=Language.PYTHON,
                 packages=["numpy==1.25.0", "pandas==2.0.0"],
                 tenant_id="test",
                 task_id="test-5b",
             )
 
-        assert result1 == result2 == snapshot_path
-        mock_create.assert_not_called()  # Both hit L1 cache
+        assert result1_path == result2_path == snapshot_path
+        mock_create.assert_not_called()  # Both hit L0 cache
 
     async def test_different_packages_different_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Different packages produce different cache keys.
@@ -1064,7 +1167,7 @@ class TestCacheHierarchy:
 
         # Spy on _download_from_s3 to verify it raises (S3 disabled)
         with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
-            result = await snapshot_manager.get_or_create_snapshot(
+            result_path, has_memory_snapshot = await snapshot_manager.get_or_create_snapshot(
                 language=Language.PYTHON,
                 packages=["aiohttp==3.9.0"],
                 tenant_id="test",
@@ -1072,8 +1175,10 @@ class TestCacheHierarchy:
             )
 
         # Verify snapshot was created
-        assert result == expected_path
-        assert result.exists()
+        assert result_path == expected_path
+        assert result_path.exists()
+        # Newly created = no memory snapshot
+        assert has_memory_snapshot is False
 
     async def test_creation_failure_propagates_error(self, images_dir: Path, tmp_path: Path) -> None:
         """When snapshot creation fails, error is propagated.
