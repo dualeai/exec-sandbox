@@ -285,6 +285,16 @@ class SnapshotManager:
             )
 
         async with QMPClientWrapper(vm.qmp_socket_path) as qmp:
+            # Step 1a: Deflate balloon to reclaim free pages (reduces snapshot size)
+            # This is an optional optimization - continues even if balloon fails
+            # Note: VM memory size isn't tracked on QemuVM, use default
+            await qmp.balloon_deflate_for_snapshot(
+                original_mb=constants.DEFAULT_MEMORY_MB,
+                min_mb=constants.BALLOON_DEFLATE_MIN_MB,
+                timeout=constants.BALLOON_DEFLATE_TIMEOUT_SECONDS,
+            )
+
+            # Step 1b: Save memory snapshot
             await qmp.save_snapshot("ready")
 
         # Step 2: Copy overlay (with internal snapshot) to L0 cache

@@ -28,6 +28,8 @@ load_module() {
 load_module "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko.gz" "virtio_mmio"
 # virtio_blk is needed for /dev/vda
 load_module "/lib/modules/$KVER/kernel/drivers/block/virtio_blk.ko.gz" "virtio_blk"
+# virtio_balloon is needed for memory reclamation before snapshots
+load_module "/lib/modules/$KVER/kernel/drivers/virtio/virtio_balloon.ko.gz" "virtio_balloon"
 
 # Load ext4 and its dependencies (order matters)
 load_module "/lib/modules/$KVER/kernel/lib/crc16.ko.gz" "crc16"
@@ -36,6 +38,33 @@ load_module "/lib/modules/$KVER/kernel/lib/libcrc32c.ko.gz" "libcrc32c"
 load_module "/lib/modules/$KVER/kernel/fs/mbcache.ko.gz" "mbcache"
 load_module "/lib/modules/$KVER/kernel/fs/jbd2/jbd2.ko.gz" "jbd2"
 load_module "/lib/modules/$KVER/kernel/fs/ext4/ext4.ko.gz" "ext4"
+
+# Load zram and lz4 compression for compressed swap
+# This effectively extends available memory by 2-3x with minimal CPU overhead
+load_module "/lib/modules/$KVER/kernel/lib/lz4/lz4_compress.ko.gz" "lz4_compress"
+load_module "/lib/modules/$KVER/kernel/lib/lz4/lz4_decompress.ko.gz" "lz4_decompress"
+load_module "/lib/modules/$KVER/kernel/crypto/lz4.ko.gz" "lz4"
+load_module "/lib/modules/$KVER/kernel/drivers/block/zram/zram.ko.gz" "zram"
+
+# Configure zram compressed swap if module loaded successfully
+if [ -e /sys/block/zram0 ]; then
+    # Use lz4 for low-latency (2M IOPS vs 820K for zstd)
+    echo "lz4" > /sys/block/zram0/comp_algorithm 2>/dev/null || \
+    echo "lzo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+
+    # Size: 50% of RAM (with lz4's 2.6x ratio, effectively 1.3x more memory)
+    MEM_KB=$(/bin/busybox awk '/MemTotal/{print $2}' /proc/meminfo)
+    ZRAM_SIZE=$((MEM_KB * 512))  # 50% in bytes (KB * 1024 / 2)
+    echo "$ZRAM_SIZE" > /sys/block/zram0/disksize 2>/dev/null || true
+
+    # Create and enable swap with high priority
+    /bin/busybox mkswap /dev/zram0 >/dev/null 2>&1
+    /bin/busybox swapon -p 100 /dev/zram0 2>/dev/null || true
+
+    # Optimize VM settings for compressed swap
+    echo 0 > /proc/sys/vm/page-cluster 2>/dev/null || true    # Disable readahead
+    echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true    # Prefer swap over cache
+fi
 
 # Wait for virtio block device to appear (up to 400ms with 20ms intervals)
 # Devices typically appear within 10-30ms with virtio-mmio

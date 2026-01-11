@@ -1866,6 +1866,16 @@ class VmManager:
             ]
         )
 
+        # virtio-balloon for memory reclamation before snapshots
+        # - deflate-on-oom: guest returns memory under OOM pressure
+        # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
+        qemu_args.extend(
+            [
+                "-device",
+                "virtio-balloon-device,deflate-on-oom=on,free-page-reporting=on",
+            ]
+        )
+
         # virtio-net configuration (optional, internet access only)
         if allow_network:
             if not gvproxy_socket:

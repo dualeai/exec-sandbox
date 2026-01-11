@@ -221,3 +221,129 @@ class QMPClientWrapper:
         except TimeoutError as e:
             msg = f"info snapshots timed out after {timeout}s"
             raise SnapshotError(msg) from e
+
+    # =========================================================================
+    # Balloon operations for memory reclamation
+    # =========================================================================
+
+    async def balloon_set_target(self, target_mb: int, timeout: float = 5.0) -> None:
+        """Set balloon target size (actual guest memory).
+
+        Inflates/deflates the balloon to adjust guest-visible memory.
+        Guest will see reduced memory when balloon is inflated.
+
+        Args:
+            target_mb: Target guest memory in MB.
+            timeout: Operation timeout in seconds.
+
+        Raises:
+            SnapshotError: If balloon operation fails or times out.
+        """
+        if self._client is None:
+            msg = "QMP client not connected"
+            raise SnapshotError(msg)
+
+        target_bytes = target_mb * 1024 * 1024
+        try:
+            await asyncio.wait_for(
+                self._client.execute("balloon", {"value": target_bytes}),
+                timeout=timeout,
+            )
+            _logger.debug("Balloon target set to %dMB", target_mb)
+        except TimeoutError as e:
+            msg = f"balloon timed out after {timeout}s"
+            raise SnapshotError(msg, {"target_mb": target_mb}) from e
+        except Exception as e:
+            # Balloon device may not be present - graceful failure
+            msg = f"balloon failed: {e}"
+            raise SnapshotError(msg, {"target_mb": target_mb}) from e
+
+    async def balloon_query(self, timeout: float = 5.0) -> dict[str, Any] | None:
+        """Query current balloon status.
+
+        Returns:
+            Dict with 'actual' (current guest memory in bytes), or None if
+            balloon device is not available.
+
+        Raises:
+            SnapshotError: If query fails or times out (except for missing device).
+        """
+        if self._client is None:
+            msg = "QMP client not connected"
+            raise SnapshotError(msg)
+
+        try:
+            result = await asyncio.wait_for(
+                self._client.execute("query-balloon"),
+                timeout=timeout,
+            )
+            # QMP returns dict with "actual" key containing bytes
+            if isinstance(result, dict):
+                return dict(result)  # type: ignore[arg-type]
+            return None
+        except TimeoutError as e:
+            msg = f"query-balloon timed out after {timeout}s"
+            raise SnapshotError(msg) from e
+        except Exception as e:  # noqa: BLE001 - Balloon device may not be present
+            _logger.debug("query-balloon failed (balloon device may be missing): %s", e)
+            return None
+
+    async def balloon_deflate_for_snapshot(
+        self,
+        original_mb: int,
+        min_mb: int = 64,
+        timeout: float = 10.0,
+    ) -> int:
+        """Deflate balloon to reclaim free pages before snapshot.
+
+        Reduces guest memory to minimum viable size, waits for stabilization,
+        then returns the achieved size. This reduces snapshot size by excluding
+        unused guest memory pages.
+
+        Args:
+            original_mb: Original guest memory allocation in MB.
+            min_mb: Minimum target memory in MB (default 64MB floor).
+            timeout: Maximum time to wait for deflation.
+
+        Returns:
+            Actual guest memory in MB after deflation, or original_mb if
+            balloon is unavailable.
+        """
+        # Check if balloon is available
+        status = await self.balloon_query(timeout / 3)
+        if status is None:
+            _logger.debug("Balloon not available, skipping deflation")
+            return original_mb
+
+        try:
+            # Set aggressive deflation target
+            await self.balloon_set_target(min_mb, timeout / 3)
+
+            # Wait for deflation to stabilize (guest needs time to return pages)
+            await asyncio.sleep(0.5)
+
+            # Query actual result
+            status = await self.balloon_query(timeout / 3)
+            if status is None:
+                return original_mb
+
+            actual_bytes = status.get("actual", original_mb * 1024 * 1024)
+            actual_mb = actual_bytes // (1024 * 1024)
+
+            saved_mb = original_mb - actual_mb
+            if saved_mb > 0:
+                _logger.info(
+                    "Balloon deflated: %dMB -> %dMB (saved %dMB)",
+                    original_mb,
+                    actual_mb,
+                    saved_mb,
+                )
+            else:
+                _logger.debug("Balloon deflation: no memory reclaimed")
+
+            return actual_mb
+
+        except SnapshotError as e:
+            # Log but continue - balloon is optional optimization
+            _logger.warning("Balloon deflation failed: %s", e)
+            return original_mb

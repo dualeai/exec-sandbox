@@ -16,10 +16,35 @@ mount -t tmpfs -o size=128M tmpfs /tmp 2>/dev/null || true
 # virtio_console: for virtio-serial support (TCG mode)
 # virtio_net: for network device (TCP guest agent communication)
 # virtio_pci: PCI bus support for virtio devices
+# virtio_balloon: for memory reclamation before snapshots
 # Silent failure if modules already built-in or not available
 modprobe virtio_pci 2>/dev/null || true
 modprobe virtio_net 2>/dev/null || true
 modprobe virtio_console 2>/dev/null || true
+modprobe virtio_balloon 2>/dev/null || true
+
+# Set up zram compressed swap for memory optimization
+# This effectively extends available memory by 2-3x with minimal CPU overhead
+if modprobe zram 2>/dev/null; then
+    if [ -e /sys/block/zram0 ]; then
+        # Use lz4 for low-latency (2M IOPS vs 820K for zstd)
+        echo "lz4" > /sys/block/zram0/comp_algorithm 2>/dev/null || \
+        echo "lzo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+
+        # Size: 50% of RAM (with lz4's 2.6x ratio, effectively 1.3x more memory)
+        MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+        ZRAM_SIZE=$((MEM_KB * 512))  # 50% in bytes (KB * 1024 / 2)
+        echo "$ZRAM_SIZE" > /sys/block/zram0/disksize 2>/dev/null || true
+
+        # Create and enable swap with high priority
+        mkswap /dev/zram0 >/dev/null 2>&1
+        swapon -p 100 /dev/zram0 2>/dev/null || true
+
+        # Optimize VM settings for compressed swap
+        echo 0 > /proc/sys/vm/page-cluster 2>/dev/null || true    # Disable readahead
+        echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true    # Prefer swap over cache
+    fi
+fi
 
 # Set PATH with standard directories
 # uv binary at /usr/local/bin/uv

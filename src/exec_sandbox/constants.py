@@ -152,3 +152,13 @@ WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 
 WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 30
 """Health check interval for warm VMs in seconds."""
+
+# ============================================================================
+# Memory Optimization (Balloon)
+# ============================================================================
+
+BALLOON_DEFLATE_MIN_MB: Final[int] = 64
+"""Minimum memory target during balloon deflation (64MB floor)."""
+
+BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 10.0
+"""Timeout for balloon deflation before snapshot."""

@@ -56,7 +56,8 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
 chmod 755 "$INITRAMFS_DIR/bin/busybox"
 
 # Create busybox symlinks for commands used in init script
-for cmd in sh mount umount switch_root sleep usleep insmod modprobe gzip uname rm ls cat mkdir basename ln head; do
+# Note: mkswap and swapon added for zram swap setup
+for cmd in sh mount umount switch_root sleep usleep insmod modprobe gzip uname rm ls cat mkdir basename ln head mkswap swapon awk; do
     ln -s busybox "$INITRAMFS_DIR/bin/$cmd"
 done
 
@@ -73,7 +74,9 @@ mknod -m 666 "$INITRAMFS_DIR/dev/null" c 1 3 2>/dev/null || true
 # Modules needed:
 # - virtio_blk: for virtio block device (/dev/vda)
 # - virtio_mmio: for virtio-serial on virt machine type (aarch64)
+# - virtio_balloon: for memory balloon (snapshot size optimization)
 # - ext4 + dependencies (jbd2, mbcache, crc16, crc32c): for ext4 filesystem
+# - zram + lz4: for compressed swap (memory optimization)
 echo "Extracting kernel modules..."
 docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
     apk add --no-cache linux-virt >/dev/null 2>&1
@@ -84,12 +87,18 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
     tar -cf - \
         kernel/drivers/block/virtio_blk.ko.gz \
         kernel/drivers/virtio/virtio_mmio.ko.gz \
+        kernel/drivers/virtio/virtio_balloon.ko.gz \
         kernel/fs/ext4/ext4.ko.gz \
         kernel/fs/jbd2/jbd2.ko.gz \
         kernel/fs/mbcache.ko.gz \
         kernel/lib/crc16.ko.gz \
         kernel/lib/libcrc32c.ko.gz \
         kernel/crypto/crc32c_generic.ko.gz \
+        kernel/drivers/block/zram/zram.ko.gz \
+        kernel/lib/lz4/lz4_compress.ko.gz \
+        kernel/lib/lz4/lz4_decompress.ko.gz \
+        kernel/lib/lz4/lz4hc_compress.ko.gz \
+        kernel/crypto/lz4.ko.gz \
         modules.dep modules.alias modules.symbols 2>/dev/null || true
 " | tar -xf - -C "$INITRAMFS_DIR/lib/modules/" 2>/dev/null || true
 
