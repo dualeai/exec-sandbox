@@ -5,9 +5,16 @@ Integration tests: Snapshot creation with QEMU (requires images).
 """
 
 import hashlib
+import sys
 from pathlib import Path
 
 import pytest
+
+# Use native zstd (Python 3.14+) or backports.zstd
+if sys.version_info >= (3, 14):
+    from compression import zstd
+else:
+    from backports import zstd
 
 from exec_sandbox.models import Language
 from exec_sandbox.settings import Settings
@@ -423,7 +430,6 @@ class TestL3Cache:
     async def test_download_from_s3_success(self, tmp_path: Path, monkeypatch) -> None:
         """Snapshot downloads from S3 and decompresses using real aioboto3 client."""
         import boto3
-        import zstandard as zstd
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -448,8 +454,7 @@ class TestL3Cache:
 
             # Compress and upload test data
             original_content = b"fake qcow2 content for download"
-            cctx = zstd.ZstdCompressor()
-            compressed = cctx.compress(original_content)
+            compressed = zstd.compress(original_content)
             s3_sync.put_object(
                 Bucket="test-snapshots",
                 Key="snapshots/python-download123.qcow2.zst",
@@ -734,7 +739,6 @@ class TestCacheHierarchy:
         from unittest.mock import AsyncMock, patch
 
         import boto3
-        import zstandard as zstd
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.models import Language
@@ -776,8 +780,7 @@ class TestCacheHierarchy:
 
             # Pre-populate S3 (L3) with compressed snapshot
             original_content = b"fake qcow2 snapshot from S3"
-            cctx = zstd.ZstdCompressor()
-            compressed = cctx.compress(original_content)
+            compressed = zstd.compress(original_content)
             s3_sync.put_object(
                 Bucket="test-snapshots",
                 Key=f"snapshots/{cache_key}.qcow2.zst",
@@ -910,7 +913,6 @@ class TestCacheHierarchy:
         from unittest.mock import AsyncMock, patch
 
         import boto3
-        import zstandard as zstd
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.models import Language
@@ -953,8 +955,7 @@ class TestCacheHierarchy:
 
             # Pre-populate S3 only
             original_content = b"scipy snapshot content"
-            cctx = zstd.ZstdCompressor()
-            compressed = cctx.compress(original_content)
+            compressed = zstd.compress(original_content)
             s3_sync.put_object(
                 Bucket="test-snapshots",
                 Key=f"snapshots/{cache_key}.qcow2.zst",

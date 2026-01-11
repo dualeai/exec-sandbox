@@ -104,16 +104,18 @@ class Scheduler:
         """Start scheduler and initialize resources.
 
         Startup sequence:
-        1. Create Settings from SchedulerConfig
-        2. Initialize VmManager
-        3. Initialize SnapshotManager (if S3 configured)
-        4. Start WarmVMPool (if warm_pool_size > 0)
+        1. Download assets from GitHub Releases (if auto_download_assets=True)
+        2. Create Settings from SchedulerConfig
+        3. Initialize VmManager
+        4. Initialize SnapshotManager (if S3 configured)
+        5. Start WarmVMPool (if warm_pool_size > 0)
 
         Returns:
             Self for use in context
 
         Raises:
             SandboxError: Startup failed
+            AssetDownloadError: Failed to download required assets
         """
         if self._started:
             raise SandboxError("Scheduler already started")
@@ -124,8 +126,16 @@ class Scheduler:
                 "max_concurrent_vms": self.config.max_concurrent_vms,
                 "warm_pool_size": self.config.warm_pool_size,
                 "s3_enabled": self.config.s3_bucket is not None,
+                "auto_download_assets": self.config.auto_download_assets,
             },
         )
+
+        # Download assets from GitHub Releases if needed
+        if self.config.auto_download_assets:
+            from exec_sandbox.assets import ensure_assets_available  # noqa: PLC0415
+
+            # Pre-fetch kernel and gvproxy (base images are fetched on-demand)
+            await ensure_assets_available()
 
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
@@ -348,7 +358,9 @@ class Scheduler:
             Settings instance configured from SchedulerConfig
         """
         # Get images directory (auto-detect if not configured)
-        images_dir = self.config.get_images_dir()
+        # When auto_download_assets=True, assets were already downloaded in __aenter__
+        # so we don't check existence again (they should exist now)
+        images_dir = self.config.get_images_dir(check_exists=not self.config.auto_download_assets)
 
         # Kernels may be in images_dir directly or in a kernels subdirectory
         kernels_subdir = images_dir / "kernels"

@@ -90,3 +90,34 @@ class PackageNotAllowedError(SandboxError):
     Raised when attempting to install a package that is not present in the
     configured allowlist, preventing potentially unsafe package installations.
     """
+
+
+class AssetError(SandboxError):
+    """Base exception for asset-related errors.
+
+    Raised when downloading, verifying, or processing assets fails.
+    """
+
+
+class AssetDownloadError(AssetError):
+    """Asset download failed.
+
+    Raised when downloading an asset from GitHub Releases fails after
+    all retry attempts are exhausted.
+    """
+
+
+class AssetChecksumError(AssetError):
+    """Asset checksum verification failed.
+
+    Raised when the downloaded asset's SHA256 hash does not match
+    the expected hash from the GitHub Release API.
+    """
+
+
+class AssetNotFoundError(AssetError):
+    """Asset not found.
+
+    Raised when an asset is not found in the registry or when
+    a GitHub Release does not exist for the specified version.
+    """

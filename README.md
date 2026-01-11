@@ -31,12 +31,55 @@ brew install qemu                # macOS
 apt install qemu-system          # Ubuntu/Debian
 ```
 
-```bash
-# Download pre-built VM images (Intel/AMD 64-bit)
-curl -LO https://github.com/dualeai/exec-sandbox/releases/latest/download/images-x86_64.tar.zst
-mkdir -p ~/.local/share/exec-sandbox/images
-tar --zstd -xf images-x86_64.tar.zst -C ~/.local/share/exec-sandbox/images/
-```
+VM images are **automatically downloaded** from GitHub Releases on first use. No manual setup required.
+
+## Asset Downloads
+
+exec-sandbox requires VM images (kernel, initramfs, qcow2) and binaries (gvproxy-wrapper) to run. These assets are **automatically downloaded** from GitHub Releases on first use.
+
+### How it works
+
+1. On first `Scheduler` initialization, exec-sandbox checks if assets exist in the cache directory
+2. If missing, it queries the GitHub Releases API for the matching version (`v{__version__}`)
+3. Assets are downloaded over HTTPS, verified against SHA256 checksums (provided by GitHub API), and decompressed
+4. Subsequent runs use the cached assets (no re-download)
+
+### Cache locations
+
+| Platform | Location |
+|----------|----------|
+| macOS | `~/Library/Caches/exec-sandbox/` |
+| Linux | `~/.cache/exec-sandbox/` (or `$XDG_CACHE_HOME/exec-sandbox/`) |
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `EXEC_SANDBOX_CACHE_DIR` | Override cache directory |
+| `EXEC_SANDBOX_OFFLINE` | Set to `1` to disable auto-download (fail if assets missing) |
+| `EXEC_SANDBOX_ASSET_VERSION` | Force specific release version |
+
+### Security considerations
+
+**Integrity verification:**
+- All downloaded assets are verified against SHA256 checksums
+- Checksums are fetched from GitHub's Release API (computed at upload time, immutable)
+- If checksum verification fails, the download is rejected and retried
+
+**Supply chain security:**
+- Assets are downloaded exclusively over HTTPS from `github.com`
+- Release assets are built in GitHub Actions CI with [build provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds)
+- You can verify attestations with: `gh attestation verify <asset> --owner dualeai`
+
+**Offline/air-gapped environments:**
+- Pre-download assets: `gh release download v{version} -R dualeai/exec-sandbox -D ~/.cache/exec-sandbox/`
+- Set `EXEC_SANDBOX_OFFLINE=1` to prevent any network requests
+- Or point `EXEC_SANDBOX_CACHE_DIR` to a pre-populated directory
+
+**Network access:**
+- Only connects to `api.github.com` (release metadata) and `github.com` (asset downloads)
+- No telemetry or analytics
+- All requests are read-only (GET)
 
 ## Quick Start
 
@@ -147,6 +190,7 @@ async with Scheduler() as scheduler:
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
+| `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
 Environment variables: `EXEC_SANDBOX_MAX_CONCURRENT_VMS`, `EXEC_SANDBOX_IMAGES_DIR`, etc.
 
@@ -220,6 +264,10 @@ Memory reclamation (balloon) shrinks to 64MB minimum, so larger VMs see bigger s
 | `GuestAgentError` | VM helper process returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
+| `AssetError` | Asset download/verification error (base) |
+| `AssetDownloadError` | Asset download failed |
+| `AssetChecksumError` | Asset checksum verification failed |
+| `AssetNotFoundError` | Asset not found in registry/release |
 
 ## Pitfalls
 

@@ -28,13 +28,19 @@ import contextlib
 import errno
 import hashlib
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiofiles
 import aiofiles.os
-import zstandard as zstd
+
+# Use native zstd module (Python 3.14+) or backports.zstd
+if sys.version_info >= (3, 14):
+    from compression import zstd
+else:
+    from backports import zstd
 
 from exec_sandbox import constants
 from exec_sandbox._imports import require_aioboto3
@@ -859,11 +865,18 @@ class SnapshotManager:
                 )
 
             # Decompress with zstd (run in thread pool to avoid blocking)
-            dctx = zstd.ZstdDecompressor()
+            chunk_size = 64 * 1024  # 64KB chunks for streaming
 
-            def _decompress():
+            def _decompress() -> None:
+                decompressor = zstd.ZstdDecompressor()
                 with Path(compressed_path).open("rb") as src, Path(snapshot_path).open("wb") as dst:
-                    dctx.copy_stream(src, dst)
+                    while True:
+                        chunk = src.read(chunk_size)
+                        if not chunk:
+                            break
+                        decompressed = decompressor.decompress(chunk)
+                        if decompressed:
+                            dst.write(decompressed)
 
             await asyncio.to_thread(_decompress)
 
@@ -899,11 +912,22 @@ class SnapshotManager:
         async with self._upload_semaphore:
             try:
                 # Compress with zstd (level 3 for speed, run in thread pool to avoid blocking)
-                cctx = zstd.ZstdCompressor(level=3)
+                chunk_size = 64 * 1024  # 64KB chunks for streaming
 
-                def _compress():
+                def _compress() -> None:
+                    compressor = zstd.ZstdCompressor(level=3)
                     with Path(snapshot_path).open("rb") as src, Path(compressed_path).open("wb") as dst:
-                        cctx.copy_stream(src, dst)
+                        while True:
+                            chunk = src.read(chunk_size)
+                            if not chunk:
+                                break
+                            compressed = compressor.compress(chunk)
+                            if compressed:
+                                dst.write(compressed)
+                        # Flush remaining data
+                        final = compressor.flush()
+                        if final:
+                            dst.write(final)
 
                 await asyncio.to_thread(_compress)
 

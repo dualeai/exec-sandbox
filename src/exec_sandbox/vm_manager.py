@@ -65,6 +65,10 @@ logger = get_logger(__name__)
 def _get_gvproxy_wrapper_path() -> Path:
     """Get path to gvproxy-wrapper binary for current platform.
 
+    Detection order:
+    1. Cached download directory (auto-downloaded from GitHub Releases)
+    2. Repo-relative path (development mode)
+
     Returns:
         Path to the platform-specific gvproxy-wrapper binary
 
@@ -89,14 +93,24 @@ def _get_gvproxy_wrapper_path() -> Path:
     else:
         raise VmError(f"Unsupported architecture for gvproxy-wrapper: {machine}")
 
-    # Construct path relative to package
     binary_name = f"gvproxy-wrapper-{os_name}-{arch}"
-    # Look in gvproxy-wrapper/bin/ relative to repo root
+
+    # 1. Check cached download directory first
+    from exec_sandbox.assets import get_cached_asset_path  # noqa: PLC0415
+
+    if cached_path := get_cached_asset_path(binary_name):
+        return cached_path
+
+    # 2. Fall back to repo-relative path (dev mode)
     repo_root = Path(__file__).parent.parent.parent
     binary_path = repo_root / "gvproxy-wrapper" / "bin" / binary_name
 
     if not binary_path.exists():
-        raise VmError(f"gvproxy-wrapper binary not found: {binary_path}. Run 'make build' to build it.")
+        raise VmError(
+            "gvproxy-wrapper binary not found. "
+            "Either enable auto_download_assets=True in SchedulerConfig, "
+            "or run 'make build' to build it locally."
+        )
 
     return binary_path
 

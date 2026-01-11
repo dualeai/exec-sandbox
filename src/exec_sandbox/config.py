@@ -57,6 +57,9 @@ class SchedulerConfig(BaseModel):
         s3_prefix: Prefix for S3 keys. Default: "snapshots/".
         enable_package_validation: Validate packages against allowlist.
             Disable for testing only. Default: True.
+        auto_download_assets: Automatically download VM images from GitHub
+            Releases if not found locally. Uses cache directory for storage.
+            Default: True.
     """
 
     model_config = ConfigDict(
@@ -127,22 +130,33 @@ class SchedulerConfig(BaseModel):
         default=True,
         description="Validate packages against allowlist",
     )
+    auto_download_assets: bool = Field(
+        default=True,
+        description="Automatically download VM images from GitHub Releases if not found",
+    )
 
-    def get_images_dir(self) -> Path:
+    def get_images_dir(self, check_exists: bool = True) -> Path:
         """Get images directory, auto-detecting if not configured.
 
         Detection order:
         1. Explicit images_dir from config
         2. EXEC_SANDBOX_IMAGES_DIR environment variable
-        3. Platform-specific default:
-           - Linux: ~/.local/share/exec-sandbox/images/
-           - macOS: ~/Library/Application Support/exec-sandbox/images/
+        3. EXEC_SANDBOX_CACHE_DIR environment variable (for auto-downloaded assets)
+        4. Platform-specific default:
+           - Linux: ~/.cache/exec-sandbox/ (when auto_download_assets=True)
+           - macOS: ~/Library/Caches/exec-sandbox/ (when auto_download_assets=True)
+           - Linux: ~/.local/share/exec-sandbox/images/ (when auto_download_assets=False)
+           - macOS: ~/Library/Application Support/exec-sandbox/images/ (when auto_download_assets=False)
+
+        Args:
+            check_exists: If True, raises FileNotFoundError when directory doesn't exist.
+                          Set to False when auto_download_assets=True (download happens later).
 
         Returns:
             Path to images directory
 
         Raises:
-            FileNotFoundError: Images directory does not exist
+            FileNotFoundError: Images directory does not exist and check_exists=True
         """
         import os  # noqa: PLC0415
         import sys  # noqa: PLC0415
@@ -151,15 +165,25 @@ class SchedulerConfig(BaseModel):
             path = self.images_dir
         elif env_path := os.environ.get("EXEC_SANDBOX_IMAGES_DIR"):
             path = Path(env_path)
+        elif self.auto_download_assets:
+            # Use cache directory for auto-downloaded assets
+            if cache_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
+                path = Path(cache_path)
+            elif sys.platform == "darwin":
+                path = Path.home() / "Library" / "Caches" / "exec-sandbox"
+            else:
+                # XDG_CACHE_HOME takes precedence if set
+                xdg_cache = os.environ.get("XDG_CACHE_HOME")
+                path = Path(xdg_cache) / "exec-sandbox" if xdg_cache else Path.home() / ".cache" / "exec-sandbox"
         elif sys.platform == "darwin":
             path = Path.home() / "Library" / "Application Support" / "exec-sandbox" / "images"
         else:
             path = Path.home() / ".local" / "share" / "exec-sandbox" / "images"
 
-        if not path.exists():
+        if check_exists and not path.exists():
             raise FileNotFoundError(
                 f"Images directory not found: {path}. "
-                f"Download images from GitHub Releases or set EXEC_SANDBOX_IMAGES_DIR."
+                f"Enable auto_download_assets=True or download images from GitHub Releases."
             )
 
         return path
