@@ -163,10 +163,6 @@ class TestSnapshotManagerIntegration:
 
     async def test_create_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
         """Create snapshot with packages (slow, requires VM)."""
-        # Skip if images not built
-        if not (images_dir / "python.qcow2").exists():
-            pytest.skip("VM images not built - run ./scripts/build-images.sh")
-
         from exec_sandbox.snapshot_manager import SnapshotManager
         from exec_sandbox.vm_manager import VmManager
 

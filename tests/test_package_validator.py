@@ -134,15 +134,8 @@ def test_load_allow_list_from_real_catalogs() -> None:
     # Use relative path from test file to catalogs
     catalog_dir = Path(__file__).parent.parent / "catalogs"
 
-    # Skip if catalogs don't exist (e.g., in isolated test environment)
-    if not catalog_dir.exists():
-        pytest.skip("Catalog directory not found")
-
     pypi_catalog = catalog_dir / "pypi_top_10k.json"
     npm_catalog = catalog_dir / "npm_top_10k.json"
-
-    if not pypi_catalog.exists() or not npm_catalog.exists():
-        pytest.skip("Catalog files not found")
 
     validator = PackageValidator(
         pypi_allow_list_path=pypi_catalog,
