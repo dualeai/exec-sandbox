@@ -1,6 +1,6 @@
 # exec-sandbox
 
-Secure code execution in isolated QEMU microVMs. Drop-in Python library for running untrusted Python, JavaScript, and shell code with 6-layer security isolation.
+Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 6-layer security isolation.
 
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
@@ -10,13 +10,13 @@ Secure code execution in isolated QEMU microVMs. Drop-in Python library for runn
 
 ## Highlights
 
-- **Hardware isolation** - Each execution runs in a dedicated QEMU microVM with KVM/HVF, not containers
-- **Fast startup** - 400ms cold boot, 1-2ms with warm pool pre-booting
-- **Simple API** - Just `Scheduler` and `run()`, async context manager pattern
-- **Streaming output** - Real-time stdout/stderr via callbacks
-- **Smart caching** - L1 local + L3 S3 snapshot cache for package installation
-- **Network control** - Disabled by default, optional DNS-based domain whitelisting
-- **Memory optimization** - zram compression + balloon for ~30% more usable memory, ~80% smaller snapshots
+- **Hardware isolation** - Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
+- **Fast startup** - 400ms fresh start, 1-2ms with pre-started VMs (warm pool)
+- **Simple API** - Just `Scheduler` and `run()`, async-friendly
+- **Streaming output** - Real-time output as code runs
+- **Smart caching** - Local + S3 remote cache for VM snapshots
+- **Network control** - Disabled by default, optional domain allowlisting
+- **Memory optimization** - Compressed memory (zram) + unused memory reclamation (balloon) for ~30% more capacity, ~80% smaller snapshots
 
 ## Installation
 
@@ -32,7 +32,7 @@ apt install qemu-system          # Ubuntu/Debian
 ```
 
 ```bash
-# Download pre-built VM images
+# Download pre-built VM images (Intel/AMD 64-bit)
 curl -LO https://github.com/dualeai/exec-sandbox/releases/latest/download/images-x86_64.tar.zst
 mkdir -p ~/.local/share/exec-sandbox/images
 tar --zstd -xf images-x86_64.tar.zst -C ~/.local/share/exec-sandbox/images/
@@ -88,7 +88,7 @@ async with Scheduler() as scheduler:
         code="import urllib.request; print(urllib.request.urlopen('https://httpbin.org/ip').read())",
         language="python",
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # DNS whitelisting
+        allowed_domains=["httpbin.org"],  # Domain allowlist
     )
 ```
 
@@ -98,11 +98,11 @@ async with Scheduler() as scheduler:
 from exec_sandbox import Scheduler, SchedulerConfig
 
 config = SchedulerConfig(
-    max_concurrent_vms=20,       # Backpressure control
-    warm_pool_size=1,            # Enable warm pool (size = max_concurrent_vms × 25%)
+    max_concurrent_vms=20,       # Limit parallel executions
+    warm_pool_size=1,            # Pre-started VMs (warm pool), size = max_concurrent_vms × 25%
     default_memory_mb=512,       # Per-VM memory
     default_timeout_seconds=60,  # Execution timeout
-    s3_bucket="my-snapshots",    # L3 cache for package snapshots
+    s3_bucket="my-snapshots",    # Remote cache for package snapshots
     s3_region="us-east-1",
 )
 
@@ -129,24 +129,24 @@ async with Scheduler() as scheduler:
 ## Documentation
 
 - [QEMU Documentation](https://www.qemu.org/docs/master/) - Virtual machine emulator
-- [KVM](https://www.linux-kvm.org/page/Documents) - Linux kernel virtualization
-- [HVF](https://developer.apple.com/documentation/hypervisor) - macOS Hypervisor.framework
-- [cgroups v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) - Resource isolation
-- [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) - Syscall filtering
+- [KVM](https://www.linux-kvm.org/page/Documents) - Linux hardware virtualization
+- [HVF](https://developer.apple.com/documentation/hypervisor) - macOS hardware virtualization (Hypervisor.framework)
+- [cgroups v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) - Linux resource limits
+- [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) - System call filtering
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_concurrent_vms` | 10 | Maximum parallel VMs (backpressure) |
-| `warm_pool_size` | 0 | Enable warm pool (>0). Size = `max_concurrent_vms × 25%` per language |
-| `default_memory_mb` | 256 | Guest VM memory (128-2048 MB). Effective ~25% higher with zram |
+| `max_concurrent_vms` | 10 | Maximum parallel VMs |
+| `warm_pool_size` | 0 | Pre-started VMs (warm pool). Set >0 to enable. Size = `max_concurrent_vms × 25%` per language |
+| `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `images_dir` | auto | VM images directory |
-| `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache (L1) |
-| `s3_bucket` | None | S3 bucket for snapshots (L3) |
+| `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache |
+| `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
-| `enable_package_validation` | True | Validate against top 10k PyPI/npm |
+| `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 
 Environment variables: `EXEC_SANDBOX_MAX_CONCURRENT_VMS`, `EXEC_SANDBOX_IMAGES_DIR`, etc.
 
@@ -156,20 +156,20 @@ VMs include automatic memory optimization that requires **no configuration**:
 
 | Feature | What It Does | Benefit |
 |---------|--------------|---------|
-| **zram** | Compressed swap in RAM (lz4) | +10-30% usable memory |
-| **virtio-balloon** | Reclaims unused pages before snapshots | 70-90% smaller snapshots |
+| **Compressed swap (zram)** | Uses RAM as compressed swap space (lz4 compression) | +10-30% usable memory |
+| **Memory reclamation (virtio-balloon)** | Returns unused memory before snapshots | 70-90% smaller snapshots |
 
 **Effective memory (scales with configured RAM):**
 
-| Configured | Available | zram | Effective Capacity |
-|------------|-----------|------|-------------------|
+| Configured | Available | Compressed Swap | Effective Capacity |
+|------------|-----------|-----------------|-------------------|
 | 256MB | ~175MB | 108MB | ~280-320MB |
 | 512MB | ~420MB | 233MB | ~600-700MB |
 | 1024MB | ~890MB | 484MB | ~1200-1400MB |
 
-zram is always 50% of total RAM, so larger VMs get proportionally more expansion.
+Compressed swap (zram) is always 50% of total RAM, so larger VMs get proportionally more expansion.
 
-**Balloon savings (before snapshots):**
+**Memory reclamation savings (before snapshots):**
 
 | Configured | Reclaimable | Snapshot Size |
 |------------|-------------|---------------|
@@ -177,20 +177,20 @@ zram is always 50% of total RAM, so larger VMs get proportionally more expansion
 | 512MB | ~430MB | ~80MB |
 | 1024MB | ~900MB | ~120MB |
 
-Balloon deflates to 64MB minimum, so larger VMs see bigger snapshot reductions.
+Memory reclamation (balloon) shrinks to 64MB minimum, so larger VMs see bigger snapshot reductions.
 
 **What this means for users:**
 
 - Memory-heavy code execution works better than the configured limit suggests
 - Compression ratio depends on data: 18-50x for code/text, ~1x for encrypted/random data
-- Latency impact is negligible (~0.2μs per memory access)
+- Speed impact is negligible (~0.2μs delay per memory access)
 - Snapshot restore is faster due to smaller files
 
 **Tradeoffs:**
 
 - CPU overhead for compression (minimal with lz4)
-- Incompressible data (encryption, media) won't benefit from zram
-- OOM errors may be delayed (zram absorbs pressure before failing)
+- Incompressible data (encryption, media) won't benefit from compressed swap
+- Out-of-memory (OOM) errors may be delayed (compressed swap absorbs pressure before failing)
 
 ## Execution Result
 
@@ -199,11 +199,11 @@ Balloon deflates to 64MB minimum, so larger VMs see bigger snapshot reductions.
 | `stdout` | str | Captured output (max 1MB) |
 | `stderr` | str | Captured errors (max 100KB) |
 | `exit_code` | int | Process exit code (0 = success) |
-| `execution_time_ms` | int | Guest-reported duration |
-| `external_cpu_time_ms` | int | Host cgroup CPU time |
-| `external_memory_peak_mb` | int | Host cgroup peak memory |
-| `timing.setup_ms` | int | Resource setup (overlay, cgroup, network) |
-| `timing.boot_ms` | int | VM boot (kernel + guest agent) |
+| `execution_time_ms` | int | Duration reported by VM |
+| `external_cpu_time_ms` | int | CPU time measured by host |
+| `external_memory_peak_mb` | int | Peak memory measured by host |
+| `timing.setup_ms` | int | Resource setup (filesystem, limits, network) |
+| `timing.boot_ms` | int | VM boot time |
 | `timing.execute_ms` | int | Code execution |
 | `timing.total_ms` | int | End-to-end time |
 
@@ -216,8 +216,8 @@ Balloon deflates to 64MB minimum, so larger VMs see bigger snapshot reductions.
 | `VmError` | VM operation failed |
 | `VmTimeoutError` | Execution exceeded timeout |
 | `VmBootError` | VM failed to start |
-| `CommunicationError` | Host-guest communication failed |
-| `GuestAgentError` | Guest agent returned error |
+| `CommunicationError` | VM communication failed |
+| `GuestAgentError` | VM helper process returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
 
@@ -230,24 +230,24 @@ result2 = await scheduler.run("print(x)", language="python")  # NameError!
 # Fix: single execution with all code
 await scheduler.run("x = 42; print(x)", language="python")
 
-# Warm pool only works without packages
+# Pre-started VMs (warm pool) only work without packages
 config = SchedulerConfig(warm_pool_size=1)
-await scheduler.run(code="...", packages=["pandas"])  # Bypasses warm pool, cold boot (400ms)
+await scheduler.run(code="...", packages=["pandas"])  # Bypasses warm pool, fresh start (400ms)
 await scheduler.run(code="...")                        # Uses warm pool (1-2ms)
 
 # Pin package versions for caching
 packages=["pandas==2.2.0"]  # Cacheable
 packages=["pandas"]         # Cache miss every time
 
-# Streaming callbacks must be fast (blocks event loop)
+# Streaming callbacks must be fast (blocks async execution)
 on_stdout=lambda chunk: time.sleep(1)        # Blocks!
 on_stdout=lambda chunk: buffer.append(chunk)  # Fast
 
-# Memory overhead: warm pool uses (max_concurrent_vms × 25%) × 2 languages × 256MB
+# Memory overhead: pre-started VMs use (max_concurrent_vms × 25%) × 2 languages × 256MB
 # max_concurrent_vms=20 → 5 VMs/lang × 2 × 256MB = 2.5GB for warm pool alone
 
-# Memory can exceed configured limit due to zram compression
-default_memory_mb=256  # Code can actually use ~280-320MB thanks to zram
+# Memory can exceed configured limit due to compressed swap
+default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
 # Don't rely on memory limits for security - use timeouts for runaway allocations
 
 # Network without domain restrictions is risky
@@ -272,19 +272,19 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 
 | Layer | Technology | Protection |
 |-------|------------|------------|
-| 1 | KVM/HVF virtualization | Hardware-enforced CPU isolation (ring -1) |
-| 2 | Unprivileged QEMU | No root privileges, reduced attack surface |
-| 3 | Seccomp | Syscall filtering, deny-by-default |
-| 4 | cgroups v2 | Memory, CPU, PID limits (fork bomb prevention) |
-| 5 | Linux namespaces | PID, network, mount, UTS, IPC isolation |
-| 6 | MAC | AppArmor/SELinux when available |
+| 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
+| 2 | Unprivileged QEMU | No root privileges, minimal exposure |
+| 3 | System call filtering (seccomp) | Blocks unauthorized OS calls |
+| 4 | Resource limits (cgroups v2) | Memory, CPU, process limits |
+| 5 | Process isolation (namespaces) | Separate process, network, filesystem views |
+| 6 | Security policies (AppArmor/SELinux) | When available |
 
 **Guarantees:**
 
 - VMs are never reused - fresh VM per `run()`, destroyed immediately after
 - Network disabled by default - requires explicit `allow_network=True`
-- DNS whitelisting - only specified domains accessible when network enabled
-- Package validation - only top 10k PyPI/npm packages allowed by default
+- Domain allowlisting - only specified domains accessible when network enabled
+- Package validation - only top 10k Python/JavaScript packages allowed by default
 
 ## Requirements
 
@@ -294,14 +294,14 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 | QEMU | 8.0+ |
 | Hardware acceleration | KVM (Linux) or HVF (macOS) |
 
-Verify acceleration:
+Verify hardware acceleration is available:
 
 ```bash
 ls /dev/kvm              # Linux
 sysctl kern.hv_support   # macOS
 ```
 
-Without hardware acceleration, QEMU uses TCG software emulation (10-50x slower).
+Without hardware acceleration, QEMU uses software emulation (TCG), which is 10-50x slower.
 
 ## VM Images
 
@@ -309,27 +309,27 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 
 | Image | Contents | Size |
 |-------|----------|------|
-| python-3.14-base | Alpine + Python 3.14 + uv + guest-agent | ~512MB |
-| node-23-base | Alpine + Node.js 23 + bun + guest-agent | ~512MB |
+| python-3.14-base | Alpine Linux + Python 3.14 + uv + VM helper | ~512MB |
+| node-23-base | Alpine Linux + Node.js 23 + bun + VM helper | ~512MB |
 
 Build from source:
 
 ```bash
 ./scripts/build-images.sh
-# Output: ./images/.dist/python-3.14-base.qcow2, ./images/.dist/node-23-base.qcow2
+# Output: ./images/.dist/python-3.14-base.qcow2, ./images/.dist/node-23-base.qcow2 (QEMU disk images)
 ```
 
 ## Security
 
 - [Security Policy](./SECURITY.md) - Vulnerability reporting
-- [SBOM](https://github.com/dualeai/exec-sandbox/releases) - Software Bill of Materials (SPDX format) attached to releases
+- [Dependency list (SBOM)](https://github.com/dualeai/exec-sandbox/releases) - Full list of included software, attached to releases
 
 ## Contributing
 
 Contributions welcome! Please open an issue first to discuss changes.
 
 ```bash
-make install      # Setup venv
+make install      # Setup environment
 make test         # Run tests
 make lint         # Format and lint
 ```
