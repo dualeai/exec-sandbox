@@ -84,11 +84,20 @@ jobs:
   # ==========================================================================
 
   build-gvproxy-wrapper:
-    name: Build / gvproxy-wrapper (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    name: Build / gvproxy-wrapper (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        arch: [x64, arm64]
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos
+            arch: arm64
+            runner: macos-26
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -98,7 +107,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gvproxy-wrapper-${{ matrix.arch }}
+          name: gvproxy-wrapper-${{ matrix.os }}-${{ matrix.arch }}
           path: gvproxy-wrapper/bin/
           retention-days: 1
 
@@ -235,7 +244,7 @@ jobs:
       - name: Download gvproxy-wrapper
         uses: actions/download-artifact@v4
         with:
-          name: gvproxy-wrapper-${{ matrix.platform.arch }}
+          name: gvproxy-wrapper-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
