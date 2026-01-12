@@ -77,9 +77,10 @@ if [ -e /sys/block/zram0 ]; then
     MIN_FREE_KB=$((MEM_KB * 4 / 100))
     echo "$MIN_FREE_KB" > /proc/sys/vm/min_free_kbytes 2>/dev/null || true
 
-    # Strict overcommit: malloc fails predictably instead of OOM kill
-    echo 2 > /proc/sys/vm/overcommit_memory 2>/dev/null || true
-    echo 95 > /proc/sys/vm/overcommit_ratio 2>/dev/null || true  # Allow 95% of RAM + swap
+    # Heuristic overcommit (default): allows large virtual memory reservations
+    # Required for JIT runtimes (Bun/JavaScriptCore reserves 128GB+ virtual address space)
+    # Mode 2 (strict) breaks JIT - malloc fails for large virtual reservations even if unused
+    echo 0 > /proc/sys/vm/overcommit_memory 2>/dev/null || true
 fi
 
 # Wait for virtio block device with exponential backoff (5+10+20+40+80=155ms max)

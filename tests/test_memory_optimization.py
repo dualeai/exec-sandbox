@@ -124,25 +124,21 @@ print(f'PASS: page-cluster={page_cluster}, swappiness={swappiness}')
         assert "PASS" in result.stdout
 
     async def test_overcommit_settings_configured(self, scheduler: Scheduler) -> None:
-        """VM should have overcommit settings for predictable allocation failures."""
+        """VM should have heuristic overcommit for JIT runtime compatibility."""
         result = await scheduler.run(
             code="""
-# vm.overcommit_memory=2 makes malloc fail predictably instead of OOM kill
+# vm.overcommit_memory=0 (heuristic) allows large virtual memory reservations
+# Required for JIT runtimes like Bun/JavaScriptCore that reserve 128GB+ virtual address space
 with open('/proc/sys/vm/overcommit_memory') as f:
     overcommit_memory = int(f.read().strip())
-    assert overcommit_memory == 2, f'overcommit_memory should be 2, got {overcommit_memory}'
-
-# vm.overcommit_ratio should be set (allows allocation beyond physical RAM)
-with open('/proc/sys/vm/overcommit_ratio') as f:
-    overcommit_ratio = int(f.read().strip())
-    assert overcommit_ratio >= 90, f'overcommit_ratio should be >=90, got {overcommit_ratio}'
+    assert overcommit_memory == 0, f'overcommit_memory should be 0 (heuristic), got {overcommit_memory}'
 
 # vm.min_free_kbytes should be set (prevents OOM deadlocks)
 with open('/proc/sys/vm/min_free_kbytes') as f:
     min_free_kb = int(f.read().strip())
     assert min_free_kb >= 5000, f'min_free_kbytes should be >=5000, got {min_free_kb}'
 
-print(f'PASS: overcommit_memory={overcommit_memory}, overcommit_ratio={overcommit_ratio}, min_free_kbytes={min_free_kb}')
+print(f'PASS: overcommit_memory={overcommit_memory}, min_free_kbytes={min_free_kb}')
 """,
             language=Language.PYTHON,
         )
