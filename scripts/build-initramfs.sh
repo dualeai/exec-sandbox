@@ -120,7 +120,14 @@ fi
 cd "$INITRAMFS_DIR"
 find . | cpio -o -H newc --quiet 2>/dev/null | lz4 -9 -l > "$OUTPUT_DIR/initramfs-$ARCH_NAME"
 
-# Report size comparison
+# Verify LZ4 legacy format (magic: 02 21 4C 18) required by Linux kernel
+MAGIC=$(od -A n -t x1 -N 4 "$OUTPUT_DIR/initramfs-$ARCH_NAME" | tr -d ' ')
+if [ "$MAGIC" != "02214c18" ]; then
+    echo "ERROR: Invalid LZ4 format (got $MAGIC, expected 02214c18)"
+    exit 1
+fi
+
+# Report size
 NEW_SIZE=$(ls -lh "$OUTPUT_DIR/initramfs-$ARCH_NAME" | awk '{print $5}')
 echo "Built minimal initramfs: $OUTPUT_DIR/initramfs-$ARCH_NAME ($NEW_SIZE)"
 
