@@ -71,6 +71,34 @@ class CommunicationError(SandboxError):
     """
 
 
+class SocketAuthError(CommunicationError):
+    """Socket peer authentication failed.
+
+    Raised when Unix socket server is not running as expected user.
+    This could indicate:
+    - QEMU crashed and another process bound the socket path
+    - Race condition during socket creation
+    - Malicious process attempting socket hijacking
+
+    Attributes:
+        expected_uid: Expected user ID
+        actual_uid: Actual user ID from peer credentials
+    """
+
+    def __init__(
+        self,
+        message: str,
+        expected_uid: int,
+        actual_uid: int,
+        context: dict[str, Any] | None = None,
+    ):
+        ctx = context or {}
+        ctx.update({"expected_uid": expected_uid, "actual_uid": actual_uid})
+        super().__init__(message, ctx)
+        self.expected_uid = expected_uid
+        self.actual_uid = actual_uid
+
+
 class GuestAgentError(SandboxError):
     """Guest agent returned error response.
 

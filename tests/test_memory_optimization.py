@@ -568,7 +568,7 @@ class TestQMPBalloonMethods:
 
         from exec_sandbox.qmp_client import QMPClientWrapper
 
-        wrapper = QMPClientWrapper("/tmp/test.sock")
+        wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
         wrapper._client = MagicMock()
         wrapper._client.execute = AsyncMock(return_value={"actual": 256 * 1024 * 1024})
 
@@ -585,7 +585,7 @@ class TestQMPBalloonMethods:
 
         from exec_sandbox.qmp_client import QMPClientWrapper
 
-        wrapper = QMPClientWrapper("/tmp/test.sock")
+        wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
         wrapper._client = MagicMock()
         wrapper._client.execute = AsyncMock(side_effect=Exception("No balloon device found"))
 
@@ -599,7 +599,7 @@ class TestQMPBalloonMethods:
 
         from exec_sandbox.qmp_client import QMPClientWrapper
 
-        wrapper = QMPClientWrapper("/tmp/test.sock")
+        wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
         wrapper._client = MagicMock()
         wrapper._client.execute = AsyncMock(return_value={})
 
@@ -622,7 +622,7 @@ class TestQMPBalloonMethods:
         ]
 
         for mb, expected_bytes in test_cases:
-            wrapper = QMPClientWrapper("/tmp/test.sock")
+            wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
             wrapper._client = MagicMock()
             wrapper._client.execute = AsyncMock(return_value={})
 
@@ -636,7 +636,7 @@ class TestQMPBalloonMethods:
 
         from exec_sandbox.qmp_client import QMPClientWrapper
 
-        wrapper = QMPClientWrapper("/tmp/test.sock")
+        wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
         wrapper._client = MagicMock()
         wrapper._client.execute = AsyncMock(
             side_effect=[
@@ -656,7 +656,7 @@ class TestQMPBalloonMethods:
 
         from exec_sandbox.qmp_client import QMPClientWrapper
 
-        wrapper = QMPClientWrapper("/tmp/test.sock")
+        wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
         wrapper._client = MagicMock()
         wrapper._client.execute = AsyncMock(side_effect=Exception("No balloon device"))
 
@@ -670,7 +670,7 @@ class TestQMPBalloonMethods:
 
         from exec_sandbox.qmp_client import QMPClientWrapper
 
-        wrapper = QMPClientWrapper("/tmp/test.sock")
+        wrapper = QMPClientWrapper("/tmp/test.sock", expected_uid=1000)
         wrapper._client = MagicMock()
         wrapper._client.execute = AsyncMock(
             side_effect=[

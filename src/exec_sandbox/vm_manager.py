@@ -55,6 +55,7 @@ from exec_sandbox.resource_cleanup import (
     cleanup_process,
 )
 from exec_sandbox.settings import Settings
+from exec_sandbox.socket_auth import get_qemu_vm_uid
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
@@ -652,6 +653,9 @@ class QemuVM:
         # Timing instrumentation (set by VmManager.create_vm)
         self._setup_ms: int | None = None  # Resource setup time
         self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
+        # Socket authentication (set by VmManager.create_vm before first use)
+        # Use -1 as sentinel (no valid UID) to fail-fast if used before being set
+        self.expected_qemu_uid: int = -1
 
     @property
     def setup_ms(self) -> int | None:
@@ -1371,7 +1375,20 @@ class VmManager:
                 with contextlib.suppress(OSError):
                     await aiofiles.os.remove(socket_path)
 
-            channel: GuestChannel = DualPortChannel(cmd_socket, event_socket)
+            # Determine expected UID for socket authentication (mandatory)
+            # Verifies QEMU process identity before sending commands
+            if workdir.use_qemu_vm_user:
+                expected_uid = get_qemu_vm_uid()
+                if expected_uid is None:
+                    # qemu-vm user expected but doesn't exist - configuration error
+                    raise VmError(
+                        "qemu-vm user required for socket authentication but not found",
+                        {"use_qemu_vm_user": True},
+                    )
+            else:
+                expected_uid = os.getuid()
+
+            channel: GuestChannel = DualPortChannel(cmd_socket, event_socket, expected_uid=expected_uid)
 
             # If cgroups unavailable, wrap with ulimit for host resource control
             # ulimit works on Linux, macOS, BSD (POSIX)
@@ -1478,6 +1495,8 @@ class VmManager:
                 gvproxy_log_task,
                 console_log,
             )
+            # Store expected UID for QMP socket authentication (used by snapshot_manager)
+            vm.expected_qemu_uid = expected_uid
 
             # Step 8a: Register VM in registry (before BOOTING to ensure tracking)
             async with self._vms_lock:

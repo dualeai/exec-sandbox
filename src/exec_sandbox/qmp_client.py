@@ -14,6 +14,7 @@ from qemu.qmp import QMPClient  # type: ignore[import-untyped]
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import SnapshotError
+from exec_sandbox.socket_auth import SocketAuthError, verify_socket_peer
 
 # Minimum parts needed to identify a snapshot entry in info snapshots output
 _MIN_SNAPSHOT_PARTS = 2
@@ -32,13 +33,15 @@ class QMPClientWrapper:
             await qmp.save_snapshot("ready")
     """
 
-    def __init__(self, socket_path: str | Path):
+    def __init__(self, socket_path: str | Path, expected_uid: int):
         """Initialize QMP client wrapper.
 
         Args:
             socket_path: Path to QEMU QMP Unix socket.
+            expected_uid: Expected UID of QEMU process for peer verification (required).
         """
         self._socket_path = str(socket_path)
+        self._expected_uid = expected_uid
         self._client: QMPClient | None = None
 
     async def __aenter__(self) -> "QMPClientWrapper":
@@ -56,13 +59,13 @@ class QMPClientWrapper:
         await self.disconnect()
 
     async def connect(self, timeout: float = 5.0) -> None:
-        """Connect to QMP socket.
+        """Connect to QMP socket with mandatory peer verification.
 
         Args:
             timeout: Connection timeout in seconds.
 
         Raises:
-            SnapshotError: If connection fails or times out.
+            SnapshotError: If connection fails, times out, or peer verification fails.
         """
         self._client = QMPClient("exec-sandbox")
         try:
@@ -70,11 +73,43 @@ class QMPClientWrapper:
                 self._client.connect(self._socket_path),
                 timeout=timeout,
             )
+
+            # Verify peer credentials after connection (mandatory)
+            # Access underlying socket from QMPClient's internal asyncio protocol.
+            # Uses getattr() because:
+            # 1. qemu.qmp is untyped (see import with type: ignore)
+            # 2. _protocol/_transport are private attrs that may change between versions
+            # 3. Defensive fallback to None avoids AttributeError if internals change
+            protocol = getattr(self._client, "_protocol", None)
+            transport = getattr(protocol, "_transport", None) if protocol else None
+            sock = transport.get_extra_info("socket") if transport else None
+
+            if sock is not None:
+                verify_socket_peer(sock, self._expected_uid, self._socket_path)
+            else:
+                # Cannot access socket - fail authentication
+                # This could indicate qemu.qmp library internals changed
+                await self._cleanup_client()
+                raise SocketAuthError(
+                    "Cannot verify QMP socket peer: unable to access underlying socket",
+                    expected_uid=self._expected_uid,
+                    actual_uid=0,
+                    context={
+                        "socket": self._socket_path,
+                        "has_protocol": protocol is not None,
+                        "has_transport": transport is not None,
+                    },
+                )
+
             _logger.debug("Connected to QMP socket: %s", self._socket_path)
         except TimeoutError as e:
             await self._cleanup_client()
             msg = f"QMP connection timed out after {timeout}s"
             raise SnapshotError(msg, {"socket": self._socket_path}) from e
+        except SocketAuthError as e:
+            await self._cleanup_client()
+            msg = f"QMP socket authentication failed: {e}"
+            raise SnapshotError(msg, {"socket": self._socket_path, **e.context}) from e
         except OSError as e:
             await self._cleanup_client()
             msg = f"QMP connection failed: {e}"

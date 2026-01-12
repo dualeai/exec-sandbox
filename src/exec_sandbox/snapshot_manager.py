@@ -290,7 +290,7 @@ class SnapshotManager:
                 context={"vm_id": vm.vm_id, "cache_key": cache_key},
             )
 
-        async with QMPClientWrapper(vm.qmp_socket_path) as qmp:
+        async with QMPClientWrapper(vm.qmp_socket_path, expected_uid=vm.expected_qemu_uid) as qmp:
             # Step 1a: Deflate balloon to reclaim free pages (reduces snapshot size)
             # This is an optional optimization - continues even if balloon fails
             # Note: VM memory size isn't tracked on QemuVM, use default

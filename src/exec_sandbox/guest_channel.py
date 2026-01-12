@@ -22,6 +22,7 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingErrorMessage,
     StreamingMessage,
 )
+from exec_sandbox.socket_auth import connect_and_verify
 
 logger = get_logger(__name__)
 
@@ -233,12 +234,14 @@ class UnixSocketChannel:
     - Fail-fast (5s) if queue full
     """
 
-    def __init__(self, socket_path: str):
+    def __init__(self, socket_path: str, expected_uid: int):
         """
         Args:
             socket_path: Unix socket path (e.g., /tmp/serial-{hash}.sock)
+            expected_uid: Expected UID of QEMU process for peer verification (required)
         """
         self.socket_path = socket_path
+        self.expected_uid = expected_uid
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
@@ -246,19 +249,24 @@ class UnixSocketChannel:
         self._shutdown_event: asyncio.Event = asyncio.Event()
 
     async def connect(self, timeout_seconds: int) -> None:
-        """Connect to guest via Unix socket.
+        """Connect to guest via Unix socket with mandatory peer verification.
 
         Single connection attempt with timeout (no retry).
         Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
+
+        Verifies the socket server (QEMU) is running as the expected user
+        via SO_PEERCRED/LOCAL_PEERCRED before allowing communication.
         """
         if self._reader and self._writer:
             return
 
-        # Connect to Unix socket (QEMU forwards to guest virtio-serial)
+        # Connect to Unix socket with mandatory peer credential verification
         # Use larger buffer limit to handle 100KB JSON messages from guest agent
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(self.socket_path, limit=STREAM_BUFFER_LIMIT),
+        self._reader, self._writer = await connect_and_verify(
+            path=self.socket_path,
+            expected_uid=self.expected_uid,
             timeout=float(timeout_seconds),
+            buffer_limit=STREAM_BUFFER_LIMIT,
         )
 
         # Start background write worker
@@ -489,16 +497,17 @@ class DualPortChannel:
         await channel.close()
     """
 
-    def __init__(self, cmd_socket: str, event_socket: str):
+    def __init__(self, cmd_socket: str, event_socket: str, expected_uid: int):
         """
         Args:
             cmd_socket: Unix socket path for command port (e.g., /tmp/cmd-{hash}.sock)
             event_socket: Unix socket path for event port (e.g., /tmp/event-{hash}.sock)
+            expected_uid: Expected UID of QEMU process for peer verification (required)
         """
         self.cmd_socket = cmd_socket
         self.event_socket = event_socket
-        self._cmd_channel: UnixSocketChannel = UnixSocketChannel(cmd_socket)
-        self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket)
+        self._cmd_channel: UnixSocketChannel = UnixSocketChannel(cmd_socket, expected_uid)
+        self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
 
     async def connect(self, timeout_seconds: int) -> None:
         """Connect both command and event ports.
