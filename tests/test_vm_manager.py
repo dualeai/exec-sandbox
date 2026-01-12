@@ -4,8 +4,8 @@ Unit tests: State machine, platform detection.
 Integration tests: Real VM lifecycle (requires QEMU + images).
 """
 
+import asyncio
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -146,32 +146,12 @@ IMAGE_TEST_CASES = [
 class TestVmManagerIntegration:
     """Integration tests for VmManager with real QEMU VMs."""
 
-    async def test_vm_manager_init(self, images_dir: Path) -> None:
+    async def test_vm_manager_init(self, vm_manager, vm_settings) -> None:
         """VmManager initializes correctly."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
+        assert vm_manager.settings == vm_settings
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
-
-        assert vm_manager.settings == settings
-
-    async def test_create_and_destroy_vm(self, images_dir: Path) -> None:
+    async def test_create_and_destroy_vm(self, vm_manager) -> None:
         """Create and destroy a VM."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
-
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
-
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test",
@@ -189,18 +169,8 @@ class TestVmManagerIntegration:
             await vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
 
-    async def test_vm_execute_code(self, images_dir: Path) -> None:
+    async def test_vm_execute_code(self, vm_manager) -> None:
         """Execute code in a VM."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
-
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
-
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test",
@@ -226,19 +196,9 @@ class TestVmManagerIntegration:
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def test_multiple_vms(self, images_dir: Path) -> None:
+    async def test_multiple_vms(self, vm_manager) -> None:
         """Create multiple VMs concurrently."""
         import asyncio
-
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
-
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
 
         # Create 2 VMs concurrently
         create_tasks = [
@@ -277,22 +237,12 @@ class TestAllImageTypes:
     @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
     async def test_vm_health_check_all_images(
         self,
-        images_dir: Path,
+        vm_manager,
         language: Language,
         code: str,
         expected_output: str,
     ) -> None:
         """VM boots and guest agent responds for all image types."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
-
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
-
         vm = await vm_manager.create_vm(
             language=language,
             tenant_id="test",
@@ -318,22 +268,12 @@ class TestAllImageTypes:
     @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
     async def test_vm_execute_code_all_images(
         self,
-        images_dir: Path,
+        vm_manager,
         language: Language,
         code: str,
         expected_output: str,
     ) -> None:
         """VM executes code and returns correct output for all image types."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
-
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
-
         vm = await vm_manager.create_vm(
             language=language,
             tenant_id="test",

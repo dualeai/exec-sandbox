@@ -4,7 +4,6 @@ Tests configuration validation and get_images_dir() path resolution.
 No mocks - uses real filesystem and environment variables.
 """
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -140,16 +139,17 @@ class TestGetImagesDir:
         assert result == images_dir
 
     def test_explicit_images_dir_not_exists(self, tmp_path: Path) -> None:
-        """get_images_dir() raises FileNotFoundError for missing explicit path."""
+        """get_images_dir() raises FileNotFoundError for missing explicit path when auto_download disabled."""
         missing_dir = tmp_path / "nonexistent"
 
-        config = SchedulerConfig(images_dir=missing_dir)
+        # With auto_download_assets=False, missing directory should raise error
+        config = SchedulerConfig(images_dir=missing_dir, auto_download_assets=False)
 
         with pytest.raises(FileNotFoundError) as exc_info:
             config.get_images_dir()
 
         assert "nonexistent" in str(exc_info.value)
-        assert "Download images from GitHub Releases" in str(exc_info.value)
+        assert "download images from GitHub Releases" in str(exc_info.value)
 
     def test_env_var_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """get_images_dir() uses EXEC_SANDBOX_IMAGES_DIR env var."""
@@ -164,11 +164,12 @@ class TestGetImagesDir:
         assert result == images_dir
 
     def test_env_var_not_exists(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_images_dir() raises FileNotFoundError for missing env var path."""
+        """get_images_dir() raises FileNotFoundError for missing env var path when auto_download disabled."""
         missing_dir = tmp_path / "missing-env-path"
         monkeypatch.setenv("EXEC_SANDBOX_IMAGES_DIR", str(missing_dir))
 
-        config = SchedulerConfig()
+        # With auto_download_assets=False, missing directory should raise error
+        config = SchedulerConfig(auto_download_assets=False)
 
         with pytest.raises(FileNotFoundError) as exc_info:
             config.get_images_dir()
@@ -191,13 +192,42 @@ class TestGetImagesDir:
         assert result == explicit_dir
         assert result != env_dir
 
-    def test_platform_default_macos(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_images_dir() uses macOS default path on darwin."""
-        # Clear env var
-        monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+    def test_platform_default_macos_with_auto_download(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """get_images_dir() uses macOS cache path when auto_download_assets=True."""
+        from exec_sandbox import platform_utils
+        from exec_sandbox.platform_utils import HostOS
 
-        # Simulate macOS
-        monkeypatch.setattr(sys, "platform", "darwin")
+        # Clear env vars
+        monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+
+        # Simulate macOS by patching detect_host_os in the module
+        monkeypatch.setattr(platform_utils, "detect_host_os", lambda: HostOS.MACOS)
+
+        # Override Path.home() to use tmp_path
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        # With auto_download_assets=True (default), uses cache path
+        scheduler_config = SchedulerConfig()
+        result = scheduler_config.get_images_dir()
+
+        # Should use Caches directory (not Application Support)
+        expected = tmp_path / "Library" / "Caches" / "exec-sandbox"
+        assert result == expected
+
+    def test_platform_default_macos_without_auto_download(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_images_dir() uses macOS Application Support path when auto_download_assets=False."""
+        from exec_sandbox import platform_utils
+        from exec_sandbox.platform_utils import HostOS
+
+        # Clear env vars
+        monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+
+        # Simulate macOS by patching detect_host_os in the module
+        monkeypatch.setattr(platform_utils, "detect_host_os", lambda: HostOS.MACOS)
 
         # Create the expected default directory
         macos_default = tmp_path / "Library" / "Application Support" / "exec-sandbox" / "images"
@@ -206,18 +236,49 @@ class TestGetImagesDir:
         # Override Path.home() to use tmp_path
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        config = SchedulerConfig()
-        result = config.get_images_dir()
+        scheduler_config = SchedulerConfig(auto_download_assets=False)
+        result = scheduler_config.get_images_dir()
 
         assert result == macos_default
 
-    def test_platform_default_linux(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_images_dir() uses Linux default path on linux."""
-        # Clear env var
-        monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+    def test_platform_default_linux_with_auto_download(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """get_images_dir() uses Linux cache path when auto_download_assets=True."""
+        from exec_sandbox import platform_utils
+        from exec_sandbox.platform_utils import HostOS
 
-        # Simulate Linux
-        monkeypatch.setattr(sys, "platform", "linux")
+        # Clear env vars
+        monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+        # Simulate Linux by patching detect_host_os in the module
+        monkeypatch.setattr(platform_utils, "detect_host_os", lambda: HostOS.LINUX)
+
+        # Override Path.home() to use tmp_path
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        # With auto_download_assets=True (default), uses cache path
+        scheduler_config = SchedulerConfig()
+        result = scheduler_config.get_images_dir()
+
+        # Should use .cache directory (not .local/share)
+        expected = tmp_path / ".cache" / "exec-sandbox"
+        assert result == expected
+
+    def test_platform_default_linux_without_auto_download(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_images_dir() uses Linux .local/share path when auto_download_assets=False."""
+        from exec_sandbox import platform_utils
+        from exec_sandbox.platform_utils import HostOS
+
+        # Clear env vars
+        monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+        # Simulate Linux by patching detect_host_os in the module
+        monkeypatch.setattr(platform_utils, "detect_host_os", lambda: HostOS.LINUX)
 
         # Create the expected default directory
         linux_default = tmp_path / ".local" / "share" / "exec-sandbox" / "images"
@@ -226,27 +287,29 @@ class TestGetImagesDir:
         # Override Path.home() to use tmp_path
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        config = SchedulerConfig()
-        result = config.get_images_dir()
+        scheduler_config = SchedulerConfig(auto_download_assets=False)
+        result = scheduler_config.get_images_dir()
 
         assert result == linux_default
 
     def test_platform_default_not_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_images_dir() raises FileNotFoundError when default path missing."""
-        # Clear env var
+        """get_images_dir() raises FileNotFoundError when default path missing and auto_download disabled."""
+        # Clear env vars
         monkeypatch.delenv("EXEC_SANDBOX_IMAGES_DIR", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
 
         # Use a non-existent home directory
         fake_home = Path("/nonexistent/home/user")
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
-        config = SchedulerConfig()
+        # With auto_download_assets=False, missing directory should raise error
+        config = SchedulerConfig(auto_download_assets=False)
 
         with pytest.raises(FileNotFoundError) as exc_info:
             config.get_images_dir()
 
         assert "exec-sandbox" in str(exc_info.value)
-        assert "EXEC_SANDBOX_IMAGES_DIR" in str(exc_info.value)
+        assert "download images from GitHub Releases" in str(exc_info.value)
 
 
 # ============================================================================

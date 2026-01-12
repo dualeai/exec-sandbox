@@ -17,7 +17,6 @@ else:
     from backports import zstd
 
 from exec_sandbox.models import Language
-from exec_sandbox.settings import Settings
 
 # ============================================================================
 # Unit Tests - Cache Key Computation
@@ -85,21 +84,15 @@ class TestCacheKeyComputation:
 class TestSettings:
     """Tests for Settings used by SnapshotManager."""
 
-    def test_settings_snapshot_cache_dir(self, tmp_path: Path) -> None:
+    def test_settings_snapshot_cache_dir(self, make_vm_settings, tmp_path: Path) -> None:
         """Settings has snapshot_cache_dir."""
-        settings = Settings(
-            base_images_dir=tmp_path / "images",
-            kernel_path=tmp_path / "kernels",
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
 
         assert settings.snapshot_cache_dir == tmp_path / "cache"
 
-    def test_settings_s3_config(self, tmp_path: Path) -> None:
+    def test_settings_s3_config(self, make_vm_settings) -> None:
         """Settings has S3 configuration."""
-        settings = Settings(
-            base_images_dir=tmp_path / "images",
-            kernel_path=tmp_path / "kernels",
+        settings = make_vm_settings(
             s3_bucket="my-bucket",
             s3_region="us-west-2",
         )
@@ -116,19 +109,14 @@ class TestSettings:
 class TestSnapshotManagerIntegration:
     """Integration tests for SnapshotManager with real QEMU VMs."""
 
-    async def test_l0_cache_miss(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_l0_cache_miss(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L0 cache miss returns (None, False) for non-existent snapshot."""
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
@@ -136,19 +124,14 @@ class TestSnapshotManagerIntegration:
         assert path is None
         assert has_memory_snapshot is False
 
-    async def test_compute_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_compute_cache_key(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """Test actual _compute_cache_key method."""
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Test with packages
@@ -168,19 +151,14 @@ class TestSnapshotManagerIntegration:
         )
         assert base_key == "python-base"
 
-    async def test_create_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """Create snapshot with packages (slow, requires VM)."""
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create snapshot (this boots a VM and installs packages)
@@ -215,21 +193,16 @@ class TestSnapshotManagerIntegration:
 class TestL0Cache:
     """Tests for L0 (memory snapshot) cache operations."""
 
-    async def test_l0_cache_hit_returns_path(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_l0_cache_hit_returns_path(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L0 cache returns (path, has_memory) when valid qcow2 snapshot exists."""
         import asyncio
 
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create a minimal valid qcow2 file
@@ -255,19 +228,14 @@ class TestL0Cache:
         # No internal snapshot named "ready" yet
         assert has_memory_snapshot is False
 
-    async def test_l0_cache_nonexistent_returns_none(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_l0_cache_nonexistent_returns_none(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L0 cache returns (None, False) for non-existent snapshot."""
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
@@ -275,22 +243,17 @@ class TestL0Cache:
         assert path is None
         assert has_memory_snapshot is False
 
-    async def test_l1_evict_oldest_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_l1_evict_oldest_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """_evict_oldest_snapshot removes oldest file by atime."""
         import asyncio
         import time
 
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create multiple snapshots with staggered atimes
@@ -348,34 +311,27 @@ class TestL0Cache:
 class TestL3Cache:
     """Tests for L3 (S3) cache operations using moto server mode."""
 
-    async def test_get_s3_client_raises_without_bucket(self, tmp_path: Path) -> None:
+    async def test_get_s3_client_raises_without_bucket(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """_get_s3_client raises SnapshotError when s3_bucket not set."""
         from exec_sandbox.exceptions import SnapshotError
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=tmp_path,
-            kernel_path=tmp_path,
-            snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket=None,
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         with pytest.raises(SnapshotError) as exc_info:
             await snapshot_manager._get_s3_client()
         assert "S3 backup disabled" in str(exc_info.value)
 
-    async def test_upload_to_s3_success(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_upload_to_s3_success(self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch) -> None:
         """Snapshot uploads to S3 with zstd compression using real aioboto3 client."""
         import boto3
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -394,9 +350,7 @@ class TestL3Cache:
             s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
             s3_sync.create_bucket(Bucket="test-snapshots")
 
-            settings = Settings(
-                base_images_dir=tmp_path,
-                kernel_path=tmp_path,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -404,7 +358,12 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="test-snapshots",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             # Create a test snapshot file
@@ -427,13 +386,14 @@ class TestL3Cache:
         finally:
             server.stop()
 
-    async def test_download_from_s3_success(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_download_from_s3_success(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """Snapshot downloads from S3 and decompresses using real aioboto3 client."""
         import boto3
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -461,9 +421,7 @@ class TestL3Cache:
                 Body=compressed,
             )
 
-            settings = Settings(
-                base_images_dir=tmp_path,
-                kernel_path=tmp_path,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -471,7 +429,12 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="test-snapshots",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             # Download using real aioboto3 client
@@ -484,14 +447,15 @@ class TestL3Cache:
         finally:
             server.stop()
 
-    async def test_download_from_s3_not_found(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_download_from_s3_not_found(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """S3 download raises SnapshotError when key missing."""
         import boto3
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.exceptions import SnapshotError
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -510,9 +474,7 @@ class TestL3Cache:
             s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
             s3_sync.create_bucket(Bucket="test-snapshots")
 
-            settings = Settings(
-                base_images_dir=tmp_path,
-                kernel_path=tmp_path,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -520,7 +482,12 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="test-snapshots",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             with pytest.raises(SnapshotError) as exc_info:
@@ -530,12 +497,13 @@ class TestL3Cache:
         finally:
             server.stop()
 
-    async def test_upload_to_s3_silent_failure(self, tmp_path: Path, monkeypatch) -> None:
+    async def test_upload_to_s3_silent_failure(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """S3 upload failure is silent (L1 cache still works)."""
         from moto.server import ThreadedMotoServer
 
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -550,9 +518,7 @@ class TestL3Cache:
         endpoint_url = f"http://localhost:{server._server.server_port}"
 
         try:
-            settings = Settings(
-                base_images_dir=tmp_path,
-                kernel_path=tmp_path,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="nonexistent-bucket",
                 s3_region="us-east-1",
@@ -560,7 +526,12 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="nonexistent-bucket",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             cache_key = "python-fail123"
@@ -574,62 +545,100 @@ class TestL3Cache:
         finally:
             server.stop()
 
-    async def test_upload_semaphore_limits_concurrency(self, tmp_path: Path) -> None:
+    async def test_upload_semaphore_limits_concurrency(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """Upload semaphore limits concurrent S3 uploads to configured max.
 
         Verifies that max_concurrent_s3_uploads actually bounds parallel uploads.
+        Uses real moto server with instrumented upload tracking.
         """
         import asyncio
-        from unittest.mock import AsyncMock, patch
+        from contextlib import asynccontextmanager
+
+        import boto3
+        from moto.server import ThreadedMotoServer
 
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        # Configure semaphore to allow only 2 concurrent uploads
-        settings = Settings(
-            base_images_dir=tmp_path,
-            kernel_path=tmp_path,
-            snapshot_cache_dir=tmp_path / "cache",
-            s3_bucket="test-bucket",
-            max_concurrent_s3_uploads=2,
-        )
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        # Set fake AWS credentials for moto
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
 
-        vm_manager = VmManager(settings)
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        # Start moto server
+        server = ThreadedMotoServer(port=0)
+        server.start()
+        endpoint_url = f"http://localhost:{server._server.server_port}"
 
-        # Track concurrent uploads
-        concurrent_count = 0
-        max_concurrent_observed = 0
-        upload_started = asyncio.Event()
+        try:
+            # Create bucket (unique name to avoid parallel test interference)
+            bucket_name = "test-semaphore-snapshots"
+            s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
+            s3_sync.create_bucket(Bucket=bucket_name)
 
-        async def mock_s3_upload(*args, **kwargs):
-            """Mock S3 upload that tracks concurrency."""
-            nonlocal concurrent_count, max_concurrent_observed
-            concurrent_count += 1
-            max_concurrent_observed = max(max_concurrent_observed, concurrent_count)
-            upload_started.set()
-            await asyncio.sleep(0.05)  # Simulate upload time
-            concurrent_count -= 1
+            # Configure semaphore to allow only 2 concurrent uploads
+            settings = make_vm_settings(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket=bucket_name,
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+                max_concurrent_s3_uploads=2,
+            )
+            settings.snapshot_cache_dir.mkdir(parents=True)
 
-        # Create test snapshot files
-        for i in range(5):
-            (settings.snapshot_cache_dir / f"test-{i}.qcow2").write_bytes(b"test")
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket=bucket_name,
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+                max_concurrent_s3_uploads=2,
+            )
+            snapshot_manager = SnapshotManager(settings, vm_manager)
 
-        # Mock the S3 client and compression to isolate semaphore behavior
-        with (
-            patch.object(snapshot_manager, "_get_s3_client") as mock_client,
-            patch("exec_sandbox.snapshot_manager.zstd.ZstdCompressor") as mock_zstd,
-        ):
-            # Mock S3 client context manager
-            mock_s3 = AsyncMock()
-            mock_s3.upload_file = mock_s3_upload
-            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_s3)
-            mock_client.return_value.__aexit__ = AsyncMock(return_value=None)
+            # Track concurrent uploads (inside semaphore-protected section)
+            concurrent_count = 0
+            max_concurrent_observed = 0
 
-            # Mock compression (instant, no-op)
-            mock_compressor = mock_zstd.return_value
-            mock_compressor.copy_stream = lambda src, dst: dst.write(src.read())
+            # Wrap _get_s3_client to return instrumented client
+            original_get_client = snapshot_manager._get_s3_client
+
+            @asynccontextmanager
+            async def instrumented_s3_context(s3):
+                original_upload = s3.upload_file
+
+                async def tracked_upload(*args, **kwargs):
+                    nonlocal concurrent_count, max_concurrent_observed
+                    concurrent_count += 1
+                    max_concurrent_observed = max(max_concurrent_observed, concurrent_count)
+                    try:
+                        await asyncio.sleep(0.05)  # Ensure overlap detection
+                        return await original_upload(*args, **kwargs)
+                    finally:
+                        concurrent_count -= 1
+
+                s3.upload_file = tracked_upload
+                yield s3
+
+            async def tracked_get_s3_client():
+                """Return instrumented S3 client context manager."""
+                original_cm = await original_get_client()
+
+                @asynccontextmanager
+                async def wrapped():
+                    async with original_cm as s3:
+                        async with instrumented_s3_context(s3) as instrumented:
+                            yield instrumented
+
+                return wrapped()
+
+            snapshot_manager._get_s3_client = tracked_get_s3_client  # type: ignore[method-assign]
+
+            # Create test snapshot files
+            for i in range(5):
+                (settings.snapshot_cache_dir / f"test-{i}.qcow2").write_bytes(b"test data")
 
             # Start 5 uploads simultaneously
             tasks = [
@@ -642,14 +651,22 @@ class TestL3Cache:
             # Wait for all uploads to complete
             await asyncio.gather(*tasks)
 
-        # Verify semaphore limited concurrency
-        assert max_concurrent_observed <= 2, (
-            f"Expected max 2 concurrent uploads (semaphore limit), but observed {max_concurrent_observed}"
-        )
-        # Also verify uploads actually ran concurrently (not serialized to 1)
-        assert max_concurrent_observed == 2, (
-            f"Expected exactly 2 concurrent uploads (semaphore should allow 2), but observed {max_concurrent_observed}"
-        )
+            # Verify all files uploaded to S3
+            objects = s3_sync.list_objects_v2(Bucket=bucket_name)
+            keys = [obj["Key"] for obj in objects.get("Contents", [])]
+            assert len(keys) == 5, f"Expected 5 uploads, got {len(keys)}"
+
+            # Verify semaphore limited concurrency
+            assert max_concurrent_observed <= 2, (
+                f"Expected max 2 concurrent uploads (semaphore limit), but observed {max_concurrent_observed}"
+            )
+            # Also verify uploads actually ran concurrently (not serialized to 1)
+            assert max_concurrent_observed == 2, (
+                f"Expected exactly 2 concurrent uploads (semaphore should allow 2), but observed {max_concurrent_observed}"
+            )
+
+        finally:
+            server.stop()
 
 
 # ============================================================================
@@ -668,7 +685,9 @@ class TestCacheHierarchy:
     Uses moto server for real S3 client and mocks _create_snapshot to avoid QEMU.
     """
 
-    async def test_l0_hit_returns_immediately_no_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    async def test_l0_hit_returns_immediately_no_s3(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """L0 cache hit returns (path, has_memory) immediately without touching S3.
 
         Flow: L0 HIT → return (no S3 call, no creation)
@@ -678,18 +697,19 @@ class TestCacheHierarchy:
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+        settings = make_vm_settings(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket="test-bucket",  # S3 configured but should NOT be called
             s3_region="us-east-1",
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(
+            snapshot_cache_dir=tmp_path / "cache",
+            s3_bucket="test-bucket",
+            s3_region="us-east-1",
+        )
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Pre-populate L1 cache with valid qcow2
@@ -731,7 +751,9 @@ class TestCacheHierarchy:
         # Verify creation was NOT called (L0 hit skips creation)
         mock_create.assert_not_called()
 
-    async def test_l0_miss_l3_hit_downloads_from_s3(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    async def test_l0_miss_l3_hit_downloads_from_s3(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """L0 miss with L3 hit downloads from S3 and returns path.
 
         Flow: L0 MISS → L3 HIT → download → return (no creation)
@@ -743,7 +765,6 @@ class TestCacheHierarchy:
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -762,9 +783,7 @@ class TestCacheHierarchy:
             s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
             s3_sync.create_bucket(Bucket="test-snapshots")
 
-            settings = Settings(
-                base_images_dir=images_dir,
-                kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -772,7 +791,12 @@ class TestCacheHierarchy:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="test-snapshots",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             # Compute cache key for the packages we'll request
@@ -811,7 +835,9 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_l0_miss_l3_miss_creates_snapshot(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    async def test_l0_miss_l3_miss_creates_snapshot(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """L0 miss and L3 miss triggers snapshot creation.
 
         Flow: L0 MISS → L3 MISS → create → return (and upload to S3)
@@ -824,7 +850,6 @@ class TestCacheHierarchy:
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -843,9 +868,7 @@ class TestCacheHierarchy:
             s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
             s3_sync.create_bucket(Bucket="test-snapshots")
 
-            settings = Settings(
-                base_images_dir=images_dir,
-                kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -853,7 +876,12 @@ class TestCacheHierarchy:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="test-snapshots",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             # Compute cache key
@@ -904,7 +932,9 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_l0_populated_after_l3_download(self, images_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    async def test_l0_populated_after_l3_download(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, monkeypatch
+    ) -> None:
         """After L3 download, L0 cache is populated for next call.
 
         Flow: L0 MISS → L3 HIT → download → L0 populated
@@ -917,7 +947,6 @@ class TestCacheHierarchy:
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -936,9 +965,7 @@ class TestCacheHierarchy:
             s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
             s3_sync.create_bucket(Bucket="test-snapshots")
 
-            settings = Settings(
-                base_images_dir=images_dir,
-                kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+            settings = make_vm_settings(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -946,7 +973,12 @@ class TestCacheHierarchy:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = VmManager(settings)
+            vm_manager = make_vm_manager(
+                snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket="test-snapshots",
+                s3_region="us-east-1",
+                s3_endpoint_url=endpoint_url,
+            )
             snapshot_manager = SnapshotManager(settings, vm_manager)
 
             # Compute cache key
@@ -1004,7 +1036,7 @@ class TestCacheHierarchy:
         finally:
             server.stop()
 
-    async def test_same_packages_same_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_same_packages_same_cache_key(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """Same packages (regardless of order) produce same cache key and path.
 
         Verifies deterministic cache key computation.
@@ -1014,17 +1046,17 @@ class TestCacheHierarchy:
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+        settings = make_vm_settings(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,  # No S3
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(
+            snapshot_cache_dir=tmp_path / "cache",
+            s3_bucket=None,
+        )
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Compute cache keys for same packages in different orders
@@ -1066,23 +1098,20 @@ class TestCacheHierarchy:
         assert result1_path == result2_path == snapshot_path
         mock_create.assert_not_called()  # Both hit L0 cache
 
-    async def test_different_packages_different_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_different_packages_different_cache_key(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path
+    ) -> None:
         """Different packages produce different cache keys.
 
         Verifies cache isolation between different package sets.
         """
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
@@ -1094,23 +1123,20 @@ class TestCacheHierarchy:
         assert key1 != key3
         assert key2 != key3
 
-    async def test_different_languages_different_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_different_languages_different_cache_key(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path
+    ) -> None:
         """Same packages with different languages produce different cache keys.
 
         Verifies cache isolation between languages.
         """
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            snapshot_cache_dir=tmp_path / "cache",
-        )
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Same "package" name but different languages
@@ -1119,7 +1145,7 @@ class TestCacheHierarchy:
 
         assert key_python != key_node
 
-    async def test_l3_disabled_skips_s3_entirely(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_l3_disabled_skips_s3_entirely(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """When S3 is not configured, L3 is skipped entirely.
 
         Flow: L1 MISS → (skip L3) → create
@@ -1129,17 +1155,17 @@ class TestCacheHierarchy:
 
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+        settings = make_vm_settings(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,  # S3 disabled
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(
+            snapshot_cache_dir=tmp_path / "cache",
+            s3_bucket=None,
+        )
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["aiohttp==3.9.0"])
@@ -1175,7 +1201,7 @@ class TestCacheHierarchy:
         # Newly created = no memory snapshot
         assert has_memory_snapshot is False
 
-    async def test_creation_failure_propagates_error(self, images_dir: Path, tmp_path: Path) -> None:
+    async def test_creation_failure_propagates_error(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """When snapshot creation fails, error is propagated.
 
         Verifies error handling in the cache hierarchy.
@@ -1185,17 +1211,17 @@ class TestCacheHierarchy:
         from exec_sandbox.exceptions import SnapshotError
         from exec_sandbox.models import Language
         from exec_sandbox.snapshot_manager import SnapshotManager
-        from exec_sandbox.vm_manager import VmManager
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+        settings = make_vm_settings(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = VmManager(settings)
+        vm_manager = make_vm_manager(
+            snapshot_cache_dir=tmp_path / "cache",
+            s3_bucket=None,
+        )
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Mock creation to fail

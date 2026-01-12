@@ -5,7 +5,6 @@ Integration tests: Real VM pool operations (requires QEMU + images).
 """
 
 import asyncio
-from pathlib import Path
 
 from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
@@ -64,21 +63,13 @@ class TestLanguageEnum:
 class TestDrainPoolForCheck:
     """Tests for _drain_pool_for_check - pure queue draining logic."""
 
-    async def test_drain_empty_pool(self) -> None:
+    async def test_drain_empty_pool(self, unit_test_vm_manager) -> None:
         """Draining empty pool returns empty list."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         # Create pool with minimal config (no VMs booted)
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Pool is empty (no startup called)
         result = pool._drain_pool_for_check(
@@ -89,20 +80,12 @@ class TestDrainPoolForCheck:
 
         assert result == []
 
-    async def test_drain_respects_pool_size_parameter(self) -> None:
+    async def test_drain_respects_pool_size_parameter(self, unit_test_vm_manager) -> None:
         """Drain only removes up to pool_size items."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Manually add items to test drain logic
         # Using simple objects since we're testing queue behavior, not VM behavior
@@ -122,20 +105,12 @@ class TestDrainPoolForCheck:
         assert result == ["vm1", "vm2"]
         assert test_queue.qsize() == 1  # One item remains
 
-    async def test_drain_more_than_exists(self) -> None:
+    async def test_drain_more_than_exists(self, unit_test_vm_manager) -> None:
         """Drain handles request for more items than queue contains."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         test_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
         await test_queue.put("vm1")
@@ -153,20 +128,12 @@ class TestDrainPoolForCheck:
         assert result == ["vm1", "vm2"]
         assert test_queue.qsize() == 0
 
-    async def test_drain_exact_size(self) -> None:
+    async def test_drain_exact_size(self, unit_test_vm_manager) -> None:
         """Drain exactly the number of items in queue (boundary)."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         test_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
         await test_queue.put("vm1")
@@ -188,20 +155,13 @@ class TestDrainPoolForCheck:
 class TestEvaluateHealthResult:
     """Tests for _evaluate_health_result - pure result evaluation logic."""
 
-    async def test_evaluate_true_returns_true(self) -> None:
+    async def test_evaluate_true_returns_true(self, unit_test_vm_manager) -> None:
         """True result means healthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Create a minimal VM object for testing
         vm = QemuVM.__new__(QemuVM)
@@ -210,20 +170,13 @@ class TestEvaluateHealthResult:
         result = pool._evaluate_health_result(True, Language.PYTHON, vm)
         assert result is True
 
-    async def test_evaluate_false_returns_false(self) -> None:
+    async def test_evaluate_false_returns_false(self, unit_test_vm_manager) -> None:
         """False result means unhealthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm = QemuVM.__new__(QemuVM)
         vm.vm_id = "test-vm"
@@ -231,20 +184,13 @@ class TestEvaluateHealthResult:
         result = pool._evaluate_health_result(False, Language.PYTHON, vm)
         assert result is False
 
-    async def test_evaluate_exception_returns_false(self) -> None:
+    async def test_evaluate_exception_returns_false(self, unit_test_vm_manager) -> None:
         """Exception result means unhealthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm = QemuVM.__new__(QemuVM)
         vm.vm_id = "test-vm"
@@ -257,20 +203,13 @@ class TestEvaluateHealthResult:
         )
         assert result is False
 
-    async def test_evaluate_oserror_returns_false(self) -> None:
+    async def test_evaluate_oserror_returns_false(self, unit_test_vm_manager) -> None:
         """OSError (connection failed) means unhealthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm = QemuVM.__new__(QemuVM)
         vm.vm_id = "test-vm"
@@ -282,20 +221,13 @@ class TestEvaluateHealthResult:
         )
         assert result is False
 
-    async def test_evaluate_connection_error_returns_false(self) -> None:
+    async def test_evaluate_connection_error_returns_false(self, unit_test_vm_manager) -> None:
         """ConnectionError means unhealthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm = QemuVM.__new__(QemuVM)
         vm.vm_id = "test-vm"
@@ -307,20 +239,13 @@ class TestEvaluateHealthResult:
         )
         assert result is False
 
-    async def test_evaluate_cancelled_error_returns_false(self) -> None:
+    async def test_evaluate_cancelled_error_returns_false(self, unit_test_vm_manager) -> None:
         """CancelledError (task cancelled) means unhealthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm = QemuVM.__new__(QemuVM)
         vm.vm_id = "test-vm"
@@ -332,20 +257,13 @@ class TestEvaluateHealthResult:
         )
         assert result is False
 
-    async def test_evaluate_base_exception_returns_false(self) -> None:
+    async def test_evaluate_base_exception_returns_false(self, unit_test_vm_manager) -> None:
         """BaseException (keyboard interrupt, system exit) means unhealthy."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm = QemuVM.__new__(QemuVM)
         vm.vm_id = "test-vm"
@@ -368,20 +286,12 @@ class TestEvaluateHealthResult:
 class TestProcessHealthResults:
     """Tests for _process_health_results - result processing logic."""
 
-    async def test_process_empty_results(self) -> None:
+    async def test_process_empty_results(self, unit_test_vm_manager) -> None:
         """Processing empty results list returns zeros."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         test_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
 
@@ -396,20 +306,13 @@ class TestProcessHealthResults:
         assert unhealthy == 0
         assert test_queue.qsize() == 0
 
-    async def test_process_all_healthy(self) -> None:
+    async def test_process_all_healthy(self, unit_test_vm_manager) -> None:
         """All healthy results restores all VMs to pool."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Create minimal VM objects
         vm1 = QemuVM.__new__(QemuVM)
@@ -430,20 +333,13 @@ class TestProcessHealthResults:
         assert unhealthy == 0
         assert test_queue.qsize() == 2
 
-    async def test_process_all_unhealthy(self) -> None:
+    async def test_process_all_unhealthy(self, unit_test_vm_manager) -> None:
         """All unhealthy results triggers cleanup for all VMs."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm1 = QemuVM.__new__(QemuVM)
         vm1.vm_id = "vm1"
@@ -463,20 +359,13 @@ class TestProcessHealthResults:
         assert unhealthy == 2
         assert test_queue.qsize() == 0  # No VMs restored
 
-    async def test_process_mixed_results(self) -> None:
+    async def test_process_mixed_results(self, unit_test_vm_manager) -> None:
         """Mixed results restores only healthy VMs."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import QemuVM, VmManager
+        from exec_sandbox.vm_manager import QemuVM
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         vm1 = QemuVM.__new__(QemuVM)
         vm1.vm_id = "vm1"
@@ -512,20 +401,12 @@ class TestProcessHealthResults:
 class TestHealthCheckPoolUnit:
     """Unit tests for _health_check_pool edge cases."""
 
-    async def test_health_check_empty_pool_returns_early(self) -> None:
+    async def test_health_check_empty_pool_returns_early(self, unit_test_vm_manager) -> None:
         """Health check on empty pool returns immediately without error."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=Path("/nonexistent"),
-            kernel_path=Path("/nonexistent"),
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(vm_manager, config)
+        pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Pool is empty (no startup called)
         # Should return early without error
@@ -546,18 +427,10 @@ class TestHealthCheckPoolUnit:
 class TestWarmVMPoolIntegration:
     """Integration tests for WarmVMPool with real QEMU VMs."""
 
-    async def test_pool_startup_shutdown(self, images_dir: Path) -> None:
+    async def test_pool_startup_shutdown(self, vm_manager) -> None:
         """Pool starts and shuts down cleanly."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
@@ -572,18 +445,10 @@ class TestWarmVMPoolIntegration:
         assert pool.pools[Language.PYTHON].qsize() == 0
         assert pool.pools[Language.JAVASCRIPT].qsize() == 0
 
-    async def test_get_vm_from_pool(self, images_dir: Path) -> None:
+    async def test_get_vm_from_pool(self, vm_manager) -> None:
         """Get VM from warm pool."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
@@ -602,18 +467,10 @@ class TestWarmVMPoolIntegration:
         finally:
             await pool.shutdown()
 
-    async def test_get_vm_with_packages_returns_none(self, images_dir: Path) -> None:
+    async def test_get_vm_with_packages_returns_none(self, vm_manager) -> None:
         """Get VM with packages returns None (not eligible for warm pool)."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
@@ -636,18 +493,10 @@ class TestWarmVMPoolIntegration:
 class TestHealthcheckIntegration:
     """Integration tests for healthcheck with real QEMU VMs."""
 
-    async def test_check_vm_health_healthy_vm(self, images_dir: Path) -> None:
+    async def test_check_vm_health_healthy_vm(self, vm_manager) -> None:
         """_check_vm_health returns True for healthy VM."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
@@ -667,18 +516,10 @@ class TestHealthcheckIntegration:
         finally:
             await pool.shutdown()
 
-    async def test_health_check_pool_preserves_healthy_vms(self, images_dir: Path) -> None:
+    async def test_health_check_pool_preserves_healthy_vms(self, vm_manager) -> None:
         """_health_check_pool keeps healthy VMs in pool."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
@@ -701,18 +542,10 @@ class TestHealthcheckIntegration:
         finally:
             await pool.shutdown()
 
-    async def test_drain_pool_restores_vms_after_health_check(self, images_dir: Path) -> None:
+    async def test_drain_pool_restores_vms_after_health_check(self, vm_manager) -> None:
         """VMs drained for health check are restored to pool."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
@@ -753,18 +586,10 @@ class TestHealthcheckIntegration:
         finally:
             await pool.shutdown()
 
-    async def test_health_check_loop_stops_on_shutdown(self, images_dir: Path) -> None:
+    async def test_health_check_loop_stops_on_shutdown(self, vm_manager) -> None:
         """Health check loop exits cleanly when shutdown is signaled."""
-        from exec_sandbox.settings import Settings
-        from exec_sandbox.vm_manager import VmManager
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        settings = Settings(
-            base_images_dir=images_dir,
-            kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            max_concurrent_vms=4,
-        )
-        vm_manager = VmManager(settings)
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
