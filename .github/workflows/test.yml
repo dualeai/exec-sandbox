@@ -85,7 +85,7 @@ jobs:
 
   build-gvproxy-wrapper:
     name: Build / gvproxy-wrapper (${{ matrix.arch }})
-    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -104,7 +104,7 @@ jobs:
 
   build-guest-agent:
     name: Build / guest-agent (${{ matrix.arch }})
-    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -132,8 +132,7 @@ jobs:
 
   build-vm-images:
     name: Build / VM images (${{ matrix.arch }})
-    # Use large runners: qcow2 builds are multithreaded (-m 8) and resource-intensive
-    runs-on: linux-${{ matrix.arch }}-ubuntu2404-large-private
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     needs: build-guest-agent
     strategy:
       matrix:
@@ -213,45 +212,98 @@ jobs:
   # ==========================================================================
 
   test-python:
-    name: Test / Python ${{ matrix.python-version }} (${{ matrix.arch }})
-    runs-on: linux-${{ matrix.arch }}-ubuntu2404-small-private
+    name: Test / Python ${{ matrix.python-version }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
     needs: [build-gvproxy-wrapper, build-vm-images]
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
         python-version: ["3.12", "3.13", "3.14"]
+        platform:
+          - os: linux
+            arch: x64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos
+            arch: arm64
+            runner: macos-26
     steps:
       - uses: actions/checkout@v6.0.1
 
       - name: Download gvproxy-wrapper
         uses: actions/download-artifact@v4
         with:
-          name: gvproxy-wrapper-${{ matrix.arch }}
+          name: gvproxy-wrapper-${{ matrix.platform.arch }}
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
         uses: actions/download-artifact@v4
         with:
-          name: vm-images-${{ matrix.arch }}
+          name: vm-images-${{ matrix.platform.arch }}
           path: images/dist/
 
       - name: Make binaries executable
         run: chmod +x gvproxy-wrapper/bin/gvproxy-wrapper-*
 
-      - name: Make images readable
+      - name: Make images readable (Linux)
+        if: matrix.platform.os == 'linux'
         run: |
           # Make files readable and directories traversable for qemu-vm user
           # Need to make parent directories traversable too (home dirs are often 700)
           chmod a+x /home/runner /home/runner/work
           chmod -R a+rX .
 
-      - name: Install QEMU
+      - name: Install QEMU (Linux)
+        if: matrix.platform.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils ${{ matrix.arch == 'x64' && 'qemu-system-x86' || 'qemu-system-arm' }}
+          # On Ubuntu 24.04+, qemu-system-x86_64-microvm binary is included in qemu-system-x86 package
+          # The microvm binary is optimized for direct kernel boot with microvm machine type
+          # See: https://documentation.ubuntu.com/server/explanation/virtualisation/qemu-microvm/
+          sudo apt-get install -y qemu-utils ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86' || 'qemu-system-arm' }}
 
-      - name: Create qemu-vm user
+      - name: Install QEMU (macOS)
+        if: matrix.platform.os == 'macos'
+        run: brew install qemu coreutils
+
+      - name: Verify QEMU installation
+        run: |
+          echo "=== QEMU binaries ==="
+          which qemu-system-x86_64 || echo "qemu-system-x86_64 not found"
+          which qemu-system-x86_64-microvm || echo "qemu-system-x86_64-microvm not found"
+          which qemu-system-aarch64 || echo "qemu-system-aarch64 not found"
+          echo ""
+          echo "=== QEMU version ==="
+          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} --version
+          echo ""
+          echo "=== Available machine types (first 20) ==="
+          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} -machine help | head -20
+          echo ""
+          echo "=== Hardware acceleration ==="
+          if [ "${{ matrix.platform.os }}" = "linux" ]; then
+            ls -la /dev/kvm || echo "/dev/kvm not available"
+          else
+            sysctl kern.hv_support || echo "HVF not available"
+          fi
+
+      - name: Setup KVM permissions (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Make /dev/kvm accessible to all users for hardware acceleration
+          # Using direct chmod because udevadm trigger can fail on some runners
+          # See: https://github.com/actions/runner-images/issues/8542
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "KVM permissions updated:"
+            ls -la /dev/kvm
+          else
+            echo "WARNING: /dev/kvm not found - KVM acceleration not available"
+          fi
+
+      - name: Create qemu-vm user (Linux)
+        if: matrix.platform.os == 'linux'
         run: |
           # Create unprivileged user for QEMU process isolation
           # Don't specify UID - let the system assign one to avoid conflicts
@@ -278,7 +330,8 @@ jobs:
       - name: Install
         run: make install-deps
 
-      - name: Setup cgroup delegation
+      - name: Setup cgroup delegation (Linux)
+        if: matrix.platform.os == 'linux'
         run: |
           # Create cgroup directory for VM resource limits
           sudo mkdir -p /sys/fs/cgroup/code-exec
