@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -60,6 +61,11 @@ from exec_sandbox.settings import Settings
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
 
 logger = get_logger(__name__)
+
+# KVM ioctl constants for probing
+# See: linux/kvm.h - these are stable ABI
+_KVM_GET_API_VERSION = 0xAE00
+_KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
 
 
 def _get_gvproxy_wrapper_path() -> Path:
@@ -143,8 +149,44 @@ if set(VmState) != set(VALID_STATE_TRANSITIONS.keys()):
     raise RuntimeError(f"Missing states in transition table: {_missing}")
 
 
+# =============================================================================
+# Cached System Probes
+# =============================================================================
+# These probes detect system capabilities once and cache the results.
+# Async probes use a shared cache container to avoid global statements.
+
+
+class _ProbeCache:
+    """Container for cached system probe results.
+
+    Uses a class to avoid global statements while maintaining module-level caching.
+    Locks are lazily initialized to ensure they're created in the right event loop.
+    """
+
+    __slots__ = (
+        "hvf",
+        "io_uring",
+        "kvm",
+        "qemu_vm_user",
+        "tsc_deadline",
+        "unshare",
+    )
+
+    def __init__(self) -> None:
+        self.hvf: bool | None = None
+        self.io_uring: bool | None = None
+        self.kvm: bool | None = None
+        self.qemu_vm_user: bool | None = None
+        self.tsc_deadline: bool | None = None
+        self.unshare: bool | None = None
+
+
+# Module-level cache instance
+_probe_cache = _ProbeCache()
+
+
 def _check_kvm_available() -> bool:
-    """Check if KVM acceleration is available.
+    """Check if KVM acceleration is available and accessible (cached).
 
     KVM vs TCG: Virtualization modes with vastly different characteristics
     ======================================================================
@@ -172,7 +214,324 @@ def _check_kvm_available() -> bool:
         True if /dev/kvm exists and is accessible (enables KVM mode)
         False otherwise (falls back to TCG software emulation)
     """
-    return Path("/dev/kvm").exists()
+    # Fast path: return cached result
+    if _probe_cache.kvm is not None:
+        return _probe_cache.kvm
+
+    kvm_path = Path("/dev/kvm")
+    if not kvm_path.exists():
+        logger.debug("KVM not available: /dev/kvm does not exist")
+        _probe_cache.kvm = False
+        return False
+
+    # Check if we can actually access /dev/kvm (not just that it exists)
+    # This catches permission issues that would cause QEMU to fail or hang
+    # See: https://github.com/actions/runner-images/issues/8542
+    try:
+        # os.access with R_OK|W_OK checks actual permission for the current user
+        if not os.access(kvm_path, os.R_OK | os.W_OK):
+            logger.debug("KVM not available: permission denied on /dev/kvm")
+            _probe_cache.kvm = False
+            return False
+
+        # Actually try to open /dev/kvm to verify it works
+        # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
+        with kvm_path.open("rb") as f:
+            try:
+                api_version = fcntl.ioctl(f.fileno(), _KVM_GET_API_VERSION)
+                _probe_cache.kvm = api_version == _KVM_API_VERSION_EXPECTED
+                if _probe_cache.kvm:
+                    logger.debug("KVM available and working", extra={"api_version": api_version})
+                else:
+                    logger.warning(
+                        "KVM available but unexpected API version",
+                        extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
+                    )
+            except OSError as e:
+                # ioctl failed - KVM not actually usable
+                logger.warning(
+                    "KVM device accessible but ioctl failed",
+                    extra={"error": str(e)},
+                )
+                _probe_cache.kvm = False
+    except OSError as e:
+        logger.debug("KVM not available: failed to open /dev/kvm", extra={"error": str(e)})
+        _probe_cache.kvm = False
+
+    return _probe_cache.kvm
+
+
+async def _check_hvf_available() -> bool:
+    """Check if HVF (Hypervisor.framework) acceleration is available on macOS (cached).
+
+    HVF requires:
+    - macOS host (automatically implied by caller)
+    - CPU with virtualization extensions
+    - Hypervisor entitlement (usually available)
+    - NOT running inside a VM without nested virtualization
+
+    GitHub Actions macOS runners run inside VMs without nested virtualization,
+    so HVF is not available there. This check detects that case.
+
+    Returns:
+        True if HVF is available and can be used
+        False otherwise (falls back to TCG software emulation)
+    """
+    # Fast path: return cached result
+    if _probe_cache.hvf is not None:
+        return _probe_cache.hvf
+
+    try:
+        # sysctl kern.hv_support returns 1 if Hypervisor.framework is available
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/sbin/sysctl",
+            "-n",
+            "kern.hv_support",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        _probe_cache.hvf = proc.returncode == 0 and stdout.decode().strip() == "1"
+    except (OSError, TimeoutError):
+        _probe_cache.hvf = False
+
+    return _probe_cache.hvf
+
+
+async def _check_tsc_deadline_available() -> bool:
+    """Check if TSC_DEADLINE CPU feature is available (cached).
+
+    TSC_DEADLINE is required to disable PIT (i8254) and PIC (i8259) in microvm.
+    Without TSC_DEADLINE, the APIC timer cannot use deadline mode, and the system
+    needs the legacy PIT for timer interrupts.
+
+    In nested virtualization (e.g., GitHub Actions runners), TSC_DEADLINE may not
+    be exposed to the guest, causing boot hangs if PIT/PIC are disabled.
+
+    See: https://www.qemu.org/docs/master/system/i386/microvm.html
+    "if your host's CPUs have the TSC_DEADLINE feature, you can also disable
+    both the i8259 PIC and the i8254 PIT"
+
+    Returns:
+        True if TSC_DEADLINE is available, False otherwise
+    """
+    # Fast path: return cached result
+    if _probe_cache.tsc_deadline is not None:
+        return _probe_cache.tsc_deadline
+
+    # TSC_DEADLINE is x86-only
+    if detect_host_arch() != HostArch.X86_64:
+        _probe_cache.tsc_deadline = False
+        return False
+
+    # Check /proc/cpuinfo for tsc_deadline_timer flag
+    cpuinfo_path = "/proc/cpuinfo"
+    if not await aiofiles.os.path.exists(cpuinfo_path):
+        # Not on Linux or /proc not mounted
+        _probe_cache.tsc_deadline = False
+        return False
+
+    try:
+        async with aiofiles.open(cpuinfo_path) as f:
+            cpuinfo = await f.read()
+        # Look for tsc_deadline_timer in the flags line
+        # Format: "flags : fpu vme ... tsc_deadline_timer ..."
+        for line in cpuinfo.split("\n"):
+            if line.startswith("flags"):
+                has_tsc_deadline = "tsc_deadline_timer" in line.split()
+                _probe_cache.tsc_deadline = has_tsc_deadline
+                if has_tsc_deadline:
+                    logger.debug("TSC_DEADLINE available (can disable PIT/PIC)")
+                else:
+                    logger.debug("TSC_DEADLINE not available (keeping PIT/PIC enabled)")
+                return has_tsc_deadline
+    except OSError as e:
+        logger.warning("Failed to read /proc/cpuinfo for TSC_DEADLINE check", extra={"error": str(e)})
+
+    _probe_cache.tsc_deadline = False
+    return False
+
+
+async def _probe_io_uring_support() -> bool:
+    """Probe for io_uring support using syscall test (cached).
+
+    Returns:
+        True if io_uring fully available, False otherwise
+    """
+    # Fast path: return cached result
+    if _probe_cache.io_uring is not None:
+        return _probe_cache.io_uring
+
+    # io_uring is Linux-only - immediately return False on other platforms
+    if detect_host_os() != HostOS.LINUX:
+        _probe_cache.io_uring = False
+        return False
+
+    # Check 1: Sysctl restrictions (kernel 5.12+)
+    sysctl_path = "/proc/sys/kernel/io_uring_disabled"
+    if await aiofiles.os.path.exists(sysctl_path):
+        try:
+            async with aiofiles.open(sysctl_path) as f:
+                content = await f.read()
+            disabled_value = int(content.strip())
+            # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
+            if disabled_value == 2:  # noqa: PLR2004
+                logger.info(
+                    "io_uring disabled via sysctl",
+                    extra={"sysctl_value": disabled_value},
+                )
+                _probe_cache.io_uring = False
+                return False
+            if disabled_value == 1:
+                logger.debug(
+                    "io_uring restricted to CAP_SYS_ADMIN",
+                    extra={"sysctl_value": disabled_value},
+                )
+        except (ValueError, OSError) as e:
+            logger.warning("Failed to read io_uring_disabled sysctl", extra={"error": str(e)})
+
+    # Check 2: Syscall probe (most reliable)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+
+        # __NR_io_uring_setup syscall number: 425
+        nr_io_uring_setup = 425
+
+        # Call io_uring_setup(0, NULL) - should fail with EINVAL if supported
+        result = libc.syscall(nr_io_uring_setup, 0, None)
+
+        if result == -1:
+            err = ctypes.get_errno()
+            if err == errno.ENOSYS:
+                logger.info(
+                    "io_uring syscall not available (ENOSYS)",
+                    extra={"kernel": platform.release()},
+                )
+                _probe_cache.io_uring = False
+                return False
+            if err in (errno.EINVAL, errno.EFAULT):
+                # Both indicate io_uring syscall is recognized and available:
+                # - EINVAL: kernel validated params and rejected entries=0
+                # - EFAULT: kernel tried to access params pointer (NULL)
+                logger.info(
+                    "io_uring syscall available",
+                    extra={"kernel": platform.release(), "probe_errno": err},
+                )
+                _probe_cache.io_uring = True
+                return True
+            if err == errno.EPERM:
+                logger.warning(
+                    "io_uring blocked by seccomp/container policy",
+                    extra={"errno": err},
+                )
+                _probe_cache.io_uring = False
+                return False
+            logger.warning(
+                "io_uring probe failed with unexpected error",
+                extra={"errno": err, "error": os.strerror(err)},
+            )
+            _probe_cache.io_uring = False
+            return False
+
+        _probe_cache.io_uring = True
+        return True
+
+    except (OSError, ValueError, RuntimeError) as e:
+        logger.warning(
+            "io_uring syscall probe failed",
+            extra={"error": str(e), "error_type": type(e).__name__},
+        )
+        _probe_cache.io_uring = False
+        return False
+
+
+async def _probe_unshare_support() -> bool:
+    """Probe for unshare (Linux namespace) support (cached).
+
+    Tests if the current environment allows creating new namespaces via unshare.
+    This requires either:
+    - Root privileges
+    - CAP_SYS_ADMIN capability
+    - Unprivileged user namespaces enabled (/proc/sys/kernel/unprivileged_userns_clone=1)
+
+    Returns:
+        True if unshare works, False otherwise (skip namespace isolation)
+    """
+    # Fast path: return cached result
+    if _probe_cache.unshare is not None:
+        return _probe_cache.unshare
+
+    # Skip on non-Linux - unshare is Linux-specific
+    if detect_host_os() == HostOS.MACOS:
+        _probe_cache.unshare = False
+        return False
+
+    try:
+        # Test unshare with minimal namespaces (pid requires fork)
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/unshare",
+            "--pid",
+            "--fork",
+            "--",
+            "/usr/bin/true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+
+        if proc.returncode == 0:
+            logger.info("unshare available (namespace isolation enabled)")
+            _probe_cache.unshare = True
+        else:
+            stderr_text = stderr.decode().strip() if stderr else ""
+            logger.warning(
+                "unshare unavailable (namespace isolation disabled)",
+                extra={"exit_code": proc.returncode, "stderr": stderr_text[:200]},
+            )
+            _probe_cache.unshare = False
+    except (OSError, TimeoutError) as e:
+        logger.warning(
+            "unshare probe failed",
+            extra={"error": str(e), "error_type": type(e).__name__},
+        )
+        _probe_cache.unshare = False
+
+    return _probe_cache.unshare
+
+
+async def _probe_qemu_vm_user() -> bool:
+    """Check if qemu-vm user exists for process isolation (cached).
+
+    Returns:
+        True if qemu-vm user exists, False otherwise
+    """
+    # Fast path: return cached result
+    if _probe_cache.qemu_vm_user is not None:
+        return _probe_cache.qemu_vm_user
+
+    # Skip on macOS - not applicable
+    if detect_host_os() == HostOS.MACOS:
+        _probe_cache.qemu_vm_user = False
+        return False
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/id",
+            "qemu-vm",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=5)
+        _probe_cache.qemu_vm_user = proc.returncode == 0
+        if _probe_cache.qemu_vm_user:
+            logger.info("qemu-vm user available (process isolation enabled)")
+        else:
+            logger.debug("qemu-vm user not found (process isolation disabled)")
+    except (OSError, TimeoutError) as e:
+        logger.debug(f"qemu-vm user probe failed: {e}")
+        _probe_cache.qemu_vm_user = False
+
+    return _probe_cache.qemu_vm_user
 
 
 class QemuVM:
@@ -224,6 +583,7 @@ class QemuVM:
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
         console_log: TextIO | None = None,
+        use_qemu_vm_user: bool = False,
     ):
         """Initialize VM handle.
 
@@ -240,6 +600,7 @@ class QemuVM:
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
             console_log: Optional file handle for QEMU console log
+            use_qemu_vm_user: Whether QEMU ran as qemu-vm user (requires sudo rm for cleanup)
         """
         self.vm_id = vm_id
         self.process = process
@@ -253,6 +614,7 @@ class QemuVM:
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
         self.console_log: TextIO | None = console_log
+        self.use_qemu_vm_user = use_qemu_vm_user
         self._destroyed = False
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
@@ -695,8 +1057,20 @@ class QemuVM:
         async def cleanup_overlay_fn():
             """Delete overlay image asynchronously."""
             if self.overlay_image.exists():
-                with contextlib.suppress(OSError):
-                    await aiofiles.os.remove(self.overlay_image)
+                with contextlib.suppress(OSError, PermissionError):
+                    if self.use_qemu_vm_user:
+                        # Overlay was chowned to qemu-vm, need sudo to delete
+                        proc = await asyncio.create_subprocess_exec(
+                            "sudo",
+                            "rm",
+                            "-f",
+                            str(self.overlay_image),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await proc.wait()
+                    else:
+                        await aiofiles.os.remove(self.overlay_image)
 
         # Run cleanup tasks in parallel
         await asyncio.gather(
@@ -721,16 +1095,19 @@ class VmManager:
 
     Usage:
         manager = VmManager(settings)
+        await manager.initialize()  # Run async system probes
         vm = await manager.create_vm("python", "tenant-123", "task-456")
         result = await vm.execute("print('hello')", "python", timeout_seconds=30)
         await manager.destroy_vm(vm)
     """
 
     def __init__(self, settings: Settings):
-        """Initialize QEMU manager.
+        """Initialize QEMU manager (sync part only).
 
         Args:
             settings: Service configuration (paths, limits, etc.)
+
+        Note: Call `await initialize()` after construction to run async system probes.
 
         Note on crash recovery:
             VM registry is in-memory only. If service crashes, registry is lost
@@ -741,23 +1118,39 @@ class VmManager:
         """
         self.settings = settings
         self.arch = detect_host_arch()
-
-        # Probe io_uring support ONCE at startup
-        self._io_uring_available = self._probe_io_uring_support()
-
-        # qemu-vm user availability checked lazily on first VM creation (optional hardening)
-        self._qemu_vm_available: bool | None = None
+        self._initialized = False
 
         self._vms: dict[str, QemuVM] = {}  # vm_id → VM object
         self._vms_lock = asyncio.Lock()  # Protect registry access
+
+    async def initialize(self) -> None:
+        """Run async system probes and complete initialization.
+
+        This method runs all async system capability probes (HVF, unshare, qemu-vm user)
+        and logs the initialization status. Must be called before creating VMs.
+
+        The probes are cached at module level, so subsequent calls are fast no-ops.
+        """
+        if self._initialized:
+            return
+
+        # Run all async probes concurrently (they cache their results at module level)
+        io_uring_available, unshare_available, qemu_vm_user_available = await asyncio.gather(
+            _probe_io_uring_support(),
+            _probe_unshare_support(),
+            _probe_qemu_vm_user(),
+        )
+
+        self._initialized = True
 
         # Log registry initialization (empty on startup, even after crash)
         logger.info(
             "VM registry initialized",
             extra={
                 "max_concurrent_vms": self.settings.max_concurrent_vms,
-                "io_uring_available": self._io_uring_available,
-                "qemu_vm_user_available": self._qemu_vm_available,
+                "io_uring_available": io_uring_available,
+                "unshare_available": unshare_available,
+                "qemu_vm_user_available": qemu_vm_user_available,
                 "note": "Any zombie QEMU processes from crashes will timeout naturally (max 2min)",
             },
         )
@@ -809,6 +1202,22 @@ class VmManager:
         # Start timing
         start_time = asyncio.get_event_loop().time()
 
+        # Step 0: Validate kernel and initramfs exist (async check)
+        arch_suffix = "aarch64" if self.arch == HostArch.AARCH64 else "x86_64"
+        kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
+        initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
+
+        if not await aiofiles.os.path.exists(kernel_path):
+            raise VmError(
+                f"Kernel not found: {kernel_path}",
+                context={"kernel_path": str(kernel_path), "arch": arch_suffix},
+            )
+        if not await aiofiles.os.path.exists(initramfs_path):
+            raise VmError(
+                f"Initramfs not found: {initramfs_path}",
+                context={"initramfs_path": str(initramfs_path), "arch": arch_suffix},
+            )
+
         # Step 1: Generate VM identifiers
         vm_id = f"{tenant_id}-{task_id}-{uuid4()}"
 
@@ -837,6 +1246,7 @@ class VmManager:
         gvproxy_socket: Path | None = None
         gvproxy_log_task: asyncio.Task[None] | None = None
         qemu_proc: ProcessWrapper | None = None
+        use_qemu_vm_user = False  # Set by _create_overlay if qemu-vm user available
         vm_created = False  # Flag to skip cleanup if VM successfully created
 
         # IMPORTANT: Always use gvproxy for network-enabled VMs
@@ -907,7 +1317,7 @@ class VmManager:
                 use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
             # Step 5: Build QEMU command (always Linux in container)
-            qemu_cmd = self._build_linux_cmd(
+            qemu_cmd = await self._build_linux_cmd(
                 language,
                 vm_id,
                 overlay_image,
@@ -922,6 +1332,13 @@ class VmManager:
             cmd_socket = self._get_cmd_socket_path(vm_id)
             event_socket = self._get_event_socket_path(vm_id)
             qmp_socket_path = self._get_qmp_socket_path(vm_id)
+
+            # Clean up any stale socket files before QEMU creates new ones
+            # This ensures QEMU gets a clean state for chardev sockets
+            for socket_path in [cmd_socket, event_socket, qmp_socket_path]:
+                with contextlib.suppress(OSError):
+                    Path(socket_path).unlink(missing_ok=True)
+
             channel: GuestChannel = DualPortChannel(cmd_socket, event_socket)
 
             # If cgroups unavailable, wrap with ulimit for host resource control
@@ -941,7 +1358,50 @@ class VmManager:
                     )
                 )
 
+                # Attach process to cgroup (only if cgroups available)
+                if cgroups_available and qemu_proc.pid is not None:
+                    await self._attach_to_cgroup(cgroup_path, qemu_proc.pid)
+
+                # Check if process crashed immediately BEFORE starting drain task
+                # This ensures we can capture stderr/stdout on immediate crash
+                await asyncio.sleep(0.1)
+                if qemu_proc.returncode is not None:
+                    stdout_text, stderr_text = await self._capture_qemu_output(qemu_proc)
+
+                    # Build full command string for debugging
+                    import shlex  # noqa: PLC0415
+
+                    qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
+
+                    # Log detailed error for debugging
+                    logger.error(
+                        "QEMU crashed immediately",
+                        extra={
+                            "vm_id": vm_id,
+                            "exit_code": qemu_proc.returncode,
+                            "stderr": stderr_text[:2000] if stderr_text else "(empty)",
+                            "stdout": stdout_text[:2000] if stdout_text else "(empty)",
+                            "qemu_cmd": qemu_cmd_str[:2000],
+                        },
+                    )
+
+                    max_bytes = constants.QEMU_OUTPUT_MAX_BYTES
+                    raise VmError(
+                        f"QEMU crashed immediately (exit code {qemu_proc.returncode}). "
+                        f"stderr: {stderr_text[:max_bytes] if stderr_text else '(empty)'}, "
+                        f"stdout: {stdout_text[:max_bytes] if stdout_text else '(empty)'}",
+                        context={
+                            "vm_id": vm_id,
+                            "language": language,
+                            "exit_code": qemu_proc.returncode,
+                            "memory_mb": memory_mb,
+                            "allow_network": allow_network,
+                            "qemu_cmd": qemu_cmd_str,
+                        },
+                    )
+
                 # Background task to drain QEMU output (prevent 64KB pipe deadlock)
+                # Started AFTER crash check to ensure we can capture error output
                 console_log_path = Path(f"/tmp/vm-{vm_id}-console.log")  # noqa: S108
                 console_log = console_log_path.open("w", buffering=1)  # noqa: ASYNC230 - Line buffering for sync writes
 
@@ -962,29 +1422,6 @@ class VmManager:
                     )
                 )
                 qemu_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-
-                # Attach process to cgroup (only if cgroups available)
-                if cgroups_available and qemu_proc.pid is not None:
-                    await self._attach_to_cgroup(cgroup_path, qemu_proc.pid)
-
-                # Check if process crashed immediately
-                await asyncio.sleep(0.1)
-                if qemu_proc.returncode is not None:
-                    stdout_text, stderr_text = await self._capture_qemu_output(qemu_proc)
-
-                    max_bytes = constants.QEMU_OUTPUT_MAX_BYTES
-                    raise VmError(
-                        f"QEMU crashed immediately (exit code {qemu_proc.returncode}). "
-                        f"stderr: {stderr_text[:max_bytes]}, stdout: {stdout_text[:max_bytes]}",
-                        context={
-                            "vm_id": vm_id,
-                            "language": language,
-                            "exit_code": qemu_proc.returncode,
-                            "memory_mb": memory_mb,
-                            "allow_network": allow_network,
-                            "qemu_cmd_preview": qemu_cmd[:5] if len(qemu_cmd) > 5 else qemu_cmd,  # noqa: PLR2004
-                        },
-                    )
 
             except (OSError, FileNotFoundError) as e:
                 raise VmError(
@@ -1010,6 +1447,7 @@ class VmManager:
                 qemu_log_task,
                 gvproxy_log_task,
                 console_log,
+                use_qemu_vm_user,
             )
 
             # Step 8a: Register VM in registry (before BOOTING to ensure tracking)
@@ -1138,6 +1576,7 @@ class VmManager:
                     gvproxy_socket=gvproxy_socket,
                     overlay_image=overlay_image,
                     cgroup_path=cgroup_path,
+                    use_qemu_vm_user=use_qemu_vm_user,
                 )
 
     async def _start_gvproxy(
@@ -1274,6 +1713,7 @@ class VmManager:
         gvproxy_socket: Path | None = None,
         overlay_image: Path | None = None,
         cgroup_path: Path | None = None,
+        use_qemu_vm_user: bool = False,
     ) -> dict[str, bool]:
         """Comprehensive cleanup of ALL VM resources in reverse dependency order.
 
@@ -1301,6 +1741,7 @@ class VmManager:
             gvproxy_socket: gvproxy socket path (can be None)
             overlay_image: qcow2 overlay path (can be None)
             cgroup_path: cgroup directory path (can be None)
+            use_qemu_vm_user: Whether QEMU ran as qemu-vm user (requires sudo rm for overlay)
 
         Returns:
             Dictionary with cleanup status for each resource
@@ -1339,6 +1780,7 @@ class VmManager:
             cleanup_overlay(
                 overlay_path=overlay_image,
                 context_id=vm_id,
+                use_qemu_vm_user=use_qemu_vm_user,
             ),
             cleanup_cgroup(
                 cgroup_path=cgroup_path,
@@ -1405,6 +1847,7 @@ class VmManager:
                 gvproxy_socket=vm.gvproxy_socket,
                 overlay_image=vm.overlay_image,
                 cgroup_path=vm.cgroup_path,
+                use_qemu_vm_user=vm.use_qemu_vm_user,
             )
         finally:
             # ALWAYS remove from registry, even on failure
@@ -1561,7 +2004,7 @@ class VmManager:
         # Change ownership to qemu-vm user for process isolation (optional hardening)
         # Only if: Linux + qemu-vm user exists + have sudo access
         # Returns whether QEMU should run as qemu-vm user (based on chown success)
-        if detect_host_os() != HostOS.MACOS and await self._qemu_vm_user_available():
+        if detect_host_os() != HostOS.MACOS and await _probe_qemu_vm_user():
             chown_proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
                     "sudo",
@@ -1600,9 +2043,18 @@ class VmManager:
             Gracefully degrades to no resource limits on Docker Desktop (read-only /sys/fs/cgroup)
             or environments without cgroup v2 support
         """
-        cgroup_path = Path(f"/sys/fs/cgroup/code-exec/{tenant_id}/{vm_id}")
+        tenant_cgroup = Path(f"/sys/fs/cgroup/code-exec/{tenant_id}")
+        cgroup_path = tenant_cgroup / vm_id
 
         try:
+            # Create tenant cgroup and enable controllers for nested VM cgroups
+            # In cgroup v2, subtree_control only affects immediate children,
+            # so we must enable controllers at each level of the hierarchy
+            await aiofiles.os.makedirs(tenant_cgroup, exist_ok=True)
+            async with aiofiles.open(tenant_cgroup / "cgroup.subtree_control", "w") as f:
+                await f.write("+memory +cpu +pids")
+
+            # Create VM cgroup
             await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
 
             # Set memory limit (512MB default + overhead)
@@ -1618,13 +2070,19 @@ class VmManager:
             async with aiofiles.open(cgroup_path / "pids.max", "w") as f:
                 await f.write(str(constants.CGROUP_PIDS_LIMIT))
 
+            # Verify cgroup.procs is writable (required for attaching processes)
+            # Writing to control files (memory.max, etc.) requires different privileges
+            # than writing to cgroup.procs, which needs proper systemd delegation
+            async with aiofiles.open(cgroup_path / "cgroup.procs", "a") as f:
+                pass  # Just test we can open for writing
+
         except OSError as e:
-            # Gracefully degrade if cgroups unavailable (e.g., Docker Desktop)
-            # Note: PermissionError is a subclass of OSError, so this handles both
-            if e.errno == constants.ERRNO_READ_ONLY_FILESYSTEM:
+            # Gracefully degrade if cgroups unavailable (e.g., Docker Desktop, CI runners)
+            # Note: PermissionError is a subclass of OSError
+            if e.errno in (constants.ERRNO_READ_ONLY_FILESYSTEM, constants.ERRNO_PERMISSION_DENIED):
                 logger.warning(
-                    "cgroup v2 unavailable (read-only filesystem), resource limits disabled",
-                    extra={"vm_id": vm_id, "path": str(cgroup_path)},
+                    "cgroup v2 unavailable, resource limits disabled",
+                    extra={"vm_id": vm_id, "path": str(cgroup_path), "errno": e.errno},
                 )
                 return Path(f"/tmp/cgroup-{vm_id}")  # noqa: S108
             raise VmError(f"Failed to setup cgroup: {e}") from e
@@ -1646,115 +2104,6 @@ class VmManager:
                 await f.write(str(pid))
         except (OSError, PermissionError) as e:
             raise VmError(f"Failed to attach PID {pid} to cgroup: {e}") from e
-
-    def _probe_io_uring_support(self) -> bool:
-        """Probe for io_uring support using syscall test.
-
-        Returns:
-            True if io_uring fully available, False otherwise
-        """
-        # Check 1: Sysctl restrictions (kernel 5.12+)
-        sysctl_path = Path("/proc/sys/kernel/io_uring_disabled")
-        if sysctl_path.exists():
-            try:
-                disabled_value = int(sysctl_path.read_text().strip())
-                # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
-                if disabled_value == 2:  # noqa: PLR2004
-                    logger.info(
-                        "io_uring disabled via sysctl",
-                        extra={"sysctl_value": disabled_value},
-                    )
-                    return False
-                if disabled_value == 1:
-                    logger.debug(
-                        "io_uring restricted to CAP_SYS_ADMIN",
-                        extra={"sysctl_value": disabled_value},
-                    )
-            except (ValueError, OSError) as e:
-                logger.warning("Failed to read io_uring_disabled sysctl", extra={"error": str(e)})
-
-        # Check 2: Syscall probe (most reliable)
-        try:
-            libc = ctypes.CDLL(None, use_errno=True)
-
-            # __NR_io_uring_setup syscall number: 425
-            nr_io_uring_setup = 425
-
-            # Call io_uring_setup(0, NULL) - should fail with EINVAL if supported
-            result = libc.syscall(nr_io_uring_setup, 0, None)
-
-            if result == -1:
-                err = ctypes.get_errno()
-                if err == errno.ENOSYS:
-                    logger.info(
-                        "io_uring syscall not available (ENOSYS)",
-                        extra={"kernel": platform.release()},
-                    )
-                    return False
-                if err == errno.EINVAL:
-                    logger.info(
-                        "io_uring syscall available",
-                        extra={"kernel": platform.release()},
-                    )
-                    return True
-                if err == errno.EPERM:
-                    logger.warning(
-                        "io_uring blocked by seccomp/container policy",
-                        extra={"errno": err},
-                    )
-                    return False
-                logger.warning(
-                    "io_uring probe failed with unexpected error",
-                    extra={"errno": err, "error": os.strerror(err)},
-                )
-                return False
-
-            return True
-
-        except (OSError, ValueError, RuntimeError) as e:
-            logger.warning(
-                "io_uring syscall probe failed",
-                extra={"error": str(e), "error_type": type(e).__name__},
-            )
-            return False
-
-    async def _probe_qemu_vm_user(self) -> bool:
-        """Check if qemu-vm user exists for process isolation (optional hardening).
-
-        Returns:
-            True if qemu-vm user exists, False otherwise
-        """
-        # Skip on macOS - not applicable
-        if detect_host_os() == HostOS.MACOS:
-            return False
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "id",
-                "qemu-vm",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            available = proc.returncode == 0
-            if available:
-                logger.info("qemu-vm user available (process isolation enabled)")
-            else:
-                logger.debug("qemu-vm user not found (process isolation disabled)")
-            return available
-        except (OSError, TimeoutError) as e:
-            logger.debug(f"qemu-vm user probe failed: {e}")
-            return False
-
-    async def _qemu_vm_user_available(self) -> bool:
-        """Check if qemu-vm user is available for process isolation.
-
-        Lazily probes on first call and caches the result.
-        """
-        if self._qemu_vm_available is not None:
-            return self._qemu_vm_available
-        self._qemu_vm_available = await self._probe_qemu_vm_user()
-        return self._qemu_vm_available
 
     def _wrap_with_ulimit(self, qemu_cmd: list[str], memory_mb: int) -> list[str]:
         """Wrap QEMU command with ulimit for resource control (cgroups alternative).
@@ -1781,7 +2130,7 @@ class VmManager:
 
         return ["sh", "-c", shell_cmd]
 
-    def _build_linux_cmd(  # noqa: PLR0912, PLR0915
+    async def _build_linux_cmd(  # noqa: PLR0912, PLR0915
         self,
         language: str,  # noqa: ARG002
         vm_id: str,
@@ -1812,26 +2161,163 @@ class VmManager:
         # Determine QEMU binary, machine type, and kernel based on architecture
         is_macos = detect_host_os() == HostOS.MACOS
 
+        # Detect hardware acceleration availability first (affects machine type selection)
+        # force_emulation bypasses KVM/HVF for testing emulation code paths
+        if self.settings.force_emulation:
+            use_kvm = False
+            use_hvf = False
+            logger.info(
+                "Hardware acceleration disabled (force_emulation=True)",
+                extra={"vm_id": vm_id, "is_macos": is_macos},
+            )
+        else:
+            use_kvm = _check_kvm_available()
+            use_hvf = is_macos and await _check_hvf_available()
+            logger.info(
+                "Hardware acceleration detection",
+                extra={"vm_id": vm_id, "use_kvm": use_kvm, "use_hvf": use_hvf, "is_macos": is_macos},
+            )
+
+        if use_hvf:
+            accel = "hvf"
+        elif use_kvm:
+            accel = "kvm"
+        else:
+            # TCG software emulation fallback (12x slower than KVM/HVF)
+            # MTTCG is enabled by default for supported configs, no need to force it
+            # tb-size=512 increases translation block cache for better code caching
+            accel = "tcg,tb-size=512"
+            if is_macos:
+                logger.info(
+                    "HVF not available on macOS, falling back to TCG emulation",
+                    extra={"vm_id": vm_id},
+                )
+
+        # Track whether to use virtio-console (hvc0) or ISA serial (ttyS0)
+        # Determined per-architecture below
+        use_virtio_console = False
+
         if self.arch == HostArch.AARCH64:
             arch_suffix = "aarch64"
             qemu_bin = "qemu-system-aarch64"
-            machine_type = "virt,mem-merge=off" if is_macos else "virt,mem-merge=off,dump-guest-core=off"
+            # highmem=off: Keep all RAM below 4GB for simpler memory mapping (faster boot)
+            # gic-version=3: Explicit GIC version for TCG (ITS not modeled in TCG)
+            # virtualization=off: Disable nested virt emulation (not needed, faster TCG)
+            machine_type = (
+                "virt,virtualization=off,highmem=off,gic-version=3,mem-merge=off"
+                if is_macos
+                else "virt,virtualization=off,highmem=off,gic-version=3,mem-merge=off,dump-guest-core=off"
+            )
+            # ARM64 always uses virtio-console (no ISA serial on virt machine)
+            use_virtio_console = True
         else:
             arch_suffix = "x86_64"
             qemu_bin = "qemu-system-x86_64"
-            machine_type = (
-                "microvm,x-option-roms=off,pit=off,pic=off,rtc=off,mem-merge=off"
-                if is_macos
-                else "microvm,x-option-roms=off,pit=off,pic=off,rtc=off,mem-merge=off,dump-guest-core=off"
-            )
+            # Machine type selection based on acceleration:
+            # - microvm: Optimized for KVM/HVF, requires hardware virtualization
+            # - q35: Standard machine type that works with TCG (software emulation)
+            # microvm is designed specifically for hardware virtualization and doesn't work correctly with TCG
+            # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+            #
+            # CRITICAL: acpi=off forces qboot instead of SeaBIOS
+            # With ACPI enabled (default), microvm uses SeaBIOS which has issues with direct kernel boot
+            # on QEMU 8.2. With acpi=off, it uses qboot which is specifically designed for direct kernel boot.
+            # See: https://www.kraxel.org/blog/2020/10/qemu-microvm-acpi/
+            if accel == "kvm":
+                # =============================================================
+                # Console Device Timing: ISA Serial vs Virtio-Console
+                # =============================================================
+                # ISA serial (ttyS0) is available IMMEDIATELY at boot because:
+                #   - It's a simple I/O port at 0x3F8 emulated by QEMU
+                #   - No driver initialization required
+                #   - Kernel can write to it from first instruction
+                #
+                # Virtio-console (hvc0) is available LATER (~30-50ms) because:
+                #   - Requires virtio-mmio bus discovery during kernel init
+                #   - Requires virtio-serial driver initialization
+                #   - Not available during early boot
+                #
+                # If kernel uses console=hvc0 but hvc0 doesn't exist yet → HANG
+                # See: https://gist.github.com/mcastelino/aa118275991d4f561ee22dc915b9345f
+                #
+                # =============================================================
+                # TSC_DEADLINE Requirement for Non-Legacy Mode
+                # =============================================================
+                # pit=off, pic=off, and isa-serial=off require TSC_DEADLINE CPU feature
+                # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+                #
+                # In nested VMs (e.g., GitHub Actions on Azure/Hyper-V), TSC_DEADLINE
+                # may not be exposed to the guest. Without it:
+                #   - PIT/PIC disabled → no timer/interrupt source → kernel hang
+                #   - ISA serial disabled → must use hvc0 → early boot hang
+                #
+                # =============================================================
+                # Nested VM Fallback: microvm with Legacy Devices Enabled
+                # =============================================================
+                # When TSC_DEADLINE is unavailable (nested VMs on Azure/Hyper-V),
+                # we keep microvm but enable ALL legacy devices:
+                #
+                # QEMU microvm legacy devices (enabled by default unless disabled):
+                #   - i8259 PIC: Interrupt controller for legacy interrupt routing
+                #   - i8254 PIT: Timer for scheduling and interrupt generation
+                #   - MC146818 RTC: Real-time clock for timekeeping
+                #   - ISA serial: Console output at ttyS0 (available at T=0)
+                #
+                # Why NOT fall back to 'pc' machine type:
+                #   - microvm with virtio-mmio is simpler and faster to boot
+                #   - Maintains consistent configuration between nested/bare-metal
+                #   - virtio-mmio works fine in nested VMs when legacy devices present
+                #   - 'pc' would require virtio-pci which needs different initramfs
+                #
+                # The key insight: without TSC_DEADLINE, kvmclock timing may be
+                # unreliable in nested VMs. The PIT provides fallback timer source.
+                #
+                # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+                # =============================================================
+                tsc_available = await _check_tsc_deadline_available()
+                if tsc_available:
+                    # Full optimization: TSC_DEADLINE available, use non-legacy mode
+                    machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
+                    use_virtio_console = True
+                else:
+                    # Nested VM compatibility: use microvm with timer legacy devices
+                    # Without TSC_DEADLINE, we need:
+                    #   - PIT (i8254) for timer interrupts
+                    #   - PIC (i8259) for interrupt handling
+                    #   - RTC for timekeeping (kvmclock may not work in nested VMs)
+                    # We disable ISA serial to avoid conflicts with virtio-serial.
+                    # Console output goes via virtio-console (hvc0) instead of ttyS0.
+                    # See: https://bugs.launchpad.net/qemu/+bug/1224444 (virtio-mmio issues)
+                    logger.info(
+                        "TSC_DEADLINE not available, using microvm with legacy timers but virtio-console for nested VM compatibility",
+                        extra={"vm_id": vm_id},
+                    )
+                    machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
+                    use_virtio_console = True
+            elif accel == "hvf":
+                # macOS with HVF uses microvm in non-legacy mode
+                # HVF always has TSC_DEADLINE equivalent, can disable pit/pic
+                machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                use_virtio_console = True
+            else:
+                # TCG emulation: use 'pc' (i440FX) which is simpler and more proven with direct kernel boot
+                # q35 uses PCIe which can have issues with PCI device enumeration on some QEMU versions
+                # See: https://wiki.qemu.org/Features/Q35
+                machine_type = "pc,mem-merge=off,dump-guest-core=off"
+                use_virtio_console = False
+                logger.info(
+                    "Using pc machine type (TCG emulation, hardware virtualization not available)",
+                    extra={"vm_id": vm_id, "accel": accel},
+                )
 
         # Auto-discover kernel and initramfs based on architecture
+        # Note: existence validated in create_vm() before calling this method
         kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
         initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
 
-        # Layer 5: Linux namespaces
+        # Layer 5: Linux namespaces (optional - requires capabilities or user namespaces)
         cmd: list[str] = []
-        if detect_host_os() != HostOS.MACOS:
+        if detect_host_os() != HostOS.MACOS and await _probe_unshare_support():
             if allow_network:
                 unshare_args = ["unshare", "--pid", "--mount", "--uts", "--ipc", "--fork"]
                 cmd.extend([*unshare_args, "--"])
@@ -1839,38 +2325,95 @@ class VmManager:
                 unshare_args = ["unshare", "--pid", "--net", "--mount", "--uts", "--ipc", "--fork"]
                 cmd.extend([*unshare_args, "--"])
 
-        # Detect hardware acceleration availability
-        use_kvm = _check_kvm_available()
-
-        if is_macos:
-            accel = "hvf"
-        elif use_kvm:
-            accel = "kvm"
-        else:
-            accel = "tcg"
-
         # Build QEMU command arguments
-        qemu_args = [
-            qemu_bin,
-            "-accel",
-            accel,
-            "-cpu",
-            ("host" if accel in ("hvf", "kvm") else "cortex-a57" if self.arch == HostArch.AARCH64 else "qemu64"),
-            "-M",
-            machine_type,
-            "-no-reboot",
-            "-m",
-            f"{memory_mb}M",
-            "-smp",
-            "1",
-            "-kernel",
-            str(kernel_path),
-            "-initrd",
-            str(initramfs_path),
-            "-append",
-            # Optimized boot params: quiet console, no logging, skip PS/2 probing, trust CPU RNG, skip RAID, disable mitigations
-            "console=hvc0 loglevel=0 quiet root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t preempt=none nomodules i8042.noaux i8042.nomux i8042.nopnp init=/init random.trust_cpu=on raid=noautodetect mitigations=off",
-        ]
+        # Determine if we're using microvm (requires -nodefaults to avoid BIOS fallback)
+        is_microvm = "microvm" in machine_type
+
+        # =============================================================
+        # Virtio Transport Selection: MMIO vs PCI
+        # =============================================================
+        # Virtio devices can use two transport mechanisms:
+        #
+        # virtio-mmio (suffix: -device):
+        #   - Memory-mapped I/O, no PCI bus required
+        #   - Simpler, smaller footprint, faster boot (~13%)
+        #   - Used by: microvm (x86 - both nested and bare-metal), virt (ARM64)
+        #   - Works in nested VMs when legacy devices (PIT/PIC/RTC) are enabled
+        #
+        # virtio-pci (suffix: -pci):
+        #   - Standard PCI bus with MSI-X interrupts
+        #   - Used by: pc/q35 (x86 TCG emulation)
+        #   - Requires different initramfs with virtio_pci.ko
+        #
+        # Selection criteria:
+        #   microvm (x86)        → virtio-mmio (all KVM modes, nested or bare-metal)
+        #   pc (x86 TCG)         → virtio-pci (software emulation fallback)
+        #   virt (ARM64)         → virtio-mmio (initramfs loads virtio_mmio.ko)
+        #
+        # CRITICAL: ARM64 initramfs loads virtio_mmio.ko, NOT virtio_pci.ko
+        # Using PCI devices on ARM64 causes boot hang (kernel can't find root device)
+        # =============================================================
+        virtio_suffix = "device" if (is_microvm or self.arch == HostArch.AARCH64) else "pci"
+
+        qemu_args = [qemu_bin]
+
+        # Set VM name for process identification (visible in ps aux, used by hwaccel test)
+        # Format: guest=vm_id - the vm_id includes tenant, task, and uuid for uniqueness
+        qemu_args.extend(["-name", f"guest={vm_id}"])
+
+        # CRITICAL: -nodefaults -no-user-config are required for microvm to avoid BIOS fallback
+        # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+        # For q35, we don't use these flags as the machine expects standard PC components
+        if is_microvm:
+            qemu_args.extend(["-nodefaults", "-no-user-config"])
+
+        # Console selection based on machine type and architecture:
+        # ┌─────────────────────────┬─────────────┬────────────────────────────────┐
+        # │ Configuration           │ Console     │ Reason                         │
+        # ├─────────────────────────┼─────────────┼────────────────────────────────┤
+        # │ x86 microvm + TSC       │ hvc0        │ Non-legacy, virtio-console     │
+        # │ x86 microvm - TSC       │ ttyS0       │ Legacy mode, ISA serial        │
+        # │ x86 pc (TCG only)       │ ttyS0       │ Software emulation fallback    │
+        # │ ARM64 virt              │ hvc0        │ No ISA serial on ARM           │
+        # └─────────────────────────┴─────────────┴────────────────────────────────┘
+        # ttyS0 (ISA serial) is used when we need reliable early boot console
+        # hvc0 (virtio-console) is used when ISA serial is disabled
+        # See: https://blog.memzero.de/toying-with-virtio/
+        if self.arch == HostArch.AARCH64:
+            # ARM64 virt machine has no ISA serial, must use virtio-console
+            console_params = "console=hvc0 loglevel=7"
+        elif use_virtio_console:
+            # x86 non-legacy mode: ISA serial disabled, use virtio-console
+            console_params = "console=hvc0 loglevel=7"
+        else:
+            # x86 legacy mode or TCG: ISA serial available at T=0, reliable boot
+            console_params = "console=ttyS0 loglevel=7"
+
+        qemu_args.extend(
+            [
+                "-accel",
+                accel,
+                "-cpu",
+                # For hardware accel use host CPU, for TCG use optimized emulated CPUs
+                # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
+                # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
+                ("host" if accel in ("hvf", "kvm") else "cortex-a57" if self.arch == HostArch.AARCH64 else "qemu64"),
+                "-M",
+                machine_type,
+                "-no-reboot",
+                "-m",
+                f"{memory_mb}M",
+                "-smp",
+                "1",
+                "-kernel",
+                str(kernel_path),
+                "-initrd",
+                str(initramfs_path),
+                "-append",
+                # Boot params: console varies by machine type, minimal kernel logging
+                f"{console_params} root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t preempt=none i8042.noaux i8042.nomux i8042.nopnp init=/init random.trust_cpu=on raid=noautodetect mitigations=off",
+            ]
+        )
 
         # Platform-specific memory configuration
         # Note: -mem-prealloc removed for faster boot (demand-paging is fine for ephemeral VMs)
@@ -1886,8 +2429,9 @@ class VmManager:
             )
 
         # Determine AIO mode based on cached startup probe
-        aio_mode = "io_uring" if self._io_uring_available else "threads"
-        if not self._io_uring_available:
+        io_uring_available = await _probe_io_uring_support()
+        aio_mode = "io_uring" if io_uring_available else "threads"
+        if not io_uring_available:
             logger.debug(
                 "Using aio=threads (io_uring not available)",
                 extra={"reason": "syscall_probe_failed", "vm_id": vm_id},
@@ -1932,42 +2476,123 @@ class VmManager:
                 qemu_args.extend(
                     [
                         "-device",
-                        "virtio-blk-device,drive=hd0,num-queues=1,queue-size=128",
+                        f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128",
                     ]
                 )
             case HostOS.LINUX | HostOS.UNKNOWN:
                 qemu_args.extend(
                     [
                         "-device",
-                        f"virtio-blk-device,drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128,logical_block_size=4096,physical_block_size=4096",
+                        # NOTE: Removed logical_block_size=4096,physical_block_size=4096
+                        # Small ext4 filesystems (<512MB) use 1024-byte blocks by default, so forcing
+                        # 4096-byte block size causes mount failures ("Invalid argument")
+                        f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128",
                     ]
                 )
 
         # Display/console configuration
+        # -nographic: headless mode
+        # -monitor none: disable QEMU monitor (it uses stdio by default with -nographic,
+        #   which conflicts with our -chardev stdio in environments without a proper TTY)
         qemu_args.extend(
             [
                 "-nographic",
+                "-monitor",
+                "none",
             ]
         )
 
-        # virtio-serial device for guest agent communication
+        # virtio-serial device for guest agent communication AND kernel console (hvc0)
+        # With microvm + -nodefaults, we must explicitly configure:
+        # 1. virtconsole for kernel console=hvc0 (required for boot output)
+        # 2. virtserialport for guest agent cmd/event channels
         cmd_socket_path = self._get_cmd_socket_path(vm_id)
         event_socket_path = self._get_event_socket_path(vm_id)
         qemu_args.extend(
             [
+                # Chardevs for communication channels
+                # server=on: QEMU creates a listening Unix socket
+                # wait=off: QEMU starts VM immediately without waiting for client connection
+                # Note: Socket permissions (via umask 000) are the key fix for Linux,
+                # NOT wait=on. The guest agent retries connection so timing is handled.
                 "-chardev",
                 f"socket,id=cmd0,path={cmd_socket_path},server=on,wait=off",
                 "-chardev",
                 f"socket,id=event0,path={event_socket_path},server=on,wait=off",
-                "-device",
-                # Reduced from 31 to 4: only using 2 ports (cmd+event), saves ~4KB/port + virtqueue init time
-                "virtio-serial-device,max_ports=4",
-                "-device",
-                "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
-                "-device",
-                "virtserialport,chardev=event0,name=org.dualeai.event,nr=2",
+                # Chardev for console output - connected to virtconsole (hvc0)
+                "-chardev",
+                "stdio,id=virtiocon0,mux=on,signal=off",
             ]
         )
+
+        # Serial port configuration:
+        # - virtio-console mode (hvc0): Disable serial to avoid stdio conflict
+        # - ISA serial mode (ttyS0): Connect serial to chardev for console output
+        if use_virtio_console:
+            # Disable default serial to prevent "cannot use stdio by multiple character devices"
+            # ARM64 virt has a default PL011 UART, x86 microvm has ISA serial
+            qemu_args.extend(["-serial", "none"])
+        else:
+            # x86 legacy mode: connect ISA serial to chardev for ttyS0
+            qemu_args.extend(["-serial", "chardev:virtiocon0"])
+
+        # =============================================================
+        # Virtio-Serial Device Configuration
+        # =============================================================
+        # Virtio-serial provides guest agent communication channels (cmd/event ports).
+        # Console output handling depends on use_virtio_console flag:
+        #
+        # NON-LEGACY MODE (use_virtio_console=True):
+        #   - virtconsole device created for hvc0 (kernel console)
+        #   - 3 ports: virtconsole (nr=0) + cmd (nr=1) + event (nr=2)
+        #   - ISA serial disabled via isa-serial=off in machine type
+        #   - Requires TSC_DEADLINE for reliable boot timing
+        #
+        # LEGACY MODE (use_virtio_console=False):
+        #   - Still uses microvm with virtio-mmio (for nested VMs)
+        #   - Or uses 'pc' with virtio-pci (for TCG emulation only)
+        #   - NO virtconsole device (would conflict with ISA serial chardev)
+        #   - 3 ports but only 2 used: cmd (nr=1) + event (nr=2)
+        #   - Port 0 reserved for virtconsole (QEMU backward compat requirement)
+        #   - ISA serial enabled, connected to stdio chardev for ttyS0
+        #   - Used when TSC_DEADLINE unavailable (nested VMs) or TCG emulation
+        #
+        # Why not always create virtconsole?
+        #   - Both virtconsole and ISA serial would use same chardev (virtiocon0)
+        #   - QEMU allows mux=on sharing, but causes output interleaving issues
+        #   - Cleaner to use one console device exclusively
+        #
+        # See: https://bugs.launchpad.net/qemu/+bug/1639791 (early virtio console lost)
+        # See: https://gist.github.com/mcastelino/aa118275991d4f561ee22dc915b9345f
+        # =============================================================
+        if use_virtio_console:
+            qemu_args.extend(
+                [
+                    "-device",
+                    f"virtio-serial-{virtio_suffix},max_ports=3",
+                    # hvc0 console device - must be nr=0 to be hvc0
+                    "-device",
+                    "virtconsole,chardev=virtiocon0,nr=0",
+                    "-device",
+                    "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
+                    "-device",
+                    "virtserialport,chardev=event0,name=org.dualeai.event,nr=2",
+                ]
+            )
+        else:
+            # Legacy mode: no virtconsole, ISA serial handles console output
+            # Port 0 is reserved for virtconsole (backward compat), so start at nr=1
+            # See: QEMU error "Port number 0 on virtio-serial devices reserved for virtconsole"
+            qemu_args.extend(
+                [
+                    "-device",
+                    f"virtio-serial-{virtio_suffix},max_ports=3",
+                    "-device",
+                    "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
+                    "-device",
+                    "virtserialport,chardev=event0,name=org.dualeai.event,nr=2",
+                ]
+            )
 
         # virtio-balloon for memory reclamation before snapshots
         # - deflate-on-oom: guest returns memory under OOM pressure
@@ -1975,7 +2600,7 @@ class VmManager:
         qemu_args.extend(
             [
                 "-device",
-                "virtio-balloon-device,deflate-on-oom=on,free-page-reporting=on",
+                f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=on",
             ]
         )
 
@@ -1988,7 +2613,7 @@ class VmManager:
                     "-netdev",
                     f"stream,id=net0,addr.type=unix,addr.path={gvproxy_socket}",
                     "-device",
-                    "virtio-net-device,netdev=net0,mq=off,csum=off,gso=off,host_tso4=off,host_tso6=off,mrg_rxbuf=off,ctrl_rx=off,guest_announce=off",
+                    f"virtio-net-{virtio_suffix},netdev=net0,mq=off,csum=off,gso=off,host_tso4=off,host_tso6=off,mrg_rxbuf=off,ctrl_rx=off,guest_announce=off",
                 ]
             )
 

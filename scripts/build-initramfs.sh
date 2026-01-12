@@ -69,6 +69,12 @@ chmod 755 "$INITRAMFS_DIR/init"
 # These are created before devtmpfs is mounted
 mknod -m 622 "$INITRAMFS_DIR/dev/console" c 5 1 2>/dev/null || true
 mknod -m 666 "$INITRAMFS_DIR/dev/null" c 1 3 2>/dev/null || true
+# ttyS0 (COM1) for early serial output - major 4, minor 64
+mknod -m 666 "$INITRAMFS_DIR/dev/ttyS0" c 4 64 2>/dev/null || true
+# hvc0 (virtio console) for microvm console=hvc0 - major 229, minor 0
+mknod -m 666 "$INITRAMFS_DIR/dev/hvc0" c 229 0 2>/dev/null || true
+# ttyAMA0 (PL011 UART) for ARM64 virt machine - major 204, minor 64
+mknod -m 666 "$INITRAMFS_DIR/dev/ttyAMA0" c 204 64 2>/dev/null || true
 
 # Extract essential kernel modules from Alpine
 # Modules needed:

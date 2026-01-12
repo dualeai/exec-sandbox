@@ -105,8 +105,9 @@ NPM_PACKAGE_DOMAINS: Final[list[str]] = [
 ERRNO_READ_ONLY_FILESYSTEM: Final[int] = 30
 """errno code for read-only filesystem (OSError.errno)."""
 
-CONSOLE_LOG_MAX_BYTES: Final[int] = 2000
-"""Maximum bytes to capture from VM console log for debugging."""
+ERRNO_PERMISSION_DENIED: Final[int] = 13
+"""errno code for permission denied (OSError.errno)."""
+
 CONSOLE_LOG_MAX_BYTES: Final[int] = 8000
 """Maximum bytes to capture from VM console log for debugging (context/structured logs)."""
 

@@ -68,6 +68,27 @@ def vm_manager(vm_settings):
 
 
 @pytest.fixture
+def emulation_settings(images_dir: Path):
+    """Settings with forced software emulation (no KVM/HVF)."""
+    from exec_sandbox.settings import Settings
+
+    return Settings(
+        base_images_dir=images_dir,
+        kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
+        max_concurrent_vms=4,
+        force_emulation=True,
+    )
+
+
+@pytest.fixture
+def emulation_vm_manager(emulation_settings):
+    """VmManager configured for software emulation."""
+    from exec_sandbox.vm_manager import VmManager
+
+    return VmManager(emulation_settings)  # type: ignore[arg-type]
+
+
+@pytest.fixture
 def unit_test_settings():
     """Settings for unit tests that don't need real images.
 

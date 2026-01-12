@@ -265,22 +265,83 @@ async def cleanup_file(
 async def cleanup_overlay(
     overlay_path: Path | None,
     context_id: str,
+    use_qemu_vm_user: bool = False,
 ) -> bool:
     """Delete overlay qcow2 file.
 
     Silently succeeds if overlay doesn't exist.
 
-    Convenience wrapper around cleanup_file for overlay images.
-
     Args:
         overlay_path: Path to overlay image to delete (None safe - returns immediately)
         context_id: Context for logging (e.g., vm_id)
+        use_qemu_vm_user: Whether QEMU ran as qemu-vm user (requires sudo rm)
 
     Returns:
         True if overlay cleaned successfully, False if issues occurred
     """
-    return await cleanup_file(
-        file_path=overlay_path,
-        context_id=context_id,
-        description="overlay image",
-    )
+    if overlay_path is None:
+        return True
+
+    if not overlay_path.exists():
+        logger.debug(
+            "overlay image already deleted",
+            extra={"context_id": context_id, "path": str(overlay_path)},
+        )
+        return True
+
+    try:
+        if use_qemu_vm_user:
+            # Overlay was chowned to qemu-vm, need sudo to delete
+            proc = await asyncio.create_subprocess_exec(
+                "sudo",
+                "rm",
+                "-f",
+                str(overlay_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            if proc.returncode == 0:
+                logger.debug(
+                    "overlay image deleted (sudo)",
+                    extra={"context_id": context_id, "path": str(overlay_path)},
+                )
+                return True
+            logger.error(
+                "overlay image sudo rm failed",
+                extra={"context_id": context_id, "path": str(overlay_path), "returncode": proc.returncode},
+            )
+            return False
+
+        await aiofiles.os.remove(overlay_path)
+        logger.debug(
+            "overlay image deleted",
+            extra={"context_id": context_id, "path": str(overlay_path)},
+        )
+        return True
+
+    except FileNotFoundError:
+        logger.debug(
+            "overlay image already deleted",
+            extra={"context_id": context_id, "path": str(overlay_path)},
+        )
+        return True
+
+    except PermissionError as e:
+        logger.error(
+            "overlay image permission denied",
+            extra={"context_id": context_id, "path": str(overlay_path), "error": str(e)},
+        )
+        return False
+
+    except OSError as e:
+        logger.error(
+            "overlay image OS error during deletion",
+            extra={
+                "context_id": context_id,
+                "path": str(overlay_path),
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+        return False

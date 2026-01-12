@@ -147,6 +147,7 @@ class Scheduler:
         from exec_sandbox.vm_manager import VmManager  # noqa: PLC0415
 
         self._vm_manager = VmManager(self._settings)
+        await self._vm_manager.initialize()
 
         # Initialize SnapshotManager (L0 local cache always available, L3 S3 optional)
         from exec_sandbox.snapshot_manager import SnapshotManager  # noqa: PLC0415

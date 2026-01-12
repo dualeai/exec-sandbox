@@ -392,3 +392,152 @@ class TestAllImageTypes:
             assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
         finally:
             await vm_manager.destroy_vm(vm)
+
+
+class TestEmulationMode:
+    """Tests with forced software emulation (TCG) to verify emulation code paths.
+
+    These tests use force_emulation=True to bypass KVM/HVF hardware acceleration,
+    ensuring the TCG emulation path works correctly. Useful for catching issues
+    that only appear in CI environments without hardware virtualization support.
+    """
+
+    async def test_emulation_uses_tcg_not_hvf(self, emulation_vm_manager) -> None:
+        """Verify force_emulation=True actually uses TCG, not hardware acceleration.
+
+        This test inspects the running QEMU process to verify:
+        1. -accel is set to 'tcg' (software emulation), not 'hvf' or 'kvm'
+        2. -cpu is NOT 'host' (should be an emulated CPU like 'cortex-a57' or 'qemu64')
+        """
+        vm = await emulation_vm_manager.create_vm(
+            language=Language.RAW,
+            tenant_id="test-emulation",
+            task_id="verify-tcg",
+            snapshot_path=None,
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
+        )
+
+        try:
+            # Find this VM's QEMU process
+            # On Linux, we read /proc/*/cmdline directly to avoid ps aux truncation
+            # On macOS, we use ps aux since /proc doesn't exist
+            import platform
+
+            if platform.system() == "Linux":
+                # Read /proc/*/cmdline for each process - this gives full command line
+                # without truncation. The cmdline uses NUL as separator, we convert to spaces.
+                proc = await asyncio.create_subprocess_exec(
+                    "bash",
+                    "-c",
+                    f"for f in /proc/[0-9]*/cmdline; do cat \"$f\" 2>/dev/null | tr '\\0' ' '; echo; done | grep -E 'qemu.*{vm.vm_id}|{vm.vm_id}.*qemu'",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                ps_output = stdout.decode()
+            else:
+                # macOS: use ps aux (no truncation issues on macOS)
+                proc = await asyncio.create_subprocess_exec(
+                    "ps",
+                    "aux",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                ps_output = stdout.decode()
+
+            accel_found = None
+            cpu_found = None
+            qemu_line_found = False
+
+            for line in ps_output.split("\n"):
+                if vm.vm_id in line and "qemu" in line:
+                    qemu_line_found = True
+                    parts = line.split()
+                    for i, p in enumerate(parts):
+                        if p == "-accel" and i + 1 < len(parts):
+                            accel_found = parts[i + 1]
+                        if p == "-cpu" and i + 1 < len(parts):
+                            cpu_found = parts[i + 1]
+                    break
+
+            # Verify we found the QEMU process
+            assert qemu_line_found, (
+                f"Could not find QEMU process for VM {vm.vm_id}\nps output sample:\n{ps_output[:2000]}"
+            )
+            assert accel_found is not None, f"Could not find -accel argument in QEMU command line:\n{ps_output[:2000]}"
+            assert cpu_found is not None, f"Could not find -cpu argument in QEMU command line:\n{ps_output[:2000]}"
+
+            # With force_emulation=True, MUST use TCG, MUST NOT use HVF/KVM
+            assert accel_found.startswith("tcg"), (
+                f"Expected TCG emulation with force_emulation=True, got: -accel {accel_found}"
+            )
+            assert accel_found not in ("hvf", "kvm"), (
+                f"force_emulation=True should NOT use hardware acceleration, got: -accel {accel_found}"
+            )
+            # CPU should be emulated (cortex-a57 for ARM, qemu64 for x86), NOT 'host'
+            assert cpu_found != "host", f"Expected emulated CPU with force_emulation=True, got: -cpu {cpu_found}"
+        finally:
+            await emulation_vm_manager.destroy_vm(vm)
+
+    @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
+    async def test_vm_boot_with_emulation(
+        self,
+        emulation_vm_manager,
+        language: Language,
+        code: str,
+        expected_output: str,
+    ) -> None:
+        """VM boots successfully with forced software emulation."""
+        vm = await emulation_vm_manager.create_vm(
+            language=language,
+            tenant_id="test-emulation",
+            task_id=f"emulation-boot-{language.value}",
+            snapshot_path=None,
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
+        )
+
+        try:
+            assert vm.vm_id is not None
+            assert vm.state == VmState.READY
+        finally:
+            await emulation_vm_manager.destroy_vm(vm)
+            assert vm.state == VmState.DESTROYED
+
+    @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
+    async def test_vm_execute_with_emulation(
+        self,
+        emulation_vm_manager,
+        language: Language,
+        code: str,
+        expected_output: str,
+    ) -> None:
+        """VM executes code correctly with forced software emulation."""
+        vm = await emulation_vm_manager.create_vm(
+            language=language,
+            tenant_id="test-emulation",
+            task_id=f"emulation-exec-{language.value}",
+            snapshot_path=None,
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
+        )
+
+        try:
+            result = await vm.execute(
+                code=code,
+                language=language,
+                timeout_seconds=120,  # Longer timeout for TCG emulation
+                env_vars=None,
+                on_stdout=None,
+                on_stderr=None,
+            )
+
+            assert result.exit_code == 0, f"Exit code {result.exit_code}, stderr: {result.stderr}"
+            assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
+        finally:
+            await emulation_vm_manager.destroy_vm(vm)

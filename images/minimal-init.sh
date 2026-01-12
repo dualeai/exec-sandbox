@@ -35,6 +35,9 @@ load_module "/lib/modules/$KVER/kernel/drivers/net/net_failover.ko.gz" "net_fail
 load_module "/lib/modules/$KVER/kernel/drivers/net/virtio_net.ko.gz" "virtio_net"
 # virtio_balloon is needed for memory reclamation before snapshots
 load_module "/lib/modules/$KVER/kernel/drivers/virtio/virtio_balloon.ko.gz" "virtio_balloon"
+# virtio_console handles BOTH virtconsole (hvc0) AND virtserialport devices
+# Must be loaded explicitly in legacy mode (console=ttyS0) where it's not auto-loaded
+load_module "/lib/modules/$KVER/kernel/drivers/char/virtio_console.ko.gz" "virtio_console"
 
 # Load ext4 and its dependencies (order matters)
 load_module "/lib/modules/$KVER/kernel/lib/crc16.ko.gz" "crc16"
@@ -71,18 +74,31 @@ if [ -e /sys/block/zram0 ]; then
     echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true    # Prefer swap over cache
 fi
 
-# Wait for virtio block device to appear (up to 400ms with 20ms intervals)
-# Devices typically appear within 10-30ms with virtio-mmio
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+# Wait for virtio block device with exponential backoff (5+10+20+40+80=155ms max)
+for delay in 5000 10000 20000 40000 80000; do
     [ -b /dev/vda ] && break
-    /bin/busybox usleep 20000
+    /bin/busybox usleep $delay
 done
 
-# Wait for virtio-serial ports to appear (up to 400ms with 20ms intervals)
-# These appear after virtio_mmio is loaded
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+# Wait for hvc0 with exponential backoff (5+10+20+40+80=155ms max)
+for delay in 5000 10000 20000 40000 80000; do
+    [ -c /dev/hvc0 ] && break
+    /bin/busybox usleep $delay
+done
+
+# Redirect output to console
+# hvc0: microvm (x86) and virt (ARM64) with virtio-console
+# ttyS0: x86 TCG fallback (pc machine)
+if [ -c /dev/hvc0 ]; then
+    exec > /dev/hvc0 2>&1
+elif [ -c /dev/ttyS0 ]; then
+    exec > /dev/ttyS0 2>&1
+fi
+
+# Wait for virtio-serial ports with exponential backoff (5+10+20+40+80=155ms max)
+for delay in 5000 10000 20000 40000 80000; do
     [ -d /sys/class/virtio-ports ] && [ "$(ls /sys/class/virtio-ports/ 2>/dev/null)" ] && break
-    /bin/busybox usleep 20000
+    /bin/busybox usleep $delay
 done
 
 # Create virtio-ports symlinks (normally done by udev/mdev)
@@ -99,7 +115,28 @@ for vport in /sys/class/virtio-ports/vport*; do
 done
 
 # Mount root filesystem
-/bin/busybox mount -t ext4 -o rw,noatime /dev/vda /mnt
+if ! /bin/busybox mount -t ext4 -o rw,noatime /dev/vda /mnt 2>/dev/null; then
+    if ! /bin/busybox mount -o rw,noatime /dev/vda /mnt 2>/dev/null; then
+        echo "[init] ERROR: Failed to mount /dev/vda"
+        echo "[init] Block devices:"
+        ls -la /dev/vd* 2>/dev/null || echo "  (none)"
+        echo "[init] dmesg (last 20 lines):"
+        /bin/busybox dmesg | /bin/busybox tail -20
+        exec /bin/busybox sh
+    fi
+fi
+
+# Verify guest-agent exists and is executable
+if [ ! -f /mnt/usr/local/bin/guest-agent ]; then
+    echo "[init] ERROR: /mnt/usr/local/bin/guest-agent not found!"
+    ls -la /mnt/usr/local/bin/ 2>/dev/null || echo "  (directory missing)"
+    exec /bin/busybox sh
+fi
+if [ ! -x /mnt/usr/local/bin/guest-agent ]; then
+    echo "[init] ERROR: guest-agent not executable!"
+    ls -la /mnt/usr/local/bin/guest-agent
+    exec /bin/busybox sh
+fi
 
 # Pivot to real root and exec guest-agent
 cd /mnt
@@ -107,4 +144,5 @@ cd /mnt
 /bin/busybox mount --move /proc proc
 /bin/busybox mount --move /sys sys
 /bin/busybox mount --move /tmp tmp
+
 exec /bin/busybox switch_root /mnt /usr/local/bin/guest-agent

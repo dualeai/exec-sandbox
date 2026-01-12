@@ -54,3 +54,8 @@ class Settings(BaseSettings):
     # Limits
     execution_timeout_max: int = constants.MAX_TIMEOUT_SECONDS
     memory_limit_max: int = constants.MAX_MEMORY_MB
+
+    # Testing/Debug
+    force_emulation: bool = False
+    """Force software emulation instead of hardware virtualization (KVM/HVF).
+    Useful for testing emulation code paths locally."""
