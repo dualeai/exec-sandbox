@@ -29,10 +29,13 @@ detect_arch() {
 # Cache helpers - content-addressable build caching via .hash sidecar files
 # =============================================================================
 
-# Compute hash for kernel inputs (just Alpine version + arch)
+# Compute hash for kernel inputs (Alpine version + arch + init script)
 compute_kernel_hash() {
     local arch=$1
-    echo "alpine=$ALPINE_VERSION arch=$arch" | sha256sum | cut -d' ' -f1
+    (
+        echo "alpine=$ALPINE_VERSION arch=$arch"
+        cat "$REPO_ROOT/images/minimal-init.sh" 2>/dev/null || true
+    ) | sha256sum | cut -d' ' -f1
 }
 
 # Check if output is up-to-date (hash matches)
