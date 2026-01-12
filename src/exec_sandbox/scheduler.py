@@ -358,9 +358,8 @@ class Scheduler:
             Settings instance configured from SchedulerConfig
         """
         # Get images directory (auto-detect if not configured)
-        # When auto_download_assets=True, assets were already downloaded in __aenter__
-        # so we don't check existence again (they should exist now)
-        images_dir = self.config.get_images_dir(check_exists=not self.config.auto_download_assets)
+        # check_exists is auto-inferred from auto_download_assets
+        images_dir = self.config.get_images_dir()
 
         # Kernels may be in images_dir directly or in a kernels subdirectory
         kernels_subdir = images_dir / "kernels"

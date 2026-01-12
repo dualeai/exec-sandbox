@@ -135,7 +135,7 @@ class SchedulerConfig(BaseModel):
         description="Automatically download VM images from GitHub Releases if not found",
     )
 
-    def get_images_dir(self, check_exists: bool = True) -> Path:
+    def get_images_dir(self, check_exists: bool | None = None) -> Path:
         """Get images directory, auto-detecting if not configured.
 
         Detection order:
@@ -150,7 +150,9 @@ class SchedulerConfig(BaseModel):
 
         Args:
             check_exists: If True, raises FileNotFoundError when directory doesn't exist.
-                          Set to False when auto_download_assets=True (download happens later).
+                          If None (default), inferred from auto_download_assets:
+                          - auto_download_assets=True -> don't check (will be created on download)
+                          - auto_download_assets=False -> check exists (must be pre-installed)
 
         Returns:
             Path to images directory
@@ -180,6 +182,10 @@ class SchedulerConfig(BaseModel):
             path = Path.home() / "Library" / "Application Support" / "exec-sandbox" / "images"
         else:
             path = Path.home() / ".local" / "share" / "exec-sandbox" / "images"
+
+        # Infer check_exists from auto_download_assets if not explicitly set
+        if check_exists is None:
+            check_exists = not self.auto_download_assets
 
         if check_exists and not path.exists():
             raise FileNotFoundError(

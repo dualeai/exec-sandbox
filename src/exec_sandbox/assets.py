@@ -104,11 +104,17 @@ async def fetch_kernel(arch: str | None = None) -> Path:
     Returns:
         Path to the decompressed kernel file.
     """
-    await ensure_registry_loaded()
-    assets = get_assets()
-
     arch = arch or get_current_arch()
     fname = f"vmlinuz-{arch}.zst"
+
+    # Check local cache first
+    if local_path := get_cached_asset_path(fname):
+        logger.debug("Using cached kernel", extra={"arch": arch, "path": str(local_path)})
+        return local_path
+
+    # Not found locally, download from GitHub
+    await ensure_registry_loaded()
+    assets = get_assets()
 
     logger.debug("Fetching kernel", extra={"arch": arch, "file": fname})
     return await assets.fetch(fname, processor=decompress_zstd)
@@ -124,11 +130,17 @@ async def fetch_initramfs(arch: str | None = None) -> Path:
     Returns:
         Path to the decompressed initramfs file.
     """
-    await ensure_registry_loaded()
-    assets = get_assets()
-
     arch = arch or get_current_arch()
     fname = f"initramfs-{arch}.zst"
+
+    # Check local cache first
+    if local_path := get_cached_asset_path(fname):
+        logger.debug("Using cached initramfs", extra={"arch": arch, "path": str(local_path)})
+        return local_path
+
+    # Not found locally, download from GitHub
+    await ensure_registry_loaded()
+    assets = get_assets()
 
     logger.debug("Fetching initramfs", extra={"arch": arch, "file": fname})
     return await assets.fetch(fname, processor=decompress_zstd)
@@ -145,9 +157,6 @@ async def fetch_base_image(language: str, arch: str | None = None) -> Path:
     Returns:
         Path to the decompressed qcow2 image file.
     """
-    await ensure_registry_loaded()
-    assets = get_assets()
-
     arch = arch or get_current_arch()
 
     # Map language to image filename
@@ -157,6 +166,15 @@ async def fetch_base_image(language: str, arch: str | None = None) -> Path:
         fname = f"node-1.3-base-{arch}.qcow2.zst"
     else:
         fname = f"raw-base-{arch}.qcow2.zst"
+
+    # Check local cache first
+    if local_path := get_cached_asset_path(fname):
+        logger.debug("Using cached base image", extra={"language": language, "arch": arch, "path": str(local_path)})
+        return local_path
+
+    # Not found locally, download from GitHub
+    await ensure_registry_loaded()
+    assets = get_assets()
 
     logger.debug("Fetching base image", extra={"language": language, "arch": arch, "file": fname})
     return await assets.fetch(fname, processor=decompress_zstd)
@@ -169,17 +187,27 @@ async def fetch_gvproxy() -> Path:
     Returns:
         Path to the gvproxy-wrapper binary (executable).
     """
-    await ensure_registry_loaded()
-    assets = get_assets()
+    import asyncio  # noqa: PLC0415
 
     suffix = get_gvproxy_suffix()
     fname = f"gvproxy-wrapper-{suffix}"
+
+    # Check local cache first
+    if local_path := get_cached_asset_path(fname):
+        logger.debug("Using cached gvproxy-wrapper", extra={"path": str(local_path)})
+        # Ensure executable
+        await asyncio.to_thread(local_path.chmod, 0o755)
+        return local_path
+
+    # Not found locally, download from GitHub
+    await ensure_registry_loaded()
+    assets = get_assets()
 
     logger.debug("Fetching gvproxy-wrapper", extra={"file": fname})
     path = await assets.fetch(fname)
 
     # Make executable
-    path.chmod(0o755)
+    await asyncio.to_thread(path.chmod, 0o755)
 
     return path
 
