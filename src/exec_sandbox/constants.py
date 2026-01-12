@@ -23,6 +23,11 @@ TMPFS_SIZE_MB: Final[int] = 128
 CGROUP_MEMORY_OVERHEAD_MB: Final[int] = 200
 """QEMU process overhead added to guest memory for cgroup limits."""
 
+TCG_TB_CACHE_SIZE_MB: Final[int] = 512
+"""TCG translation block cache size in MB (must match tb-size in vm_manager.py).
+QEMU 5.0+ defaults to 1GB, we use 512MB for better CI compatibility.
+See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache"""
+
 CGROUP_PIDS_LIMIT: Final[int] = 100
 """Maximum PIDs in cgroup (fork bomb prevention)."""
 

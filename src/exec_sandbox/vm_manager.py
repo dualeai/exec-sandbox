@@ -1268,7 +1268,12 @@ class VmManager:
             },
         )
 
-        # Step 2-4: Parallel resource setup (overlay + cgroup + gvproxy)
+        # Step 2: Determine virtualization mode early (needed for cgroup memory sizing)
+        # TCG mode requires significantly more memory for translation block cache
+        accel_type = await self._detect_accel_type()
+        use_tcg = accel_type == AccelType.TCG
+
+        # Step 3-5: Parallel resource setup (overlay + cgroup + gvproxy)
         # These operations are independent and can run concurrently
         overlay_image = Path(f"/tmp/qemu-{vm_id}.qcow2")  # noqa: S108
         base_image = snapshot_path or self.get_base_image(language)
@@ -1310,7 +1315,7 @@ class VmManager:
                 # Run all tasks in parallel including gvproxy
                 overlay_result, cgroup_result, gvproxy_result = await asyncio.gather(
                     self._create_overlay(base_image, overlay_image),
-                    self._setup_cgroup(vm_id, tenant_id),
+                    self._setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     self._start_gvproxy(vm_id, allowed_domains, language),
                     return_exceptions=True,
                 )
@@ -1334,7 +1339,7 @@ class VmManager:
                 # Run overlay and cgroup setup in parallel (no gvproxy)
                 overlay_result, cgroup_result = await asyncio.gather(
                     self._create_overlay(base_image, overlay_image),
-                    self._setup_cgroup(vm_id, tenant_id),
+                    self._setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     return_exceptions=True,
                 )
                 setup_complete_time = asyncio.get_event_loop().time()
@@ -2115,24 +2120,30 @@ class VmManager:
 
         return False  # qemu-vm not available, QEMU should run as current user
 
-    async def _setup_cgroup(self, vm_id: str, tenant_id: str) -> Path:
+    async def _setup_cgroup(self, vm_id: str, tenant_id: str, memory_mb: int, use_tcg: bool) -> Path:
         """Set up cgroup v2 resource limits.
 
         Limits:
-        - memory.max: 512MB
+        - memory.max: guest_mb + overhead (+ TCG TB cache if software emulation)
         - cpu.max: 100000 (1 vCPU)
         - pids.max: 100 (fork bomb prevention)
 
         Args:
             vm_id: Unique VM identifier
             tenant_id: Tenant identifier
+            memory_mb: Guest VM memory in MB
+            use_tcg: True if using TCG software emulation (needs extra memory for TB cache)
 
         Returns:
             Path to cgroup directory (dummy path if cgroups unavailable)
 
         Note:
             Gracefully degrades to no resource limits on Docker Desktop (read-only /sys/fs/cgroup)
-            or environments without cgroup v2 support
+            or environments without cgroup v2 support.
+
+            TCG mode requires significantly more memory due to the translation block (TB) cache.
+            QEMU 5.0+ defaults to 1GB TB cache; we use 512MB (tb-size=512) but still need to
+            account for this overhead. See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache
         """
         tenant_cgroup = Path(f"/sys/fs/cgroup/code-exec/{tenant_id}")
         cgroup_path = tenant_cgroup / vm_id
@@ -2148,10 +2159,16 @@ class VmManager:
             # Create VM cgroup
             await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
 
-            # Set memory limit (512MB default + overhead)
-            memory_mb = 512
+            # Calculate memory limit based on virtualization mode:
+            # - KVM/HVF: guest_mb + process overhead (~200MB)
+            # - TCG: guest_mb + TB cache (512MB) + process overhead (~200MB)
+            # TCG needs the TB cache for JIT-compiled code translation blocks
+            cgroup_memory_mb = memory_mb + constants.CGROUP_MEMORY_OVERHEAD_MB
+            if use_tcg:
+                cgroup_memory_mb += constants.TCG_TB_CACHE_SIZE_MB
+
             async with aiofiles.open(cgroup_path / "memory.max", "w") as f:
-                await f.write(str((memory_mb + constants.CGROUP_MEMORY_OVERHEAD_MB) * 1024 * 1024))
+                await f.write(str(cgroup_memory_mb * 1024 * 1024))
 
             # Set CPU limit (1 vCPU)
             async with aiofiles.open(cgroup_path / "cpu.max", "w") as f:
