@@ -1337,7 +1337,7 @@ class VmManager:
             # This ensures QEMU gets a clean state for chardev sockets
             for socket_path in [cmd_socket, event_socket, qmp_socket_path]:
                 with contextlib.suppress(OSError):
-                    Path(socket_path).unlink(missing_ok=True)
+                    await aiofiles.os.remove(socket_path)
 
             channel: GuestChannel = DualPortChannel(cmd_socket, event_socket)
 
