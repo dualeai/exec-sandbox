@@ -2010,7 +2010,18 @@ class VmManager:
         # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
         # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
         if use_qemu_vm_user:
-            cmd.extend(["sudo", "-u", "qemu-vm"])
+            # stdbuf -oL forces line-buffered stdout to ensure console output is captured
+            # immediately rather than being block-buffered (which happens with piped stdout)
+            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security
+            #
+            # umask 000: Create chardev sockets with world-readable/writable permissions (0666).
+            # Without this, sockets are created with restrictive permissions (e.g., 0600)
+            # and the host process cannot connect to sockets owned by 'qemu-vm'.
+            import shlex  # noqa: PLC0415
+
+            qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_args)
+            cmd.extend(["sudo", "-u", "qemu-vm", "sh", "-c", f"umask 000 && exec stdbuf -oL {qemu_cmd_str}"])
+            return cmd  # Already added qemu_args via sh -c
 
         cmd.extend(qemu_args)
 
