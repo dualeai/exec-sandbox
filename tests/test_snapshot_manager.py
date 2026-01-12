@@ -151,8 +151,9 @@ class TestSnapshotManagerIntegration:
         )
         assert base_key == "python-base"
 
+    @pytest.mark.sudo
     async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
-        """Create snapshot with packages (slow, requires VM)."""
+        """Create snapshot with packages (slow, requires VM, uses qemu-vm user on Linux)."""
         from exec_sandbox.snapshot_manager import SnapshotManager
 
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")

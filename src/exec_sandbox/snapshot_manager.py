@@ -440,7 +440,10 @@ class SnapshotManager:
 
                 # Step 6: Commit overlay changes to snapshot
                 # QEMU shutdown, overlay still exists on disk
-                await self._commit_overlay_to_snapshot(overlay_path, snapshot_path)
+                # Pass use_qemu_vm_user to run with sudo if overlay is owned by qemu-vm
+                await self._commit_overlay_to_snapshot(
+                    overlay_path, snapshot_path, use_qemu_vm_user=vm.use_qemu_vm_user
+                )
 
                 # Step 7: Clean up ALL resources (now safe to delete overlay)
                 # This calls vm.destroy() which deletes overlay + cgroup
@@ -624,6 +627,7 @@ class SnapshotManager:
         self,
         overlay_path: Path,
         snapshot_path: Path,
+        use_qemu_vm_user: bool,
     ) -> None:
         """Commit overlay changes to snapshot using qemu-img commit.
 
@@ -645,16 +649,24 @@ class SnapshotManager:
         Args:
             overlay_path: Ephemeral overlay file to commit from
             snapshot_path: Snapshot file to commit into
+            use_qemu_vm_user: If True, overlay is owned by qemu-vm user, run with sudo
 
         Raises:
             SnapshotError: qemu-img commit failed
         """
         logger.info(
             "Committing overlay to snapshot",
-            extra={"overlay": str(overlay_path), "snapshot": str(snapshot_path)},
+            extra={"overlay": str(overlay_path), "snapshot": str(snapshot_path), "use_sudo": use_qemu_vm_user},
         )
 
-        cmd = ["qemu-img", "commit", str(overlay_path)]
+        # When overlay is owned by qemu-vm user, need sudo to read it
+        if use_qemu_vm_user:
+            cmd = ["sudo", "qemu-img", "commit", str(overlay_path)]
+        else:
+            cmd = ["qemu-img", "commit", str(overlay_path)]
+
+        # Capture stderr for error reporting
+        stderr_lines: list[str] = []
 
         proc = ProcessWrapper(
             await asyncio.create_subprocess_exec(
@@ -666,6 +678,11 @@ class SnapshotManager:
 
         # Drain subprocess output using subprocess_utils (prevents pipe deadlock)
         context_id = f"commit-{overlay_path.name}"
+
+        def capture_stderr(line: str) -> None:
+            stderr_lines.append(line)
+            logger.info("qemu-img commit stderr", extra={"context_id": context_id, "output": line})
+
         drain_task = asyncio.create_task(
             drain_subprocess_output(
                 proc,
@@ -674,9 +691,7 @@ class SnapshotManager:
                 stdout_handler=lambda line: logger.info(
                     "qemu-img commit stdout", extra={"context_id": context_id, "output": line}
                 ),
-                stderr_handler=lambda line: logger.info(
-                    "qemu-img commit stderr", extra={"context_id": context_id, "output": line}
-                ),
+                stderr_handler=capture_stderr,
             )
         )
 
@@ -687,12 +702,14 @@ class SnapshotManager:
         await drain_task
 
         if returncode != 0:
+            stderr_output = "\n".join(stderr_lines) if stderr_lines else "(no stderr)"
             raise SnapshotError(
-                f"qemu-img commit failed with exit code {returncode}",
+                f"qemu-img commit failed with exit code {returncode}: {stderr_output}",
                 context={
                     "overlay": str(overlay_path),
                     "snapshot": str(snapshot_path),
                     "exit_code": returncode,
+                    "stderr": stderr_output,
                 },
             )
 
