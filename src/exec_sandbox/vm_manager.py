@@ -2104,6 +2104,17 @@ class VmManager:
             async with asyncio.timeout(timeout):
                 death_task = asyncio.create_task(monitor_process_death())
 
+                # Pre-connect to chardev sockets to trigger QEMU's poll registration.
+                # Without this, QEMU may not add sockets to its poll set until after
+                # guest opens virtio-serial ports, causing reads to return EOF.
+                # See: https://bugs.launchpad.net/qemu/+bug/1224444 (virtio-mmio socket race)
+                try:
+                    await vm.channel.connect(timeout_seconds=2)
+                    logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": vm.vm_id})
+                except (TimeoutError, OSError) as e:
+                    # Expected - sockets may not be ready yet, retry loop will handle
+                    logger.debug("Pre-connect to sockets deferred", extra={"vm_id": vm.vm_id, "reason": str(e)})
+
                 # Retry with exponential backoff + full jitter
                 async for attempt in AsyncRetrying(
                     retry=retry_if_exception_type(
