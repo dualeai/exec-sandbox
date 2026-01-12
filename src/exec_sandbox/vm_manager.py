@@ -23,7 +23,6 @@ import contextlib
 import ctypes
 import errno
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -53,12 +52,11 @@ from exec_sandbox.models import ExecutionResult, Language
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
 from exec_sandbox.resource_cleanup import (
     cleanup_cgroup,
-    cleanup_file,
-    cleanup_overlay,
     cleanup_process,
 )
 from exec_sandbox.settings import Settings
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
+from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 logger = get_logger(__name__)
 
@@ -603,9 +601,10 @@ class QemuVM:
         vm_id: Unique VM identifier format: {tenant_id}-{task_id}-{uuid4}
         process: QEMU subprocess handle
         cgroup_path: cgroup v2 path for resource limits
-        overlay_image: Ephemeral qcow2 overlay (deleted on destroy)
+        workdir: Working directory containing all VM temp files
+        overlay_image: Ephemeral qcow2 overlay (property, from workdir)
         gvproxy_proc: Optional gvproxy-wrapper process for DNS filtering
-        gvproxy_socket: Optional QEMU stream socket path
+        gvproxy_socket: Optional QEMU stream socket path (property, from workdir)
         gvproxy_log_task: Optional background task draining gvproxy stdout/stderr
     """
 
@@ -614,16 +613,13 @@ class QemuVM:
         vm_id: str,
         process: ProcessWrapper,
         cgroup_path: Path,
-        overlay_image: Path,
+        workdir: VmWorkingDirectory,
         channel: GuestChannel,
         language: str,
         gvproxy_proc: ProcessWrapper | None = None,
-        gvproxy_socket: Path | None = None,
-        qmp_socket_path: Path | None = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
         console_log: TextIO | None = None,
-        use_qemu_vm_user: bool = False,
     ):
         """Initialize VM handle.
 
@@ -631,30 +627,24 @@ class QemuVM:
             vm_id: Unique VM identifier (scoped by tenant_id)
             process: Running QEMU subprocess (ProcessWrapper for PID-reuse safety)
             cgroup_path: cgroup v2 path for cleanup
-            overlay_image: Ephemeral qcow2 overlay for cleanup
+            workdir: Working directory containing overlay, sockets, and logs
             channel: Communication channel for TCP guest agent
             language: Programming language for this VM
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
-            gvproxy_socket: Optional QEMU stream socket path
-            qmp_socket_path: Optional QMP (QEMU Monitor Protocol) socket path for memory snapshots
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
             console_log: Optional file handle for QEMU console log
-            use_qemu_vm_user: Whether QEMU ran as qemu-vm user (requires sudo rm for cleanup)
         """
         self.vm_id = vm_id
         self.process = process
         self.cgroup_path = cgroup_path
-        self.overlay_image = overlay_image
+        self.workdir = workdir
         self.channel = channel
         self.language = language
         self.gvproxy_proc = gvproxy_proc
-        self.gvproxy_socket = gvproxy_socket
-        self.qmp_socket_path = qmp_socket_path
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
         self.console_log: TextIO | None = console_log
-        self.use_qemu_vm_user = use_qemu_vm_user
         self._destroyed = False
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
@@ -682,6 +672,26 @@ class QemuVM:
     def boot_ms(self, value: int) -> None:
         """Set VM boot time in milliseconds."""
         self._boot_ms = value
+
+    @property
+    def overlay_image(self) -> Path:
+        """Path to overlay image (from workdir)."""
+        return self.workdir.overlay_image
+
+    @property
+    def qmp_socket_path(self) -> Path:
+        """Path to QMP socket (from workdir)."""
+        return self.workdir.qmp_socket
+
+    @property
+    def gvproxy_socket(self) -> Path | None:
+        """Path to gvproxy socket (from workdir, None if no network)."""
+        return self.workdir.gvproxy_socket if self.gvproxy_proc else None
+
+    @property
+    def use_qemu_vm_user(self) -> bool:
+        """Whether QEMU runs as qemu-vm user."""
+        return self.workdir.use_qemu_vm_user
 
     async def __aenter__(self) -> "QemuVM":
         """Enter async context manager.
@@ -1070,7 +1080,7 @@ class QemuVM:
         with contextlib.suppress(OSError, RuntimeError):
             await self.channel.close()
 
-        # Step 3-4: Parallel cleanup (cgroup + overlay)
+        # Step 3-4: Parallel cleanup (cgroup + workdir)
         # After QEMU terminates, cleanup tasks are independent
         async def cleanup_cgroup_fn():
             """Remove cgroup asynchronously."""
@@ -1094,28 +1104,11 @@ class QemuVM:
                 except (OSError, PermissionError):
                     pass
 
-        async def cleanup_overlay_fn():
-            """Delete overlay image asynchronously."""
-            if self.overlay_image.exists():
-                with contextlib.suppress(OSError, PermissionError):
-                    if self.use_qemu_vm_user:
-                        # Overlay was chowned to qemu-vm, need sudo to delete
-                        proc = await asyncio.create_subprocess_exec(
-                            "sudo",
-                            "rm",
-                            "-f",
-                            str(self.overlay_image),
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
-                        )
-                        await proc.wait()
-                    else:
-                        await aiofiles.os.remove(self.overlay_image)
-
         # Run cleanup tasks in parallel
+        # workdir.cleanup() removes overlay, sockets, and console log in one operation
         await asyncio.gather(
             cleanup_cgroup_fn(),
-            cleanup_overlay_fn(),
+            self.workdir.cleanup(),
             return_exceptions=True,
         )
 
@@ -1254,6 +1247,10 @@ class VmManager:
         # Step 1: Generate VM identifiers
         vm_id = f"{tenant_id}-{task_id}-{uuid4()}"
 
+        # Step 1.5: Create working directory for all VM temp files
+        # Uses tempfile.mkdtemp() for atomic, secure directory creation (mode 0700)
+        workdir = await VmWorkingDirectory.create(vm_id)
+
         # Domain whitelist semantics:
         # - None or [] = no filtering (full internet access)
         # - list with domains = whitelist filtering via gvproxy
@@ -1275,16 +1272,15 @@ class VmManager:
 
         # Step 3-5: Parallel resource setup (overlay + cgroup + gvproxy)
         # These operations are independent and can run concurrently
-        overlay_image = Path(f"/tmp/qemu-{vm_id}.qcow2")  # noqa: S108
-        base_image = snapshot_path or self.get_base_image(language)
+        # Resolve to absolute path - qemu-img resolves backing file relative to overlay location,
+        # and VmWorkingDirectory places overlay in a temp dir, so relative paths would break
+        base_image = (snapshot_path or self.get_base_image(language)).resolve()
 
         # Initialize ALL tracking variables before try block for finally cleanup
         cgroup_path: Path | None = None
         gvproxy_proc: ProcessWrapper | None = None
-        gvproxy_socket: Path | None = None
         gvproxy_log_task: asyncio.Task[None] | None = None
         qemu_proc: ProcessWrapper | None = None
-        use_qemu_vm_user = False  # Set by _create_overlay if qemu-vm user available
         vm_created = False  # Flag to skip cleanup if VM successfully created
 
         # IMPORTANT: Always use gvproxy for network-enabled VMs
@@ -1314,9 +1310,9 @@ class VmManager:
                 )
                 # Run all tasks in parallel including gvproxy
                 overlay_result, cgroup_result, gvproxy_result = await asyncio.gather(
-                    self._create_overlay(base_image, overlay_image),
+                    self._create_overlay(base_image, workdir.overlay_image),
                     self._setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
-                    self._start_gvproxy(vm_id, allowed_domains, language),
+                    self._start_gvproxy(vm_id, allowed_domains, language, workdir),
                     return_exceptions=True,
                 )
                 setup_complete_time = asyncio.get_event_loop().time()
@@ -1331,14 +1327,14 @@ class VmManager:
 
                 # Type narrowing: after BaseException checks
                 cgroup_path = cgroup_result
-                use_qemu_vm_user = overlay_result  # bool from _create_overlay
+                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
                 # Unpack tuple from _start_gvproxy
-                gvproxy_proc, gvproxy_socket, gvproxy_log_task = gvproxy_result
+                gvproxy_proc, gvproxy_log_task = gvproxy_result
             else:
                 # Run overlay and cgroup setup in parallel (no gvproxy)
                 overlay_result, cgroup_result = await asyncio.gather(
-                    self._create_overlay(base_image, overlay_image),
+                    self._create_overlay(base_image, workdir.overlay_image),
                     self._setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     return_exceptions=True,
                 )
@@ -1352,28 +1348,26 @@ class VmManager:
 
                 # Type narrowing: after BaseException checks
                 cgroup_path = cgroup_result
-                use_qemu_vm_user = overlay_result  # bool from _create_overlay
+                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
             # Step 5: Build QEMU command (always Linux in container)
             qemu_cmd = await self._build_linux_cmd(
                 language,
                 vm_id,
-                overlay_image,
+                workdir,
                 memory_mb,
                 allow_network,
                 enable_dns_filtering,
-                gvproxy_socket,
-                use_qemu_vm_user=use_qemu_vm_user,
             )
 
             # Step 6: Create dual-port Unix socket communication channel for guest agent
-            cmd_socket = self._get_cmd_socket_path(vm_id)
-            event_socket = self._get_event_socket_path(vm_id)
-            qmp_socket_path = self._get_qmp_socket_path(vm_id)
+            # Socket paths are now in workdir (shorter, under 108-byte Unix socket limit)
+            cmd_socket = workdir.cmd_socket
+            event_socket = workdir.event_socket
 
             # Clean up any stale socket files before QEMU creates new ones
             # This ensures QEMU gets a clean state for chardev sockets
-            for socket_path in [cmd_socket, event_socket, qmp_socket_path]:
+            for socket_path in [cmd_socket, event_socket, str(workdir.qmp_socket)]:
                 with contextlib.suppress(OSError):
                     await aiofiles.os.remove(socket_path)
 
@@ -1440,8 +1434,8 @@ class VmManager:
 
                 # Background task to drain QEMU output (prevent 64KB pipe deadlock)
                 # Started AFTER crash check to ensure we can capture error output
-                console_log_path = Path(f"/tmp/vm-{vm_id}-console.log")  # noqa: S108
-                console_log = console_log_path.open("w", buffering=1)  # noqa: ASYNC230 - Line buffering for sync writes
+                console_log_path = workdir.console_log
+                console_log = console_log_path.open("w", buffering=1)  # Line buffering for sync writes
 
                 def write_to_console(line: str) -> None:
                     """Write line to console log file and structured logs."""
@@ -1476,16 +1470,13 @@ class VmManager:
                 vm_id,
                 qemu_proc,
                 cgroup_path,
-                overlay_image,
+                workdir,
                 channel,
                 language,
                 gvproxy_proc,
-                gvproxy_socket,
-                qmp_socket_path,
                 qemu_log_task,
                 gvproxy_log_task,
                 console_log,
-                use_qemu_vm_user,
             )
 
             # Step 8a: Register VM in registry (before BOOTING to ensure tracking)
@@ -1533,7 +1524,7 @@ class VmManager:
                         "qemu_running": qemu_proc.returncode is None,
                         "qemu_returncode": qemu_proc.returncode,
                         "qemu_cmd": qemu_cmd_str[:1000],
-                        "overlay_image": str(overlay_image) if overlay_image else "(none)",
+                        "overlay_image": str(workdir.overlay_image),
                         "kernel_path": str(kernel_path),
                         "initramfs_path": str(initramfs_path),
                     },
@@ -1571,7 +1562,7 @@ class VmManager:
                         "qemu_cmd": qemu_cmd_str[:1000],
                         "kernel_path": str(kernel_path),
                         "initramfs_path": str(initramfs_path),
-                        "overlay_image": str(overlay_image) if overlay_image else None,
+                        "overlay_image": str(workdir.overlay_image),
                     },
                 ) from e
 
@@ -1611,10 +1602,8 @@ class VmManager:
                     vm_id=vm_id,
                     qemu_proc=qemu_proc,
                     gvproxy_proc=gvproxy_proc,
-                    gvproxy_socket=gvproxy_socket,
-                    overlay_image=overlay_image,
+                    workdir=workdir,
                     cgroup_path=cgroup_path,
-                    use_qemu_vm_user=use_qemu_vm_user,
                 )
 
     async def _start_gvproxy(
@@ -1622,7 +1611,8 @@ class VmManager:
         vm_id: str,
         allowed_domains: list[str] | None,
         language: str,
-    ) -> tuple[ProcessWrapper, Path, asyncio.Task[None]]:
+        workdir: VmWorkingDirectory,
+    ) -> tuple[ProcessWrapper, asyncio.Task[None]]:
         r"""Start gvproxy-wrapper with DNS filtering for this VM.
 
         Architecture Decision: gvisor-tap-vsock over alternatives
@@ -1639,14 +1629,15 @@ class VmManager:
             vm_id: Unique VM identifier
             allowed_domains: Whitelist of allowed domains
             language: Programming language (for default registries)
+            workdir: VM working directory containing socket paths
 
         Returns:
-            Tuple of (gvproxy_process, socket_path, gvproxy_log_task)
+            Tuple of (gvproxy_process, gvproxy_log_task)
 
         Raises:
             VmError: Failed to start gvproxy-wrapper
         """
-        socket_path = self._get_socket_path(vm_id, prefix="gvproxy")
+        socket_path = workdir.gvproxy_socket
 
         # Generate DNS zones JSON configuration
         dns_zones_json = generate_dns_zones_json(allowed_domains, language)
@@ -1741,45 +1732,39 @@ class VmManager:
             },
         )
 
-        return proc, socket_path, gvproxy_log_task
+        return proc, gvproxy_log_task
 
     async def _force_cleanup_all_resources(
         self,
         vm_id: str,
         qemu_proc: ProcessWrapper | None = None,
         gvproxy_proc: ProcessWrapper | None = None,
-        gvproxy_socket: Path | None = None,
-        overlay_image: Path | None = None,
+        workdir: VmWorkingDirectory | None = None,
         cgroup_path: Path | None = None,
-        use_qemu_vm_user: bool = False,
     ) -> dict[str, bool]:
         """Comprehensive cleanup of ALL VM resources in reverse dependency order.
 
         This is the MAIN cleanup method used in finally blocks.
 
         Best practices:
-        - Cleans in reverse dependency order (processes → files → directories)
+        - Cleans in reverse dependency order (processes → workdir → cgroup)
         - NEVER raises exceptions (logs errors instead)
         - Safe to call multiple times (idempotent)
         - Handles None/already-cleaned resources
         - Returns status dict for monitoring/debugging
-        - Uses standardized generic cleanup functions
 
         Cleanup order (reverse dependencies):
-        1. QEMU process (depends on: overlay, cgroup, networking)
+        1. QEMU process (depends on: workdir files, cgroup, networking)
         2. gvproxy process (QEMU networking dependency)
-        3. gvproxy socket (gvproxy dependency)
-        4. Overlay file (QEMU disk dependency)
-        5. Cgroup directory (QEMU process was in it)
+        3. Working directory (contains overlay, sockets, logs - single rmtree)
+        4. Cgroup directory (QEMU process was in it)
 
         Args:
             vm_id: VM identifier for logging
             qemu_proc: QEMU subprocess (can be None)
             gvproxy_proc: gvproxy subprocess (can be None)
-            gvproxy_socket: gvproxy socket path (can be None)
-            overlay_image: qcow2 overlay path (can be None)
+            workdir: VM working directory containing all temp files (can be None)
             cgroup_path: cgroup directory path (can be None)
-            use_qemu_vm_user: Whether QEMU ran as qemu-vm user (requires sudo rm for overlay)
 
         Returns:
             Dictionary with cleanup status for each resource
@@ -1808,27 +1793,23 @@ class VmManager:
         results["qemu"] = process_results[0] if isinstance(process_results[0], bool) else False
         results["gvproxy"] = process_results[1] if isinstance(process_results[1], bool) else False
 
-        # Phase 2: Cleanup files in parallel (after processes dead)
+        # Phase 2: Cleanup workdir and cgroup in parallel (after processes dead)
+        # workdir.cleanup() removes overlay, sockets, and console log in one operation
+        async def cleanup_workdir() -> bool:
+            if workdir is None:
+                return True
+            return await workdir.cleanup()
+
         file_results = await asyncio.gather(
-            cleanup_file(
-                file_path=gvproxy_socket,
-                context_id=vm_id,
-                description="gvproxy socket",
-            ),
-            cleanup_overlay(
-                overlay_path=overlay_image,
-                context_id=vm_id,
-                use_qemu_vm_user=use_qemu_vm_user,
-            ),
+            cleanup_workdir(),
             cleanup_cgroup(
                 cgroup_path=cgroup_path,
                 context_id=vm_id,
             ),
             return_exceptions=True,
         )
-        results["socket"] = file_results[0] if isinstance(file_results[0], bool) else False
-        results["overlay"] = file_results[1] if isinstance(file_results[1], bool) else False
-        results["cgroup"] = file_results[2] if isinstance(file_results[2], bool) else False
+        results["workdir"] = file_results[0] if isinstance(file_results[0], bool) else False
+        results["cgroup"] = file_results[1] if isinstance(file_results[1], bool) else False
 
         # Log summary
         success_count = sum(results.values())
@@ -1882,10 +1863,8 @@ class VmManager:
                 vm_id=vm.vm_id,
                 qemu_proc=vm.process,
                 gvproxy_proc=vm.gvproxy_proc,
-                gvproxy_socket=vm.gvproxy_socket,
-                overlay_image=vm.overlay_image,
+                workdir=vm.workdir,
                 cgroup_path=vm.cgroup_path,
-                use_qemu_vm_user=vm.use_qemu_vm_user,
             )
         finally:
             # ALWAYS remove from registry, even on failure
@@ -1908,56 +1887,6 @@ class VmManager:
             except TimeoutError:
                 pass
         return "", ""
-
-    def _get_socket_path(self, vm_id: str, prefix: str = "qemu-serial") -> Path:
-        """Generate short socket path from VM ID using full SHA-256 hash.
-
-        UNIX domain sockets have 108-byte path limit.
-
-        Args:
-            vm_id: Unique VM identifier
-            prefix: Socket file prefix (default: qemu-serial)
-
-        Returns:
-            Path to socket file with hashed vm_id
-        """
-        hash_hex = hashlib.sha256(vm_id.encode()).hexdigest()
-        return Path(f"/tmp/{prefix}-{hash_hex}.sock")  # noqa: S108
-
-    def _get_cmd_socket_path(self, vm_id: str) -> str:
-        """Get path to virtio-serial Unix socket for command channel (host → guest).
-
-        Args:
-            vm_id: Unique VM identifier
-
-        Returns:
-            /tmp/cmd-{hash}.sock
-        """
-        return str(self._get_socket_path(vm_id, prefix="cmd"))
-
-    def _get_event_socket_path(self, vm_id: str) -> str:
-        """Get path to virtio-serial Unix socket for event channel (guest → host).
-
-        Args:
-            vm_id: Unique VM identifier
-
-        Returns:
-            /tmp/event-{hash}.sock
-        """
-        return str(self._get_socket_path(vm_id, prefix="event"))
-
-    def _get_qmp_socket_path(self, vm_id: str) -> Path:
-        """Get path to QMP (QEMU Monitor Protocol) Unix socket.
-
-        Used for memory snapshot operations (savevm/loadvm).
-
-        Args:
-            vm_id: Unique VM identifier
-
-        Returns:
-            /tmp/qmp-{hash}.sock
-        """
-        return self._get_socket_path(vm_id, prefix="qmp")
 
     def get_base_image(self, language: str) -> Path:
         """Get base image path for language via auto-discovery.
@@ -2114,6 +2043,22 @@ class VmManager:
             )
             await chown_proc.communicate()
             if chown_proc.returncode == 0:
+                # Make workdir accessible to qemu-vm for socket creation
+                # mkdtemp creates with mode 0700, but qemu-vm needs access to create sockets
+                workdir_path = overlay_image.parent
+                chmod_workdir_proc = ProcessWrapper(
+                    await asyncio.create_subprocess_exec(
+                        "chmod",
+                        "a+rwx",
+                        str(workdir_path),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                )
+                await chmod_workdir_proc.communicate()
+                if chmod_workdir_proc.returncode != 0:
+                    logger.debug("Could not chmod workdir for qemu-vm access")
                 return True  # Overlay chowned to qemu-vm, QEMU should run as qemu-vm
             logger.debug("Could not chown overlay to qemu-vm user (optional hardening)")
             return False  # Chown failed, QEMU should run as current user
@@ -2242,26 +2187,22 @@ class VmManager:
         self,
         language: str,  # noqa: ARG002
         vm_id: str,
-        overlay_image: Path,
+        workdir: VmWorkingDirectory,
         memory_mb: int,
         allow_network: bool,
         enable_dns_filtering: bool = False,  # noqa: ARG002
-        gvproxy_socket: Path | None = None,
         loadvm_snapshot: str | None = None,
-        use_qemu_vm_user: bool = False,
     ) -> list[str]:
         """Build QEMU command for Linux (KVM + unshare + namespaces).
 
         Args:
             language: Programming language
             vm_id: Unique VM identifier
-            overlay_image: Ephemeral qcow2 overlay
+            workdir: VM working directory containing overlay and socket paths
             memory_mb: Guest VM memory in MB
             allow_network: Enable network access
             enable_dns_filtering: Enable DNS filtering via gvisor-tap-vsock
-            gvproxy_socket: QEMU stream socket path for gvproxy connection
             loadvm_snapshot: Optional snapshot name to restore from (for fast VM boot)
-            use_qemu_vm_user: Run QEMU as qemu-vm user (optional hardening)
 
         Returns:
             QEMU command as list of strings
@@ -2491,7 +2432,13 @@ class VmManager:
                 # For hardware accel use host CPU, for TCG use optimized emulated CPUs
                 # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
                 # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
-                ("host" if accel_type in (AccelType.HVF, AccelType.KVM) else "cortex-a57" if self.arch == HostArch.AARCH64 else "qemu64"),
+                (
+                    "host"
+                    if accel_type in (AccelType.HVF, AccelType.KVM)
+                    else "cortex-a57"
+                    if self.arch == HostArch.AARCH64
+                    else "qemu64"
+                ),
                 "-M",
                 machine_type,
                 "-no-reboot",
@@ -2546,7 +2493,7 @@ class VmManager:
         qemu_args.extend(
             [
                 "-drive",
-                f"file={overlay_image},"
+                f"file={workdir.overlay_image},"
                 f"format=qcow2,"
                 f"if=none,"
                 f"id=hd0,"
@@ -2600,8 +2547,6 @@ class VmManager:
         # With microvm + -nodefaults, we must explicitly configure:
         # 1. virtconsole for kernel console=hvc0 (required for boot output)
         # 2. virtserialport for guest agent cmd/event channels
-        cmd_socket_path = self._get_cmd_socket_path(vm_id)
-        event_socket_path = self._get_event_socket_path(vm_id)
         qemu_args.extend(
             [
                 # Chardevs for communication channels
@@ -2610,9 +2555,9 @@ class VmManager:
                 # Note: Socket permissions (via umask 000) are the key fix for Linux,
                 # NOT wait=on. The guest agent retries connection so timing is handled.
                 "-chardev",
-                f"socket,id=cmd0,path={cmd_socket_path},server=on,wait=off",
+                f"socket,id=cmd0,path={workdir.cmd_socket},server=on,wait=off",
                 "-chardev",
-                f"socket,id=event0,path={event_socket_path},server=on,wait=off",
+                f"socket,id=event0,path={workdir.event_socket},server=on,wait=off",
                 # Chardev for console output - connected to virtconsole (hvc0)
                 "-chardev",
                 "stdio,id=virtiocon0,mux=on,signal=off",
@@ -2700,12 +2645,10 @@ class VmManager:
 
         # virtio-net configuration (optional, internet access only)
         if allow_network:
-            if not gvproxy_socket:
-                raise RuntimeError(f"gvproxy socket required for network-enabled VM but not provided (vm_id={vm_id})")
             qemu_args.extend(
                 [
                     "-netdev",
-                    f"stream,id=net0,addr.type=unix,addr.path={gvproxy_socket}",
+                    f"stream,id=net0,addr.type=unix,addr.path={workdir.gvproxy_socket}",
                     "-device",
                     f"virtio-net-{virtio_suffix},netdev=net0,mq=off,csum=off,gso=off,host_tso4=off,host_tso6=off,mrg_rxbuf=off,ctrl_rx=off,guest_announce=off",
                 ]
@@ -2713,11 +2656,10 @@ class VmManager:
 
         # QMP (QEMU Monitor Protocol) socket for memory snapshot operations
         # Used for savevm/loadvm commands to create/restore memory snapshots
-        qmp_socket_path = self._get_qmp_socket_path(vm_id)
         qemu_args.extend(
             [
                 "-qmp",
-                f"unix:{qmp_socket_path},server=on,wait=off",
+                f"unix:{workdir.qmp_socket},server=on,wait=off",
             ]
         )
 
@@ -2728,7 +2670,7 @@ class VmManager:
 
         # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
         # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
-        if use_qemu_vm_user:
+        if workdir.use_qemu_vm_user:
             # stdbuf -oL forces line-buffered stdout to ensure console output is captured
             # immediately rather than being block-buffered (which happens with piped stdout)
             # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security
@@ -2784,8 +2726,7 @@ class VmManager:
                 signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"signal {sig}"
 
             # Read console log (last N bytes for debugging)
-            console_log_path = f"/tmp/vm-{vm.vm_id}-console.log"  # noqa: S108
-            console_output = await read_log_tail(console_log_path, constants.CONSOLE_LOG_MAX_BYTES)
+            console_output = await read_log_tail(str(vm.workdir.console_log), constants.CONSOLE_LOG_MAX_BYTES)
 
             logger.error(
                 "QEMU process exited unexpectedly",
@@ -2883,8 +2824,7 @@ class VmManager:
                 with contextlib.suppress(OSError):
                     vm.console_log.flush()
 
-            console_log_path = f"/tmp/vm-{vm.vm_id}-console.log"  # noqa: S108
-            console_output = await read_log_tail(console_log_path, constants.CONSOLE_LOG_MAX_BYTES)
+            console_output = await read_log_tail(str(vm.workdir.console_log), constants.CONSOLE_LOG_MAX_BYTES)
 
             logger.error(
                 "Guest agent timeout",

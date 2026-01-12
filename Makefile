@@ -70,9 +70,13 @@ test-static:
 	$(MAKE) --directory guest-agent test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
-# All tests together for accurate coverage measurement
+# All tests together for accurate coverage measurement (excludes sudo tests)
 test-func:
-	uv run pytest tests/ -v -n auto
+	uv run pytest tests/ -v -n auto -m "not sudo"
+
+# Tests requiring sudo privileges (run separately with elevated permissions)
+test-sudo:
+	uv run pytest tests/ -v -n auto -m "sudo"
 
 # Unit tests only (fast)
 test-unit:

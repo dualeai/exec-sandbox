@@ -91,6 +91,9 @@ addopts = [
     "-n", "auto",  # pytest-xdist: parallel execution using all CPU cores
     "--dist", "loadfile",  # Keep tests in same file together (shared fixtures)
 ]
+markers = [
+    "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
+]
 
 [tool.pyright]
 pythonVersion = "3.12"

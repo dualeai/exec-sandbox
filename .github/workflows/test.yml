@@ -372,6 +372,12 @@ jobs:
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
           make test-func
 
+      - name: Sudo tests (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          sudo env "PATH=$PATH" make test-sudo
+
       - name: Functional tests (macOS)
         if: matrix.platform.os == 'macos'
         run: make test-func
