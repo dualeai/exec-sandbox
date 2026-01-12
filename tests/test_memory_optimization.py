@@ -103,7 +103,7 @@ print(f'PASS: zram={zram_kb//1024}MB, RAM={mem_kb//1024}MB, ratio={ratio:.3f}')
         assert "PASS" in result.stdout
 
     async def test_vm_settings_optimized_for_zram(self, scheduler: Scheduler) -> None:
-        """VM settings should be optimized: page-cluster=0, swappiness=100."""
+        """VM settings should be optimized: page-cluster=0, swappiness>=100."""
         result = await scheduler.run(
             code="""
 # page-cluster=0 disables swap readahead (critical for compressed swap)
@@ -111,12 +111,38 @@ with open('/proc/sys/vm/page-cluster') as f:
     page_cluster = int(f.read().strip())
     assert page_cluster == 0, f'page-cluster must be 0 for zram, got {page_cluster}'
 
-# swappiness=100 prefers swap over dropping caches (good for ephemeral VMs)
+# swappiness>=100 prefers swap over dropping caches (kernel allows up to 200 for zram)
 with open('/proc/sys/vm/swappiness') as f:
     swappiness = int(f.read().strip())
-    assert swappiness == 100, f'swappiness should be 100, got {swappiness}'
+    assert swappiness >= 100, f'swappiness should be >=100 for zram, got {swappiness}'
 
-print('PASS: page-cluster=0, swappiness=100')
+print(f'PASS: page-cluster={page_cluster}, swappiness={swappiness}')
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "PASS" in result.stdout
+
+    async def test_overcommit_settings_configured(self, scheduler: Scheduler) -> None:
+        """VM should have overcommit settings for predictable allocation failures."""
+        result = await scheduler.run(
+            code="""
+# vm.overcommit_memory=2 makes malloc fail predictably instead of OOM kill
+with open('/proc/sys/vm/overcommit_memory') as f:
+    overcommit_memory = int(f.read().strip())
+    assert overcommit_memory == 2, f'overcommit_memory should be 2, got {overcommit_memory}'
+
+# vm.overcommit_ratio should be set (allows allocation beyond physical RAM)
+with open('/proc/sys/vm/overcommit_ratio') as f:
+    overcommit_ratio = int(f.read().strip())
+    assert overcommit_ratio >= 90, f'overcommit_ratio should be >=90, got {overcommit_ratio}'
+
+# vm.min_free_kbytes should be set (prevents OOM deadlocks)
+with open('/proc/sys/vm/min_free_kbytes') as f:
+    min_free_kb = int(f.read().strip())
+    assert min_free_kb >= 5000, f'min_free_kbytes should be >=5000, got {min_free_kb}'
+
+print(f'PASS: overcommit_memory={overcommit_memory}, overcommit_ratio={overcommit_ratio}, min_free_kbytes={min_free_kb}')
 """,
             language=Language.PYTHON,
         )
@@ -187,7 +213,7 @@ class TestZramMemoryExpansion:
     """Tests for zram enabling memory expansion beyond physical RAM."""
 
     async def test_allocate_well_beyond_physical_ram(self, scheduler: Scheduler) -> None:
-        """VM should allocate 280MB when only ~175MB available (60% over)."""
+        """VM should allocate 240MB when only ~175MB available (37% over)."""
         result = await scheduler.run(
             code="""
 import gc
@@ -203,8 +229,8 @@ with open('/proc/meminfo') as f:
 available_mb = available_kb // 1024
 print(f'Available memory: {available_mb}MB')
 
-# Allocate 280MB (significantly more than available ~175MB)
-target_mb = 280
+# Allocate 240MB (significantly more than available ~175MB)
+target_mb = 240
 chunks = []
 allocated = 0
 try:

@@ -71,7 +71,15 @@ if [ -e /sys/block/zram0 ]; then
 
     # Optimize VM settings for compressed swap
     echo 0 > /proc/sys/vm/page-cluster 2>/dev/null || true    # Disable readahead
-    echo 100 > /proc/sys/vm/swappiness 2>/dev/null || true    # Prefer swap over cache
+    echo 180 > /proc/sys/vm/swappiness 2>/dev/null || true    # Aggressive swap for zram (kernel allows up to 200)
+
+    # Reserve 4% of RAM for kernel critical tasks (prevents OOM deadlocks during swap I/O)
+    MIN_FREE_KB=$((MEM_KB * 4 / 100))
+    echo "$MIN_FREE_KB" > /proc/sys/vm/min_free_kbytes 2>/dev/null || true
+
+    # Strict overcommit: malloc fails predictably instead of OOM kill
+    echo 2 > /proc/sys/vm/overcommit_memory 2>/dev/null || true
+    echo 95 > /proc/sys/vm/overcommit_ratio 2>/dev/null || true  # Allow 95% of RAM + swap
 fi
 
 # Wait for virtio block device with exponential backoff (5+10+20+40+80=155ms max)
