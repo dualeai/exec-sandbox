@@ -133,6 +133,14 @@ class VmState(Enum):
     DESTROYED = "destroyed"
 
 
+class AccelType(Enum):
+    """QEMU acceleration type."""
+
+    KVM = "kvm"  # Linux hardware virtualization
+    HVF = "hvf"  # macOS hardware virtualization
+    TCG = "tcg"  # Software emulation (slow, but works everywhere)
+
+
 # Valid state transitions for VM lifecycle
 VALID_STATE_TRANSITIONS: dict[VmState, set[VmState]] = {
     VmState.CREATING: {VmState.BOOTING, VmState.DESTROYING},
@@ -1985,6 +1993,25 @@ class VmManager:
         # Return first match (sorted for determinism)
         return sorted(matches)[0]
 
+    async def _detect_accel_type(self) -> AccelType:
+        """Detect which QEMU accelerator to use.
+
+        This is the single source of truth for virtualization mode detection.
+        Used for both cgroup memory sizing (TCG needs more) and QEMU command building.
+
+        Returns:
+            AccelType.KVM if Linux KVM available
+            AccelType.HVF if macOS HVF available
+            AccelType.TCG if software emulation needed (or force_emulation=True)
+        """
+        if self.settings.force_emulation:
+            return AccelType.TCG
+        if _check_kvm_available():
+            return AccelType.KVM
+        if detect_host_os() == HostOS.MACOS and await _check_hvf_available():
+            return AccelType.HVF
+        return AccelType.TCG
+
     async def _create_overlay(self, base_image: Path, overlay_image: Path) -> bool:
         """Create ephemeral qcow2 overlay with CoW backing file.
 
@@ -2225,37 +2252,23 @@ class VmManager:
         # Determine QEMU binary, machine type, and kernel based on architecture
         is_macos = detect_host_os() == HostOS.MACOS
 
-        # Detect hardware acceleration availability first (affects machine type selection)
-        # force_emulation bypasses KVM/HVF for testing emulation code paths
-        if self.settings.force_emulation:
-            use_kvm = False
-            use_hvf = False
-            logger.info(
-                "Hardware acceleration disabled (force_emulation=True)",
-                extra={"vm_id": vm_id, "is_macos": is_macos},
-            )
-        else:
-            use_kvm = _check_kvm_available()
-            use_hvf = is_macos and await _check_hvf_available()
-            logger.info(
-                "Hardware acceleration detection",
-                extra={"vm_id": vm_id, "use_kvm": use_kvm, "use_hvf": use_hvf, "is_macos": is_macos},
-            )
+        # Detect hardware acceleration type (centralized in _detect_accel_type)
+        accel_type = await self._detect_accel_type()
+        logger.info(
+            "Hardware acceleration detection",
+            extra={"vm_id": vm_id, "accel_type": accel_type.value, "is_macos": is_macos},
+        )
 
-        if use_hvf:
+        # Build accelerator string for QEMU
+        if accel_type == AccelType.HVF:
             accel = "hvf"
-        elif use_kvm:
+        elif accel_type == AccelType.KVM:
             accel = "kvm"
         else:
             # TCG software emulation fallback (12x slower than KVM/HVF)
             # MTTCG is enabled by default for supported configs, no need to force it
             # tb-size=512 increases translation block cache for better code caching
             accel = "tcg,tb-size=512"
-            if is_macos:
-                logger.info(
-                    "HVF not available on macOS, falling back to TCG emulation",
-                    extra={"vm_id": vm_id},
-                )
 
         # Track whether to use virtio-console (hvc0) or ISA serial (ttyS0)
         # Determined per-architecture below
@@ -2287,7 +2300,7 @@ class VmManager:
             # With ACPI enabled (default), microvm uses SeaBIOS which has issues with direct kernel boot
             # on QEMU 8.2. With acpi=off, it uses qboot which is specifically designed for direct kernel boot.
             # See: https://www.kraxel.org/blog/2020/10/qemu-microvm-acpi/
-            if accel == "kvm":
+            if accel_type == AccelType.KVM:
                 # =============================================================
                 # Console Device Timing: ISA Serial vs Virtio-Console
                 # =============================================================
@@ -2358,7 +2371,7 @@ class VmManager:
                     )
                     machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
                     use_virtio_console = True
-            elif accel == "hvf":
+            elif accel_type == AccelType.HVF:
                 # macOS with HVF uses microvm in non-legacy mode
                 # HVF always has TSC_DEADLINE equivalent, can disable pit/pic
                 machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
@@ -2461,7 +2474,7 @@ class VmManager:
                 # For hardware accel use host CPU, for TCG use optimized emulated CPUs
                 # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
                 # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
-                ("host" if accel in ("hvf", "kvm") else "cortex-a57" if self.arch == HostArch.AARCH64 else "qemu64"),
+                ("host" if accel_type in (AccelType.HVF, AccelType.KVM) else "cortex-a57" if self.arch == HostArch.AARCH64 else "qemu64"),
                 "-M",
                 machine_type,
                 "-no-reboot",
