@@ -1,6 +1,6 @@
 # exec-sandbox
 
-Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 6-layer security isolation.
+Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 7-layer security isolation.
 
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
@@ -261,6 +261,7 @@ Memory reclamation (balloon) shrinks to 64MB minimum, so larger VMs see bigger s
 | `VmTimeoutError` | Execution exceeded timeout |
 | `VmBootError` | VM failed to start |
 | `CommunicationError` | VM communication failed |
+| `SocketAuthError` | Socket peer authentication failed |
 | `GuestAgentError` | VM helper process returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
@@ -326,6 +327,7 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 | 4 | Resource limits (cgroups v2) | Memory, CPU, process limits |
 | 5 | Process isolation (namespaces) | Separate process, network, filesystem views |
 | 6 | Security policies (AppArmor/SELinux) | When available |
+| 7 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
 
 **Guarantees:**
 
