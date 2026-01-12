@@ -357,16 +357,62 @@ Without hardware acceleration, QEMU uses software emulation (TCG), which is 10-5
 
 Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/releases):
 
-| Image | Contents | Size |
-|-------|----------|------|
-| python-3.14-base | Alpine Linux + Python 3.14 + uv + VM helper | ~512MB |
-| node-23-base | Alpine Linux + Node.js 23 + bun + VM helper | ~512MB |
+| Image | Runtime | Package Manager | Size | Description |
+|-------|---------|-----------------|------|-------------|
+| `python-3.14-base` | Python 3.14 | uv | ~140MB | Full Python environment with C extension support |
+| `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
+| `raw-base` | None | None | ~15MB | Shell scripts and custom runtimes |
+
+All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and include common tools for AI agent workflows.
+
+### Common Tools (all images)
+
+| Tool | Purpose |
+|------|---------|
+| `git` | Version control, clone repositories |
+| `curl` | HTTP requests, download files |
+| `jq` | JSON processing |
+| `bash` | Shell scripting |
+| `coreutils` | Standard Unix utilities (ls, cp, mv, etc.) |
+| `tar`, `gzip`, `unzip` | Archive extraction |
+| `file` | File type detection |
+
+### Python Image
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| Python | 3.14 | [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (musl) |
+| uv | 0.9+ | 10-100x faster than pip ([docs](https://docs.astral.sh/uv/)) |
+| gcc, musl-dev | Alpine | For C extensions (numpy, pandas, etc.) |
+
+**Usage notes:**
+- Use `uv pip install` instead of `pip install` (pip not included)
+- Python 3.14 includes t-strings, deferred annotations, free-threading support
+
+### JavaScript Image
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| Bun | 1.3 | Runtime, bundler, package manager ([docs](https://bun.com/docs)) |
+
+**Usage notes:**
+- Bun is a Node.js-compatible runtime (not Node.js itself)
+- Built-in TypeScript/JSX support, no transpilation needed
+- Use `bun install` for packages, `bun run` for scripts
+- Near-complete Node.js API compatibility
+
+### Raw Image
+
+Minimal Alpine Linux with common tools only. Use for:
+- Shell script execution (`language="raw"`)
+- Custom runtime installation
+- Lightweight workloads
 
 Build from source:
 
 ```bash
 ./scripts/build-images.sh
-# Output: ./images/.dist/python-3.14-base.qcow2, ./images/.dist/node-23-base.qcow2 (QEMU disk images)
+# Output: ./images/dist/python-3.14-base.qcow2, ./images/dist/node-1.3-base.qcow2, ./images/dist/raw-base.qcow2
 ```
 
 ## Security
