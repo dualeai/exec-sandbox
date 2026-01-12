@@ -57,7 +57,7 @@ from exec_sandbox.resource_cleanup import (
     cleanup_process,
 )
 from exec_sandbox.settings import Settings
-from exec_sandbox.subprocess_utils import drain_subprocess_output
+from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
 
 logger = get_logger(__name__)
 
@@ -1033,26 +1033,69 @@ class VmManager:
                 # Capture QEMU output for debugging
                 stdout_text, stderr_text = await self._capture_qemu_output(qemu_proc)
 
+                # Flush console log before reading to ensure all buffered content is written
+                if console_log:
+                    with contextlib.suppress(OSError):
+                        console_log.flush()
+
+                # Read console log (last N bytes for debugging)
+                console_output = await read_log_tail(str(console_log_path), constants.CONSOLE_LOG_MAX_BYTES)
+
+                # Build command string for debugging
+                import shlex  # noqa: PLC0415
+
+                qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
+
                 # Log output if available
-                if stderr_text or stdout_text:
-                    logger.error(
-                        "QEMU output captured",
-                        extra={
-                            "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES],
-                            "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES],
-                        },
-                    )
-                else:
-                    logger.error("QEMU process still running but guest agent not responding")
+                logger.error(
+                    "Guest agent boot timeout",
+                    extra={
+                        "vm_id": vm_id,
+                        "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
+                        "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
+                        "console_log": console_output,
+                        "qemu_running": qemu_proc.returncode is None,
+                        "qemu_returncode": qemu_proc.returncode,
+                        "qemu_cmd": qemu_cmd_str[:1000],
+                        "overlay_image": str(overlay_image) if overlay_image else "(none)",
+                        "kernel_path": str(kernel_path),
+                        "initramfs_path": str(initramfs_path),
+                    },
+                )
 
                 await vm.destroy()
 
+                # Get QEMU binary from command - handle ulimit wrapper case
+                # When wrapped with sh -c, qemu_cmd is ["sh", "-c", "ulimit ... && exec qemu-system-..."]
+                qemu_binary = "(unknown)"
+                if qemu_cmd:
+                    if qemu_cmd[0] == "sh" and len(qemu_cmd) > 2:  # noqa: PLR2004
+                        # Extract actual QEMU binary from shell command string
+                        import re  # noqa: PLC0415
+
+                        shell_cmd_str = qemu_cmd[2]
+                        qemu_match = re.search(r"(qemu-system-[^\s]+)", shell_cmd_str)
+                        qemu_binary = qemu_match.group(1) if qemu_match else f"sh -c '{shell_cmd_str[:100]}...'"
+                    else:
+                        qemu_binary = qemu_cmd[0]
+
                 raise VmError(
-                    f"Guest agent not ready after {constants.VM_BOOT_TIMEOUT_SECONDS}s: {e}. stderr: {stderr_text[:200] if stderr_text else 'none'}",
+                    f"Guest agent not ready after {constants.VM_BOOT_TIMEOUT_SECONDS}s: {e}. "
+                    f"qemu_binary={qemu_binary}, qemu_running={qemu_proc.returncode is None}, "
+                    f"returncode={qemu_proc.returncode}, "
+                    f"stderr: {stderr_text[:200] if stderr_text else '(empty)'}, "
+                    f"console: {console_output[-constants.CONSOLE_LOG_PREVIEW_BYTES :] if console_output else '(empty)'}",
                     context={
                         "vm_id": vm_id,
                         "language": language,
                         "timeout_seconds": constants.VM_BOOT_TIMEOUT_SECONDS,
+                        "console_log": console_output,
+                        "qemu_running": qemu_proc.returncode is None,
+                        "qemu_returncode": qemu_proc.returncode,
+                        "qemu_cmd": qemu_cmd_str[:1000],
+                        "kernel_path": str(kernel_path),
+                        "initramfs_path": str(initramfs_path),
+                        "overlay_image": str(overlay_image) if overlay_image else None,
                     },
                 ) from e
 
@@ -2010,19 +2053,26 @@ class VmManager:
                 sig = -vm.process.returncode
                 signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"signal {sig}"
 
+            # Read console log (last N bytes for debugging)
+            console_log_path = f"/tmp/vm-{vm.vm_id}-console.log"  # noqa: S108
+            console_output = await read_log_tail(console_log_path, constants.CONSOLE_LOG_MAX_BYTES)
+
             logger.error(
                 "QEMU process exited unexpectedly",
                 extra={
                     "vm_id": vm.vm_id,
                     "exit_code": vm.process.returncode,
                     "signal": signal_name,
-                    "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "",
-                    "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "",
+                    "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
+                    "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
+                    "console_log": console_output,
                 },
             )
-            stderr_preview = stderr_text[:200] if stderr_text else ""
+            stderr_preview = stderr_text[:200] if stderr_text else "(empty)"
+            console_preview = console_output[-constants.CONSOLE_LOG_PREVIEW_BYTES :] if console_output else "(empty)"
             raise VmError(
-                f"QEMU process died (exit code {vm.process.returncode}, {signal_name}). stderr: {stderr_preview}"
+                f"QEMU process died (exit code {vm.process.returncode}, {signal_name}). "
+                f"stderr: {stderr_preview}, console: {console_preview}"
             )
 
         async def check_guest_ready() -> None:
@@ -2086,13 +2136,14 @@ class VmManager:
                 if task is not None:
                     with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
                         await task
-            console_log_path = Path(f"/tmp/vm-{vm.vm_id}-console.log")  # noqa: S108
-            console_output = "none"
-            if console_log_path.exists():
-                try:
-                    console_output = console_log_path.read_text()[: constants.CONSOLE_LOG_MAX_BYTES]
-                except OSError:
-                    console_output = "failed to read console log"
+
+            # Flush console log before reading to ensure all buffered content is written
+            if vm.console_log:
+                with contextlib.suppress(OSError):
+                    vm.console_log.flush()
+
+            console_log_path = f"/tmp/vm-{vm.vm_id}-console.log"  # noqa: S108
+            console_output = await read_log_tail(console_log_path, constants.CONSOLE_LOG_MAX_BYTES)
 
             logger.error(
                 "Guest agent timeout",
@@ -2101,6 +2152,7 @@ class VmManager:
                     "timeout": timeout,
                     "qemu_running": vm.process.returncode is None,
                     "console_output": console_output,
+                    "overlay_image": str(vm.overlay_image) if vm.overlay_image else "(none)",
                 },
             )
 

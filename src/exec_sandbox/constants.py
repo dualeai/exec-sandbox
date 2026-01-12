@@ -107,8 +107,13 @@ ERRNO_READ_ONLY_FILESYSTEM: Final[int] = 30
 
 CONSOLE_LOG_MAX_BYTES: Final[int] = 2000
 """Maximum bytes to capture from VM console log for debugging."""
+CONSOLE_LOG_MAX_BYTES: Final[int] = 8000
+"""Maximum bytes to capture from VM console log for debugging (context/structured logs)."""
 
-QEMU_OUTPUT_MAX_BYTES: Final[int] = 500
+CONSOLE_LOG_PREVIEW_BYTES: Final[int] = 4000
+"""Maximum bytes for console log preview in error messages."""
+
+QEMU_OUTPUT_MAX_BYTES: Final[int] = 2000
 """Maximum bytes to capture from QEMU stdout/stderr."""
 
 # ============================================================================
