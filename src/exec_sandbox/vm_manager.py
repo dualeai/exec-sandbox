@@ -534,6 +534,38 @@ async def _probe_qemu_vm_user() -> bool:
     return _probe_cache.qemu_vm_user
 
 
+# Pre-flight validation cache keyed by (kernel_path, arch)
+_kernel_validated: set[tuple[Path, HostArch]] = set()
+
+
+async def _validate_kernel_initramfs(kernel_path: Path, arch: HostArch) -> None:
+    """Pre-flight check: validate kernel and initramfs exist (cached, one-time per config).
+
+    This is NOT a probe (optional feature) - it's a hard requirement.
+    Raises VmError if files are missing.
+    """
+    cache_key = (kernel_path, arch)
+    if cache_key in _kernel_validated:
+        return
+
+    arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+    kernel = kernel_path / f"vmlinuz-{arch_suffix}"
+    initramfs = kernel_path / f"initramfs-{arch_suffix}"
+
+    if not await aiofiles.os.path.exists(kernel):
+        raise VmError(
+            f"Kernel not found: {kernel}",
+            context={"kernel_path": str(kernel), "arch": arch_suffix},
+        )
+    if not await aiofiles.os.path.exists(initramfs):
+        raise VmError(
+            f"Initramfs not found: {initramfs}",
+            context={"initramfs_path": str(initramfs), "arch": arch_suffix},
+        )
+
+    _kernel_validated.add(cache_key)
+
+
 class QemuVM:
     """Handle to running QEMU microVM.
 
@@ -1141,6 +1173,9 @@ class VmManager:
             _probe_qemu_vm_user(),
         )
 
+        # Pre-flight check: validate kernel and initramfs exist (cached)
+        await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
+
         self._initialized = True
 
         # Log registry initialization (empty on startup, even after crash)
@@ -1202,21 +1237,11 @@ class VmManager:
         # Start timing
         start_time = asyncio.get_event_loop().time()
 
-        # Step 0: Validate kernel and initramfs exist (async check)
+        # Step 0: Validate kernel and initramfs exist (cached, one-time check)
+        await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
         arch_suffix = "aarch64" if self.arch == HostArch.AARCH64 else "x86_64"
         kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
         initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
-
-        if not await aiofiles.os.path.exists(kernel_path):
-            raise VmError(
-                f"Kernel not found: {kernel_path}",
-                context={"kernel_path": str(kernel_path), "arch": arch_suffix},
-            )
-        if not await aiofiles.os.path.exists(initramfs_path):
-            raise VmError(
-                f"Initramfs not found: {initramfs_path}",
-                context={"initramfs_path": str(initramfs_path), "arch": arch_suffix},
-            )
 
         # Step 1: Generate VM identifiers
         vm_id = f"{tenant_id}-{task_id}-{uuid4()}"

@@ -6,12 +6,21 @@ Integration tests: Real VM lifecycle (requires QEMU + images).
 
 import asyncio
 import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from exec_sandbox.exceptions import VmError
 from exec_sandbox.models import Language
-from exec_sandbox.platform_utils import HostOS, detect_host_os
-from exec_sandbox.vm_manager import VALID_STATE_TRANSITIONS, VmState, _check_kvm_available
+from exec_sandbox.platform_utils import HostOS, detect_host_arch, detect_host_os
+from exec_sandbox.vm_manager import (
+    VALID_STATE_TRANSITIONS,
+    VmState,
+    _check_kvm_available,
+    _kernel_validated,
+    _validate_kernel_initramfs,
+)
 
 # ============================================================================
 # Unit Tests - VM State Machine
@@ -113,6 +122,60 @@ class TestHostOSForVm:
             assert host_os == HostOS.MACOS
         elif sys.platform.startswith("linux"):
             assert host_os == HostOS.LINUX
+
+
+# ============================================================================
+# Unit Tests - Kernel/Initramfs Pre-flight Validation
+# ============================================================================
+
+
+class TestKernelInitramfsValidation:
+    """Tests for _validate_kernel_initramfs() pre-flight check."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self) -> None:
+        """Clear validation cache before each test."""
+        _kernel_validated.clear()
+
+    async def test_validation_succeeds_with_real_paths(self, vm_settings) -> None:
+        """Validation passes when kernel and initramfs exist."""
+        arch = detect_host_arch()
+        # Should not raise
+        await _validate_kernel_initramfs(vm_settings.kernel_path, arch)
+
+    async def test_validation_fails_with_fake_path(self) -> None:
+        """Validation raises VmError when kernel doesn't exist."""
+        arch = detect_host_arch()
+        fake_path = Path("/nonexistent/kernels")
+
+        with pytest.raises(VmError, match="Kernel not found"):
+            await _validate_kernel_initramfs(fake_path, arch)
+
+    async def test_cache_prevents_repeated_io(self, vm_settings) -> None:
+        """Second call uses cache, no I/O operations."""
+        arch = detect_host_arch()
+
+        # First call - real I/O
+        await _validate_kernel_initramfs(vm_settings.kernel_path, arch)
+        assert (vm_settings.kernel_path, arch) in _kernel_validated
+
+        # Second call - should use cache, mock should NOT be called
+        with patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", new_callable=AsyncMock) as mock_exists:
+            await _validate_kernel_initramfs(vm_settings.kernel_path, arch)
+            mock_exists.assert_not_called()
+
+    async def test_different_paths_validated_separately(self, vm_settings) -> None:
+        """Different kernel paths are cached separately."""
+        arch = detect_host_arch()
+
+        # First path succeeds
+        await _validate_kernel_initramfs(vm_settings.kernel_path, arch)
+        assert (vm_settings.kernel_path, arch) in _kernel_validated
+
+        # Different path still gets validated (and fails)
+        fake_path = Path("/nonexistent/kernels")
+        with pytest.raises(VmError, match="Kernel not found"):
+            await _validate_kernel_initramfs(fake_path, arch)
 
 
 # ============================================================================
