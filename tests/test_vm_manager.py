@@ -234,6 +234,100 @@ class TestAllImageTypes:
     2. Execute code and return correct output
     """
 
+    async def test_default_uses_hardware_acceleration(self, vm_manager) -> None:
+        """Verify default settings (force_emulation=False) use hardware accel when available.
+
+        On macOS: -accel hvf, -cpu host
+        On Linux with KVM: -accel kvm, -cpu host
+        Without hardware accel: -accel tcg (fallback)
+
+        This test verifies that when hardware acceleration is available,
+        we actually use it (not accidentally falling back to TCG).
+        """
+        from exec_sandbox.vm_manager import _check_hvf_available, _check_kvm_available
+
+        vm = await vm_manager.create_vm(
+            language=Language.RAW,
+            tenant_id="test-hwaccel",
+            task_id="verify-hwaccel",
+            snapshot_path=None,
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
+        )
+
+        try:
+            # Find this VM's QEMU process
+            # On Linux, we read /proc/*/cmdline directly to avoid ps aux truncation
+            # On macOS, we use ps aux since /proc doesn't exist
+            import platform
+
+            if platform.system() == "Linux":
+                # Read /proc/*/cmdline for each process - this gives full command line
+                # without truncation. The cmdline uses NUL as separator, we convert to spaces.
+                proc = await asyncio.create_subprocess_exec(
+                    "bash",
+                    "-c",
+                    f"for f in /proc/[0-9]*/cmdline; do cat \"$f\" 2>/dev/null | tr '\\0' ' '; echo; done | grep -E 'qemu.*{vm.vm_id}|{vm.vm_id}.*qemu'",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                ps_output = stdout.decode()
+            else:
+                # macOS: use ps aux (no truncation issues on macOS)
+                proc = await asyncio.create_subprocess_exec(
+                    "ps",
+                    "aux",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                ps_output = stdout.decode()
+
+            accel_found = None
+            cpu_found = None
+            qemu_line_found = False
+
+            for line in ps_output.split("\n"):
+                if vm.vm_id in line and "qemu" in line:
+                    qemu_line_found = True
+                    parts = line.split()
+                    for i, p in enumerate(parts):
+                        if p == "-accel" and i + 1 < len(parts):
+                            accel_found = parts[i + 1]
+                        if p == "-cpu" and i + 1 < len(parts):
+                            cpu_found = parts[i + 1]
+                    break
+
+            # Verify we found the QEMU process
+            assert qemu_line_found, (
+                f"Could not find QEMU process for VM {vm.vm_id}\nps output sample:\n{ps_output[:2000]}"
+            )
+            assert accel_found is not None, f"Could not find -accel argument in QEMU command line:\n{ps_output[:2000]}"
+            assert cpu_found is not None, f"Could not find -cpu argument in QEMU command line:\n{ps_output[:2000]}"
+
+            # Check what hardware acceleration should be available
+            # Note: HVF is macOS-only, KVM is Linux-only
+            kvm_available = _check_kvm_available()
+            hvf_available = await _check_hvf_available()
+
+            if hvf_available:
+                # macOS with HVF available should use HVF (Hypervisor.framework)
+                assert accel_found == "hvf", f"Expected HVF on macOS, got: -accel {accel_found}"
+                assert cpu_found == "host", f"Expected '-cpu host' with HVF, got: -cpu {cpu_found}"
+            elif kvm_available:
+                # Linux with KVM should use KVM
+                assert accel_found == "kvm", f"Expected KVM on Linux with KVM available, got: -accel {accel_found}"
+                assert cpu_found == "host", f"Expected '-cpu host' with KVM, got: -cpu {cpu_found}"
+            else:
+                # Fallback to TCG (this is expected in some CI environments)
+                assert accel_found.startswith("tcg"), (
+                    f"Expected TCG fallback without hardware accel, got: -accel {accel_found}"
+                )
+        finally:
+            await vm_manager.destroy_vm(vm)
+
     @pytest.mark.parametrize("language,code,expected_output", IMAGE_TEST_CASES)
     async def test_vm_health_check_all_images(
         self,
