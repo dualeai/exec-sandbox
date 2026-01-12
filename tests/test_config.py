@@ -151,6 +151,17 @@ class TestGetImagesDir:
         assert "nonexistent" in str(exc_info.value)
         assert "download images from GitHub Releases" in str(exc_info.value)
 
+    def test_explicit_images_dir_not_exists_with_auto_download(self, tmp_path: Path) -> None:
+        """get_images_dir() returns path without checking existence when auto_download enabled."""
+        missing_dir = tmp_path / "nonexistent"
+
+        # With auto_download_assets=True (default), missing directory is OK (will be created)
+        config = SchedulerConfig(images_dir=missing_dir)
+
+        # Should NOT raise - path will be created during asset download
+        result = config.get_images_dir()
+        assert result == missing_dir
+
     def test_env_var_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """get_images_dir() uses EXEC_SANDBOX_IMAGES_DIR env var."""
         images_dir = tmp_path / "env-images"
