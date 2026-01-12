@@ -99,6 +99,7 @@ venv = ".venv"
 venvPath = "."
 include = ["src", "scripts"]
 exclude = [".venv", "tests"]
+stubPath = "stubs"
 
 [tool.ruff]
 line-length = 120
