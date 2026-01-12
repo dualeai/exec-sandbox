@@ -349,8 +349,20 @@ jobs:
           # This allows nested cgroups like /sys/fs/cgroup/code-exec/{tenant}/{vm}
           echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
           echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/code-exec/cgroup.subtree_control
+          # Create runner cgroup (cgroups with subtree_control can't have processes directly)
+          sudo mkdir -p /sys/fs/cgroup/code-exec/runner
           # Delegate ownership to runner user so tests can create sub-cgroups
           sudo chown -R runner:runner /sys/fs/cgroup/code-exec
 
-      - name: Functional tests
+      - name: Functional tests (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Move into delegated cgroup subtree so child processes (QEMU) can be moved freely
+          # Requires sudo because moving FROM outside the subtree needs root (common ancestor rule)
+          # Once inside, child processes (QEMU) can be moved freely within the subtree
+          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          make test-func
+
+      - name: Functional tests (macOS)
+        if: matrix.platform.os == 'macos'
         run: make test-func
