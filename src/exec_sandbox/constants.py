@@ -47,9 +47,13 @@ VM_BOOT_TIMEOUT_SECONDS: Final[int] = 30
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent (TCP)."""
 
-EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 2
+EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 8
 """Hard timeout margin above soft timeout (host watchdog protection).
-Accounts for: JSON serialization, network transmission, clock skew."""
+Accounts for:
+- Guest graceful termination grace period (5s SIGTERM→SIGKILL)
+- JSON serialization, network transmission, clock skew (~2s)
+- Safety buffer (~1s)
+Must be >= guest-agent TERM_GRACE_PERIOD_SECONDS (5s) + overhead."""
 
 PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 120
 """Timeout for package installation in guest VM."""

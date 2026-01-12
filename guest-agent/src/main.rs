@@ -51,6 +51,12 @@ const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300; // 5 min timeout for package i
 const FLUSH_INTERVAL_MS: u64 = 50; // 50ms flush interval (not 1s - too slow for real-time)
 const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB max buffer before forced flush
 
+// Graceful termination configuration
+// - First send SIGTERM to allow process to cleanup (Python atexit, temp files, etc.)
+// - Wait grace period for process to exit
+// - If still running, send SIGKILL to entire process group
+const TERM_GRACE_PERIOD_SECONDS: u64 = 5; // 5 seconds grace period before SIGKILL
+
 /// Regex for validating package names with version specifiers (required).
 ///
 /// Pattern: Package name + version operator (required) + version spec
@@ -344,6 +350,8 @@ async fn install_packages(
             for pkg in packages {
                 c.arg(pkg);
             }
+            // Spawn in new process group for clean termination of all children
+            c.process_group(0);
             c.stdout(std::process::Stdio::piped());
             c.stderr(std::process::Stdio::piped());
             c
@@ -354,6 +362,8 @@ async fn install_packages(
             for pkg in packages {
                 c.arg(pkg);
             }
+            // Spawn in new process group for clean termination of all children
+            c.process_group(0);
             c.stdout(std::process::Stdio::piped());
             c.stderr(std::process::Stdio::piped());
             c
@@ -437,7 +447,8 @@ async fn install_packages(
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = child.kill().await;
+            // Graceful termination: SIGTERM → wait → SIGKILL
+            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             send_streaming_error(
                 write_tx,
                 format!("Process wait error: {}", e),
@@ -447,7 +458,8 @@ async fn install_packages(
             return Ok(());
         }
         Err(_) => {
-            let _ = child.kill().await;
+            // Timeout: Graceful termination: SIGTERM → wait → SIGKILL
+            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             send_streaming_error(
                 write_tx,
                 format!(
@@ -617,6 +629,81 @@ async fn flush_output_buffer(
     Ok(())
 }
 
+/// Gracefully terminate a process group: SIGTERM → wait → SIGKILL
+///
+/// Implements Kubernetes-style graceful shutdown:
+/// 1. Send SIGTERM to entire process group (allows cleanup)
+/// 2. Wait for grace period
+/// 3. If still running, send SIGKILL
+///
+/// Uses process groups to ensure all child processes are terminated,
+/// not just the direct child. This is critical for shell commands
+/// that spawn subprocesses.
+async fn graceful_terminate_process_group(
+    child: &mut tokio::process::Child,
+    grace_period_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::time::{timeout, Duration};
+
+    // Get PID (= PGID when process_group(0) was used at spawn)
+    let pid = match child.id() {
+        Some(id) => id as i32,
+        None => {
+            // Process already exited - nothing to do
+            return Ok(());
+        }
+    };
+
+    // Phase 1: Send SIGTERM to entire process group
+    // Negative PID sends signal to all processes in the group
+    // SAFETY: libc::kill is safe with valid signal numbers
+    let term_result = unsafe { libc::kill(-pid, libc::SIGTERM) };
+    if term_result == -1 {
+        let errno = std::io::Error::last_os_error();
+        // ESRCH (3) = No such process - already dead, that's fine
+        if errno.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("SIGTERM to process group {} failed: {}", pid, errno);
+        }
+        // Process already dead or error - try to reap
+        let _ = child.wait().await;
+        return Ok(());
+    }
+
+    // Phase 2: Wait for grace period for process to exit gracefully
+    match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
+        Ok(Ok(_status)) => {
+            // Process exited gracefully within grace period
+            return Ok(());
+        }
+        Ok(Err(e)) => {
+            // Wait error - log but continue to SIGKILL
+            eprintln!("Wait error after SIGTERM: {}", e);
+        }
+        Err(_) => {
+            // Timeout - process didn't respond to SIGTERM
+            eprintln!(
+                "Process {} didn't respond to SIGTERM within {}s, sending SIGKILL",
+                pid, grace_period_secs
+            );
+        }
+    }
+
+    // Phase 3: Send SIGKILL to entire process group
+    let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if kill_result == -1 {
+        let errno = std::io::Error::last_os_error();
+        // ESRCH = already dead, not an error
+        if errno.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("SIGKILL to process group {} failed: {}", pid, errno);
+        }
+    }
+
+    // Reap the process to prevent zombie
+    let _ = child.wait().await;
+
+    Ok(())
+}
+
 async fn execute_code_streaming(
     language: &str,
     code: &str,
@@ -640,6 +727,8 @@ async fn execute_code_streaming(
         "python" => {
             let mut c = Command::new("python3");
             c.arg("-c").arg(code);
+            // Spawn in new process group for clean termination of all children
+            c.process_group(0);
             c.stdout(std::process::Stdio::piped());
             c.stderr(std::process::Stdio::piped());
             c
@@ -647,6 +736,8 @@ async fn execute_code_streaming(
         "javascript" => {
             let mut c = Command::new("bun");
             c.arg("-e").arg(code);
+            // Spawn in new process group for clean termination of all children
+            c.process_group(0);
             c.stdout(std::process::Stdio::piped());
             c.stderr(std::process::Stdio::piped());
             c
@@ -654,6 +745,8 @@ async fn execute_code_streaming(
         "raw" => {
             let mut c = Command::new("sh");
             c.arg("-c").arg(code);
+            // Spawn in new process group for clean termination of all children
+            c.process_group(0);
             c.stdout(std::process::Stdio::piped());
             c.stderr(std::process::Stdio::piped());
             c
@@ -760,7 +853,8 @@ async fn execute_code_streaming(
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = child.kill().await;
+            // Graceful termination: SIGTERM → wait → SIGKILL
+            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             streaming_task.abort();
             send_streaming_error(
                 write_tx,
@@ -771,7 +865,8 @@ async fn execute_code_streaming(
             return Ok(());
         }
         Err(_) => {
-            let _ = child.kill().await;
+            // Timeout: Graceful termination: SIGTERM → wait → SIGKILL
+            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             streaming_task.abort();
             send_streaming_error(
                 write_tx,

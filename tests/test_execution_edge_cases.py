@@ -285,6 +285,163 @@ os._exit(42)
 
         assert result.exit_code == 42
 
+    async def test_sigterm_graceful_exit(self, scheduler: Scheduler) -> None:
+        """Process catches SIGTERM and exits gracefully.
+
+        Reliability: Verifies signal type via output.
+        """
+        code = """
+import signal
+import sys
+import time
+
+def handler(signum, frame):
+    # Print signal name to verify SIGTERM was sent (not SIGKILL)
+    sig_name = signal.Signals(signum).name
+    print(f"RECEIVED_{sig_name}", flush=True)
+    sys.exit(42)
+
+signal.signal(signal.SIGTERM, handler)
+print("READY", flush=True)
+time.sleep(60)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=2,
+        )
+
+        # Verify SIGTERM was sent (not SIGKILL)
+        assert "RECEIVED_SIGTERM" in result.stdout
+
+    async def test_normal_exit_no_termination_needed(self, scheduler: Scheduler) -> None:
+        """Process exits normally before timeout - no termination needed.
+
+        Normal case: verifies baseline behavior when graceful termination
+        is not triggered.
+        """
+        code = """
+print("STARTING", flush=True)
+print("DONE", flush=True)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=30,
+        )
+
+        assert result.exit_code == 0
+        assert "STARTING" in result.stdout
+        assert "DONE" in result.stdout
+        # Should complete very quickly (no timeout, no termination)
+        assert result.timing is not None
+        assert result.timing.execute_ms < 2000  # < 2s
+
+    async def test_sigterm_ignored_escalates_to_sigkill(self, scheduler: Scheduler) -> None:
+        """Process ignoring SIGTERM is killed by SIGKILL after grace period.
+
+        Weird case: verifies SIGTERM→SIGKILL escalation via timing.
+        If SIGTERM worked, execution would be ~2s. Since it's ignored,
+        must wait 5s grace period before SIGKILL, so execution >= 5s.
+        """
+        code = """
+import signal
+import time
+
+# Ignore SIGTERM - process won't exit gracefully
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print("IGNORING_SIGTERM", flush=True)
+time.sleep(60)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=2,  # Host adds 8s margin for grace period
+        )
+
+        assert "IGNORING_SIGTERM" in result.stdout
+        # Key assertion: execution time >= 5s (grace period elapsed)
+        # If SIGTERM worked, would be ~2s. Since ignored, must wait 5s grace.
+        assert result.timing is not None
+        assert result.timing.execute_ms >= 5000  # At least 5s (grace period)
+        assert result.timing.execute_ms < 12000  # Under 12s
+
+    async def test_nested_process_tree_termination(self, scheduler: Scheduler) -> None:
+        """Nested/deep process tree is terminated via process group.
+
+        Out of bounds case: shell spawns children that spawn grandchildren.
+        Process group signal should kill entire tree.
+        """
+        # Parent spawns child, child spawns grandchild
+        # All should be killed by process group signal
+        code = """
+sh -c 'sh -c "sleep 60" & sleep 60' &
+sh -c 'sh -c "sleep 60" & sleep 60' &
+echo NESTED_SPAWNED
+wait
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.RAW,
+            timeout_seconds=2,  # Host adds 8s margin for grace period
+        )
+
+        assert "NESTED_SPAWNED" in result.stdout
+        # If nested processes weren't killed, would take 60s
+        assert result.timing is not None
+        assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
+
+    async def test_subprocess_tree_termination(self, scheduler: Scheduler) -> None:
+        """Shell subprocesses are terminated via process group.
+
+        Reliability: If process group kill fails, `wait` would block for 60s.
+        Timing proves all children were killed.
+        """
+        # Spawn 3 background sleeps, then wait for them
+        # If process group works: killed after timeout + grace
+        # If process group fails: wait blocks for 60s (test timeout)
+        code = "sleep 60 & sleep 60 & sleep 60 & echo SPAWNED && wait"
+
+        result = await scheduler.run(
+            code=code,
+            language=Language.RAW,
+            timeout_seconds=2,  # Host adds 8s margin for grace period
+        )
+
+        assert "SPAWNED" in result.stdout
+        # Key assertion: completes in reasonable time (not 60s)
+        # Expected: ~2s timeout + ~5s grace = ~7s (host allows 2+8=10s)
+        assert result.timing is not None
+        assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
+
+    async def test_python_subprocess_tree_termination(self, scheduler: Scheduler) -> None:
+        """Python subprocesses are terminated via process group.
+
+        Reliability: Same timing strategy as shell test.
+        """
+        code = """
+import subprocess
+import time
+
+# Spawn background processes
+for _ in range(3):
+    subprocess.Popen(["sleep", "60"])
+
+print("SPAWNED", flush=True)
+time.sleep(60)  # Wait to be killed
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=2,  # Host adds 8s margin for grace period
+        )
+
+        assert "SPAWNED" in result.stdout
+        # Should complete after timeout + grace, not after 60s
+        # Expected: ~2s timeout + ~5s grace = ~7s (host allows 2+8=10s)
+        assert result.timing is not None
+        assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
+
 
 # =============================================================================
 # Out of Bounds: Resource exhaustion
