@@ -932,20 +932,6 @@ class VmManager:
 
             # Step 7: Launch QEMU
             try:
-                # DEBUG: Log the exact command
-                last_arg = qemu_cmd[-1]
-                last_arg_preview = last_arg[:200] if len(last_arg) > 200 else last_arg  # noqa: PLR2004
-                logger.debug(
-                    "QEMU command with network",
-                    extra={
-                        "debug_category": "network",
-                        "vm_id": vm_id,
-                        "cmd_length": len(qemu_cmd),
-                        "first_args": qemu_cmd[:3],
-                        "last_arg_preview": last_arg_preview,
-                    },
-                )
-
                 qemu_proc = ProcessWrapper(
                     await asyncio.create_subprocess_exec(
                         *qemu_cmd,
