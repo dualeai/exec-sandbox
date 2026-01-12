@@ -157,8 +157,12 @@ class TcpChannel:
             streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
             return streaming_adapter.validate_json(response_data.decode().strip())
 
-        except (asyncio.IncompleteReadError, TimeoutError, OSError, BrokenPipeError, ConnectionError):
-            # Connection broken - reset state so caller reconnects on next attempt
+        except TimeoutError:
+            # TimeoutError means no data received in time, but connection is still valid.
+            # DO NOT reset - keep connection open for retry.
+            raise
+        except (asyncio.IncompleteReadError, OSError, BrokenPipeError, ConnectionError):
+            # Connection actually broken - reset state so caller reconnects on next attempt
             self._reader = None
             self._writer = None
             raise
@@ -331,14 +335,19 @@ class UnixSocketChannel:
             streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
             return streaming_adapter.validate_json(response_data.decode().strip())
 
+        except TimeoutError:
+            # TimeoutError means no data received in time, but connection is still valid.
+            # DO NOT reset - closing the socket causes QEMU to signal "host disconnected"
+            # which makes the guest read EOF. Keep connection open for retry.
+            # See: nested KVM timing issues where guest boots before host sends data.
+            raise
         except (
             asyncio.IncompleteReadError,
-            TimeoutError,
             OSError,
             BrokenPipeError,
             ConnectionError,
         ):
-            # Connection broken - reset state so caller reconnects on next attempt
+            # Connection actually broken - reset state so caller reconnects on next attempt
             self._reader = None
             self._writer = None
             raise
