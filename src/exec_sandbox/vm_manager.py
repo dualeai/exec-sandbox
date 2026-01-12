@@ -2030,6 +2030,45 @@ class VmManager:
         # Only if: Linux + qemu-vm user exists + have sudo access
         # Returns whether QEMU should run as qemu-vm user (based on chown success)
         if detect_host_os() != HostOS.MACOS and await _probe_qemu_vm_user():
+            # Make base image accessible to qemu-vm user
+            # qemu-vm needs: read on file + execute on all parent directories
+            # This is safe because the base image is read-only (writes go to overlay)
+
+            # Make all parent directories traversable (a+x) up to /tmp or root
+            current = base_image.parent
+            dirs_to_chmod: list[Path] = []
+            while current != current.parent and str(current) not in ("/", "/tmp"):  # noqa: S108
+                dirs_to_chmod.append(current)
+                current = current.parent
+
+            for dir_path in dirs_to_chmod:
+                chmod_dir_proc = ProcessWrapper(
+                    await asyncio.create_subprocess_exec(
+                        "chmod",
+                        "a+x",
+                        str(dir_path),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                )
+                await chmod_dir_proc.communicate()
+
+            # Make base image readable
+            chmod_proc = ProcessWrapper(
+                await asyncio.create_subprocess_exec(
+                    "chmod",
+                    "a+r",
+                    str(base_image),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+            )
+            await chmod_proc.communicate()
+            if chmod_proc.returncode != 0:
+                logger.debug("Could not chmod base image (qemu-vm may not have access)")
+
             chown_proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
                     "sudo",
