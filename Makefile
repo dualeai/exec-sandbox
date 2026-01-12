@@ -80,19 +80,6 @@ test-unit:
 	$(MAKE) --directory guest-agent test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
 
-# Integration tests (requires QEMU)
-test-int:
-	uv run pytest tests/ -v -n auto -m "integration"
-
-# E2E tests (requires QEMU + images)
-test-e2e:
-	@echo "🧪 Running E2E tests with real QEMU..."
-	uv run pytest tests/e2e/ -v -m "e2e" --no-cov --tb=short || [ $$? -eq 5 ]
-
-# CI-friendly tests (no slow tests, parallel execution)
-test-ci:
-	uv run pytest tests/ -v -n auto -m "not slow"
-
 # ============================================================================
 # Linting
 # ============================================================================
