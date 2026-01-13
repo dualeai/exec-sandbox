@@ -916,3 +916,451 @@ class TestCheckVmHealthRetry:
 
         # Should only attempt once - ValueError is not retryable
         assert mock_vm.channel.send_request.call_count == 1
+
+
+# ============================================================================
+# Unit Tests - Replenish Race Condition Fix
+# ============================================================================
+
+
+class TestReplenishRaceCondition:
+    """Tests for replenish race condition fix using semaphore serialization.
+
+    These tests use asyncio.Event for deterministic synchronization instead of
+    timing-based sleeps, ensuring reliable CI execution.
+    """
+
+    async def test_concurrent_replenish_serialized_by_semaphore(self, unit_test_vm_manager) -> None:
+        """Prove only 1 boot runs at a time with semaphore."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Tracking variables
+        max_concurrent = 0
+        current_concurrent = 0
+        boot_count = 0
+
+        # Gates for deterministic control
+        boot_started = asyncio.Event()  # Signals "a boot began"
+        boot_can_finish = asyncio.Event()  # Test controls when boots complete
+
+        async def controlled_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal max_concurrent, current_concurrent, boot_count
+
+            # Track concurrency
+            current_concurrent += 1
+            boot_count += 1
+            max_concurrent = max(max_concurrent, current_concurrent)
+
+            boot_started.set()  # Tell test "I started"
+            await boot_can_finish.wait()  # Wait for test permission
+
+            current_concurrent -= 1
+
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=controlled_boot):
+            # Spawn 3 concurrent replenish tasks
+            tasks = [asyncio.create_task(pool._replenish_pool(Language.PYTHON)) for _ in range(3)]
+
+            # Wait for first boot to start (deterministic, no sleep)
+            await asyncio.wait_for(boot_started.wait(), timeout=1.0)
+
+            # Release the gate - let all proceed
+            boot_can_finish.set()
+
+            await asyncio.gather(*tasks)
+
+        # THE KEY ASSERTIONS:
+        # With semaphore: max_concurrent == 1 (serialized)
+        # Without semaphore: max_concurrent == 3 (racing)
+        assert max_concurrent == 1, f"Expected 1 concurrent boot, got {max_concurrent}"
+
+        # Only 1 boot needed - others see pool full and skip
+        assert boot_count == 1, f"Expected 1 boot, got {boot_count}"
+
+    async def test_replenish_skips_when_pool_full(self, unit_test_vm_manager) -> None:
+        """After first replenish, subsequent calls skip (pool full)."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)  # pool_size = 1
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        boot_count = 0
+
+        async def mock_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal boot_count
+            boot_count += 1
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
+            # First replenish - should boot
+            await pool._replenish_pool(Language.PYTHON)
+            assert boot_count == 1
+            assert pool.pools[Language.PYTHON].qsize() == 1
+
+            # Second replenish - pool is full, should skip
+            await pool._replenish_pool(Language.PYTHON)
+            assert boot_count == 1  # No additional boot
+
+    async def test_per_language_semaphore_independence(self, unit_test_vm_manager) -> None:
+        """Python replenish must not block JavaScript (would deadlock if shared)."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        py_started = asyncio.Event()
+        js_started = asyncio.Event()
+
+        async def mock_boot(language: Language, index: int) -> AsyncMock:
+            if language == Language.PYTHON:
+                py_started.set()
+                # Would deadlock here if JS is blocked by Python's semaphore
+                await asyncio.wait_for(js_started.wait(), timeout=1.0)
+            else:
+                js_started.set()
+                # Would deadlock here if Python is blocked by JS's semaphore
+                await asyncio.wait_for(py_started.wait(), timeout=1.0)
+
+            vm = AsyncMock()
+            vm.vm_id = f"{language.value}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
+            # This times out (fails) if languages block each other
+            await asyncio.wait_for(
+                asyncio.gather(
+                    pool._replenish_pool(Language.PYTHON),
+                    pool._replenish_pool(Language.JAVASCRIPT),
+                ),
+                timeout=2.0,  # Would hang forever if blocking
+            )
+
+    async def test_semaphore_released_on_boot_failure(self, unit_test_vm_manager) -> None:
+        """Semaphore is released even when boot fails, allowing retry."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        call_count = 0
+
+        async def failing_then_succeeding_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Simulated boot failure")
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{call_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=failing_then_succeeding_boot):
+            # First replenish fails
+            await pool._replenish_pool(Language.PYTHON)
+            assert pool.pools[Language.PYTHON].qsize() == 0  # Failed, no VM added
+
+            # Second replenish should succeed (semaphore was released)
+            await pool._replenish_pool(Language.PYTHON)
+            assert pool.pools[Language.PYTHON].qsize() == 1  # Success
+
+        assert call_count == 2
+
+    # -------------------------------------------------------------------------
+    # Edge Cases
+    # -------------------------------------------------------------------------
+
+    async def test_semaphore_released_on_cancellation(self, unit_test_vm_manager) -> None:
+        """Semaphore is released when task is cancelled during boot."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        boot_started = asyncio.Event()
+
+        async def slow_boot(language: Language, index: int) -> AsyncMock:
+            boot_started.set()
+            await asyncio.sleep(10)  # Will be cancelled
+            vm = AsyncMock()
+            vm.vm_id = "never-returned"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=slow_boot):
+            task = asyncio.create_task(pool._replenish_pool(Language.PYTHON))
+
+            # Wait for boot to start
+            await asyncio.wait_for(boot_started.wait(), timeout=1.0)
+
+            # Semaphore should be held
+            assert pool._replenish_semaphores[Language.PYTHON].locked()
+
+            # Cancel the task
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # Semaphore should be released after cancellation
+            assert not pool._replenish_semaphores[Language.PYTHON].locked()
+
+    async def test_empty_pool_replenish(self, unit_test_vm_manager) -> None:
+        """Replenish on completely empty pool works correctly."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)  # pool_size = 1
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Pool starts empty
+        assert pool.pools[Language.PYTHON].qsize() == 0
+
+        async def mock_boot(language: Language, index: int) -> AsyncMock:
+            vm = AsyncMock()
+            vm.vm_id = "new-vm"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
+            await pool._replenish_pool(Language.PYTHON)
+
+        assert pool.pools[Language.PYTHON].qsize() == 1
+
+    # -------------------------------------------------------------------------
+    # Boundary Cases
+    # -------------------------------------------------------------------------
+
+    async def test_larger_pool_multiple_replenishes(self, unit_test_vm_manager) -> None:
+        """With pool_size > 1, multiple sequential replenishes fill the pool."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        # max_concurrent_vms=20 → pool_size = max(1, int(20 * 0.25)) = 5
+        config = SchedulerConfig(max_concurrent_vms=20)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        assert pool.pool_size_per_language == 5
+
+        boot_count = 0
+
+        async def mock_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal boot_count
+            boot_count += 1
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
+            # Replenish 5 times to fill pool
+            for i in range(5):
+                await pool._replenish_pool(Language.PYTHON)
+                assert pool.pools[Language.PYTHON].qsize() == i + 1
+
+            # 6th replenish should skip (pool full)
+            await pool._replenish_pool(Language.PYTHON)
+            assert boot_count == 5  # No additional boot
+
+    async def test_pool_size_one_boundary(self, unit_test_vm_manager) -> None:
+        """Pool size = 1 is the minimum boundary case."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        # max_concurrent_vms=1 → pool_size = max(1, int(1 * 0.25)) = max(1, 0) = 1
+        config = SchedulerConfig(max_concurrent_vms=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        assert pool.pool_size_per_language == 1
+
+        boot_count = 0
+
+        async def mock_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal boot_count
+            boot_count += 1
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
+            # First replenish fills the pool
+            await pool._replenish_pool(Language.PYTHON)
+            assert pool.pools[Language.PYTHON].qsize() == 1
+            assert boot_count == 1
+
+            # Second replenish skips
+            await pool._replenish_pool(Language.PYTHON)
+            assert boot_count == 1
+
+    # -------------------------------------------------------------------------
+    # Stress Cases
+    # -------------------------------------------------------------------------
+
+    async def test_many_concurrent_replenishes_small_pool(self, unit_test_vm_manager) -> None:
+        """10 concurrent replenishes on pool_size=2 → only 2 boots, max 1 concurrent."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        # max_concurrent_vms=8 → pool_size = max(1, int(8 * 0.25)) = 2
+        # replenish_max_concurrent = max(1, int(2 * 0.5)) = 1
+        config = SchedulerConfig(max_concurrent_vms=8)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        assert pool.pool_size_per_language == 2
+        assert pool._replenish_max_concurrent == 1  # Small pool = serialized
+
+        max_concurrent = 0
+        current_concurrent = 0
+        boot_count = 0
+        boot_started = asyncio.Event()
+        boot_can_finish = asyncio.Event()
+
+        async def controlled_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal max_concurrent, current_concurrent, boot_count
+
+            current_concurrent += 1
+            boot_count += 1
+            max_concurrent = max(max_concurrent, current_concurrent)
+
+            boot_started.set()
+            await boot_can_finish.wait()
+
+            current_concurrent -= 1
+
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=controlled_boot):
+            # Spawn 10 concurrent replenish tasks
+            tasks = [asyncio.create_task(pool._replenish_pool(Language.PYTHON)) for _ in range(10)]
+
+            # Wait for first boot to start
+            await asyncio.wait_for(boot_started.wait(), timeout=1.0)
+
+            # Release gate
+            boot_can_finish.set()
+
+            await asyncio.gather(*tasks)
+
+        # Only 2 boots needed (pool_size=2), others skip
+        assert boot_count == 2, f"Expected 2 boots, got {boot_count}"
+        # Max concurrent = 1 for small pools (serialized by semaphore)
+        assert max_concurrent == 1, f"Expected max 1 concurrent, got {max_concurrent}"
+        # Pool should be full
+        assert pool.pools[Language.PYTHON].qsize() == 2
+
+    async def test_concurrent_replenish_large_pool_allows_parallelism(self, unit_test_vm_manager) -> None:
+        """Large pool (size=5) allows 2 concurrent boots for faster replenishment."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        # max_concurrent_vms=20 → pool_size = max(1, int(20 * 0.25)) = 5
+        # replenish_max_concurrent = max(1, int(5 * 0.5)) = 2
+        config = SchedulerConfig(max_concurrent_vms=20)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        assert pool.pool_size_per_language == 5
+        assert pool._replenish_max_concurrent == 2  # Large pool = parallel boots
+
+        max_concurrent = 0
+        current_concurrent = 0
+        boot_count = 0
+        boots_started = asyncio.Event()
+        boot_can_finish = asyncio.Event()
+
+        async def controlled_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal max_concurrent, current_concurrent, boot_count
+
+            current_concurrent += 1
+            boot_count += 1
+            max_concurrent = max(max_concurrent, current_concurrent)
+
+            # Signal when 2 boots are running concurrently
+            if current_concurrent >= 2:
+                boots_started.set()
+
+            await boot_can_finish.wait()
+
+            current_concurrent -= 1
+
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=controlled_boot):
+            # Spawn 10 concurrent replenish tasks
+            tasks = [asyncio.create_task(pool._replenish_pool(Language.PYTHON)) for _ in range(10)]
+
+            # Wait for 2 concurrent boots (proves parallelism works)
+            await asyncio.wait_for(boots_started.wait(), timeout=1.0)
+
+            # Release gate
+            boot_can_finish.set()
+
+            await asyncio.gather(*tasks)
+
+        # Only 5 boots needed (pool_size=5), others skip
+        assert boot_count == 5, f"Expected 5 boots, got {boot_count}"
+        # Max concurrent should be 2 (limited by semaphore, not 10)
+        assert max_concurrent == 2, f"Expected max 2 concurrent, got {max_concurrent}"
+        # Pool should be full
+        assert pool.pools[Language.PYTHON].qsize() == 5
+
+    # -------------------------------------------------------------------------
+    # Weird Cases
+    # -------------------------------------------------------------------------
+
+    async def test_pool_filled_externally_during_semaphore_wait(self, unit_test_vm_manager) -> None:
+        """If pool becomes full while waiting for semaphore, skip boot."""
+        from unittest.mock import patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)  # pool_size = 1
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        boot_count = 0
+        first_boot_done = asyncio.Event()
+
+        async def mock_boot(language: Language, index: int) -> AsyncMock:
+            nonlocal boot_count
+            boot_count += 1
+            vm = AsyncMock()
+            vm.vm_id = f"vm-{boot_count}"
+            first_boot_done.set()
+            return vm
+
+        with patch.object(pool, "_boot_warm_vm", side_effect=mock_boot):
+            # Start first replenish (will acquire semaphore and boot)
+            task1 = asyncio.create_task(pool._replenish_pool(Language.PYTHON))
+
+            # Wait for first boot to complete
+            await asyncio.wait_for(first_boot_done.wait(), timeout=1.0)
+            await task1
+
+            # Pool is now full
+            assert pool.pools[Language.PYTHON].qsize() == 1
+
+            # Second replenish should see pool is full and skip
+            await pool._replenish_pool(Language.PYTHON)
+
+            # Only 1 boot should have happened
+            assert boot_count == 1

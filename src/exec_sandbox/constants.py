@@ -175,6 +175,9 @@ IO_URING_MIN_KERNEL_MINOR: Final[int] = 1
 WARM_POOL_SIZE_RATIO: Final[float] = 0.25
 """Warm pool size as ratio of max_concurrent_vms (25% = 2-3 VMs for default=10)."""
 
+WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
+"""Max concurrent replenish boots as ratio of pool_size (50% = 2-3 concurrent for pool_size=5)."""
+
 WARM_POOL_LANGUAGES: Final[tuple[Language, ...]] = (Language.PYTHON, Language.JAVASCRIPT)
 """Languages eligible for warm VM pool."""
 

@@ -106,6 +106,17 @@ class WarmVMPool:
         # Track background replenish tasks (prevent GC)
         self._replenish_tasks: set[asyncio.Task[None]] = set()
 
+        # Semaphore to limit concurrent replenishment per language (prevents race condition
+        # where multiple tasks pass the pool.full() check before any VM is booted)
+        # Allows parallel boots up to 50% of pool_size for faster replenishment under load
+        self._replenish_max_concurrent = max(
+            1,  # Minimum 1 concurrent boot
+            int(self.pool_size_per_language * constants.WARM_POOL_REPLENISH_CONCURRENCY_RATIO),
+        )
+        self._replenish_semaphores: dict[Language, asyncio.Semaphore] = {
+            lang: asyncio.Semaphore(self._replenish_max_concurrent) for lang in constants.WARM_POOL_LANGUAGES
+        }
+
         # Health check task
         self._health_task: asyncio.Task[None] | None = None
         self._shutdown_event = asyncio.Event()
@@ -349,37 +360,41 @@ class WarmVMPool:
     async def _replenish_pool(self, language: Language) -> None:
         """Replenish pool in background (non-blocking).
 
+        Uses semaphore to serialize replenishment per language, preventing race
+        condition where multiple tasks pass pool.full() before any VM is booted.
+
         Replenishes ONE VM to maintain pool size.
         Logs failures but doesn't propagate (graceful degradation).
 
         Args:
             language: Programming language enum to replenish
         """
-        try:
-            # Check if pool already full (race condition)
-            if self.pools[language].full():
-                logger.debug("Warm pool already full (skip replenish)", extra={"language": language.value})
-                return
+        async with self._replenish_semaphores[language]:
+            try:
+                # Check if pool already full (now atomic with boot due to semaphore)
+                if self.pools[language].full():
+                    logger.debug("Warm pool already full (skip replenish)", extra={"language": language.value})
+                    return
 
-            # Boot new VM
-            index = self.pools[language].maxsize - self.pools[language].qsize()
-            vm = await self._boot_warm_vm(language, index=index)
+                # Boot new VM
+                index = self.pools[language].maxsize - self.pools[language].qsize()
+                vm = await self._boot_warm_vm(language, index=index)
 
-            # Add to pool
-            await self.pools[language].put(vm)
+                # Add to pool
+                await self.pools[language].put(vm)
 
-            logger.info(
-                "Warm pool replenished",
-                extra={"language": language.value, "vm_id": vm.vm_id, "pool_size": self.pools[language].qsize()},
-            )
+                logger.info(
+                    "Warm pool replenished",
+                    extra={"language": language.value, "vm_id": vm.vm_id, "pool_size": self.pools[language].qsize()},
+                )
 
-        except Exception as e:
-            logger.error(
-                "Failed to replenish warm pool",
-                extra={"language": language.value, "error": str(e)},
-                exc_info=True,
-            )
-            # Don't propagate - graceful degradation
+            except Exception as e:
+                logger.error(
+                    "Failed to replenish warm pool",
+                    extra={"language": language.value, "error": str(e)},
+                    exc_info=True,
+                )
+                # Don't propagate - graceful degradation
 
     async def _health_check_loop(self) -> None:
         """Background health check for warm VMs.
