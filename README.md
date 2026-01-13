@@ -31,56 +31,6 @@ brew install qemu                # macOS
 apt install qemu-system          # Ubuntu/Debian
 ```
 
-VM images are **automatically downloaded** from GitHub Releases on first use. No manual setup required.
-
-## Asset Downloads
-
-exec-sandbox requires VM images (kernel, initramfs, qcow2) and binaries (gvproxy-wrapper) to run. These assets are **automatically downloaded** from GitHub Releases on first use.
-
-### How it works
-
-1. On first `Scheduler` initialization, exec-sandbox checks if assets exist in the cache directory
-2. If missing, it queries the GitHub Releases API for the matching version (`v{__version__}`)
-3. Assets are downloaded over HTTPS, verified against SHA256 checksums (provided by GitHub API), and decompressed
-4. Subsequent runs use the cached assets (no re-download)
-
-### Cache locations
-
-| Platform | Location |
-|----------|----------|
-| macOS | `~/Library/Caches/exec-sandbox/` |
-| Linux | `~/.cache/exec-sandbox/` (or `$XDG_CACHE_HOME/exec-sandbox/`) |
-
-### Environment variables
-
-| Variable | Description |
-|----------|-------------|
-| `EXEC_SANDBOX_CACHE_DIR` | Override cache directory |
-| `EXEC_SANDBOX_OFFLINE` | Set to `1` to disable auto-download (fail if assets missing) |
-| `EXEC_SANDBOX_ASSET_VERSION` | Force specific release version |
-
-### Security considerations
-
-**Integrity verification:**
-- All downloaded assets are verified against SHA256 checksums
-- Checksums are fetched from GitHub's Release API (computed at upload time, immutable)
-- If checksum verification fails, the download is rejected and retried
-
-**Supply chain security:**
-- Assets are downloaded exclusively over HTTPS from `github.com`
-- Release assets are built in GitHub Actions CI with [build provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds)
-- You can verify attestations with: `gh attestation verify <asset> --owner dualeai`
-
-**Offline/air-gapped environments:**
-- Pre-download assets: `gh release download v{version} -R dualeai/exec-sandbox -D ~/.cache/exec-sandbox/`
-- Set `EXEC_SANDBOX_OFFLINE=1` to prevent any network requests
-- Or point `EXEC_SANDBOX_CACHE_DIR` to a pre-populated directory
-
-**Network access:**
-- Only connects to `api.github.com` (release metadata) and `github.com` (asset downloads)
-- No telemetry or analytics
-- All requests are read-only (GET)
-
 ## Quick Start
 
 ### Basic Execution
@@ -169,6 +119,36 @@ async with Scheduler() as scheduler:
         print(f"Sandbox error: {e}")
 ```
 
+## Asset Downloads
+
+exec-sandbox requires VM images (kernel, initramfs, qcow2) and binaries (gvproxy-wrapper) to run. These assets are **automatically downloaded** from GitHub Releases on first use.
+
+### How it works
+
+1. On first `Scheduler` initialization, exec-sandbox checks if assets exist in the cache directory
+2. If missing, it queries the GitHub Releases API for the matching version (`v{__version__}`)
+3. Assets are downloaded over HTTPS, verified against SHA256 checksums (provided by GitHub API), and decompressed
+4. Subsequent runs use the cached assets (no re-download)
+
+### Cache locations
+
+| Platform | Location |
+|----------|----------|
+| macOS | `~/Library/Caches/exec-sandbox/` |
+| Linux | `~/.cache/exec-sandbox/` (or `$XDG_CACHE_HOME/exec-sandbox/`) |
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `EXEC_SANDBOX_CACHE_DIR` | Override cache directory |
+| `EXEC_SANDBOX_OFFLINE` | Set to `1` to disable auto-download (fail if assets missing) |
+| `EXEC_SANDBOX_ASSET_VERSION` | Force specific release version |
+
+### Security
+
+Assets are verified against SHA256 checksums and built with [provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds). For offline environments, set `EXEC_SANDBOX_OFFLINE=1` after pre-downloading assets.
+
 ## Documentation
 
 - [QEMU Documentation](https://www.qemu.org/docs/master/) - Virtual machine emulator
@@ -196,45 +176,10 @@ Environment variables: `EXEC_SANDBOX_MAX_CONCURRENT_VMS`, `EXEC_SANDBOX_IMAGES_D
 
 ## Memory Optimization
 
-VMs include automatic memory optimization that requires **no configuration**:
+VMs include automatic memory optimization (no configuration required):
 
-| Feature | What It Does | Benefit |
-|---------|--------------|---------|
-| **Compressed swap (zram)** | Uses RAM as compressed swap space (lz4 compression) | +10-30% usable memory |
-| **Memory reclamation (virtio-balloon)** | Returns unused memory before snapshots | 70-90% smaller snapshots |
-
-**Effective memory (scales with configured RAM):**
-
-| Configured | Available | Compressed Swap | Effective Capacity |
-|------------|-----------|-----------------|-------------------|
-| 256MB | ~175MB | 108MB | ~280-320MB |
-| 512MB | ~420MB | 233MB | ~600-700MB |
-| 1024MB | ~890MB | 484MB | ~1200-1400MB |
-
-Compressed swap (zram) is always 50% of total RAM, so larger VMs get proportionally more expansion.
-
-**Memory reclamation savings (before snapshots):**
-
-| Configured | Reclaimable | Snapshot Size |
-|------------|-------------|---------------|
-| 256MB | ~180MB | ~70MB |
-| 512MB | ~430MB | ~80MB |
-| 1024MB | ~900MB | ~120MB |
-
-Memory reclamation (balloon) shrinks to 64MB minimum, so larger VMs see bigger snapshot reductions.
-
-**What this means for users:**
-
-- Memory-heavy code execution works better than the configured limit suggests
-- Compression ratio depends on data: 18-50x for code/text, ~1x for encrypted/random data
-- Speed impact is negligible (~0.2μs delay per memory access)
-- Snapshot restore is faster due to smaller files
-
-**Tradeoffs:**
-
-- CPU overhead for compression (minimal with lz4)
-- Incompressible data (encryption, media) won't benefit from compressed swap
-- Out-of-memory (OOM) errors may be delayed (compressed swap absorbs pressure before failing)
+- **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
+- **Memory reclamation (virtio-balloon)** - 70-90% smaller snapshots
 
 ## Execution Result
 
