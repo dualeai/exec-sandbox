@@ -22,6 +22,7 @@ from exec_sandbox.asset_downloader import (
     get_current_arch,
     get_gvproxy_suffix,
 )
+from exec_sandbox.permission_utils import chmod_executable
 
 logger = get_logger(__name__)
 
@@ -187,8 +188,6 @@ async def fetch_gvproxy() -> Path:
     Returns:
         Path to the gvproxy-wrapper binary (executable).
     """
-    import asyncio  # noqa: PLC0415
-
     suffix = get_gvproxy_suffix()
     fname = f"gvproxy-wrapper-{suffix}"
 
@@ -196,7 +195,7 @@ async def fetch_gvproxy() -> Path:
     if local_path := get_cached_asset_path(fname):
         logger.debug("Using cached gvproxy-wrapper", extra={"path": str(local_path)})
         # Ensure executable
-        await asyncio.to_thread(local_path.chmod, 0o755)
+        await chmod_executable(local_path)
         return local_path
 
     # Not found locally, download from GitHub
@@ -207,7 +206,7 @@ async def fetch_gvproxy() -> Path:
     path = await assets.fetch(fname)
 
     # Make executable
-    await asyncio.to_thread(path.chmod, 0o755)
+    await chmod_executable(path)
 
     return path
 

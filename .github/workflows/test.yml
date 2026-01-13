@@ -321,6 +321,8 @@ jobs:
           fi
           # Add qemu-vm to kvm group for hardware acceleration access
           sudo usermod -aG kvm qemu-vm
+          # Add runner to qemu-vm group for socket access (sockets are 0660)
+          sudo usermod -aG qemu-vm runner
           # Allow runner to run commands AS qemu-vm (for QEMU process)
           # Note: runner already has full sudo via GitHub Actions, so chown works
           echo "runner ALL=(qemu-vm) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/qemu-vm
@@ -370,13 +372,15 @@ jobs:
           # Requires sudo because moving FROM outside the subtree needs root (common ancestor rule)
           # Once inside, child processes (QEMU) can be moved freely within the subtree
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          make test-func
+          # Use sg to activate qemu-vm group membership (usermod -aG doesn't take effect until next login)
+          # This is required for socket access: QEMU chardev sockets are 0660 owned by qemu-vm:qemu-vm
+          sg qemu-vm -c "make test-func"
 
       - name: Sudo tests (Linux)
         if: matrix.platform.os == 'linux'
         run: |
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          sudo env "PATH=$PATH" make test-sudo
+          sudo env "PATH=$PATH" sg qemu-vm -c "make test-sudo"
 
       - name: Functional tests (macOS)
         if: matrix.platform.os == 'macos'

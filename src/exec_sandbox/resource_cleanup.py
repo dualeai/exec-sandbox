@@ -12,6 +12,7 @@ import aiofiles
 import aiofiles.os
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.permission_utils import sudo_rm
 from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
@@ -220,16 +221,7 @@ async def cleanup_overlay(
     try:
         if use_qemu_vm_user:
             # Overlay was chowned to qemu-vm, need sudo to delete
-            proc = await asyncio.create_subprocess_exec(
-                "sudo",
-                "rm",
-                "-f",
-                str(overlay_path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            if proc.returncode == 0:
+            if await sudo_rm(overlay_path):
                 logger.debug(
                     "overlay image deleted (sudo)",
                     extra={"context_id": context_id, "path": str(overlay_path)},
@@ -237,7 +229,7 @@ async def cleanup_overlay(
                 return True
             logger.error(
                 "overlay image sudo rm failed",
-                extra={"context_id": context_id, "path": str(overlay_path), "returncode": proc.returncode},
+                extra={"context_id": context_id, "path": str(overlay_path)},
             )
             return False
 

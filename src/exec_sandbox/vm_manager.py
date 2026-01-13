@@ -49,10 +49,18 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.models import ExecutionResult, Language
+from exec_sandbox.permission_utils import (
+    can_access,
+    chmod_async,
+    chown_to_qemu_vm,
+    ensure_traversable,
+    get_qemu_vm_uid,
+    grant_qemu_vm_access,
+    probe_sudo_as_qemu_vm,
+)
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
-from exec_sandbox.socket_auth import get_qemu_vm_uid
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
@@ -171,7 +179,6 @@ class _ProbeCache:
         "hvf",
         "io_uring",
         "kvm",
-        "qemu_vm_user",
         "tsc_deadline",
         "unshare",
     )
@@ -180,7 +187,6 @@ class _ProbeCache:
         self.hvf: bool | None = None
         self.io_uring: bool | None = None
         self.kvm: bool | None = None
-        self.qemu_vm_user: bool | None = None
         self.tsc_deadline: bool | None = None
         self.unshare: bool | None = None
 
@@ -232,8 +238,8 @@ def _check_kvm_available() -> bool:
     # This catches permission issues that would cause QEMU to fail or hang
     # See: https://github.com/actions/runner-images/issues/8542
     try:
-        # os.access with R_OK|W_OK checks actual permission for the current user
-        if not os.access(kvm_path, os.R_OK | os.W_OK):
+        # Check actual permission for the current user (uses os.access internally)
+        if not can_access(kvm_path, os.R_OK | os.W_OK):
             logger.debug("KVM not available: permission denied on /dev/kvm")
             _probe_cache.kvm = False
             return False
@@ -501,41 +507,6 @@ async def _probe_unshare_support() -> bool:
         _probe_cache.unshare = False
 
     return _probe_cache.unshare
-
-
-async def _probe_qemu_vm_user() -> bool:
-    """Check if qemu-vm user exists for process isolation (cached).
-
-    Returns:
-        True if qemu-vm user exists, False otherwise
-    """
-    # Fast path: return cached result
-    if _probe_cache.qemu_vm_user is not None:
-        return _probe_cache.qemu_vm_user
-
-    # Skip on macOS - not applicable
-    if detect_host_os() == HostOS.MACOS:
-        _probe_cache.qemu_vm_user = False
-        return False
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/bin/id",
-            "qemu-vm",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=5)
-        _probe_cache.qemu_vm_user = proc.returncode == 0
-        if _probe_cache.qemu_vm_user:
-            logger.info("qemu-vm user available (process isolation enabled)")
-        else:
-            logger.debug("qemu-vm user not found (process isolation disabled)")
-    except (OSError, TimeoutError) as e:
-        logger.debug(f"qemu-vm user probe failed: {e}")
-        _probe_cache.qemu_vm_user = False
-
-    return _probe_cache.qemu_vm_user
 
 
 # Pre-flight validation cache keyed by (kernel_path, arch)
@@ -1115,10 +1086,9 @@ class VmManager:
             return
 
         # Run all async probes concurrently (they cache their results at module level)
-        io_uring_available, unshare_available, qemu_vm_user_available = await asyncio.gather(
+        io_uring_available, unshare_available = await asyncio.gather(
             _probe_io_uring_support(),
             _probe_unshare_support(),
-            _probe_qemu_vm_user(),
         )
 
         # Pre-flight check: validate kernel and initramfs exist (cached)
@@ -1133,7 +1103,6 @@ class VmManager:
                 "max_concurrent_vms": self.settings.max_concurrent_vms,
                 "io_uring_available": io_uring_available,
                 "unshare_available": unshare_available,
-                "qemu_vm_user_available": qemu_vm_user_available,
                 "note": "Any zombie QEMU processes from crashes will timeout naturally (max 2min)",
             },
         )
@@ -1498,16 +1467,16 @@ class VmManager:
                 await vm.destroy()
 
                 # Get QEMU binary from command - handle ulimit wrapper case
-                # When wrapped with sh -c, qemu_cmd is ["sh", "-c", "ulimit ... && exec qemu-system-..."]
+                # When wrapped with bash -c, qemu_cmd is ["bash", "-c", "ulimit ... && exec qemu-system-..."]
                 qemu_binary = "(unknown)"
                 if qemu_cmd:
-                    if qemu_cmd[0] == "sh" and len(qemu_cmd) > 2:  # noqa: PLR2004
+                    if qemu_cmd[0] == "bash" and len(qemu_cmd) > 2:  # noqa: PLR2004
                         # Extract actual QEMU binary from shell command string
                         import re  # noqa: PLC0415
 
                         shell_cmd_str = qemu_cmd[2]
                         qemu_match = re.search(r"(qemu-system-[^\s]+)", shell_cmd_str)
-                        qemu_binary = qemu_match.group(1) if qemu_match else f"sh -c '{shell_cmd_str[:100]}...'"
+                        qemu_binary = qemu_match.group(1) if qemu_match else f"bash -c '{shell_cmd_str[:100]}...'"
                     else:
                         qemu_binary = qemu_cmd[0]
 
@@ -1675,18 +1644,9 @@ class VmManager:
                 },
             )
 
-        # Fix socket permissions so qemu-vm user can connect
-        chmod_proc = ProcessWrapper(
-            await asyncio.create_subprocess_exec(
-                "chmod",
-                "666",
-                str(socket_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        )
-        await chmod_proc.communicate()
+        # Grant qemu-vm user access to socket via ACL (more secure than chmod 666)
+        # Only needed on Linux when qemu-vm user exists; skipped on macOS
+        await grant_qemu_vm_access(socket_path)
 
         logger.info(
             "gvproxy-wrapper started successfully",
@@ -1953,9 +1913,11 @@ class VmManager:
             raise VmError(f"qemu-img create failed: {stderr.decode()}")
 
         # Change ownership to qemu-vm user for process isolation (optional hardening)
-        # Only if: Linux + qemu-vm user exists + have sudo access
+        # Only if: Linux + qemu-vm user exists + can run sudo -u qemu-vm
+        # The stronger probe_sudo_as_qemu_vm() ensures we can actually execute as qemu-vm
+        # (probe_qemu_vm_user only checks if user exists, not sudo permissions)
         # Returns whether QEMU should run as qemu-vm user (based on chown success)
-        if detect_host_os() != HostOS.MACOS and await _probe_qemu_vm_user():
+        if await probe_sudo_as_qemu_vm():
             # Make base image accessible to qemu-vm user
             # qemu-vm needs: read on file + execute on all parent directories
             # This is safe because the base image is read-only (writes go to overlay)
@@ -1967,62 +1929,17 @@ class VmManager:
                 dirs_to_chmod.append(current)
                 current = current.parent
 
-            for dir_path in dirs_to_chmod:
-                chmod_dir_proc = ProcessWrapper(
-                    await asyncio.create_subprocess_exec(
-                        "chmod",
-                        "a+x",
-                        str(dir_path),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        start_new_session=True,
-                    )
-                )
-                await chmod_dir_proc.communicate()
+            await ensure_traversable(dirs_to_chmod)
 
             # Make base image readable
-            chmod_proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    "chmod",
-                    "a+r",
-                    str(base_image),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                )
-            )
-            await chmod_proc.communicate()
-            if chmod_proc.returncode != 0:
+            if not await chmod_async(base_image, "a+r"):
                 logger.debug("Could not chmod base image (qemu-vm may not have access)")
 
-            chown_proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    "sudo",
-                    "chown",
-                    "qemu-vm:qemu-vm",
-                    str(overlay_image),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                )
-            )
-            await chown_proc.communicate()
-            if chown_proc.returncode == 0:
+            if await chown_to_qemu_vm(overlay_image):
                 # Make workdir accessible to qemu-vm for socket creation
                 # mkdtemp creates with mode 0700, but qemu-vm needs access to create sockets
                 workdir_path = overlay_image.parent
-                chmod_workdir_proc = ProcessWrapper(
-                    await asyncio.create_subprocess_exec(
-                        "chmod",
-                        "a+rwx",
-                        str(workdir_path),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        start_new_session=True,
-                    )
-                )
-                await chmod_workdir_proc.communicate()
-                if chmod_workdir_proc.returncode != 0:
+                if not await chmod_async(workdir_path, "a+rwx"):
                     logger.debug("Could not chmod workdir for qemu-vm access")
                 return True  # Overlay chowned to qemu-vm, QEMU should run as qemu-vm
             logger.debug("Could not chown overlay to qemu-vm user (optional hardening)")
@@ -2401,8 +2318,8 @@ class VmManager:
                 # Chardevs for communication channels
                 # server=on: QEMU creates a listening Unix socket
                 # wait=off: QEMU starts VM immediately without waiting for client connection
-                # Note: Socket permissions (via umask 000) are the key fix for Linux,
-                # NOT wait=on. The guest agent retries connection so timing is handled.
+                # Note: Socket permissions (via umask) are set in _build_linux_cmd.
+                # The guest agent retries connection so timing is handled.
                 "-chardev",
                 f"socket,id=cmd0,path={workdir.cmd_socket},server=on,wait=off",
                 "-chardev",
@@ -2524,13 +2441,15 @@ class VmManager:
             # immediately rather than being block-buffered (which happens with piped stdout)
             # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security
             #
-            # umask 000: Create chardev sockets with world-readable/writable permissions (0666).
-            # Without this, sockets are created with restrictive permissions (e.g., 0600)
-            # and the host process cannot connect to sockets owned by 'qemu-vm'.
+            # umask 007: Create chardev sockets with owner+group permissions (0660).
+            # Host user must be in 'qemu-vm' group to connect to sockets owned by 'qemu-vm'.
+            # More secure than 0666 (world-writable). Follows libvirt group membership pattern.
+            # Note: CI uses 'sg qemu-vm' to activate group membership since usermod -aG
+            # doesn't take effect until next login.
             import shlex  # noqa: PLC0415
 
             qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_args)
-            cmd.extend(["sudo", "-u", "qemu-vm", "sh", "-c", f"umask 000 && exec stdbuf -oL {qemu_cmd_str}"])
+            cmd.extend(["sudo", "-u", "qemu-vm", "sh", "-c", f"umask 007 && exec stdbuf -oL {qemu_cmd_str}"])
             return cmd  # Already added qemu_args via sh -c
 
         cmd.extend(qemu_args)

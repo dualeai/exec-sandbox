@@ -18,10 +18,10 @@ import pwd
 import socket
 import struct
 from dataclasses import dataclass
-from functools import lru_cache
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import SocketAuthError
+from exec_sandbox.permission_utils import get_qemu_vm_uid
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 logger = get_logger(__name__)
@@ -198,19 +198,6 @@ def verify_socket_peer(
         "Socket peer credentials verified",
         extra={"uid": creds.uid, "gid": creds.gid, "pid": creds.pid},
     )
-
-
-@lru_cache(maxsize=1)
-def get_qemu_vm_uid() -> int | None:
-    """Get UID for qemu-vm user if it exists (cached).
-
-    Returns:
-        UID of qemu-vm user, or None if user doesn't exist
-    """
-    try:
-        return pwd.getpwnam("qemu-vm").pw_uid
-    except KeyError:
-        return None
 
 
 async def connect_and_verify(

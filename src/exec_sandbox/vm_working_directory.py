@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.permission_utils import sudo_rm
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -173,22 +174,12 @@ class VmWorkingDirectory:
         try:
             if self._use_qemu_vm_user:
                 # Files owned by qemu-vm user, need sudo
-                proc = await asyncio.create_subprocess_exec(
-                    "sudo",
-                    "rm",
-                    "-rf",
-                    str(self._path),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-                if proc.returncode != 0:
+                if not await sudo_rm(self._path):
                     logger.error(
                         "VM working directory sudo rm failed",
                         extra={
                             "vm_id": self.vm_id,
                             "path": str(self._path),
-                            "returncode": proc.returncode,
                         },
                     )
                     return False

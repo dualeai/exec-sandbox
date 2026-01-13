@@ -298,6 +298,28 @@ sysctl kern.hv_support   # macOS
 
 Without hardware acceleration, QEMU uses software emulation (TCG), which is 10-50x slower.
 
+### Linux Setup (Optional Security Hardening)
+
+For enhanced security on Linux, exec-sandbox can run QEMU as an unprivileged `qemu-vm` user. This isolates the VM process from your user account.
+
+```bash
+# Create qemu-vm system user
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin qemu-vm
+
+# Add qemu-vm to kvm group (for hardware acceleration)
+sudo usermod -aG kvm qemu-vm
+
+# Add your user to qemu-vm group (for socket access)
+sudo usermod -aG qemu-vm $USER
+
+# Re-login or activate group membership
+newgrp qemu-vm
+```
+
+**Why is this needed?** When `qemu-vm` user exists, exec-sandbox runs QEMU as that user for process isolation. The host needs to connect to QEMU's Unix sockets (0660 permissions), which requires group membership. This follows the [libvirt security model](https://wiki.archlinux.org/title/Libvirt).
+
+If `qemu-vm` user doesn't exist, exec-sandbox runs QEMU as your user (no additional setup required, but less isolated).
+
 ## VM Images
 
 Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/releases):

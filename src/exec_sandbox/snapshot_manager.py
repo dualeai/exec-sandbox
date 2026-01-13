@@ -53,6 +53,7 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingErrorMessage,
 )
 from exec_sandbox.models import Language
+from exec_sandbox.permission_utils import sudo_exec
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.qmp_client import QMPClientWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
@@ -660,21 +661,21 @@ class SnapshotManager:
         )
 
         # When overlay is owned by qemu-vm user, need sudo to read it
-        if use_qemu_vm_user:
-            cmd = ["sudo", "qemu-img", "commit", str(overlay_path)]
-        else:
-            cmd = ["qemu-img", "commit", str(overlay_path)]
-
         # Capture stderr for error reporting
         stderr_lines: list[str] = []
 
-        proc = ProcessWrapper(
-            await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        if use_qemu_vm_user:
+            proc = await sudo_exec(["qemu-img", "commit", str(overlay_path)])
+        else:
+            proc = ProcessWrapper(
+                await asyncio.create_subprocess_exec(
+                    "qemu-img",
+                    "commit",
+                    str(overlay_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             )
-        )
 
         # Drain subprocess output using subprocess_utils (prevents pipe deadlock)
         context_id = f"commit-{overlay_path.name}"
