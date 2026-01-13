@@ -10,6 +10,7 @@ Uses dynamic fixtures to test various payload sizes.
 """
 
 import hashlib
+from collections.abc import Callable
 
 import pytest
 
@@ -40,7 +41,21 @@ STREAMING_ONLY_SIZES = {
     "2mb": 2_000_000,  # 2 MB
     "5mb": 5_000_000,  # 5 MB
     "10mb": 10_000_000,  # 10 MB
+    "25mb": 25_000_000,  # 25 MB
+    "50mb": 50_000_000,  # 50 MB
+    "100mb": 100_000_000,  # 100 MB
+    "200mb": 200_000_000,  # 200 MB
+    "500mb": 500_000_000,  # 500 MB
 }
+
+# Extra large sizes need longer timeout (generation + transfer time)
+# 500MB needs significant time for generation
+EXTRA_LARGE_TIMEOUT_SECONDS = 300
+
+# Throughput thresholds (MiB/s) - CI runners have variable I/O performance,
+# so we use low thresholds to catch severe regressions only
+MIN_THROUGHPUT_DEVZERO_MIBPS = 1  # /dev/zero throughput (local: ~20+, CI: ~2)
+MIN_THROUGHPUT_URANDOM_MIBPS = 1  # /dev/urandom throughput (local: ~15+, CI: ~3)
 
 
 @pytest.fixture(params=list(PAYLOAD_SIZES.keys()))
@@ -93,29 +108,39 @@ def generate_sequential_bytes(size: int) -> bytes:
 
 
 def python_code_for_ascii_pattern(size: int) -> str:
-    """Generate Python code that outputs ASCII pattern of given size."""
+    """Generate Python code that outputs ASCII pattern of given size.
+
+    Uses chunked string multiplication to stay within VM memory limits (256MB).
+    Each chunk is generated independently using the same deterministic pattern.
+    """
     if size == 1:
         return 'print("A", end="")'
 
-    # For larger sizes, write in chunks to avoid memory issues
-    if size > 100 * 1024:
-        return f"""
-import sys
-chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-size = {size}
-chunk_size = 64 * 1024
-for start in range(0, size, chunk_size):
-    end = min(start + chunk_size, size)
-    chunk = "".join(chars[i % len(chars)] for i in range(start, end))
-    sys.stdout.write(chunk)
-sys.stdout.flush()
-"""
+    # Chunked approach - generate 1MB at a time to stay within VM memory
+    # Pattern must match host's generate_ascii_pattern() exactly
     return f"""
 import sys
 chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 size = {size}
-output = "".join(chars[i % len(chars)] for i in range(size))
-sys.stdout.write(output)
+chars_len = len(chars)
+chunk_size = 1024 * 1024  # 1MB chunks
+
+written = 0
+while written < size:
+    # Calculate this chunk's size
+    remaining = size - written
+    this_chunk = min(chunk_size, remaining)
+
+    # Build chunk using string multiplication (fast)
+    # Offset ensures pattern continues correctly across chunks
+    offset = written % chars_len
+    rotated = chars[offset:] + chars[:offset]
+    repeats = (this_chunk // chars_len) + 2
+    chunk = (rotated * repeats)[:this_chunk]
+
+    sys.stdout.write(chunk)
+    written += this_chunk
+
 sys.stdout.flush()
 """
 
@@ -404,20 +429,30 @@ class TestRawPayloadIntegrity:
 
 
 # =============================================================================
-# Large Payload Streaming Tests (1MB - 10MB)
+# Large Payload Streaming Tests (1MB - 500MB)
 # =============================================================================
 # NOTE: Payloads >= 1MB exceed stdout limit, so we use streaming callbacks.
 
 
 class TestLargePayloadStreaming:
-    """Large payload streaming tests (1MB - 10MB).
+    """Large payload streaming tests (1MB - 500MB).
 
     These tests use streaming callbacks because stdout is limited to 1MB.
+    Tests 25MB+ use longer timeout to account for generation + transfer time.
+
+    Verified stream reliability:
+    - 64KB chunking from guest agent (flushed every 50ms or when buffer full)
+    - 16MB asyncio buffer handles individual messages easily
+    - SHA256 hash verification ensures zero data corruption
+    - Throughput: ~20+ MiB/s for raw data (dd from /dev/zero)
     """
 
     async def test_streaming_integrity(self, scheduler: Scheduler, streaming_payload_size: tuple[str, int]) -> None:
         """Verify streaming receives all data for large payloads."""
         size_name, size_bytes = streaming_payload_size
+
+        # Use longer timeout for extra large payloads (25MB+)
+        timeout = EXTRA_LARGE_TIMEOUT_SECONDS if size_bytes >= 25_000_000 else TIMEOUT_SECONDS
 
         expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
         code = python_code_for_ascii_pattern(size_bytes)
@@ -430,7 +465,7 @@ class TestLargePayloadStreaming:
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=TIMEOUT_SECONDS,
+            timeout_seconds=timeout,
             on_stdout=on_stdout,
         )
 
@@ -449,3 +484,162 @@ class TestLargePayloadStreaming:
         assert streamed_hash == expected_hash, (
             f"[{size_name}] Streamed data corrupted!\nExpected: {expected_hash}\nActual: {streamed_hash}"
         )
+
+
+# =============================================================================
+# Throughput Benchmark Tests
+# =============================================================================
+# Measure raw streaming throughput by minimizing generation overhead
+
+
+class TestStreamingThroughput:
+    """Benchmark tests to measure raw streaming throughput.
+
+    Uses optimized data generation (os.urandom or /dev/zero) to isolate
+    streaming performance from Python string manipulation overhead.
+    """
+
+    @pytest.mark.parametrize("size_mib", [10, 50, 100])
+    async def test_raw_throughput_devzero(self, scheduler: Scheduler, size_mib: int) -> None:
+        """Measure throughput using /dev/zero (fastest possible generation)."""
+        import time
+
+        # 1M in dd = 1 MiB = 1024*1024 bytes
+        expected_bytes = size_mib * 1024 * 1024
+
+        # Use dd from /dev/zero - zero generation overhead
+        code = f"dd if=/dev/zero bs=1M count={size_mib} 2>/dev/null"
+
+        streamed_bytes = 0
+        start_time = time.perf_counter()
+
+        def on_stdout(chunk: str) -> None:
+            nonlocal streamed_bytes
+            streamed_bytes += len(chunk.encode("utf-8"))
+
+        result = await scheduler.run(
+            code=code,
+            language=Language.RAW,
+            timeout_seconds=120,
+            on_stdout=on_stdout,
+        )
+
+        elapsed = time.perf_counter() - start_time
+        throughput_mibps = (streamed_bytes / (1024 * 1024)) / elapsed
+
+        assert result.exit_code == 0, f"dd failed: {result.stderr}"
+        assert streamed_bytes == expected_bytes, f"Size mismatch: {streamed_bytes} vs {expected_bytes}"
+
+        assert throughput_mibps > MIN_THROUGHPUT_DEVZERO_MIBPS, f"Throughput too low: {throughput_mibps:.1f} MiB/s"
+
+    @pytest.mark.parametrize("size_mib", [10, 50, 100])
+    async def test_raw_throughput_urandom(self, scheduler: Scheduler, size_mib: int) -> None:
+        """Measure throughput with random data (tests full pipeline)."""
+        import time
+
+        # Use dd from /dev/urandom - realistic random data
+        # base64 expands by ~33%, so output is ~1.33x input size
+        code = f"dd if=/dev/urandom bs=1M count={size_mib} 2>/dev/null | base64"
+
+        streamed_bytes = 0
+        start_time = time.perf_counter()
+
+        def on_stdout(chunk: str) -> None:
+            nonlocal streamed_bytes
+            streamed_bytes += len(chunk)
+
+        result = await scheduler.run(
+            code=code,
+            language=Language.RAW,
+            timeout_seconds=120,
+            on_stdout=on_stdout,
+        )
+
+        elapsed = time.perf_counter() - start_time
+        # base64 expands by ~33%, so effective raw bytes is 3/4 of output
+        effective_mib = (streamed_bytes * 3 // 4) / (1024 * 1024)
+        throughput_mibps = effective_mib / elapsed
+
+        assert result.exit_code == 0, f"dd failed: {result.stderr}"
+        assert throughput_mibps > MIN_THROUGHPUT_URANDOM_MIBPS, f"Throughput too low: {throughput_mibps:.1f} MiB/s"
+
+
+# =============================================================================
+# Stress Tests - Rapid Sequential Payloads
+# =============================================================================
+
+
+class TestStreamingStress:
+    """Stress tests for streaming reliability under load."""
+
+    async def test_rapid_small_payloads(self, scheduler: Scheduler) -> None:
+        """Send many small payloads rapidly to test connection stability."""
+        num_iterations = 20
+        payload_size = 100_000  # 100KB each
+
+        expected_hash = compute_hash(generate_ascii_pattern(payload_size))
+        code = python_code_for_ascii_pattern(payload_size)
+
+        for i in range(num_iterations):
+            chunks: list[str] = []
+
+            def make_callback(chunk_list: list[str]) -> Callable[[str], None]:
+                def on_stdout(chunk: str) -> None:
+                    chunk_list.append(chunk)
+
+                return on_stdout
+
+            result = await scheduler.run(
+                code=code,
+                language=Language.PYTHON,
+                timeout_seconds=30,
+                on_stdout=make_callback(chunks),
+            )
+
+            assert result.exit_code == 0, f"Iteration {i} failed: {result.stderr}"
+
+            streamed_data = "".join(chunks).rstrip("\n").encode("utf-8")
+            actual_hash = compute_hash(streamed_data)
+
+            assert actual_hash == expected_hash, f"Iteration {i} corrupted!"
+
+    async def test_interleaved_stdout_stderr(self, scheduler: Scheduler) -> None:
+        """Test rapid interleaving of stdout and stderr streams."""
+        # Generate alternating stdout/stderr output
+        code = """
+import sys
+for i in range(1000):
+    sys.stdout.write(f"OUT{i:04d}\\n")
+    sys.stdout.flush()
+    sys.stderr.write(f"ERR{i:04d}\\n")
+    sys.stderr.flush()
+"""
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        def on_stdout(chunk: str) -> None:
+            stdout_chunks.append(chunk)
+
+        def on_stderr(chunk: str) -> None:
+            stderr_chunks.append(chunk)
+
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=60,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+
+        assert result.exit_code == 0, f"Interleave test failed: {result.stderr}"
+
+        # Verify all lines present (order may vary due to buffering)
+        stdout_full = "".join(stdout_chunks)
+        stderr_full = "".join(stderr_chunks)
+
+        stdout_lines = [line for line in stdout_full.strip().split("\n") if line]
+        stderr_lines = [line for line in stderr_full.strip().split("\n") if line]
+
+        assert len(stdout_lines) == 1000, f"Missing stdout lines: {len(stdout_lines)}"
+        assert len(stderr_lines) == 1000, f"Missing stderr lines: {len(stderr_lines)}"
