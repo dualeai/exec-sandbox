@@ -227,7 +227,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14", "3.14t"]
         platform:
           - os: linux
             arch: x64
