@@ -141,9 +141,7 @@ class TestSchedulerConfig:
 class TestSchedulerSnapshotInit:
     """Tests for SnapshotManager initialization in Scheduler."""
 
-    async def test_snapshot_manager_initialized_without_s3(
-        self, scheduler_config: SchedulerConfig
-    ) -> None:
+    async def test_snapshot_manager_initialized_without_s3(self, scheduler_config: SchedulerConfig) -> None:
         """SnapshotManager is created even without S3 config (L1 cache works)."""
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
@@ -159,9 +157,7 @@ class TestSchedulerSnapshotInit:
         async with Scheduler(config) as scheduler:
             assert scheduler._snapshot_manager is not None
 
-    async def test_snapshot_manager_has_vm_manager(
-        self, scheduler_config: SchedulerConfig
-    ) -> None:
+    async def test_snapshot_manager_has_vm_manager(self, scheduler_config: SchedulerConfig) -> None:
         """SnapshotManager receives vm_manager reference."""
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
@@ -913,9 +909,7 @@ class TestSchedulerWarmPoolTiming:
         assert result.timing.execute_ms >= 40  # Allow some variance
         assert result.timing.total_ms >= 40
 
-    async def test_warm_pool_total_approximately_equals_execute(
-        self, warm_pool_scheduler: Scheduler
-    ) -> None:
+    async def test_warm_pool_total_approximately_equals_execute(self, warm_pool_scheduler: Scheduler) -> None:
         """For warm pool, total_ms should be close to execute_ms (no boot overhead)."""
         result = await warm_pool_scheduler.run(
             code="print('hello')",
@@ -929,9 +923,7 @@ class TestSchedulerWarmPoolTiming:
         # Total shouldn't be dramatically larger than execute for warm pool
         assert result.timing.total_ms <= result.timing.execute_ms + 100  # 100ms tolerance
 
-    async def test_warm_pool_exhaustion_falls_back_to_cold(
-        self, scheduler_config: SchedulerConfig
-    ) -> None:
+    async def test_warm_pool_exhaustion_falls_back_to_cold(self, scheduler_config: SchedulerConfig) -> None:
         """When warm pool is exhausted, falls back to cold boot with full timing."""
         import asyncio
 
