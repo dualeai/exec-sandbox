@@ -1315,7 +1315,7 @@ class VmManager:
 
                 # Check if process crashed immediately BEFORE starting drain task
                 # This ensures we can capture stderr/stdout on immediate crash
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.02)
                 if qemu_proc.returncode is not None:
                     stdout_text, stderr_text = await self._capture_qemu_output(qemu_proc)
 
@@ -1614,10 +1614,10 @@ class VmManager:
         gvproxy_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         # Wait for socket creation (max 5 seconds)
-        for _ in range(50):
+        for _ in range(250):
             if socket_path.exists():
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
         else:
             await proc.terminate()
             await proc.wait()
