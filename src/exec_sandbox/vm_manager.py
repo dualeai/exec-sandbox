@@ -38,7 +38,7 @@ import aiofiles
 import aiofiles.os
 from tenacity import AsyncRetrying, before_sleep_log, retry_if_exception_type, wait_random_exponential
 
-from exec_sandbox import constants
+from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.dns_filter import generate_dns_zones_json
 from exec_sandbox.exceptions import VmError, VmTimeoutError
@@ -50,10 +50,7 @@ from exec_sandbox.guest_agent_protocol import (
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.models import ExecutionResult, Language
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
-from exec_sandbox.resource_cleanup import (
-    cleanup_cgroup,
-    cleanup_process,
-)
+from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import get_qemu_vm_uid
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
@@ -995,38 +992,7 @@ class QemuVM:
             Tuple of (cpu_time_ms, peak_memory_mb)
             Returns (None, None) if cgroup not available or read fails
         """
-        if not self.cgroup_path or not await aiofiles.os.path.exists(self.cgroup_path):
-            return (None, None)
-
-        cpu_time_ms: int | None = None
-        peak_memory_mb: int | None = None
-
-        try:
-            # Read cpu.stat for usage_usec (microseconds)
-            cpu_stat_file = self.cgroup_path / "cpu.stat"
-            if await aiofiles.os.path.exists(cpu_stat_file):
-                async with aiofiles.open(cpu_stat_file) as f:
-                    cpu_stat = await f.read()
-                for line in cpu_stat.splitlines():
-                    if line.startswith("usage_usec"):
-                        usage_usec = int(line.split()[1])
-                        cpu_time_ms = usage_usec // 1000  # Convert to milliseconds
-                        break
-
-            # Read memory.peak for peak memory usage (bytes)
-            memory_peak_file = self.cgroup_path / "memory.peak"
-            if await aiofiles.os.path.exists(memory_peak_file):
-                async with aiofiles.open(memory_peak_file) as f:
-                    peak_bytes = int((await f.read()).strip())
-                peak_memory_mb = peak_bytes // (1024 * 1024)  # Convert to MB
-
-        except (OSError, ValueError) as e:
-            logger.debug(
-                f"Failed to read cgroup stats: {e}",
-                extra={"vm_id": self.vm_id, "cgroup_path": str(self.cgroup_path)},
-            )
-
-        return (cpu_time_ms, peak_memory_mb)
+        return await cgroup.read_cgroup_stats(self.cgroup_path)
 
     async def destroy(self) -> None:
         """Clean up VM and resources.
@@ -1086,32 +1052,9 @@ class QemuVM:
 
         # Step 3-4: Parallel cleanup (cgroup + workdir)
         # After QEMU terminates, cleanup tasks are independent
-        async def cleanup_cgroup_fn():
-            """Remove cgroup asynchronously."""
-            if self.cgroup_path.exists():
-                try:
-                    # Move all processes to parent cgroup first
-                    parent_cgroup = self.cgroup_path.parent / "cgroup.procs"
-                    if parent_cgroup.exists():
-                        async with aiofiles.open(self.cgroup_path / "cgroup.procs") as f:
-                            pids = (await f.read()).strip().split("\n")
-                        for pid in pids:
-                            if pid:
-                                try:
-                                    async with aiofiles.open(parent_cgroup, "w") as f:
-                                        await f.write(pid)
-                                except (OSError, PermissionError):
-                                    pass
-
-                    # Remove cgroup directory
-                    await aiofiles.os.rmdir(self.cgroup_path)
-                except (OSError, PermissionError):
-                    pass
-
-        # Run cleanup tasks in parallel
         # workdir.cleanup() removes overlay, sockets, and console log in one operation
         await asyncio.gather(
-            cleanup_cgroup_fn(),
+            cgroup.cleanup_cgroup(self.cgroup_path, self.vm_id),
             self.workdir.cleanup(),
             return_exceptions=True,
         )
@@ -1315,7 +1258,7 @@ class VmManager:
                 # Run all tasks in parallel including gvproxy
                 overlay_result, cgroup_result, gvproxy_result = await asyncio.gather(
                     self._create_overlay(base_image, workdir.overlay_image),
-                    self._setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
+                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     self._start_gvproxy(vm_id, allowed_domains, language, workdir),
                     return_exceptions=True,
                 )
@@ -1335,11 +1278,16 @@ class VmManager:
 
                 # Unpack tuple from _start_gvproxy
                 gvproxy_proc, gvproxy_log_task = gvproxy_result
+
+                # Attach gvproxy to cgroup for resource limits (memory, CPU, PIDs)
+                # This prevents runaway connections from exhausting host resources
+                # pids.max also limits goroutines since they map to OS threads
+                await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
             else:
                 # Run overlay and cgroup setup in parallel (no gvproxy)
                 overlay_result, cgroup_result = await asyncio.gather(
                     self._create_overlay(base_image, workdir.overlay_image),
-                    self._setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
+                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     return_exceptions=True,
                 )
                 setup_complete_time = asyncio.get_event_loop().time()
@@ -1392,9 +1340,8 @@ class VmManager:
 
             # If cgroups unavailable, wrap with ulimit for host resource control
             # ulimit works on Linux, macOS, BSD (POSIX)
-            cgroups_available = str(cgroup_path).startswith("/sys/fs/cgroup")
-            if not cgroups_available:
-                qemu_cmd = self._wrap_with_ulimit(qemu_cmd, memory_mb)
+            if not cgroup.is_cgroup_available(cgroup_path):
+                qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, memory_mb)
 
             # Step 7: Launch QEMU
             try:
@@ -1408,8 +1355,7 @@ class VmManager:
                 )
 
                 # Attach process to cgroup (only if cgroups available)
-                if cgroups_available and qemu_proc.pid is not None:
-                    await self._attach_to_cgroup(cgroup_path, qemu_proc.pid)
+                await cgroup.attach_if_available(cgroup_path, qemu_proc.pid)
 
                 # Check if process crashed immediately BEFORE starting drain task
                 # This ensures we can capture stderr/stdout on immediate crash
@@ -1821,7 +1767,7 @@ class VmManager:
 
         file_results = await asyncio.gather(
             cleanup_workdir(),
-            cleanup_cgroup(
+            cgroup.cleanup_cgroup(
                 cgroup_path=cgroup_path,
                 context_id=vm_id,
             ),
@@ -2083,124 +2029,6 @@ class VmManager:
             return False  # Chown failed, QEMU should run as current user
 
         return False  # qemu-vm not available, QEMU should run as current user
-
-    async def _setup_cgroup(self, vm_id: str, tenant_id: str, memory_mb: int, use_tcg: bool) -> Path:
-        """Set up cgroup v2 resource limits.
-
-        Limits:
-        - memory.max: guest_mb + overhead (+ TCG TB cache if software emulation)
-        - cpu.max: 100000 (1 vCPU)
-        - pids.max: 100 (fork bomb prevention)
-
-        Args:
-            vm_id: Unique VM identifier
-            tenant_id: Tenant identifier
-            memory_mb: Guest VM memory in MB
-            use_tcg: True if using TCG software emulation (needs extra memory for TB cache)
-
-        Returns:
-            Path to cgroup directory (dummy path if cgroups unavailable)
-
-        Note:
-            Gracefully degrades to no resource limits on Docker Desktop (read-only /sys/fs/cgroup)
-            or environments without cgroup v2 support.
-
-            TCG mode requires significantly more memory due to the translation block (TB) cache.
-            QEMU 5.0+ defaults to 1GB TB cache; we use 512MB (tb-size=512) but still need to
-            account for this overhead. See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache
-        """
-        tenant_cgroup = Path(f"/sys/fs/cgroup/code-exec/{tenant_id}")
-        cgroup_path = tenant_cgroup / vm_id
-
-        try:
-            # Create tenant cgroup and enable controllers for nested VM cgroups
-            # In cgroup v2, subtree_control only affects immediate children,
-            # so we must enable controllers at each level of the hierarchy
-            await aiofiles.os.makedirs(tenant_cgroup, exist_ok=True)
-            async with aiofiles.open(tenant_cgroup / "cgroup.subtree_control", "w") as f:
-                await f.write("+memory +cpu +pids")
-
-            # Create VM cgroup
-            await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
-
-            # Calculate memory limit based on virtualization mode:
-            # - KVM/HVF: guest_mb + process overhead (~200MB)
-            # - TCG: guest_mb + TB cache (512MB) + process overhead (~200MB)
-            # TCG needs the TB cache for JIT-compiled code translation blocks
-            cgroup_memory_mb = memory_mb + constants.CGROUP_MEMORY_OVERHEAD_MB
-            if use_tcg:
-                cgroup_memory_mb += constants.TCG_TB_CACHE_SIZE_MB
-
-            async with aiofiles.open(cgroup_path / "memory.max", "w") as f:
-                await f.write(str(cgroup_memory_mb * 1024 * 1024))
-
-            # Set CPU limit (1 vCPU)
-            async with aiofiles.open(cgroup_path / "cpu.max", "w") as f:
-                await f.write("100000 100000")
-
-            # Set PID limit (fork bomb prevention)
-            async with aiofiles.open(cgroup_path / "pids.max", "w") as f:
-                await f.write(str(constants.CGROUP_PIDS_LIMIT))
-
-            # Verify cgroup.procs is writable (required for attaching processes)
-            # Writing to control files (memory.max, etc.) requires different privileges
-            # than writing to cgroup.procs, which needs proper systemd delegation
-            async with aiofiles.open(cgroup_path / "cgroup.procs", "a") as f:
-                pass  # Just test we can open for writing
-
-        except OSError as e:
-            # Gracefully degrade if cgroups unavailable (e.g., Docker Desktop, CI runners)
-            # Note: PermissionError is a subclass of OSError
-            if e.errno in (constants.ERRNO_READ_ONLY_FILESYSTEM, constants.ERRNO_PERMISSION_DENIED):
-                logger.warning(
-                    "cgroup v2 unavailable, resource limits disabled",
-                    extra={"vm_id": vm_id, "path": str(cgroup_path), "errno": e.errno},
-                )
-                return Path(f"/tmp/cgroup-{vm_id}")  # noqa: S108
-            raise VmError(f"Failed to setup cgroup: {e}") from e
-
-        return cgroup_path
-
-    async def _attach_to_cgroup(self, cgroup_path: Path, pid: int) -> None:
-        """Attach process to cgroup.
-
-        Args:
-            cgroup_path: cgroup directory
-            pid: Process ID to attach
-
-        Raises:
-            VmError: Failed to attach process
-        """
-        try:
-            async with aiofiles.open(cgroup_path / "cgroup.procs", "w") as f:
-                await f.write(str(pid))
-        except (OSError, PermissionError) as e:
-            raise VmError(f"Failed to attach PID {pid} to cgroup: {e}") from e
-
-    def _wrap_with_ulimit(self, qemu_cmd: list[str], memory_mb: int) -> list[str]:
-        """Wrap QEMU command with ulimit for resource control (cgroups alternative).
-
-        Args:
-            qemu_cmd: Original QEMU command
-            memory_mb: Guest memory in MB
-
-        Returns:
-            Command wrapped with ulimit via sh -c
-        """
-        import shlex  # noqa: PLC0415
-
-        qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
-
-        # QEMU overhead: ~1.5-2x guest memory for KVM
-        virtual_mem_kb = memory_mb * 1024 * constants.ULIMIT_MEMORY_MULTIPLIER
-
-        # Platform-specific: macOS kernel doesn't support modifying virtual memory limits
-        if detect_host_os() == HostOS.MACOS:
-            shell_cmd = f"exec {qemu_cmd_str}"
-        else:
-            shell_cmd = f"ulimit -v {virtual_mem_kb} && exec {qemu_cmd_str}"
-
-        return ["sh", "-c", shell_cmd]
 
     async def _build_linux_cmd(  # noqa: PLR0912, PLR0915
         self,

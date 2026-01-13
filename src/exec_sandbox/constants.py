@@ -20,17 +20,6 @@ MAX_MEMORY_MB: Final[int] = 2048
 TMPFS_SIZE_MB: Final[int] = 128
 """tmpfs /tmp size limit in MB (half of default VM memory)."""
 
-CGROUP_MEMORY_OVERHEAD_MB: Final[int] = 200
-"""QEMU process overhead added to guest memory for cgroup limits."""
-
-TCG_TB_CACHE_SIZE_MB: Final[int] = 512
-"""TCG translation block cache size in MB (must match tb-size in vm_manager.py).
-QEMU 5.0+ defaults to 1GB, we use 512MB for better CI compatibility.
-See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache"""
-
-CGROUP_PIDS_LIMIT: Final[int] = 100
-"""Maximum PIDs in cgroup (fork bomb prevention)."""
-
 # ============================================================================
 # Execution Timeouts
 # ============================================================================
@@ -57,12 +46,6 @@ Must be >= guest-agent TERM_GRACE_PERIOD_SECONDS (5s) + overhead."""
 
 PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 120
 """Timeout for package installation in guest VM."""
-
-ULIMIT_CPU_TIME_SECONDS: Final[int] = 60
-"""CPU time limit for ulimit (fallback when cgroups unavailable)."""
-
-ULIMIT_MEMORY_MULTIPLIER: Final[int] = 14
-"""Virtual memory multiplier for ulimit (guest_mb * 14 for TCG overhead)."""
 
 # ============================================================================
 # Code Execution Limits
@@ -126,12 +109,6 @@ NPM_PACKAGE_DOMAINS: Final[list[str]] = [
 # ============================================================================
 # System Limits
 # ============================================================================
-
-ERRNO_READ_ONLY_FILESYSTEM: Final[int] = 30
-"""errno code for read-only filesystem (OSError.errno)."""
-
-ERRNO_PERMISSION_DENIED: Final[int] = 13
-"""errno code for permission denied (OSError.errno)."""
 
 CONSOLE_LOG_MAX_BYTES: Final[int] = 8000
 """Maximum bytes to capture from VM console log for debugging (context/structured logs)."""

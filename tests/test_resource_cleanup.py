@@ -4,9 +4,9 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from exec_sandbox.cgroup import cleanup_cgroup
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import (
-    cleanup_cgroup,
     cleanup_file,
     cleanup_overlay,
     cleanup_process,
@@ -317,29 +317,36 @@ class TestResourceCleanupFilesystem:
         # Verify REAL deletion happened
         assert not regular_dir.exists()
 
-    async def test_cleanup_cgroup_not_empty_error(self, tmp_path: Path):
-        """OSError on non-empty directory returns False."""
+    async def test_cleanup_cgroup_non_cgroup_path_silently_succeeds(self, tmp_path: Path):
+        """Non-cgroup paths (fallback dummy paths) always return True.
+
+        This is intentional: fallback paths like /tmp/cgroup-vm123 are used
+        when cgroups are unavailable. These dummy paths may not exist and
+        errors during cleanup are silently ignored.
+        """
         cgroup_dir = tmp_path / "test-cgroup"
         cgroup_dir.mkdir()
         (cgroup_dir / "somefile.txt").write_text("content")
 
-        # REAL cleanup_cgroup logic with real filesystem
-        # Real rmdir will fail on non-empty directory
+        # Non-cgroup paths silently succeed even if rmdir fails
         result = await cleanup_cgroup(cgroup_dir, "test-ctx")
 
-        assert result is False
-        # Verify directory still exists (cleanup failed)
+        assert result is True
+        # Directory still exists (rmdir failed but was suppressed)
         assert cgroup_dir.exists()
 
-    async def test_cleanup_cgroup_permission_error(self, tmp_path: Path):
-        """Permission error returns False."""
-        cgroup_dir = tmp_path / "test-cgroup"
-        cgroup_dir.mkdir()
+    async def test_cleanup_cgroup_real_cgroup_error(self):
+        """Real cgroup paths report errors on failure."""
+        # Mock path to look like a real cgroup path
+        fake_cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
 
-        # Mock aiofiles.os.rmdir to simulate permission error
-        with patch("aiofiles.os.rmdir", side_effect=PermissionError("Access denied")):
-            # REAL error handling logic runs
-            result = await cleanup_cgroup(cgroup_dir, "test-ctx")
+        # Mock filesystem operations
+        with (
+            patch("exec_sandbox.cgroup._check_cgroup_v2_mounted", return_value=True),
+            patch("aiofiles.os.path.exists", return_value=False),
+            patch("aiofiles.os.rmdir", side_effect=OSError("Directory not empty")),
+        ):
+            result = await cleanup_cgroup(fake_cgroup_path, "test-ctx")
 
             assert result is False
 

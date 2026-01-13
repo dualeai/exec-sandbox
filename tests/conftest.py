@@ -7,7 +7,24 @@ from pathlib import Path
 import pytest
 
 from exec_sandbox.config import SchedulerConfig
+from exec_sandbox.platform_utils import HostOS, detect_host_os
 from exec_sandbox.scheduler import Scheduler
+
+# ============================================================================
+# Shared Skip Markers
+# ============================================================================
+
+# Skip marker for Linux-only tests (cgroups, virtual memory ulimit, etc.)
+skip_unless_linux = pytest.mark.skipif(
+    detect_host_os() != HostOS.LINUX,
+    reason="This test requires Linux (cgroups, virtual memory limits, etc.)",
+)
+
+# Skip marker for macOS-only tests (HVF, macOS-specific behavior, etc.)
+skip_unless_macos = pytest.mark.skipif(
+    detect_host_os() != HostOS.MACOS,
+    reason="This test requires macOS",
+)
 
 # ============================================================================
 # Common Paths and Config Fixtures
