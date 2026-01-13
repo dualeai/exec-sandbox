@@ -17,6 +17,7 @@ Integration tests require QEMU + images (run 'make build-images').
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from tests.conftest import skip_on_python_312_subprocess_bug
 
 
 class TestPid1ZombieReaping:
@@ -246,6 +247,11 @@ print('RAPID_SPAWNS:50')
 class TestZombieReapingShell:
     """Shell-based tests for zombie reaping."""
 
+    # NOTE: This test triggers CPython bug #103847 on Python 3.12.
+    # The shell double-fork pattern (`sh -c 'sh -c "..." &' &`) creates complex
+    # subprocess trees that cause asyncio to hang during task cancellation.
+    # Fixed in Python 3.13+ via https://github.com/python/cpython/pull/140805
+    @skip_on_python_312_subprocess_bug
     async def test_shell_orphan_reaped(self, scheduler: Scheduler) -> None:
         """Shell-created orphan processes are reaped by PID 1."""
         # Shell script that creates actual orphans via double-fork pattern

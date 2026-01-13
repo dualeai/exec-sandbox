@@ -1,6 +1,7 @@
 """Shared pytest fixtures for exec-sandbox tests."""
 
 import os
+import sys
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -24,6 +25,20 @@ skip_unless_linux = pytest.mark.skipif(
 skip_unless_macos = pytest.mark.skipif(
     detect_host_os() != HostOS.MACOS,
     reason="This test requires macOS",
+)
+
+# Skip marker for tests affected by Python 3.12 asyncio subprocess bug.
+# Bug: asyncio.create_subprocess_exec() with piped output hangs indefinitely
+# when tasks are cancelled during pipe connection phase.
+# Fixed in Python 3.13+ via https://github.com/python/cpython/pull/140805
+# See: https://github.com/python/cpython/issues/103847
+skip_on_python_312_subprocess_bug = pytest.mark.skipif(
+    sys.version_info < (3, 13),
+    reason=(
+        "Skipped due to CPython bug #103847: asyncio subprocess hangs on task "
+        "cancellation during pipe connection. Fixed in Python 3.13+. "
+        "See: https://github.com/python/cpython/issues/103847"
+    ),
 )
 
 # ============================================================================
