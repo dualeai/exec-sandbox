@@ -181,8 +181,17 @@ WARM_POOL_LANGUAGES: Final[tuple[Language, ...]] = (Language.PYTHON, Language.JA
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
 
-WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 30
-"""Health check interval for warm VMs in seconds."""
+WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 10
+"""Health check interval for warm VMs in seconds (matches K8s/Cloud Run periodSeconds default)."""
+
+WARM_POOL_HEALTH_CHECK_MAX_RETRIES: Final[int] = 3
+"""Maximum retry attempts before declaring VM unhealthy (matches K8s failureThreshold)."""
+
+WARM_POOL_HEALTH_CHECK_RETRY_MIN_SECONDS: Final[float] = 0.1
+"""Minimum backoff between health check retries."""
+
+WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
+"""Maximum backoff between health check retries."""
 
 # ============================================================================
 # Memory Optimization (Balloon)

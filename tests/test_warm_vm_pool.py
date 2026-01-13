@@ -5,6 +5,10 @@ Integration tests: Real VM pool operations (requires QEMU + images).
 """
 
 import asyncio
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from tenacity import wait_none
 
 from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
@@ -604,3 +608,311 @@ class TestHealthcheckIntegration:
 
         assert pool._health_task.done()
         assert pool._shutdown_event.is_set()
+
+
+# ============================================================================
+# Unit Tests - Health Check Retry Logic (No QEMU, uses mocks)
+# ============================================================================
+
+
+class TestCheckVmHealthRetry:
+    """Unit tests for _check_vm_health retry logic."""
+
+    @pytest.fixture
+    def mock_vm(self):
+        """Create a mock VM with mocked channel."""
+        vm = Mock()
+        vm.vm_id = "test-vm"
+        vm.channel = Mock()
+        vm.channel.close = AsyncMock()
+        vm.channel.connect = AsyncMock()
+        vm.channel.send_request = AsyncMock()
+        return vm
+
+    async def test_success_on_first_attempt(self, unit_test_vm_manager, mock_vm) -> None:
+        """Health check succeeds on first attempt without retry."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
+
+        # Inject wait_none() for instant retries (no delays)
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 1
+
+    async def test_retry_succeeds_after_transient_timeout(self, unit_test_vm_manager, mock_vm) -> None:
+        """Retry succeeds after transient TimeoutError."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # First 2 calls: TimeoutError, Third call: success
+        mock_vm.channel.send_request = AsyncMock(
+            side_effect=[
+                TimeoutError("timeout"),
+                TimeoutError("timeout"),
+                PongMessage(version="1.0"),
+            ]
+        )
+
+        # Inject wait_none() - retries happen instantly
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 3
+
+    async def test_retry_succeeds_after_transient_oserror(self, unit_test_vm_manager, mock_vm) -> None:
+        """Retry succeeds after transient OSError."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.send_request = AsyncMock(
+            side_effect=[OSError("connection refused"), PongMessage(version="1.0")]
+        )
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 2
+
+    async def test_retry_succeeds_after_connection_error(self, unit_test_vm_manager, mock_vm) -> None:
+        """Retry succeeds after transient ConnectionError."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.send_request = AsyncMock(side_effect=[ConnectionError("reset"), PongMessage(version="1.0")])
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 2
+
+    async def test_retry_exhausted_returns_false(self, unit_test_vm_manager, mock_vm) -> None:
+        """Returns False after all retries exhausted."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # All attempts fail with TimeoutError
+        mock_vm.channel.send_request = AsyncMock(side_effect=TimeoutError("always timeout"))
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is False
+        assert mock_vm.channel.send_request.call_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES
+
+    async def test_cancellation_not_retried(self, unit_test_vm_manager, mock_vm) -> None:
+        """CancelledError propagates immediately without retry."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.connect = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        # Should only attempt once - no retry on cancellation
+        assert mock_vm.channel.connect.call_count == 1
+
+    @pytest.mark.parametrize(
+        "exception_type",
+        [
+            OSError("connection refused"),
+            TimeoutError("timeout"),
+            ConnectionError("connection reset"),
+        ],
+    )
+    async def test_retries_on_all_transient_exception_types(
+        self, unit_test_vm_manager, mock_vm, exception_type
+    ) -> None:
+        """Retries on all transient exception types then succeeds."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.send_request = AsyncMock(side_effect=[exception_type, PongMessage(version="1.0")])
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 2
+
+    # -------------------------------------------------------------------------
+    # Edge Cases
+    # -------------------------------------------------------------------------
+
+    async def test_wrong_response_type_returns_false_no_retry(self, unit_test_vm_manager, mock_vm) -> None:
+        """Wrong response type returns False without retry (protocol error, not transient)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Return something that's not a PongMessage
+        wrong_response = Mock()
+        wrong_response.__class__.__name__ = "UnexpectedMessage"
+        mock_vm.channel.send_request = AsyncMock(return_value=wrong_response)
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is False
+        # Should not retry - wrong response type is not a transient error
+        assert mock_vm.channel.send_request.call_count == 1
+
+    async def test_connect_failure_is_retried(self, unit_test_vm_manager, mock_vm) -> None:
+        """Failure during connect() is retried."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Connect fails twice, then succeeds
+        mock_vm.channel.connect = AsyncMock(side_effect=[OSError("refused"), TimeoutError("timeout"), None])
+        mock_vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.connect.call_count == 3
+        assert mock_vm.channel.send_request.call_count == 1
+
+    async def test_close_failure_is_retried(self, unit_test_vm_manager, mock_vm) -> None:
+        """Failure during close() is retried."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Close fails once, then succeeds
+        mock_vm.channel.close = AsyncMock(side_effect=[OSError("broken pipe"), None])
+        mock_vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.close.call_count == 2
+
+    async def test_mixed_exception_types_across_retries(self, unit_test_vm_manager, mock_vm) -> None:
+        """Different exception types across retries still succeed."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Different exceptions on each retry
+        mock_vm.channel.send_request = AsyncMock(
+            side_effect=[
+                OSError("connection refused"),
+                TimeoutError("timeout"),
+                PongMessage(version="1.0"),
+            ]
+        )
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 3
+
+    async def test_success_on_last_retry_boundary(self, unit_test_vm_manager, mock_vm) -> None:
+        """Success on exactly the last retry attempt (boundary condition)."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # Fail exactly (MAX_RETRIES - 1) times, succeed on last attempt
+        failures = [TimeoutError("timeout")] * (constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES - 1)
+        mock_vm.channel.send_request = AsyncMock(side_effect=[*failures, PongMessage(version="1.0")])
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES
+
+    async def test_failure_on_last_retry_returns_false(self, unit_test_vm_manager, mock_vm) -> None:
+        """Failure on last retry returns False (boundary condition)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # All MAX_RETRIES attempts fail
+        mock_vm.channel.send_request = AsyncMock(side_effect=TimeoutError("always fails"))
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is False
+        assert mock_vm.channel.send_request.call_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES
+
+    # -------------------------------------------------------------------------
+    # Weird Cases
+    # -------------------------------------------------------------------------
+
+    async def test_none_response_returns_false(self, unit_test_vm_manager, mock_vm) -> None:
+        """None response returns False (edge case)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.send_request = AsyncMock(return_value=None)
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is False
+        assert mock_vm.channel.send_request.call_count == 1
+
+    async def test_exception_subclass_is_retried(self, unit_test_vm_manager, mock_vm) -> None:
+        """Exception subclasses (e.g., ConnectionRefusedError) are retried."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        # ConnectionRefusedError is a subclass of ConnectionError
+        mock_vm.channel.send_request = AsyncMock(
+            side_effect=[ConnectionRefusedError("refused"), PongMessage(version="1.0")]
+        )
+
+        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        assert result is True
+        assert mock_vm.channel.send_request.call_count == 2
+
+    async def test_non_retryable_exception_propagates(self, unit_test_vm_manager, mock_vm) -> None:
+        """Non-retryable exceptions (e.g., ValueError) propagate immediately."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        mock_vm.channel.send_request = AsyncMock(side_effect=ValueError("unexpected"))
+
+        with pytest.raises(ValueError, match="unexpected"):
+            await pool._check_vm_health(mock_vm, _wait=wait_none())
+
+        # Should only attempt once - ValueError is not retryable
+        assert mock_vm.channel.send_request.call_count == 1

@@ -38,7 +38,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from typing import TYPE_CHECKING, Any
+
+from tenacity import (
+    AsyncRetrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
@@ -46,6 +55,8 @@ from exec_sandbox.models import Language
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
+
+    from tenacity.wait import wait_base
 
     from exec_sandbox.config import SchedulerConfig
     from exec_sandbox.vm_manager import QemuVM, VmManager
@@ -501,8 +512,16 @@ class WarmVMPool:
         self._replenish_tasks.add(task)
         task.add_done_callback(lambda t: self._replenish_tasks.discard(t))
 
-    async def _check_vm_health(self, vm: QemuVM) -> bool:
+    async def _check_vm_health(
+        self,
+        vm: QemuVM,
+        *,
+        _wait: wait_base | None = None,
+    ) -> bool:
         """Check if VM is healthy (guest agent responsive).
+
+        Uses retry with exponential backoff to prevent false positives from
+        transient failures. Matches Kubernetes failureThreshold=3 pattern.
 
         Uses QEMU GA industry standard pattern: connect → command → disconnect
         (same as libvirt, QEMU GA reference implementation).
@@ -518,25 +537,24 @@ class WarmVMPool:
 
         Args:
             vm: QemuVM to check
+            _wait: Optional wait strategy override (for testing with wait_none())
 
         Returns:
             True if healthy, False otherwise
         """
-        try:
-            from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
-                PingRequest,
-                PongMessage,
-            )
+        from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
+            PingRequest,
+            PongMessage,
+        )
 
+        async def _ping_guest() -> bool:
+            """Single ping attempt - may raise on transient failure."""
             # QEMU GA standard pattern: connect before each command
             logger.debug("Health check: closing existing connection", extra={"vm_id": vm.vm_id})
-            # Close existing connection first (if any)
             await vm.channel.close()
             logger.debug("Health check: establishing fresh connection", extra={"vm_id": vm.vm_id})
-            # Establish fresh connection
             await vm.channel.connect(timeout_seconds=5)
             logger.debug("Health check: sending ping request", extra={"vm_id": vm.vm_id})
-            # Send command
             response = await vm.channel.send_request(PingRequest(), timeout=5)
             logger.debug(
                 "Health check: received response",
@@ -544,10 +562,39 @@ class WarmVMPool:
             )
             return isinstance(response, PongMessage)
 
-        except (OSError, TimeoutError, asyncio.CancelledError, ConnectionError) as e:
-            # Log exception for debugging - specific exceptions for health check failures
+        # Use injected wait strategy or default exponential backoff
+        wait_strategy = _wait or wait_random_exponential(
+            min=constants.WARM_POOL_HEALTH_CHECK_RETRY_MIN_SECONDS,
+            max=constants.WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS,
+        )
+
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES),
+                wait=wait_strategy,
+                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError)),
+                before_sleep=before_sleep_log(logger, logging.DEBUG),
+                reraise=True,
+            ):
+                with attempt:
+                    return await _ping_guest()
+        except (OSError, TimeoutError, ConnectionError) as e:
+            # All retries exhausted - log and return unhealthy
             logger.warning(
-                "Health check ping failed",
-                extra={"vm_id": vm.vm_id, "error": str(e), "error_type": type(e).__name__},
+                "Health check failed after retries",
+                extra={
+                    "vm_id": vm.vm_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "max_retries": constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES,
+                },
             )
             return False
+        except asyncio.CancelledError:
+            # Don't retry on cancellation - propagate immediately
+            logger.debug("Health check cancelled", extra={"vm_id": vm.vm_id})
+            raise
+
+        # Unreachable: AsyncRetrying either returns from within or raises
+        # But required for type checker (mypy/pyright) to see all paths return
+        raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
