@@ -79,6 +79,8 @@ async def benchmark_cold_boot(
     scheduler: Scheduler,
     language: Language,
     concurrency: int,
+    *,
+    allow_network: bool = False,
 ) -> TimingStats:
     """Benchmark cold VM boot + execution latency with concurrent requests."""
     code_map = {
@@ -94,6 +96,7 @@ async def benchmark_cold_boot(
             code=code,
             language=language,
             timeout_seconds=60,
+            allow_network=allow_network,
         )
         e2e_ms = (time.perf_counter() - start) * 1000
         return result, e2e_ms
@@ -110,6 +113,8 @@ async def benchmark_cold_boot(
 async def benchmark_warm_pool(
     scheduler: Scheduler,
     concurrency: int,
+    *,
+    allow_network: bool = False,
 ) -> TimingStats:
     """Benchmark warm pool with concurrent requests."""
 
@@ -119,6 +124,7 @@ async def benchmark_warm_pool(
             code="print('ping')",
             language=Language.PYTHON,
             timeout_seconds=30,
+            allow_network=allow_network,
         )
         e2e_ms = (time.perf_counter() - start) * 1000
         return result, e2e_ms
@@ -179,10 +185,11 @@ async def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                 Quick benchmark (10 iterations, cold boot only)
-  %(prog)s -n 20           More iterations for stable results
-  %(prog)s --pool 8        Enable warm pool with 8 pre-warmed VMs
-  %(prog)s -n 20 --pool 8  Full benchmark
+  %(prog)s                   Quick benchmark (10 iterations, cold boot only)
+  %(prog)s -n 20             More iterations for stable results
+  %(prog)s --pool 8          Enable warm pool with 8 pre-warmed VMs
+  %(prog)s --network         Benchmark with network enabled (gvproxy overhead)
+  %(prog)s -n 20 --pool 8    Full benchmark
 """,
     )
     parser.add_argument(
@@ -198,6 +205,11 @@ Examples:
         default=0,
         metavar="SIZE",
         help="warm pool size, 0=disabled (default: 0)",
+    )
+    parser.add_argument(
+        "--network",
+        action="store_true",
+        help="enable network access for VMs (tests gvproxy overhead)",
     )
     args = parser.parse_args()
 
@@ -218,6 +230,7 @@ Examples:
     print("=" * 60)
     print(f"Concurrency:  {args.n}")
     print(f"Warm pool:    {args.pool} VMs" if pool_enabled else "Warm pool:    disabled")
+    print(f"Network:      {'enabled' if args.network else 'disabled'}")
     print(f"Memory/VM:    {memory_mb} MB")
 
     # Configure scheduler - need enough slots for concurrent requests + warm pool
@@ -236,7 +249,7 @@ Examples:
         # Cold boot benchmark (concurrent)
         print(f"\nRunning cold boot benchmark ({args.n} concurrent)...")
         all_results["Cold Boot"] = await benchmark_cold_boot(
-            scheduler, Language.PYTHON, args.n
+            scheduler, Language.PYTHON, args.n, allow_network=args.network
         )
 
         # Warm pool benchmark (if enabled)
@@ -247,7 +260,7 @@ Examples:
 
             # Use pool size as concurrency to ensure all VMs come from pool
             print(f"\nRunning warm pool benchmark ({args.pool} concurrent = pool size)...")
-            all_results["Warm Pool"] = await benchmark_warm_pool(scheduler, args.pool)
+            all_results["Warm Pool"] = await benchmark_warm_pool(scheduler, args.pool, allow_network=args.network)
 
     # Print results
     print("\n" + "=" * 60)
