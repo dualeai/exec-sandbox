@@ -1,0 +1,265 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read        # Required for artifact caching (gh run list)
+  attestations: write  # Required for GitHub attestations
+  contents: write      # Required for release asset upload
+  id-token: write      # Required for PyPI trusted publishing + Sigstore signing
+
+jobs:
+  # ==========================================================================
+  # Python Package
+  # ==========================================================================
+
+  python-package:
+    name: Python Package
+    runs-on: linux-arm64-ubuntu2404-small-private
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Inject version from git tag
+        run: |
+          VERSION=$(./cicd/version.sh -g .)
+          VERSION_FULL=$(./cicd/version.sh -g . -c -m)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION_FULL=$VERSION_FULL" >> $GITHUB_ENV
+          echo "Injecting version: $VERSION (full: $VERSION_FULL)"
+          sed -i "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify build artifacts
+        run: |
+          ls -la dist/
+          test -f dist/exec_sandbox-*.whl
+          test -f dist/exec_sandbox-*.tar.gz
+          uv run twine check dist/*
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3.1.0
+        with:
+          subject-path: dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+          retention-days: 30
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: python-package
+    runs-on: linux-x64-ubuntu2404-small-private  # x64 required: pypi-publish action is amd64 only
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/exec_sandbox
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+          print-hash: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [python-package, publish-testpypi]
+    runs-on: linux-x64-ubuntu2404-small-private  # x64 required: pypi-publish action is amd64 only
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/exec_sandbox
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+          print-hash: true
+
+  # ==========================================================================
+  # Binary Builds
+  # ==========================================================================
+
+  gvproxy-wrapper:
+    name: gvproxy-wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build gvproxy-wrapper (all platforms)
+        uses: ./.github/actions/build-gvproxy-wrapper
+        with:
+          all-platforms: "true"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvproxy-wrapper
+          path: gvproxy-wrapper/bin/gvproxy-wrapper-*
+
+  guest-agent:
+    name: guest-agent (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build guest-agent
+        uses: ./.github/actions/build-guest-agent
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-agent-${{ matrix.arch }}
+          path: images/dist/guest-agent-linux-${{ matrix.arch }}
+
+  # ==========================================================================
+  # VM Images
+  # ==========================================================================
+
+  vm-images:
+    name: VM Images (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [guest-agent]
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Download guest-agent
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-agent-${{ matrix.arch }}
+          path: images/dist/
+
+      - name: Build VM images
+        uses: ./.github/actions/build-vm-images
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-${{ matrix.arch }}
+          path: |
+            images/dist/vmlinuz-${{ matrix.arch }}
+            images/dist/initramfs-${{ matrix.arch }}
+            images/dist/*-${{ matrix.arch }}.qcow2
+
+  # ==========================================================================
+  # GitHub Release
+  # ==========================================================================
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [publish-pypi, gvproxy-wrapper, guest-agent, vm-images]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+
+          # Python package
+          cp artifacts/python-dist/*.whl release/
+          cp artifacts/python-dist/*.tar.gz release/
+
+          # gvproxy-wrapper
+          cp artifacts/gvproxy-wrapper/* release/
+
+          # guest-agent
+          cp artifacts/guest-agent-x86_64/* release/
+          cp artifacts/guest-agent-aarch64/* release/
+
+          # VM images (kernel + initramfs + qcow2)
+          cp artifacts/vm-images-x86_64/* release/
+          cp artifacts/vm-images-aarch64/* release/
+
+          # Compress large files
+          cd release
+          for f in *.qcow2 vmlinuz-* initramfs-*; do
+            zstd -19 --rm "$f"
+          done
+
+          # Generate checksums
+          sha256sum * > SHA256SUMS
+
+          ls -lh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Generate job summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Published To" >> $GITHUB_STEP_SUMMARY
+          echo "- [TestPyPI](https://test.pypi.org/p/exec_sandbox)" >> $GITHUB_STEP_SUMMARY
+          echo "- [PyPI](https://pypi.org/p/exec_sandbox)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Python wheel + sdist" >> $GITHUB_STEP_SUMMARY
+          echo "- gvproxy-wrapper (4 platforms)" >> $GITHUB_STEP_SUMMARY
+          echo "- guest-agent (2 architectures)" >> $GITHUB_STEP_SUMMARY
+          echo "- Kernel + initramfs (2 architectures)" >> $GITHUB_STEP_SUMMARY
+          echo "- qcow2 images (6 variants)" >> $GITHUB_STEP_SUMMARY

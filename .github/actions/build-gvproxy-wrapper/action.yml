@@ -1,0 +1,29 @@
+name: Build gvproxy-wrapper
+description: Build gvproxy-wrapper Go binary
+
+inputs:
+  all-platforms:
+    description: Build for all platforms (linux/darwin × amd64/arm64)
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.24"
+        cache-dependency-path: gvproxy-wrapper/go.sum
+
+    - name: Build (current platform)
+      if: inputs.all-platforms == 'false'
+      working-directory: gvproxy-wrapper
+      shell: bash
+      run: make build
+
+    - name: Build (all platforms)
+      if: inputs.all-platforms == 'true'
+      working-directory: gvproxy-wrapper
+      shell: bash
+      run: make build-all

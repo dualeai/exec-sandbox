@@ -1,0 +1,387 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  # ==========================================================================
+  # Static Analysis - Run immediately, no dependencies
+  # ==========================================================================
+
+  static-python:
+    name: Static / Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: make install-deps
+
+      - name: Static checks
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run pyright .
+          uv run -m vulture src/ scripts/ --min-confidence 80
+
+  static-rust:
+    name: Static / Rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guest-agent
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache-workspaces: guest-agent
+
+      - name: Static checks
+        run: make test-static
+
+  static-go:
+    name: Static / Go
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gvproxy-wrapper
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: gvproxy-wrapper/go.sum
+
+      - name: Static checks
+        run: make test-static
+
+  # ==========================================================================
+  # Build - Run in parallel, once per architecture
+  # ==========================================================================
+
+  build-gvproxy-wrapper:
+    name: Build / gvproxy-wrapper (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos
+            arch: arm64
+            runner: macos-26
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build
+        uses: ./.github/actions/build-gvproxy-wrapper
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvproxy-wrapper-${{ matrix.os }}-${{ matrix.arch }}
+          path: gvproxy-wrapper/bin/
+          retention-days: 1
+
+  build-guest-agent:
+    name: Build / guest-agent (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            image_arch: x86_64
+          - arch: arm64
+            image_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build
+        uses: ./.github/actions/build-guest-agent
+        with:
+          arch: ${{ matrix.image_arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-agent-${{ matrix.arch }}
+          path: |
+            images/dist/guest-agent-linux-${{ matrix.image_arch }}
+            images/dist/guest-agent-linux-${{ matrix.image_arch }}.hash
+          retention-days: 7
+
+  build-vm-images:
+    name: Build / VM images (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    needs: build-guest-agent
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            image_arch: x86_64
+          - arch: arm64
+            image_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Download guest-agent
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-agent-${{ matrix.arch }}
+          path: images/dist/
+
+      - name: Build
+        uses: ./.github/actions/build-vm-images
+        with:
+          arch: ${{ matrix.image_arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-images-${{ matrix.arch }}
+          path: |
+            images/dist/vmlinuz-${{ matrix.image_arch }}
+            images/dist/vmlinuz-${{ matrix.image_arch }}.hash
+            images/dist/initramfs-${{ matrix.image_arch }}
+            images/dist/*-${{ matrix.image_arch }}.qcow2
+            images/dist/*-${{ matrix.image_arch }}.qcow2.hash
+          retention-days: 7
+
+  # ==========================================================================
+  # Unit Tests - Run in parallel with builds
+  # ==========================================================================
+
+  test-rust:
+    name: Test / Rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guest-agent
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: guest-agent
+
+      - name: Unit tests
+        run: make test-unit
+
+  test-go:
+    name: Test / Go
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gvproxy-wrapper
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: gvproxy-wrapper/go.sum
+
+      - name: Unit tests
+        run: make test-unit
+
+  # ==========================================================================
+  # Integration Tests - Run after builds complete
+  # ==========================================================================
+
+  test-python:
+    name: Test / Python ${{ matrix.python-version }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    needs: [build-gvproxy-wrapper, build-vm-images]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+        platform:
+          - os: linux
+            arch: x64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - os: macos
+            arch: arm64
+            runner: macos-26
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Download gvproxy-wrapper
+        uses: actions/download-artifact@v4
+        with:
+          name: gvproxy-wrapper-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+          path: gvproxy-wrapper/bin/
+
+      - name: Download VM images
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-images-${{ matrix.platform.arch }}
+          path: images/dist/
+
+      - name: Make binaries executable
+        run: chmod +x gvproxy-wrapper/bin/gvproxy-wrapper-*
+
+      - name: Make images readable (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Make files readable and directories traversable for qemu-vm user
+          # Need to make parent directories traversable too (home dirs are often 700)
+          chmod a+x /home/runner /home/runner/work
+          chmod -R a+rX .
+
+      - name: Install QEMU (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          sudo apt-get update
+          # On Ubuntu 24.04+, qemu-system-x86_64-microvm binary is included in qemu-system-x86 package
+          # The microvm binary is optimized for direct kernel boot with microvm machine type
+          # See: https://documentation.ubuntu.com/server/explanation/virtualisation/qemu-microvm/
+          sudo apt-get install -y qemu-utils ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86' || 'qemu-system-arm' }}
+
+      - name: Install QEMU (macOS)
+        if: matrix.platform.os == 'macos'
+        run: brew install qemu coreutils
+
+      - name: Verify QEMU installation
+        run: |
+          echo "=== QEMU binaries ==="
+          which qemu-system-x86_64 || echo "qemu-system-x86_64 not found"
+          which qemu-system-x86_64-microvm || echo "qemu-system-x86_64-microvm not found"
+          which qemu-system-aarch64 || echo "qemu-system-aarch64 not found"
+          echo ""
+          echo "=== QEMU version ==="
+          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} --version
+          echo ""
+          echo "=== Available machine types (first 20) ==="
+          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} -machine help | head -20
+          echo ""
+          echo "=== Hardware acceleration ==="
+          if [ "${{ matrix.platform.os }}" = "linux" ]; then
+            ls -la /dev/kvm || echo "/dev/kvm not available"
+          else
+            sysctl kern.hv_support || echo "HVF not available"
+          fi
+
+      - name: Setup KVM permissions (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Make /dev/kvm accessible to all users for hardware acceleration
+          # Using direct chmod because udevadm trigger can fail on some runners
+          # See: https://github.com/actions/runner-images/issues/8542
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            echo "KVM permissions updated:"
+            ls -la /dev/kvm
+          else
+            echo "WARNING: /dev/kvm not found - KVM acceleration not available"
+          fi
+
+      - name: Create qemu-vm user (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Create unprivileged user for QEMU process isolation
+          # Don't specify UID - let the system assign one to avoid conflicts
+          if ! id qemu-vm &>/dev/null; then
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin qemu-vm
+          fi
+          # Add qemu-vm to kvm group for hardware acceleration access
+          sudo usermod -aG kvm qemu-vm
+          # Add runner to qemu-vm group for socket access (sockets are 0660)
+          sudo usermod -aG qemu-vm runner
+          # Allow runner to run commands AS qemu-vm (for QEMU process)
+          # Note: runner already has full sudo via GitHub Actions, so chown works
+          echo "runner ALL=(qemu-vm) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/qemu-vm
+
+      - name: Enable unprivileged user namespaces (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor by default
+          # Disable this restriction to allow unshare for namespace isolation
+          # See: https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: make install-deps
+
+      - name: Setup cgroup delegation (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Create cgroup directory for VM resource limits
+          sudo mkdir -p /sys/fs/cgroup/code-exec
+          # Enable required controllers (memory, cpu, pids) at root and code-exec levels
+          # This allows nested cgroups like /sys/fs/cgroup/code-exec/{tenant}/{vm}
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/code-exec/cgroup.subtree_control
+          # Create runner cgroup (cgroups with subtree_control can't have processes directly)
+          sudo mkdir -p /sys/fs/cgroup/code-exec/runner
+          # Delegate ownership to runner user so tests can create sub-cgroups
+          sudo chown -R runner:runner /sys/fs/cgroup/code-exec
+
+      - name: Functional tests (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Move into delegated cgroup subtree so child processes (QEMU) can be moved freely
+          # Requires sudo because moving FROM outside the subtree needs root (common ancestor rule)
+          # Once inside, child processes (QEMU) can be moved freely within the subtree
+          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          # Use sg to activate qemu-vm group membership (usermod -aG doesn't take effect until next login)
+          # This is required for socket access: QEMU chardev sockets are 0660 owned by qemu-vm:qemu-vm
+          sg qemu-vm -c "make test-func"
+
+      - name: Sudo tests (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          sudo env "PATH=$PATH" sg qemu-vm -c "make test-sudo"
+
+      - name: Functional tests (macOS)
+        if: matrix.platform.os == 'macos'
+        run: make test-func

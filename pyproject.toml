@@ -1,0 +1,185 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "exec-sandbox"
+version = "0.1.0"
+description = "Secure code execution in microVMs with QEMU"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [
+    { name = "Duale AI", email = "hello@duale.ai" },
+]
+keywords = [
+    "sandbox",
+    "code-execution",
+    "microvm",
+    "qemu",
+    "security",
+    "isolation",
+    "vm",
+    "virtualization",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Security",
+    "Topic :: Software Development :: Interpreters",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic~=2.0",
+    "pydantic-settings~=2.0",
+    "aiofiles~=24.0",
+    "aiohttp~=3.11",  # For async HTTP downloads from GitHub Releases
+    "aiojobs~=1.3",
+    "backports.zstd ; python_version<'3.14'",  # PEP-784 backport for zstd decompression
+    "psutil~=5.9",
+    "qemu-qmp~=0.0.5",  # Async QMP client for QEMU memory snapshots
+    "tenacity~=8.0",
+]
+
+[project.optional-dependencies]
+s3 = [
+    "aioboto3~=13.0",
+]
+dev = [
+    "aioresponses~=0.7",  # For mocking aiohttp requests in tests
+    "hypothesis~=6.0",  # Property-based testing
+    "pytest~=8.0",
+    "pytest-asyncio~=0.24",
+    "pytest-cov~=6.0",
+    "pytest-timeout~=2.3",
+    "pytest-xdist~=3.5",  # Parallel test execution (-n auto)
+    "pyright~=1.1",
+    "ruff~=0.7",
+    "twine~=6.1",  # Package verification before PyPI upload
+    "vulture~=2.14",  # Dead code detection
+    "moto[s3,server]~=5.0",  # AWS mocking for S3 tests (server mode for aioboto3)
+]
+
+[project.urls]
+Homepage = "https://github.com/dualeai/exec-sandbox"
+Documentation = "https://github.com/dualeai/exec-sandbox#readme"
+Repository = "https://github.com/dualeai/exec-sandbox.git"
+Changelog = "https://github.com/dualeai/exec-sandbox/releases"
+Issues = "https://github.com/dualeai/exec-sandbox/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/exec_sandbox"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"catalogs" = "exec_sandbox/catalogs"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "-n", "auto",  # pytest-xdist: parallel execution using all CPU cores
+    "--dist", "loadfile",  # Keep tests in same file together (shared fixtures)
+]
+markers = [
+    "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
+]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+venv = ".venv"
+venvPath = "."
+include = ["src", "scripts"]
+exclude = [".venv", "tests"]
+stubPath = "stubs"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "A",      # flake8-builtins
+    "ARG",    # flake8-unused-arguments
+    "ASYNC",  # flake8-async
+    "B",      # flake8-bugbear
+    "BLE",    # flake8-blind-except
+    "C4",     # flake8-comprehensions
+    "DTZ",    # flake8-datetimez
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "FBT",    # flake8-boolean-trap
+    "I",      # isort
+    "N",      # pep8-naming
+    "PERF",   # Perflint
+    "PIE",    # flake8-pie
+    "PL",     # Pylint
+    "PTH",    # flake8-use-pathlib
+    "PYI",    # flake8-pyi
+    "Q",      # flake8-quotes
+    "RET",    # flake8-return
+    "RUF",    # Ruff-specific
+    "S",      # flake8-bandit (security)
+    "SIM",    # flake8-simplify
+    "SLF",    # flake8-self
+    "T20",    # flake8-print
+    "TCH",    # flake8-type-checking
+    "TID",    # flake8-tidy-imports
+    "UP",     # pyupgrade
+    "W",      # pycodestyle warnings
+]
+ignore = [
+    "A002",     # shadowing builtin (common parameter names like input)
+    "ASYNC109", # async function with timeout parameter (common pattern)
+    "E501",     # line too long (handled by formatter)
+    "FBT001",   # boolean positional in function definition (common pattern)
+    "FBT002",   # boolean default positional argument (common pattern)
+    "PLR0911",  # too many return statements
+    "PLR0913",  # too many arguments
+    "S311",     # random for non-crypto
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**/*.py" = [
+    "PLC0415",  # import outside top-level (fine for scripts)
+    "T201",     # print statements (expected in CLI scripts)
+]
+"tests/**/*.py" = [
+    "ARG001",   # unused function argument (fixtures, callbacks)
+    "ARG002",   # unused method argument (fixtures in test methods)
+    "ARG005",   # unused lambda argument (callbacks)
+    "ASYNC109", # async timeout patterns
+    "ASYNC220", # async subprocess
+    "ASYNC230", # async open
+    "ASYNC251", # time.sleep in async (needed for atime tests)
+    "F841",     # unused variable
+    "FBT001",   # boolean positional in function definition
+    "FBT003",   # boolean positional in function call
+    "PLC0415",  # import outside top-level
+    "PLR0915",  # too many statements
+    "PLR2004",  # magic values
+    "S101",     # assert
+    "S104",     # possible binding to all interfaces (0.0.0.0 in tests is fine)
+    "S108",     # probable insecure temp file (test paths are fine)
+    "S603",     # subprocess call
+    "S607",     # partial executable path
+    "SIM105",   # contextlib.suppress (explicit try-except is clearer in tests)
+    "SIM115",   # context manager for open
+    "SIM117",   # nested with
+    "SLF001",   # private member access (needed for testing internal methods)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["exec_sandbox"]
