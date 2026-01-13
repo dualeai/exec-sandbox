@@ -61,6 +61,7 @@ from exec_sandbox.permission_utils import (
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
+from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
@@ -76,8 +77,8 @@ def _get_gvproxy_wrapper_path() -> Path:
     """Get path to gvproxy-wrapper binary for current platform.
 
     Detection order:
-    1. Cached download directory (auto-downloaded from GitHub Releases)
-    2. Repo-relative path (development mode)
+    1. Repo-relative path (development mode - prioritized for local builds)
+    2. Cached download directory (auto-downloaded from GitHub Releases)
 
     Returns:
         Path to the platform-specific gvproxy-wrapper binary
@@ -106,24 +107,24 @@ def _get_gvproxy_wrapper_path() -> Path:
 
     binary_name = f"gvproxy-wrapper-{os_name}-{arch}"
 
-    # 1. Check cached download directory first
+    # 1. Check repo-relative path first (dev mode - prioritized for local builds)
+    repo_root = Path(__file__).parent.parent.parent
+    binary_path = repo_root / "gvproxy-wrapper" / "bin" / binary_name
+
+    if binary_path.exists():
+        return binary_path
+
+    # 2. Fall back to cached download directory
     from exec_sandbox.assets import get_cached_asset_path  # noqa: PLC0415
 
     if cached_path := get_cached_asset_path(binary_name):
         return cached_path
 
-    # 2. Fall back to repo-relative path (dev mode)
-    repo_root = Path(__file__).parent.parent.parent
-    binary_path = repo_root / "gvproxy-wrapper" / "bin" / binary_name
-
-    if not binary_path.exists():
-        raise VmError(
-            "gvproxy-wrapper binary not found. "
-            "Either enable auto_download_assets=True in SchedulerConfig, "
-            "or run 'make build' to build it locally."
-        )
-
-    return binary_path
+    raise VmError(
+        "gvproxy-wrapper binary not found. "
+        "Either enable auto_download_assets=True in SchedulerConfig, "
+        "or run 'make build' to build it locally."
+    )
 
 
 class VmState(Enum):
@@ -1546,6 +1547,13 @@ class VmManager:
         - ✅ Simple JSON zone configuration
         - ✅ Zero CVEs (vs SLIRP: CVE-2021-3592/3/4/5, CVE-2020-29129/30)
 
+        Socket Pre-binding (systemd activation pattern)
+        ==============================================
+        We create and bind the Unix socket in Python BEFORE spawning gvproxy,
+        then pass the file descriptor to the child process. This eliminates
+        the 100-300ms polling latency that was required when gvproxy created
+        the socket itself.
+
         Args:
             vm_id: Unique VM identifier
             allowed_domains: Whitelist of allowed domains
@@ -1573,22 +1581,39 @@ class VmManager:
             },
         )
 
-        # Start gvproxy-wrapper
+        # Pre-create and bind socket in parent process (systemd socket activation pattern)
+        # This eliminates polling latency - socket is ready before gvproxy starts
+        try:
+            parent_sock = create_unix_socket(str(socket_path))
+            socket_fd = parent_sock.fileno()
+        except OSError as e:
+            raise VmError(
+                f"Failed to create gvproxy socket: {e}",
+                context={
+                    "vm_id": vm_id,
+                    "language": language,
+                    "socket_path": str(socket_path),
+                },
+            ) from e
+
+        # Start gvproxy-wrapper with pre-bound FD
         gvproxy_binary = _get_gvproxy_wrapper_path()
         try:
             proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
                     str(gvproxy_binary),
-                    "-listen-qemu",
-                    f"unix://{socket_path}",
+                    "-listen-fd",
+                    str(socket_fd),
                     "-dns-zones",
                     dns_zones_json,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,  # Create new process group for proper cleanup
+                    pass_fds=(socket_fd,),  # Pass pre-bound socket FD to child
                 )
             )
         except (OSError, FileNotFoundError) as e:
+            parent_sock.close()
             raise VmError(
                 f"Failed to start gvproxy-wrapper: {e}",
                 context={
@@ -1599,37 +1624,46 @@ class VmManager:
                 },
             ) from e
 
+        # Close parent's copy of FD (child has its own via pass_fds)
+        parent_sock.close()
+
+        # Wait for gvproxy to be ready (virtualnetwork.New() must complete before QEMU connects)
+        # gvproxy prints "Listening on QEMU socket" after initialization is complete
+        ready_event = asyncio.Event()
+
+        def check_ready(line: str) -> None:
+            logger.debug("[gvproxy-wrapper]", extra={"vm_id": vm_id, "output": line})
+            if "Listening on QEMU socket" in line:
+                ready_event.set()
+
         # Background task to drain gvproxy output (prevent pipe deadlock)
         gvproxy_log_task = asyncio.create_task(
             drain_subprocess_output(
                 proc,
                 process_name="gvproxy-wrapper",
                 context_id=vm_id,
-                stdout_handler=lambda line: logger.debug("[gvproxy-wrapper]", extra={"vm_id": vm_id, "output": line}),
+                stdout_handler=check_ready,
                 stderr_handler=lambda line: logger.error(
-                    "[gvproxy-wrapper error]", extra={"vm_id": vm_id, "output": line}
+                    f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line}
                 ),
             )
         )
         gvproxy_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
-        # Wait for socket creation (max 5 seconds)
-        for _ in range(250):
-            if socket_path.exists():
-                break
-            await asyncio.sleep(0.02)
-        else:
+        # Wait for gvproxy to signal readiness (timeout after 5 seconds)
+        try:
+            await asyncio.wait_for(ready_event.wait(), timeout=5.0)
+        except TimeoutError:
             await proc.terminate()
             await proc.wait()
             raise VmError(
-                f"gvproxy-wrapper socket not created: {socket_path}",
+                "gvproxy-wrapper did not become ready in time",
                 context={
                     "vm_id": vm_id,
                     "language": language,
                     "socket_path": str(socket_path),
-                    "allowed_domains": allowed_domains,
                 },
-            )
+            ) from None
 
         # Grant qemu-vm user access to socket via ACL (more secure than chmod 666)
         # Only needed on Linux when qemu-vm user exists; skipped on macOS
