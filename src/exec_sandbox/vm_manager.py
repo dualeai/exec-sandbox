@@ -1629,6 +1629,11 @@ class VmManager:
 
         # Wait for gvproxy to be ready (virtualnetwork.New() must complete before QEMU connects)
         # gvproxy prints "Listening on QEMU socket" after initialization is complete
+        #
+        # Design note: We use stdout event detection instead of polling or kqueue/inotify.
+        # - Polling (asyncio.sleep loop): Would add 5-20ms latency between socket creation and detection
+        # - kqueue (macOS) / inotify (Linux): Native but adds ~50 lines of platform-specific code
+        # - Event-based (current): Instant notification via stdout, simple, cross-platform
         ready_event = asyncio.Event()
 
         def check_ready(line: str) -> None:
@@ -2557,8 +2562,11 @@ class VmManager:
                 # Without this, QEMU may not add sockets to its poll set until after
                 # guest opens virtio-serial ports, causing reads to return EOF.
                 # See: https://bugs.launchpad.net/qemu/+bug/1224444 (virtio-mmio socket race)
+                #
+                # Timeout is short (1s vs previous 2s) because sockets are usually not ready this early.
+                # The retry loop below handles actual connection with proper exponential backoff.
                 try:
-                    await vm.channel.connect(timeout_seconds=2)
+                    await vm.channel.connect(timeout_seconds=1)
                     logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": vm.vm_id})
                 except (TimeoutError, OSError) as e:
                     # Expected - sockets may not be ready yet, retry loop will handle
