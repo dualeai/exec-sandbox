@@ -77,6 +77,22 @@ MAX_PACKAGES: Final[int] = 50
 MAX_ENV_VARS: Final[int] = 100
 """Maximum number of environment variables allowed."""
 
+MAX_ENV_VAR_NAME_LENGTH: Final[int] = 256
+"""Maximum length for environment variable names."""
+
+MAX_ENV_VAR_VALUE_LENGTH: Final[int] = 4096
+"""Maximum length for environment variable values."""
+
+# Control characters forbidden in env var names/values (security risk)
+# Allows: tab (0x09), printable ASCII (0x20-0x7E), UTF-8 multibyte (0x80+)
+# Forbids: NUL, C0 controls (except tab), DEL
+ENV_VAR_FORBIDDEN_CONTROL_CHARS: Final[frozenset[int]] = frozenset(
+    list(range(0x09))  # NUL, SOH, STX, ETX, EOT, ENQ, ACK, BEL, BS
+    + list(range(0x0A, 0x20))  # LF, VT, FF, CR, SO through US (includes ESC at 0x1B)
+    + [0x7F]  # DEL
+)
+"""Forbidden control characters in env var names/values (terminal escape injection prevention)."""
+
 MAX_STDOUT_SIZE: Final[int] = 1_000_000  # 1MB
 """Maximum stdout capture size in bytes."""
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
 
@@ -54,6 +54,47 @@ class ExecuteCodeRequest(GuestAgentRequest):
         default_factory=dict,
         description="Environment variables (max 100, see BLOCKED_ENV_VARS in guest-agent)",
     )
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, v: dict[str, str]) -> dict[str, str]:
+        """Validate environment variable names and values.
+
+        Security: Rejects control characters to prevent terminal escape injection,
+        log injection, and protocol manipulation attacks.
+        """
+        from exec_sandbox.constants import (  # noqa: PLC0415
+            ENV_VAR_FORBIDDEN_CONTROL_CHARS,
+            MAX_ENV_VAR_NAME_LENGTH,
+            MAX_ENV_VAR_VALUE_LENGTH,
+            MAX_ENV_VARS,
+        )
+
+        if len(v) > MAX_ENV_VARS:
+            raise ValueError(f"Too many environment variables: {len(v)} (max {MAX_ENV_VARS})")
+
+        for key, value in v.items():
+            # Validate name length
+            if not key or len(key) > MAX_ENV_VAR_NAME_LENGTH:
+                raise ValueError(f"Invalid env var name length: {len(key)} (must be 1-{MAX_ENV_VAR_NAME_LENGTH})")
+
+            # Validate value length
+            if len(value) > MAX_ENV_VAR_VALUE_LENGTH:
+                raise ValueError(
+                    f"Env var '{key}' value too large: {len(value)} bytes (max {MAX_ENV_VAR_VALUE_LENGTH})"
+                )
+
+            # Check for control characters in name
+            for char in key:
+                if ord(char) in ENV_VAR_FORBIDDEN_CONTROL_CHARS:
+                    raise ValueError(f"Env var name contains forbidden control character: 0x{ord(char):02X}")
+
+            # Check for control characters in value
+            for char in value:
+                if ord(char) in ENV_VAR_FORBIDDEN_CONTROL_CHARS:
+                    raise ValueError(f"Env var '{key}' value contains forbidden control character: 0x{ord(char):02X}")
+
+        return v
 
 
 class InstallPackagesRequest(GuestAgentRequest):

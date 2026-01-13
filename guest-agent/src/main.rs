@@ -597,8 +597,26 @@ fn validate_execute_params(
             ));
         }
 
-        if key.contains('\0') || value.contains('\0') {
-            return Err("Environment variable contains null byte".to_string());
+        // Check for control characters in name and value
+        // Allows: tab (0x09), printable ASCII (0x20-0x7E), UTF-8 continuation (0x80+)
+        // Forbids: NUL, C0 controls (except tab), DEL (0x7F)
+        fn is_forbidden_control_char(c: char) -> bool {
+            let code = c as u32;
+            code < 0x09 || (0x0A..0x20).contains(&code) || code == 0x7F
+        }
+
+        if key.chars().any(is_forbidden_control_char) {
+            return Err(format!(
+                "Environment variable name '{}' contains forbidden control character",
+                key
+            ));
+        }
+
+        if value.chars().any(is_forbidden_control_char) {
+            return Err(format!(
+                "Environment variable '{}' value contains forbidden control character",
+                key
+            ));
         }
     }
 

@@ -120,6 +120,14 @@ class PackageNotAllowedError(SandboxError):
     """
 
 
+class EnvVarValidationError(SandboxError):
+    """Environment variable validation failed.
+
+    Raised when environment variable names or values contain invalid
+    characters (control characters, null bytes) or exceed size limits.
+    """
+
+
 class AssetError(SandboxError):
     """Base exception for asset-related errors.
 
