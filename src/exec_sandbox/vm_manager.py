@@ -2450,13 +2450,15 @@ class VmManager:
                 "-cpu",
                 # For hardware accel use host CPU, for TCG use optimized emulated CPUs
                 # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
+                # x86 TCG: Haswell required for AVX2 (Python/Bun built for x86_64_v3)
                 # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
+                # See: https://gitlab.com/qemu-project/qemu/-/issues/844
                 (
                     "host"
                     if accel_type in (AccelType.HVF, AccelType.KVM)
                     else "cortex-a57"
                     if self.arch == HostArch.AARCH64
-                    else "qemu64"
+                    else "Haswell"
                 ),
                 "-M",
                 machine_type,
