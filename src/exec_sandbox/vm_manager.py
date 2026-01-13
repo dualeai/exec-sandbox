@@ -1196,8 +1196,9 @@ class VmManager:
         accel_type = await self._detect_accel_type()
         use_tcg = accel_type == AccelType.TCG
 
-        # Step 3-5: Parallel resource setup (overlay + cgroup + gvproxy)
+        # Step 3-4: Parallel resource setup (overlay + cgroup)
         # These operations are independent and can run concurrently
+        # Note: gvproxy moved to boot phase to reduce contention under high concurrency
         # Resolve to absolute path - qemu-img resolves backing file relative to overlay location,
         # and VmWorkingDirectory places overlay in a temp dir, so relative paths would break
         base_image = (snapshot_path or self.get_base_image(language)).resolve()
@@ -1214,10 +1215,9 @@ class VmManager:
         enable_dns_filtering = allow_network  # Force gvproxy for all network-enabled VMs
 
         try:
-            # Run independent setup tasks in parallel
-            # Add gvproxy startup to parallel tasks if network enabled
+            # Log network configuration for debugging
             logger.debug(
-                "Checking gvproxy condition",
+                "Network configuration",
                 extra={
                     "debug_category": "network",
                     "vm_id": vm_id,
@@ -1227,59 +1227,24 @@ class VmManager:
                 },
             )
 
-            if allow_network:
-                # Always use gvproxy for network-enabled VMs
-                # Pass allowed_domains to gvproxy - None means use language defaults
-                logger.info(
-                    "Adding gvproxy-wrapper to parallel tasks",
-                    extra={"vm_id": vm_id, "allowed_domains": allowed_domains},
-                )
-                # Run all tasks in parallel including gvproxy
-                overlay_result, cgroup_result, gvproxy_result = await asyncio.gather(
-                    self._create_overlay(base_image, workdir.overlay_image),
-                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
-                    self._start_gvproxy(vm_id, allowed_domains, language, workdir),
-                    return_exceptions=True,
-                )
-                setup_complete_time = asyncio.get_event_loop().time()
+            # Unified setup phase: overlay + cgroup (gvproxy moved to boot phase)
+            # This reduces setup contention under high concurrency
+            overlay_result, cgroup_result = await asyncio.gather(
+                self._create_overlay(base_image, workdir.overlay_image),
+                cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
+                return_exceptions=True,
+            )
+            setup_complete_time = asyncio.get_event_loop().time()
 
-                # Check for failures
-                if isinstance(overlay_result, BaseException):
-                    raise overlay_result
-                if isinstance(cgroup_result, BaseException):
-                    raise cgroup_result
-                if isinstance(gvproxy_result, BaseException):
-                    raise gvproxy_result
+            # Check for failures
+            if isinstance(overlay_result, BaseException):
+                raise overlay_result
+            if isinstance(cgroup_result, BaseException):
+                raise cgroup_result
 
-                # Type narrowing: after BaseException checks
-                cgroup_path = cgroup_result
-                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
-
-                # Unpack tuple from _start_gvproxy
-                gvproxy_proc, gvproxy_log_task = gvproxy_result
-
-                # Attach gvproxy to cgroup for resource limits (memory, CPU, PIDs)
-                # This prevents runaway connections from exhausting host resources
-                # pids.max also limits goroutines since they map to OS threads
-                await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
-            else:
-                # Run overlay and cgroup setup in parallel (no gvproxy)
-                overlay_result, cgroup_result = await asyncio.gather(
-                    self._create_overlay(base_image, workdir.overlay_image),
-                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
-                    return_exceptions=True,
-                )
-                setup_complete_time = asyncio.get_event_loop().time()
-
-                # Check for failures
-                if isinstance(overlay_result, BaseException):
-                    raise overlay_result
-                if isinstance(cgroup_result, BaseException):
-                    raise cgroup_result
-
-                # Type narrowing: after BaseException checks
-                cgroup_path = cgroup_result
-                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
+            # Type narrowing: after BaseException checks
+            cgroup_path = cgroup_result
+            workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
             # Step 5: Build QEMU command (always Linux in container)
             qemu_cmd = await self._build_linux_cmd(
@@ -1321,6 +1286,18 @@ class VmManager:
             # ulimit works on Linux, macOS, BSD (POSIX)
             if not cgroup.is_cgroup_available(cgroup_path):
                 qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, memory_mb)
+
+            # Boot phase: Start gvproxy BEFORE QEMU (if network enabled)
+            # gvproxy must create socket before QEMU connects to it
+            # Moved from setup phase to boot phase to reduce contention under high concurrency
+            if allow_network:
+                logger.info(
+                    "Starting gvproxy-wrapper in boot phase (before QEMU)",
+                    extra={"vm_id": vm_id, "allowed_domains": allowed_domains},
+                )
+                gvproxy_proc, gvproxy_log_task = await self._start_gvproxy(vm_id, allowed_domains, language, workdir)
+                # Attach gvproxy to cgroup for resource limits
+                await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
 
             # Step 7: Launch QEMU
             try:
