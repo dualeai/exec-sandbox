@@ -141,35 +141,29 @@ class TestSchedulerConfig:
 class TestSchedulerSnapshotInit:
     """Tests for SnapshotManager initialization in Scheduler."""
 
-    async def test_snapshot_manager_initialized_without_s3(self, tmp_path: Path) -> None:
+    async def test_snapshot_manager_initialized_without_s3(
+        self, scheduler_config: SchedulerConfig
+    ) -> None:
         """SnapshotManager is created even without S3 config (L1 cache works)."""
-        test_images_dir = tmp_path / "images"
-        test_images_dir.mkdir()
-
-        config = SchedulerConfig(images_dir=test_images_dir, s3_bucket=None)
-        async with Scheduler(config) as scheduler:
+        async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
 
-    async def test_snapshot_manager_initialized_with_s3(self, tmp_path: Path) -> None:
+    async def test_snapshot_manager_initialized_with_s3(self, images_dir: Path) -> None:
         """SnapshotManager is created with S3 config."""
-        test_images_dir = tmp_path / "images"
-        test_images_dir.mkdir()
-
         config = SchedulerConfig(
-            images_dir=test_images_dir,
+            images_dir=images_dir,
             s3_bucket="test-bucket",
             s3_region="us-east-1",
+            auto_download_assets=False,
         )
         async with Scheduler(config) as scheduler:
             assert scheduler._snapshot_manager is not None
 
-    async def test_snapshot_manager_has_vm_manager(self, tmp_path: Path) -> None:
+    async def test_snapshot_manager_has_vm_manager(
+        self, scheduler_config: SchedulerConfig
+    ) -> None:
         """SnapshotManager receives vm_manager reference."""
-        test_images_dir = tmp_path / "images"
-        test_images_dir.mkdir()
-
-        config = SchedulerConfig(images_dir=test_images_dir)
-        async with Scheduler(config) as scheduler:
+        async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
             assert scheduler._snapshot_manager.vm_manager is scheduler._vm_manager
 
