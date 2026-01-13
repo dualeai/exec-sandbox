@@ -1,9 +1,9 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
@@ -195,13 +195,14 @@ jobs:
             images/dist/*-${{ matrix.arch }}.qcow2
 
   # ==========================================================================
-  # GitHub Release
+  # Upload to GitHub Release
   # ==========================================================================
 
-  release:
-    name: Create GitHub Release
+  upload-release:
+    name: Upload to GitHub Release
     runs-on: ubuntu-latest
     needs: [publish-pypi, gvproxy-wrapper, guest-agent, vm-images]
+    if: github.event_name == 'release'
     permissions:
       contents: write
     steps:
@@ -242,11 +243,10 @@ jobs:
 
           ls -lh
 
-      - name: Create GitHub Release
+      - name: Upload to GitHub release
         uses: softprops/action-gh-release@v2.5.0
         with:
           files: release/*
-          generate_release_notes: true
           fail_on_unmatched_files: true
 
       - name: Generate job summary
