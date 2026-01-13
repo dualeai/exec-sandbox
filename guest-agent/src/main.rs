@@ -164,6 +164,10 @@ struct ExecutionComplete {
     msg_type: String, // "complete"
     exit_code: i32,
     execution_time_ms: u64,
+    /// Time for cmd.spawn() to return (fork/exec overhead)
+    spawn_ms: Option<u64>,
+    /// Time from spawn completion to child.wait() returning (actual process runtime)
+    process_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -509,11 +513,13 @@ async fn install_packages(
             .map_err(|_| "Write queue closed")?;
     }
 
-    // Send completion message
+    // Send completion message (no granular timing for install_packages)
     let complete = ExecutionComplete {
         msg_type: "complete".to_string(),
         exit_code,
         execution_time_ms: duration_ms,
+        spawn_ms: None,
+        process_ms: None,
     };
     let json = serde_json::to_string(&complete)?;
     let mut response = json.into_bytes();
@@ -741,6 +747,10 @@ async fn execute_code_streaming(
 
     let start = Instant::now();
 
+    // Granular timing for diagnostics
+    let mut spawn_ms: Option<u64> = None;
+    let mut process_ms: Option<u64> = None;
+
     let mut cmd = match language {
         "python" => {
             let mut c = Command::new("python3");
@@ -777,10 +787,15 @@ async fn execute_code_streaming(
         cmd.env(key, value);
     }
 
-    // Spawn process
+    // Spawn process with timing
+    let spawn_start = Instant::now();
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(c) => {
+            spawn_ms = Some(spawn_start.elapsed().as_millis() as u64);
+            c
+        }
         Err(e) => {
+            // spawn_ms stays None on failure
             send_streaming_error(
                 write_tx,
                 format!("Failed to execute {} code: {}", language, e),
@@ -790,6 +805,7 @@ async fn execute_code_streaming(
             return Ok(());
         }
     };
+    let process_start = Instant::now();
 
     // Get stdout/stderr streams
     let mut stdout = child.stdout.take().unwrap();
@@ -869,7 +885,10 @@ async fn execute_code_streaming(
     };
 
     let status = match wait_result {
-        Ok(Ok(s)) => s,
+        Ok(Ok(s)) => {
+            process_ms = Some(process_start.elapsed().as_millis() as u64);
+            s
+        }
         Ok(Err(e)) => {
             // Graceful termination: SIGTERM → wait → SIGKILL
             let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
@@ -907,6 +926,8 @@ async fn execute_code_streaming(
         msg_type: "complete".to_string(),
         exit_code,
         execution_time_ms: duration_ms,
+        spawn_ms,
+        process_ms,
     };
     let json = serde_json::to_string(&complete)?;
     let mut response = json.into_bytes();

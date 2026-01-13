@@ -524,6 +524,92 @@ class TestExecutionResultTiming:
         assert result.timing.setup_ms == 0
         assert result.timing.boot_ms == 0
 
+    def test_timing_breakdown_with_connect_ms(self) -> None:
+        """TimingBreakdown with optional connect_ms field."""
+        from exec_sandbox.models import TimingBreakdown
+
+        timing = TimingBreakdown(
+            setup_ms=10,
+            boot_ms=200,
+            execute_ms=50,
+            total_ms=260,
+            connect_ms=5,
+        )
+        assert timing.connect_ms == 5
+
+    def test_timing_breakdown_without_connect_ms(self) -> None:
+        """TimingBreakdown without connect_ms (backwards compat)."""
+        from exec_sandbox.models import TimingBreakdown
+
+        timing = TimingBreakdown(
+            setup_ms=10,
+            boot_ms=200,
+            execute_ms=50,
+            total_ms=260,
+        )
+        assert timing.connect_ms is None
+
+    def test_execution_result_with_guest_timing(self) -> None:
+        """ExecutionResult with guest-reported spawn_ms and process_ms."""
+        from exec_sandbox.models import ExecutionResult, TimingBreakdown
+
+        result = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=0,
+            timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
+            spawn_ms=5,
+            process_ms=10,
+        )
+        assert result.spawn_ms == 5
+        assert result.process_ms == 10
+
+    def test_execution_result_without_guest_timing(self) -> None:
+        """ExecutionResult without guest timing (backwards compat)."""
+        from exec_sandbox.models import ExecutionResult, TimingBreakdown
+
+        result = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=0,
+            timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
+        )
+        assert result.spawn_ms is None
+        assert result.process_ms is None
+
+    def test_execution_result_full_timing(self) -> None:
+        """ExecutionResult with all timing fields populated."""
+        from exec_sandbox.models import ExecutionResult, TimingBreakdown
+
+        result = ExecutionResult(
+            stdout="hello",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=71,
+            timing=TimingBreakdown(
+                setup_ms=45,
+                boot_ms=380,
+                execute_ms=85,
+                total_ms=512,
+                connect_ms=2,
+            ),
+            warm_pool_hit=False,
+            spawn_ms=52,
+            process_ms=15,
+        )
+        # Host-measured timing
+        assert result.timing.setup_ms == 45
+        assert result.timing.boot_ms == 380
+        assert result.timing.execute_ms == 85
+        assert result.timing.total_ms == 512
+        assert result.timing.connect_ms == 2
+        # Guest-measured timing
+        assert result.execution_time_ms == 71
+        assert result.spawn_ms == 52
+        assert result.process_ms == 15
+        # Warm pool flag
+        assert result.warm_pool_hit is False
+
 
 # ============================================================================
 # Integration Tests - Timing Behavior
@@ -676,6 +762,45 @@ class TestSchedulerTimingIntegration:
         assert result.timing is not None
         assert result.timing.total_ms >= 0
         assert result.timing.execute_ms >= 0
+
+    async def test_granular_timing_populated(self, scheduler: Scheduler) -> None:
+        """Granular timing fields (connect_ms, spawn_ms, process_ms) are populated."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+
+        # connect_ms should be populated (host-measured)
+        assert result.timing.connect_ms is not None
+        assert result.timing.connect_ms >= 0
+
+        # Guest-reported timing should be populated
+        assert result.spawn_ms is not None
+        assert result.spawn_ms >= 0
+
+        assert result.process_ms is not None
+        assert result.process_ms >= 0
+
+        # Guest timing should be reasonable relative to execution_time_ms
+        if result.execution_time_ms is not None:
+            # spawn + process should be <= execution_time_ms (with some margin for streaming)
+            assert result.spawn_ms <= result.execution_time_ms
+            assert result.process_ms <= result.execution_time_ms
+
+    async def test_granular_timing_consistency(self, scheduler: Scheduler) -> None:
+        """Granular timing values should be consistent with each other."""
+        result = await scheduler.run(
+            code="import time; time.sleep(0.1); print('done')",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+
+        # With a 100ms sleep, process_ms should be at least ~100ms
+        if result.process_ms is not None:
+            assert result.process_ms >= 50  # Allow some margin for timing variance
 
 
 class TestSchedulerTimingEdgeCases:

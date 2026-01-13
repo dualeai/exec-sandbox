@@ -345,8 +345,11 @@ class Scheduler:
                         boot_ms=boot_ms,
                         execute_ms=execute_ms,
                         total_ms=total_ms,
+                        connect_ms=result.timing.connect_ms,  # Pass through from VM
                     ),
                     warm_pool_hit=not is_cold_boot,
+                    spawn_ms=result.spawn_ms,  # Pass through from guest
+                    process_ms=result.process_ms,  # Pass through from guest
                 )
 
             finally:

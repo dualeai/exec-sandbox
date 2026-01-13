@@ -45,6 +45,10 @@ class TimingStats:
     boot: list[float] = field(default_factory=_float_list)
     execute: list[float] = field(default_factory=_float_list)
     guest_exec: list[float] = field(default_factory=_float_list)
+    # Granular timing (new)
+    connect: list[float] = field(default_factory=_float_list)  # Host: channel.connect()
+    spawn: list[float] = field(default_factory=_float_list)  # Guest: cmd.spawn() fork/exec
+    process: list[float] = field(default_factory=_float_list)  # Guest: actual process runtime
     warm_hits: int = 0
     cold_boots: int = 0
 
@@ -58,6 +62,13 @@ def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -
     stats.execute.append(result.timing.execute_ms)
     if result.execution_time_ms is not None:
         stats.guest_exec.append(result.execution_time_ms)
+    # Granular timing (new)
+    if result.timing.connect_ms is not None:
+        stats.connect.append(result.timing.connect_ms)
+    if result.spawn_ms is not None:
+        stats.spawn.append(result.spawn_ms)
+    if result.process_ms is not None:
+        stats.process.append(result.process_ms)
     if result.warm_pool_hit:
         stats.warm_hits += 1
     else:
@@ -147,6 +158,16 @@ def print_stats(name: str, stats: TimingStats) -> None:
     print(f"    ├─ Setup:   {fmt_stats(stats.setup)} ms")
     print(f"    ├─ Boot:    {fmt_stats(stats.boot)} ms")
     print(f"    └─ Execute: {fmt_stats(stats.execute)} ms")
+
+    # Granular execute breakdown (if available)
+    if stats.connect or stats.spawn or stats.process:
+        print("  Execute breakdown:")
+        if stats.connect:
+            print(f"       ├─ Connect: {fmt_stats(stats.connect)} ms")
+        if stats.spawn:
+            print(f"       ├─ Spawn:   {fmt_stats(stats.spawn)} ms")
+        if stats.process:
+            print(f"       └─ Process: {fmt_stats(stats.process)} ms")
 
     if stats.guest_exec:
         print(f"    Guest time: {fmt_stats(stats.guest_exec)} ms")

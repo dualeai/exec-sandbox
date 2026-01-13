@@ -154,6 +154,14 @@ class ExecutionCompleteMessage(BaseModel):
     type: Literal["complete"] = "complete"
     exit_code: int = Field(description="Process exit code (0=success)")
     execution_time_ms: int = Field(description="Total execution time in milliseconds")
+    spawn_ms: int | None = Field(
+        default=None,
+        description="Time for process spawn (fork/exec) in milliseconds (guest-reported)",
+    )
+    process_ms: int | None = Field(
+        default=None,
+        description="Time from spawn to process exit in milliseconds (guest-reported)",
+    )
 
 
 class StreamingErrorMessage(BaseModel):

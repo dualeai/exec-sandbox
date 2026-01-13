@@ -24,6 +24,10 @@ class TimingBreakdown(BaseModel):
     boot_ms: int = Field(description="VM boot time (QEMU start + kernel + initramfs + guest-agent ready)")
     execute_ms: int = Field(description="Code execution time (connect + run + response)")
     total_ms: int = Field(description="Total end-to-end time (setup + boot + execute)")
+    connect_ms: int | None = Field(
+        default=None,
+        description="Time for channel.connect() in milliseconds (host-measured)",
+    )
 
 
 class ExecutionResult(BaseModel):
@@ -37,3 +41,12 @@ class ExecutionResult(BaseModel):
     external_memory_peak_mb: int | None = Field(default=None, description="Peak memory in MB (host cgroup)")
     timing: TimingBreakdown = Field(description="Detailed timing breakdown (setup, boot, execute, total)")
     warm_pool_hit: bool = Field(default=False, description="True if VM was allocated from warm pool (instant start)")
+    # Guest-reported granular timing (pass-through from guest agent)
+    spawn_ms: int | None = Field(
+        default=None,
+        description="Time for process spawn (fork/exec) in milliseconds (guest-reported)",
+    )
+    process_ms: int | None = Field(
+        default=None,
+        description="Time from spawn to process exit in milliseconds (guest-reported)",
+    )

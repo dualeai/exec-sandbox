@@ -821,9 +821,11 @@ class QemuVM:
         )
 
         try:
-            # Connect to guest via TCP
+            # Connect to guest via TCP with timing
             # Fixed init timeout (connection establishment, independent of execution timeout)
+            connect_start = asyncio.get_event_loop().time()
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            connect_ms = int((asyncio.get_event_loop().time() - connect_start) * 1000)
 
             # Stream execution output to console
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
@@ -831,7 +833,9 @@ class QemuVM:
 
             # Stream messages and collect output
             exit_code = -1
-            execution_time_ms = None
+            execution_time_ms: int | None = None
+            spawn_ms: int | None = None
+            process_ms: int | None = None
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
 
@@ -866,9 +870,11 @@ class QemuVM:
                         },
                     )
                 elif isinstance(msg, ExecutionCompleteMessage):
-                    # Execution complete
+                    # Execution complete - capture all timing fields
                     exit_code = msg.exit_code
                     execution_time_ms = msg.execution_time_ms
+                    spawn_ms = msg.spawn_ms
+                    process_ms = msg.process_ms
                 elif isinstance(msg, StreamingErrorMessage):
                     # Streaming error from guest - include details in log message
                     logger.error(
@@ -918,7 +924,9 @@ class QemuVM:
                 execution_time_ms=execution_time_ms,  # Guest-reported
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured
                 external_memory_peak_mb=external_mem_mb or None,  # Host-measured
-                timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
+                timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0, connect_ms=connect_ms),
+                spawn_ms=spawn_ms,  # Guest-reported granular timing
+                process_ms=process_ms,  # Guest-reported granular timing
             )
 
             # Success - transition back to READY for reuse (if not destroyed)
