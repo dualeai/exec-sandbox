@@ -95,6 +95,19 @@ lint:
 	$(MAKE) --directory gvproxy-wrapper lint
 
 # ============================================================================
+# CI Monitoring (requires: gh cli)
+# Usage: make ci-status [run_id=ID] or make ci-diagnose [run_id=ID]
+# ============================================================================
+
+run_id ?=
+
+ci-status:
+	@./scripts/ci-diagnose.sh status $(run_id)
+
+ci-diagnose:
+	@./scripts/ci-diagnose.sh diagnose $(run_id)
+
+# ============================================================================
 # Building
 # ============================================================================
 
