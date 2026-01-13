@@ -35,4 +35,5 @@ class ExecutionResult(BaseModel):
     execution_time_ms: int | None = Field(default=None, description="Execution time in ms (guest-reported)")
     external_cpu_time_ms: int | None = Field(default=None, description="CPU time in ms (host cgroup)")
     external_memory_peak_mb: int | None = Field(default=None, description="Peak memory in MB (host cgroup)")
-    timing: TimingBreakdown | None = Field(default=None, description="Detailed timing breakdown (cold start only)")
+    timing: TimingBreakdown = Field(description="Detailed timing breakdown (setup, boot, execute, total)")
+    warm_pool_hit: bool = Field(default=False, description="True if VM was allocated from warm pool (instant start)")

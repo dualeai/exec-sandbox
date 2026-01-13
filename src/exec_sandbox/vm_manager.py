@@ -48,7 +48,7 @@ from exec_sandbox.guest_agent_protocol import (
     PongMessage,
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
-from exec_sandbox.models import ExecutionResult, Language
+from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.permission_utils import (
     can_access,
     chmod_async,
@@ -910,6 +910,7 @@ class QemuVM:
             )
 
             # Parse result with both internal (guest) and external (host) measurements
+            # Note: timing is a placeholder here - scheduler will populate actual values
             exec_result = ExecutionResult(
                 stdout=stdout_truncated,  # Return to user
                 stderr=stderr_truncated,  # Return to user
@@ -917,6 +918,7 @@ class QemuVM:
                 execution_time_ms=execution_time_ms,  # Guest-reported
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured
                 external_memory_peak_mb=external_mem_mb or None,  # Host-measured
+                timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
             )
 
             # Success - transition back to READY for reuse (if not destroyed)

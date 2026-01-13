@@ -324,26 +324,30 @@ class Scheduler:
                 )
                 execute_end_time = asyncio.get_event_loop().time()
 
-                # Attach timing breakdown for cold boots
-                if is_cold_boot and vm.setup_ms is not None and vm.boot_ms is not None:
-                    execute_ms = int((execute_end_time - execute_start_time) * 1000)
-                    total_ms = int((execute_end_time - run_start_time) * 1000)
-                    result = ExecutionResult(
-                        stdout=result.stdout,
-                        stderr=result.stderr,
-                        exit_code=result.exit_code,
-                        execution_time_ms=result.execution_time_ms,
-                        external_cpu_time_ms=result.external_cpu_time_ms,
-                        external_memory_peak_mb=result.external_memory_peak_mb,
-                        timing=TimingBreakdown(
-                            setup_ms=vm.setup_ms,
-                            boot_ms=vm.boot_ms,
-                            execute_ms=execute_ms,
-                            total_ms=total_ms,
-                        ),
-                    )
+                # Calculate timing
+                execute_ms = int((execute_end_time - execute_start_time) * 1000)
+                total_ms = int((execute_end_time - run_start_time) * 1000)
 
-                return result
+                # For warm pool: setup/boot are "free" (happened at service startup)
+                # For cold boot: use actual setup/boot times from VM
+                setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
+                boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+
+                return ExecutionResult(
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    exit_code=result.exit_code,
+                    execution_time_ms=result.execution_time_ms,
+                    external_cpu_time_ms=result.external_cpu_time_ms,
+                    external_memory_peak_mb=result.external_memory_peak_mb,
+                    timing=TimingBreakdown(
+                        setup_ms=setup_ms,
+                        boot_ms=boot_ms,
+                        execute_ms=execute_ms,
+                        total_ms=total_ms,
+                    ),
+                    warm_pool_hit=not is_cold_boot,
+                )
 
             finally:
                 # Always destroy VM (never reused)

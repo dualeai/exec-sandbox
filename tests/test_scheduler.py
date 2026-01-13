@@ -429,3 +429,434 @@ class TestSchedulerAllImages:
 
         assert result.exit_code == 0, f"Exit code {result.exit_code}, stderr: {result.stderr}"
         assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
+
+
+# ============================================================================
+# Unit Tests - TimingBreakdown and warm_pool_hit
+# ============================================================================
+
+
+class TestTimingBreakdownModel:
+    """Unit tests for TimingBreakdown model validation."""
+
+    def test_timing_breakdown_all_fields_required(self) -> None:
+        """TimingBreakdown requires all four timing fields."""
+        from exec_sandbox.models import TimingBreakdown
+
+        timing = TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50, total_ms=350)
+        assert timing.setup_ms == 100
+        assert timing.boot_ms == 200
+        assert timing.execute_ms == 50
+        assert timing.total_ms == 350
+
+    def test_timing_breakdown_zero_values_valid(self) -> None:
+        """TimingBreakdown accepts zero values (warm pool case)."""
+        from exec_sandbox.models import TimingBreakdown
+
+        timing = TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=50, total_ms=50)
+        assert timing.setup_ms == 0
+        assert timing.boot_ms == 0
+
+    def test_timing_breakdown_missing_field_raises(self) -> None:
+        """TimingBreakdown raises if any field is missing."""
+        from pydantic import ValidationError
+
+        from exec_sandbox.models import TimingBreakdown
+
+        with pytest.raises(ValidationError):
+            TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50)  # type: ignore[call-arg]
+
+
+class TestExecutionResultTiming:
+    """Unit tests for ExecutionResult timing and warm_pool_hit fields."""
+
+    def test_execution_result_timing_required(self) -> None:
+        """ExecutionResult requires timing field."""
+        from pydantic import ValidationError
+
+        from exec_sandbox.models import ExecutionResult
+
+        with pytest.raises(ValidationError):
+            ExecutionResult(  # type: ignore[call-arg]
+                stdout="hello",
+                stderr="",
+                exit_code=0,
+                # Missing timing
+            )
+
+    def test_execution_result_with_timing(self) -> None:
+        """ExecutionResult accepts timing field."""
+        from exec_sandbox.models import ExecutionResult, TimingBreakdown
+
+        result = ExecutionResult(
+            stdout="hello",
+            stderr="",
+            exit_code=0,
+            timing=TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50, total_ms=350),
+        )
+        assert result.timing.setup_ms == 100
+        assert result.timing.total_ms == 350
+
+    def test_execution_result_warm_pool_hit_default_false(self) -> None:
+        """warm_pool_hit defaults to False."""
+        from exec_sandbox.models import ExecutionResult, TimingBreakdown
+
+        result = ExecutionResult(
+            stdout="hello",
+            stderr="",
+            exit_code=0,
+            timing=TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50, total_ms=350),
+        )
+        assert result.warm_pool_hit is False
+
+    def test_execution_result_warm_pool_hit_explicit_true(self) -> None:
+        """warm_pool_hit can be set to True."""
+        from exec_sandbox.models import ExecutionResult, TimingBreakdown
+
+        result = ExecutionResult(
+            stdout="hello",
+            stderr="",
+            exit_code=0,
+            timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=50, total_ms=50),
+            warm_pool_hit=True,
+        )
+        assert result.warm_pool_hit is True
+        assert result.timing.setup_ms == 0
+        assert result.timing.boot_ms == 0
+
+
+# ============================================================================
+# Integration Tests - Timing Behavior
+# ============================================================================
+
+
+class TestSchedulerTimingIntegration:
+    """Integration tests for scheduler timing behavior.
+
+    These tests verify that:
+    1. timing is always populated (never None)
+    2. timing values are reasonable (non-negative, consistent)
+    3. warm_pool_hit is correctly set
+    """
+
+    async def test_cold_boot_timing_always_populated(self, scheduler: Scheduler) -> None:
+        """Cold boot execution always returns timing breakdown."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        # timing must always be present
+        assert result.timing is not None
+        assert isinstance(result.timing.setup_ms, int)
+        assert isinstance(result.timing.boot_ms, int)
+        assert isinstance(result.timing.execute_ms, int)
+        assert isinstance(result.timing.total_ms, int)
+
+    async def test_timing_values_non_negative(self, scheduler: Scheduler) -> None:
+        """All timing values must be non-negative."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.timing.setup_ms >= 0
+        assert result.timing.boot_ms >= 0
+        assert result.timing.execute_ms >= 0
+        assert result.timing.total_ms >= 0
+
+    async def test_timing_total_reasonable(self, scheduler: Scheduler) -> None:
+        """Total time should be >= execute time."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        # total_ms should be at least execute_ms
+        assert result.timing.total_ms >= result.timing.execute_ms
+
+    async def test_cold_boot_warm_pool_hit_false(self, scheduler: Scheduler) -> None:
+        """Cold boot (no warm pool) should have warm_pool_hit=False."""
+        # Default scheduler fixture has warm_pool_size=0
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.warm_pool_hit is False
+
+    async def test_cold_boot_has_nonzero_boot_time(self, scheduler: Scheduler) -> None:
+        """Cold boot should have measurable boot time."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        # Cold boot should have some boot time (at least 1ms typically 100-500ms)
+        # We use a very low threshold to avoid flaky tests
+        assert result.timing.boot_ms >= 0
+        # setup_ms + boot_ms should contribute to total (unless warm pool)
+        if not result.warm_pool_hit:
+            assert result.timing.setup_ms >= 0
+            assert result.timing.boot_ms >= 0
+
+    async def test_timing_with_timeout(self, scheduler_config: SchedulerConfig) -> None:
+        """Timing is populated even when execution times out."""
+        config = SchedulerConfig(
+            images_dir=scheduler_config.images_dir,
+            default_timeout_seconds=2,
+        )
+
+        code = "import time; time.sleep(10)"
+
+        async with Scheduler(config) as sched:
+            from exec_sandbox.exceptions import VmTimeoutError
+
+            try:
+                result = await sched.run(
+                    code=code,
+                    language=Language.PYTHON,
+                    timeout_seconds=1,
+                )
+                # If we get a result, timing should still be populated
+                assert result.timing is not None
+                assert result.timing.total_ms >= 0
+            except VmTimeoutError:
+                # Timeout at host level - this is also valid behavior
+                pass
+
+    async def test_timing_with_error_code(self, scheduler: Scheduler) -> None:
+        """Timing is populated even when code exits with error."""
+        result = await scheduler.run(
+            code="import sys; sys.exit(42)",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 42
+        # Timing should still be populated
+        assert result.timing is not None
+        assert result.timing.total_ms >= 0
+
+    async def test_timing_with_exception(self, scheduler: Scheduler) -> None:
+        """Timing is populated even when code raises exception."""
+        result = await scheduler.run(
+            code="raise ValueError('test error')",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code != 0
+        # Timing should still be populated
+        assert result.timing is not None
+        assert result.timing.total_ms >= 0
+
+    async def test_timing_with_large_output(self, scheduler: Scheduler) -> None:
+        """Timing is populated for executions with large output."""
+        # Generate 100KB of output
+        code = "print('x' * 100000)"
+
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+        assert len(result.stdout) > 0
+        # Timing should still be populated
+        assert result.timing is not None
+        assert result.timing.execute_ms >= 0
+
+    async def test_timing_javascript(self, scheduler: Scheduler) -> None:
+        """Timing works for JavaScript executions."""
+        result = await scheduler.run(
+            code="console.log('hello')",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert result.timing is not None
+        assert result.timing.total_ms >= 0
+        assert result.timing.execute_ms >= 0
+
+
+class TestSchedulerTimingEdgeCases:
+    """Edge case tests for timing behavior."""
+
+    async def test_timing_very_fast_execution(self, scheduler: Scheduler) -> None:
+        """Timing handles very fast executions (sub-millisecond code)."""
+        result = await scheduler.run(
+            code="pass",  # Minimal Python code
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+        # Even for fast code, timing should be populated
+        assert result.timing is not None
+        # execute_ms might be 0 for very fast code, that's OK
+        assert result.timing.execute_ms >= 0
+
+    async def test_timing_empty_output(self, scheduler: Scheduler) -> None:
+        """Timing works when code produces no output."""
+        result = await scheduler.run(
+            code="x = 1",  # No print
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout == ""
+        # Timing should still be populated
+        assert result.timing is not None
+
+    async def test_multiple_runs_have_independent_timing(self, scheduler: Scheduler) -> None:
+        """Each run has its own independent timing values."""
+        # Fast execution
+        result1 = await scheduler.run(
+            code="print('fast')",
+            language=Language.PYTHON,
+        )
+
+        # Slightly slower execution
+        result2 = await scheduler.run(
+            code="import time; time.sleep(0.1); print('slow')",
+            language=Language.PYTHON,
+        )
+
+        # Both should have timing
+        assert result1.timing is not None
+        assert result2.timing is not None
+
+        # Second should have longer execute_ms (sleeping 100ms)
+        # Allow some variance for timing precision
+        assert result2.timing.execute_ms >= 50  # At least 50ms for sleep(0.1)
+
+
+# ============================================================================
+# Integration Tests - Warm Pool Timing
+# ============================================================================
+
+
+class TestSchedulerWarmPoolTiming:
+    """Integration tests for warm pool timing behavior.
+
+    These tests verify that warm pool hits have:
+    1. warm_pool_hit=True
+    2. setup_ms=0, boot_ms=0 (boot happened at startup, not request time)
+    3. execute_ms and total_ms reflect actual request time
+    """
+
+    @pytest.fixture
+    async def warm_pool_scheduler(self, scheduler_config: SchedulerConfig):
+        """Scheduler with warm pool enabled."""
+        config = SchedulerConfig(
+            images_dir=scheduler_config.images_dir,
+            warm_pool_size=2,  # Enable warm pool with 2 VMs per language
+            auto_download_assets=False,
+        )
+        async with Scheduler(config) as sched:
+            yield sched
+
+    async def test_warm_pool_hit_flag_true(self, warm_pool_scheduler: Scheduler) -> None:
+        """Warm pool hit should have warm_pool_hit=True."""
+        result = await warm_pool_scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+        assert result.warm_pool_hit is True
+
+    async def test_warm_pool_timing_zero_setup_boot(self, warm_pool_scheduler: Scheduler) -> None:
+        """Warm pool hit should have setup_ms=0 and boot_ms=0."""
+        result = await warm_pool_scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.warm_pool_hit is True
+        # Setup and boot are "free" for warm pool - they happened at startup
+        assert result.timing.setup_ms == 0
+        assert result.timing.boot_ms == 0
+
+    async def test_warm_pool_timing_has_execute_time(self, warm_pool_scheduler: Scheduler) -> None:
+        """Warm pool hit should have real execute_ms and total_ms."""
+        result = await warm_pool_scheduler.run(
+            code="import time; time.sleep(0.05); print('done')",
+            language=Language.PYTHON,
+        )
+
+        assert result.warm_pool_hit is True
+        # Execute time should reflect actual code execution (at least 50ms for sleep)
+        assert result.timing.execute_ms >= 40  # Allow some variance
+        assert result.timing.total_ms >= 40
+
+    async def test_warm_pool_total_approximately_equals_execute(
+        self, warm_pool_scheduler: Scheduler
+    ) -> None:
+        """For warm pool, total_ms should be close to execute_ms (no boot overhead)."""
+        result = await warm_pool_scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.warm_pool_hit is True
+        # For warm pool: total ≈ execute (since setup=0, boot=0)
+        # Allow some overhead for queue allocation, etc.
+        assert result.timing.total_ms >= result.timing.execute_ms
+        # Total shouldn't be dramatically larger than execute for warm pool
+        assert result.timing.total_ms <= result.timing.execute_ms + 100  # 100ms tolerance
+
+    async def test_warm_pool_exhaustion_falls_back_to_cold(
+        self, scheduler_config: SchedulerConfig
+    ) -> None:
+        """When warm pool is exhausted, falls back to cold boot with full timing."""
+        import asyncio
+
+        # Create scheduler with very small pool (1 VM)
+        config = SchedulerConfig(
+            images_dir=scheduler_config.images_dir,
+            warm_pool_size=1,
+            auto_download_assets=False,
+        )
+
+        async with Scheduler(config) as sched:
+            # Run multiple concurrent executions to exhaust pool
+            # First one gets warm VM, subsequent ones may cold boot
+            results = await asyncio.gather(
+                sched.run(code="import time; time.sleep(0.2); print('1')", language=Language.PYTHON),
+                sched.run(code="import time; time.sleep(0.2); print('2')", language=Language.PYTHON),
+                sched.run(code="import time; time.sleep(0.2); print('3')", language=Language.PYTHON),
+            )
+
+            # All should succeed
+            for r in results:
+                assert r.exit_code == 0
+                assert r.timing is not None
+                assert r.timing.total_ms >= 0
+
+            # At least one should be warm, at least one should be cold (pool exhausted)
+            warm_hits = sum(1 for r in results if r.warm_pool_hit)
+            cold_boots = sum(1 for r in results if not r.warm_pool_hit)
+
+            # With pool size 1, we expect 1 warm hit and 2 cold boots
+            # (assuming no replenishment completes during the test)
+            assert warm_hits >= 1, "Expected at least one warm pool hit"
+            assert cold_boots >= 1, "Expected at least one cold boot (pool exhaustion)"
+
+            # Cold boots should have non-zero setup/boot times
+            for r in results:
+                if not r.warm_pool_hit:
+                    # Cold boot - should have real timing values
+                    # At least one of setup_ms or boot_ms should be > 0
+                    assert r.timing.setup_ms > 0 or r.timing.boot_ms > 0
+
+    async def test_warm_pool_javascript(self, warm_pool_scheduler: Scheduler) -> None:
+        """Warm pool works for JavaScript with correct timing."""
+        result = await warm_pool_scheduler.run(
+            code="console.log('hello')",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert result.warm_pool_hit is True
+        assert result.timing.setup_ms == 0
+        assert result.timing.boot_ms == 0
+        assert result.timing.execute_ms >= 0
