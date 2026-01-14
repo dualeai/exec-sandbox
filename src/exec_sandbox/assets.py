@@ -62,7 +62,6 @@ def _create_assets_registry() -> AsyncPooch:
         path=get_cache_dir("exec-sandbox"),
         base_url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/v{{version}}",
         version=pooch_version,
-        version_dev="latest",
         env="EXEC_SANDBOX_CACHE_DIR",
         registry={},  # Loaded dynamically from GitHub API
     )

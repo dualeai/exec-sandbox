@@ -555,27 +555,63 @@ class TestAsyncPooch:
 
             assert pooch.registry["file.txt"] == "sha256:hash"
 
-    async def test_fetch_with_dev_version(self, tmp_path: Path):
-        """Should use version_dev when version ends with .dev0."""
-        content = b"dev content"
+    async def test_fetch_fallback_to_configured_version(self, tmp_path: Path):
+        """Should use configured version when _resolved_version is not set."""
+        content = b"fallback content"
         content_hash = hashlib.sha256(content).hexdigest()
 
         pooch = AsyncPooch(
             path=tmp_path,
             base_url="https://example.com/v{version}",
-            version="1.0.0.dev0",
-            version_dev="latest",
+            version="1.0.0",
             registry={"file.txt": f"sha256:{content_hash}"},
         )
 
         with aioresponses() as m:
-            # Should use "latest" instead of "1.0.0.dev0"
-            m.get("https://example.com/vlatest/file.txt", body=content)
+            # Should use configured version directly
+            m.get("https://example.com/v1.0.0/file.txt", body=content)
 
             path = await pooch.fetch("file.txt")
 
             assert path.exists()
             assert path.read_bytes() == content
+
+    async def test_fetch_uses_resolved_version_from_github(self, tmp_path: Path):
+        """Should use actual tag from GitHub API instead of configured version."""
+        content = b"resolved version content"
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        pooch = AsyncPooch(
+            path=tmp_path,
+            base_url="https://github.com/owner/repo/releases/download/v{version}",
+            version="1.0.0.dev0",  # This would be used if _resolved_version wasn't set
+            registry={},
+        )
+
+        github_response = {
+            "tag_name": "v2.0.0",  # Actual tag from GitHub
+            "assets": [
+                {"name": "file.txt", "digest": f"sha256:{content_hash}"},
+            ],
+        }
+
+        with aioresponses() as m:
+            m.get(
+                "https://api.github.com/repos/owner/repo/releases/latest",
+                payload=github_response,
+            )
+            # Should use "v2.0.0" (resolved) instead of "vlatest"
+            m.get(
+                "https://github.com/owner/repo/releases/download/v2.0.0/file.txt",
+                body=content,
+            )
+
+            await pooch.load_registry_from_github("owner", "repo", "latest")
+            path = await pooch.fetch("file.txt")
+
+            assert path.exists()
+            assert path.read_bytes() == content
+            assert pooch._resolved_version == "v2.0.0"
 
 
 class TestDecompressZstd:
