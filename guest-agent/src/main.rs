@@ -15,7 +15,9 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::Command as StdCommand;
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -33,6 +35,8 @@ const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 const MAX_REQUEST_SIZE_BYTES: usize = 2_000_000; // 2MB max request JSON
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
+const READ_TIMEOUT_MS: u64 = 5000; // Timeout for idle reads - detects hung connections
+                                   // 5s is long enough for normal operation but short enough for stale detection
 
 // Environment variable limits
 const MAX_ENV_VARS: usize = 100; // Max number of environment variables
@@ -940,20 +944,123 @@ async fn execute_code_streaming(
     Ok(())
 }
 
-async fn handle_connection<R, W>(
-    mut reader: R,
-    write_half: W,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    R: AsyncBufReadExt + Unpin,
-    W: AsyncWriteExt + Unpin + Send + 'static,
-{
-    // Create bounded channel for writes (decouples read/write paths)
+/// Non-blocking file wrapper for virtio-serial ports.
+///
+/// Uses AsyncFd for true async I/O (epoll-based) instead of tokio::fs::File
+/// which uses a blocking threadpool. This enables proper timeout detection:
+/// blocking reads can get stuck in kernel space on hung connections, ignoring
+/// tokio timeouts. With AsyncFd + epoll, timeouts work correctly and the
+/// guest agent can detect and recover from stale connections.
+struct NonBlockingFile {
+    async_fd: AsyncFd<std::fs::File>,
+}
+
+impl NonBlockingFile {
+    /// Open a file with O_NONBLOCK and wrap it for async I/O.
+    fn open_read(path: &str) -> std::io::Result<Self> {
+        use std::fs::OpenOptions;
+
+        let file = OpenOptions::new().read(true).open(path)?;
+        Self::set_nonblocking(file.as_raw_fd())?;
+        let async_fd = AsyncFd::new(file)?;
+        Ok(Self { async_fd })
+    }
+
+    /// Set O_NONBLOCK on a file descriptor using fcntl.
+    fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+        // Get current flags
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Set O_NONBLOCK
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Read a line with proper async timeout support.
+    ///
+    /// Unlike tokio::fs::File::read which uses spawn_blocking (and thus
+    /// can't be interrupted by timeout when stuck in kernel), this method
+    /// uses AsyncFd::readable() which properly integrates with tokio's
+    /// event loop and can be cancelled by timeout.
+    async fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
+        let mut total_bytes = 0;
+        let mut byte_buf = [0u8; 1];
+
+        loop {
+            // Wait for the fd to be readable (epoll-based, properly cancellable)
+            let mut guard = self.async_fd.readable().await?;
+
+            // Try to read one byte (non-blocking)
+            match guard.try_io(|inner| {
+                let fd = inner.get_ref().as_raw_fd();
+                let result =
+                    unsafe { libc::read(fd, byte_buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                if result < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(result as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    // EOF
+                    return Ok(total_bytes);
+                }
+                Ok(Ok(n)) => {
+                    total_bytes += n;
+                    let byte = byte_buf[0];
+                    if byte == b'\n' {
+                        // Include newline in buffer for compatibility
+                        buf.push(byte as char);
+                        return Ok(total_bytes);
+                    }
+                    buf.push(byte as char);
+                }
+                Ok(Err(e)) => {
+                    return Err(e);
+                }
+                Err(_would_block) => {
+                    // Spurious wakeup, continue waiting
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+async fn run_with_ports(
+    cmd_file: NonBlockingFile,
+    event_file: tokio::fs::File,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Use the non-blocking file directly for reads
+    // Event file can stay as tokio::fs::File since writes don't block
+
+    // Run the connection handler with non-blocking cmd reader
+    handle_connection_nonblocking(&cmd_file, event_file).await
+}
+
+/// Handle connection with non-blocking command reader.
+///
+/// Uses NonBlockingFile for the command port, enabling proper timeout
+/// detection on hung/stale connections.
+async fn handle_connection_nonblocking(
+    cmd_reader: &NonBlockingFile,
+    event_file: tokio::fs::File,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writer = BufWriter::new(event_file);
+
+    // Create bounded channel for write queue to prevent deadlocks
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE_SIZE);
 
-    // Spawn background writer task
-    let mut writer = BufWriter::new(write_half);
-    let write_task = tokio::spawn(async move {
+    // Spawn write task
+    let write_handle = tokio::spawn(async move {
+        let mut writer = writer;
         while let Some(data) = write_rx.recv().await {
             if let Err(e) = writer.write_all(&data).await {
                 eprintln!("Write error: {}", e);
@@ -964,25 +1071,37 @@ where
                 break;
             }
         }
-        // Graceful shutdown - flush remaining data
-        let _ = writer.flush().await;
     });
 
     // Main loop: read requests, queue responses
     let mut line = String::new();
-    loop {
+    let result = loop {
         line.clear();
 
-        // Read request with size limit
-        let bytes_read = match reader.read_line(&mut line).await {
-            Ok(0) => {
+        // Read request with timeout using non-blocking I/O
+        // This timeout will actually work because AsyncFd::readable() is properly
+        // cancellable, unlike tokio::fs::File which uses blocking threadpool
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_millis(READ_TIMEOUT_MS),
+            cmd_reader.read_line(&mut line),
+        )
+        .await;
+
+        let bytes_read = match read_result {
+            Ok(Ok(0)) => {
                 eprintln!("Connection closed by client");
-                break;
+                break Ok(());
             }
-            Ok(n) => n,
-            Err(e) => {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 eprintln!("Read error: {}", e);
-                break;
+                break Err(e.into());
+            }
+            Err(_) => {
+                // Timeout - hung or stale connection
+                // AsyncFd enables proper timeout (unlike blocking I/O which ignores it)
+                eprintln!("Read timeout after {}ms, reconnecting...", READ_TIMEOUT_MS);
+                break Err("read timeout - triggering reconnect".into());
             }
         };
 
@@ -1017,7 +1136,7 @@ where
 
                 if write_tx.send(response).await.is_err() {
                     eprintln!("Write queue closed");
-                    break;
+                    break Err("write queue closed".into());
                 }
             }
             Ok(GuestCommand::InstallPackages { language, packages }) => {
@@ -1030,7 +1149,7 @@ where
                     .await
                     .is_err()
                 {
-                    break;
+                    break Err("install_packages failed".into());
                 }
             }
             Ok(GuestCommand::ExecuteCode {
@@ -1050,57 +1169,58 @@ where
                     .await
                     .is_err()
                 {
-                    break;
+                    break Err("execute_code failed".into());
                 }
             }
             Err(e) => {
                 eprintln!("JSON parse error: {}", e);
                 let _ = send_streaming_error(
                     &write_tx,
-                    format!("Invalid command JSON: {}", e),
-                    "parse_error",
+                    format!("Invalid JSON: {}", e),
+                    "request_error",
                 )
                 .await;
             }
         }
-    }
+    };
 
-    // Cleanup: signal writer to shutdown
-    drop(write_tx); // Closes channel, writer loop exits
+    // Drop write_tx to signal write task to exit
+    drop(write_tx);
 
-    // Wait for writer to finish
-    let _ = write_task.await;
+    // Wait for write task to finish
+    let _ = write_handle.await;
 
-    Ok(())
+    result
 }
 
 async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::fs::OpenOptions;
 
     // Open dual virtio-serial ports (created by QEMU virtserialport)
-    // CMD port: host → guest (read-only)
-    // EVENT port: guest → host (write-only)
+    // CMD port: host → guest (read-only) - uses NonBlockingFile for timeout support
+    // EVENT port: guest → host (write-only) - uses tokio::fs::File
     eprintln!(
         "Guest agent opening virtio-serial ports: cmd={}, event={}",
         CMD_PORT_PATH, EVENT_PORT_PATH
     );
 
     loop {
-        // Open command port (host → guest, read-only)
-        let cmd_file = match OpenOptions::new().read(true).open(CMD_PORT_PATH).await {
+        // Open command port with O_NONBLOCK for proper timeout support
+        // Enables detection of hung/stale connections
+        let cmd_file = match NonBlockingFile::open_read(CMD_PORT_PATH) {
             Ok(f) => {
-                eprintln!("Guest agent connected to command port (read)");
+                eprintln!("Guest agent connected to command port (read, non-blocking)");
                 f
             }
             Err(e) => {
                 eprintln!("Failed to open command port: {}, retrying in 100ms...", e);
-                // Reduced from 1s to 100ms: virtio ports available shortly after kernel boot
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
 
         // Open event port (guest → host, write-only)
+        // Write port can use tokio::fs::File - writes don't block in the same way
         let event_file = match OpenOptions::new().write(true).open(EVENT_PORT_PATH).await {
             Ok(f) => {
                 eprintln!("Guest agent connected to event port (write)");
@@ -1108,20 +1228,17 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 eprintln!("Failed to open event port: {}, retrying in 100ms...", e);
-                // Reduced from 1s to 100ms: virtio ports available shortly after kernel boot
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
 
-        // Split command port (only need read half)
-        let (read_half, _) = tokio::io::split(cmd_file);
-        let reader = BufReader::new(read_half);
-
-        // Handle connection with dual ports and error recovery
-        if let Err(e) = handle_connection(reader, event_file).await {
+        // Handle connection with non-blocking cmd reader
+        // Note: We pass ownership of files to run_with_ports which ensures
+        // they are dropped when it returns (before we try to reopen)
+        if let Err(e) = run_with_ports(cmd_file, event_file).await {
             eprintln!("Connection error: {}, reopening ports...", e);
-            // Small delay before reconnecting
+            // Small delay before reconnecting to give kernel time to release
             tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
         }
     }
