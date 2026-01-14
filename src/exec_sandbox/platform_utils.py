@@ -212,8 +212,15 @@ class ProcessWrapper:
 
         Async version prevents blocking event loop on system/kernel hangs.
         Uses asyncio.to_thread() for blocking psutil operations.
+
+        Raises:
+            ProcessLookupError: If process is not running
         """
-        if self.psutil_proc and await self.is_running():
+        if not await self.is_running():
+            raise ProcessLookupError(f"Process {self.pid} is not running")
+
+        if self.psutil_proc:
+            # Use psutil (suppress errors for race conditions where process dies during call)
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 await asyncio.to_thread(self.psutil_proc.terminate)
         else:
@@ -224,8 +231,15 @@ class ProcessWrapper:
 
         Async version prevents blocking event loop on system/kernel hangs.
         Uses asyncio.to_thread() for blocking psutil operations.
+
+        Raises:
+            ProcessLookupError: If process is not running
         """
-        if self.psutil_proc and await self.is_running():
+        if not await self.is_running():
+            raise ProcessLookupError(f"Process {self.pid} is not running")
+
+        if self.psutil_proc:
+            # Use psutil (suppress errors for race conditions where process dies during call)
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 await asyncio.to_thread(self.psutil_proc.kill)
         else:
