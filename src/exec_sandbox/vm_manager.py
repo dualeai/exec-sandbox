@@ -870,7 +870,7 @@ class QemuVM:
             # Fixed init timeout (connection establishment, independent of execution timeout)
             connect_start = asyncio.get_event_loop().time()
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            connect_ms = int((asyncio.get_event_loop().time() - connect_start) * 1000)
+            connect_ms = round((asyncio.get_event_loop().time() - connect_start) * 1000)
 
             # Stream execution output to console
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
@@ -1475,8 +1475,8 @@ class VmManager:
                 await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
                 boot_complete_time = asyncio.get_event_loop().time()
                 # Store timing on VM for scheduler to use
-                vm.setup_ms = int((setup_complete_time - start_time) * 1000)
-                vm.boot_ms = int((boot_complete_time - setup_complete_time) * 1000)
+                vm.setup_ms = round((setup_complete_time - start_time) * 1000)
+                vm.boot_ms = round((boot_complete_time - setup_complete_time) * 1000)
                 # Transition to READY state after boot completes
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
@@ -1550,7 +1550,7 @@ class VmManager:
                 ) from e
 
             # Log boot time with breakdown
-            total_boot_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            total_boot_ms = round((asyncio.get_event_loop().time() - start_time) * 1000)
             logger.info(
                 "VM created",
                 extra={

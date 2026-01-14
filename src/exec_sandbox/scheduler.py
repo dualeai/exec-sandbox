@@ -333,8 +333,8 @@ class Scheduler:
                 execute_end_time = asyncio.get_event_loop().time()
 
                 # Calculate timing
-                execute_ms = int((execute_end_time - execute_start_time) * 1000)
-                total_ms = int((execute_end_time - run_start_time) * 1000)
+                execute_ms = round((execute_end_time - execute_start_time) * 1000)
+                total_ms = round((execute_end_time - run_start_time) * 1000)
 
                 # For warm pool: setup/boot are "free" (happened at service startup)
                 # For cold boot: use actual setup/boot times from VM

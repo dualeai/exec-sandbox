@@ -559,7 +559,7 @@ class WarmVMPool:
             "Health check iteration complete",
             extra={
                 "language": language.value,
-                "duration_ms": f"{check_duration * 1000:.1f}",
+                "duration_ms": round(check_duration * 1000),
                 "healthy": healthy_count,
                 "unhealthy": unhealthy_count,
                 "pool_size": pool.qsize(),

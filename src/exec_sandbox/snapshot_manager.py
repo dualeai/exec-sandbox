@@ -20,7 +20,6 @@ import contextlib
 import errno
 import hashlib
 import sys
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -309,7 +308,7 @@ class SnapshotManager:
             SnapshotError: Creation failed
             VmError: VM crashed during snapshot creation
         """
-        start_time = time.time()
+        start_time = asyncio.get_event_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
         # Resolve to absolute path - qemu-img resolves backing file relative to snapshot location,
         # so we need absolute path when snapshot_cache_dir differs from base_images_dir
@@ -467,14 +466,14 @@ class SnapshotManager:
                         )
 
         # Record snapshot creation duration
-        duration_ms = (time.time() - start_time) * 1000
+        duration_ms = round((asyncio.get_event_loop().time() - start_time) * 1000)
         logger.info(
             "Snapshot created",
             extra={
                 "cache_key": cache_key,
                 "language": language,
                 "package_count": len(packages),
-                "duration_ms": f"{duration_ms:.1f}",
+                "duration_ms": duration_ms,
             },
         )
 
