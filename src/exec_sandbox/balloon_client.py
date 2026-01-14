@@ -185,13 +185,17 @@ class BalloonClient:
         """
         try:
             resp = await self._execute("query-balloon", timeout=timeout)
+            if "error" in resp:
+                # Device error (e.g., balloon not available)
+                logger.warning("Balloon query failed", extra={"error": resp["error"]})
+                return None
             if "return" in resp:
                 # QMP returns bytes, convert to MB
                 actual_bytes = resp["return"].get("actual")
                 if actual_bytes is not None:
                     return actual_bytes // (1024 * 1024)
             return None
-        except (BalloonError, json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError) as e:
             logger.warning("Balloon query failed", extra={"error": str(e)})
             return None
 
