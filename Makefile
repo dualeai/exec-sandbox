@@ -108,6 +108,16 @@ ci-diagnose:
 	@./scripts/ci-diagnose.sh diagnose $(run_id)
 
 # ============================================================================
+# Benchmarking (concurrent VM latency)
+# ============================================================================
+
+bench:
+	uv run python scripts/benchmark_latency.py -n 10
+
+bench-pool:
+	uv run python scripts/benchmark_latency.py -n 10 --pool 8
+
+# ============================================================================
 # Building
 # ============================================================================
 

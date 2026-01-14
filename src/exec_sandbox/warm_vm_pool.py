@@ -14,15 +14,19 @@ Performance:
 - Custom packages: Fallback to cold boot (no change)
 - Memory overhead: ~1GB for 4 VMs (256MB x 4, based on 25% of max_concurrent_vms=10)
 
-L0 Memory Snapshots (Future Enhancement):
-- First boot: cold boot → save L0 snapshot (python-base, javascript-base)
-- Subsequent boots: restore from L0 via -loadvm (~50-200ms)
-- Requires create_vm_from_snapshot() method in VmManager
+L2 Disk Snapshots:
+- Uses L2 cache (local qcow2) for faster warm pool boots
+- snapshot_manager: Optional for L2 cache (graceful degradation to cold boot if None)
+
+Memory Optimization (Balloon):
+- Idle pool VMs have balloon inflated (guest has ~64MB free)
+- Before execution, balloon deflates (guest gets full memory back)
+- Reduces idle memory from ~1GB to ~256MB for 4 VMs (75% reduction)
 
 Example:
     ```python
     # In Scheduler
-    warm_pool = WarmVMPool(vm_manager, config)
+    warm_pool = WarmVMPool(vm_manager, config, snapshot_manager)
     await warm_pool.startup()  # Pre-boot VMs
 
     # Per execution
@@ -51,7 +55,9 @@ from tenacity import (
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.balloon_client import BalloonClient, BalloonError
 from exec_sandbox.models import Language
+from exec_sandbox.permission_utils import get_expected_socket_uid
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -59,6 +65,7 @@ if TYPE_CHECKING:
     from tenacity.wait import wait_base
 
     from exec_sandbox.config import SchedulerConfig
+    from exec_sandbox.snapshot_manager import SnapshotManager
     from exec_sandbox.vm_manager import QemuVM, VmManager
 
 logger = get_logger(__name__)
@@ -82,15 +89,22 @@ class WarmVMPool:
         pools: Dict[language, Queue[QemuVM]] for each language
     """
 
-    def __init__(self, vm_manager: VmManager, config: SchedulerConfig):
+    def __init__(
+        self,
+        vm_manager: VmManager,
+        config: SchedulerConfig,
+        snapshot_manager: SnapshotManager | None = None,
+    ):
         """Initialize warm VM pool.
 
         Args:
             vm_manager: VmManager for VM lifecycle
             config: Scheduler configuration
+            snapshot_manager: Optional SnapshotManager for L2 cache (faster refill)
         """
         self.vm_manager = vm_manager
         self.config = config
+        self.snapshot_manager = snapshot_manager
 
         # Calculate pool size: 25% of max_concurrent_vms
         self.pool_size_per_language = max(
@@ -206,6 +220,9 @@ class WarmVMPool:
             # Non-blocking get (raises QueueEmpty if pool exhausted)
             vm = self.pools[language].get_nowait()
 
+            # Deflate balloon to restore memory before code execution
+            await self._deflate_balloon(vm)
+
             logger.debug(
                 "Warm VM allocated",
                 extra={
@@ -311,6 +328,10 @@ class WarmVMPool:
         """
         try:
             vm = await self._boot_warm_vm(language, index)
+
+            # Inflate balloon to reduce idle memory footprint
+            await self._inflate_balloon(vm)
+
             await self.pools[language].put(vm)
             logger.info(
                 "Warm VM ready",
@@ -336,6 +357,8 @@ class WarmVMPool:
     ) -> QemuVM:
         """Boot single warm VM with placeholder IDs.
 
+        Uses L2 cache for disk caching if available.
+
         Args:
             language: Programming language enum
             index: VM index in pool (for unique ID)
@@ -347,13 +370,35 @@ class WarmVMPool:
         tenant_id = constants.WARM_POOL_TENANT_ID
         task_id = f"warm-{language.value}-{index}"
 
+        # Check L2 cache for base image (check-only, no create)
+        # For base images (no packages), creating L2 cache is pointless - would boot VM
+        # just to shut it down with no data to cache. Boot from base image directly.
+        snapshot_path = None
+        if self.snapshot_manager:
+            try:
+                snapshot_path = await self.snapshot_manager.check_cache(
+                    language=language,
+                    packages=[],  # Base image, no packages
+                )
+                if snapshot_path:
+                    logger.debug(
+                        "L2 cache hit for warm pool VM",
+                        extra={"language": language.value, "snapshot_path": str(snapshot_path)},
+                    )
+            except (OSError, RuntimeError) as e:
+                # Graceful degradation: log and continue with cold boot
+                logger.warning(
+                    "L2 cache check failed for warm pool, falling back to cold boot",
+                    extra={"language": language.value, "error": str(e)},
+                )
+
         return await self.vm_manager.create_vm(
-            language=language.value,
+            language=language,
             tenant_id=tenant_id,
             task_id=task_id,
-            snapshot_path=None,  # Default image (no packages)
+            backing_image=snapshot_path,
             memory_mb=constants.DEFAULT_MEMORY_MB,
-            allow_network=False,  # Complete isolation
+            allow_network=False,  # Warm pool VMs don't need network
             allowed_domains=None,
         )
 
@@ -396,6 +441,62 @@ class WarmVMPool:
                 )
                 # Don't propagate - graceful degradation
 
+    async def _inflate_balloon(self, vm: QemuVM) -> None:
+        """Inflate balloon to reduce guest memory for idle pool VM.
+
+        Inflating the balloon takes memory FROM the guest, reducing idle footprint.
+        Graceful degradation: logs warning and continues if balloon fails.
+
+        Args:
+            vm: QemuVM to inflate balloon for
+        """
+        try:
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
+            client = BalloonClient(vm.qmp_socket, expected_uid)
+            await client.connect()
+            try:
+                await client.inflate(target_mb=constants.BALLOON_INFLATE_TARGET_MB)
+                logger.debug(
+                    "Balloon inflated for warm pool VM",
+                    extra={"vm_id": vm.vm_id, "target_mb": constants.BALLOON_INFLATE_TARGET_MB},
+                )
+            finally:
+                await client.disconnect()
+        except (BalloonError, OSError, TimeoutError) as e:
+            # Graceful degradation: log and continue
+            logger.warning(
+                "Balloon inflation failed (VM will use full memory)",
+                extra={"vm_id": vm.vm_id, "error": str(e)},
+            )
+
+    async def _deflate_balloon(self, vm: QemuVM) -> None:
+        """Deflate balloon to restore guest memory before code execution.
+
+        Deflating the balloon returns memory TO the guest.
+        Graceful degradation: logs warning and continues if balloon fails.
+
+        Args:
+            vm: QemuVM to deflate balloon for
+        """
+        try:
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
+            client = BalloonClient(vm.qmp_socket, expected_uid)
+            await client.connect()
+            try:
+                await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB)
+                logger.debug(
+                    "Balloon deflated for warm pool VM",
+                    extra={"vm_id": vm.vm_id, "target_mb": constants.DEFAULT_MEMORY_MB},
+                )
+            finally:
+                await client.disconnect()
+        except (BalloonError, OSError, TimeoutError) as e:
+            # Graceful degradation: log and continue (VM may be memory-constrained)
+            logger.warning(
+                "Balloon deflation failed (VM may be memory-constrained)",
+                extra={"vm_id": vm.vm_id, "error": str(e)},
+            )
+
     async def _health_check_loop(self) -> None:
         """Background health check for warm VMs.
 
@@ -424,8 +525,9 @@ class WarmVMPool:
     async def _health_check_pool(self, language: Language, pool: asyncio.Queue[QemuVM]) -> None:
         """Perform health check on a single pool.
 
-        Strategy: Remove VMs, check in parallel, restore only healthy ones.
-        This ensures pool never has unhealthy VMs, even if some exhaustion during check.
+        Strategy: Remove VMs, check in parallel, restore immediately when healthy.
+        Each VM is restored as soon as its check completes - unhealthy VMs don't
+        block healthy ones from returning to the pool.
         """
         pool_size = pool.qsize()
         if pool_size == 0:
@@ -442,14 +544,15 @@ class WarmVMPool:
         if not vms_to_check:
             return
 
-        # Health check all VMs in parallel
+        # Health check all VMs in parallel - each VM restored immediately when healthy
         results = await asyncio.gather(
-            *[self._check_vm_health(vm) for vm in vms_to_check],
+            *[self._check_and_restore_vm(vm, pool, language) for vm in vms_to_check],
             return_exceptions=True,
         )
 
-        # Process results and restore healthy VMs
-        healthy_count, unhealthy_count = await self._process_health_results(language, pool, vms_to_check, results)
+        # Count results (True = healthy, False = unhealthy, Exception = error)
+        healthy_count = sum(1 for r in results if r is True)
+        unhealthy_count = len(results) - healthy_count
 
         check_duration = asyncio.get_event_loop().time() - check_start
         logger.info(
@@ -479,39 +582,36 @@ class WarmVMPool:
         )
         return vms_to_check
 
-    async def _process_health_results(
+    async def _check_and_restore_vm(
         self,
-        language: Language,
+        vm: QemuVM,
         pool: asyncio.Queue[QemuVM],
-        vms: list[QemuVM],
-        results: list[bool | BaseException],
-    ) -> tuple[int, int]:
-        """Process health check results and restore healthy VMs."""
-        healthy_count = 0
-        unhealthy_count = 0
+        language: Language,
+    ) -> bool:
+        """Check VM health and immediately restore to pool if healthy.
 
-        for vm, result in zip(vms, results, strict=True):
-            healthy = self._evaluate_health_result(result, language, vm)
+        This is called in parallel for all VMs. Each healthy VM is restored
+        immediately without waiting for other checks to complete, minimizing
+        the window where the pool is depleted.
 
+        Returns:
+            True if healthy (restored to pool), False if unhealthy (destroyed).
+        """
+        try:
+            healthy = await self._check_vm_health(vm)
             if healthy:
-                await pool.put(vm)
-                healthy_count += 1
-            else:
-                await self._handle_unhealthy_vm(vm, language)
-                unhealthy_count += 1
-
-        return healthy_count, unhealthy_count
-
-    def _evaluate_health_result(self, result: bool | BaseException, language: Language, vm: QemuVM) -> bool:
-        """Evaluate health check result for a single VM."""
-        if isinstance(result, BaseException):
+                await pool.put(vm)  # Immediately back in pool
+                return True
+            await self._handle_unhealthy_vm(vm, language)
+            return False
+        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
             logger.error(
                 "Health check exception",
-                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(result)},
-                exc_info=result,
+                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
+                exc_info=e,
             )
+            await self._handle_unhealthy_vm(vm, language)
             return False
-        return result
 
     async def _handle_unhealthy_vm(self, vm: QemuVM, language: Language) -> None:
         """Handle an unhealthy VM by destroying and triggering replenishment."""
@@ -587,13 +687,13 @@ class WarmVMPool:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES),
                 wait=wait_strategy,
-                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError)),
+                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError, EOFError)),
                 before_sleep=before_sleep_log(logger, logging.DEBUG),
                 reraise=True,
             ):
                 with attempt:
                     return await _ping_guest()
-        except (OSError, TimeoutError, ConnectionError) as e:
+        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
             # All retries exhausted - log and return unhealthy
             logger.warning(
                 "Health check failed after retries",

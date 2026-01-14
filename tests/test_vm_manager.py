@@ -219,7 +219,6 @@ class TestVmManagerIntegration:
             language=Language.PYTHON,
             tenant_id="test",
             task_id="test-1",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -238,7 +237,6 @@ class TestVmManagerIntegration:
             language=Language.PYTHON,
             tenant_id="test",
             task_id="test-1",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -247,7 +245,6 @@ class TestVmManagerIntegration:
         try:
             result = await vm.execute(
                 code="print('hello from vm')",
-                language=Language.PYTHON,
                 timeout_seconds=30,
                 env_vars=None,
                 on_stdout=None,
@@ -269,7 +266,6 @@ class TestVmManagerIntegration:
                 language=Language.PYTHON,
                 tenant_id="test",
                 task_id=f"test-{i}",
-                snapshot_path=None,
                 memory_mb=256,
                 allow_network=False,
                 allowed_domains=None,
@@ -313,7 +309,6 @@ class TestAllImageTypes:
             language=Language.RAW,
             tenant_id="test-hwaccel",
             task_id="verify-hwaccel",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -404,7 +399,6 @@ class TestAllImageTypes:
             language=language,
             tenant_id="test",
             task_id=f"health-check-{language.value}",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -435,7 +429,6 @@ class TestAllImageTypes:
             language=language,
             tenant_id="test",
             task_id=f"execute-{language.value}",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -444,7 +437,6 @@ class TestAllImageTypes:
         try:
             result = await vm.execute(
                 code=code,
-                language=language,
                 timeout_seconds=30,
                 env_vars=None,
                 on_stdout=None,
@@ -476,7 +468,6 @@ class TestEmulationMode:
             language=Language.RAW,
             tenant_id="test-emulation",
             task_id="verify-tcg",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -558,7 +549,6 @@ class TestEmulationMode:
             language=language,
             tenant_id="test-emulation",
             task_id=f"emulation-boot-{language.value}",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -584,7 +574,6 @@ class TestEmulationMode:
             language=language,
             tenant_id="test-emulation",
             task_id=f"emulation-exec-{language.value}",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,
@@ -593,7 +582,6 @@ class TestEmulationMode:
         try:
             result = await vm.execute(
                 code=code,
-                language=language,
                 timeout_seconds=120,  # Longer timeout for TCG emulation
                 env_vars=None,
                 on_stdout=None,

@@ -174,11 +174,15 @@ WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
 """Maximum backoff between health check retries."""
 
 # ============================================================================
-# Memory Optimization (Balloon)
+# Balloon Memory Management (for warm pool memory efficiency)
 # ============================================================================
 
-BALLOON_DEFLATE_MIN_MB: Final[int] = 64
-"""Minimum memory target during balloon deflation (64MB floor)."""
+BALLOON_INFLATE_TARGET_MB: Final[int] = 64
+"""Target guest memory in MB when inflating balloon for idle warm pool VMs.
+Inflating the balloon reduces guest memory, allowing host to reclaim."""
 
-BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 10.0
-"""Timeout for balloon deflation before snapshot."""
+BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout for balloon inflate operation (reducing guest memory for idle pool)."""
+
+BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout for balloon deflate operation (restoring guest memory before execution)."""

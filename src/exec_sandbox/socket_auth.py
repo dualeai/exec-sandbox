@@ -39,6 +39,7 @@ __all__ = [
     "PeerCredentials",
     "SocketAuthError",
     "connect_and_verify",
+    "create_unix_socket",
     "get_peer_credentials",
     "get_qemu_vm_uid",
     "verify_socket_peer",
@@ -249,3 +250,37 @@ async def connect_and_verify(
         raise
 
     return reader, writer
+
+
+def create_unix_socket(path: str, backlog: int = 128) -> socket.socket:
+    """Create and bind a Unix domain socket (socket activation pattern).
+
+    Creates a listening socket that can be passed to a child process via
+    file descriptor inheritance. This eliminates polling latency - the
+    socket is ready before the child process starts.
+
+    Args:
+        path: Unix socket path
+        backlog: Listen backlog (default 128)
+
+    Returns:
+        Bound and listening socket. Caller is responsible for closing it
+        after the child process has inherited the FD.
+
+    Raises:
+        OSError: Socket creation, bind, or listen failed
+
+    Example:
+        sock = create_unix_socket("/tmp/my.sock")
+        fd = sock.fileno()
+        proc = subprocess.Popen(..., pass_fds=(fd,))
+        sock.close()  # Close parent's copy after child inherits
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(path)
+        sock.listen(backlog)
+        return sock
+    except OSError:
+        sock.close()
+        raise

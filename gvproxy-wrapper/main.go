@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	listenQemu = flag.String("listen-qemu", "", "QEMU socket path (unix:///path/to/socket)")
-	dnsZones   = flag.String("dns-zones", "", "DNS zones JSON configuration")
-	debug      = flag.Bool("debug", false, "Enable debug logging")
+	listenFD = flag.Int("listen-fd", -1, "Pre-bound socket FD (socket activation from parent process)")
+	dnsZones = flag.String("dns-zones", "", "DNS zones JSON configuration")
+	debug    = flag.Bool("debug", false, "Enable debug logging")
 )
 
 func main() {
@@ -27,8 +27,8 @@ func main() {
 	// Errors still go to stderr via log.Fatal
 	log.SetOutput(os.Stdout)
 
-	if *listenQemu == "" {
-		log.Fatal("Error: -listen-qemu flag is required")
+	if *listenFD < 0 {
+		log.Fatal("Error: -listen-fd flag is required (pre-bound socket FD from parent process)")
 	}
 
 	// Parse DNS zones from JSON
@@ -64,20 +64,21 @@ func main() {
 		log.Fatalf("Error creating virtual network: %v", err)
 	}
 
-	// Parse QEMU socket path (remove "unix://" prefix)
-	qemuPath := *listenQemu
-	if len(qemuPath) > 7 && qemuPath[:7] == "unix://" {
-		qemuPath = qemuPath[7:]
+	// Create listener from pre-bound FD (socket activation pattern)
+	// Parent process creates and binds the socket, then passes FD to us
+	// This eliminates polling latency - socket is already bound and listening
+	file := os.NewFile(uintptr(*listenFD), "socket")
+	if file == nil {
+		log.Fatalf("Error: invalid file descriptor %d", *listenFD)
 	}
-
-	// Listen on QEMU socket
-	listener, err := net.Listen("unix", qemuPath)
+	listener, err := net.FileListener(file)
+	file.Close() // Close Go's file wrapper, FD ownership transferred to listener
 	if err != nil {
-		log.Fatalf("Error listening on QEMU socket: %v", err)
+		log.Fatalf("Error creating listener from FD %d: %v", *listenFD, err)
 	}
 	defer listener.Close()
 
-	log.Printf("Listening on QEMU socket: %s", qemuPath)
+	log.Printf("Listening on QEMU socket: (pre-bound FD %d)", *listenFD)
 	if len(zones) > 0 {
 		log.Printf("DNS filtering enabled with %d zone(s)", len(zones))
 		for i, zone := range zones {
@@ -94,7 +95,7 @@ func main() {
 		log.Println("Received shutdown signal, cleaning up...")
 		cancel()
 		listener.Close()
-		os.Remove(qemuPath)
+		// Socket file is managed by parent process, not us
 		os.Exit(0)
 	}()
 

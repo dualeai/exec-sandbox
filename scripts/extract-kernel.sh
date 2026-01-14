@@ -29,12 +29,40 @@ detect_arch() {
 # Cache helpers - content-addressable build caching via .hash sidecar files
 # =============================================================================
 
-# Compute hash for kernel inputs (Alpine version + arch + init script)
+# Get kernel package version from Alpine's package index (without running Docker)
+# This ensures cache invalidation when Alpine updates the kernel package
+get_kernel_version() {
+    local arch=$1
+    local apk_arch
+    case "$arch" in
+        x86_64)  apk_arch="x86_64" ;;
+        aarch64) apk_arch="aarch64" ;;
+    esac
+    curl -sf "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${apk_arch}/APKINDEX.tar.gz" 2>/dev/null \
+        | tar -xzO APKINDEX 2>/dev/null \
+        | grep -A1 "^P:linux-virt$" \
+        | grep "^V:" \
+        | cut -d: -f2 \
+        || echo "unknown"
+}
+
+# Compute hash for kernel inputs (Alpine version + arch + kernel package version)
 compute_kernel_hash() {
     local arch=$1
+    local kernel_ver
+    kernel_ver=$(get_kernel_version "$arch")
+    echo "alpine=$ALPINE_VERSION arch=$arch kernel=$kernel_ver" | sha256sum | cut -d' ' -f1
+}
+
+# Compute hash for initramfs inputs (kernel hash + init script + build script)
+compute_initramfs_hash() {
+    local arch=$1
+    local kernel_ver
+    kernel_ver=$(get_kernel_version "$arch")
     (
-        echo "alpine=$ALPINE_VERSION arch=$arch"
+        echo "alpine=$ALPINE_VERSION arch=$arch kernel=$kernel_ver"
         cat "$REPO_ROOT/images/minimal-init.sh" 2>/dev/null || true
+        cat "$SCRIPT_DIR/build-initramfs.sh" 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }
 
@@ -75,40 +103,58 @@ extract_for_arch() {
         aarch64) docker_platform="linux/arm64" ;;
     esac
 
-    # Check cache (use vmlinuz as the cache key file)
-    local current_hash
-    current_hash=$(compute_kernel_hash "$target_arch")
+    # Check cache separately for kernel and initramfs
+    local kernel_hash initramfs_hash
+    kernel_hash=$(compute_kernel_hash "$target_arch")
+    initramfs_hash=$(compute_initramfs_hash "$target_arch")
 
-    if cache_hit "$vmlinuz_file" "$current_hash" && [ -f "$initramfs_file" ]; then
+    local need_kernel=false need_initramfs=false
+
+    if ! cache_hit "$vmlinuz_file" "$kernel_hash"; then
+        need_kernel=true
+    fi
+
+    if ! cache_hit "$initramfs_file" "$initramfs_hash"; then
+        need_initramfs=true
+    fi
+
+    if [ "$need_kernel" = false ] && [ "$need_initramfs" = false ]; then
         echo "Kernel up-to-date: $target_arch (cache hit)"
         return 0
     fi
 
-    echo "Extracting kernel for $target_arch (Alpine $ALPINE_VERSION)..."
-
     mkdir -p "$OUTPUT_DIR"
 
-    # Extract only kernel from Alpine (we build our own minimal initramfs)
-    docker run --rm \
-        -v "$OUTPUT_DIR:/output" \
-        --platform "$docker_platform" \
-        "alpine:$ALPINE_VERSION" \
-        sh -c "
-            apk add --no-cache linux-virt >/dev/null 2>&1
-            cp /boot/vmlinuz-virt /output/vmlinuz-$target_arch
-            chmod 644 /output/vmlinuz-$target_arch
-        "
+    # Extract kernel from Alpine if needed
+    if [ "$need_kernel" = true ]; then
+        echo "Extracting kernel for $target_arch (Alpine $ALPINE_VERSION)..."
+        docker run --rm \
+            -v "$OUTPUT_DIR:/output" \
+            --platform "$docker_platform" \
+            "alpine:$ALPINE_VERSION" \
+            sh -c "
+                apk add --no-cache linux-virt >/dev/null 2>&1
+                cp /boot/vmlinuz-virt /output/vmlinuz-$target_arch
+                chmod 644 /output/vmlinuz-$target_arch
+            "
+        save_hash "$vmlinuz_file" "$kernel_hash"
+    fi
 
-    # Build custom minimal initramfs (2MB vs 9MB Alpine stock)
-    # This includes only essential modules: virtio_blk, ext4 + dependencies
-    "$SCRIPT_DIR/build-initramfs.sh" "$target_arch" "$OUTPUT_DIR"
+    # Build initramfs if needed
+    if [ "$need_initramfs" = true ]; then
+        # Build custom minimal initramfs (2MB vs 9MB Alpine stock)
+        # This includes only essential modules: virtio_blk, ext4 + dependencies
+        "$SCRIPT_DIR/build-initramfs.sh" "$target_arch" "$OUTPUT_DIR"
+        save_hash "$initramfs_file" "$initramfs_hash"
+    fi
 
-    save_hash "$vmlinuz_file" "$current_hash"
-
-    local vmlinuz_size initramfs_size
-    vmlinuz_size=$(du -h "$vmlinuz_file" | cut -f1)
-    initramfs_size=$(du -h "$initramfs_file" | cut -f1)
-    echo "Extracted: vmlinuz-$target_arch ($vmlinuz_size), initramfs-$target_arch ($initramfs_size)"
+    # Report what was built
+    if [ "$need_kernel" = true ] || [ "$need_initramfs" = true ]; then
+        local vmlinuz_size initramfs_size
+        vmlinuz_size=$(du -h "$vmlinuz_file" | cut -f1)
+        initramfs_size=$(du -h "$initramfs_file" | cut -f1)
+        echo "Extracted: vmlinuz-$target_arch ($vmlinuz_size), initramfs-$target_arch ($initramfs_size)"
+    fi
 }
 
 main() {

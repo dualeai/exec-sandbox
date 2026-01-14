@@ -376,6 +376,34 @@ class TestExecutionCompleteMessage:
         msg = ExecutionCompleteMessage(exit_code=-9, execution_time_ms=100)
         assert msg.exit_code == -9
 
+    def test_with_timing_fields(self) -> None:
+        """ExecutionCompleteMessage with optional timing fields."""
+        msg = ExecutionCompleteMessage(
+            exit_code=0,
+            execution_time_ms=150,
+            spawn_ms=5,
+            process_ms=140,
+        )
+        assert msg.spawn_ms == 5
+        assert msg.process_ms == 140
+
+    def test_without_timing_fields(self) -> None:
+        """ExecutionCompleteMessage without optional timing fields (backwards compat)."""
+        msg = ExecutionCompleteMessage(exit_code=0, execution_time_ms=150)
+        assert msg.spawn_ms is None
+        assert msg.process_ms is None
+
+    def test_partial_timing_fields(self) -> None:
+        """ExecutionCompleteMessage with only spawn_ms (timeout scenario)."""
+        msg = ExecutionCompleteMessage(
+            exit_code=-1,
+            execution_time_ms=30000,
+            spawn_ms=10,
+            process_ms=None,  # Process timed out before completing
+        )
+        assert msg.spawn_ms == 10
+        assert msg.process_ms is None
+
 
 class TestPongMessage:
     """Tests for PongMessage model."""
@@ -455,6 +483,28 @@ class TestStreamingMessage:
         msg = adapter.validate_python(data)
         assert isinstance(msg, ExecutionCompleteMessage)
         assert msg.exit_code == 0
+
+    def test_parse_complete_with_timing(self) -> None:
+        """Parse ExecutionCompleteMessage with timing fields from JSON."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "complete", "exit_code": 0, "execution_time_ms": 100, "spawn_ms": 5, "process_ms": 90}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, ExecutionCompleteMessage)
+        assert msg.spawn_ms == 5
+        assert msg.process_ms == 90
+
+    def test_parse_complete_without_timing(self) -> None:
+        """Parse ExecutionCompleteMessage without timing fields (backwards compat)."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "complete", "exit_code": 0, "execution_time_ms": 42}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, ExecutionCompleteMessage)
+        assert msg.spawn_ms is None
+        assert msg.process_ms is None
 
     def test_parse_pong(self) -> None:
         """Parse PongMessage from dict."""
