@@ -18,7 +18,7 @@ done
 cd "$GIT_DIR" || exit 1
 
 # Try to get version from git tag
-VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")
+VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0.dev0")
 
 # Remove 'v' prefix if present
 VERSION=${VERSION#v}

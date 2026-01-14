@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "exec-sandbox"
-version = "0.1.0"
+version = "0.0.0.dev0"
 description = "Secure code execution in microVMs with QEMU"
 readme = "README.md"
 license = "Apache-2.0"
