@@ -7,6 +7,7 @@ Uses AsyncPooch for caching and checksum verification.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import TYPE_CHECKING
 
@@ -37,12 +38,30 @@ except ImportError:
     __version__ = "0.0.0.dev0"
 
 
+def _get_asset_version() -> tuple[str, str]:
+    """Get asset version from env var or package version.
+
+    Returns:
+        Tuple of (version_for_pooch, version_for_github_tag).
+        - version_for_pooch: Version without 'v' prefix for AsyncPooch
+        - version_for_github_tag: Version with 'v' prefix (or 'latest' for dev)
+    """
+    env_version = os.environ.get("EXEC_SANDBOX_ASSET_VERSION")
+    if env_version:
+        version = env_version.lstrip("v")
+        return version, f"v{version}"
+    if ".dev" in __version__:
+        return __version__, "latest"
+    return __version__, f"v{__version__}"
+
+
 def _create_assets_registry() -> AsyncPooch:
     """Create the assets registry singleton."""
+    pooch_version, _ = _get_asset_version()
     return AsyncPooch(
         path=get_cache_dir("exec-sandbox"),
         base_url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/v{{version}}",
-        version=__version__,
+        version=pooch_version,
         version_dev="latest",
         env="EXEC_SANDBOX_CACHE_DIR",
         registry={},  # Loaded dynamically from GitHub API
@@ -82,14 +101,8 @@ async def ensure_registry_loaded() -> None:
         logger.debug("Offline mode enabled, skipping registry load from GitHub")
         return
 
-    # Get version override from environment
-    version = os.environ.get("EXEC_SANDBOX_ASSET_VERSION") or f"v{__version__}"
-    if not version.startswith("v"):
-        version = f"v{version}"
-
-    # Handle dev versions
-    if ".dev" in __version__:
-        version = "latest"
+    # Get version (env var takes precedence, then dev->latest, then package version)
+    _, version = _get_asset_version()
 
     logger.info("Loading asset registry from GitHub", extra={"version": version})
     await assets.load_registry_from_github(GITHUB_OWNER, GITHUB_REPO, version)
@@ -231,13 +244,17 @@ async def ensure_assets_available(language: str | None = None) -> tuple[Path, Pa
         AssetChecksumError: Hash verification failed.
         FileNotFoundError: Offline mode and assets missing.
     """
-    # Fetch required assets
-    kernel_path = await fetch_kernel()
-    gvproxy_path = await fetch_gvproxy()
-
-    # Pre-fetch language base image if specified
+    # Fetch required assets in parallel
+    fetch_tasks: list[asyncio.Task[Path]] = [
+        asyncio.create_task(fetch_kernel()),
+        asyncio.create_task(fetch_initramfs()),
+        asyncio.create_task(fetch_gvproxy()),
+    ]
     if language:
-        await fetch_base_image(language)
+        fetch_tasks.append(asyncio.create_task(fetch_base_image(language)))
+
+    results = await asyncio.gather(*fetch_tasks)
+    kernel_path, _, gvproxy_path = results[0], results[1], results[2]
 
     # Images directory is the parent of the kernel
     images_dir = kernel_path.parent

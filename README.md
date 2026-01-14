@@ -283,11 +283,13 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 
 ## Requirements
 
-| Requirement | Version |
-|-------------|---------|
-| Python | 3.12+ |
+| Requirement | Supported |
+|-------------|-----------|
+| Python | 3.12, 3.13, 3.14 (including free-threaded) |
+| Linux | x64, arm64 |
+| macOS | arm64 |
 | QEMU | 8.0+ |
-| Hardware acceleration | KVM (Linux) or HVF (macOS) |
+| Hardware acceleration | KVM (Linux) or HVF (macOS) recommended, 10-50x faster |
 
 Verify hardware acceleration is available:
 

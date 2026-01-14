@@ -41,10 +41,10 @@ jobs:
       - name: Install dependencies
         run: make install-deps
 
-      - name: Inject version from git tag
+      - name: Inject version from make version
         run: |
-          VERSION=$(./cicd/version.sh -g .)
-          VERSION_FULL=$(./cicd/version.sh -g . -c -m)
+          VERSION=$(make version-pypi)
+          VERSION_FULL=$(make version-full)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "VERSION_FULL=$VERSION_FULL" >> $GITHUB_ENV
           echo "Injecting version: $VERSION (full: $VERSION_FULL)"
