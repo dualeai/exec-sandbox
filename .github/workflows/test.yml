@@ -227,6 +227,9 @@ jobs:
     name: Test / Python ${{ matrix.python-version }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
     needs: [build-gvproxy-wrapper, build-vm-images]
+    env:
+      # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
