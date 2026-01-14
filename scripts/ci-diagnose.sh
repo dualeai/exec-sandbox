@@ -163,12 +163,13 @@ cmd_diagnose() {
         gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null > "$LOGFILE"
 
         # Extract and display failures (filtered)
+        # Note: || true handles empty output (e.g., Rust jobs without pytest format)
         sed -n '/= FAILURES =/,/= short test summary/p' "$LOGFILE" | \
             sed 's/^[0-9T:.Z-]* //' | \
             grep -v "^= short test summary" | \
             filter_noise | \
             format_failures | \
-            head -500
+            head -500 || true
 
         # Collect errors for summary (from short test summary section)
         sed -n '/short test summary/,/passed.*failed/p' "$LOGFILE" | \
