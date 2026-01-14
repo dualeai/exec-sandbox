@@ -36,7 +36,12 @@ from uuid import uuid4
 
 import aiofiles
 import aiofiles.os
-from tenacity import AsyncRetrying, before_sleep_log, retry_if_exception_type, wait_random_exponential
+from tenacity import (
+    AsyncRetrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    wait_random_exponential,
+)
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
@@ -561,7 +566,7 @@ class QemuVM:
 
         ```python
         async with await manager.launch_vm(...) as vm:
-            result = await vm.execute(code="print('hello')", language="python", timeout_seconds=30)
+            result = await vm.execute(code="print('hello')", timeout_seconds=30)
             # VM automatically destroyed on exit, even if exception occurs
         ```
 
@@ -585,7 +590,7 @@ class QemuVM:
         cgroup_path: Path,
         workdir: VmWorkingDirectory,
         channel: GuestChannel,
-        language: str,
+        language: Language,
         gvproxy_proc: ProcessWrapper | None = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
@@ -618,13 +623,9 @@ class QemuVM:
         self._destroyed = False
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
-        self._creation_time = asyncio.get_event_loop().time()
         # Timing instrumentation (set by VmManager.create_vm)
         self._setup_ms: int | None = None  # Resource setup time
         self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
-        # Socket authentication (set by VmManager.create_vm before first use)
-        # Use -1 as sentinel (no valid UID) to fail-fast if used before being set
-        self.expected_qemu_uid: int = -1
 
     @property
     def setup_ms(self) -> int | None:
@@ -652,11 +653,6 @@ class QemuVM:
         return self.workdir.overlay_image
 
     @property
-    def qmp_socket_path(self) -> Path:
-        """Path to QMP socket (from workdir)."""
-        return self.workdir.qmp_socket
-
-    @property
     def gvproxy_socket(self) -> Path | None:
         """Path to gvproxy socket (from workdir, None if no network)."""
         return self.workdir.gvproxy_socket if self.gvproxy_proc else None
@@ -665,6 +661,11 @@ class QemuVM:
     def use_qemu_vm_user(self) -> bool:
         """Whether QEMU runs as qemu-vm user."""
         return self.workdir.use_qemu_vm_user
+
+    @property
+    def qmp_socket(self) -> Path:
+        """Path to QMP control socket (from workdir)."""
+        return self.workdir.qmp_socket
 
     async def __aenter__(self) -> "QemuVM":
         """Enter async context manager.
@@ -736,7 +737,6 @@ class QemuVM:
     async def execute(  # noqa: PLR0912, PLR0915
         self,
         code: str,
-        language: Language,
         timeout_seconds: int,
         env_vars: dict[str, str] | None = None,
         on_stdout: Callable[[str], None] | None = None,
@@ -762,7 +762,6 @@ class QemuVM:
 
         Args:
             code: Code to execute in guest VM
-            language: Programming language (python or javascript)
             timeout_seconds: Maximum execution time (enforced by cgroup)
             env_vars: Environment variables for code execution (default: None)
             on_stdout: Optional callback for real-time stdout streaming
@@ -783,7 +782,7 @@ class QemuVM:
                     context={
                         "vm_id": self.vm_id,
                         "current_state": self._state.value,
-                        "language": language,
+                        "language": self.language,
                     },
                 )
 
@@ -815,7 +814,7 @@ class QemuVM:
 
         # Prepare execution request
         request = ExecuteCodeRequest(
-            language=language,
+            language=self.language,
             code=code,
             timeout=timeout_seconds,
             env_vars=env_vars or {},
@@ -944,7 +943,7 @@ class QemuVM:
         except asyncio.CancelledError:
             logger.warning(
                 "Code execution cancelled",
-                extra={"vm_id": self.vm_id, "language": language},
+                extra={"vm_id": self.vm_id, "language": self.language},
             )
             # Re-raise to propagate cancellation
             raise
@@ -954,7 +953,7 @@ class QemuVM:
                 context={
                     "vm_id": self.vm_id,
                     "timeout_seconds": timeout_seconds,
-                    "language": language,
+                    "language": self.language,
                 },
             ) from e
         except (OSError, json.JSONDecodeError) as e:
@@ -962,7 +961,7 @@ class QemuVM:
                 f"VM {self.vm_id} communication failed: {e}",
                 context={
                     "vm_id": self.vm_id,
-                    "language": language,
+                    "language": self.language,
                     "error_type": type(e).__name__,
                 },
             ) from e
@@ -1058,8 +1057,8 @@ class VmManager:
     Usage:
         manager = VmManager(settings)
         await manager.initialize()  # Run async system probes
-        vm = await manager.create_vm("python", "tenant-123", "task-456")
-        result = await vm.execute("print('hello')", "python", timeout_seconds=30)
+        vm = await manager.create_vm(Language.PYTHON, "tenant-123", "task-456")
+        result = await vm.execute("print('hello')", timeout_seconds=30)
         await manager.destroy_vm(vm)
     """
 
@@ -1128,19 +1127,20 @@ class VmManager:
 
     async def create_vm(  # noqa: PLR0912, PLR0915
         self,
-        language: str,
+        language: Language,
         tenant_id: str,
         task_id: str,
-        snapshot_path: Path | None = None,
+        backing_image: Path | None = None,
         memory_mb: int = constants.DEFAULT_MEMORY_MB,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
+        direct_write_target: Path | None = None,
     ) -> QemuVM:
-        """Create and boot QEMU microVM from snapshot.
+        """Create and boot QEMU microVM.
 
         Workflow:
         1. Generate unique VM ID and CID
-        2. Create ephemeral qcow2 overlay from snapshot
+        2. Create ephemeral qcow2 overlay from backing image (or write directly)
         3. Set up cgroup v2 resource limits
         4. Build QEMU command (platform-specific)
         5. Launch QEMU subprocess
@@ -1150,10 +1150,12 @@ class VmManager:
             language: Programming language (python or javascript)
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
-            snapshot_path: Optional snapshot base image (default: use base image)
+            backing_image: Base image for overlay (default: language base image)
             memory_mb: Memory limit in MB (128-2048, default 512)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
+            direct_write_target: If set, write directly to this file (no overlay).
+                Used for snapshot creation. Mutually exclusive with backing_image.
 
         Returns:
             QemuVM handle for code execution
@@ -1174,9 +1176,17 @@ class VmManager:
         # Step 1: Generate VM identifiers
         vm_id = f"{tenant_id}-{task_id}-{uuid4()}"
 
+        # Validate mutual exclusivity
+        if backing_image and direct_write_target:
+            raise VmError("backing_image and direct_write_target are mutually exclusive")
+
         # Step 1.5: Create working directory for all VM temp files
         # Uses tempfile.mkdtemp() for atomic, secure directory creation (mode 0700)
-        workdir = await VmWorkingDirectory.create(vm_id)
+        # For direct_write_target mode, use it as the overlay path
+        workdir = await VmWorkingDirectory.create(
+            vm_id,
+            custom_overlay_path=direct_write_target,
+        )
 
         # Domain whitelist semantics:
         # - None or [] = no filtering (full internet access)
@@ -1202,7 +1212,7 @@ class VmManager:
         # Note: gvproxy moved to boot phase to reduce contention under high concurrency
         # Resolve to absolute path - qemu-img resolves backing file relative to overlay location,
         # and VmWorkingDirectory places overlay in a temp dir, so relative paths would break
-        base_image = (snapshot_path or self.get_base_image(language)).resolve()
+        base_image = (backing_image or self.get_base_image(language)).resolve()
 
         # Initialize ALL tracking variables before try block for finally cleanup
         cgroup_path: Path | None = None
@@ -1230,22 +1240,30 @@ class VmManager:
 
             # Unified setup phase: overlay + cgroup (gvproxy moved to boot phase)
             # This reduces setup contention under high concurrency
-            overlay_result, cgroup_result = await asyncio.gather(
-                self._create_overlay(base_image, workdir.overlay_image),
-                cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
-                return_exceptions=True,
-            )
+            if direct_write_target:
+                # Direct write mode - VM writes directly to target file (no overlay)
+                # Used for L2 snapshot creation where disk changes are written directly
+                workdir.use_qemu_vm_user = False  # target file owned by current user
+                cgroup_path = await cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg)
+            else:
+                # Normal mode - create overlay backed by base image
+                # This allows the backing image to remain read-only and shareable
+                overlay_result, cgroup_result = await asyncio.gather(
+                    self._create_overlay(base_image, workdir.overlay_image),
+                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
+                    return_exceptions=True,
+                )
+
+                # Check for failures
+                if isinstance(overlay_result, BaseException):
+                    raise overlay_result
+                if isinstance(cgroup_result, BaseException):
+                    raise cgroup_result
+
+                # Type narrowing: after BaseException checks
+                cgroup_path = cgroup_result
+                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
             setup_complete_time = asyncio.get_event_loop().time()
-
-            # Check for failures
-            if isinstance(overlay_result, BaseException):
-                raise overlay_result
-            if isinstance(cgroup_result, BaseException):
-                raise cgroup_result
-
-            # Type narrowing: after BaseException checks
-            cgroup_path = cgroup_result
-            workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
 
             # Step 5: Build QEMU command (always Linux in container)
             qemu_cmd = await self._build_linux_cmd(
@@ -1398,8 +1416,6 @@ class VmManager:
                 gvproxy_log_task,
                 console_log,
             )
-            # Store expected UID for QMP socket authentication (used by snapshot_manager)
-            vm.expected_qemu_uid = expected_uid
 
             # Step 8a: Register VM in registry (before BOOTING to ensure tracking)
             async with self._vms_lock:
@@ -1981,7 +1997,6 @@ class VmManager:
         memory_mb: int,
         allow_network: bool,
         enable_dns_filtering: bool = False,  # noqa: ARG002
-        loadvm_snapshot: str | None = None,
     ) -> list[str]:
         """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -1992,7 +2007,6 @@ class VmManager:
             memory_mb: Guest VM memory in MB
             allow_network: Enable network access
             enable_dns_filtering: Enable DNS filtering via gvisor-tap-vsock
-            loadvm_snapshot: Optional snapshot name to restore from (for fast VM boot)
 
         Returns:
             QEMU command as list of strings
@@ -2282,6 +2296,9 @@ class VmManager:
             qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
 
         # Disk configuration
+        # Uses overlay backed by either:
+        # - snapshot_path (cached L2 qcow2) for pre-installed packages
+        # - base_image for cold boot
         qemu_args.extend(
             [
                 "-drive",
@@ -2425,7 +2442,7 @@ class VmManager:
                 ]
             )
 
-        # virtio-balloon for memory reclamation before snapshots
+        # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
         # - deflate-on-oom: guest returns memory under OOM pressure
         # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
         qemu_args.extend(
@@ -2446,19 +2463,13 @@ class VmManager:
                 ]
             )
 
-        # QMP (QEMU Monitor Protocol) socket for memory snapshot operations
-        # Used for savevm/loadvm commands to create/restore memory snapshots
+        # QMP (QEMU Monitor Protocol) socket for VM control operations
         qemu_args.extend(
             [
                 "-qmp",
                 f"unix:{workdir.qmp_socket},server=on,wait=off",
             ]
         )
-
-        # Restore from memory snapshot if specified
-        # This provides fast VM boot (~50-200ms vs ~300-400ms cold boot)
-        if loadvm_snapshot:
-            qemu_args.extend(["-loadvm", loadvm_snapshot])
 
         # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
         # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation

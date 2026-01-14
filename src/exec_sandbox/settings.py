@@ -35,9 +35,9 @@ class Settings(BaseSettings):
     max_concurrent_vms: int = 10
     snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-snapshots")  # noqa: S108
 
-    # Snapshot cache (2-tier: L0=local memory, L3=S3)
+    # Snapshot cache (2-tier: L2=local disk, L3=S3)
     snapshot_cache_ttl_days: int = 14  # AWS Lambda SnapStart pattern
-    snapshot_cache_max_size_gb: int = 50  # L0 cache size limit
+    snapshot_cache_max_size_gb: int = 50  # L2 cache size limit
     s3_bucket: str | None = None  # S3 enabled when set
     s3_region: str = "us-east-1"
     s3_endpoint_url: str | None = None  # Custom S3 endpoint (for testing/MinIO)

@@ -6,7 +6,7 @@ Inspired by aiojobs - explicit resource management via async context manager.
 Architecture:
 - VM lifecycle: VMs are NEVER reused. Each run() gets a fresh VM, destroyed after.
 - Warm pool: Pre-started VMs waiting for commands (faster than cold boot).
-- Snapshot cache: L0 (local memory snapshots) + L3 (S3) for package installation speedup.
+- Snapshot cache: L2 (local disk cache) + L3 (S3) for package installation speedup.
 - Backpressure: max_concurrent_vms prevents OOM from unbounded VM creation.
 
 Example:
@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import PackageNotAllowedError, SandboxError
+from exec_sandbox.exceptions import PackageNotAllowedError, SandboxError, SnapshotError, VmError
 from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.settings import Settings
 
@@ -67,7 +67,7 @@ class Scheduler:
     The Scheduler is the main entry point for exec-sandbox. It handles:
     - VM pool management (max concurrent VMs, backpressure)
     - Warm VM pool (pre-booted VMs for instant execution)
-    - Snapshot caching (L0 local + L3 S3)
+    - Snapshot caching (L2 local + L3 S3)
     - Package validation
 
     Thread-safety: Single Scheduler per process. Use asyncio for concurrency.
@@ -149,7 +149,7 @@ class Scheduler:
         self._vm_manager = VmManager(self._settings)
         await self._vm_manager.initialize()
 
-        # Initialize SnapshotManager (L0 local cache always available, L3 S3 optional)
+        # Initialize SnapshotManager (L2 local cache always available, L3 S3 optional)
         from exec_sandbox.snapshot_manager import SnapshotManager  # noqa: PLC0415
 
         self._snapshot_manager = SnapshotManager(self._settings, self._vm_manager)
@@ -158,7 +158,7 @@ class Scheduler:
         if self.config.warm_pool_size > 0:
             from exec_sandbox.warm_vm_pool import WarmVMPool  # noqa: PLC0415
 
-            self._warm_pool = WarmVMPool(self._vm_manager, self.config)
+            self._warm_pool = WarmVMPool(self._vm_manager, self.config, self._snapshot_manager)
             await self._warm_pool.startup()
 
         self._started = True
@@ -279,14 +279,16 @@ class Scheduler:
         if packages and self.config.enable_package_validation:
             await self._validate_packages(packages, language)
 
-        # Determine snapshot path (if packages specified)
+        # Check L2 snapshot cache for disk caching
+        # ALL VMs (base images + packages) are cached to L2 for fast subsequent access
+        # First run is slow (creates snapshot), subsequent runs benefit from cached packages
         snapshot_path: Path | None = None
-        has_memory_snapshot = False
-        if packages and self._snapshot_manager:
-            # Check snapshot cache for pre-built image with packages
-            snapshot_path, has_memory_snapshot = await self._get_or_create_snapshot(language, packages)
-            # TODO: Pass has_memory_snapshot to create_vm for fast restore via -loadvm
-            _ = has_memory_snapshot  # Suppress unused warning until fully integrated
+        if self._snapshot_manager:
+            snapshot_path = await self._get_or_create_snapshot(language, packages, memory)
+            logger.info(
+                "Snapshot cache result",
+                extra={"snapshot_path": str(snapshot_path) if snapshot_path else None},
+            )
 
         # Acquire semaphore (backpressure)
         async with self._semaphore:
@@ -306,7 +308,7 @@ class Scheduler:
                         language=language,
                         tenant_id="exec-sandbox",
                         task_id=f"run-{id(code)}",
-                        snapshot_path=snapshot_path,
+                        backing_image=snapshot_path,
                         memory_mb=memory,
                         allow_network=allow_network,
                         allowed_domains=allowed_domains,
@@ -316,7 +318,6 @@ class Scheduler:
                 execute_start_time = asyncio.get_event_loop().time()
                 result = await vm.execute(
                     code=code,
-                    language=language,
                     timeout_seconds=timeout,
                     env_vars=env_vars,
                     on_stdout=on_stdout,
@@ -405,30 +406,29 @@ class Scheduler:
                     context={"package": name, "language": language.value},
                 )
 
-    async def _get_or_create_snapshot(self, language: str, packages: list[str]) -> tuple[Path | None, bool]:
+    async def _get_or_create_snapshot(self, language: str, packages: list[str], memory_mb: int) -> Path | None:
         """Get cached snapshot or create new one with packages.
 
-        Checks L0 (memory snapshot) and L3 (S3) caches before building.
+        Checks L2 (local qcow2) and L3 (S3) caches before building.
 
         Args:
             language: Programming language
             packages: List of packages to install
+            memory_mb: VM memory in MB (included in cache key)
 
         Returns:
-            Tuple of (snapshot_path, has_memory_snapshot):
-            - (path, True) if snapshot has memory state (use -loadvm for fast restore)
-            - (path, False) if snapshot is disk-only (cold boot required)
-            - (None, False) on error (graceful degradation)
+            Path to snapshot qcow2, or None on error (graceful degradation).
         """
         if not self._snapshot_manager:
-            return (None, False)
+            return None
 
         try:
-            snapshot_path, has_memory_snapshot = await self._snapshot_manager.get_or_create_snapshot(
+            snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
                 language=Language(language),
                 packages=packages,
                 tenant_id="exec-sandbox",
                 task_id=f"snapshot-{hash(tuple(sorted(packages)))}",
+                memory_mb=memory_mb,
             )
             logger.debug(
                 "Snapshot ready",
@@ -436,14 +436,13 @@ class Scheduler:
                     "language": language,
                     "packages": packages,
                     "path": str(snapshot_path),
-                    "has_memory_snapshot": has_memory_snapshot,
                 },
             )
-            return (snapshot_path, has_memory_snapshot)
-        except (OSError, RuntimeError, TimeoutError, ConnectionError) as e:
+            return snapshot_path
+        except (OSError, RuntimeError, TimeoutError, ConnectionError, SnapshotError, VmError) as e:
             # Graceful degradation: log error, continue without snapshot
             logger.warning(
                 "Snapshot creation failed, continuing without cache",
                 extra={"language": language, "packages": packages, "error": str(e)},
             )
-            return (None, False)
+            return None

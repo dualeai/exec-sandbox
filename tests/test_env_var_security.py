@@ -181,7 +181,6 @@ class TestGuestAgentControlCharValidation:
             language=Language.PYTHON,
             tenant_id="test",
             task_id="test-control-char",
-            snapshot_path=None,
             memory_mb=256,
             allow_network=False,
             allowed_domains=None,

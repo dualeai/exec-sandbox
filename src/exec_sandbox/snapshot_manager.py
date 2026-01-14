@@ -1,16 +1,8 @@
-"""qcow2 snapshot management with memory snapshots for fast VM restore.
+"""qcow2 snapshot management for disk caching.
 
 Implements two-tier snapshot architecture:
-- L0 Cache: Memory snapshots (CPU + RAM + device state) - 50-200ms restore
-- L3 Cache: S3 with zstd compression - disk-only backup for cross-host
-
-L1 disk cache has been REPLACED by L0 memory snapshots.
-Memory snapshots include full VM state and allow instant restore via QEMU's -loadvm.
-
-Performance targets:
-- L0 hit: 50-200ms (QEMU loadvm restore)
-- L3 hit: <5s (download + cold boot + create L0)
-- Cache miss: 10-30s (package install + create L0 + upload L3)
+- L2 Cache: Local qcow2 disk snapshots (cold boot with cached packages)
+- L3 Cache: S3 with zstd compression (cross-host sharing)
 
 qcow2 optimizations:
 - lazy_refcounts=on: Postpone metadata updates
@@ -18,7 +10,7 @@ qcow2 optimizations:
 - cluster_size=128k: Balance between metadata and allocation
 
 Snapshot structure:
-- {cache_key}.qcow2 (qcow2 image with internal snapshot "ready")
+- {cache_key}.qcow2: Disk state (backing file + package changes)
 """
 
 from __future__ import annotations
@@ -27,7 +19,6 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -53,11 +44,8 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingErrorMessage,
 )
 from exec_sandbox.models import Language
-from exec_sandbox.permission_utils import sudo_exec
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.qmp_client import QMPClientWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
-from exec_sandbox.subprocess_utils import drain_subprocess_output
 
 if TYPE_CHECKING:
     from exec_sandbox.vm_manager import QemuVM, VmManager
@@ -66,13 +54,11 @@ logger = get_logger(__name__)
 
 
 class SnapshotManager:
-    """Manages qcow2 snapshot cache with memory snapshots for fast VM restore.
+    """Manages qcow2 snapshot cache for disk caching.
 
     Architecture (2-tier):
-    - L0 cache: Memory snapshots (local only, includes CPU/RAM/device state)
-    - L3 cache: S3 with zstd compression (cross-host, disk-only)
-
-    L1 disk cache has been REPLACED by L0 memory snapshots.
+    - L2 cache: Local qcow2 disk snapshots (cold boot with cached packages)
+    - L3 cache: S3 with zstd compression (cross-host sharing)
 
     Cache key format:
     - "{language}-base" for no packages
@@ -88,7 +74,7 @@ class SnapshotManager:
     - ❌ No metadata tracking (parse from cache_key)
     - ❌ No proactive eviction (lazy on disk full)
     - ✅ Pure filesystem (atime tracking only)
-    - ✅ Single qcow2 file per snapshot with internal "ready" snapshot
+    - ✅ Single qcow2 file per snapshot
     """
 
     def __init__(self, settings: Settings, vm_manager: VmManager):
@@ -110,6 +96,12 @@ class SnapshotManager:
         # Max 1 concurrent snapshot creation (heavy operations: VM boot + package install)
         self._creation_semaphore = asyncio.Semaphore(1)
 
+        # Per-cache-key locks to prevent race conditions during snapshot creation
+        # When creating a snapshot, other VMs wanting the same snapshot wait rather than
+        # trying to use a partially-created file
+        self._creation_locks: dict[str, asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()  # Protects _creation_locks dict
+
         # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
         # S3 PutObject is atomic - aborted uploads leave no partial blobs
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
@@ -117,78 +109,107 @@ class SnapshotManager:
         # Track background S3 upload tasks to prevent GC
         self._background_tasks: set[asyncio.Task[None]] = set()
 
+    async def check_cache(
+        self,
+        language: Language,
+        packages: list[str],
+    ) -> Path | None:
+        """Check L2 cache without creating snapshot.
+
+        Use this for warm pool: creating L2 cache for base images (no packages)
+        is pointless - would boot VM just to shut it down. Check-only instead.
+        Returns cached snapshot if available, None if cache miss.
+
+        Args:
+            language: Programming language
+            packages: Package list (empty for base image)
+
+        Returns:
+            Path to cached qcow2 snapshot, or None if cache miss.
+        """
+        cache_key = self._compute_cache_key(language, packages)
+        return await self._check_l2_cache(cache_key)
+
     async def get_or_create_snapshot(
         self,
         language: Language,
         packages: list[str],
         tenant_id: str,
         task_id: str,
-    ) -> tuple[Path, bool]:
+        memory_mb: int,
+    ) -> Path:
         """Get cached snapshot or create new one.
 
-        Returns (path, has_memory_snapshot) tuple:
-        - has_memory_snapshot=True: Can restore via -loadvm "ready" (50-200ms)
-        - has_memory_snapshot=False: Must cold boot (300-400ms), then create L0
-
         Cache hierarchy:
-        1. Check L0 (memory snapshot) → 50-200ms restore
-        2. Check L3 (S3 download) → download + cold boot + create L0
-        3. Create new snapshot → package install + create L0 + upload L3
+        1. Check L2 (local qcow2) → cold boot with cached disk
+        2. Check L3 (S3 download) → download + cold boot
+        3. Create new snapshot → package install + upload L3
 
         Args:
             language: Programming language
             packages: Package list with versions (e.g., ["pandas==2.1.0"])
             tenant_id: Tenant identifier
             task_id: Task identifier
+            memory_mb: VM memory in MB (used for snapshot creation, not cache key)
 
         Returns:
-            Tuple of (snapshot_path, has_memory_snapshot)
+            Path to snapshot qcow2 file.
 
         Raises:
             SnapshotError: Snapshot creation failed
         """
         cache_key = self._compute_cache_key(language, packages)
 
-        # L0 cache check (memory snapshot)
-        snapshot_path, has_memory_snapshot = await self._check_l0_cache(cache_key)
+        # Fast path: Check L2 cache without lock (read-only, safe for concurrent access)
+        snapshot_path = await self._check_l2_cache(cache_key)
         if snapshot_path:
-            logger.debug(
-                "L0 cache hit",
-                extra={
-                    "cache_key": cache_key,
-                    "has_memory_snapshot": has_memory_snapshot,
-                },
-            )
-            return (snapshot_path, has_memory_snapshot)
+            logger.debug("L2 cache hit", extra={"cache_key": cache_key})
+            return snapshot_path
 
-        # L3 cache check (S3)
-        try:
-            snapshot_path = await self._download_from_s3(cache_key)
-            # Downloaded from S3 = no memory snapshot (cold boot required)
-            logger.debug("L3 cache hit", extra={"cache_key": cache_key})
-            return (snapshot_path, False)
-        except SnapshotError:
-            pass  # Cache miss, create new
+        # Slow path: Need to create or wait for creation
+        # Use per-cache-key lock to prevent races during snapshot creation
+        async with self._locks_lock:
+            if cache_key not in self._creation_locks:
+                self._creation_locks[cache_key] = asyncio.Lock()
+            lock = self._creation_locks[cache_key]
 
-        # Cache miss: Create new snapshot
-        logger.debug("Cache miss, creating snapshot", extra={"cache_key": cache_key})
-        snapshot_path = await self._create_snapshot(language, packages, cache_key, tenant_id, task_id)
+        async with lock:
+            # Re-check L2 cache under lock (another request may have created it)
+            snapshot_path = await self._check_l2_cache(cache_key)
+            if snapshot_path:
+                logger.debug("L2 cache hit (after lock)", extra={"cache_key": cache_key})
+                return snapshot_path
 
-        # Upload to S3 (async, fire-and-forget, tracked to prevent GC)
-        upload_task: asyncio.Task[None] = asyncio.create_task(self._upload_to_s3(cache_key, snapshot_path))
-        self._background_tasks.add(upload_task)
-        upload_task.add_done_callback(lambda t: self._background_tasks.discard(t))
-        upload_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            # L3 cache check (S3) - only for images with packages
+            # Base images are already distributed via asset downloads, no need for S3
+            if packages:
+                try:
+                    snapshot_path = await self._download_from_s3(cache_key)
+                    logger.debug("L3 cache hit", extra={"cache_key": cache_key})
+                    return snapshot_path
+                except SnapshotError:
+                    pass  # Cache miss, create new
 
-        # New snapshot has no memory state yet (caller must cold boot + create L0)
-        return (snapshot_path, False)
+            # Cache miss: Create new snapshot
+            logger.debug("Cache miss, creating snapshot", extra={"cache_key": cache_key})
+            snapshot_path = await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
+
+            # Upload to S3 (async, fire-and-forget) - only for images with packages
+            # Base images don't need S3 - they're already globally distributed
+            if packages:
+                upload_task: asyncio.Task[None] = asyncio.create_task(self._upload_to_s3(cache_key, snapshot_path))
+                self._background_tasks.add(upload_task)
+                upload_task.add_done_callback(lambda t: self._background_tasks.discard(t))
+                upload_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+            return snapshot_path
 
     def _compute_cache_key(
         self,
         language: Language,
         packages: list[str],
     ) -> str:
-        """Compute L0 cache key for snapshot.
+        """Compute L2 cache key for snapshot.
 
         Format:
         - "{language}-base" for no packages
@@ -207,21 +228,21 @@ class SnapshotManager:
         packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
         return f"{language.value}-{packages_hash}"
 
-    async def _check_l0_cache(self, cache_key: str) -> tuple[Path | None, bool]:
-        """Check L0 local cache for memory snapshot.
+    async def _check_l2_cache(self, cache_key: str) -> Path | None:
+        """Check L2 local cache for qcow2 snapshot.
+
+        Args:
+            cache_key: Snapshot cache key.
 
         Returns:
-            Tuple of (snapshot_path, has_memory_snapshot):
-            - (path, True) if file exists with internal "ready" snapshot
-            - (path, False) if file exists but no memory snapshot
-            - (None, False) if file doesn't exist
+            Path to qcow2 snapshot if valid cache hit, None otherwise.
         """
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
 
         if not await aiofiles.os.path.exists(snapshot_path):
-            return (None, False)
+            return None
 
-        # Verify qcow2 format and check for internal snapshot
+        # Verify qcow2 format
         try:
             proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
@@ -232,117 +253,38 @@ class SnapshotManager:
                     stderr=asyncio.subprocess.PIPE,
                 )
             )
-            stdout, _stderr = await proc.communicate()
+            _stdout, _stderr = await proc.communicate()
 
             if proc.returncode != 0:
-                return (None, False)  # Invalid qcow2
-
-            # Check for internal snapshot named "ready"
-            has_memory_snapshot = b"ready" in stdout
+                return None  # Invalid qcow2
 
         except (OSError, FileNotFoundError):
-            return (None, False)
+            return None
 
         # Update atime for LRU tracking
         snapshot_path.touch(exist_ok=True)
 
-        return (snapshot_path, has_memory_snapshot)
-
-    async def save_memory_snapshot(
-        self,
-        vm: QemuVM,
-        language: Language,
-        packages: list[str],
-    ) -> Path:
-        """Save memory snapshot from running VM to L0 cache.
-
-        Creates an internal snapshot named "ready" in the VM's overlay,
-        then copies the overlay to the L0 cache. The memory snapshot
-        includes CPU state, RAM, and device state for fast restore.
-
-        Use case:
-        - Called after cold boot + guest agent ready
-        - Called after package installation completes
-        - Creates L0 cache entry for future fast restores
-
-        Args:
-            vm: Running QemuVM with QMP socket
-            language: Programming language
-            packages: Package list (for cache key computation)
-
-        Returns:
-            Path to L0 cache file with memory snapshot
-
-        Raises:
-            SnapshotError: If savevm fails
-        """
-        cache_key = self._compute_cache_key(language, packages)
-        l0_path = self.cache_dir / f"{cache_key}.qcow2"
-
-        logger.info(
-            "Saving memory snapshot to L0 cache",
-            extra={"cache_key": cache_key, "vm_id": vm.vm_id},
-        )
-
-        # Step 1: Save memory snapshot via QMP
-        if not vm.qmp_socket_path:
-            raise SnapshotError(
-                "VM has no QMP socket path",
-                context={"vm_id": vm.vm_id, "cache_key": cache_key},
-            )
-
-        async with QMPClientWrapper(vm.qmp_socket_path, expected_uid=vm.expected_qemu_uid) as qmp:
-            # Step 1a: Deflate balloon to reclaim free pages (reduces snapshot size)
-            # This is an optional optimization - continues even if balloon fails
-            # Note: VM memory size isn't tracked on QemuVM, use default
-            await qmp.balloon_deflate_for_snapshot(
-                original_mb=constants.DEFAULT_MEMORY_MB,
-                min_mb=constants.BALLOON_DEFLATE_MIN_MB,
-                timeout=constants.BALLOON_DEFLATE_TIMEOUT_SECONDS,
-            )
-
-            # Step 1b: Save memory snapshot
-            await qmp.save_snapshot("ready")
-
-        # Step 2: Copy overlay (with internal snapshot) to L0 cache
-        # The overlay contains the memory snapshot and disk changes
-        l0_path.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(shutil.copy2, vm.overlay_image, l0_path)
-
-        logger.info(
-            "Memory snapshot saved to L0 cache",
-            extra={
-                "cache_key": cache_key,
-                "vm_id": vm.vm_id,
-                "l0_path": str(l0_path),
-            },
-        )
-
-        return l0_path
+        return snapshot_path
 
     async def _create_snapshot(  # noqa: PLR0912, PLR0915
         self,
-        language: str,
+        language: Language,
         packages: list[str],
         cache_key: str,
         tenant_id: str,
         task_id: str,
+        memory_mb: int,
     ) -> Path:
-        """Create new qcow2 snapshot with packages installed using asyncio.wait racing.
+        """Create new qcow2 snapshot with packages installed.
 
-        Architecture:
-        - Semaphore prevents resource exhaustion (max 1 concurrent snapshot)
-        - asyncio.wait(FIRST_COMPLETED) races install vs VM death
-        - Instant crash detection (not 120s timeout)
-        - Proper task cancellation on completion
+        Uses asyncio.wait racing for instant crash detection.
 
         Workflow:
-        1. Acquire creation semaphore (prevent resource exhaustion)
-        2. Create qcow2 with backing file (base image)
-        3. Boot VM with snapshot image
-        4. Install packages via guest agent (with death monitoring)
-        5. Shutdown VM (writes committed to snapshot)
-        6. Return snapshot path
+        1. Create qcow2 with backing file (base image)
+        2. Boot VM with snapshot image
+        3. Install packages via guest agent (with death monitoring)
+        4. Shutdown VM (writes committed to snapshot)
+        5. Return snapshot path
 
         Args:
             language: Programming language
@@ -350,6 +292,7 @@ class SnapshotManager:
             cache_key: Snapshot cache key
             tenant_id: Tenant identifier
             task_id: Task identifier
+            memory_mb: VM memory in MB
 
         Returns:
             Path to created qcow2 snapshot
@@ -360,7 +303,9 @@ class SnapshotManager:
         """
         start_time = time.time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
-        base_image = self.vm_manager.get_base_image(language)
+        # Resolve to absolute path - qemu-img resolves backing file relative to snapshot location,
+        # so we need absolute path when snapshot_cache_dir differs from base_images_dir
+        base_image = self.vm_manager.get_base_image(language).resolve()
 
         # Acquire semaphore to limit concurrent snapshot creation
         async with self._creation_semaphore:
@@ -370,23 +315,30 @@ class SnapshotManager:
                 # Step 1: Create qcow2 with backing file
                 await self._create_snapshot_image(snapshot_path, base_image, cache_key, language, packages, tenant_id)
 
-                # Step 2: Determine allowed domains for package installation
-                # Restrict to package registries only during snapshot creation
-                if language == "python":
-                    package_domains = list(constants.PYTHON_PACKAGE_DOMAINS)
-                elif language == "javascript":
-                    package_domains = list(constants.NPM_PACKAGE_DOMAINS)
+                # Step 2: Determine network configuration for snapshot creation
+                # ALWAYS enable network during snapshot creation (pip/npm needs it)
+                # Restrict to package registries only for security
+                if packages:
+                    if language == "python":
+                        package_domains = list(constants.PYTHON_PACKAGE_DOMAINS)
+                    elif language == "javascript":
+                        package_domains = list(constants.NPM_PACKAGE_DOMAINS)
+                    else:
+                        package_domains = []
                 else:
-                    package_domains = []  # No filtering for other languages
+                    package_domains = None
 
-                # Step 3: Create VM with network restricted to package registries
+                # Step 3: Create VM with config that matches cache key
+                # NOTE: memory_mb should match for consistency
+                # NOTE: Snapshot always created with allow_network=True (for pip/npm)
                 vm = await self.vm_manager.create_vm(
                     language,
                     tenant_id,
                     task_id,
-                    snapshot_path=snapshot_path,
-                    allow_network=True,
-                    allowed_domains=package_domains,  # Explicit restriction
+                    memory_mb=memory_mb,
+                    allow_network=True,  # Always need network for package install
+                    allowed_domains=package_domains,
+                    direct_write_target=snapshot_path,  # Write directly to snapshot (no overlay)
                 )
 
                 # Step 4: Install packages with death monitoring (asyncio.wait)
@@ -425,12 +377,7 @@ class SnapshotManager:
                                 await task
                     raise
 
-                # Step 5: Shutdown QEMU process (but keep overlay for commit)
-                # CRITICAL: Must shutdown QEMU before qemu-img commit (cannot commit live images)
-                # but must NOT delete overlay yet (need it for commit operation)
-                overlay_path = vm.overlay_image
-
-                # Shutdown QEMU process cleanly (don't call vm.destroy() - it deletes overlay!)
+                # Step 4: Shutdown QEMU process cleanly
                 if vm.process.returncode is None:
                     await vm.process.terminate()
                     try:
@@ -439,15 +386,9 @@ class SnapshotManager:
                         await vm.process.kill()
                         await vm.process.wait()
 
-                # Step 6: Commit overlay changes to snapshot
-                # QEMU shutdown, overlay still exists on disk
-                # Pass use_qemu_vm_user to run with sudo if overlay is owned by qemu-vm
-                await self._commit_overlay_to_snapshot(
-                    overlay_path, snapshot_path, use_qemu_vm_user=vm.use_qemu_vm_user
-                )
-
-                # Step 7: Clean up ALL resources (now safe to delete overlay)
-                # This calls vm.destroy() which deletes overlay + cgroup
+                # Step 5: Clean up resources
+                # With direct_write_target, we wrote directly to snapshot_path
+                # No commit needed - just destroy VM (which cleans up cgroup, sockets, etc.)
                 await self.vm_manager.destroy_vm(vm)
                 vm = None
 
@@ -457,7 +398,7 @@ class SnapshotManager:
                     # Evict oldest snapshot and retry once
                     # Cleanup handled by finally block
                     await self._evict_oldest_snapshot()
-                    return await self._create_snapshot(language, packages, cache_key, tenant_id, task_id)
+                    return await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
                 raise
 
             # Handle VM death during snapshot creation
@@ -624,101 +565,6 @@ class SnapshotManager:
             },
         )
 
-    async def _commit_overlay_to_snapshot(
-        self,
-        overlay_path: Path,
-        snapshot_path: Path,
-        use_qemu_vm_user: bool,
-    ) -> None:
-        """Commit overlay changes to snapshot using qemu-img commit.
-
-        QEMU backing file chain architecture:
-        - Base image (read-only, system-wide)
-        - Snapshot (writable, backed by base)
-        - Overlay (ephemeral, backed by snapshot)
-
-        After package installation in VM:
-        - Packages written to overlay (top layer)
-        - Overlay is ephemeral (deleted on VM destroy)
-        - Must commit overlay → snapshot for persistence
-
-        This method runs `qemu-img commit` to merge overlay changes
-        into the snapshot backing file, ensuring packages persist.
-
-        CRITICAL: Must run AFTER VM shutdown (qemu-img cannot run on live images).
-
-        Args:
-            overlay_path: Ephemeral overlay file to commit from
-            snapshot_path: Snapshot file to commit into
-            use_qemu_vm_user: If True, overlay is owned by qemu-vm user, run with sudo
-
-        Raises:
-            SnapshotError: qemu-img commit failed
-        """
-        logger.info(
-            "Committing overlay to snapshot",
-            extra={"overlay": str(overlay_path), "snapshot": str(snapshot_path), "use_sudo": use_qemu_vm_user},
-        )
-
-        # When overlay is owned by qemu-vm user, need sudo to read it
-        # Capture stderr for error reporting
-        stderr_lines: list[str] = []
-
-        if use_qemu_vm_user:
-            proc = await sudo_exec(["qemu-img", "commit", str(overlay_path)])
-        else:
-            proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    "qemu-img",
-                    "commit",
-                    str(overlay_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            )
-
-        # Drain subprocess output using subprocess_utils (prevents pipe deadlock)
-        context_id = f"commit-{overlay_path.name}"
-
-        def capture_stderr(line: str) -> None:
-            stderr_lines.append(line)
-            logger.info("qemu-img commit stderr", extra={"context_id": context_id, "output": line})
-
-        drain_task = asyncio.create_task(
-            drain_subprocess_output(
-                proc,
-                process_name="qemu-img",
-                context_id=context_id,
-                stdout_handler=lambda line: logger.info(
-                    "qemu-img commit stdout", extra={"context_id": context_id, "output": line}
-                ),
-                stderr_handler=capture_stderr,
-            )
-        )
-
-        # Wait for process completion
-        returncode = await proc.wait()
-
-        # Wait for output draining to complete
-        await drain_task
-
-        if returncode != 0:
-            stderr_output = "\n".join(stderr_lines) if stderr_lines else "(no stderr)"
-            raise SnapshotError(
-                f"qemu-img commit failed with exit code {returncode}: {stderr_output}",
-                context={
-                    "overlay": str(overlay_path),
-                    "snapshot": str(snapshot_path),
-                    "exit_code": returncode,
-                    "stderr": stderr_output,
-                },
-            )
-
-        logger.info(
-            "Overlay committed successfully",
-            extra={"overlay": str(overlay_path), "snapshot": str(snapshot_path)},
-        )
-
     async def _install_packages(
         self,
         vm: QemuVM,
@@ -858,7 +704,7 @@ class SnapshotManager:
         await aiofiles.os.remove(oldest_file)
 
     async def _download_from_s3(self, cache_key: str) -> Path:
-        """Download and decompress snapshot from S3 to L0 cache.
+        """Download and decompress snapshot from S3 to L2 cache.
 
         Args:
             cache_key: Snapshot cache key
@@ -965,7 +811,7 @@ class SnapshotManager:
                 await aiofiles.os.remove(compressed_path)
 
             except (OSError, RuntimeError, ConnectionError, Exception) as e:  # noqa: BLE001 - Fire-and-forget S3 upload
-                # Silent failure (L0 cache still works)
+                # Silent failure (L2 cache still works)
                 # Catch all exceptions including botocore.exceptions.ClientError
                 logger.warning("S3 upload failed silently", extra={"cache_key": cache_key, "error": str(e)})
                 if compressed_path.exists():

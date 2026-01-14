@@ -56,26 +56,35 @@ class VmWorkingDirectory:
 
     __slots__ = (
         "_cleaned_up",
+        "_custom_overlay_path",
         "_path",
         "_use_qemu_vm_user",
         "vm_id",
     )
 
-    def __init__(self, vm_id: str, path: Path, use_qemu_vm_user: bool = False) -> None:
+    def __init__(
+        self,
+        vm_id: str,
+        path: Path,
+        use_qemu_vm_user: bool = False,
+        custom_overlay_path: Path | None = None,
+    ) -> None:
         """Initialize working directory (private - use create() classmethod).
 
         Args:
             vm_id: VM identifier for logging
             path: Directory path (must already exist)
             use_qemu_vm_user: Whether files will be owned by qemu-vm user
+            custom_overlay_path: Override overlay path (for skip_overlay mode)
         """
         self.vm_id = vm_id
         self._path = path
         self._use_qemu_vm_user = use_qemu_vm_user
         self._cleaned_up = False
+        self._custom_overlay_path = custom_overlay_path
 
     @classmethod
-    async def create(cls, vm_id: str) -> Self:
+    async def create(cls, vm_id: str, custom_overlay_path: Path | None = None) -> Self:
         """Create a new working directory atomically.
 
         Uses tempfile.mkdtemp() for secure, atomic directory creation with
@@ -83,6 +92,7 @@ class VmWorkingDirectory:
 
         Args:
             vm_id: VM identifier for logging and directory naming
+            custom_overlay_path: Override overlay path (for skip_overlay mode)
 
         Returns:
             VmWorkingDirectory instance with directory created
@@ -99,7 +109,7 @@ class VmWorkingDirectory:
             extra={"vm_id": vm_id, "path": path},
         )
 
-        return cls(vm_id, Path(path))
+        return cls(vm_id, Path(path), custom_overlay_path=custom_overlay_path)
 
     @property
     def path(self) -> Path:
@@ -108,7 +118,12 @@ class VmWorkingDirectory:
 
     @property
     def overlay_image(self) -> Path:
-        """Path to qcow2 overlay image."""
+        """Path to qcow2 overlay image.
+
+        Returns custom path if set via constructor (for skip_overlay mode), otherwise default.
+        """
+        if self._custom_overlay_path is not None:
+            return self._custom_overlay_path
         return self._path / "overlay.qcow2"
 
     @property

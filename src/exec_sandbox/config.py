@@ -49,7 +49,7 @@ class SchedulerConfig(BaseModel):
             - Linux: ~/.local/share/exec-sandbox/images/
             - macOS: ~/Library/Application Support/exec-sandbox/images/
             - Env: EXEC_SANDBOX_IMAGES_DIR
-        snapshot_cache_dir: Local directory for snapshot cache (L0 cache).
+        snapshot_cache_dir: Local directory for snapshot cache (L2 cache).
             Default: /tmp/exec-sandbox-cache
         s3_bucket: S3 bucket name for snapshot backup (L3 cache).
             If None, S3 backup is disabled. Requires aioboto3 optional dependency.
@@ -102,7 +102,7 @@ class SchedulerConfig(BaseModel):
     )
     snapshot_cache_dir: Path = Field(
         default=Path("/tmp/exec-sandbox-cache"),  # noqa: S108
-        description="Local snapshot cache directory (L0 cache)",
+        description="Local snapshot cache directory (L2 cache)",
     )
 
     # S3 snapshot backup (optional)

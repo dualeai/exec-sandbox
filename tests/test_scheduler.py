@@ -142,7 +142,7 @@ class TestSchedulerSnapshotInit:
     """Tests for SnapshotManager initialization in Scheduler."""
 
     async def test_snapshot_manager_initialized_without_s3(self, scheduler_config: SchedulerConfig) -> None:
-        """SnapshotManager is created even without S3 config (L1 cache works)."""
+        """SnapshotManager is created even without S3 config (L2 cache works)."""
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
 
