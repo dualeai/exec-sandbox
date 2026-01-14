@@ -228,6 +228,24 @@ class TestWrapWithUlimit:
             assert "-t" not in wrapped[2]
             assert "qemu-system-aarch64" in wrapped[2]
 
+    def test_macos_x86_64_uses_process_limit_only(self):
+        """macOS x86_64 uses only process (-u) limit, same as ARM64."""
+        with patch("exec_sandbox.cgroup.detect_host_os") as mock_os:
+            mock_os.return_value = HostOS.MACOS
+
+            # Use x86_64 QEMU binary (Intel Mac)
+            cmd = ["qemu-system-x86_64", "-m", "512"]
+            wrapped = wrap_with_ulimit(cmd, memory_mb=512)
+
+            # macOS should have ulimit with -u (processes) only
+            assert "ulimit" in wrapped[2]
+            assert f"-u {CGROUP_PIDS_LIMIT}" in wrapped[2]
+            # Should NOT have -v (virtual memory) - not supported on macOS
+            assert "-v" not in wrapped[2]
+            # Should NOT have -t (CPU time) - breaks subprocess stdout on macOS
+            assert "-t" not in wrapped[2]
+            assert "qemu-system-x86_64" in wrapped[2]
+
     def test_memory_multiplier_applied(self):
         """Memory multiplier (14x) is applied to virtual memory limit."""
         with patch("exec_sandbox.cgroup.detect_host_os") as mock_os:

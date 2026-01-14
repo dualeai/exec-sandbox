@@ -19,6 +19,14 @@ from exec_sandbox.platform_utils import (
     get_arch_name,
     get_os_name,
 )
+from tests.conftest import (
+    skip_unless_aarch64,
+    skip_unless_linux,
+    skip_unless_macos,
+    skip_unless_macos_arm64,
+    skip_unless_macos_x86_64,
+    skip_unless_x86_64,
+)
 
 # ============================================================================
 # OS Detection
@@ -121,35 +129,39 @@ class TestGetOsName:
         result = get_os_name()
         assert isinstance(result, str)
 
-    def test_returns_valid_os_name(self) -> None:
-        """get_os_name returns valid OS name for current platform."""
-        host_os = detect_host_os()
-        if host_os == HostOS.MACOS:
-            assert get_os_name() == "darwin"
-        elif host_os == HostOS.LINUX:
-            assert get_os_name() == "linux"
+    @skip_unless_macos
+    def test_returns_darwin_on_macos(self) -> None:
+        """get_os_name returns 'darwin' on macOS."""
+        assert get_os_name() == "darwin"
+
+    @skip_unless_linux
+    def test_returns_linux_on_linux(self) -> None:
+        """get_os_name returns 'linux' on Linux."""
+        assert get_os_name() == "linux"
 
 
 class TestGetArchName:
     """Tests for get_arch_name helper function."""
 
-    def test_kernel_convention(self) -> None:
-        """get_arch_name returns kernel-style names by default."""
-        result = get_arch_name("kernel")
-        host_arch = detect_host_arch()
-        if host_arch == HostArch.X86_64:
-            assert result == "x86_64"
-        elif host_arch == HostArch.AARCH64:
-            assert result == "aarch64"
+    @skip_unless_x86_64
+    def test_kernel_convention_x86_64(self) -> None:
+        """get_arch_name returns 'x86_64' for kernel convention on x86_64."""
+        assert get_arch_name("kernel") == "x86_64"
 
-    def test_go_convention(self) -> None:
-        """get_arch_name returns Go-style names with convention='go'."""
-        result = get_arch_name("go")
-        host_arch = detect_host_arch()
-        if host_arch == HostArch.X86_64:
-            assert result == "amd64"
-        elif host_arch == HostArch.AARCH64:
-            assert result == "arm64"
+    @skip_unless_aarch64
+    def test_kernel_convention_aarch64(self) -> None:
+        """get_arch_name returns 'aarch64' for kernel convention on ARM64."""
+        assert get_arch_name("kernel") == "aarch64"
+
+    @skip_unless_x86_64
+    def test_go_convention_x86_64(self) -> None:
+        """get_arch_name returns 'amd64' for Go convention on x86_64."""
+        assert get_arch_name("go") == "amd64"
+
+    @skip_unless_aarch64
+    def test_go_convention_aarch64(self) -> None:
+        """get_arch_name returns 'arm64' for Go convention on ARM64."""
+        assert get_arch_name("go") == "arm64"
 
     def test_default_convention_is_kernel(self) -> None:
         """get_arch_name defaults to kernel convention."""
@@ -421,3 +433,26 @@ class TestProcessWrapperWaitWithTimeout:
 
         code = await proc.wait_with_timeout(5.0)
         assert code == 0
+
+
+# ============================================================================
+# Platform-Specific Tests Using Skip Markers
+# ============================================================================
+
+
+class TestPlatformArchCombinations:
+    """Test platform+architecture combinations using skip markers."""
+
+    @skip_unless_macos_x86_64
+    def test_darwin_amd64_naming_combination(self) -> None:
+        """Verify darwin-amd64 naming for Intel Mac."""
+        assert get_os_name() == "darwin"
+        assert get_arch_name("go") == "amd64"
+        # Combined suffix: darwin-amd64
+
+    @skip_unless_macos_arm64
+    def test_darwin_arm64_naming_combination(self) -> None:
+        """Verify darwin-arm64 naming for Apple Silicon."""
+        assert get_os_name() == "darwin"
+        assert get_arch_name("go") == "arm64"
+        # Combined suffix: darwin-arm64

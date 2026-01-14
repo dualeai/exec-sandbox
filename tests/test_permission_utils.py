@@ -31,7 +31,6 @@ from exec_sandbox.permission_utils import (
     sudo_rm,
     verify_user_access,
 )
-from exec_sandbox.platform_utils import HostOS, detect_host_os  # Used in macOS tests
 from tests.conftest import skip_unless_linux, skip_unless_macos
 
 
@@ -64,11 +63,11 @@ class TestProbeQemuVmUser:
         result2 = await probe_qemu_vm_user()
         assert result1 == result2
 
+    @skip_unless_macos
     async def test_false_on_macos(self) -> None:
         """probe_qemu_vm_user returns False on macOS."""
-        if detect_host_os() == HostOS.MACOS:
-            result = await probe_qemu_vm_user()
-            assert result is False
+        result = await probe_qemu_vm_user()
+        assert result is False
 
 
 class TestProbeSudoAsQemuVm:
@@ -291,11 +290,9 @@ class TestEnsureTraversable:
 class TestAclOperations:
     """Tests for ACL functions (Linux only, no-op on macOS)."""
 
+    @skip_unless_macos
     async def test_set_acl_user_macos_returns_false(self, tmp_path: Path) -> None:
         """set_acl_user returns False on macOS."""
-        if detect_host_os() != HostOS.MACOS:
-            pytest.skip("macOS-only test")
-
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
@@ -303,11 +300,9 @@ class TestAclOperations:
 
         assert result is False
 
+    @skip_unless_macos
     async def test_get_acl_macos_returns_none(self, tmp_path: Path) -> None:
         """get_acl returns None on macOS."""
-        if detect_host_os() != HostOS.MACOS:
-            pytest.skip("macOS-only test")
-
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
@@ -519,14 +514,12 @@ class TestSudoRmReal:
 
 
 @pytest.mark.sudo
+@skip_unless_linux
 class TestAclRealLinux:
     """Real ACL tests on Linux - require setfacl."""
 
     async def test_set_and_get_acl(self, tmp_path: Path) -> None:
         """set_acl_user and get_acl work together."""
-        if detect_host_os() != HostOS.LINUX:
-            pytest.skip("Linux-only test")
-
         test_file = tmp_path / "acl_test.txt"
         test_file.write_text("content")
 
@@ -548,9 +541,6 @@ class TestAclRealLinux:
 
     async def test_verify_user_access(self, tmp_path: Path) -> None:
         """verify_user_access checks ACL permissions."""
-        if detect_host_os() != HostOS.LINUX:
-            pytest.skip("Linux-only test")
-
         test_file = tmp_path / "verify_test.txt"
         test_file.write_text("content")
 
@@ -570,9 +560,6 @@ class TestAclRealLinux:
 
     async def test_remove_acl_user(self, tmp_path: Path) -> None:
         """remove_acl_user removes user ACL entry."""
-        if detect_host_os() != HostOS.LINUX:
-            pytest.skip("Linux-only test")
-
         test_file = tmp_path / "remove_acl.txt"
         test_file.write_text("content")
 
@@ -596,9 +583,6 @@ class TestAclRealLinux:
 
     async def test_grant_qemu_vm_access_real(self, tmp_path: Path) -> None:
         """grant_qemu_vm_access sets ACL for qemu-vm user."""
-        if detect_host_os() != HostOS.LINUX:
-            pytest.skip("Linux-only test")
-
         qemu_uid = get_qemu_vm_uid()
         if qemu_uid is None:
             pytest.skip("qemu-vm user does not exist")

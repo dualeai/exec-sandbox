@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.platform_utils import HostOS, detect_host_os
+from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
 
 # ============================================================================
@@ -25,6 +25,29 @@ skip_unless_linux = pytest.mark.skipif(
 skip_unless_macos = pytest.mark.skipif(
     detect_host_os() != HostOS.MACOS,
     reason="This test requires macOS",
+)
+
+# Skip marker for x86_64-only tests
+skip_unless_x86_64 = pytest.mark.skipif(
+    detect_host_arch() != HostArch.X86_64,
+    reason="This test requires x86_64 architecture",
+)
+
+# Skip marker for ARM64-only tests
+skip_unless_aarch64 = pytest.mark.skipif(
+    detect_host_arch() != HostArch.AARCH64,
+    reason="This test requires ARM64/aarch64 architecture",
+)
+
+# Combined markers for specific platform+arch combinations
+skip_unless_macos_x86_64 = pytest.mark.skipif(
+    not (detect_host_os() == HostOS.MACOS and detect_host_arch() == HostArch.X86_64),
+    reason="This test requires macOS on Intel (x86_64)",
+)
+
+skip_unless_macos_arm64 = pytest.mark.skipif(
+    not (detect_host_os() == HostOS.MACOS and detect_host_arch() == HostArch.AARCH64),
+    reason="This test requires macOS on Apple Silicon (ARM64)",
 )
 
 # Skip marker for tests affected by Python 3.12 asyncio subprocess bug.

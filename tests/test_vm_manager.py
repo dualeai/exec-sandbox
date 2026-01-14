@@ -13,14 +13,16 @@ import pytest
 
 from exec_sandbox.exceptions import VmError
 from exec_sandbox.models import Language
-from exec_sandbox.platform_utils import HostOS, detect_host_arch, detect_host_os
+from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.vm_manager import (
     VALID_STATE_TRANSITIONS,
     VmState,
     _check_kvm_available,
+    _check_tsc_deadline_macos,
     _kernel_validated,
     _validate_kernel_initramfs,
 )
+from tests.conftest import skip_unless_macos
 
 # ============================================================================
 # Unit Tests - VM State Machine
@@ -97,14 +99,11 @@ class TestKvmDetection:
         result = _check_kvm_available()
         assert isinstance(result, bool)
 
-    def test_kvm_matches_platform(self) -> None:
-        """KVM available on Linux, not on macOS."""
-        host_os = detect_host_os()
+    @skip_unless_macos
+    def test_kvm_not_available_on_macos(self) -> None:
+        """KVM is never available on macOS."""
         kvm_available = _check_kvm_available()
-
-        if host_os == HostOS.MACOS:
-            assert kvm_available is False
-        # On Linux, KVM might or might not be available
+        assert kvm_available is False
 
 
 class TestHostOSForVm:
@@ -592,3 +591,167 @@ class TestEmulationMode:
             assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
         finally:
             await emulation_vm_manager.destroy_vm(vm)
+
+
+# ============================================================================
+# Unit Tests - TSC_DEADLINE Detection for macOS
+# ============================================================================
+
+
+class TestTscDeadlineMacOS:
+    """Tests for TSC_DEADLINE detection on macOS (Intel Macs)."""
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_macos_arm64_returns_false(self) -> None:
+        """ARM64 Macs always return False for TSC_DEADLINE (ARM uses different timer)."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        # Save original cache value
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            # Clear cache
+            _probe_cache.tsc_deadline = None
+
+            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.AARCH64):
+                result = await _check_tsc_deadline_macos()
+                assert result is False
+        finally:
+            # Restore cache
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_macos_x86_64_with_tsc(self) -> None:
+        """Intel Mac with TSC_DEADLINE returns True."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        # Save original cache value
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            # Clear cache
+            _probe_cache.tsc_deadline = None
+
+            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.X86_64):
+                mock_proc = AsyncMock()
+                mock_proc.returncode = 0
+                mock_proc.communicate = AsyncMock(
+                    return_value=(b"FPU VME DE PSE TSC MSR PAE MCE TSC_DEADLINE SSE", b"")
+                )
+
+                with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+                    result = await _check_tsc_deadline_macos()
+                    assert result is True
+        finally:
+            # Restore cache
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_macos_x86_64_without_tsc(self) -> None:
+        """Intel Mac without TSC_DEADLINE returns False."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        # Save original cache value
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            # Clear cache
+            _probe_cache.tsc_deadline = None
+
+            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.X86_64):
+                mock_proc = AsyncMock()
+                mock_proc.returncode = 0
+                mock_proc.communicate = AsyncMock(return_value=(b"FPU VME DE PSE TSC MSR PAE MCE SSE SSE2", b""))
+
+                with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+                    result = await _check_tsc_deadline_macos()
+                    assert result is False
+        finally:
+            # Restore cache
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_macos_sysctl_failure(self) -> None:
+        """sysctl failure returns False gracefully."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        # Save original cache value
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            # Clear cache
+            _probe_cache.tsc_deadline = None
+
+            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.X86_64):
+                mock_proc = AsyncMock()
+                mock_proc.returncode = 1  # sysctl failed
+                mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+                with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+                    result = await _check_tsc_deadline_macos()
+                    assert result is False
+        finally:
+            # Restore cache
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_macos_cached(self) -> None:
+        """TSC_DEADLINE result is cached."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        # Save original cache value
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            # Set cached value
+            _probe_cache.tsc_deadline = True
+
+            # Should return cached value without calling sysctl
+            with patch("asyncio.create_subprocess_exec") as mock_exec:
+                result = await _check_tsc_deadline_macos()
+                assert result is True
+                mock_exec.assert_not_called()
+        finally:
+            # Restore cache
+            _probe_cache.tsc_deadline = original_tsc
+
+
+# ============================================================================
+# Unit Tests - gvproxy-wrapper Binary Selection
+# ============================================================================
+
+
+class TestGvproxyWrapperBinarySelection:
+    """Tests for gvproxy-wrapper binary naming for different platforms."""
+
+    def test_darwin_amd64_suffix(self) -> None:
+        """Intel Mac uses darwin-amd64 suffix for gvproxy-wrapper."""
+        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="darwin"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="amd64"):
+                assert get_gvproxy_suffix() == "darwin-amd64"
+
+    def test_darwin_arm64_suffix(self) -> None:
+        """Apple Silicon uses darwin-arm64 suffix for gvproxy-wrapper."""
+        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="darwin"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="arm64"):
+                assert get_gvproxy_suffix() == "darwin-arm64"
+
+    def test_linux_amd64_suffix(self) -> None:
+        """Linux x86_64 uses linux-amd64 suffix for gvproxy-wrapper."""
+        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="linux"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="amd64"):
+                assert get_gvproxy_suffix() == "linux-amd64"
+
+    def test_linux_arm64_suffix(self) -> None:
+        """Linux ARM64 uses linux-arm64 suffix for gvproxy-wrapper."""
+        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+
+        with patch("exec_sandbox.asset_downloader.get_os_name", return_value="linux"):
+            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="arm64"):
+                assert get_gvproxy_suffix() == "linux-arm64"

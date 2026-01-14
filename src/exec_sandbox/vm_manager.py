@@ -368,6 +368,51 @@ async def _check_tsc_deadline_available() -> bool:
     return False
 
 
+async def _check_tsc_deadline_macos() -> bool:
+    """Check if TSC_DEADLINE CPU feature is available on macOS (cached).
+
+    Uses sysctl to query CPU features on Intel Macs.
+    ARM64 Macs don't have TSC_DEADLINE (ARM uses different timer mechanism).
+
+    Returns:
+        True if TSC_DEADLINE is available, False otherwise
+    """
+    # Fast path: return cached result
+    if _probe_cache.tsc_deadline is not None:
+        return _probe_cache.tsc_deadline
+
+    # TSC_DEADLINE is x86-only concept
+    if detect_host_arch() != HostArch.X86_64:
+        _probe_cache.tsc_deadline = False
+        return False
+
+    try:
+        # machdep.cpu.features contains CPU feature flags on Intel Macs
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/sbin/sysctl",
+            "-n",
+            "machdep.cpu.features",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode == 0:
+            features = stdout.decode().upper()
+            # TSC_DEADLINE or TSCDEAD in CPU features
+            has_tsc = "TSC_DEADLINE" in features or "TSCDEAD" in features
+            _probe_cache.tsc_deadline = has_tsc
+            if has_tsc:
+                logger.debug("TSC_DEADLINE available on macOS (can disable PIT/PIC)")
+            else:
+                logger.debug("TSC_DEADLINE not available on macOS (keeping legacy timers)")
+            return has_tsc
+    except (OSError, TimeoutError):
+        pass
+
+    _probe_cache.tsc_deadline = False
+    return False
+
+
 async def _probe_io_uring_support() -> bool:
     """Probe for io_uring support using syscall test (cached).
 
@@ -2134,9 +2179,29 @@ class VmManager:
                     machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
                     use_virtio_console = True
             elif accel_type == AccelType.HVF:
-                # macOS with HVF uses microvm in non-legacy mode
-                # HVF always has TSC_DEADLINE equivalent, can disable pit/pic
-                machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                # macOS with HVF - configuration depends on architecture
+                # Note: dump-guest-core=off not included - may not be supported on macOS QEMU
+                if self.arch == HostArch.X86_64:
+                    # Intel Mac: check TSC_DEADLINE availability
+                    tsc_available = await _check_tsc_deadline_macos()
+                    if tsc_available:
+                        # Full optimization: TSC_DEADLINE available, disable legacy devices
+                        machine_type = (
+                            "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                        )
+                    else:
+                        # Conservative: keep legacy timers for older Intel Macs
+                        logger.info(
+                            "TSC_DEADLINE not available on Intel Mac, using microvm with legacy timers",
+                            extra={"vm_id": vm_id},
+                        )
+                        machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off"
+                else:
+                    # ARM64 Mac: no x86 legacy devices needed
+                    # ARM uses different timer mechanism (CNTVCT_EL0), no TSC concept
+                    machine_type = (
+                        "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                    )
                 use_virtio_console = True
             else:
                 # TCG emulation: use 'pc' (i440FX) which is simpler and more proven with direct kernel boot
