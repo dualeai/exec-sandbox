@@ -544,8 +544,9 @@ class WarmVMPool:
     async def _health_check_pool(self, language: Language, pool: asyncio.Queue[QemuVM]) -> None:
         """Perform health check on a single pool.
 
-        Strategy: Remove VMs, check in parallel, restore only healthy ones.
-        This ensures pool never has unhealthy VMs, even if some exhaustion during check.
+        Strategy: Remove VMs, check in parallel, restore immediately when healthy.
+        Each VM is restored as soon as its check completes - unhealthy VMs don't
+        block healthy ones from returning to the pool.
         """
         pool_size = pool.qsize()
         if pool_size == 0:
@@ -562,14 +563,15 @@ class WarmVMPool:
         if not vms_to_check:
             return
 
-        # Health check all VMs in parallel
+        # Health check all VMs in parallel - each VM restored immediately when healthy
         results = await asyncio.gather(
-            *[self._check_vm_health(vm) for vm in vms_to_check],
+            *[self._check_and_restore_vm(vm, pool, language) for vm in vms_to_check],
             return_exceptions=True,
         )
 
-        # Process results and restore healthy VMs
-        healthy_count, unhealthy_count = await self._process_health_results(language, pool, vms_to_check, results)
+        # Count results (True = healthy, False = unhealthy, Exception = error)
+        healthy_count = sum(1 for r in results if r is True)
+        unhealthy_count = len(results) - healthy_count
 
         check_duration = asyncio.get_event_loop().time() - check_start
         logger.info(
@@ -599,39 +601,36 @@ class WarmVMPool:
         )
         return vms_to_check
 
-    async def _process_health_results(
+    async def _check_and_restore_vm(
         self,
-        language: Language,
+        vm: QemuVM,
         pool: asyncio.Queue[QemuVM],
-        vms: list[QemuVM],
-        results: list[bool | BaseException],
-    ) -> tuple[int, int]:
-        """Process health check results and restore healthy VMs."""
-        healthy_count = 0
-        unhealthy_count = 0
+        language: Language,
+    ) -> bool:
+        """Check VM health and immediately restore to pool if healthy.
 
-        for vm, result in zip(vms, results, strict=True):
-            healthy = self._evaluate_health_result(result, language, vm)
+        This is called in parallel for all VMs. Each healthy VM is restored
+        immediately without waiting for other checks to complete, minimizing
+        the window where the pool is depleted.
 
+        Returns:
+            True if healthy (restored to pool), False if unhealthy (destroyed).
+        """
+        try:
+            healthy = await self._check_vm_health(vm)
             if healthy:
-                await pool.put(vm)
-                healthy_count += 1
-            else:
-                await self._handle_unhealthy_vm(vm, language)
-                unhealthy_count += 1
-
-        return healthy_count, unhealthy_count
-
-    def _evaluate_health_result(self, result: bool | BaseException, language: Language, vm: QemuVM) -> bool:
-        """Evaluate health check result for a single VM."""
-        if isinstance(result, BaseException):
+                await pool.put(vm)  # Immediately back in pool
+                return True
+            await self._handle_unhealthy_vm(vm, language)
+            return False
+        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
             logger.error(
                 "Health check exception",
-                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(result)},
-                exc_info=result,
+                extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
+                exc_info=e,
             )
+            await self._handle_unhealthy_vm(vm, language)
             return False
-        return result
 
     async def _handle_unhealthy_vm(self, vm: QemuVM, language: Language) -> None:
         """Handle an unhealthy VM by destroying and triggering replenishment."""
@@ -707,13 +706,13 @@ class WarmVMPool:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES),
                 wait=wait_strategy,
-                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError)),
+                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError, EOFError)),
                 before_sleep=before_sleep_log(logger, logging.DEBUG),
                 reraise=True,
             ):
                 with attempt:
                     return await _ping_guest()
-        except (OSError, TimeoutError, ConnectionError) as e:
+        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
             # All retries exhausted - log and return unhealthy
             logger.warning(
                 "Health check failed after retries",

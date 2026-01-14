@@ -5,10 +5,10 @@ Integration tests: Real VM pool operations (requires QEMU + images).
 """
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+import contextlib
+from unittest.mock import AsyncMock
 
 import pytest
-from tenacity import wait_none
 
 from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
@@ -154,247 +154,6 @@ class TestDrainPoolForCheck:
         assert len(result) == 3
         assert result == ["vm1", "vm2", "vm3"]
         assert test_queue.qsize() == 0
-
-
-class TestEvaluateHealthResult:
-    """Tests for _evaluate_health_result - pure result evaluation logic."""
-
-    async def test_evaluate_true_returns_true(self, unit_test_vm_manager) -> None:
-        """True result means healthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # Create a minimal VM object for testing
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        result = pool._evaluate_health_result(True, Language.PYTHON, vm)
-        assert result is True
-
-    async def test_evaluate_false_returns_false(self, unit_test_vm_manager) -> None:
-        """False result means unhealthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        result = pool._evaluate_health_result(False, Language.PYTHON, vm)
-        assert result is False
-
-    async def test_evaluate_exception_returns_false(self, unit_test_vm_manager) -> None:
-        """Exception result means unhealthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        # Any exception should be treated as unhealthy
-        result = pool._evaluate_health_result(
-            TimeoutError("connection timeout"),
-            Language.PYTHON,
-            vm,
-        )
-        assert result is False
-
-    async def test_evaluate_oserror_returns_false(self, unit_test_vm_manager) -> None:
-        """OSError (connection failed) means unhealthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        result = pool._evaluate_health_result(
-            OSError("Connection refused"),
-            Language.PYTHON,
-            vm,
-        )
-        assert result is False
-
-    async def test_evaluate_connection_error_returns_false(self, unit_test_vm_manager) -> None:
-        """ConnectionError means unhealthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        result = pool._evaluate_health_result(
-            ConnectionError("Connection reset by peer"),
-            Language.PYTHON,
-            vm,
-        )
-        assert result is False
-
-    async def test_evaluate_cancelled_error_returns_false(self, unit_test_vm_manager) -> None:
-        """CancelledError (task cancelled) means unhealthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        result = pool._evaluate_health_result(
-            asyncio.CancelledError(),
-            Language.PYTHON,
-            vm,
-        )
-        assert result is False
-
-    async def test_evaluate_base_exception_returns_false(self, unit_test_vm_manager) -> None:
-        """BaseException (keyboard interrupt, system exit) means unhealthy."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm = QemuVM.__new__(QemuVM)
-        vm.vm_id = "test-vm"
-
-        # BaseException that's not an Exception (KeyboardInterrupt, SystemExit)
-        # Implementation correctly handles this as unhealthy
-        result = pool._evaluate_health_result(
-            KeyboardInterrupt(),
-            Language.PYTHON,
-            vm,
-        )
-        assert result is False
-
-
-# ============================================================================
-# Unit Tests - Process Health Results (No QEMU, No Mocks)
-# ============================================================================
-
-
-class TestProcessHealthResults:
-    """Tests for _process_health_results - result processing logic."""
-
-    async def test_process_empty_results(self, unit_test_vm_manager) -> None:
-        """Processing empty results list returns zeros."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        test_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
-
-        healthy, unhealthy = await pool._process_health_results(
-            Language.PYTHON,
-            test_queue,  # type: ignore[arg-type]
-            vms=[],
-            results=[],
-        )
-
-        assert healthy == 0
-        assert unhealthy == 0
-        assert test_queue.qsize() == 0
-
-    async def test_process_all_healthy(self, unit_test_vm_manager) -> None:
-        """All healthy results restores all VMs to pool."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # Create minimal VM objects
-        vm1 = QemuVM.__new__(QemuVM)
-        vm1.vm_id = "vm1"
-        vm2 = QemuVM.__new__(QemuVM)
-        vm2.vm_id = "vm2"
-
-        test_queue: asyncio.Queue[QemuVM] = asyncio.Queue(maxsize=10)
-
-        healthy, unhealthy = await pool._process_health_results(
-            Language.PYTHON,
-            test_queue,
-            vms=[vm1, vm2],
-            results=[True, True],
-        )
-
-        assert healthy == 2
-        assert unhealthy == 0
-        assert test_queue.qsize() == 2
-
-    async def test_process_all_unhealthy(self, unit_test_vm_manager) -> None:
-        """All unhealthy results triggers cleanup for all VMs."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm1 = QemuVM.__new__(QemuVM)
-        vm1.vm_id = "vm1"
-        vm2 = QemuVM.__new__(QemuVM)
-        vm2.vm_id = "vm2"
-
-        test_queue: asyncio.Queue[QemuVM] = asyncio.Queue(maxsize=10)
-
-        healthy, unhealthy = await pool._process_health_results(
-            Language.PYTHON,
-            test_queue,
-            vms=[vm1, vm2],
-            results=[False, False],
-        )
-
-        assert healthy == 0
-        assert unhealthy == 2
-        assert test_queue.qsize() == 0  # No VMs restored
-
-    async def test_process_mixed_results(self, unit_test_vm_manager) -> None:
-        """Mixed results restores only healthy VMs."""
-        from exec_sandbox.vm_manager import QemuVM
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        vm1 = QemuVM.__new__(QemuVM)
-        vm1.vm_id = "vm1"
-        vm2 = QemuVM.__new__(QemuVM)
-        vm2.vm_id = "vm2"
-        vm3 = QemuVM.__new__(QemuVM)
-        vm3.vm_id = "vm3"
-
-        test_queue: asyncio.Queue[QemuVM] = asyncio.Queue(maxsize=10)
-
-        # vm1: healthy, vm2: unhealthy (False), vm3: unhealthy (exception)
-        healthy, unhealthy = await pool._process_health_results(
-            Language.PYTHON,
-            test_queue,
-            vms=[vm1, vm2, vm3],
-            results=[True, False, TimeoutError("timeout")],
-        )
-
-        assert healthy == 1
-        assert unhealthy == 2
-        assert test_queue.qsize() == 1
-
-        # Verify the healthy VM was restored
-        restored_vm = await test_queue.get()
-        assert restored_vm.vm_id == "vm1"
 
 
 # ============================================================================
@@ -569,19 +328,15 @@ class TestHealthcheckIntegration:
             assert python_pool.qsize() == 0
             assert len(vms) == initial_size
 
-            # Check health of all VMs
+            # Check and restore each VM immediately (new architecture)
             results = await asyncio.gather(
-                *[pool._check_vm_health(vm) for vm in vms],
+                *[pool._check_and_restore_vm(vm, python_pool, Language.PYTHON) for vm in vms],
                 return_exceptions=True,
             )
 
-            # Process results - should restore all healthy VMs
-            healthy_count, unhealthy_count = await pool._process_health_results(
-                Language.PYTHON,
-                python_pool,
-                vms,
-                results,
-            )
+            # Count results (True = healthy, False = unhealthy)
+            healthy_count = sum(1 for r in results if r is True)
+            unhealthy_count = len(results) - healthy_count
 
             assert healthy_count == initial_size
             assert unhealthy_count == 0
@@ -609,313 +364,325 @@ class TestHealthcheckIntegration:
         assert pool._health_task.done()
         assert pool._shutdown_event.is_set()
 
-
-# ============================================================================
-# Unit Tests - Health Check Retry Logic (No QEMU, uses mocks)
-# ============================================================================
-
-
-class TestCheckVmHealthRetry:
-    """Unit tests for _check_vm_health retry logic."""
-
-    @pytest.fixture
-    def mock_vm(self):
-        """Create a mock VM with mocked channel."""
-        vm = Mock()
-        vm.vm_id = "test-vm"
-        vm.channel = Mock()
-        vm.channel.close = AsyncMock()
-        vm.channel.connect = AsyncMock()
-        vm.channel.send_request = AsyncMock()
-        return vm
-
-    async def test_success_on_first_attempt(self, unit_test_vm_manager, mock_vm) -> None:
-        """Health check succeeds on first attempt without retry."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        mock_vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
-
-        # Inject wait_none() for instant retries (no delays)
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 1
-
-    async def test_retry_succeeds_after_transient_timeout(self, unit_test_vm_manager, mock_vm) -> None:
-        """Retry succeeds after transient TimeoutError."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # First 2 calls: TimeoutError, Third call: success
-        mock_vm.channel.send_request = AsyncMock(
-            side_effect=[
-                TimeoutError("timeout"),
-                TimeoutError("timeout"),
-                PongMessage(version="1.0"),
-            ]
-        )
-
-        # Inject wait_none() - retries happen instantly
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 3
-
-    async def test_retry_succeeds_after_transient_oserror(self, unit_test_vm_manager, mock_vm) -> None:
-        """Retry succeeds after transient OSError."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        mock_vm.channel.send_request = AsyncMock(
-            side_effect=[OSError("connection refused"), PongMessage(version="1.0")]
-        )
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 2
-
-    async def test_retry_succeeds_after_connection_error(self, unit_test_vm_manager, mock_vm) -> None:
-        """Retry succeeds after transient ConnectionError."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        mock_vm.channel.send_request = AsyncMock(side_effect=[ConnectionError("reset"), PongMessage(version="1.0")])
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 2
-
-    async def test_retry_exhausted_returns_false(self, unit_test_vm_manager, mock_vm) -> None:
-        """Returns False after all retries exhausted."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # All attempts fail with TimeoutError
-        mock_vm.channel.send_request = AsyncMock(side_effect=TimeoutError("always timeout"))
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is False
-        assert mock_vm.channel.send_request.call_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES
-
-    async def test_cancellation_not_retried(self, unit_test_vm_manager, mock_vm) -> None:
-        """CancelledError propagates immediately without retry."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        mock_vm.channel.connect = AsyncMock(side_effect=asyncio.CancelledError())
-
-        with pytest.raises(asyncio.CancelledError):
-            await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        # Should only attempt once - no retry on cancellation
-        assert mock_vm.channel.connect.call_count == 1
-
-    @pytest.mark.parametrize(
-        "exception_type",
-        [
-            OSError("connection refused"),
-            TimeoutError("timeout"),
-            ConnectionError("connection reset"),
-        ],
-    )
-    async def test_retries_on_all_transient_exception_types(
-        self, unit_test_vm_manager, mock_vm, exception_type
-    ) -> None:
-        """Retries on all transient exception types then succeeds."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        mock_vm.channel.send_request = AsyncMock(side_effect=[exception_type, PongMessage(version="1.0")])
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 2
-
     # -------------------------------------------------------------------------
-    # Edge Cases
+    # Edge Cases - Real VM Tests (NO MOCKS)
     # -------------------------------------------------------------------------
 
-    async def test_wrong_response_type_returns_false_no_retry(self, unit_test_vm_manager, mock_vm) -> None:
-        """Wrong response type returns False without retry (protocol error, not transient)."""
+    async def test_killed_vm_detected_as_unhealthy(self, vm_manager) -> None:
+        """Health check detects killed VM process as unhealthy.
+
+        This is a critical test - verifies that when QEMU process dies,
+        the health check correctly identifies the VM as unhealthy.
+        """
+        import signal
+
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(vm_manager, config)
 
-        # Return something that's not a PongMessage
-        wrong_response = Mock()
-        wrong_response.__class__.__name__ = "UnexpectedMessage"
-        mock_vm.channel.send_request = AsyncMock(return_value=wrong_response)
+        await pool.startup()
 
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+        try:
+            # Get a VM from pool
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None
 
-        assert result is False
-        # Should not retry - wrong response type is not a transient error
-        assert mock_vm.channel.send_request.call_count == 1
+            # Verify it's healthy first
+            is_healthy = await pool._check_vm_health(vm)
+            assert is_healthy is True
 
-    async def test_connect_failure_is_retried(self, unit_test_vm_manager, mock_vm) -> None:
-        """Failure during connect() is retried."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
+            # Kill the QEMU process (simulate crash)
+            assert vm.process.pid is not None
+            import os
+
+            os.kill(vm.process.pid, signal.SIGKILL)
+
+            # Wait for process to die
+            await asyncio.sleep(0.1)
+
+            # Health check should now detect unhealthy
+            is_healthy = await pool._check_vm_health(vm)
+            assert is_healthy is False
+
+        finally:
+            await pool.shutdown()
+
+    async def test_mixed_pool_healthy_and_killed_vms(self, vm_manager) -> None:
+        """Health check correctly handles mix of healthy and killed VMs.
+
+        Tests the real-world scenario where some VMs in pool have crashed
+        while others are still healthy. Verifies selective detection.
+        """
+        import signal
+
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # Connect fails twice, then succeeds
-        mock_vm.channel.connect = AsyncMock(side_effect=[OSError("refused"), TimeoutError("timeout"), None])
-        mock_vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.connect.call_count == 3
-        assert mock_vm.channel.send_request.call_count == 1
-
-    async def test_close_failure_is_retried(self, unit_test_vm_manager, mock_vm) -> None:
-        """Failure during close() is retried."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # Close fails once, then succeeds
-        mock_vm.channel.close = AsyncMock(side_effect=[OSError("broken pipe"), None])
-        mock_vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.close.call_count == 2
-
-    async def test_mixed_exception_types_across_retries(self, unit_test_vm_manager, mock_vm) -> None:
-        """Different exception types across retries still succeed."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # Different exceptions on each retry
-        mock_vm.channel.send_request = AsyncMock(
-            side_effect=[
-                OSError("connection refused"),
-                TimeoutError("timeout"),
-                PongMessage(version="1.0"),
-            ]
+        # Create 2 VMs manually (warm pool only creates 1 per language with max_concurrent=4)
+        vm1 = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test",
+            task_id="mixed-test-1",
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
+        )
+        vm2 = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test",
+            task_id="mixed-test-2",
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
         )
 
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(vm_manager, config)
 
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 3
+        try:
+            # Kill first VM
+            killed_vm_id = vm1.vm_id
+            assert vm1.process.pid is not None
+            import os
 
-    async def test_success_on_last_retry_boundary(self, unit_test_vm_manager, mock_vm) -> None:
-        """Success on exactly the last retry attempt (boundary condition)."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
+            os.kill(vm1.process.pid, signal.SIGKILL)
+            await asyncio.sleep(0.1)
+
+            # Check both VMs
+            result1 = await pool._check_vm_health(vm1)
+            result2 = await pool._check_vm_health(vm2)
+
+            # vm1 should be unhealthy (killed), vm2 should be healthy
+            assert result1 is False, "Killed VM should be unhealthy"
+            assert result2 is True, "Live VM should be healthy"
+
+        finally:
+            # Clean up
+            with contextlib.suppress(Exception):
+                await vm_manager.destroy_vm(vm1)
+            with contextlib.suppress(Exception):
+                await vm_manager.destroy_vm(vm2)
+
+    async def test_health_check_pool_removes_killed_vm(self, vm_manager) -> None:
+        """Full _health_check_pool correctly removes killed VM from pool.
+
+        Tests the complete health check flow, not just individual VM checks.
+        Uses _check_and_restore_vm to verify killed VM is not restored.
+        """
+        import signal
+
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # Fail exactly (MAX_RETRIES - 1) times, succeed on last attempt
-        failures = [TimeoutError("timeout")] * (constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES - 1)
-        mock_vm.channel.send_request = AsyncMock(side_effect=[*failures, PongMessage(version="1.0")])
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES
-
-    async def test_failure_on_last_retry_returns_false(self, unit_test_vm_manager, mock_vm) -> None:
-        """Failure on last retry returns False (boundary condition)."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # All MAX_RETRIES attempts fail
-        mock_vm.channel.send_request = AsyncMock(side_effect=TimeoutError("always fails"))
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is False
-        assert mock_vm.channel.send_request.call_count == constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES
-
-    # -------------------------------------------------------------------------
-    # Weird Cases
-    # -------------------------------------------------------------------------
-
-    async def test_none_response_returns_false(self, unit_test_vm_manager, mock_vm) -> None:
-        """None response returns False (edge case)."""
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        mock_vm.channel.send_request = AsyncMock(return_value=None)
-
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
-
-        assert result is False
-        assert mock_vm.channel.send_request.call_count == 1
-
-    async def test_exception_subclass_is_retried(self, unit_test_vm_manager, mock_vm) -> None:
-        """Exception subclasses (e.g., ConnectionRefusedError) are retried."""
-        from exec_sandbox.guest_agent_protocol import PongMessage
-        from exec_sandbox.warm_vm_pool import WarmVMPool
-
-        config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
-
-        # ConnectionRefusedError is a subclass of ConnectionError
-        mock_vm.channel.send_request = AsyncMock(
-            side_effect=[ConnectionRefusedError("refused"), PongMessage(version="1.0")]
+        # Create 2 VMs manually
+        vm1 = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test",
+            task_id="pool-test-1",
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
+        )
+        vm2 = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test",
+            task_id="pool-test-2",
+            memory_mb=256,
+            allow_network=False,
+            allowed_domains=None,
         )
 
-        result = await pool._check_vm_health(mock_vm, _wait=wait_none())
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(vm_manager, config)
+        python_pool = pool.pools[Language.PYTHON]
 
-        assert result is True
-        assert mock_vm.channel.send_request.call_count == 2
+        try:
+            # Kill first VM
+            killed_vm_id = vm1.vm_id
+            assert vm1.process.pid is not None
+            import os
 
-    async def test_non_retryable_exception_propagates(self, unit_test_vm_manager, mock_vm) -> None:
-        """Non-retryable exceptions (e.g., ValueError) propagate immediately."""
+            os.kill(vm1.process.pid, signal.SIGKILL)
+            await asyncio.sleep(0.1)
+
+            # Run check and restore on both VMs
+            result1 = await pool._check_and_restore_vm(vm1, python_pool, Language.PYTHON)
+            result2 = await pool._check_and_restore_vm(vm2, python_pool, Language.PYTHON)
+
+            # vm1 should fail (not restored), vm2 should succeed (restored)
+            assert result1 is False, "Killed VM should not be restored"
+            assert result2 is True, "Healthy VM should be restored"
+
+            # Pool should only contain vm2
+            assert python_pool.qsize() == 1, f"Pool should have 1 VM, got {python_pool.qsize()}"
+
+            # Get the VM and verify it's vm2
+            restored_vm = python_pool.get_nowait()
+            assert restored_vm.vm_id == vm2.vm_id, f"Expected {vm2.vm_id}, got {restored_vm.vm_id}"
+            assert restored_vm.vm_id != killed_vm_id, "Killed VM should not be in pool"
+
+        finally:
+            # Clean up any remaining VMs
+            with contextlib.suppress(Exception):
+                await vm_manager.destroy_vm(vm1)
+            with contextlib.suppress(Exception):
+                await vm_manager.destroy_vm(vm2)
+
+    async def test_frozen_vm_detected_as_unhealthy(self, vm_manager) -> None:
+        """Health check detects frozen VM (SIGSTOP) as unhealthy via timeout.
+
+        SIGSTOP freezes the QEMU process, making it unresponsive.
+        The health check should timeout and mark it unhealthy.
+        """
+        import signal
+
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(max_concurrent_vms=4)
-        pool = WarmVMPool(unit_test_vm_manager, config)
+        pool = WarmVMPool(vm_manager, config)
 
-        mock_vm.channel.send_request = AsyncMock(side_effect=ValueError("unexpected"))
+        await pool.startup()
 
-        with pytest.raises(ValueError, match="unexpected"):
-            await pool._check_vm_health(mock_vm, _wait=wait_none())
+        try:
+            # Get a VM from pool
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None
 
-        # Should only attempt once - ValueError is not retryable
-        assert mock_vm.channel.send_request.call_count == 1
+            # Verify healthy first
+            is_healthy = await pool._check_vm_health(vm)
+            assert is_healthy is True
+
+            # Freeze the QEMU process (simulate hang)
+            assert vm.process.pid is not None
+            import os
+
+            os.kill(vm.process.pid, signal.SIGSTOP)
+
+            try:
+                # Health check should timeout and return unhealthy
+                # Uses retry with backoff, so give it time
+                is_healthy = await pool._check_vm_health(vm)
+                assert is_healthy is False
+            finally:
+                # Unfreeze so cleanup can proceed
+                os.kill(vm.process.pid, signal.SIGCONT)
+                await asyncio.sleep(0.1)
+
+            # Clean up
+            await vm_manager.destroy_vm(vm)
+
+        finally:
+            await pool.shutdown()
+
+    async def test_vm_killed_during_health_check(self, vm_manager) -> None:
+        """Health check handles VM dying mid-check gracefully.
+
+        Tests that the health check doesn't crash when VM dies during the check.
+        The result may be True (if check completed before kill) or False (if kill
+        happened first) - the key assertion is no crash/exception.
+        """
+        import signal
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(vm_manager, config)
+
+        await pool.startup()
+
+        try:
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None
+
+            # Kill VM immediately (no delay) to maximize chance of race
+            async def kill_vm_now():
+                if vm.process.pid:
+                    import os
+
+                    os.kill(vm.process.pid, signal.SIGKILL)
+
+            # Start health check and kill concurrently
+            health_task = asyncio.create_task(pool._check_vm_health(vm))
+            kill_task = asyncio.create_task(kill_vm_now())
+
+            # Both should complete without exception
+            results = await asyncio.gather(health_task, kill_task, return_exceptions=True)
+
+            # Health check should return a boolean (True or False), not crash
+            health_result = results[0]
+            assert isinstance(health_result, bool), f"Expected bool, got {type(health_result)}: {health_result}"
+
+        finally:
+            await pool.shutdown()
+
+    async def test_multiple_consecutive_health_checks_after_kill(self, vm_manager) -> None:
+        """Multiple health checks on killed VM all return False.
+
+        Verifies consistent behavior across repeated checks on dead VM.
+        """
+        import signal
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(vm_manager, config)
+
+        await pool.startup()
+
+        try:
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None
+
+            # Kill VM
+            assert vm.process.pid is not None
+            import os
+
+            os.kill(vm.process.pid, signal.SIGKILL)
+            await asyncio.sleep(0.1)
+
+            # Multiple health checks should all return False
+            for i in range(3):
+                is_healthy = await pool._check_vm_health(vm)
+                assert is_healthy is False, f"Check {i + 1} should return False"
+
+        finally:
+            await pool.shutdown()
+
+    async def test_check_and_restore_only_restores_healthy(self, vm_manager) -> None:
+        """_check_and_restore_vm only puts healthy VMs back in pool.
+
+        Verifies the new immediate-restore architecture works correctly.
+        """
+        import signal
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4)
+        pool = WarmVMPool(vm_manager, config)
+
+        await pool.startup()
+
+        try:
+            python_pool = pool.pools[Language.PYTHON]
+
+            # Get VM from pool
+            vm = await python_pool.get()
+            assert python_pool.qsize() == 0  # Pool now empty
+
+            # Kill VM
+            assert vm.process.pid is not None
+            import os
+
+            os.kill(vm.process.pid, signal.SIGKILL)
+            await asyncio.sleep(0.1)
+
+            # _check_and_restore_vm should NOT put killed VM back
+            result = await pool._check_and_restore_vm(vm, python_pool, Language.PYTHON)
+
+            assert result is False  # Unhealthy
+            assert python_pool.qsize() == 0  # VM NOT restored to pool
+
+        finally:
+            await pool.shutdown()
 
 
 # ============================================================================

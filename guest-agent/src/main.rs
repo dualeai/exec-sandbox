@@ -35,8 +35,8 @@ const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 const MAX_REQUEST_SIZE_BYTES: usize = 2_000_000; // 2MB max request JSON
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
-const READ_TIMEOUT_MS: u64 = 5000; // Timeout for idle reads - detects hung connections
-                                   // 5s is long enough for normal operation but short enough for stale detection
+const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
+                                    // 12s > 10s health check interval to avoid spurious reconnects
 
 // Environment variable limits
 const MAX_ENV_VARS: usize = 100; // Max number of environment variables

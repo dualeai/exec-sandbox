@@ -12,9 +12,9 @@ import pytest
 from exec_sandbox.models import Language
 from exec_sandbox.vm_manager import VmManager, VmState
 
-# Guest agent READ_TIMEOUT_MS is 5000ms (5 seconds)
+# Guest agent READ_TIMEOUT_MS is 12000ms (12 seconds)
 # We wait longer than that to trigger the timeout/reconnect
-GUEST_AGENT_READ_TIMEOUT_MS = 5000
+GUEST_AGENT_READ_TIMEOUT_MS = 12000
 
 
 @pytest.fixture
