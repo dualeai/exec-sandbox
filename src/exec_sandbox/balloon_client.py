@@ -25,7 +25,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from typing import TYPE_CHECKING, Any
+
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    before_sleep_log,
+    retry_if_result,
+    stop_after_attempt,
+    wait_fixed,
+)
 
 from exec_sandbox import constants
 
@@ -35,6 +45,10 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.socket_auth import connect_and_verify
 
 logger = get_logger(__name__)
+
+# Tolerance for balloon target polling (MB). Allows early exit when balloon is
+# "close enough" to target, accounting for kernel overhead and slow CI runners.
+_BALLOON_TOLERANCE_MB = 40
 
 
 class BalloonError(Exception):
@@ -230,15 +244,22 @@ class BalloonClient:
         self,
         target_mb: int = constants.BALLOON_INFLATE_TARGET_MB,
         timeout: float = constants.BALLOON_INFLATE_TIMEOUT_SECONDS,
+        wait_for_target: bool = True,
     ) -> int:
         """Inflate balloon to reduce guest memory for idle pool VMs.
 
         Inflating the balloon takes memory FROM the guest, allowing the host
         to reclaim it. Used when adding VM to warm pool.
 
+        Note: Balloon operations are asynchronous - the guest needs time to
+        respond to balloon requests. This method polls until the target is
+        reached, following QEMU's own test patterns (10 retries @ 0.5s).
+        See: https://www.mail-archive.com/qemu-devel@nongnu.org/msg1102693.html
+
         Args:
             target_mb: Target guest memory in MB (default: BALLOON_INFLATE_TARGET_MB)
             timeout: Operation timeout in seconds
+            wait_for_target: If True, poll until balloon reaches target
 
         Returns:
             Previous guest memory in MB (for deflate restore)
@@ -254,6 +275,40 @@ class BalloonClient:
 
         await self.set_target(target_mb, timeout=timeout)
 
+        # Balloon operations are asynchronous - guest needs time to respond.
+        # Poll until target is reached, following QEMU test patterns.
+        if wait_for_target:
+
+            async def _check_balloon() -> int | None:
+                return await self.query(timeout=1.0)
+
+            def _not_at_target(result: int | None) -> bool:
+                """Retry while balloon hasn't reached target."""
+                return result is None or result > target_mb + _BALLOON_TOLERANCE_MB
+
+            try:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(10),
+                    wait=wait_fixed(0.5),
+                    retry=retry_if_result(_not_at_target),
+                    before_sleep=before_sleep_log(logger, logging.DEBUG),
+                    reraise=True,
+                ):
+                    with attempt:
+                        actual_mb = await _check_balloon()
+                        if not _not_at_target(actual_mb):
+                            logger.debug(
+                                "Balloon reached target",
+                                extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                            )
+            except RetryError:
+                # Log warning but don't fail - balloon may still be inflating
+                actual_mb = await self.query(timeout=1.0)
+                logger.warning(
+                    "Balloon did not reach target within retry limit",
+                    extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                )
+
         logger.info(
             "Balloon inflated",
             extra={"from_mb": current_mb, "to_mb": target_mb},
@@ -265,20 +320,60 @@ class BalloonClient:
         self,
         target_mb: int,
         timeout: float = constants.BALLOON_DEFLATE_TIMEOUT_SECONDS,
+        wait_for_target: bool = True,
     ) -> None:
         """Deflate balloon to restore guest memory before code execution.
 
         Deflating the balloon returns memory TO the guest. Used before
         executing user code.
 
+        Note: Like inflate, balloon operations are asynchronous - the guest
+        needs time to reclaim memory from the balloon. This method polls
+        until the target is reached.
+
         Args:
             target_mb: Target guest memory in MB
             timeout: Operation timeout in seconds
+            wait_for_target: If True, poll until balloon reaches target
 
         Raises:
             BalloonError: Deflation failed
         """
         await self.set_target(target_mb, timeout=timeout)
+
+        # Balloon operations are asynchronous - guest needs time to reclaim memory.
+        # Poll until target is reached, following QEMU test patterns.
+        if wait_for_target:
+
+            async def _check_balloon() -> int | None:
+                return await self.query(timeout=1.0)
+
+            def _not_at_target(result: int | None) -> bool:
+                """Retry while balloon hasn't reached target (memory still too low)."""
+                return result is None or result < target_mb - _BALLOON_TOLERANCE_MB
+
+            try:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(10),
+                    wait=wait_fixed(0.5),
+                    retry=retry_if_result(_not_at_target),
+                    before_sleep=before_sleep_log(logger, logging.DEBUG),
+                    reraise=True,
+                ):
+                    with attempt:
+                        actual_mb = await _check_balloon()
+                        if not _not_at_target(actual_mb):
+                            logger.debug(
+                                "Balloon reached deflate target",
+                                extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                            )
+            except RetryError:
+                # Log warning but don't fail - balloon may still be deflating
+                actual_mb = await self.query(timeout=1.0)
+                logger.warning(
+                    "Balloon did not reach deflate target within retry limit",
+                    extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                )
 
         logger.info(
             "Balloon deflated",
