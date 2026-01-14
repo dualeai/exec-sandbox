@@ -35,9 +35,7 @@ load_module "/lib/modules/$KVER/kernel/drivers/net/net_failover.ko.gz" "net_fail
 load_module "/lib/modules/$KVER/kernel/drivers/net/virtio_net.ko.gz" "virtio_net"
 # virtio_balloon is needed for memory reclamation before snapshots
 load_module "/lib/modules/$KVER/kernel/drivers/virtio/virtio_balloon.ko.gz" "virtio_balloon"
-# virtio_console handles BOTH virtconsole (hvc0) AND virtserialport devices
-# Must be loaded explicitly in legacy mode (console=ttyS0) where it's not auto-loaded
-load_module "/lib/modules/$KVER/kernel/drivers/char/virtio_console.ko.gz" "virtio_console"
+# Note: virtio_console is built-in (CONFIG_VIRTIO_CONSOLE=y) on Alpine linux-virt kernel
 
 # Load ext4 and its dependencies (order matters)
 load_module "/lib/modules/$KVER/kernel/lib/crc16.ko.gz" "crc16"
@@ -50,7 +48,7 @@ load_module "/lib/modules/$KVER/kernel/fs/ext4/ext4.ko.gz" "ext4"
 # Load zram and lz4 compression for compressed swap
 # This effectively extends available memory by 2-3x with minimal CPU overhead
 load_module "/lib/modules/$KVER/kernel/lib/lz4/lz4_compress.ko.gz" "lz4_compress"
-load_module "/lib/modules/$KVER/kernel/lib/lz4/lz4_decompress.ko.gz" "lz4_decompress"
+# Note: lz4_decompress is built-in on Alpine linux-virt kernel (modules.builtin)
 load_module "/lib/modules/$KVER/kernel/crypto/lz4.ko.gz" "lz4"
 load_module "/lib/modules/$KVER/kernel/drivers/block/zram/zram.ko.gz" "zram"
 

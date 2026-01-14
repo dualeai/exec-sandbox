@@ -106,7 +106,6 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
         kernel/crypto/crc32c_generic.ko.gz \
         kernel/drivers/block/zram/zram.ko.gz \
         kernel/lib/lz4/lz4_compress.ko.gz \
-        kernel/lib/lz4/lz4_decompress.ko.gz \
         kernel/lib/lz4/lz4hc_compress.ko.gz \
         kernel/crypto/lz4.ko.gz \
         modules.dep modules.alias modules.symbols 2>/dev/null || true
