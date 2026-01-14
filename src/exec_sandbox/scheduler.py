@@ -304,6 +304,13 @@ class Scheduler:
                 # Cold boot if no warm VM available
                 if vm is None:
                     is_cold_boot = True
+
+                    # Auto-download base image if needed
+                    if self.config.auto_download_assets:
+                        from exec_sandbox.assets import fetch_base_image  # noqa: PLC0415
+
+                        await fetch_base_image(language)
+
                     vm = await self._vm_manager.create_vm(
                         language=language,
                         tenant_id="exec-sandbox",
