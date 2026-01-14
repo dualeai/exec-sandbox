@@ -57,7 +57,7 @@ from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.balloon_client import BalloonClient, BalloonError
 from exec_sandbox.models import Language
-from exec_sandbox.permission_utils import get_qemu_vm_uid
+from exec_sandbox.permission_utils import get_expected_socket_uid
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -441,25 +441,6 @@ class WarmVMPool:
                 )
                 # Don't propagate - graceful degradation
 
-    async def _get_expected_uid(self, vm: QemuVM) -> int:
-        """Get expected UID for QMP socket authentication.
-
-        Args:
-            vm: QemuVM to get expected UID for
-
-        Returns:
-            Expected UID of QEMU process
-        """
-        import os  # noqa: PLC0415
-
-        if vm.use_qemu_vm_user:
-            uid = get_qemu_vm_uid()
-            if uid is None:
-                # Fall back to current user if qemu-vm not available
-                return os.getuid()
-            return uid
-        return os.getuid()
-
     async def _inflate_balloon(self, vm: QemuVM) -> None:
         """Inflate balloon to reduce guest memory for idle pool VM.
 
@@ -470,7 +451,7 @@ class WarmVMPool:
             vm: QemuVM to inflate balloon for
         """
         try:
-            expected_uid = await self._get_expected_uid(vm)
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
             try:
@@ -498,7 +479,7 @@ class WarmVMPool:
             vm: QemuVM to deflate balloon for
         """
         try:
-            expected_uid = await self._get_expected_uid(vm)
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
             try:

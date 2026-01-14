@@ -64,6 +64,25 @@ def get_qemu_vm_uid() -> int | None:
         return None
 
 
+def get_expected_socket_uid(use_qemu_vm_user: bool) -> int:
+    """Get expected UID for socket authentication.
+
+    Used to verify QEMU process identity before sending commands.
+    Falls back to current user if qemu-vm user not available.
+
+    Args:
+        use_qemu_vm_user: Whether QEMU is running as qemu-vm user
+
+    Returns:
+        Expected UID of QEMU process for socket peer verification
+    """
+    if use_qemu_vm_user:
+        uid = get_qemu_vm_uid()
+        if uid is not None:
+            return uid
+    return os.getuid()
+
+
 async def probe_qemu_vm_user() -> bool:
     """Check if qemu-vm user exists for process isolation (cached).
 

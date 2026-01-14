@@ -9,19 +9,7 @@ import pytest
 from exec_sandbox import constants
 from exec_sandbox.balloon_client import BalloonClient, BalloonError
 from exec_sandbox.models import Language
-from exec_sandbox.permission_utils import get_qemu_vm_uid
-from exec_sandbox.platform_utils import detect_host_os
-
-
-def _get_expected_uid() -> int:
-    """Get expected UID for QMP socket authentication."""
-    import os
-
-    if detect_host_os().requires_sandbox_uid():
-        uid = get_qemu_vm_uid()
-        return uid if uid is not None else 0
-    return os.getuid()
-
+from exec_sandbox.permission_utils import get_expected_socket_uid
 
 # Code to run inside VM to get MemAvailable (more accurate than MemTotal)
 GET_MEM_AVAILABLE_CODE = """
@@ -107,7 +95,7 @@ class TestBalloonInsideVM:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -145,7 +133,7 @@ class TestBalloonInsideVM:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -192,7 +180,7 @@ class TestBalloonInsideVM:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -249,7 +237,7 @@ class TestBalloonEdgeCases:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -288,7 +276,7 @@ class TestBalloonEdgeCases:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -321,7 +309,7 @@ class TestBalloonEdgeCases:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -363,7 +351,7 @@ class TestBalloonEdgeCases:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -405,7 +393,7 @@ class TestBalloonMemoryPressure:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
@@ -458,7 +446,7 @@ class TestBalloonErrorHandling:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
 
             # Should raise BalloonError when not connected
@@ -485,7 +473,7 @@ class TestBalloonErrorHandling:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
 
             await client.connect()
@@ -512,7 +500,7 @@ class TestBalloonErrorHandling:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
 
             await client.connect()
@@ -538,7 +526,7 @@ class TestBalloonWarmPoolSimulation:
         )
 
         try:
-            expected_uid = _get_expected_uid()
+            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
 
