@@ -752,8 +752,8 @@ async fn execute_code_streaming(
     let start = Instant::now();
 
     // Granular timing for diagnostics
-    let mut spawn_ms: Option<u64> = None;
-    let mut process_ms: Option<u64> = None;
+    let spawn_ms: Option<u64>;
+    let process_ms: Option<u64>;
 
     let mut cmd = match language {
         "python" => {
