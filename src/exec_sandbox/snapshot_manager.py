@@ -33,7 +33,7 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
-from exec_sandbox import constants
+from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmError
@@ -61,13 +61,8 @@ class SnapshotManager:
     - L3 cache: S3 with zstd compression (cross-host sharing)
 
     Cache key format:
-    - "{language}-base" for no packages
-    - "{language}-{16char_hash}" for packages
-
-    Memory snapshot benefits:
-    - 50-200ms restore vs 300-400ms cold boot
-    - Guest agent immediately ready (no boot wait)
-    - Full device state preserved (virtio-serial, virtio-blk)
+    - "{language}-v{major.minor}-base" for base images (no packages)
+    - "{language}-v{major.minor}-{16char_hash}" for packages
 
     Simplifications:
     - ❌ No Redis (never implemented)
@@ -211,9 +206,17 @@ class SnapshotManager:
     ) -> str:
         """Compute L2 cache key for snapshot.
 
+        Includes library major.minor version to invalidate cache when lib changes.
+        memory_mb is NOT in the cache key because disk-only snapshots work
+        with any memory allocation.
+
+        Note: allow_network is NOT in the cache key because:
+        - Snapshots are always created with network (for pip/npm install)
+        - User's allow_network setting only controls gvproxy at execution time
+
         Format:
-        - "{language}-base" for no packages
-        - "{language}-{16char_hash}" for packages
+        - "{language}-v{major.minor}-base" for base (no packages)
+        - "{language}-v{major.minor}-{16char_hash}" for packages
 
         Args:
             language: Programming language
@@ -222,11 +225,16 @@ class SnapshotManager:
         Returns:
             Cache key string
         """
+        # Extract major.minor from __version__ (e.g., "0.1.0" -> "0.1")
+        version_parts = __version__.split(".")
+        version = f"{version_parts[0]}.{version_parts[1]}"
+        base = f"{language.value}-v{version}"
+
         if not packages:
-            return f"{language.value}-base"
+            return f"{base}-base"
         packages_str = "".join(sorted(packages))
         packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
-        return f"{language.value}-{packages_hash}"
+        return f"{base}-{packages_hash}"
 
     async def _check_l2_cache(self, cache_key: str) -> Path | None:
         """Check L2 local cache for qcow2 snapshot.
