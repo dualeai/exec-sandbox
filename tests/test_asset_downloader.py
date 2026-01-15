@@ -346,8 +346,9 @@ class TestRetrieve:
         # - IncrementalHasher internal state
         # - asyncio.to_thread overhead (~100KB)
         # - Free-threaded Python (3.14t+) has ~150KB additional overhead
-        # Empirically: ~350KB for 64KB chunks, ~550KB on 3.14t
-        max_allowed = 600 * 1024  # 600KB - proves streaming works for 4MB file
+        # - ARM64 has ~300KB additional overhead (16KB page size vs 4KB on x86_64)
+        # Empirically: ~350KB for 64KB chunks, ~550KB on 3.14t, ~900KB on ARM64
+        max_allowed = 1024 * 1024  # 1MB - proves streaming works for 4MB file
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "
             f"for {file_size / 1024 / 1024:.0f}MB file. Streaming may be broken."
