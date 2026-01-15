@@ -2506,7 +2506,13 @@ class VmManager:
                 f"bps={constants.DISK_BPS_LIMIT},"
                 f"bps_max={constants.DISK_BPS_BURST},"
                 f"iops={constants.DISK_IOPS_LIMIT},"
-                f"iops_max={constants.DISK_IOPS_BURST}",
+                f"iops_max={constants.DISK_IOPS_BURST},"
+                # Disable QEMU file locking to allow concurrent VMs sharing same backing file.
+                # On Linux, QEMU uses OFD (Open File Descriptor) locks which cause "Failed to
+                # get shared write lock" errors when multiple VMs access the same base image.
+                # macOS doesn't enforce OFD locks, so this issue only manifests on Linux/CI.
+                # Safe because: (1) each VM has unique overlay, (2) base image is read-only.
+                f"file.locking=off",
             ]
         )
 
