@@ -56,6 +56,7 @@ from tenacity import (
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.balloon_client import BalloonClient, BalloonError
+from exec_sandbox.exceptions import SocketAuthError
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
 
@@ -69,6 +70,19 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import QemuVM, VmManager
 
 logger = get_logger(__name__)
+
+# Transient exceptions during health checks that should trigger retry/unhealthy status.
+# These indicate temporary communication failures, not permanent VM problems:
+# - OSError/ConnectionError/EOFError: Socket/network issues
+# - TimeoutError: Guest agent slow to respond
+# - SocketAuthError: SO_PEERCRED returns pid=0 when QEMU frozen (SIGSTOP) due to kernel race
+_HEALTH_CHECK_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    TimeoutError,
+    ConnectionError,
+    EOFError,
+    SocketAuthError,
+)
 
 
 class WarmVMPool:
@@ -604,7 +618,7 @@ class WarmVMPool:
                 return True
             await self._handle_unhealthy_vm(vm, language)
             return False
-        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
+        except _HEALTH_CHECK_TRANSIENT_ERRORS as e:
             logger.error(
                 "Health check exception",
                 extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
@@ -687,13 +701,13 @@ class WarmVMPool:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES),
                 wait=wait_strategy,
-                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError, EOFError)),
+                retry=retry_if_exception_type(_HEALTH_CHECK_TRANSIENT_ERRORS),
                 before_sleep=before_sleep_log(logger, logging.DEBUG),
                 reraise=True,
             ):
                 with attempt:
                     return await _ping_guest()
-        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
+        except _HEALTH_CHECK_TRANSIENT_ERRORS as e:
             # All retries exhausted - log and return unhealthy
             logger.warning(
                 "Health check failed after retries",
