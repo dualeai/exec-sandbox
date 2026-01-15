@@ -185,6 +185,7 @@ class _ProbeCache:
         "hvf",
         "io_uring",
         "kvm",
+        "qemu_accels",
         "tsc_deadline",
         "unshare",
     )
@@ -193,6 +194,7 @@ class _ProbeCache:
         self.hvf: bool | None = None
         self.io_uring: bool | None = None
         self.kvm: bool | None = None
+        self.qemu_accels: set[str] | None = None  # Accelerators available in QEMU binary
         self.tsc_deadline: bool | None = None
         self.unshare: bool | None = None
 
@@ -201,8 +203,98 @@ class _ProbeCache:
 _probe_cache = _ProbeCache()
 
 
+async def _probe_qemu_accelerators() -> set[str]:
+    """Probe QEMU binary for available accelerators (cached).
+
+    This provides a 2nd layer of verification beyond OS-level checks (ioctl/sysctl).
+    Even if /dev/kvm exists and responds to ioctl, QEMU may not have the accelerator
+    compiled in, or may fail to initialize it in certain environments.
+
+    Uses `qemu-system-xxx -accel help` to get the list of accelerators that QEMU
+    actually supports. This is the same method recommended by QEMU documentation.
+
+    References:
+        - QEMU docs: "help can also be passed as an argument to another option"
+        - libvirt probes QEMU binary presence + /dev/kvm (drvqemu.html)
+        - GitHub Actions KVM issues: https://github.com/orgs/community/discussions/8305
+
+    Returns:
+        Set of available accelerator names (e.g., {"tcg", "kvm"} or {"tcg", "hvf"})
+    """
+    # Fast path: return cached result
+    if _probe_cache.qemu_accels is not None:
+        return _probe_cache.qemu_accels
+
+    # Determine QEMU binary based on host architecture
+    arch = detect_host_arch()
+    qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            qemu_bin,
+            "-accel",
+            "help",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+
+        if proc.returncode != 0:
+            logger.warning(
+                "QEMU accelerator probe failed",
+                extra={"qemu_bin": qemu_bin, "returncode": proc.returncode},
+            )
+            _probe_cache.qemu_accels = set()
+            return _probe_cache.qemu_accels
+
+        # Parse output: "Accelerators supported in QEMU binary:\ntcg\nkvm\n"
+        # or "tcg\nhvf\n" on macOS
+        output = stdout.decode().strip()
+        accels: set[str] = set()
+        for raw_line in output.split("\n"):
+            accel_name = raw_line.strip().lower()
+            # Skip header line and empty lines
+            if accel_name and not accel_name.startswith("accelerator"):
+                accels.add(accel_name)
+
+        _probe_cache.qemu_accels = accels
+        logger.debug(
+            "QEMU accelerator probe complete",
+            extra={"qemu_bin": qemu_bin, "accelerators": sorted(accels)},
+        )
+
+    except FileNotFoundError:
+        logger.warning(
+            "QEMU binary not found for accelerator probe",
+            extra={"qemu_bin": qemu_bin},
+        )
+        _probe_cache.qemu_accels = set()
+    except (OSError, TimeoutError) as e:
+        logger.warning(
+            "QEMU accelerator probe failed",
+            extra={"qemu_bin": qemu_bin, "error": str(e)},
+        )
+        _probe_cache.qemu_accels = set()
+
+    return _probe_cache.qemu_accels
+
+
 async def _check_kvm_available() -> bool:
     """Check if KVM acceleration is available and accessible (cached).
+
+    Two-layer verification approach
+    ===============================
+    Layer 1 (Kernel): Verify /dev/kvm exists, is accessible, and responds to ioctl
+    Layer 2 (QEMU):   Verify QEMU binary has KVM support via `-accel help`
+
+    This 2-layer approach catches edge cases where:
+    - /dev/kvm exists but KVM module is broken (nested VMs, containers)
+    - KVM ioctl works but QEMU doesn't have KVM compiled in
+    - GitHub Actions runners with inconsistent KVM availability
+
+    References:
+    - GitHub Actions KVM issues: https://github.com/orgs/community/discussions/8305
+    - libvirt capability probing: https://libvirt.org/drvqemu.html
 
     KVM vs TCG: Virtualization modes with vastly different characteristics
     ======================================================================
@@ -227,7 +319,7 @@ async def _check_kvm_available() -> bool:
     TCG is acceptable ONLY for local development and testing.
 
     Returns:
-        True if /dev/kvm exists and is accessible (enables KVM mode)
+        True if both kernel and QEMU verify KVM is available
         False otherwise (falls back to TCG software emulation)
     """
     # Fast path: return cached result
@@ -266,18 +358,35 @@ async def _check_kvm_available() -> bool:
             return False
 
         api_version = int(stdout.decode().strip())
-        _probe_cache.kvm = api_version == _KVM_API_VERSION_EXPECTED
-        if _probe_cache.kvm:
-            logger.debug("KVM available and working", extra={"api_version": api_version})
-        else:
+        if api_version != _KVM_API_VERSION_EXPECTED:
             logger.warning(
                 "KVM available but unexpected API version",
                 extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
             )
+            _probe_cache.kvm = False
+            return False
+
+        logger.debug("KVM ioctl check passed", extra={"api_version": api_version})
+
     except (OSError, TimeoutError, ValueError) as e:
         logger.debug("KVM not available: failed to verify /dev/kvm", extra={"error": str(e)})
         _probe_cache.kvm = False
+        return False
 
+    # Layer 2: Verify QEMU binary has KVM support compiled in
+    # Even if /dev/kvm works, QEMU may not have KVM support or may fail to initialize it
+    # See: https://github.com/orgs/community/discussions/8305 (GitHub Actions KVM issues)
+    qemu_accels = await _probe_qemu_accelerators()
+    if "kvm" not in qemu_accels:
+        logger.warning(
+            "KVM not available: QEMU binary does not support KVM accelerator",
+            extra={"available_accelerators": sorted(qemu_accels)},
+        )
+        _probe_cache.kvm = False
+        return False
+
+    logger.debug("KVM available and working (kernel + QEMU verified)")
+    _probe_cache.kvm = True
     return _probe_cache.kvm
 
 
@@ -311,10 +420,33 @@ async def _check_hvf_available() -> bool:
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        _probe_cache.hvf = proc.returncode == 0 and stdout.decode().strip() == "1"
-    except (OSError, TimeoutError):
-        _probe_cache.hvf = False
+        hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
 
+        if not hvf_kernel_support:
+            logger.debug("HVF not available: kern.hv_support is not enabled")
+            _probe_cache.hvf = False
+            return False
+
+        logger.debug("HVF kernel support check passed")
+
+    except (OSError, TimeoutError) as e:
+        logger.debug("HVF not available: sysctl check failed", extra={"error": str(e)})
+        _probe_cache.hvf = False
+        return False
+
+    # Layer 2: Verify QEMU binary has HVF support compiled in
+    # Even if kern.hv_support is enabled, QEMU may not have HVF support
+    qemu_accels = await _probe_qemu_accelerators()
+    if "hvf" not in qemu_accels:
+        logger.warning(
+            "HVF not available: QEMU binary does not support HVF accelerator",
+            extra={"available_accelerators": sorted(qemu_accels)},
+        )
+        _probe_cache.hvf = False
+        return False
+
+    logger.debug("HVF available and working (kernel + QEMU verified)")
+    _probe_cache.hvf = True
     return _probe_cache.hvf
 
 

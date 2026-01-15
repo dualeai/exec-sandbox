@@ -17,12 +17,16 @@ from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, dete
 from exec_sandbox.vm_manager import (
     VALID_STATE_TRANSITIONS,
     VmState,
+    _check_hvf_available,
     _check_kvm_available,
     _check_tsc_deadline_macos,
     _kernel_validated,
+    _probe_cache,
+    _probe_qemu_accelerators,
     _validate_kernel_initramfs,
+    check_hwaccel_available,
 )
-from tests.conftest import skip_unless_macos
+from tests.conftest import skip_unless_hwaccel, skip_unless_linux, skip_unless_macos
 
 # ============================================================================
 # Unit Tests - VM State Machine
@@ -104,6 +108,369 @@ class TestKvmDetection:
         """KVM is never available on macOS."""
         kvm_available = await _check_kvm_available()
         assert kvm_available is False
+
+
+# ============================================================================
+# Unit Tests - QEMU Accelerator Probe (2-Layer Detection)
+# ============================================================================
+
+
+class TestQemuAcceleratorProbe:
+    """Tests for _probe_qemu_accelerators() - QEMU binary capability detection.
+
+    This is Layer 2 of the 2-layer hardware acceleration detection:
+    - Layer 1: Kernel/OS level (ioctl for KVM, sysctl for HVF)
+    - Layer 2: QEMU binary level (what accelerators QEMU actually supports)
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_qemu_cache(self) -> None:
+        """Clear QEMU accelerator cache before each test."""
+        _probe_cache.qemu_accels = None
+
+    # ========================================================================
+    # Normal Cases - Happy path scenarios
+    # ========================================================================
+
+    async def test_probe_returns_set(self) -> None:
+        """Probe returns a set of accelerator names."""
+        result = await _probe_qemu_accelerators()
+        assert isinstance(result, set)
+
+    async def test_probe_contains_tcg(self) -> None:
+        """TCG should always be available (software emulation fallback)."""
+        result = await _probe_qemu_accelerators()
+        assert "tcg" in result, "TCG should always be available in QEMU"
+
+    @skip_unless_macos
+    async def test_probe_contains_hvf_on_macos(self) -> None:
+        """HVF should be available on macOS with Hypervisor.framework."""
+        result = await _probe_qemu_accelerators()
+        # HVF may or may not be available depending on QEMU build
+        # Just verify the probe runs and returns valid data
+        assert isinstance(result, set)
+        assert "tcg" in result
+
+    @skip_unless_linux
+    async def test_probe_may_contain_kvm_on_linux(self) -> None:
+        """KVM may be available on Linux if QEMU is compiled with KVM support."""
+        result = await _probe_qemu_accelerators()
+        assert isinstance(result, set)
+        assert "tcg" in result
+        # KVM availability depends on QEMU build and system config
+
+    async def test_probe_result_is_cached(self) -> None:
+        """Subsequent calls return cached result."""
+        result1 = await _probe_qemu_accelerators()
+        result2 = await _probe_qemu_accelerators()
+        assert result1 is result2, "Results should be the same cached object"
+
+    async def test_probe_result_lowercase(self) -> None:
+        """Accelerator names are normalized to lowercase."""
+        result = await _probe_qemu_accelerators()
+        for accel in result:
+            assert accel == accel.lower(), f"Accelerator '{accel}' should be lowercase"
+
+    # ========================================================================
+    # Edge Cases - Boundary conditions
+    # ========================================================================
+
+    async def test_probe_with_missing_qemu_binary(self) -> None:
+        """Probe returns empty set when QEMU binary is not found."""
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.side_effect = FileNotFoundError("qemu-system-x86_64 not found")
+            _probe_cache.qemu_accels = None  # Clear cache
+            result = await _probe_qemu_accelerators()
+            assert result == set()
+
+    async def test_probe_with_qemu_failure(self) -> None:
+        """Probe returns empty set when QEMU returns non-zero exit code."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"error"))
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert result == set()
+
+    async def test_probe_with_empty_output(self) -> None:
+        """Probe returns empty set when QEMU returns empty output."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert result == set()
+
+    async def test_probe_with_only_header_line(self) -> None:
+        """Probe returns empty set when QEMU returns only header line."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\n", b""))
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert result == set()
+
+    async def test_probe_with_timeout(self) -> None:
+        """Probe returns empty set when QEMU times out."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert result == set()
+
+    # ========================================================================
+    # Weird Cases - Unusual but valid scenarios
+    # ========================================================================
+
+    async def test_probe_with_extra_whitespace(self) -> None:
+        """Probe handles extra whitespace in QEMU output."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(
+            return_value=(b"Accelerators supported in QEMU binary:\n  tcg  \n  kvm  \n\n", b"")
+        )
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert "tcg" in result
+            assert "kvm" in result
+            assert len(result) == 2
+
+    async def test_probe_with_mixed_case(self) -> None:
+        """Probe normalizes mixed-case accelerator names."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(
+            return_value=(b"Accelerators supported in QEMU binary:\nTCG\nKVM\nHvF\n", b"")
+        )
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert "tcg" in result
+            assert "kvm" in result
+            assert "hvf" in result
+            # Verify all are lowercase
+            for accel in result:
+                assert accel == accel.lower()
+
+    async def test_probe_with_unknown_accelerators(self) -> None:
+        """Probe includes unknown accelerators from QEMU output."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(
+            return_value=(b"Accelerators supported in QEMU binary:\ntcg\nxen\nwhpx\nnvmm\n", b"")
+        )
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert "tcg" in result
+            assert "xen" in result
+            assert "whpx" in result
+            assert "nvmm" in result
+
+    async def test_probe_with_windows_line_endings(self) -> None:
+        """Probe handles Windows-style line endings."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(
+            return_value=(b"Accelerators supported in QEMU binary:\r\ntcg\r\nkvm\r\n", b"")
+        )
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            # strip() handles \r\n
+            assert "tcg" in result or "tcg\r" in result  # Verify parsing works
+
+    # ========================================================================
+    # Out of Bound Cases - Error conditions
+    # ========================================================================
+
+    async def test_probe_with_oserror(self) -> None:
+        """Probe returns empty set on OSError."""
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.side_effect = OSError("Permission denied")
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert result == set()
+
+    async def test_probe_with_very_long_output(self) -> None:
+        """Probe handles very long QEMU output gracefully."""
+        # Simulate QEMU returning many accelerators
+        accels = "\n".join([f"accel{i}" for i in range(1000)])
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(f"Accelerators supported:\n{accels}\n".encode(), b""))
+
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+            _probe_cache.qemu_accels = None
+            result = await _probe_qemu_accelerators()
+            assert len(result) == 1000
+
+    async def test_cache_cleared_between_tests(self) -> None:
+        """Verify cache is properly cleared (test isolation)."""
+        # This test verifies the fixture works
+        assert _probe_cache.qemu_accels is None
+
+
+class TestTwoLayerKvmDetection:
+    """Tests for 2-layer KVM detection (kernel + QEMU verification)."""
+
+    @pytest.fixture(autouse=True)
+    def clear_caches(self) -> None:
+        """Clear all relevant caches before each test."""
+        _probe_cache.kvm = None
+        _probe_cache.qemu_accels = None
+
+    async def test_kvm_fails_when_qemu_lacks_kvm_support(self) -> None:
+        """KVM detection fails if QEMU doesn't have KVM compiled in."""
+        # Mock Layer 1 passing (kernel check)
+        with (
+            patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", return_value=True),
+            patch("exec_sandbox.vm_manager.can_access", return_value=True),
+            patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            # First call: ioctl check passes
+            ioctl_proc = AsyncMock()
+            ioctl_proc.returncode = 0
+            ioctl_proc.communicate = AsyncMock(return_value=(b"12\n", b""))
+
+            # Second call: QEMU probe returns only TCG (no KVM)
+            qemu_proc = AsyncMock()
+            qemu_proc.returncode = 0
+            qemu_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\ntcg\n", b""))
+
+            mock_exec.side_effect = [ioctl_proc, qemu_proc]
+
+            result = await _check_kvm_available()
+            assert result is False
+
+    async def test_kvm_passes_when_both_layers_pass(self) -> None:
+        """KVM detection passes when both kernel and QEMU verify KVM."""
+        with (
+            patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", return_value=True),
+            patch("exec_sandbox.vm_manager.can_access", return_value=True),
+            patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            # First call: ioctl check passes
+            ioctl_proc = AsyncMock()
+            ioctl_proc.returncode = 0
+            ioctl_proc.communicate = AsyncMock(return_value=(b"12\n", b""))
+
+            # Second call: QEMU probe returns KVM
+            qemu_proc = AsyncMock()
+            qemu_proc.returncode = 0
+            qemu_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\ntcg\nkvm\n", b""))
+
+            mock_exec.side_effect = [ioctl_proc, qemu_proc]
+
+            result = await _check_kvm_available()
+            assert result is True
+
+    @skip_unless_linux
+    async def test_kvm_fails_when_dev_kvm_missing(self) -> None:
+        """KVM detection fails early if /dev/kvm doesn't exist."""
+        with patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", return_value=False):
+            _probe_cache.kvm = None
+            result = await _check_kvm_available()
+            assert result is False
+
+
+class TestTwoLayerHvfDetection:
+    """Tests for 2-layer HVF detection (kernel + QEMU verification)."""
+
+    @pytest.fixture(autouse=True)
+    def clear_caches(self) -> None:
+        """Clear all relevant caches before each test."""
+        _probe_cache.hvf = None
+        _probe_cache.qemu_accels = None
+
+    async def test_hvf_fails_when_qemu_lacks_hvf_support(self) -> None:
+        """HVF detection fails if QEMU doesn't have HVF compiled in."""
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+            # First call: sysctl check passes
+            sysctl_proc = AsyncMock()
+            sysctl_proc.returncode = 0
+            sysctl_proc.communicate = AsyncMock(return_value=(b"1\n", b""))
+
+            # Second call: QEMU probe returns only TCG (no HVF)
+            qemu_proc = AsyncMock()
+            qemu_proc.returncode = 0
+            qemu_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\ntcg\n", b""))
+
+            mock_exec.side_effect = [sysctl_proc, qemu_proc]
+
+            result = await _check_hvf_available()
+            assert result is False
+
+    async def test_hvf_passes_when_both_layers_pass(self) -> None:
+        """HVF detection passes when both kernel and QEMU verify HVF."""
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+            # First call: sysctl check passes
+            sysctl_proc = AsyncMock()
+            sysctl_proc.returncode = 0
+            sysctl_proc.communicate = AsyncMock(return_value=(b"1\n", b""))
+
+            # Second call: QEMU probe returns HVF
+            qemu_proc = AsyncMock()
+            qemu_proc.returncode = 0
+            qemu_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\ntcg\nhvf\n", b""))
+
+            mock_exec.side_effect = [sysctl_proc, qemu_proc]
+
+            result = await _check_hvf_available()
+            assert result is True
+
+    async def test_hvf_fails_when_kernel_check_fails(self) -> None:
+        """HVF detection fails early if kern.hv_support is 0."""
+        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+            sysctl_proc = AsyncMock()
+            sysctl_proc.returncode = 0
+            sysctl_proc.communicate = AsyncMock(return_value=(b"0\n", b""))
+
+            mock_exec.return_value = sysctl_proc
+
+            result = await _check_hvf_available()
+            assert result is False
+
+
+class TestCheckHwaccelAvailable:
+    """Tests for the synchronous check_hwaccel_available() wrapper."""
+
+    @pytest.fixture(autouse=True)
+    def clear_caches(self) -> None:
+        """Clear all relevant caches before each test."""
+        _probe_cache.kvm = None
+        _probe_cache.hvf = None
+        _probe_cache.qemu_accels = None
+
+    def test_returns_boolean(self) -> None:
+        """check_hwaccel_available returns a boolean."""
+        result = check_hwaccel_available()
+        assert isinstance(result, bool)
+
+    @skip_unless_hwaccel
+    def test_hwaccel_available_when_expected(self) -> None:
+        """Hardware acceleration is available on supported systems."""
+        # This test only runs when hwaccel is expected to be available
+        assert check_hwaccel_available() is True
+
+    def test_consistent_results(self) -> None:
+        """Multiple calls return consistent results."""
+        result1 = check_hwaccel_available()
+        result2 = check_hwaccel_available()
+        assert result1 == result2
 
 
 class TestHostOSForVm:
