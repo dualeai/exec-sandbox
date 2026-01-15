@@ -181,6 +181,10 @@ BALLOON_INFLATE_TARGET_MB: Final[int] = 64
 """Target guest memory in MB when inflating balloon for idle warm pool VMs.
 Inflating the balloon reduces guest memory, allowing host to reclaim."""
 
+BALLOON_TOLERANCE_MB: Final[int] = 40
+"""Tolerance in MB for balloon target polling. Allows early exit when balloon is
+'close enough' to target, accounting for kernel overhead and slow CI runners."""
+
 BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout for balloon inflate operation (reducing guest memory for idle pool)."""
 

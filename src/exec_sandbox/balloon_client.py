@@ -46,10 +46,6 @@ from exec_sandbox.socket_auth import connect_and_verify
 
 logger = get_logger(__name__)
 
-# Tolerance for balloon target polling (MB). Allows early exit when balloon is
-# "close enough" to target, accounting for kernel overhead and slow CI runners.
-_BALLOON_TOLERANCE_MB = 40
-
 
 class BalloonError(Exception):
     """Balloon operation failed."""
@@ -284,7 +280,7 @@ class BalloonClient:
 
             def _not_at_target(result: int | None) -> bool:
                 """Retry while balloon hasn't reached target."""
-                return result is None or result > target_mb + _BALLOON_TOLERANCE_MB
+                return result is None or result > target_mb + constants.BALLOON_TOLERANCE_MB
 
             try:
                 async for attempt in AsyncRetrying(
@@ -350,7 +346,7 @@ class BalloonClient:
 
             def _not_at_target(result: int | None) -> bool:
                 """Retry while balloon hasn't reached target (memory still too low)."""
-                return result is None or result < target_mb - _BALLOON_TOLERANCE_MB
+                return result is None or result < target_mb - constants.BALLOON_TOLERANCE_MB
 
             try:
                 async for attempt in AsyncRetrying(
