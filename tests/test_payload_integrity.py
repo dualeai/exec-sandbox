@@ -9,13 +9,15 @@ Strategy: Generate deterministic output in VM, compare hash with pre-computed ex
 Uses dynamic fixtures to test various payload sizes.
 """
 
-import hashlib
 from collections.abc import Callable
 
 import pytest
 
+from exec_sandbox.hash_utils import bytes_hash
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+
+from .conftest import skip_unless_hwaccel
 
 # =============================================================================
 # Payload size fixtures - from tiny to max stdout limit
@@ -89,11 +91,6 @@ def streaming_payload_size(request: pytest.FixtureRequest) -> tuple[str, int]:
 # =============================================================================
 # Helper functions
 # =============================================================================
-
-
-def compute_hash(data: bytes) -> str:
-    """Compute SHA256 hash."""
-    return hashlib.sha256(data).hexdigest()
 
 
 def generate_ascii_pattern(size: int) -> bytes:
@@ -191,7 +188,7 @@ class TestPythonPayloadIntegrity:
 
         # Pre-compute expected
         expected_data = generate_ascii_pattern(size_bytes)
-        expected_hash = compute_hash(expected_data)
+        expected_hash = bytes_hash(expected_data)
 
         # Generate code
         code = python_code_for_ascii_pattern(size_bytes)
@@ -207,7 +204,7 @@ class TestPythonPayloadIntegrity:
         # Strip trailing newline (runtime may add one)
         stdout = result.stdout.rstrip("\n")
         actual_data = stdout.encode("utf-8")
-        actual_hash = compute_hash(actual_data)
+        actual_hash = bytes_hash(actual_data)
 
         assert len(actual_data) == size_bytes, f"[{size_name}] Size mismatch: {len(actual_data)} vs {size_bytes}"
 
@@ -223,7 +220,7 @@ class TestPythonStreamingIntegrity:
         """Verify streaming receives uncorrupted data."""
         size_name, size_bytes = medium_payload_size
 
-        expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
+        expected_hash = bytes_hash(generate_ascii_pattern(size_bytes))
         code = python_code_for_ascii_pattern(size_bytes)
 
         streamed_chunks: list[str] = []
@@ -242,7 +239,7 @@ class TestPythonStreamingIntegrity:
 
         # Verify streamed data (strip trailing newline)
         streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
-        streamed_hash = compute_hash(streamed_data)
+        streamed_hash = bytes_hash(streamed_data)
 
         assert len(streamed_data) == size_bytes, f"[{size_name}] Streamed size: {len(streamed_data)} vs {size_bytes}"
 
@@ -251,7 +248,7 @@ class TestPythonStreamingIntegrity:
         )
 
         # Verify final result matches streamed
-        final_hash = compute_hash(result.stdout.rstrip("\n").encode("utf-8"))
+        final_hash = bytes_hash(result.stdout.rstrip("\n").encode("utf-8"))
         assert final_hash == streamed_hash, f"[{size_name}] Final vs streamed mismatch!"
 
 
@@ -267,7 +264,7 @@ class TestJavaScriptPayloadIntegrity:
         """Verify JavaScript payload integrity."""
         size_name, size_bytes = small_payload_size
 
-        expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
+        expected_hash = bytes_hash(generate_ascii_pattern(size_bytes))
         code = javascript_code_for_ascii_pattern(size_bytes)
 
         result = await scheduler.run(
@@ -280,7 +277,7 @@ class TestJavaScriptPayloadIntegrity:
 
         # Strip trailing newline (runtime may add one)
         stdout = result.stdout.rstrip("\n")
-        actual_hash = compute_hash(stdout.encode("utf-8"))
+        actual_hash = bytes_hash(stdout.encode("utf-8"))
 
         assert len(stdout) == size_bytes, f"[JS-{size_name}] Size: {len(stdout)} vs {size_bytes}"
 
@@ -300,7 +297,7 @@ class TestBinaryPayloadIntegrity:
         size_name, size_bytes = small_payload_size
 
         expected_binary = generate_sequential_bytes(size_bytes)
-        expected_hash = compute_hash(expected_binary)
+        expected_hash = bytes_hash(expected_binary)
 
         code = f"""
 import base64
@@ -324,7 +321,7 @@ sys.stdout.flush()
         import base64
 
         actual_binary = base64.b64decode(result.stdout)
-        actual_hash = compute_hash(actual_binary)
+        actual_hash = bytes_hash(actual_binary)
 
         assert len(actual_binary) == size_bytes, f"[Binary-{size_name}] Size: {len(actual_binary)} vs {size_bytes}"
 
@@ -344,7 +341,7 @@ class TestVMHashVerification:
         size_name, size_bytes = small_payload_size
 
         expected_data = generate_ascii_pattern(size_bytes)
-        expected_hash = compute_hash(expected_data)
+        expected_hash = bytes_hash(expected_data)
 
         code = f"""
 import hashlib
@@ -382,7 +379,7 @@ sys.stdout.flush()
         )
 
         # Data we received matches?
-        host_hash = compute_hash(received_data.encode("utf-8"))
+        host_hash = bytes_hash(received_data.encode("utf-8"))
         assert host_hash == expected_hash, f"[{size_name}] Received data corrupted in transit!"
 
 
@@ -406,7 +403,7 @@ class TestRawPayloadIntegrity:
     async def test_raw_repeated_char(self, scheduler: Scheduler, repeat_char: str, count: int) -> None:
         """Verify RAW shell can output repeated characters correctly."""
         expected_data = (repeat_char * count).encode("utf-8")
-        expected_hash = compute_hash(expected_data)
+        expected_hash = bytes_hash(expected_data)
 
         # Use head -c for exact byte count
         code = f"yes '{repeat_char}' | tr -d '\\n' | head -c {count}"
@@ -421,7 +418,7 @@ class TestRawPayloadIntegrity:
 
         # Strip trailing newline (shell may add one)
         stdout = result.stdout.rstrip("\n")
-        actual_hash = compute_hash(stdout.encode("utf-8"))
+        actual_hash = bytes_hash(stdout.encode("utf-8"))
 
         assert len(stdout) == count, f"[RAW-{count}] Size: {len(stdout)} vs {count}"
 
@@ -454,7 +451,7 @@ class TestLargePayloadStreaming:
         # Use longer timeout for extra large payloads (25MB+)
         timeout = EXTRA_LARGE_TIMEOUT_SECONDS if size_bytes >= 25_000_000 else TIMEOUT_SECONDS
 
-        expected_hash = compute_hash(generate_ascii_pattern(size_bytes))
+        expected_hash = bytes_hash(generate_ascii_pattern(size_bytes))
         code = python_code_for_ascii_pattern(size_bytes)
 
         streamed_chunks: list[str] = []
@@ -473,7 +470,7 @@ class TestLargePayloadStreaming:
 
         # Strip trailing newline (runtime may add one)
         streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
-        streamed_hash = compute_hash(streamed_data)
+        streamed_hash = bytes_hash(streamed_data)
 
         assert len(streamed_data) == size_bytes, (
             f"[{size_name}] Streamed size mismatch!\n"
@@ -492,6 +489,7 @@ class TestLargePayloadStreaming:
 # Measure raw streaming throughput by minimizing generation overhead
 
 
+@skip_unless_hwaccel
 class TestStreamingThroughput:
     """Benchmark tests to measure raw streaming throughput.
 
@@ -577,7 +575,7 @@ class TestStreamingStress:
         num_iterations = 20
         payload_size = 100_000  # 100KB each
 
-        expected_hash = compute_hash(generate_ascii_pattern(payload_size))
+        expected_hash = bytes_hash(generate_ascii_pattern(payload_size))
         code = python_code_for_ascii_pattern(payload_size)
 
         for i in range(num_iterations):
@@ -599,7 +597,7 @@ class TestStreamingStress:
             assert result.exit_code == 0, f"Iteration {i} failed: {result.stderr}"
 
             streamed_data = "".join(chunks).rstrip("\n").encode("utf-8")
-            actual_hash = compute_hash(streamed_data)
+            actual_hash = bytes_hash(streamed_data)
 
             assert actual_hash == expected_hash, f"Iteration {i} corrupted!"
 

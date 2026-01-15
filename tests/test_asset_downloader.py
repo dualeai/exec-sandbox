@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import sys
 import tracemalloc
 from pathlib import Path
@@ -23,6 +22,7 @@ from exec_sandbox.asset_downloader import (
     untar,
 )
 from exec_sandbox.exceptions import AssetDownloadError, AssetNotFoundError
+from exec_sandbox.hash_utils import IncrementalHasher, bytes_hash
 from exec_sandbox.platform_utils import HostOS
 
 
@@ -135,7 +135,7 @@ class TestRetrieve:
     async def test_downloads_and_caches(self, tmp_path: Path):
         """Should download file and cache it locally."""
         content = b"hello world"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         with aioresponses() as m:
             m.get(
@@ -155,7 +155,7 @@ class TestRetrieve:
     async def test_uses_cache_on_second_call(self, tmp_path: Path):
         """Should use cached file on second call without re-downloading."""
         content = b"cached content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         with aioresponses() as m:
             m.get("https://example.com/cached.txt", body=content)
@@ -261,7 +261,7 @@ class TestRetrieve:
     async def test_processor_is_called(self, tmp_path: Path):
         """Should call processor function after download."""
         content = b"original content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         # Track if processor was called
         processor_called = False
@@ -293,7 +293,7 @@ class TestRetrieve:
     async def test_redownloads_on_hash_mismatch(self, tmp_path: Path):
         """Should re-download when cached file has wrong hash."""
         content = b"correct content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         # Pre-populate cache with wrong content
         cached_file = tmp_path / "cached.txt"
@@ -325,7 +325,7 @@ class TestRetrieve:
 
         # Write file in chunks to avoid memory spike during setup
         chunk = b"x" * (64 * 1024)  # 64KB chunks
-        hasher = hashlib.sha256()
+        hasher = IncrementalHasher()
         with large_file.open("wb") as f:
             for _ in range(file_size // len(chunk)):
                 f.write(chunk)
@@ -343,11 +343,12 @@ class TestRetrieve:
         # Peak memory should be bounded by:
         # - 64KB chunk buffer
         # - ~130KB Python file I/O baseline overhead
-        # - hashlib internal state
+        # - IncrementalHasher internal state
         # - asyncio.to_thread overhead (~100KB)
         # - Free-threaded Python (3.14t+) has ~150KB additional overhead
-        # Empirically: ~350KB for 64KB chunks, ~550KB on 3.14t
-        max_allowed = 600 * 1024  # 600KB - proves streaming works for 4MB file
+        # - ARM64 has ~300KB additional overhead (16KB page size vs 4KB on x86_64)
+        # Empirically: ~350KB for 64KB chunks, ~550KB on 3.14t, ~900KB on ARM64
+        max_allowed = 1024 * 1024  # 1MB - proves streaming works for 4MB file
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "
             f"for {file_size / 1024 / 1024:.0f}MB file. Streaming may be broken."
@@ -384,7 +385,7 @@ class TestAsyncPooch:
     async def test_fetch_downloads_file(self, tmp_path: Path):
         """Should download file from registry."""
         content = b"registry content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         pooch = AsyncPooch(
             path=tmp_path,
@@ -555,27 +556,63 @@ class TestAsyncPooch:
 
             assert pooch.registry["file.txt"] == "sha256:hash"
 
-    async def test_fetch_with_dev_version(self, tmp_path: Path):
-        """Should use version_dev when version ends with .dev0."""
-        content = b"dev content"
-        content_hash = hashlib.sha256(content).hexdigest()
+    async def test_fetch_fallback_to_configured_version(self, tmp_path: Path):
+        """Should use configured version when _resolved_version is not set."""
+        content = b"fallback content"
+        content_hash = bytes_hash(content)
 
         pooch = AsyncPooch(
             path=tmp_path,
             base_url="https://example.com/v{version}",
-            version="1.0.0.dev0",
-            version_dev="latest",
+            version="1.0.0",
             registry={"file.txt": f"sha256:{content_hash}"},
         )
 
         with aioresponses() as m:
-            # Should use "latest" instead of "1.0.0.dev0"
-            m.get("https://example.com/vlatest/file.txt", body=content)
+            # Should use configured version directly
+            m.get("https://example.com/v1.0.0/file.txt", body=content)
 
             path = await pooch.fetch("file.txt")
 
             assert path.exists()
             assert path.read_bytes() == content
+
+    async def test_fetch_uses_resolved_version_from_github(self, tmp_path: Path):
+        """Should use actual tag from GitHub API instead of configured version."""
+        content = b"resolved version content"
+        content_hash = bytes_hash(content)
+
+        pooch = AsyncPooch(
+            path=tmp_path,
+            base_url="https://github.com/owner/repo/releases/download/v{version}",
+            version="1.0.0.dev0",  # This would be used if _resolved_version wasn't set
+            registry={},
+        )
+
+        github_response = {
+            "tag_name": "v2.0.0",  # Actual tag from GitHub
+            "assets": [
+                {"name": "file.txt", "digest": f"sha256:{content_hash}"},
+            ],
+        }
+
+        with aioresponses() as m:
+            m.get(
+                "https://api.github.com/repos/owner/repo/releases/latest",
+                payload=github_response,
+            )
+            # Should use "v2.0.0" (resolved) instead of "vlatest"
+            m.get(
+                "https://github.com/owner/repo/releases/download/v2.0.0/file.txt",
+                body=content,
+            )
+
+            await pooch.load_registry_from_github("owner", "repo", "latest")
+            path = await pooch.fetch("file.txt")
+
+            assert path.exists()
+            assert path.read_bytes() == content
+            assert pooch._resolved_version == "v2.0.0"
 
 
 class TestDecompressZstd:

@@ -7,6 +7,7 @@ Provides PID-reuse safe process management wrappers.
 import asyncio
 import contextlib
 import platform
+import time
 from enum import Enum, auto
 from functools import cache
 from typing import Literal
@@ -155,10 +156,14 @@ class ProcessWrapper:
         self.psutil_proc: psutil.Process | None = None
 
         # Wrap with psutil for PID-reuse safe monitoring
+        # Retry a few times to handle race conditions on free-threaded Python
+        # where the process may not be immediately visible to psutil
         if async_proc.pid:
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                # Process already died or inaccessible
-                self.psutil_proc = psutil.Process(async_proc.pid)
+            for _ in range(3):
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    self.psutil_proc = psutil.Process(async_proc.pid)
+                    break
+                time.sleep(0.001)  # 1ms retry delay
 
     async def is_running(self) -> bool:
         """Check if process is still running (PID-reuse safe).
@@ -212,8 +217,15 @@ class ProcessWrapper:
 
         Async version prevents blocking event loop on system/kernel hangs.
         Uses asyncio.to_thread() for blocking psutil operations.
+
+        Raises:
+            ProcessLookupError: If process is not running
         """
-        if self.psutil_proc and await self.is_running():
+        if not await self.is_running():
+            raise ProcessLookupError(f"Process {self.pid} is not running")
+
+        if self.psutil_proc:
+            # Use psutil (suppress errors for race conditions where process dies during call)
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 await asyncio.to_thread(self.psutil_proc.terminate)
         else:
@@ -224,8 +236,15 @@ class ProcessWrapper:
 
         Async version prevents blocking event loop on system/kernel hangs.
         Uses asyncio.to_thread() for blocking psutil operations.
+
+        Raises:
+            ProcessLookupError: If process is not running
         """
-        if self.psutil_proc and await self.is_running():
+        if not await self.is_running():
+            raise ProcessLookupError(f"Process {self.pid} is not running")
+
+        if self.psutil_proc:
+            # Use psutil (suppress errors for race conditions where process dies during call)
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 await asyncio.to_thread(self.psutil_proc.kill)
         else:

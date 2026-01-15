@@ -8,7 +8,6 @@ Provides zero-memory-copy streaming for large files.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import http
 import os
 from pathlib import Path
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import AssetChecksumError, AssetDownloadError, AssetNotFoundError
+from exec_sandbox.hash_utils import IncrementalHasher, file_hash, parse_hash_spec
 from exec_sandbox.platform_utils import HostOS, detect_host_os, get_arch_name, get_os_name
 
 logger = get_logger(__name__)
@@ -130,16 +130,8 @@ async def _verify_hash(path: Path, expected_hash: str) -> bool:
     if not expected_hash:
         return True
 
-    algorithm, expected_digest = expected_hash.split(":", 1)
-
-    def _compute_hash() -> str:
-        hasher = hashlib.new(algorithm)
-        with path.open("rb") as f:
-            while chunk := f.read(CHUNK_SIZE):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-
-    actual_digest = await asyncio.to_thread(_compute_hash)
+    algorithm, expected_digest = parse_hash_spec(expected_hash)
+    actual_digest = await file_hash(path, algorithm)
     return actual_digest == expected_digest
 
 
@@ -185,8 +177,8 @@ async def _download_file(url: str, dest: Path, expected_hash: str, progressbar: 
     Hash is computed incrementally during download (no second pass).
     Uses atomic write pattern (temp file -> rename).
     """
-    algorithm, expected_digest = expected_hash.split(":", 1) if expected_hash else ("sha256", "")
-    hasher = hashlib.new(algorithm)
+    algorithm, expected_digest = parse_hash_spec(expected_hash) if expected_hash else ("sha256", "")
+    hasher = IncrementalHasher(algorithm)
     temp_path = dest.with_suffix(dest.suffix + ".tmp")
 
     if progressbar:
@@ -243,7 +235,6 @@ class AsyncPooch:
             path=get_cache_dir(),
             base_url="https://github.com/dualeai/exec-sandbox/releases/download/{version}",
             version=__version__,
-            version_dev="latest",
             env="EXEC_SANDBOX_CACHE_DIR",
             registry={
                 "vmlinuz-x86_64.zst": "sha256:abc123...",
@@ -259,7 +250,6 @@ class AsyncPooch:
         path: Path,
         base_url: str,
         version: str,
-        version_dev: str = "latest",
         env: str | None = None,
         registry: dict[str, str] | None = None,
     ) -> None:
@@ -269,8 +259,7 @@ class AsyncPooch:
         Args:
             path: Local cache directory
             base_url: Base URL template with {version} placeholder
-            version: Current version string
-            version_dev: Version to use for dev builds (default: "latest")
+            version: Current version string (used as fallback if GitHub API not called)
             env: Environment variable to override cache path
             registry: Dict mapping filename to hash (e.g., {"file.txt": "sha256:abc123..."})
         """
@@ -282,9 +271,9 @@ class AsyncPooch:
 
         self.base_url = base_url
         self.version = version
-        self.version_dev = version_dev
         self.registry: dict[str, str] = registry or {}
         self._github_release_cache: dict[str, dict[str, Any]] | None = None
+        self._resolved_version: str | None = None  # Actual tag from GitHub API
 
     async def fetch(
         self,
@@ -317,7 +306,9 @@ class AsyncPooch:
         known_hash = self.registry[fname]
 
         # Build URL with version
-        version = self.version if not self.version.endswith(".dev0") else self.version_dev
+        # Use resolved version from GitHub API if available (e.g., "v0.2.1" from /releases/latest)
+        # Otherwise fall back to configured version
+        version = self._resolved_version.lstrip("v") if self._resolved_version else self.version
         url = self.base_url.format(version=version) + "/" + fname
 
         return await retrieve(
@@ -384,6 +375,10 @@ class AsyncPooch:
 
         # Cache release data for URL lookups
         self._github_release_cache = {asset["name"]: asset for asset in release_data.get("assets", [])}
+
+        # Store actual tag name for URL construction (e.g., "v0.2.1" from /releases/latest)
+        self._resolved_version = release_data.get("tag_name")
+        logger.debug("Resolved release version", extra={"tag": self._resolved_version, "requested": tag})
 
         # Extract asset names and digests
         for asset in release_data.get("assets", []):

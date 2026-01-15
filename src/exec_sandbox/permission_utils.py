@@ -545,10 +545,10 @@ async def sudo_rm(path: Path) -> bool:
 # =============================================================================
 
 
-def can_access(path: Path, mode: int = os.R_OK | os.W_OK) -> bool:
+async def can_access(path: Path | str, mode: int = os.R_OK | os.W_OK) -> bool:
     """Check if current user can access path with specified mode.
 
-    Wrapper around os.access().
+    Async wrapper around os.access() using aiofiles.
 
     Args:
         path: File or directory path
@@ -557,7 +557,7 @@ def can_access(path: Path, mode: int = os.R_OK | os.W_OK) -> bool:
     Returns:
         True if access is allowed, False otherwise
     """
-    return os.access(path, mode)
+    return await aiofiles.os.access(path, mode)
 
 
 async def verify_user_access(path: Path, user: str, perms: str = "rw") -> bool:

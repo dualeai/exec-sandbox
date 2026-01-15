@@ -752,8 +752,8 @@ async fn execute_code_streaming(
     let start = Instant::now();
 
     // Granular timing for diagnostics
-    let mut spawn_ms: Option<u64> = None;
-    let mut process_ms: Option<u64> = None;
+    let spawn_ms: Option<u64>;
+    let process_ms: Option<u64>;
 
     let mut cmd = match language {
         "python" => {
@@ -992,6 +992,9 @@ impl NonBlockingFile {
     async fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
         let mut total_bytes = 0;
         let mut byte_buf = [0u8; 1];
+        // Accumulate raw bytes for proper UTF-8 decoding
+        // (pushing bytes directly as chars corrupts multi-byte UTF-8 sequences)
+        let mut bytes = Vec::new();
 
         loop {
             // Wait for the fd to be readable (epoll-based, properly cancellable)
@@ -1009,18 +1012,19 @@ impl NonBlockingFile {
                 }
             }) {
                 Ok(Ok(0)) => {
-                    // EOF
+                    // EOF - convert accumulated bytes to UTF-8
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
                     return Ok(total_bytes);
                 }
                 Ok(Ok(n)) => {
                     total_bytes += n;
                     let byte = byte_buf[0];
+                    bytes.push(byte);
                     if byte == b'\n' {
-                        // Include newline in buffer for compatibility
-                        buf.push(byte as char);
+                        // End of line - convert accumulated bytes to UTF-8
+                        buf.push_str(&String::from_utf8_lossy(&bytes));
                         return Ok(total_bytes);
                     }
-                    buf.push(byte as char);
                 }
                 Ok(Err(e)) => {
                     return Err(e);

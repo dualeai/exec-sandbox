@@ -18,9 +18,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
-import hashlib
+import json
 import sys
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,6 +42,7 @@ from exec_sandbox.guest_agent_protocol import (
     OutputChunkMessage,
     StreamingErrorMessage,
 )
+from exec_sandbox.hash_utils import crc32, crc64
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
@@ -206,7 +206,11 @@ class SnapshotManager:
     ) -> str:
         """Compute L2 cache key for snapshot.
 
-        Includes library major.minor version to invalidate cache when lib changes.
+        Includes:
+        - Library major.minor version (invalidates on lib upgrade)
+        - Base image hash (invalidates when images are rebuilt)
+        - Package hash (different packages = different cache entry)
+
         memory_mb is NOT in the cache key because disk-only snapshots work
         with any memory allocation.
 
@@ -215,8 +219,8 @@ class SnapshotManager:
         - User's allow_network setting only controls gvproxy at execution time
 
         Format:
-        - "{language}-v{major.minor}-base" for base (no packages)
-        - "{language}-v{major.minor}-{16char_hash}" for packages
+        - "{language}-v{major.minor}-{img_hash}-base" for base (no packages)
+        - "{language}-v{major.minor}-{img_hash}-{16char_pkg_hash}" for packages
 
         Args:
             language: Programming language
@@ -228,16 +232,47 @@ class SnapshotManager:
         # Extract major.minor from __version__ (e.g., "0.1.0" -> "0.1")
         version_parts = __version__.split(".")
         version = f"{version_parts[0]}.{version_parts[1]}"
-        base = f"{language.value}-v{version}"
+
+        # Include base image hash (first 8 chars) to invalidate cache on image rebuild
+        base_image = self.vm_manager.get_base_image(language)
+        img_hash = self._get_base_image_hash(base_image)
+
+        base = f"{language.value}-v{version}-{img_hash}"
 
         if not packages:
             return f"{base}-base"
         packages_str = "".join(sorted(packages))
-        packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
+        packages_hash = crc64(packages_str)
         return f"{base}-{packages_hash}"
+
+    def _get_base_image_hash(self, base_image: Path) -> str:
+        """Get hash of base image for cache key.
+
+        Uses file modification time + size for fast hashing (avoids reading entire file).
+        This detects image rebuilds while being O(1) instead of O(n).
+
+        Args:
+            base_image: Path to base qcow2 image
+
+        Returns:
+            8-character hash string (CRC32 in hex)
+        """
+        try:
+            stat = base_image.stat()
+            # Combine mtime (nanoseconds) + size for unique fingerprint
+            fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
+            return crc32(fingerprint)
+        except OSError:
+            # If image doesn't exist, return placeholder (will fail later anyway)
+            return "missing0"
 
     async def _check_l2_cache(self, cache_key: str) -> Path | None:
         """Check L2 local cache for qcow2 snapshot.
+
+        Validates:
+        1. Snapshot file exists
+        2. Valid qcow2 format
+        3. Backing file exists and matches expected base image
 
         Args:
             cache_key: Snapshot cache key.
@@ -250,21 +285,57 @@ class SnapshotManager:
         if not await aiofiles.os.path.exists(snapshot_path):
             return None
 
-        # Verify qcow2 format
+        # Verify qcow2 format and get backing file info
         try:
             proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
                     "qemu-img",
                     "info",
+                    "--output=json",
                     str(snapshot_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
             )
-            _stdout, _stderr = await proc.communicate()
+            stdout, _stderr = await proc.communicate()
 
             if proc.returncode != 0:
-                return None  # Invalid qcow2
+                logger.debug("Invalid qcow2 snapshot, removing", extra={"cache_key": cache_key})
+                await aiofiles.os.remove(snapshot_path)
+                return None
+
+            # Parse JSON output to check backing file
+            info = json.loads(stdout.decode())
+            backing_file = info.get("backing-filename") or info.get("full-backing-filename")
+
+            if backing_file:
+                # Verify backing file exists
+                if not await aiofiles.os.path.exists(backing_file):
+                    logger.warning(
+                        "Snapshot backing file missing, removing stale cache",
+                        extra={"cache_key": cache_key, "backing_file": backing_file},
+                    )
+                    await aiofiles.os.remove(snapshot_path)
+                    return None
+
+                # Verify backing file matches expected base image by checking hash
+                # Extract language from cache_key (format: "{language}-v{version}-{hash|base}")
+                language_str = cache_key.split("-")[0]
+                try:
+                    expected_base = self.vm_manager.get_base_image(Language(language_str)).resolve()
+                    if Path(backing_file).resolve() != expected_base:
+                        logger.warning(
+                            "Snapshot backing file mismatch, removing stale cache",
+                            extra={
+                                "cache_key": cache_key,
+                                "backing_file": backing_file,
+                                "expected": str(expected_base),
+                            },
+                        )
+                        await aiofiles.os.remove(snapshot_path)
+                        return None
+                except (ValueError, KeyError):
+                    pass  # Can't determine expected base, skip validation
 
         except (OSError, FileNotFoundError):
             return None
@@ -309,7 +380,7 @@ class SnapshotManager:
             SnapshotError: Creation failed
             VmError: VM crashed during snapshot creation
         """
-        start_time = time.time()
+        start_time = asyncio.get_event_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
         # Resolve to absolute path - qemu-img resolves backing file relative to snapshot location,
         # so we need absolute path when snapshot_cache_dir differs from base_images_dir
@@ -467,14 +538,14 @@ class SnapshotManager:
                         )
 
         # Record snapshot creation duration
-        duration_ms = (time.time() - start_time) * 1000
+        duration_ms = round((asyncio.get_event_loop().time() - start_time) * 1000)
         logger.info(
             "Snapshot created",
             extra={
                 "cache_key": cache_key,
                 "language": language,
                 "package_count": len(packages),
-                "duration_ms": f"{duration_ms:.1f}",
+                "duration_ms": duration_ms,
             },
         )
 

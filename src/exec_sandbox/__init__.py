@@ -80,9 +80,9 @@ __all__ = [
     "VmTimeoutError",
 ]
 
-try:
-    from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
+try:
     __version__ = version("exec-sandbox")
-except Exception:
+except PackageNotFoundError:
     __version__ = "0.0.0.dev0"

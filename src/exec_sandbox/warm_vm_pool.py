@@ -56,6 +56,7 @@ from tenacity import (
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.balloon_client import BalloonClient, BalloonError
+from exec_sandbox.exceptions import SocketAuthError
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
 
@@ -69,6 +70,19 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import QemuVM, VmManager
 
 logger = get_logger(__name__)
+
+# Transient exceptions during health checks that should trigger retry/unhealthy status.
+# These indicate temporary communication failures, not permanent VM problems:
+# - OSError/ConnectionError/EOFError: Socket/network issues
+# - TimeoutError: Guest agent slow to respond
+# - SocketAuthError: SO_PEERCRED returns pid=0 when QEMU frozen (SIGSTOP) due to kernel race
+_HEALTH_CHECK_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    TimeoutError,
+    ConnectionError,
+    EOFError,
+    SocketAuthError,
+)
 
 
 class WarmVMPool:
@@ -472,7 +486,15 @@ class WarmVMPool:
     async def _deflate_balloon(self, vm: QemuVM) -> None:
         """Deflate balloon to restore guest memory before code execution.
 
-        Deflating the balloon returns memory TO the guest.
+        Deflating the balloon returns memory TO the guest. Uses fire-and-forget
+        mode (wait_for_target=False) to avoid blocking - the balloon command is
+        sent immediately and memory is restored progressively while code runs.
+
+        This eliminates up to 5s of polling overhead on slow systems (nested
+        virtualization) where balloon operations are degraded. Most code doesn't
+        need the full 256MB immediately - the 64MB idle memory is sufficient
+        for runtime startup, and additional memory becomes available within ~1s.
+
         Graceful degradation: logs warning and continues if balloon fails.
 
         Args:
@@ -483,7 +505,7 @@ class WarmVMPool:
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
             try:
-                await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB)
+                await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB, wait_for_target=False)
                 logger.debug(
                     "Balloon deflated for warm pool VM",
                     extra={"vm_id": vm.vm_id, "target_mb": constants.DEFAULT_MEMORY_MB},
@@ -559,7 +581,7 @@ class WarmVMPool:
             "Health check iteration complete",
             extra={
                 "language": language.value,
-                "duration_ms": f"{check_duration * 1000:.1f}",
+                "duration_ms": round(check_duration * 1000),
                 "healthy": healthy_count,
                 "unhealthy": unhealthy_count,
                 "pool_size": pool.qsize(),
@@ -604,7 +626,7 @@ class WarmVMPool:
                 return True
             await self._handle_unhealthy_vm(vm, language)
             return False
-        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
+        except _HEALTH_CHECK_TRANSIENT_ERRORS as e:
             logger.error(
                 "Health check exception",
                 extra={"language": language.value, "vm_id": vm.vm_id, "error": str(e)},
@@ -657,6 +679,15 @@ class WarmVMPool:
         Returns:
             True if healthy, False otherwise
         """
+        # Fast fail: Check if QEMU process is still running before socket check
+        # This catches killed VMs immediately without waiting for socket timeouts
+        if not await vm.process.is_running():
+            logger.warning(
+                "VM process not running (killed or crashed)",
+                extra={"vm_id": vm.vm_id},
+            )
+            return False
+
         from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
             PingRequest,
             PongMessage,
@@ -687,13 +718,13 @@ class WarmVMPool:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.WARM_POOL_HEALTH_CHECK_MAX_RETRIES),
                 wait=wait_strategy,
-                retry=retry_if_exception_type((OSError, TimeoutError, ConnectionError, EOFError)),
+                retry=retry_if_exception_type(_HEALTH_CHECK_TRANSIENT_ERRORS),
                 before_sleep=before_sleep_log(logger, logging.DEBUG),
                 reraise=True,
             ):
                 with attempt:
                     return await _ping_guest()
-        except (OSError, TimeoutError, ConnectionError, EOFError) as e:
+        except _HEALTH_CHECK_TRANSIENT_ERRORS as e:
             # All retries exhausted - log and return unhealthy
             logger.warning(
                 "Health check failed after retries",

@@ -12,6 +12,7 @@ from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from tests.conftest import skip_unless_fast_balloon
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -909,8 +910,14 @@ class TestSchedulerWarmPoolTiming:
         assert result.timing.execute_ms >= 40  # Allow some variance
         assert result.timing.total_ms >= 40
 
+    @skip_unless_fast_balloon
     async def test_warm_pool_total_approximately_equals_execute(self, warm_pool_scheduler: Scheduler) -> None:
-        """For warm pool, total_ms should be close to execute_ms (no boot overhead)."""
+        """For warm pool, total_ms should be close to execute_ms (no boot overhead).
+
+        Note: Balloon deflation uses fire-and-forget mode (wait_for_target=False) to
+        avoid the 5s polling overhead. The skip marker is kept as a safety margin for
+        other potential timing variations on slow/nested virtualization environments.
+        """
         result = await warm_pool_scheduler.run(
             code="print('hello')",
             language=Language.PYTHON,

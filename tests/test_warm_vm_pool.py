@@ -14,6 +14,8 @@ from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 
+from .conftest import skip_unless_hwaccel
+
 # ============================================================================
 # Unit Tests - No QEMU needed
 # ============================================================================
@@ -187,6 +189,7 @@ class TestHealthCheckPoolUnit:
 # ============================================================================
 
 
+@skip_unless_hwaccel
 class TestWarmVMPoolIntegration:
     """Integration tests for WarmVMPool with real QEMU VMs."""
 
@@ -253,6 +256,7 @@ class TestWarmVMPoolIntegration:
 # ============================================================================
 
 
+@skip_unless_hwaccel
 class TestHealthcheckIntegration:
     """Integration tests for healthcheck with real QEMU VMs."""
 
@@ -289,6 +293,10 @@ class TestHealthcheckIntegration:
         await pool.startup()
 
         try:
+            # Wait for VMs to stabilize after startup balloon inflation
+            # On slow CI, VMs may need time to adjust to reduced memory
+            await asyncio.sleep(0.5)
+
             initial_size = pool.pools[Language.PYTHON].qsize()
             assert initial_size > 0
 
@@ -533,7 +541,10 @@ class TestHealthcheckIntegration:
         SIGSTOP freezes the QEMU process, making it unresponsive.
         The health check should timeout and mark it unhealthy.
         """
+        import os
         import signal
+
+        import psutil
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
@@ -547,15 +558,35 @@ class TestHealthcheckIntegration:
             vm = await pool.get_vm(Language.PYTHON, packages=[])
             assert vm is not None
 
-            # Verify healthy first
-            is_healthy = await pool._check_vm_health(vm)
-            assert is_healthy is True
+            # Wait for VM to stabilize after balloon deflation
+            # On slow CI, the guest needs time to reclaim memory after deflate
+            await asyncio.sleep(0.5)
+
+            # Verify healthy first (with retries for slow CI where balloon
+            # operations may leave the guest temporarily slow)
+            is_healthy = False
+            for _ in range(3):
+                is_healthy = await pool._check_vm_health(vm)
+                if is_healthy:
+                    break
+                await asyncio.sleep(0.3)
+            assert is_healthy is True, "VM should be healthy before SIGSTOP"
 
             # Freeze the QEMU process (simulate hang)
             assert vm.process.pid is not None
-            import os
-
             os.kill(vm.process.pid, signal.SIGSTOP)
+
+            # Wait for process to actually stop - SIGSTOP is async, os.kill()
+            # returns before the kernel fully stops the process. Without this,
+            # there's a race where QEMU can respond to the health check ping
+            # before being frozen.
+            proc = psutil.Process(vm.process.pid)
+            for _ in range(100):  # 1s max
+                if proc.status() == psutil.STATUS_STOPPED:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"QEMU process did not stop within 1s (status: {proc.status()})")
 
             try:
                 # Health check should timeout and return unhealthy

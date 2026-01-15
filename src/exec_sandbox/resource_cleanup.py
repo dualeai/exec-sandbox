@@ -98,7 +98,7 @@ async def cleanup_process(
             # Still try to reap in background to prevent zombie
             async def drain_and_wait() -> None:
                 with contextlib.suppress(OSError, TimeoutError, asyncio.CancelledError):
-                    await proc.wait_with_timeout(timeout=999999)  # Infinite-like timeout
+                    await proc.wait_with_timeout(timeout=30)  # 30s timeout for zombie reaping
 
             _ = asyncio.create_task(drain_and_wait())  # noqa: RUF006
             return False

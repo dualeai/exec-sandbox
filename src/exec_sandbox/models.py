@@ -18,6 +18,13 @@ class TimingBreakdown(BaseModel):
 
     All times are in milliseconds, measured from the host side.
     Follows Firecracker/AWS Lambda SnapStart conventions for phase separation.
+
+    Note: total_ms is independently measured end-to-end and may be slightly
+    larger than setup_ms + boot_ms + execute_ms due to orchestration overhead
+    (warm pool checks, semaphore acquisition, etc.).
+
+    For warm pool hits, setup_ms and boot_ms are 0 since those costs were
+    pre-paid at pool startup time.
     """
 
     setup_ms: int = Field(description="Resource setup time (overlay, cgroup, gvproxy - parallel)")

@@ -22,12 +22,12 @@ import asyncio
 import contextlib
 import ctypes
 import errno
-import fcntl
 import json
 import logging
 import os
 import platform
 import signal
+import sys
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
@@ -185,6 +185,7 @@ class _ProbeCache:
         "hvf",
         "io_uring",
         "kvm",
+        "qemu_accels",
         "tsc_deadline",
         "unshare",
     )
@@ -193,6 +194,7 @@ class _ProbeCache:
         self.hvf: bool | None = None
         self.io_uring: bool | None = None
         self.kvm: bool | None = None
+        self.qemu_accels: set[str] | None = None  # Accelerators available in QEMU binary
         self.tsc_deadline: bool | None = None
         self.unshare: bool | None = None
 
@@ -201,8 +203,98 @@ class _ProbeCache:
 _probe_cache = _ProbeCache()
 
 
-def _check_kvm_available() -> bool:
+async def _probe_qemu_accelerators() -> set[str]:
+    """Probe QEMU binary for available accelerators (cached).
+
+    This provides a 2nd layer of verification beyond OS-level checks (ioctl/sysctl).
+    Even if /dev/kvm exists and responds to ioctl, QEMU may not have the accelerator
+    compiled in, or may fail to initialize it in certain environments.
+
+    Uses `qemu-system-xxx -accel help` to get the list of accelerators that QEMU
+    actually supports. This is the same method recommended by QEMU documentation.
+
+    References:
+        - QEMU docs: "help can also be passed as an argument to another option"
+        - libvirt probes QEMU binary presence + /dev/kvm (drvqemu.html)
+        - GitHub Actions KVM issues: https://github.com/orgs/community/discussions/8305
+
+    Returns:
+        Set of available accelerator names (e.g., {"tcg", "kvm"} or {"tcg", "hvf"})
+    """
+    # Fast path: return cached result
+    if _probe_cache.qemu_accels is not None:
+        return _probe_cache.qemu_accels
+
+    # Determine QEMU binary based on host architecture
+    arch = detect_host_arch()
+    qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            qemu_bin,
+            "-accel",
+            "help",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+
+        if proc.returncode != 0:
+            logger.warning(
+                "QEMU accelerator probe failed",
+                extra={"qemu_bin": qemu_bin, "returncode": proc.returncode},
+            )
+            _probe_cache.qemu_accels = set()
+            return _probe_cache.qemu_accels
+
+        # Parse output: "Accelerators supported in QEMU binary:\ntcg\nkvm\n"
+        # or "tcg\nhvf\n" on macOS
+        output = stdout.decode().strip()
+        accels: set[str] = set()
+        for raw_line in output.split("\n"):
+            accel_name = raw_line.strip().lower()
+            # Skip header line and empty lines
+            if accel_name and not accel_name.startswith("accelerator"):
+                accels.add(accel_name)
+
+        _probe_cache.qemu_accels = accels
+        logger.debug(
+            "QEMU accelerator probe complete",
+            extra={"qemu_bin": qemu_bin, "accelerators": sorted(accels)},
+        )
+
+    except FileNotFoundError:
+        logger.warning(
+            "QEMU binary not found for accelerator probe",
+            extra={"qemu_bin": qemu_bin},
+        )
+        _probe_cache.qemu_accels = set()
+    except (OSError, TimeoutError) as e:
+        logger.warning(
+            "QEMU accelerator probe failed",
+            extra={"qemu_bin": qemu_bin, "error": str(e)},
+        )
+        _probe_cache.qemu_accels = set()
+
+    return _probe_cache.qemu_accels
+
+
+async def _check_kvm_available() -> bool:
     """Check if KVM acceleration is available and accessible (cached).
+
+    Two-layer verification approach
+    ===============================
+    Layer 1 (Kernel): Verify /dev/kvm exists, is accessible, and responds to ioctl
+    Layer 2 (QEMU):   Verify QEMU binary has KVM support via `-accel help`
+
+    This 2-layer approach catches edge cases where:
+    - /dev/kvm exists but KVM module is broken (nested VMs, containers)
+    - KVM ioctl works but QEMU doesn't have KVM compiled in
+    - GitHub Actions runners with inconsistent KVM availability
+
+    References:
+    - GitHub Actions KVM issues: https://github.com/orgs/community/discussions/8305
+    - libvirt capability probing: https://libvirt.org/drvqemu.html
 
     KVM vs TCG: Virtualization modes with vastly different characteristics
     ======================================================================
@@ -227,15 +319,15 @@ def _check_kvm_available() -> bool:
     TCG is acceptable ONLY for local development and testing.
 
     Returns:
-        True if /dev/kvm exists and is accessible (enables KVM mode)
+        True if both kernel and QEMU verify KVM is available
         False otherwise (falls back to TCG software emulation)
     """
     # Fast path: return cached result
     if _probe_cache.kvm is not None:
         return _probe_cache.kvm
 
-    kvm_path = Path("/dev/kvm")
-    if not kvm_path.exists():
+    kvm_path = "/dev/kvm"
+    if not await aiofiles.os.path.exists(kvm_path):
         logger.debug("KVM not available: /dev/kvm does not exist")
         _probe_cache.kvm = False
         return False
@@ -243,37 +335,58 @@ def _check_kvm_available() -> bool:
     # Check if we can actually access /dev/kvm (not just that it exists)
     # This catches permission issues that would cause QEMU to fail or hang
     # See: https://github.com/actions/runner-images/issues/8542
+    if not await can_access(kvm_path, os.R_OK | os.W_OK):
+        logger.debug("KVM not available: permission denied on /dev/kvm")
+        _probe_cache.kvm = False
+        return False
+
+    # Actually try to open /dev/kvm and check API version via subprocess
+    # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
+    # Uses subprocess to avoid blocking the event loop with ioctl()
     try:
-        # Check actual permission for the current user (uses os.access internally)
-        if not can_access(kvm_path, os.R_OK | os.W_OK):
-            logger.debug("KVM not available: permission denied on /dev/kvm")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            logger.warning("KVM device accessible but ioctl failed")
             _probe_cache.kvm = False
             return False
 
-        # Actually try to open /dev/kvm to verify it works
-        # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
-        with kvm_path.open("rb") as f:
-            try:
-                api_version = fcntl.ioctl(f.fileno(), _KVM_GET_API_VERSION)
-                _probe_cache.kvm = api_version == _KVM_API_VERSION_EXPECTED
-                if _probe_cache.kvm:
-                    logger.debug("KVM available and working", extra={"api_version": api_version})
-                else:
-                    logger.warning(
-                        "KVM available but unexpected API version",
-                        extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
-                    )
-            except OSError as e:
-                # ioctl failed - KVM not actually usable
-                logger.warning(
-                    "KVM device accessible but ioctl failed",
-                    extra={"error": str(e)},
-                )
-                _probe_cache.kvm = False
-    except OSError as e:
-        logger.debug("KVM not available: failed to open /dev/kvm", extra={"error": str(e)})
-        _probe_cache.kvm = False
+        api_version = int(stdout.decode().strip())
+        if api_version != _KVM_API_VERSION_EXPECTED:
+            logger.warning(
+                "KVM available but unexpected API version",
+                extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
+            )
+            _probe_cache.kvm = False
+            return False
 
+        logger.debug("KVM ioctl check passed", extra={"api_version": api_version})
+
+    except (OSError, TimeoutError, ValueError) as e:
+        logger.debug("KVM not available: failed to verify /dev/kvm", extra={"error": str(e)})
+        _probe_cache.kvm = False
+        return False
+
+    # Layer 2: Verify QEMU binary has KVM support compiled in
+    # Even if /dev/kvm works, QEMU may not have KVM support or may fail to initialize it
+    # See: https://github.com/orgs/community/discussions/8305 (GitHub Actions KVM issues)
+    qemu_accels = await _probe_qemu_accelerators()
+    if "kvm" not in qemu_accels:
+        logger.warning(
+            "KVM not available: QEMU binary does not support KVM accelerator",
+            extra={"available_accelerators": sorted(qemu_accels)},
+        )
+        _probe_cache.kvm = False
+        return False
+
+    logger.debug("KVM available and working (kernel + QEMU verified)")
+    _probe_cache.kvm = True
     return _probe_cache.kvm
 
 
@@ -307,11 +420,128 @@ async def _check_hvf_available() -> bool:
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        _probe_cache.hvf = proc.returncode == 0 and stdout.decode().strip() == "1"
-    except (OSError, TimeoutError):
-        _probe_cache.hvf = False
+        hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
 
+        if not hvf_kernel_support:
+            logger.debug("HVF not available: kern.hv_support is not enabled")
+            _probe_cache.hvf = False
+            return False
+
+        logger.debug("HVF kernel support check passed")
+
+    except (OSError, TimeoutError) as e:
+        logger.debug("HVF not available: sysctl check failed", extra={"error": str(e)})
+        _probe_cache.hvf = False
+        return False
+
+    # Layer 2: Verify QEMU binary has HVF support compiled in
+    # Even if kern.hv_support is enabled, QEMU may not have HVF support
+    qemu_accels = await _probe_qemu_accelerators()
+    if "hvf" not in qemu_accels:
+        logger.warning(
+            "HVF not available: QEMU binary does not support HVF accelerator",
+            extra={"available_accelerators": sorted(qemu_accels)},
+        )
+        _probe_cache.hvf = False
+        return False
+
+    logger.debug("HVF available and working (kernel + QEMU verified)")
+    _probe_cache.hvf = True
     return _probe_cache.hvf
+
+
+def check_hwaccel_available() -> bool:
+    """Check if hardware acceleration (KVM or HVF) is available.
+
+    Synchronous function for use in pytest skipif markers.
+    TCG (software emulation) is 10-50x slower than hardware virtualization,
+    making timing-sensitive tests unreliable.
+
+    Returns:
+        True if KVM (Linux) or HVF (macOS) is available
+        False otherwise (will use TCG software emulation)
+    """
+    host_os = detect_host_os()
+
+    if host_os == HostOS.LINUX:
+        return asyncio.run(_check_kvm_available())
+    if host_os == HostOS.MACOS:
+        return asyncio.run(_check_hvf_available())
+    return False
+
+
+def check_fast_balloon_available() -> bool:
+    """Check if fast balloon operations are expected (not degraded nested virtualization).
+
+    Synchronous function for use in pytest skipif markers.
+    Used for timing-sensitive tests that include balloon inflate/deflate overhead.
+
+    Background
+    ==========
+    Balloon operations (memory reclaim via virtio-balloon) have vastly different
+    performance characteristics depending on the virtualization environment:
+
+    - Bare-metal KVM: Balloon operations complete in <100ms
+    - Nested KVM (CI runners): Balloon operations can take 5+ seconds due to
+      hypervisor overhead, often timing out after retry limits
+
+    The Problem
+    ===========
+    GitHub Actions runners are VMs on Azure, creating nested virtualization when
+    running QEMU. Even when /dev/kvm exists and KVM "works", balloon operations
+    are significantly degraded:
+
+    1. KVM availability is inconsistent on GitHub Actions - "/dev/kvm sometimes
+       exists (and works!), and sometimes it doesn't" (GitHub community #8305)
+
+    2. pytest-xdist workers perform independent test collection, so flaky KVM
+       detection can cause tests to run on workers where KVM isn't actually fast
+
+    3. TSC_DEADLINE timer (required for efficient APIC timer virtualization) is
+       often not exposed to nested VMs, causing timer fallback to slower modes
+
+    Solution
+    ========
+    Use TSC_DEADLINE availability as a proxy for "fast virtualization":
+
+    - TSC_DEADLINE is a CPU feature, not a kernel module state - deterministic
+    - When missing, QEMU enables legacy PIT/PIC timers (slower, more overhead)
+    - Reliably identifies degraded nested virt vs bare-metal/L1 KVM
+
+    References
+    ==========
+    - Linux kernel timekeeping: https://docs.kernel.org/virt/kvm/x86/timekeeping.html
+    - QEMU Hyper-V enlightenments: https://www.qemu.org/docs/master/system/i386/hyperv.html
+    - GitHub Actions KVM issues: https://github.com/actions/runner-images/issues/8542
+    - pytest-xdist collection: https://pytest-xdist.readthedocs.io/en/stable/how-it-works.html
+
+    Returns:
+        True if balloon operations are expected to be fast:
+          - Linux x86_64: KVM available AND TSC_DEADLINE available
+          - Linux ARM64: KVM available (ARM uses different timer, less affected)
+          - macOS: HVF available (nested virt not possible on macOS)
+        False otherwise (balloon operations may be slow, skip timing tests)
+    """
+    if not check_hwaccel_available():
+        return False
+
+    host_os = detect_host_os()
+    host_arch = detect_host_arch()
+
+    # On Linux x86_64, TSC_DEADLINE absence indicates degraded nested virt
+    # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+    if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
+        return asyncio.run(_check_tsc_deadline_available())
+
+    # On macOS, HVF availability implies not nested (macOS doesn't support nested virt)
+    # If we got here, HVF is available, so balloon should be fast
+    if host_os == HostOS.MACOS:
+        return True
+
+    # On ARM64 Linux, KVM availability is sufficient
+    # ARM uses GIC timer (not TSC/APIC), less affected by nested virt overhead
+    # Unknown platform: conservative assumption (return False)
+    return host_os == HostOS.LINUX and host_arch == HostArch.AARCH64
 
 
 async def _check_tsc_deadline_available() -> bool:
@@ -363,6 +593,51 @@ async def _check_tsc_deadline_available() -> bool:
                 return has_tsc_deadline
     except OSError as e:
         logger.warning("Failed to read /proc/cpuinfo for TSC_DEADLINE check", extra={"error": str(e)})
+
+    _probe_cache.tsc_deadline = False
+    return False
+
+
+async def _check_tsc_deadline_macos() -> bool:
+    """Check if TSC_DEADLINE CPU feature is available on macOS (cached).
+
+    Uses sysctl to query CPU features on Intel Macs.
+    ARM64 Macs don't have TSC_DEADLINE (ARM uses different timer mechanism).
+
+    Returns:
+        True if TSC_DEADLINE is available, False otherwise
+    """
+    # Fast path: return cached result
+    if _probe_cache.tsc_deadline is not None:
+        return _probe_cache.tsc_deadline
+
+    # TSC_DEADLINE is x86-only concept
+    if detect_host_arch() != HostArch.X86_64:
+        _probe_cache.tsc_deadline = False
+        return False
+
+    try:
+        # machdep.cpu.features contains CPU feature flags on Intel Macs
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/sbin/sysctl",
+            "-n",
+            "machdep.cpu.features",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode == 0:
+            features = stdout.decode().upper()
+            # TSC_DEADLINE or TSCDEAD in CPU features
+            has_tsc = "TSC_DEADLINE" in features or "TSCDEAD" in features
+            _probe_cache.tsc_deadline = has_tsc
+            if has_tsc:
+                logger.debug("TSC_DEADLINE available on macOS (can disable PIT/PIC)")
+            else:
+                logger.debug("TSC_DEADLINE not available on macOS (keeping legacy timers)")
+            return has_tsc
+    except (OSError, TimeoutError):
+        pass
 
     _probe_cache.tsc_deadline = False
     return False
@@ -825,7 +1100,7 @@ class QemuVM:
             # Fixed init timeout (connection establishment, independent of execution timeout)
             connect_start = asyncio.get_event_loop().time()
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            connect_ms = int((asyncio.get_event_loop().time() - connect_start) * 1000)
+            connect_ms = round((asyncio.get_event_loop().time() - connect_start) * 1000)
 
             # Stream execution output to console
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
@@ -1430,8 +1705,8 @@ class VmManager:
                 await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
                 boot_complete_time = asyncio.get_event_loop().time()
                 # Store timing on VM for scheduler to use
-                vm.setup_ms = int((setup_complete_time - start_time) * 1000)
-                vm.boot_ms = int((boot_complete_time - setup_complete_time) * 1000)
+                vm.setup_ms = round((setup_complete_time - start_time) * 1000)
+                vm.boot_ms = round((boot_complete_time - setup_complete_time) * 1000)
                 # Transition to READY state after boot completes
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
@@ -1505,7 +1780,7 @@ class VmManager:
                 ) from e
 
             # Log boot time with breakdown
-            total_boot_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            total_boot_ms = round((asyncio.get_event_loop().time() - start_time) * 1000)
             logger.info(
                 "VM created",
                 extra={
@@ -1907,7 +2182,7 @@ class VmManager:
         """
         if self.settings.force_emulation:
             return AccelType.TCG
-        if _check_kvm_available():
+        if await _check_kvm_available():
             return AccelType.KVM
         if detect_host_os() == HostOS.MACOS and await _check_hvf_available():
             return AccelType.HVF
@@ -2028,9 +2303,23 @@ class VmManager:
             accel = "kvm"
         else:
             # TCG software emulation fallback (12x slower than KVM/HVF)
-            # MTTCG is enabled by default for supported configs, no need to force it
-            # tb-size=512 increases translation block cache for better code caching
-            accel = "tcg,tb-size=512"
+            #
+            # thread=single: Disable MTTCG to reduce thread count per VM. Without this,
+            # each VM creates multiple threads for parallel translation, exhausting
+            # system thread limits when running parallel tests (qemu_thread_create:
+            # Resource temporarily unavailable). Single-threaded TCG is slower but
+            # prevents SIGABRT crashes on CI runners without KVM.
+            # See: https://www.qemu.org/docs/master/devel/multi-thread-tcg.html
+            #
+            # tb-size: Translation block cache size in MB. QEMU 5.0+ defaults to 1GB
+            # which causes OOM on CI runners with multiple VMs. Must match
+            # cgroup.TCG_TB_CACHE_SIZE_MB for correct cgroup memory limits.
+            # See cgroup.py for size rationale and benchmarks.
+            accel = f"tcg,thread=single,tb-size={cgroup.TCG_TB_CACHE_SIZE_MB}"
+            logger.warning(
+                "Using TCG software emulation (slow) - KVM/HVF not available",
+                extra={"vm_id": vm_id, "accel": accel},
+            )
 
         # Track whether to use virtio-console (hvc0) or ISA serial (ttyS0)
         # Determined per-architecture below
@@ -2134,9 +2423,29 @@ class VmManager:
                     machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
                     use_virtio_console = True
             elif accel_type == AccelType.HVF:
-                # macOS with HVF uses microvm in non-legacy mode
-                # HVF always has TSC_DEADLINE equivalent, can disable pit/pic
-                machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                # macOS with HVF - configuration depends on architecture
+                # Note: dump-guest-core=off not included - may not be supported on macOS QEMU
+                if self.arch == HostArch.X86_64:
+                    # Intel Mac: check TSC_DEADLINE availability
+                    tsc_available = await _check_tsc_deadline_macos()
+                    if tsc_available:
+                        # Full optimization: TSC_DEADLINE available, disable legacy devices
+                        machine_type = (
+                            "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                        )
+                    else:
+                        # Conservative: keep legacy timers for older Intel Macs
+                        logger.info(
+                            "TSC_DEADLINE not available on Intel Mac, using microvm with legacy timers",
+                            extra={"vm_id": vm_id},
+                        )
+                        machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off"
+                else:
+                    # ARM64 Mac: no x86 legacy devices needed
+                    # ARM uses different timer mechanism (CNTVCT_EL0), no TSC concept
+                    machine_type = (
+                        "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
+                    )
                 use_virtio_console = True
             else:
                 # TCG emulation: use 'pc' (i440FX) which is simpler and more proven with direct kernel boot
@@ -2329,7 +2638,13 @@ class VmManager:
                 f"bps={constants.DISK_BPS_LIMIT},"
                 f"bps_max={constants.DISK_BPS_BURST},"
                 f"iops={constants.DISK_IOPS_LIMIT},"
-                f"iops_max={constants.DISK_IOPS_BURST}",
+                f"iops_max={constants.DISK_IOPS_BURST},"
+                # Disable QEMU file locking to allow concurrent VMs sharing same backing file.
+                # On Linux, QEMU uses OFD (Open File Descriptor) locks which cause "Failed to
+                # get shared write lock" errors when multiple VMs access the same base image.
+                # macOS doesn't enforce OFD locks, so this issue only manifests on Linux/CI.
+                # Safe because: (1) each VM has unique overlay, (2) base image is read-only.
+                f"file.locking=off",
             ]
         )
 

@@ -9,6 +9,7 @@ Tests that the execution system handles unusual inputs gracefully:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from tests.conftest import skip_unless_hwaccel
 
 
 # =============================================================================
@@ -285,6 +286,7 @@ os._exit(42)
 
         assert result.exit_code == 42
 
+    @skip_unless_hwaccel
     async def test_sigterm_graceful_exit(self, scheduler: Scheduler) -> None:
         """Process catches SIGTERM and exits gracefully.
 
@@ -314,6 +316,7 @@ time.sleep(60)
         # Verify SIGTERM was sent (not SIGKILL)
         assert "RECEIVED_SIGTERM" in result.stdout
 
+    @skip_unless_hwaccel
     async def test_normal_exit_no_termination_needed(self, scheduler: Scheduler) -> None:
         """Process exits normally before timeout - no termination needed.
 
@@ -337,12 +340,16 @@ print("DONE", flush=True)
         assert result.timing is not None
         assert result.timing.execute_ms < 2000  # < 2s
 
+    @skip_unless_hwaccel
     async def test_sigterm_ignored_escalates_to_sigkill(self, scheduler: Scheduler) -> None:
         """Process ignoring SIGTERM is killed by SIGKILL after grace period.
 
         Weird case: verifies SIGTERM→SIGKILL escalation via timing.
         If SIGTERM worked, execution would be ~2s. Since it's ignored,
         must wait 5s grace period before SIGKILL, so execution >= 5s.
+
+        Note: Requires hardware acceleration because TCG is 10-50x slower,
+        making the 2s timeout fail before the process can even print output.
         """
         code = """
 import signal
@@ -414,6 +421,7 @@ wait
         assert result.timing is not None
         assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
 
+    @skip_unless_hwaccel
     async def test_python_subprocess_tree_termination(self, scheduler: Scheduler) -> None:
         """Python subprocesses are terminated via process group.
 

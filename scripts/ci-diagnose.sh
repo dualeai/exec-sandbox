@@ -4,15 +4,19 @@
 
 set -euo pipefail
 
-# Colors
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-DIM='\033[2m'
-RESET='\033[0m'
+# Colors (using $'...' for escape sequence interpretation)
+YELLOW=$'\033[1;33m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
 
 # Check dependencies
 if ! command -v gh &>/dev/null; then
     echo "Error: gh CLI is required. Install with: brew install gh" >&2
+    exit 1
+fi
+if ! command -v jq &>/dev/null; then
+    echo "Error: jq is required. Install with: brew install jq" >&2
     exit 1
 fi
 
@@ -30,30 +34,46 @@ get_run_info() {
     fi
 
     REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
-    BRANCH=$(gh run view "$RUN_ID" --json headBranch --jq '.headBranch')
-    STATUS=$(gh run view "$RUN_ID" --json status --jq '.status')
+    # Fetch run metadata in a single API call
+    read -r BRANCH STATUS COMMIT STARTED_AT < <(gh run view "$RUN_ID" --json headBranch,status,headSha,createdAt --jq '[.headBranch, .status, .headSha[0:7], .createdAt] | @tsv')
     RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+}
+
+# Display run header
+show_header() {
+    # Format timestamp to user locale
+    local started_fmt
+    started_fmt=$(date -d "$STARTED_AT" 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$STARTED_AT" 2>/dev/null || echo "$STARTED_AT")
+
+    echo "📊 CI Run $RUN_ID ($BRANCH)"
+    printf '%b🔗 %s%b\n' "$DIM" "$RUN_URL" "$RESET"
+    printf '%b   commit: %s | started: %s%b\n' "$DIM" "$COMMIT" "$started_fmt" "$RESET"
+    echo ""
 }
 
 # Show CI status overview
 cmd_status() {
     get_run_info "$1"
+    show_header
 
-    echo "📊 CI Run $RUN_ID ($BRANCH)"
-    printf '%b🔗 %s%b\n' "$DIM" "$RUN_URL" "$RESET"
-    echo ""
-    gh run view "$RUN_ID" --json jobs --jq '
+    # Fetch job data once
+    JOBS_DATA=$(gh run view "$RUN_ID" --json jobs --jq '.jobs')
+
+    echo "$JOBS_DATA" | jq -r '
+        [.[] | select(.name | startswith("Test / Python"))] |
         {
-            p: ([.jobs[] | select(.name | startswith("Test / Python")) | select(.conclusion == "success")] | length),
-            f: ([.jobs[] | select(.name | startswith("Test / Python")) | select(.conclusion == "failure")] | length),
-            r: ([.jobs[] | select(.name | startswith("Test / Python")) | select(.status == "in_progress")] | length)
-        } | "✅ \(.p) passed | ❌ \(.f) failed | 🔄 \(.r) running"'
+            p: ([.[] | select(.conclusion == "success")] | length),
+            f: ([.[] | select(.conclusion == "failure")] | length),
+            c: ([.[] | select(.conclusion == "cancelled")] | length),
+            r: ([.[] | select(.status == "in_progress")] | length)
+        } | "✅ \(.p) passed | ❌ \(.f) failed | 🚫 \(.c) cancelled | 🔄 \(.r) running"'
     echo ""
-    gh run view "$RUN_ID" --json jobs --jq '
-        .jobs[]
+    echo "$JOBS_DATA" | jq -r '
+        .[]
         | select(.name | startswith("Test / Python"))
         | (if .conclusion == "success" then "✅"
            elif .conclusion == "failure" then "❌"
+           elif .conclusion == "cancelled" then "🚫"
            elif .status == "in_progress" then "🔄"
            else "⏳" end) + " " + .name'
 }
@@ -79,60 +99,48 @@ filter_noise() {
 }
 
 # Format pytest failures with colors
+# Yellow for test names only
 format_failures() {
-    awk '
-        /^={10,}/ { next }
-        /^_{4,}.*_{4,}$/ {
+    awk -v yellow="$YELLOW" -v reset="$RESET" '
+        /^=+$/ || /^=+ .* =+$/ { next }
+        /^\[gw[0-9]+\]/ { next }
+        /^_+ .* _+$/ {
             gsub(/^_+ /, ""); gsub(/ _+$/, "");
-            printf "\n\033[1;31m❌ %s\033[0m\n", $0
-            next
-        }
-        /^\[gw[0-9]+\]/ {
-            printf "\033[2m   %s\033[0m\n", $0
+            printf "\n%s❌ %s%s\n", yellow, $0, reset
             next
         }
         /^E   / {
             gsub(/^E   /, "");
-            printf "\033[1;33m   → %s\033[0m\n", $0
+            printf "   → %s\n", $0
             next
         }
-        /^-{10,}.*-{10,}$/ {
-            printf "\033[2m   %s\033[0m\n", $0
-            next
-        }
-        /^[A-Z]+  / {
-            printf "\033[2m   %s\033[0m\n", $0
-            next
-        }
-        /^[a-z_\/]+\.py:[0-9]+:/ {
-            printf "   \033[36m%s\033[0m\n", $0
-            next
-        }
-        /^    / {
+        /./ {
+            gsub(/^[ ]+/, "")
             printf "   %s\n", $0
-            next
         }
-        /./ { print "   " $0 }
     '
 }
 
 # Diagnose CI failures
 cmd_diagnose() {
     get_run_info "$1"
+    show_header
 
-    echo "📊 CI Run $RUN_ID ($BRANCH)"
-    printf '%b🔗 %s%b\n' "$DIM" "$RUN_URL" "$RESET"
-    echo ""
-    gh run view "$RUN_ID" --json jobs --jq '
+    # Fetch all job data once and cache it
+    JOBS_DATA=$(gh run view "$RUN_ID" --json jobs --jq '.jobs')
+
+    # Show summary counts
+    echo "$JOBS_DATA" | jq -r '
         {
-            p: ([.jobs[] | select(.conclusion == "success")] | length),
-            f: ([.jobs[] | select(.conclusion == "failure")] | length),
-            r: ([.jobs[] | select(.status == "in_progress")] | length)
-        } | "✅ \(.p) passed | ❌ \(.f) failed | 🔄 \(.r) running"'
+            p: ([.[] | select(.conclusion == "success")] | length),
+            f: ([.[] | select(.conclusion == "failure")] | length),
+            c: ([.[] | select(.conclusion == "cancelled")] | length),
+            r: ([.[] | select(.status == "in_progress")] | length)
+        } | "✅ \(.p) passed | ❌ \(.f) failed | 🚫 \(.c) cancelled | 🔄 \(.r) running"'
     echo ""
 
     # Get failed job IDs (space-separated for bash iteration)
-    FAILED_JOBS=$(gh run view "$RUN_ID" --json jobs --jq '[.jobs[] | select(.conclusion=="failure") | .databaseId] | join(" ")')
+    FAILED_JOBS=$(echo "$JOBS_DATA" | jq -r '[.[] | select(.conclusion=="failure") | .databaseId] | join(" ")')
 
     if [[ -z "$FAILED_JOBS" ]]; then
         if [[ "$STATUS" == "completed" ]]; then
@@ -144,7 +152,7 @@ cmd_diagnose() {
     fi
 
     echo "❌ Failed Jobs:"
-    gh run view "$RUN_ID" --json jobs --jq '.jobs[] | select(.conclusion=="failure") | "  • \(.name)"'
+    echo "$JOBS_DATA" | jq -r '.[] | select(.conclusion=="failure") | "  • \(.name)"'
     echo ""
 
     # Collect all errors for summary
@@ -153,27 +161,34 @@ cmd_diagnose() {
 
     # Process each failed job
     for JOB_ID in $FAILED_JOBS; do
-        JOB_NAME=$(gh run view "$RUN_ID" --json jobs --jq ".jobs[] | select(.databaseId==$JOB_ID) | .name")
+        JOB_NAME=$(echo "$JOBS_DATA" | jq -r ".[] | select(.databaseId==$JOB_ID) | .name")
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         printf '%b📋 %s%b\n' "$BOLD" "$JOB_NAME" "$RESET"
 
         # Fetch logs
         LOGFILE=$(mktemp)
-        gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null > "$LOGFILE"
+        if ! gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null > "$LOGFILE"; then
+            echo "  ⚠️  Could not fetch logs for this job"
+            rm -f "$LOGFILE"
+            echo ""
+            continue
+        fi
 
         # Extract and display failures (filtered)
+        # Note: || true handles empty output (e.g., Rust jobs without pytest format)
         sed -n '/= FAILURES =/,/= short test summary/p' "$LOGFILE" | \
             sed 's/^[0-9T:.Z-]* //' | \
             grep -v "^= short test summary" | \
             filter_noise | \
             format_failures | \
-            head -500
+            head -500 || true
 
         # Collect errors for summary (from short test summary section)
+        # Extract just the core error message from FAILED lines for clean grouping
         sed -n '/short test summary/,/passed.*failed/p' "$LOGFILE" | \
-            grep "FAILED " | \
             sed 's/^[0-9T:.Z-]* //' | \
+            grep '^FAILED ' | \
             sed 's/FAILED [^ ]* - //' >> "$ALL_ERRORS_FILE" || true
 
         rm -f "$LOGFILE"

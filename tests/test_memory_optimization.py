@@ -15,6 +15,11 @@ from exec_sandbox import Scheduler, SchedulerConfig
 from exec_sandbox.models import ExecutionResult
 from exec_sandbox.warm_vm_pool import Language
 
+# Maximum concurrent VMs for stress tests. QEMU creates 5-15 threads per VM;
+# with pytest-xdist this can exhaust thread limits (SIGABRT). Value of 3 is
+# safe while still testing concurrency.
+_MAX_CONCURRENT_VMS = 3
+
 # ============================================================================
 # zram Tests
 # ============================================================================
@@ -448,11 +453,11 @@ class TestConcurrentVMs:
     """Tests for multiple VMs running concurrently with memory features."""
 
     async def test_concurrent_vms_with_heavy_memory_pressure(self, images_dir: Path) -> None:
-        """5 VMs should each handle 180MB allocation concurrently."""
+        """Concurrent VMs should each handle 180MB allocation."""
         config = SchedulerConfig(
             default_memory_mb=256,
             default_timeout_seconds=90,
-            max_concurrent_vms=5,
+            max_concurrent_vms=_MAX_CONCURRENT_VMS,
             images_dir=images_dir,
         )
 
@@ -480,28 +485,24 @@ with open('/proc/swaps') as f:
 
 print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
 """
-            # Run 5 VMs concurrently
-            tasks = [sched.run(code=code, language=Language.PYTHON) for _ in range(5)]
+            # Run VMs concurrently (limited by _MAX_CONCURRENT_VMS to avoid thread exhaustion)
+            tasks = [sched.run(code=code, language=Language.PYTHON) for _ in range(_MAX_CONCURRENT_VMS)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # All should succeed
-            success_count = 0
             for i, r in enumerate(results):
                 if isinstance(r, BaseException):
                     pytest.fail(f"VM {i + 1} failed with exception: {r}")
                 result: ExecutionResult = r
                 assert result.exit_code == 0, f"VM {i + 1} exit_code={result.exit_code}, stderr={result.stderr}"
                 assert "PASS" in result.stdout, f"VM {i + 1} output: {result.stdout}"
-                success_count += 1
-
-            assert success_count == 5, f"Only {success_count}/5 VMs succeeded"
 
     async def test_concurrent_vms_isolation(self, images_dir: Path) -> None:
         """Each VM should have independent memory space (no cross-contamination)."""
         config = SchedulerConfig(
             default_memory_mb=256,
             default_timeout_seconds=60,
-            max_concurrent_vms=3,
+            max_concurrent_vms=_MAX_CONCURRENT_VMS,
             images_dir=images_dir,
         )
 
@@ -534,7 +535,7 @@ print(f'PASS: VM{vm_id} hash={{h.hexdigest()[:16]}}')
 """
                 return await sched.run(code=code, language=Language.PYTHON)
 
-            tasks = [run_vm_with_signature(i) for i in range(3)]
+            tasks = [run_vm_with_signature(i) for i in range(_MAX_CONCURRENT_VMS)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             hashes: list[str] = []
@@ -551,7 +552,9 @@ print(f'PASS: VM{vm_id} hash={{h.hexdigest()[:16]}}')
                         hashes.append(h)
 
             # All hashes should be different (each VM has unique signature)
-            assert len(set(hashes)) == 3, f"Expected 3 unique hashes, got: {hashes}"
+            assert len(set(hashes)) == _MAX_CONCURRENT_VMS, (
+                f"Expected {_MAX_CONCURRENT_VMS} unique hashes, got: {hashes}"
+            )
 
 
 # ============================================================================
