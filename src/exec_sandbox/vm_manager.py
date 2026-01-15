@@ -2076,6 +2076,10 @@ class VmManager:
             # MTTCG is enabled by default for supported configs, no need to force it
             # tb-size=512 increases translation block cache for better code caching
             accel = "tcg,tb-size=512"
+            logger.warning(
+                "Using TCG software emulation (slow) - KVM/HVF not available",
+                extra={"vm_id": vm_id, "accel": accel},
+            )
 
         # Track whether to use virtio-console (hvc0) or ISA serial (ttyS0)
         # Determined per-architecture below
