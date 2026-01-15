@@ -269,16 +269,30 @@ class TestL2Cache:
         # First create a temporary backing file so qemu-img create succeeds
         temp_backing = tmp_path / "temp-base.qcow2"
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", str(temp_backing), "1M",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            str(temp_backing),
+            "1M",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
 
         # Create snapshot with backing file
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
-            "-b", str(temp_backing), str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            "-F",
+            "qcow2",
+            "-b",
+            str(temp_backing),
+            str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
         assert proc.returncode == 0
@@ -286,8 +300,16 @@ class TestL2Cache:
 
         # Rebase to non-existent backing file (simulates image rebuild/deletion)
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "rebase", "-u", "-b", str(fake_backing), "-F", "qcow2", str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "qemu-img",
+            "rebase",
+            "-u",
+            "-b",
+            str(fake_backing),
+            "-F",
+            "qcow2",
+            str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
 
@@ -314,8 +336,14 @@ class TestL2Cache:
         # Create a wrong backing file (not the expected base image)
         wrong_backing = tmp_path / "wrong-base.qcow2"
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", str(wrong_backing), "1M",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            str(wrong_backing),
+            "1M",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
 
@@ -325,9 +353,17 @@ class TestL2Cache:
         snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
 
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
-            "-b", str(wrong_backing), str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            "-F",
+            "qcow2",
+            "-b",
+            str(wrong_backing),
+            str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
         assert proc.returncode == 0
@@ -363,9 +399,17 @@ class TestL2Cache:
 
         # Create snapshot with correct backing file
         proc = await asyncio.create_subprocess_exec(
-            "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
-            "-b", str(base_image.resolve()), str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            "-F",
+            "qcow2",
+            "-b",
+            str(base_image.resolve()),
+            str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
         assert proc.returncode == 0
