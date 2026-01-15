@@ -8,7 +8,6 @@ Provides zero-memory-copy streaming for large files.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import http
 import os
 from pathlib import Path
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import AssetChecksumError, AssetDownloadError, AssetNotFoundError
+from exec_sandbox.hash_utils import IncrementalHasher, file_hash, parse_hash_spec
 from exec_sandbox.platform_utils import HostOS, detect_host_os, get_arch_name, get_os_name
 
 logger = get_logger(__name__)
@@ -130,16 +130,8 @@ async def _verify_hash(path: Path, expected_hash: str) -> bool:
     if not expected_hash:
         return True
 
-    algorithm, expected_digest = expected_hash.split(":", 1)
-
-    def _compute_hash() -> str:
-        hasher = hashlib.new(algorithm)
-        with path.open("rb") as f:
-            while chunk := f.read(CHUNK_SIZE):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-
-    actual_digest = await asyncio.to_thread(_compute_hash)
+    algorithm, expected_digest = parse_hash_spec(expected_hash)
+    actual_digest = await file_hash(path, algorithm)
     return actual_digest == expected_digest
 
 
@@ -185,8 +177,8 @@ async def _download_file(url: str, dest: Path, expected_hash: str, progressbar: 
     Hash is computed incrementally during download (no second pass).
     Uses atomic write pattern (temp file -> rename).
     """
-    algorithm, expected_digest = expected_hash.split(":", 1) if expected_hash else ("sha256", "")
-    hasher = hashlib.new(algorithm)
+    algorithm, expected_digest = parse_hash_spec(expected_hash) if expected_hash else ("sha256", "")
+    hasher = IncrementalHasher(algorithm)
     temp_path = dest.with_suffix(dest.suffix + ".tmp")
 
     if progressbar:

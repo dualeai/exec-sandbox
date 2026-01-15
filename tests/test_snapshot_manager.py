@@ -4,7 +4,6 @@ Unit tests: Cache key computation, filesystem operations.
 Integration tests: Snapshot creation with QEMU (requires images).
 """
 
-import hashlib
 import sys
 from pathlib import Path
 
@@ -17,6 +16,7 @@ else:
     from backports import zstd
 
 from exec_sandbox import __version__
+from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
 
 
@@ -36,14 +36,14 @@ class TestCacheKeyComputation:
 
     def test_cache_key_format(self) -> None:
         """Cache key format: {language}-v{version}-{16char_packages_hash}."""
-        # Simulate _compute_cache_key logic
+        # Simulate _compute_cache_key logic (without img_hash for simplicity)
         language = "python"
         version = _get_major_minor_version()
         packages = ["pandas==2.0.0", "numpy==1.24.0"]
 
-        # L2 format: sorted packages joined without separator, 16-char hash
+        # Package hash: 16-char CRC64
         packages_str = "".join(sorted(packages))
-        packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
+        packages_hash = crc64(packages_str)
         cache_key = f"{language}-v{version}-{packages_hash}"
 
         assert cache_key.startswith(f"python-v{version}-")
@@ -55,10 +55,9 @@ class TestCacheKeyComputation:
         """Same inputs produce same cache key."""
         packages = ["pandas==2.0.0", "numpy==1.24.0"]
 
-        # L2 format: joined without separator
         packages_str = "".join(sorted(packages))
-        hash1 = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
-        hash2 = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
+        hash1 = crc64(packages_str)
+        hash2 = crc64(packages_str)
 
         assert hash1 == hash2
 
@@ -67,9 +66,8 @@ class TestCacheKeyComputation:
         packages1 = ["pandas==2.0.0", "numpy==1.24.0"]
         packages2 = ["numpy==1.24.0", "pandas==2.0.0"]
 
-        # L2 format: joined without separator
-        hash1 = hashlib.sha256("".join(sorted(packages1)).encode()).hexdigest()[:16]
-        hash2 = hashlib.sha256("".join(sorted(packages2)).encode()).hexdigest()[:16]
+        hash1 = crc64("".join(sorted(packages1)))
+        hash2 = crc64("".join(sorted(packages2)))
 
         assert hash1 == hash2
 
@@ -78,17 +76,17 @@ class TestCacheKeyComputation:
         version = _get_major_minor_version()
         packages = ["lodash@4.17.21"]
 
-        # L2 format: with version
-        key1 = f"python-v{version}-{hashlib.sha256(''.join(sorted(packages)).encode()).hexdigest()[:16]}"
-        key2 = f"javascript-v{version}-{hashlib.sha256(''.join(sorted(packages)).encode()).hexdigest()[:16]}"
+        key1 = f"python-v{version}-{crc64(''.join(sorted(packages)))}"
+        key2 = f"javascript-v{version}-{crc64(''.join(sorted(packages)))}"
 
         assert key1 != key2
 
     def test_cache_key_empty_packages(self) -> None:
         """Empty packages list produces '{language}-v{version}-base' key."""
         version = _get_major_minor_version()
-        # L2 format: empty packages = "{language}-v{version}-base"
-        cache_key = f"python-v{version}-base"
+        # L2 format: empty packages = "{language}-v{version}-{img_hash}-base"
+        # For this test, we just verify the pattern ends with "-base"
+        cache_key = f"python-v{version}-xxxxxxxx-base"
 
         assert cache_key.startswith(f"python-v{version}-")
         assert cache_key.endswith("-base")

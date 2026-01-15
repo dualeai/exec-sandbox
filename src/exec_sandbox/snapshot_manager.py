@@ -16,10 +16,8 @@ Snapshot structure:
 from __future__ import annotations
 
 import asyncio
-import binascii
 import contextlib
 import errno
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -44,6 +42,7 @@ from exec_sandbox.guest_agent_protocol import (
     OutputChunkMessage,
     StreamingErrorMessage,
 )
+from exec_sandbox.hash_utils import crc32, crc64
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
@@ -243,7 +242,7 @@ class SnapshotManager:
         if not packages:
             return f"{base}-base"
         packages_str = "".join(sorted(packages))
-        packages_hash = hashlib.sha256(packages_str.encode()).hexdigest()[:16]
+        packages_hash = crc64(packages_str)
         return f"{base}-{packages_hash}"
 
     def _get_base_image_hash(self, base_image: Path) -> str:
@@ -262,9 +261,7 @@ class SnapshotManager:
             stat = base_image.stat()
             # Combine mtime (nanoseconds) + size for unique fingerprint
             fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
-            # CRC32 is appropriate for non-cryptographic fingerprints (fast, 32-bit output)
-            crc = binascii.crc32(fingerprint.encode()) & 0xFFFFFFFF
-            return f"{crc:08x}"
+            return crc32(fingerprint)
         except OSError:
             # If image doesn't exist, return placeholder (will fail later anyway)
             return "missing0"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import sys
 import tracemalloc
 from pathlib import Path
@@ -23,6 +22,7 @@ from exec_sandbox.asset_downloader import (
     untar,
 )
 from exec_sandbox.exceptions import AssetDownloadError, AssetNotFoundError
+from exec_sandbox.hash_utils import IncrementalHasher, bytes_hash
 from exec_sandbox.platform_utils import HostOS
 
 
@@ -135,7 +135,7 @@ class TestRetrieve:
     async def test_downloads_and_caches(self, tmp_path: Path):
         """Should download file and cache it locally."""
         content = b"hello world"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         with aioresponses() as m:
             m.get(
@@ -155,7 +155,7 @@ class TestRetrieve:
     async def test_uses_cache_on_second_call(self, tmp_path: Path):
         """Should use cached file on second call without re-downloading."""
         content = b"cached content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         with aioresponses() as m:
             m.get("https://example.com/cached.txt", body=content)
@@ -261,7 +261,7 @@ class TestRetrieve:
     async def test_processor_is_called(self, tmp_path: Path):
         """Should call processor function after download."""
         content = b"original content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         # Track if processor was called
         processor_called = False
@@ -293,7 +293,7 @@ class TestRetrieve:
     async def test_redownloads_on_hash_mismatch(self, tmp_path: Path):
         """Should re-download when cached file has wrong hash."""
         content = b"correct content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         # Pre-populate cache with wrong content
         cached_file = tmp_path / "cached.txt"
@@ -325,7 +325,7 @@ class TestRetrieve:
 
         # Write file in chunks to avoid memory spike during setup
         chunk = b"x" * (64 * 1024)  # 64KB chunks
-        hasher = hashlib.sha256()
+        hasher = IncrementalHasher()
         with large_file.open("wb") as f:
             for _ in range(file_size // len(chunk)):
                 f.write(chunk)
@@ -343,7 +343,7 @@ class TestRetrieve:
         # Peak memory should be bounded by:
         # - 64KB chunk buffer
         # - ~130KB Python file I/O baseline overhead
-        # - hashlib internal state
+        # - IncrementalHasher internal state
         # - asyncio.to_thread overhead (~100KB)
         # - Free-threaded Python (3.14t+) has ~150KB additional overhead
         # Empirically: ~350KB for 64KB chunks, ~550KB on 3.14t
@@ -384,7 +384,7 @@ class TestAsyncPooch:
     async def test_fetch_downloads_file(self, tmp_path: Path):
         """Should download file from registry."""
         content = b"registry content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         pooch = AsyncPooch(
             path=tmp_path,
@@ -558,7 +558,7 @@ class TestAsyncPooch:
     async def test_fetch_fallback_to_configured_version(self, tmp_path: Path):
         """Should use configured version when _resolved_version is not set."""
         content = b"fallback content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         pooch = AsyncPooch(
             path=tmp_path,
@@ -579,7 +579,7 @@ class TestAsyncPooch:
     async def test_fetch_uses_resolved_version_from_github(self, tmp_path: Path):
         """Should use actual tag from GitHub API instead of configured version."""
         content = b"resolved version content"
-        content_hash = hashlib.sha256(content).hexdigest()
+        content_hash = bytes_hash(content)
 
         pooch = AsyncPooch(
             path=tmp_path,
