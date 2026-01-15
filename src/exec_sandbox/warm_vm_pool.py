@@ -486,7 +486,15 @@ class WarmVMPool:
     async def _deflate_balloon(self, vm: QemuVM) -> None:
         """Deflate balloon to restore guest memory before code execution.
 
-        Deflating the balloon returns memory TO the guest.
+        Deflating the balloon returns memory TO the guest. Uses fire-and-forget
+        mode (wait_for_target=False) to avoid blocking - the balloon command is
+        sent immediately and memory is restored progressively while code runs.
+
+        This eliminates up to 5s of polling overhead on slow systems (nested
+        virtualization) where balloon operations are degraded. Most code doesn't
+        need the full 256MB immediately - the 64MB idle memory is sufficient
+        for runtime startup, and additional memory becomes available within ~1s.
+
         Graceful degradation: logs warning and continues if balloon fails.
 
         Args:
@@ -497,7 +505,7 @@ class WarmVMPool:
             client = BalloonClient(vm.qmp_socket, expected_uid)
             await client.connect()
             try:
-                await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB)
+                await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB, wait_for_target=False)
                 logger.debug(
                     "Balloon deflated for warm pool VM",
                     extra={"vm_id": vm.vm_id, "target_mb": constants.DEFAULT_MEMORY_MB},

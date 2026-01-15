@@ -914,10 +914,9 @@ class TestSchedulerWarmPoolTiming:
     async def test_warm_pool_total_approximately_equals_execute(self, warm_pool_scheduler: Scheduler) -> None:
         """For warm pool, total_ms should be close to execute_ms (no boot overhead).
 
-        Note: Uses skip_unless_fast_balloon (not skip_unless_hwaccel) because total_ms
-        includes balloon deflation time from warm_pool.get_vm(). On nested virtualization
-        (CI runners), balloon operations timeout after ~5s of retries, making the 100ms
-        tolerance impossible even when KVM is technically available.
+        Note: Balloon deflation uses fire-and-forget mode (wait_for_target=False) to
+        avoid the 5s polling overhead. The skip marker is kept as a safety margin for
+        other potential timing variations on slow/nested virtualization environments.
         """
         result = await warm_pool_scheduler.run(
             code="print('hello')",
