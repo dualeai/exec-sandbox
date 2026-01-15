@@ -27,8 +27,11 @@ class TestBalloonClientUnit:
         """Mock the connect_and_verify function."""
         with patch("exec_sandbox.balloon_client.connect_and_verify") as mock:
             reader = AsyncMock()
-            writer = AsyncMock()
-            # Configure writer.transport.get_extra_info
+            # writer must be MagicMock because write() and close() are sync methods
+            # on StreamWriter - only drain() and wait_closed() are async
+            writer = MagicMock()
+            writer.drain = AsyncMock()
+            writer.wait_closed = AsyncMock()
             writer.transport = MagicMock()
 
             mock.return_value = (reader, writer)
