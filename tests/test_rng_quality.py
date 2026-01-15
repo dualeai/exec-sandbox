@@ -210,30 +210,39 @@ print("PASS" if ratio > 0.99 else "FAIL")
         assert "PASS" in result.stdout
 
     async def test_monte_carlo_pi(self, scheduler: Scheduler) -> None:
-        """Monte Carlo pi estimation - tests 2D uniformity."""
+        """Monte Carlo pi estimation - tests 2D uniformity.
+
+        Uses 3 attempts to reduce false positive rate from ~5% to ~0.01%.
+        A truly broken RNG would fail all attempts consistently.
+        """
         code = """
 import os
 import struct
 import math
 
-# Generate coordinate pairs
-data = os.urandom(4 * 100000)  # 100k pairs of 16-bit coords
-coords = struct.unpack(f"{len(data)//2}H", data)
+def estimate_pi(n_samples=100000):
+    data = os.urandom(4 * n_samples)  # n pairs of 16-bit coords
+    coords = struct.unpack(f"{len(data)//2}H", data)
 
-inside = 0
-for i in range(0, len(coords), 2):
-    x = coords[i] / 65535.0
-    y = coords[i+1] / 65535.0
-    if x*x + y*y <= 1.0:
-        inside += 1
+    inside = 0
+    for i in range(0, len(coords), 2):
+        x = coords[i] / 65535.0
+        y = coords[i+1] / 65535.0
+        if x*x + y*y <= 1.0:
+            inside += 1
 
-pi_estimate = 4.0 * inside / (len(coords) // 2)
-error = abs(pi_estimate - math.pi)
+    return 4.0 * inside / (len(coords) // 2)
 
-print(f"PI_ESTIMATE:{pi_estimate:.6f}")
-print(f"ERROR:{error:.6f}")
-# Error should be < 0.01 with 100k samples
-print("PASS" if error < 0.01 else "FAIL")
+# Try up to 3 times - reduces false positive rate from ~5% to ~0.01%
+for attempt in range(3):
+    pi_estimate = estimate_pi()
+    error = abs(pi_estimate - math.pi)
+    print(f"ATTEMPT:{attempt + 1} PI:{pi_estimate:.6f} ERROR:{error:.6f}")
+    if error < 0.01:
+        print("PASS")
+        break
+else:
+    print("FAIL")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
 
