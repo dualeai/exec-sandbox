@@ -7,6 +7,7 @@ Provides PID-reuse safe process management wrappers.
 import asyncio
 import contextlib
 import platform
+import time
 from enum import Enum, auto
 from functools import cache
 from typing import Literal
@@ -155,10 +156,14 @@ class ProcessWrapper:
         self.psutil_proc: psutil.Process | None = None
 
         # Wrap with psutil for PID-reuse safe monitoring
+        # Retry a few times to handle race conditions on free-threaded Python
+        # where the process may not be immediately visible to psutil
         if async_proc.pid:
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                # Process already died or inaccessible
-                self.psutil_proc = psutil.Process(async_proc.pid)
+            for _ in range(3):
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    self.psutil_proc = psutil.Process(async_proc.pid)
+                    break
+                time.sleep(0.001)  # 1ms retry delay
 
     async def is_running(self) -> bool:
         """Check if process is still running (PID-reuse safe).
