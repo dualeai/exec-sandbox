@@ -36,9 +36,16 @@ CGROUP_APP_NAMESPACE: Final[str] = "code-exec"
 CGROUP_MEMORY_OVERHEAD_MB: Final[int] = 200
 """QEMU process overhead added to guest memory for cgroup limits."""
 
-TCG_TB_CACHE_SIZE_MB: Final[int] = 512
+TCG_TB_CACHE_SIZE_MB: Final[int] = 256
 """TCG translation block cache size in MB (must match tb-size in vm_manager.py).
-QEMU 5.0+ defaults to 1GB, we use 512MB for better CI compatibility.
+
+QEMU 5.0+ defaults to 1GB which causes OOM on CI runners with multiple VMs.
+We use 256MB as a balance between cache hit rate and memory usage:
+- 32MB (old default): ~15 TB flushes, slower but minimal memory
+- 256MB (our choice): ~5 TB flushes, good balance for CI workloads
+- 512MB: ~3 TB flushes, better perf but higher memory pressure
+- 1GB (QEMU default): ~1 TB flush, best perf but OOM risk
+
 See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache"""
 
 CGROUP_PIDS_LIMIT: Final[int] = 100
@@ -180,8 +187,8 @@ async def setup_cgroup(
         or environments without cgroup v2 support.
 
         TCG mode requires significantly more memory due to the translation block (TB) cache.
-        QEMU 5.0+ defaults to 1GB TB cache; we use 512MB (tb-size=512) but still need to
-        account for this overhead. See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache
+        QEMU 5.0+ defaults to 1GB TB cache; we use 256MB (tb-size=256) as a balance between
+        cache hit rate and memory pressure. See TCG_TB_CACHE_SIZE_MB for details.
     """
     tenant_cgroup = Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/{tenant_id}")
     cgroup_path = tenant_cgroup / vm_id
@@ -198,8 +205,8 @@ async def setup_cgroup(
         await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
 
         # Calculate memory limit based on virtualization mode:
-        # - KVM/HVF: guest_mb + process overhead (~200MB)
-        # - TCG: guest_mb + TB cache (512MB) + process overhead (~200MB)
+        # - KVM/HVF: guest_mb + process overhead (CGROUP_MEMORY_OVERHEAD_MB)
+        # - TCG: guest_mb + TB cache (TCG_TB_CACHE_SIZE_MB) + process overhead
         # TCG needs the TB cache for JIT-compiled code translation blocks
         cgroup_memory_mb = memory_mb + CGROUP_MEMORY_OVERHEAD_MB
         if use_tcg:

@@ -2073,9 +2073,19 @@ class VmManager:
             accel = "kvm"
         else:
             # TCG software emulation fallback (12x slower than KVM/HVF)
-            # MTTCG is enabled by default for supported configs, no need to force it
-            # tb-size=512 increases translation block cache for better code caching
-            accel = "tcg,tb-size=512"
+            #
+            # thread=single: Disable MTTCG to reduce thread count per VM. Without this,
+            # each VM creates multiple threads for parallel translation, exhausting
+            # system thread limits when running parallel tests (qemu_thread_create:
+            # Resource temporarily unavailable). Single-threaded TCG is slower but
+            # prevents SIGABRT crashes on CI runners without KVM.
+            # See: https://www.qemu.org/docs/master/devel/multi-thread-tcg.html
+            #
+            # tb-size: Translation block cache size in MB. QEMU 5.0+ defaults to 1GB
+            # which causes OOM on CI runners with multiple VMs. Must match
+            # cgroup.TCG_TB_CACHE_SIZE_MB for correct cgroup memory limits.
+            # See cgroup.py for size rationale and benchmarks.
+            accel = f"tcg,thread=single,tb-size={cgroup.TCG_TB_CACHE_SIZE_MB}"
             logger.warning(
                 "Using TCG software emulation (slow) - KVM/HVF not available",
                 extra={"vm_id": vm_id, "accel": accel},
