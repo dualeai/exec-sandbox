@@ -404,21 +404,25 @@ print(hashlib.sha256(data).hexdigest())
         assert hashes[0] != hashes[1], "CRITICAL: VMs produced identical random!"
 
     async def test_multiple_vms_all_unique(self, scheduler: Scheduler) -> None:
-        """Five VMs must all produce unique random outputs."""
-        import asyncio
+        """Three VMs must all produce unique random outputs.
 
+        Runs sequentially to avoid thread exhaustion on CI runners.
+        """
         code = """
 import os
 import hashlib
 data = os.urandom(1024)
 print(hashlib.sha256(data).hexdigest())
 """
-        # Run in 5 VMs concurrently
-        results = await asyncio.gather(*[scheduler.run(code=code, language=Language.PYTHON) for _ in range(5)])
+        # Run 3 VMs sequentially to avoid thread exhaustion on CI
+        # (pytest -n auto + 5 concurrent VMs can exceed thread limits)
+        hashes: list[str] = []
+        for _ in range(3):
+            result = await scheduler.run(code=code, language=Language.PYTHON)
+            hashes.append(result.stdout.strip())
 
-        hashes = [r.stdout.strip() for r in results]
-        assert len(hashes) == 5
-        assert len(set(hashes)) == 5, f"Duplicate hashes found: {hashes}"
+        assert len(hashes) == 3
+        assert len(set(hashes)) == 3, f"Duplicate hashes found: {hashes}"
 
 
 # =============================================================================

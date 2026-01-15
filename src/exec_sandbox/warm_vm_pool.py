@@ -671,6 +671,15 @@ class WarmVMPool:
         Returns:
             True if healthy, False otherwise
         """
+        # Fast fail: Check if QEMU process is still running before socket check
+        # This catches killed VMs immediately without waiting for socket timeouts
+        if not await vm.process.is_running():
+            logger.warning(
+                "VM process not running (killed or crashed)",
+                extra={"vm_id": vm.vm_id},
+            )
+            return False
+
         from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
             PingRequest,
             PongMessage,
