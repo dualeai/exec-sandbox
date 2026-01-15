@@ -228,26 +228,26 @@ class TestGetOwner:
 class TestCanAccess:
     """Tests for can_access function."""
 
-    def test_readable_file(self, tmp_path: Path) -> None:
+    async def test_readable_file(self, tmp_path: Path) -> None:
         """can_access returns True for readable file."""
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
         test_file.chmod(0o644)
 
-        assert can_access(test_file, os.R_OK) is True
+        assert await can_access(test_file, os.R_OK) is True
 
-    def test_nonexistent_file(self, tmp_path: Path) -> None:
+    async def test_nonexistent_file(self, tmp_path: Path) -> None:
         """can_access returns False for nonexistent file."""
         nonexistent = tmp_path / "nonexistent.txt"
 
-        assert can_access(nonexistent, os.R_OK) is False
+        assert await can_access(nonexistent, os.R_OK) is False
 
-    def test_write_access(self, tmp_path: Path) -> None:
+    async def test_write_access(self, tmp_path: Path) -> None:
         """can_access checks write permission."""
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
-        assert can_access(test_file, os.W_OK) is True
+        assert await can_access(test_file, os.W_OK) is True
 
 
 class TestEnsureTraversable:

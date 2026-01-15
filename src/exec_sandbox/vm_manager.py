@@ -22,12 +22,12 @@ import asyncio
 import contextlib
 import ctypes
 import errno
-import fcntl
 import json
 import logging
 import os
 import platform
 import signal
+import sys
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
@@ -201,7 +201,7 @@ class _ProbeCache:
 _probe_cache = _ProbeCache()
 
 
-def _check_kvm_available() -> bool:
+async def _check_kvm_available() -> bool:
     """Check if KVM acceleration is available and accessible (cached).
 
     KVM vs TCG: Virtualization modes with vastly different characteristics
@@ -234,8 +234,8 @@ def _check_kvm_available() -> bool:
     if _probe_cache.kvm is not None:
         return _probe_cache.kvm
 
-    kvm_path = Path("/dev/kvm")
-    if not kvm_path.exists():
+    kvm_path = "/dev/kvm"
+    if not await aiofiles.os.path.exists(kvm_path):
         logger.debug("KVM not available: /dev/kvm does not exist")
         _probe_cache.kvm = False
         return False
@@ -243,35 +243,39 @@ def _check_kvm_available() -> bool:
     # Check if we can actually access /dev/kvm (not just that it exists)
     # This catches permission issues that would cause QEMU to fail or hang
     # See: https://github.com/actions/runner-images/issues/8542
+    if not await can_access(kvm_path, os.R_OK | os.W_OK):
+        logger.debug("KVM not available: permission denied on /dev/kvm")
+        _probe_cache.kvm = False
+        return False
+
+    # Actually try to open /dev/kvm and check API version via subprocess
+    # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
+    # Uses subprocess to avoid blocking the event loop with ioctl()
     try:
-        # Check actual permission for the current user (uses os.access internally)
-        if not can_access(kvm_path, os.R_OK | os.W_OK):
-            logger.debug("KVM not available: permission denied on /dev/kvm")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            logger.warning("KVM device accessible but ioctl failed")
             _probe_cache.kvm = False
             return False
 
-        # Actually try to open /dev/kvm to verify it works
-        # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
-        with kvm_path.open("rb") as f:
-            try:
-                api_version = fcntl.ioctl(f.fileno(), _KVM_GET_API_VERSION)
-                _probe_cache.kvm = api_version == _KVM_API_VERSION_EXPECTED
-                if _probe_cache.kvm:
-                    logger.debug("KVM available and working", extra={"api_version": api_version})
-                else:
-                    logger.warning(
-                        "KVM available but unexpected API version",
-                        extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
-                    )
-            except OSError as e:
-                # ioctl failed - KVM not actually usable
-                logger.warning(
-                    "KVM device accessible but ioctl failed",
-                    extra={"error": str(e)},
-                )
-                _probe_cache.kvm = False
-    except OSError as e:
-        logger.debug("KVM not available: failed to open /dev/kvm", extra={"error": str(e)})
+        api_version = int(stdout.decode().strip())
+        _probe_cache.kvm = api_version == _KVM_API_VERSION_EXPECTED
+        if _probe_cache.kvm:
+            logger.debug("KVM available and working", extra={"api_version": api_version})
+        else:
+            logger.warning(
+                "KVM available but unexpected API version",
+                extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
+            )
+    except (OSError, TimeoutError, ValueError) as e:
+        logger.debug("KVM not available: failed to verify /dev/kvm", extra={"error": str(e)})
         _probe_cache.kvm = False
 
     return _probe_cache.kvm
@@ -312,6 +316,100 @@ async def _check_hvf_available() -> bool:
         _probe_cache.hvf = False
 
     return _probe_cache.hvf
+
+
+def check_hwaccel_available() -> bool:
+    """Check if hardware acceleration (KVM or HVF) is available.
+
+    Synchronous function for use in pytest skipif markers.
+    TCG (software emulation) is 10-50x slower than hardware virtualization,
+    making timing-sensitive tests unreliable.
+
+    Returns:
+        True if KVM (Linux) or HVF (macOS) is available
+        False otherwise (will use TCG software emulation)
+    """
+    host_os = detect_host_os()
+
+    if host_os == HostOS.LINUX:
+        return asyncio.run(_check_kvm_available())
+    if host_os == HostOS.MACOS:
+        return asyncio.run(_check_hvf_available())
+    return False
+
+
+def check_fast_balloon_available() -> bool:
+    """Check if fast balloon operations are expected (not degraded nested virtualization).
+
+    Synchronous function for use in pytest skipif markers.
+    Used for timing-sensitive tests that include balloon inflate/deflate overhead.
+
+    Background
+    ==========
+    Balloon operations (memory reclaim via virtio-balloon) have vastly different
+    performance characteristics depending on the virtualization environment:
+
+    - Bare-metal KVM: Balloon operations complete in <100ms
+    - Nested KVM (CI runners): Balloon operations can take 5+ seconds due to
+      hypervisor overhead, often timing out after retry limits
+
+    The Problem
+    ===========
+    GitHub Actions runners are VMs on Azure, creating nested virtualization when
+    running QEMU. Even when /dev/kvm exists and KVM "works", balloon operations
+    are significantly degraded:
+
+    1. KVM availability is inconsistent on GitHub Actions - "/dev/kvm sometimes
+       exists (and works!), and sometimes it doesn't" (GitHub community #8305)
+
+    2. pytest-xdist workers perform independent test collection, so flaky KVM
+       detection can cause tests to run on workers where KVM isn't actually fast
+
+    3. TSC_DEADLINE timer (required for efficient APIC timer virtualization) is
+       often not exposed to nested VMs, causing timer fallback to slower modes
+
+    Solution
+    ========
+    Use TSC_DEADLINE availability as a proxy for "fast virtualization":
+
+    - TSC_DEADLINE is a CPU feature, not a kernel module state - deterministic
+    - When missing, QEMU enables legacy PIT/PIC timers (slower, more overhead)
+    - Reliably identifies degraded nested virt vs bare-metal/L1 KVM
+
+    References
+    ==========
+    - Linux kernel timekeeping: https://docs.kernel.org/virt/kvm/x86/timekeeping.html
+    - QEMU Hyper-V enlightenments: https://www.qemu.org/docs/master/system/i386/hyperv.html
+    - GitHub Actions KVM issues: https://github.com/actions/runner-images/issues/8542
+    - pytest-xdist collection: https://pytest-xdist.readthedocs.io/en/stable/how-it-works.html
+
+    Returns:
+        True if balloon operations are expected to be fast:
+          - Linux x86_64: KVM available AND TSC_DEADLINE available
+          - Linux ARM64: KVM available (ARM uses different timer, less affected)
+          - macOS: HVF available (nested virt not possible on macOS)
+        False otherwise (balloon operations may be slow, skip timing tests)
+    """
+    if not check_hwaccel_available():
+        return False
+
+    host_os = detect_host_os()
+    host_arch = detect_host_arch()
+
+    # On Linux x86_64, TSC_DEADLINE absence indicates degraded nested virt
+    # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+    if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
+        return asyncio.run(_check_tsc_deadline_available())
+
+    # On macOS, HVF availability implies not nested (macOS doesn't support nested virt)
+    # If we got here, HVF is available, so balloon should be fast
+    if host_os == HostOS.MACOS:
+        return True
+
+    # On ARM64 Linux, KVM availability is sufficient
+    # ARM uses GIC timer (not TSC/APIC), less affected by nested virt overhead
+    # Unknown platform: conservative assumption (return False)
+    return host_os == HostOS.LINUX and host_arch == HostArch.AARCH64
 
 
 async def _check_tsc_deadline_available() -> bool:
@@ -1952,7 +2050,7 @@ class VmManager:
         """
         if self.settings.force_emulation:
             return AccelType.TCG
-        if _check_kvm_available():
+        if await _check_kvm_available():
             return AccelType.KVM
         if detect_host_os() == HostOS.MACOS and await _check_hvf_available():
             return AccelType.HVF

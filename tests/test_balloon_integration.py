@@ -11,6 +11,8 @@ from exec_sandbox.balloon_client import BalloonClient, BalloonError
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
 
+from .conftest import skip_unless_fast_balloon
+
 # Code to run inside VM to get MemAvailable (more accurate than MemTotal)
 GET_MEM_AVAILABLE_CODE = """
 with open('/proc/meminfo') as f:
@@ -53,6 +55,7 @@ except MemoryError:
 """
 
 
+@skip_unless_fast_balloon
 class TestBalloonInsideVM:
     """Tests that verify balloon operations via actual memory allocation inside VM."""
 
@@ -222,6 +225,7 @@ class TestBalloonInsideVM:
             await vm_manager.destroy_vm(vm)
 
 
+@skip_unless_fast_balloon
 class TestBalloonEdgeCases:
     """Edge case tests for balloon operations."""
 
@@ -378,6 +382,7 @@ class TestBalloonEdgeCases:
             await vm_manager.destroy_vm(vm)
 
 
+@skip_unless_fast_balloon
 class TestBalloonMemoryPressure:
     """Tests for balloon under memory pressure conditions."""
 
@@ -431,6 +436,7 @@ class TestBalloonMemoryPressure:
             await vm_manager.destroy_vm(vm)
 
 
+@skip_unless_fast_balloon
 class TestBalloonErrorHandling:
     """Tests for balloon error handling."""
 
@@ -511,6 +517,7 @@ class TestBalloonErrorHandling:
             await vm_manager.destroy_vm(vm)
 
 
+@skip_unless_fast_balloon
 class TestBalloonWarmPoolSimulation:
     """Tests that simulate actual warm pool usage patterns."""
 

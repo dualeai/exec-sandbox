@@ -94,15 +94,15 @@ class TestStateTransitions:
 class TestKvmDetection:
     """Tests for KVM availability detection."""
 
-    def test_kvm_detection_runs(self) -> None:
+    async def test_kvm_detection_runs(self) -> None:
         """_check_kvm_available returns a boolean."""
-        result = _check_kvm_available()
+        result = await _check_kvm_available()
         assert isinstance(result, bool)
 
     @skip_unless_macos
-    def test_kvm_not_available_on_macos(self) -> None:
+    async def test_kvm_not_available_on_macos(self) -> None:
         """KVM is never available on macOS."""
-        kvm_available = _check_kvm_available()
+        kvm_available = await _check_kvm_available()
         assert kvm_available is False
 
 
@@ -366,7 +366,7 @@ class TestAllImageTypes:
 
             # Check what hardware acceleration should be available
             # Note: HVF is macOS-only, KVM is Linux-only
-            kvm_available = _check_kvm_available()
+            kvm_available = await _check_kvm_available()
             hvf_available = await _check_hvf_available()
 
             if hvf_available:

@@ -10,10 +10,32 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_manager import check_fast_balloon_available, check_hwaccel_available
 
 # ============================================================================
 # Shared Skip Markers
 # ============================================================================
+
+# Skip marker for timing-sensitive tests that require hardware acceleration.
+# TCG (software emulation) is 10-50x slower than KVM/HVF, making these tests
+# unreliable on GitHub Actions macOS runners (no nested virtualization).
+skip_unless_hwaccel = pytest.mark.skipif(
+    not check_hwaccel_available(),
+    reason="Requires hardware acceleration (KVM/HVF) - TCG too slow for timing-sensitive tests",
+)
+
+# Skip marker for tests with tight timing assertions that include balloon overhead.
+# Even with KVM available, nested virtualization (GitHub Actions runners on Azure)
+# causes balloon operations to be 50-100x slower than bare-metal. This marker
+# requires both hwaccel AND TSC_DEADLINE (x86_64) to ensure fast balloon ops.
+# See check_fast_balloon_available() docstring for full rationale and references.
+skip_unless_fast_balloon = pytest.mark.skipif(
+    not check_fast_balloon_available(),
+    reason=(
+        "Requires fast balloon operations - nested virtualization (CI runners) causes "
+        "balloon timeouts. TSC_DEADLINE CPU feature missing indicates degraded nested virt."
+    ),
+)
 
 # Skip marker for Linux-only tests (cgroups, virtual memory ulimit, etc.)
 skip_unless_linux = pytest.mark.skipif(

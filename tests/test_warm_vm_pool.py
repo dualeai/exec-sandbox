@@ -14,6 +14,8 @@ from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 
+from .conftest import skip_unless_hwaccel
+
 # ============================================================================
 # Unit Tests - No QEMU needed
 # ============================================================================
@@ -187,6 +189,7 @@ class TestHealthCheckPoolUnit:
 # ============================================================================
 
 
+@skip_unless_hwaccel
 class TestWarmVMPoolIntegration:
     """Integration tests for WarmVMPool with real QEMU VMs."""
 
@@ -253,6 +256,7 @@ class TestWarmVMPoolIntegration:
 # ============================================================================
 
 
+@skip_unless_hwaccel
 class TestHealthcheckIntegration:
     """Integration tests for healthcheck with real QEMU VMs."""
 

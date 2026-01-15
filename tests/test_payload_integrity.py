@@ -17,6 +17,8 @@ import pytest
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
+from .conftest import skip_unless_hwaccel
+
 # =============================================================================
 # Payload size fixtures - from tiny to max stdout limit
 # =============================================================================
@@ -492,6 +494,7 @@ class TestLargePayloadStreaming:
 # Measure raw streaming throughput by minimizing generation overhead
 
 
+@skip_unless_hwaccel
 class TestStreamingThroughput:
     """Benchmark tests to measure raw streaming throughput.
 

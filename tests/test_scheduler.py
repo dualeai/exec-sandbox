@@ -12,6 +12,7 @@ from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from tests.conftest import skip_unless_fast_balloon
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -909,8 +910,15 @@ class TestSchedulerWarmPoolTiming:
         assert result.timing.execute_ms >= 40  # Allow some variance
         assert result.timing.total_ms >= 40
 
+    @skip_unless_fast_balloon
     async def test_warm_pool_total_approximately_equals_execute(self, warm_pool_scheduler: Scheduler) -> None:
-        """For warm pool, total_ms should be close to execute_ms (no boot overhead)."""
+        """For warm pool, total_ms should be close to execute_ms (no boot overhead).
+
+        Note: Uses skip_unless_fast_balloon (not skip_unless_hwaccel) because total_ms
+        includes balloon deflation time from warm_pool.get_vm(). On nested virtualization
+        (CI runners), balloon operations timeout after ~5s of retries, making the 100ms
+        tolerance impossible even when KVM is technically available.
+        """
         result = await warm_pool_scheduler.run(
             code="print('hello')",
             language=Language.PYTHON,
