@@ -260,6 +260,7 @@ class TestL2Cache:
     async def test_l1_evict_oldest_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """_evict_oldest_snapshot removes oldest file by atime."""
         import asyncio
+        import os
         import time
 
         from exec_sandbox.snapshot_manager import SnapshotManager
@@ -270,41 +271,30 @@ class TestL2Cache:
         vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
-        # Create multiple snapshots with staggered atimes
+        # Create multiple snapshots
         oldest_path = settings.snapshot_cache_dir / "python-oldest.qcow2"
         newest_path = settings.snapshot_cache_dir / "python-newest.qcow2"
 
-        # Create oldest first
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(oldest_path),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
+        # Create both files
+        for path in [oldest_path, newest_path]:
+            proc = await asyncio.create_subprocess_exec(
+                "qemu-img",
+                "create",
+                "-f",
+                "qcow2",
+                str(path),
+                "1M",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
 
-        # Small delay to ensure different atime
-        time.sleep(0.1)
-
-        # Create newest
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(newest_path),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        # Touch newest to update atime
-        newest_path.touch()
+        # Explicitly set atimes to ensure deterministic ordering
+        # (avoids relying on filesystem atime behavior which varies across platforms,
+        # especially on macOS APFS which uses relatime semantics)
+        now = time.time()
+        os.utime(oldest_path, (now - 100, now))  # atime=100s ago, mtime=now
+        os.utime(newest_path, (now, now))  # atime=now, mtime=now
 
         assert oldest_path.exists()
         assert newest_path.exists()
