@@ -537,7 +537,10 @@ class TestHealthcheckIntegration:
         SIGSTOP freezes the QEMU process, making it unresponsive.
         The health check should timeout and mark it unhealthy.
         """
+        import os
         import signal
+
+        import psutil
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
@@ -557,9 +560,19 @@ class TestHealthcheckIntegration:
 
             # Freeze the QEMU process (simulate hang)
             assert vm.process.pid is not None
-            import os
-
             os.kill(vm.process.pid, signal.SIGSTOP)
+
+            # Wait for process to actually stop - SIGSTOP is async, os.kill()
+            # returns before the kernel fully stops the process. Without this,
+            # there's a race where QEMU can respond to the health check ping
+            # before being frozen.
+            proc = psutil.Process(vm.process.pid)
+            for _ in range(100):  # 1s max
+                if proc.status() == psutil.STATUS_STOPPED:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"QEMU process did not stop within 1s (status: {proc.status()})")
 
             try:
                 # Health check should timeout and return unhealthy
