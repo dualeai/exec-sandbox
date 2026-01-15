@@ -152,20 +152,26 @@ class TestSnapshotManagerIntegration:
             packages=["pandas==2.0.0", "numpy==1.24.0"],
         )
 
-        # L2 format: python-v{version}-{16-char hash}
+        # L2 format: python-v{version}-{img_hash}-{pkg_hash}
         version = _get_major_minor_version()
         assert key.startswith(f"python-v{version}-")
-        # Hash is 16 chars (last part after splitting by -)
+        # Format: python-v{version}-{8-char img_hash}-{16-char pkg_hash}
         parts = key.split("-")
-        assert len(parts) == 3  # python, v{version}, {hash}
-        assert len(parts[2]) == 16
+        assert len(parts) == 4  # python, v{version}, {img_hash}, {pkg_hash}
+        assert len(parts[2]) == 8  # img_hash is 8 chars
+        assert len(parts[3]) == 16  # pkg_hash is 16 chars
 
         # Test without packages (base)
         base_key = snapshot_manager._compute_cache_key(
             language=Language.PYTHON,
             packages=[],
         )
-        assert base_key == f"python-v{version}-base"
+        # Format: python-v{version}-{img_hash}-base
+        assert base_key.startswith(f"python-v{version}-")
+        assert base_key.endswith("-base")
+        base_parts = base_key.split("-")
+        assert len(base_parts) == 4  # python, v{version}, {img_hash}, base
+        assert len(base_parts[2]) == 8  # img_hash is 8 chars
 
     @pytest.mark.sudo
     async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
@@ -242,6 +248,135 @@ class TestL2Cache:
 
         path = await snapshot_manager._check_l2_cache(cache_key)
         assert path == snapshot_path
+
+    async def test_l2_cache_removes_snapshot_with_missing_backing_file(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path
+    ) -> None:
+        """L2 cache detects and removes snapshot with missing backing file."""
+        import asyncio
+
+        from exec_sandbox.snapshot_manager import SnapshotManager
+
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
+        settings.snapshot_cache_dir.mkdir(parents=True)
+
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = SnapshotManager(settings, vm_manager)
+
+        # Create qcow2 with backing file that doesn't exist
+        cache_key = "python-stale123"
+        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+        fake_backing = tmp_path / "nonexistent-base.qcow2"
+
+        # First create a temporary backing file so qemu-img create succeeds
+        temp_backing = tmp_path / "temp-base.qcow2"
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "create", "-f", "qcow2", str(temp_backing), "1M",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        # Create snapshot with backing file
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+            "-b", str(temp_backing), str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        assert proc.returncode == 0
+        assert snapshot_path.exists()
+
+        # Rebase to non-existent backing file (simulates image rebuild/deletion)
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "rebase", "-u", "-b", str(fake_backing), "-F", "qcow2", str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        # _check_l2_cache should detect missing backing file and remove snapshot
+        result = await snapshot_manager._check_l2_cache(cache_key)
+
+        assert result is None, "Should return None for stale cache"
+        assert not snapshot_path.exists(), "Stale snapshot should be removed"
+
+    async def test_l2_cache_removes_snapshot_with_wrong_backing_file(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path
+    ) -> None:
+        """L2 cache detects and removes snapshot pointing to wrong base image."""
+        import asyncio
+
+        from exec_sandbox.snapshot_manager import SnapshotManager
+
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
+        settings.snapshot_cache_dir.mkdir(parents=True)
+
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = SnapshotManager(settings, vm_manager)
+
+        # Create a wrong backing file (not the expected base image)
+        wrong_backing = tmp_path / "wrong-base.qcow2"
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "create", "-f", "qcow2", str(wrong_backing), "1M",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        # Create snapshot with wrong backing file
+        # Use cache key format: "python-v{version}-{img_hash}-base"
+        cache_key = "python-v0.0-xxxxxxxx-base"
+        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+            "-b", str(wrong_backing), str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        assert proc.returncode == 0
+        assert snapshot_path.exists()
+
+        # _check_l2_cache should detect wrong backing file and remove snapshot
+        result = await snapshot_manager._check_l2_cache(cache_key)
+
+        assert result is None, "Should return None for mismatched backing file"
+        assert not snapshot_path.exists(), "Snapshot with wrong backing file should be removed"
+
+    async def test_l2_cache_accepts_valid_backing_file(
+        self, make_vm_manager, make_vm_settings, tmp_path: Path, images_dir: Path
+    ) -> None:
+        """L2 cache accepts snapshot with correct backing file."""
+        import asyncio
+
+        from exec_sandbox.models import Language
+        from exec_sandbox.snapshot_manager import SnapshotManager
+
+        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
+        settings.snapshot_cache_dir.mkdir(parents=True)
+
+        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = SnapshotManager(settings, vm_manager)
+
+        # Get the correct base image path
+        base_image = vm_manager.get_base_image(Language.PYTHON)
+
+        # Compute cache key (will include base image hash)
+        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, [])
+        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+
+        # Create snapshot with correct backing file
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+            "-b", str(base_image.resolve()), str(snapshot_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        assert proc.returncode == 0
+
+        # _check_l2_cache should accept valid snapshot
+        result = await snapshot_manager._check_l2_cache(cache_key)
+
+        assert result == snapshot_path, "Should return path for valid cache"
+        assert snapshot_path.exists(), "Valid snapshot should NOT be removed"
 
     async def test_l2_cache_nonexistent_returns_none(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L2 cache returns None for non-existent snapshot."""
