@@ -343,6 +343,10 @@ class Scheduler:
                 # For cold boot: use actual setup/boot times from VM
                 setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
                 boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+                qemu_cmd_build_ms = vm.qemu_cmd_build_ms if is_cold_boot and vm.qemu_cmd_build_ms is not None else 0
+                gvproxy_start_ms = vm.gvproxy_start_ms if is_cold_boot and vm.gvproxy_start_ms is not None else 0
+                qemu_fork_ms = vm.qemu_fork_ms if is_cold_boot and vm.qemu_fork_ms is not None else 0
+                guest_wait_ms = vm.guest_wait_ms if is_cold_boot and vm.guest_wait_ms is not None else 0
 
                 return ExecutionResult(
                     stdout=result.stdout,
@@ -356,7 +360,11 @@ class Scheduler:
                         boot_ms=boot_ms,
                         execute_ms=execute_ms,
                         total_ms=total_ms,
-                        connect_ms=result.timing.connect_ms,  # Pass through from VM
+                        connect_ms=result.timing.connect_ms,
+                        qemu_cmd_build_ms=qemu_cmd_build_ms,
+                        gvproxy_start_ms=gvproxy_start_ms,
+                        qemu_fork_ms=qemu_fork_ms,
+                        guest_wait_ms=guest_wait_ms,
                     ),
                     warm_pool_hit=not is_cold_boot,
                     spawn_ms=result.spawn_ms,  # Pass through from guest

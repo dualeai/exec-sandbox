@@ -847,6 +847,11 @@ class QemuVM:
         # Timing instrumentation (set by VmManager.create_vm)
         self._setup_ms: int | None = None  # Resource setup time
         self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
+        # Granular boot timing (for tracing)
+        self._qemu_cmd_build_ms: int | None = None
+        self._gvproxy_start_ms: int | None = None
+        self._qemu_fork_ms: int | None = None
+        self._guest_wait_ms: int | None = None
 
     @property
     def setup_ms(self) -> int | None:
@@ -867,6 +872,42 @@ class QemuVM:
     def boot_ms(self, value: int) -> None:
         """Set VM boot time in milliseconds."""
         self._boot_ms = value
+
+    @property
+    def qemu_cmd_build_ms(self) -> int | None:
+        """Time for pre-launch setup (command build, socket cleanup, channel creation)."""
+        return self._qemu_cmd_build_ms
+
+    @qemu_cmd_build_ms.setter
+    def qemu_cmd_build_ms(self, value: int) -> None:
+        self._qemu_cmd_build_ms = value
+
+    @property
+    def gvproxy_start_ms(self) -> int | None:
+        """Time to start gvproxy (0 if network disabled)."""
+        return self._gvproxy_start_ms
+
+    @gvproxy_start_ms.setter
+    def gvproxy_start_ms(self, value: int) -> None:
+        self._gvproxy_start_ms = value
+
+    @property
+    def qemu_fork_ms(self) -> int | None:
+        """Time for QEMU process fork/exec."""
+        return self._qemu_fork_ms
+
+    @qemu_fork_ms.setter
+    def qemu_fork_ms(self, value: int) -> None:
+        self._qemu_fork_ms = value
+
+    @property
+    def guest_wait_ms(self) -> int | None:
+        """Time waiting for guest agent (kernel + initramfs + agent init)."""
+        return self._guest_wait_ms
+
+    @guest_wait_ms.setter
+    def guest_wait_ms(self, value: int) -> None:
+        self._guest_wait_ms = value
 
     @property
     def overlay_image(self) -> Path:
@@ -1490,6 +1531,7 @@ class VmManager:
             setup_complete_time = asyncio.get_event_loop().time()
 
             # Step 5: Build QEMU command (always Linux in container)
+            qemu_cmd_start = asyncio.get_event_loop().time()
             qemu_cmd = await self._build_linux_cmd(
                 language,
                 vm_id,
@@ -1529,8 +1571,11 @@ class VmManager:
             # ulimit works on Linux, macOS, BSD (POSIX)
             if not cgroup.is_cgroup_available(cgroup_path):
                 qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, memory_mb)
+            qemu_cmd_build_ms = round((asyncio.get_event_loop().time() - qemu_cmd_start) * 1000)
 
             # Boot phase: Start gvproxy BEFORE QEMU (if network enabled)
+            gvproxy_start_time = asyncio.get_event_loop().time()
+            gvproxy_start_ms = 0
             # gvproxy must create socket before QEMU connects to it
             # Moved from setup phase to boot phase to reduce contention under high concurrency
             if allow_network:
@@ -1541,8 +1586,10 @@ class VmManager:
                 gvproxy_proc, gvproxy_log_task = await self._start_gvproxy(vm_id, allowed_domains, language, workdir)
                 # Attach gvproxy to cgroup for resource limits
                 await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
+                gvproxy_start_ms = round((asyncio.get_event_loop().time() - gvproxy_start_time) * 1000)
 
             # Step 7: Launch QEMU
+            qemu_start_time = asyncio.get_event_loop().time()
             try:
                 qemu_proc = ProcessWrapper(
                     await asyncio.create_subprocess_exec(
@@ -1552,6 +1599,8 @@ class VmManager:
                         start_new_session=True,  # Create new process group for proper cleanup
                     )
                 )
+                # Capture fork time immediately after subprocess creation
+                qemu_fork_ms = round((asyncio.get_event_loop().time() - qemu_start_time) * 1000)
 
                 # Attach process to cgroup (only if cgroups available)
                 await cgroup.attach_if_available(cgroup_path, qemu_proc.pid)
@@ -1628,6 +1677,7 @@ class VmManager:
                 ) from e
 
             # Step 8: Wait for guest agent ready
+            guest_wait_start = asyncio.get_event_loop().time()
             vm = QemuVM(
                 vm_id,
                 qemu_proc,
@@ -1653,9 +1703,15 @@ class VmManager:
             try:
                 await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
                 boot_complete_time = asyncio.get_event_loop().time()
+                guest_wait_ms = round((boot_complete_time - guest_wait_start) * 1000)
                 # Store timing on VM for scheduler to use
                 vm.setup_ms = round((setup_complete_time - start_time) * 1000)
                 vm.boot_ms = round((boot_complete_time - setup_complete_time) * 1000)
+                # Granular boot timing
+                vm.qemu_cmd_build_ms = qemu_cmd_build_ms
+                vm.gvproxy_start_ms = gvproxy_start_ms
+                vm.qemu_fork_ms = qemu_fork_ms
+                vm.guest_wait_ms = guest_wait_ms
                 # Transition to READY state after boot completes
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
@@ -1738,6 +1794,11 @@ class VmManager:
                     "setup_ms": vm.setup_ms,
                     "boot_ms": vm.boot_ms,
                     "total_boot_ms": total_boot_ms,
+                    # Granular boot breakdown
+                    "qemu_cmd_build_ms": qemu_cmd_build_ms,
+                    "gvproxy_start_ms": gvproxy_start_ms,
+                    "qemu_fork_ms": qemu_fork_ms,
+                    "guest_wait_ms": guest_wait_ms,
                 },
             )
 

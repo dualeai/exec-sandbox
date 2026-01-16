@@ -49,6 +49,11 @@ class TimingStats:
     connect: list[float] = field(default_factory=_float_list)  # Host: channel.connect()
     spawn: list[float] = field(default_factory=_float_list)  # Guest: cmd.spawn() fork/exec
     process: list[float] = field(default_factory=_float_list)  # Guest: actual process runtime
+    # Granular boot timing
+    qemu_cmd_build: list[float] = field(default_factory=_float_list)
+    gvproxy_start: list[float] = field(default_factory=_float_list)
+    qemu_fork: list[float] = field(default_factory=_float_list)
+    guest_wait: list[float] = field(default_factory=_float_list)
     warm_hits: int = 0
     cold_boots: int = 0
 
@@ -69,6 +74,15 @@ def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -
         stats.spawn.append(result.spawn_ms)
     if result.process_ms is not None:
         stats.process.append(result.process_ms)
+    # Granular boot timing
+    if result.timing.qemu_cmd_build_ms is not None:
+        stats.qemu_cmd_build.append(result.timing.qemu_cmd_build_ms)
+    if result.timing.gvproxy_start_ms is not None:
+        stats.gvproxy_start.append(result.timing.gvproxy_start_ms)
+    if result.timing.qemu_fork_ms is not None:
+        stats.qemu_fork.append(result.timing.qemu_fork_ms)
+    if result.timing.guest_wait_ms is not None:
+        stats.guest_wait.append(result.timing.guest_wait_ms)
     if result.warm_pool_hit:
         stats.warm_hits += 1
     else:
@@ -164,6 +178,18 @@ def print_stats(name: str, stats: TimingStats) -> None:
     print(f"    ├─ Setup:   {fmt_stats(stats.setup)} ms")
     print(f"    ├─ Boot:    {fmt_stats(stats.boot)} ms")
     print(f"    └─ Execute: {fmt_stats(stats.execute)} ms")
+
+    # Granular boot breakdown (if available - cold boots only)
+    if stats.qemu_cmd_build or stats.gvproxy_start or stats.qemu_fork or stats.guest_wait:
+        print("  Boot breakdown:")
+        if stats.qemu_cmd_build:
+            print(f"       ├─ Pre-launch: {fmt_stats(stats.qemu_cmd_build)} ms")
+        if stats.gvproxy_start:
+            print(f"       ├─ gvproxy:    {fmt_stats(stats.gvproxy_start)} ms")
+        if stats.qemu_fork:
+            print(f"       ├─ QEMU fork:  {fmt_stats(stats.qemu_fork)} ms")
+        if stats.guest_wait:
+            print(f"       └─ Guest wait: {fmt_stats(stats.guest_wait)} ms  ← kernel+agent")
 
     # Granular execute breakdown (if available)
     if stats.connect or stats.spawn or stats.process:

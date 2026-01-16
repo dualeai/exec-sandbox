@@ -25,6 +25,11 @@ class TimingBreakdown(BaseModel):
 
     For warm pool hits, setup_ms and boot_ms are 0 since those costs were
     pre-paid at pool startup time.
+
+    Granular boot timing note: The sum of (qemu_cmd_build_ms + gvproxy_start_ms +
+    qemu_fork_ms + guest_wait_ms) will be ~20-30ms less than boot_ms due to
+    unmeasured overhead between QEMU fork and guest wait (crash-check sleep,
+    console log setup, VM registration, state transitions).
     """
 
     setup_ms: int = Field(description="Resource setup time (overlay, cgroup, gvproxy - parallel)")
@@ -34,6 +39,23 @@ class TimingBreakdown(BaseModel):
     connect_ms: int | None = Field(
         default=None,
         description="Time for channel.connect() in milliseconds (host-measured)",
+    )
+    # Granular boot timing (for tracing/profiling)
+    qemu_cmd_build_ms: int | None = Field(
+        default=None,
+        description="Time for pre-launch setup (command build, socket cleanup, channel creation)",
+    )
+    gvproxy_start_ms: int | None = Field(
+        default=None,
+        description="Time to start gvproxy (0 if network disabled)",
+    )
+    qemu_fork_ms: int | None = Field(
+        default=None,
+        description="Time for QEMU process fork/exec (subprocess creation)",
+    )
+    guest_wait_ms: int | None = Field(
+        default=None,
+        description="Time waiting for guest agent to become ready (kernel + initramfs + agent init)",
     )
 
 
