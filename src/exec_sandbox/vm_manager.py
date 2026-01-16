@@ -64,7 +64,7 @@ from exec_sandbox.permission_utils import (
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
-from exec_sandbox.resource_cleanup import cleanup_process
+from exec_sandbox.resource_cleanup import cleanup_process, cleanup_vm_processes
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
@@ -76,60 +76,6 @@ logger = get_logger(__name__)
 # See: linux/kvm.h - these are stable ABI
 _KVM_GET_API_VERSION = 0xAE00
 _KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
-
-
-def _get_gvproxy_wrapper_path() -> Path:
-    """Get path to gvproxy-wrapper binary for current platform.
-
-    Detection order:
-    1. Repo-relative path (development mode - prioritized for local builds)
-    2. Cached download directory (auto-downloaded from GitHub Releases)
-
-    Returns:
-        Path to the platform-specific gvproxy-wrapper binary
-
-    Raises:
-        VmError: Binary not found for current platform
-    """
-    # Detect OS
-    host_os = detect_host_os()
-    if host_os == HostOS.MACOS:
-        os_name = "darwin"
-    elif host_os == HostOS.LINUX:
-        os_name = "linux"
-    else:
-        raise VmError("Unsupported OS for gvproxy-wrapper")
-
-    # Detect architecture
-    host_arch = detect_host_arch()
-    match host_arch:
-        case HostArch.AARCH64:
-            arch = "arm64"
-        case HostArch.X86_64:
-            arch = "amd64"
-        case _:
-            raise VmError(f"Unsupported architecture for gvproxy-wrapper: {host_arch}")
-
-    binary_name = f"gvproxy-wrapper-{os_name}-{arch}"
-
-    # 1. Check repo-relative path first (dev mode - prioritized for local builds)
-    repo_root = Path(__file__).parent.parent.parent
-    binary_path = repo_root / "gvproxy-wrapper" / "bin" / binary_name
-
-    if binary_path.exists():
-        return binary_path
-
-    # 2. Fall back to cached download directory
-    from exec_sandbox.assets import get_cached_asset_path  # noqa: PLC0415
-
-    if cached_path := get_cached_asset_path(binary_name):
-        return cached_path
-
-    raise VmError(
-        "gvproxy-wrapper binary not found. "
-        "Either enable auto_download_assets=True in SchedulerConfig, "
-        "or run 'make build' to build it locally."
-    )
 
 
 class VmState(Enum):
@@ -1306,6 +1252,9 @@ class QemuVM:
         with contextlib.suppress(OSError, RuntimeError):
             await self.channel.close()
 
+        # Step 2: Terminate QEMU and gvproxy processes (SIGTERM → SIGKILL)
+        await cleanup_vm_processes(self.process, self.gvproxy_proc, self.vm_id)
+
         # Step 3-4: Parallel cleanup (cgroup + workdir)
         # After QEMU terminates, cleanup tasks are independent
         # workdir.cleanup() removes overlay, sockets, and console log in one operation
@@ -1888,7 +1837,16 @@ class VmManager:
             ) from e
 
         # Start gvproxy-wrapper with pre-bound FD
-        gvproxy_binary = _get_gvproxy_wrapper_path()
+        from exec_sandbox.assets import get_gvproxy_path  # noqa: PLC0415
+
+        gvproxy_binary = await get_gvproxy_path()
+        if gvproxy_binary is None:
+            parent_sock.close()
+            raise VmError(
+                "gvproxy-wrapper binary not found. "
+                "Either enable auto_download_assets=True in SchedulerConfig, "
+                "or run 'make build' to build it locally."
+            )
         try:
             proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(

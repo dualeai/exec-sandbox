@@ -45,10 +45,10 @@ class SchedulerConfig(BaseModel):
         default_timeout_seconds: Default execution timeout in seconds.
             Can be overridden per-run. Range: 1-300. Default: 30.
         images_dir: Directory containing base VM images (qcow2, kernels).
-            If None, auto-detects from standard locations:
-            - Linux: ~/.local/share/exec-sandbox/images/
-            - macOS: ~/Library/Application Support/exec-sandbox/images/
-            - Env: EXEC_SANDBOX_IMAGES_DIR
+            If None, auto-detects from (in priority order):
+            - EXEC_SANDBOX_IMAGES_DIR env var
+            - ./images/dist/ (local build)
+            - ~/.cache/exec-sandbox/ (download cache)
         snapshot_cache_dir: Local directory for snapshot cache (L2 cache).
             Default: /tmp/exec-sandbox-cache
         s3_bucket: S3 bucket name for snapshot backup (L3 cache).
@@ -134,63 +134,3 @@ class SchedulerConfig(BaseModel):
         default=True,
         description="Automatically download VM images from GitHub Releases if not found",
     )
-
-    def get_images_dir(self, check_exists: bool | None = None) -> Path:
-        """Get images directory, auto-detecting if not configured.
-
-        Detection order:
-        1. Explicit images_dir from config
-        2. EXEC_SANDBOX_IMAGES_DIR environment variable
-        3. EXEC_SANDBOX_CACHE_DIR environment variable (for auto-downloaded assets)
-        4. Platform-specific default:
-           - Linux: ~/.cache/exec-sandbox/ (when auto_download_assets=True)
-           - macOS: ~/Library/Caches/exec-sandbox/ (when auto_download_assets=True)
-           - Linux: ~/.local/share/exec-sandbox/images/ (when auto_download_assets=False)
-           - macOS: ~/Library/Application Support/exec-sandbox/images/ (when auto_download_assets=False)
-
-        Args:
-            check_exists: If True, raises FileNotFoundError when directory doesn't exist.
-                          If None (default), inferred from auto_download_assets:
-                          - auto_download_assets=True -> don't check (will be created on download)
-                          - auto_download_assets=False -> check exists (must be pre-installed)
-
-        Returns:
-            Path to images directory
-
-        Raises:
-            FileNotFoundError: Images directory does not exist and check_exists=True
-        """
-        import os  # noqa: PLC0415
-
-        from exec_sandbox.platform_utils import HostOS, detect_host_os  # noqa: PLC0415
-
-        if self.images_dir is not None:
-            path = self.images_dir
-        elif env_path := os.environ.get("EXEC_SANDBOX_IMAGES_DIR"):
-            path = Path(env_path)
-        elif self.auto_download_assets:
-            # Use cache directory for auto-downloaded assets
-            if cache_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
-                path = Path(cache_path)
-            elif detect_host_os() == HostOS.MACOS:
-                path = Path.home() / "Library" / "Caches" / "exec-sandbox"
-            else:
-                # XDG_CACHE_HOME takes precedence if set
-                xdg_cache = os.environ.get("XDG_CACHE_HOME")
-                path = Path(xdg_cache) / "exec-sandbox" if xdg_cache else Path.home() / ".cache" / "exec-sandbox"
-        elif detect_host_os() == HostOS.MACOS:
-            path = Path.home() / "Library" / "Application Support" / "exec-sandbox" / "images"
-        else:
-            path = Path.home() / ".local" / "share" / "exec-sandbox" / "images"
-
-        # Infer check_exists from auto_download_assets if not explicitly set
-        if check_exists is None:
-            check_exists = not self.auto_download_assets
-
-        if check_exists and not path.exists():
-            raise FileNotFoundError(
-                f"Images directory not found: {path}. "
-                f"Enable auto_download_assets=True or download images from GitHub Releases."
-            )
-
-        return path

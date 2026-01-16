@@ -401,6 +401,18 @@ class AsyncPooch:
 # Processors (post-download transformations)
 # ============================================================================
 
+# Per-file locks for decompression to prevent concurrent writes to same destination
+_decompression_locks: dict[Path, asyncio.Lock] = {}
+_decompression_locks_guard = asyncio.Lock()
+
+
+async def _get_decompression_lock(dest: Path) -> asyncio.Lock:
+    """Get or create a lock for a specific destination file."""
+    async with _decompression_locks_guard:
+        if dest not in _decompression_locks:
+            _decompression_locks[dest] = asyncio.Lock()
+        return _decompression_locks[dest]
+
 
 async def decompress_zstd(fname: Path) -> Path:
     """
@@ -408,6 +420,9 @@ async def decompress_zstd(fname: Path) -> Path:
 
     Uses Python's native zstd module (3.14+) or backports.zstd for older versions.
     Streaming decompression ensures minimal memory usage regardless of file size.
+
+    Thread-safety: Uses per-file locks and atomic write pattern to prevent race
+    conditions when multiple callers decompress the same file concurrently.
 
     Memory usage: ~64KB (chunk size) regardless of file size.
 
@@ -427,25 +442,50 @@ async def decompress_zstd(fname: Path) -> Path:
 
     dest = fname.with_suffix("")  # Remove .zst
 
-    logger.debug("Decompressing", extra={"src": str(fname), "dest": str(dest)})
+    # Acquire per-file lock to prevent concurrent decompression of same file
+    lock = await _get_decompression_lock(dest)
+    async with lock:
+        # Another caller may have completed decompression while we waited
+        if dest.exists():
+            logger.debug("Already decompressed by another caller", extra={"file": str(dest)})
+            return dest
 
-    def _decompress_sync() -> None:
-        with fname.open("rb") as src, dest.open("wb") as dst:
-            # Use streaming decompression with incremental decompressor
-            decompressor = zstd.ZstdDecompressor()
-            while True:
-                chunk = src.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                decompressed = decompressor.decompress(chunk)
-                if decompressed:
-                    dst.write(decompressed)
-        fname.unlink()  # Remove compressed file
+        # Check source still exists (may have been consumed by another caller)
+        if not fname.exists():
+            if dest.exists():
+                return dest
+            raise FileNotFoundError(f"Source file not found: {fname}")
 
-    await asyncio.to_thread(_decompress_sync)
+        logger.debug("Decompressing", extra={"src": str(fname), "dest": str(dest)})
 
-    logger.debug("Decompression complete", extra={"file": str(dest)})
-    return dest
+        # Use atomic write pattern: write to temp file, then rename
+        temp_dest = dest.with_suffix(".tmp")
+
+        def _decompress_sync() -> None:
+            try:
+                with fname.open("rb") as src, temp_dest.open("wb") as dst:
+                    # Use streaming decompression with incremental decompressor
+                    decompressor = zstd.ZstdDecompressor()
+                    while True:
+                        chunk = src.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        decompressed = decompressor.decompress(chunk)
+                        if decompressed:
+                            dst.write(decompressed)
+                # Atomic rename (POSIX guarantees atomicity)
+                temp_dest.rename(dest)
+                # Remove compressed file only after successful rename
+                fname.unlink()
+            except Exception:
+                # Clean up temp file on failure
+                temp_dest.unlink(missing_ok=True)
+                raise
+
+        await asyncio.to_thread(_decompress_sync)
+
+        logger.debug("Decompression complete", extra={"file": str(dest)})
+        return dest
 
 
 async def untar(fname: Path) -> Path:

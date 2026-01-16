@@ -9,6 +9,10 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# CLI versions are centralized here for easy maintenance
+env:
+  CYCLONEDX_CLI_VERSION: v0.29.2 # https://github.com/CycloneDX/cyclonedx-cli/releases
+
 permissions:
   actions: read        # Required for artifact caching (gh run list)
   attestations: write  # Required for GitHub attestations
@@ -60,6 +64,38 @@ jobs:
           test -f dist/exec_sandbox-*.tar.gz
           uv run twine check dist/*
 
+      - name: Generate SBOM (CycloneDX)
+        run: uv export --format cyclonedx1.5 --all-extras --output-file sbom.cyclonedx.json
+
+      - name: Install CycloneDX CLI
+        run: |
+          curl -sSfL "https://github.com/CycloneDX/cyclonedx-cli/releases/download/${{ env.CYCLONEDX_CLI_VERSION }}/cyclonedx-linux-arm64" -o cyclonedx
+          chmod +x cyclonedx
+
+      - name: Convert to SPDX
+        run: ./cyclonedx convert --input-file sbom.cyclonedx.json --output-file sbom.spdx.json --output-format spdxjson
+
+      - name: Validate SBOMs
+        run: |
+          echo "Validating CycloneDX SBOM..."
+          jq empty sbom.cyclonedx.json
+          echo "- Components: $(jq '.components | length' sbom.cyclonedx.json)"
+          echo "Validating SPDX SBOM..."
+          jq empty sbom.spdx.json
+          echo "- Packages: $(jq '.packages | length' sbom.spdx.json)"
+
+      - name: Attest SBOM (CycloneDX)
+        uses: actions/attest-sbom@v3.0.0
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.cyclonedx.json
+
+      - name: Attest SBOM (SPDX)
+        uses: actions/attest-sbom@v3.0.0
+        with:
+          subject-path: dist/*
+          sbom-path: sbom.spdx.json
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v3.1.0
         with:
@@ -70,6 +106,15 @@ jobs:
         with:
           name: python-dist
           path: dist/
+          retention-days: 30
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.cyclonedx.json
+            sbom.spdx.json
           retention-days: 30
 
   publish-testpypi:
@@ -204,7 +249,9 @@ jobs:
     needs: [publish-pypi, gvproxy-wrapper, guest-agent, vm-images]
     if: github.event_name == 'release'
     permissions:
+      attestations: write
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -220,6 +267,9 @@ jobs:
           # Python package
           cp artifacts/python-dist/*.whl release/
           cp artifacts/python-dist/*.tar.gz release/
+
+          # SBOMs
+          cp artifacts/sbom/*.json release/
 
           # gvproxy-wrapper
           cp artifacts/gvproxy-wrapper/* release/
@@ -243,6 +293,14 @@ jobs:
 
           ls -lh
 
+      - name: Attest build provenance (binaries)
+        uses: actions/attest-build-provenance@v3.1.0
+        with:
+          subject-path: |
+            release/gvproxy-wrapper-*
+            release/guest-agent-*
+            release/*.zst
+
       - name: Upload to GitHub release
         uses: softprops/action-gh-release@v2.5.0
         with:
@@ -257,9 +315,14 @@ jobs:
           echo "- [TestPyPI](https://test.pypi.org/p/exec_sandbox)" >> $GITHUB_STEP_SUMMARY
           echo "- [PyPI](https://pypi.org/p/exec_sandbox)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Attestations" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub: SBOM (CycloneDX + SPDX), Build Provenance" >> $GITHUB_STEP_SUMMARY
+          echo "- PyPI: PEP 740 Digital Attestations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
           echo "- Python wheel + sdist" >> $GITHUB_STEP_SUMMARY
           echo "- gvproxy-wrapper (4 platforms)" >> $GITHUB_STEP_SUMMARY
           echo "- guest-agent (2 architectures)" >> $GITHUB_STEP_SUMMARY
           echo "- Kernel + initramfs (2 architectures)" >> $GITHUB_STEP_SUMMARY
           echo "- qcow2 images (6 variants)" >> $GITHUB_STEP_SUMMARY
+          echo "- 2 SBOM files (CycloneDX, SPDX)" >> $GITHUB_STEP_SUMMARY

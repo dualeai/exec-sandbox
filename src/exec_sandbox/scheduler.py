@@ -93,6 +93,7 @@ class Scheduler:
             Use as async context manager: `async with Scheduler() as s:`
         """
         self.config = config or SchedulerConfig()
+        self._images_dir: Path | None = None
         self._settings: Settings | None = None
         self._vm_manager: VmManager | None = None
         self._snapshot_manager: SnapshotManager | None = None
@@ -104,7 +105,7 @@ class Scheduler:
         """Start scheduler and initialize resources.
 
         Startup sequence:
-        1. Download assets from GitHub Releases (if auto_download_assets=True)
+        1. Resolve images directory (downloads from GitHub if needed)
         2. Create Settings from SchedulerConfig
         3. Initialize VmManager
         4. Initialize SnapshotManager (if S3 configured)
@@ -115,6 +116,7 @@ class Scheduler:
 
         Raises:
             SandboxError: Startup failed
+            FileNotFoundError: Assets not found and auto_download_assets=False
             AssetDownloadError: Failed to download required assets
         """
         if self._started:
@@ -130,12 +132,13 @@ class Scheduler:
             },
         )
 
-        # Download assets from GitHub Releases if needed
-        if self.config.auto_download_assets:
-            from exec_sandbox.assets import ensure_assets_available  # noqa: PLC0415
+        # Resolve images directory (downloads if needed and allowed)
+        from exec_sandbox.assets import ensure_assets  # noqa: PLC0415
 
-            # Pre-fetch kernel and gvproxy (base images are fetched on-demand)
-            await ensure_assets_available()
+        self._images_dir = await ensure_assets(
+            override=self.config.images_dir,
+            download=self.config.auto_download_assets,
+        )
 
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
@@ -369,13 +372,14 @@ class Scheduler:
         """Create Settings from SchedulerConfig.
 
         Bridges the public SchedulerConfig to internal Settings.
+        Must be called after ensure_assets() has set self._images_dir.
 
         Returns:
             Settings instance configured from SchedulerConfig
         """
-        # Get images directory (auto-detect if not configured)
-        # check_exists is auto-inferred from auto_download_assets
-        images_dir = self.config.get_images_dir()
+        if self._images_dir is None:
+            raise RuntimeError("_create_settings called before ensure_assets")
+        images_dir = self._images_dir
 
         # Kernels may be in images_dir directly or in a kernels subdirectory
         kernels_subdir = images_dir / "kernels"
