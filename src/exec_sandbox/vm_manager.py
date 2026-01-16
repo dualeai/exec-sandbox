@@ -2891,28 +2891,18 @@ class VmManager:
                         if death_task in done:
                             # QEMU died - cancel guest and retrieve exception
                             guest_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
+                            # Suppress ALL exceptions - we're about to re-raise VmError from death_task.
+                            # Race condition: guest_task may also have completed with an exception
+                            # (e.g., IncompleteReadError) which we must suppress to avoid masking VmError.
+                            # Use BaseException to also catch CancelledError (not a subclass of Exception in Python 3.8+).
+                            with contextlib.suppress(BaseException):
                                 await guest_task
                             await death_task  # Re-raise VmError
 
                         # Guest task completed - check result (raises if failed, triggering retry)
                         await guest_task
 
-                # Success - cancel death monitor
-                death_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await death_task
-
         except TimeoutError:
-            # Clean up in-flight tasks
-            for task in (death_task, guest_task):
-                if task is not None and not task.done():
-                    task.cancel()
-            for task in (death_task, guest_task):
-                if task is not None:
-                    with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
-                        await task
-
             # Flush console log before reading to ensure all buffered content is written
             if vm.console_log:
                 with contextlib.suppress(OSError):
@@ -2932,3 +2922,15 @@ class VmManager:
             )
 
             raise TimeoutError(f"Guest agent not ready after {timeout}s") from None
+
+        finally:
+            # Always clean up tasks to prevent "Task exception was never retrieved" warnings.
+            # This handles all exit paths: success, TimeoutError, VmError, and any other exception.
+            # Use BaseException to catch CancelledError (which is not a subclass of Exception in Python 3.8+).
+            for task in (death_task, guest_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (death_task, guest_task):
+                if task is not None:
+                    with contextlib.suppress(BaseException):
+                        await task
