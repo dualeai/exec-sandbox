@@ -120,11 +120,14 @@ class WarmVMPool:
         self.config = config
         self.snapshot_manager = snapshot_manager
 
-        # Calculate pool size: 25% of max_concurrent_vms
-        self.pool_size_per_language = max(
-            1,  # Minimum 1 VM per language
-            int(config.max_concurrent_vms * constants.WARM_POOL_SIZE_RATIO),
-        )
+        # Calculate pool size: use explicit warm_pool_size if set, else 25% of max_concurrent_vms
+        if config.warm_pool_size > 0:
+            self.pool_size_per_language = config.warm_pool_size
+        else:
+            self.pool_size_per_language = max(
+                1,  # Minimum 1 VM per language
+                int(config.max_concurrent_vms * constants.WARM_POOL_SIZE_RATIO),
+            )
 
         # Pools: asyncio.Queue for thread-safe async access
         self.pools: dict[Language, asyncio.Queue[QemuVM]] = {

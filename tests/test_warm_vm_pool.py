@@ -25,7 +25,7 @@ class TestWarmVMPoolConfig:
     """Tests for WarmVMPool configuration."""
 
     def test_pool_size_calculation(self) -> None:
-        """Pool size is 25% of max_concurrent_vms."""
+        """Pool size is 25% of max_concurrent_vms when warm_pool_size=0."""
         # The calculation: max(1, int(max_concurrent_vms * 0.25))
 
         # max_concurrent_vms=10 → pool_size=2
@@ -39,6 +39,22 @@ class TestWarmVMPoolConfig:
         # max_concurrent_vms=1 → pool_size=1 (minimum)
         expected = max(1, int(1 * constants.WARM_POOL_SIZE_RATIO))
         assert expected == 1
+
+    def test_explicit_warm_pool_size_overrides_ratio(self, unit_test_vm_manager) -> None:
+        """When warm_pool_size > 0, it overrides the 25% ratio calculation."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        # With warm_pool_size=5 and max_concurrent_vms=100,
+        # pool should be 5, not 25 (100 * 0.25)
+        config = SchedulerConfig(warm_pool_size=5, max_concurrent_vms=100)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+        assert pool.pool_size_per_language == 5
+
+        # With warm_pool_size=50 and max_concurrent_vms=10,
+        # pool should be 50, not 2 (10 * 0.25)
+        config = SchedulerConfig(warm_pool_size=50, max_concurrent_vms=200)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+        assert pool.pool_size_per_language == 50
 
     def test_warm_pool_languages(self) -> None:
         """Warm pool supports python and javascript."""
