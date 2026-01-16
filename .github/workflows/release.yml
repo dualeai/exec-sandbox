@@ -205,6 +205,26 @@ jobs:
           name: guest-agent-${{ matrix.arch }}
           path: images/dist/guest-agent-linux-${{ matrix.arch }}
 
+  tiny-init:
+    name: tiny-init (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build tiny-init
+        uses: ./.github/actions/build-tiny-init
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-init-${{ matrix.arch }}
+          path: images/dist/tiny-init-${{ matrix.arch }}
+
   # ==========================================================================
   # VM Images
   # ==========================================================================
@@ -212,7 +232,7 @@ jobs:
   vm-images:
     name: VM Images (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    needs: [guest-agent]
+    needs: [guest-agent, tiny-init]
     strategy:
       matrix:
         arch: [x86_64, aarch64]
@@ -223,6 +243,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: guest-agent-${{ matrix.arch }}
+          path: images/dist/
+
+      - name: Download tiny-init
+        uses: actions/download-artifact@v4
+        with:
+          name: tiny-init-${{ matrix.arch }}
           path: images/dist/
 
       - name: Build VM images
@@ -246,7 +272,7 @@ jobs:
   upload-release:
     name: Upload to GitHub Release
     runs-on: ubuntu-latest
-    needs: [publish-pypi, gvproxy-wrapper, guest-agent, vm-images]
+    needs: [publish-pypi, gvproxy-wrapper, guest-agent, tiny-init, vm-images]
     if: github.event_name == 'release'
     permissions:
       attestations: write
@@ -278,6 +304,10 @@ jobs:
           cp artifacts/guest-agent-x86_64/* release/
           cp artifacts/guest-agent-aarch64/* release/
 
+          # tiny-init
+          cp artifacts/tiny-init-x86_64/* release/
+          cp artifacts/tiny-init-aarch64/* release/
+
           # VM images (kernel + initramfs + qcow2)
           cp artifacts/vm-images-x86_64/* release/
           cp artifacts/vm-images-aarch64/* release/
@@ -299,6 +329,7 @@ jobs:
           subject-path: |
             release/gvproxy-wrapper-*
             release/guest-agent-*
+            release/tiny-init-*
             release/*.zst
 
       - name: Upload to GitHub release
@@ -323,6 +354,7 @@ jobs:
           echo "- Python wheel + sdist" >> $GITHUB_STEP_SUMMARY
           echo "- gvproxy-wrapper (4 platforms)" >> $GITHUB_STEP_SUMMARY
           echo "- guest-agent (2 architectures)" >> $GITHUB_STEP_SUMMARY
+          echo "- tiny-init (2 architectures)" >> $GITHUB_STEP_SUMMARY
           echo "- Kernel + initramfs (2 architectures)" >> $GITHUB_STEP_SUMMARY
           echo "- qcow2 images (6 variants)" >> $GITHUB_STEP_SUMMARY
           echo "- 2 SBOM files (CycloneDX, SPDX)" >> $GITHUB_STEP_SUMMARY

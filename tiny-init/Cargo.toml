@@ -1,0 +1,22 @@
+[package]
+name = "tiny-init"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Minimal init for QEMU microVMs - replaces busybox+shell init"
+repository = "https://github.com/dualeai/exec-sandbox"
+keywords = ["qemu", "microvm", "init", "sandbox"]
+categories = ["virtualization"]
+
+[dependencies]
+libc = "0.2"
+flate2 = { version = "1.0", default-features = false, features = [
+    "rust_backend",
+] }
+
+[profile.release]
+opt-level = "z"   # Optimize for size
+lto = true        # Link-time optimization
+codegen-units = 1 # Better optimization
+strip = true      # Strip symbols
+panic = "abort"   # Abort on panic (smaller binary, no unwinding)

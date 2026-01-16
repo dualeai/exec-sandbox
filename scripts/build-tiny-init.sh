@@ -1,14 +1,14 @@
 #!/bin/bash
-# Build guest-agent Rust binary using Docker
+# Build tiny-init Rust binary using Docker
 #
 # Uses Docker with Rust cross-compilation (no QEMU emulation needed).
-# Produces statically-linked musl binaries.
+# Produces statically-linked musl binaries optimized for size.
 #
 # Usage:
-#   ./scripts/build-guest-agent.sh              # Build for current arch
-#   ./scripts/build-guest-agent.sh x86_64       # Build for x86_64
-#   ./scripts/build-guest-agent.sh aarch64      # Build for aarch64
-#   ./scripts/build-guest-agent.sh all          # Build for both
+#   ./scripts/build-tiny-init.sh              # Build for current arch
+#   ./scripts/build-tiny-init.sh x86_64       # Build for x86_64
+#   ./scripts/build-tiny-init.sh aarch64      # Build for aarch64
+#   ./scripts/build-tiny-init.sh all          # Build for both
 
 set -euo pipefail
 
@@ -40,9 +40,9 @@ compute_hash() {
     (
         echo "arch=$arch"
         echo "rust=$RUST_VERSION"
-        cat "$REPO_ROOT/guest-agent/Cargo.lock" 2>/dev/null || true
-        cat "$REPO_ROOT/guest-agent/Cargo.toml" 2>/dev/null || true
-        find "$REPO_ROOT/guest-agent/src" -type f -name "*.rs" -print0 2>/dev/null | \
+        cat "$REPO_ROOT/tiny-init/Cargo.lock" 2>/dev/null || true
+        cat "$REPO_ROOT/tiny-init/Cargo.toml" 2>/dev/null || true
+        find "$REPO_ROOT/tiny-init/src" -type f -name "*.rs" -print0 2>/dev/null | \
             sort -z | xargs -0 cat 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }
@@ -74,22 +74,22 @@ save_hash() {
 build_for_arch() {
     local arch=$1
     local rust_target="${arch}-unknown-linux-musl"
-    local output_file="$OUTPUT_DIR/guest-agent-linux-$arch"
+    local output_file="$OUTPUT_DIR/tiny-init-$arch"
 
     local current_hash
     current_hash=$(compute_hash "$arch")
 
     if cache_hit "$output_file" "$current_hash"; then
-        echo "Guest-agent up-to-date: $output_file (cache hit)"
+        echo "tiny-init up-to-date: $output_file (cache hit)"
         return 0
     fi
 
-    echo "Building guest-agent for $arch (Rust $RUST_VERSION, cross-compile)..."
+    echo "Building tiny-init for $arch (Rust $RUST_VERSION, cross-compile)..."
 
     mkdir -p "$OUTPUT_DIR"
 
     # Scope includes arch and Rust version to avoid cache collisions
-    local cache_scope="guest-agent-rust${RUST_VERSION}-${arch}"
+    local cache_scope="tiny-init-rust${RUST_VERSION}-${arch}"
     local cache_args=()
     [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
     [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
@@ -133,11 +133,11 @@ RUN --mount=type=cache,target=/tmp/toolchain-cache,sharing=locked \
 RUN rustup target add ${RUST_TARGET}
 
 # Copy source
-COPY guest-agent/ ./guest-agent/
+COPY tiny-init/ ./tiny-init/
 
 # Build with cross-compilation
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/workspace/guest-agent/target,sharing=locked \
+    --mount=type=cache,target=/workspace/tiny-init/target,sharing=locked \
     set -e && \
     HOST_ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ] && [ "$HOST_ARCH" != "x86_64" ]; then \
@@ -149,20 +149,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc && \
         export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc; \
     fi && \
-    cd guest-agent && \
+    cd tiny-init && \
     cargo build --release --target ${RUST_TARGET} && \
-    cp target/${RUST_TARGET}/release/guest-agent /guest-agent-linux-${ARCH}
+    cp target/${RUST_TARGET}/release/tiny-init /tiny-init-${ARCH}
 
 FROM scratch
 ARG ARCH
-COPY --from=builder /guest-agent-linux-* .
+COPY --from=builder /tiny-init-* .
 DOCKERFILE
 
     save_hash "$output_file" "$current_hash"
 
     local size
     size=$(du -h "$output_file" | cut -f1)
-    echo "Built: guest-agent-linux-$arch ($size)"
+    echo "Built: tiny-init-$arch ($size)"
 }
 
 main() {

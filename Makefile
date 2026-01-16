@@ -26,6 +26,7 @@ install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
 	$(MAKE) --directory guest-agent install
+	$(MAKE) --directory tiny-init install
 	$(MAKE) --directory gvproxy-wrapper install
 
 install-deps:
@@ -39,6 +40,7 @@ upgrade:
 	uv lock --upgrade --refresh
 	$(MAKE) build-catalogs
 	$(MAKE) --directory guest-agent upgrade
+	$(MAKE) --directory tiny-init upgrade
 	$(MAKE) --directory gvproxy-wrapper upgrade
 
 # Build package allow-lists from PyPI and npm registries
@@ -68,6 +70,7 @@ test-static:
 	uv run pyright .
 	uv run -m vulture src/ scripts/ --min-confidence 80
 	$(MAKE) --directory guest-agent test-static
+	$(MAKE) --directory tiny-init test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
 # All tests together for accurate coverage measurement (excludes sudo tests)
@@ -82,6 +85,7 @@ test-sudo:
 test-unit:
 	uv run pytest tests/ -v -n auto -m "unit"
 	$(MAKE) --directory guest-agent test-unit
+	$(MAKE) --directory tiny-init test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
 
 # ============================================================================
@@ -92,6 +96,7 @@ lint:
 	uv run ruff format .
 	uv run ruff check --fix .
 	$(MAKE) --directory guest-agent lint
+	$(MAKE) --directory tiny-init lint
 	$(MAKE) --directory gvproxy-wrapper lint
 
 # ============================================================================
@@ -123,6 +128,7 @@ bench-pool:
 
 build:
 	$(MAKE) --directory guest-agent build
+	$(MAKE) --directory tiny-init build
 	$(MAKE) --directory gvproxy-wrapper build
 
 # ============================================================================
@@ -131,5 +137,6 @@ build:
 
 clean:
 	$(MAKE) --directory guest-agent clean
+	$(MAKE) --directory tiny-init clean
 	$(MAKE) --directory gvproxy-wrapper clean
 	rm -rf .pytest_cache .coverage htmlcov

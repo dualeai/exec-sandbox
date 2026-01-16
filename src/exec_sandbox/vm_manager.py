@@ -2598,14 +2598,18 @@ class VmManager:
         # │ x86 microvm + TSC       │ hvc0        │ Non-legacy, virtio-console     │
         # │ x86 microvm - TSC       │ ttyS0       │ Legacy mode, ISA serial        │
         # │ x86 pc (TCG only)       │ ttyS0       │ Software emulation fallback    │
-        # │ ARM64 virt              │ hvc0        │ No ISA serial on ARM           │
+        # │ ARM64 virt              │ ttyAMA0     │ PL011 UART (always available)  │
         # └─────────────────────────┴─────────────┴────────────────────────────────┘
-        # ttyS0 (ISA serial) is used when we need reliable early boot console
-        # hvc0 (virtio-console) is used when ISA serial is disabled
+        # ttyS0 (ISA serial) is used when we need reliable early boot console (x86)
+        # ttyAMA0 (PL011 UART) is used for ARM64 virt machine
+        # hvc0 (virtio-console) is NOT reliable for kernel console on ARM64 because
+        # it requires virtio-serial driver initialization (not available at early boot)
         # See: https://blog.memzero.de/toying-with-virtio/
         if self.arch == HostArch.AARCH64:
-            # ARM64 virt machine has no ISA serial, must use virtio-console
-            console_params = "console=hvc0 loglevel=7"
+            # ARM64 virt machine has PL011 UART (ttyAMA0) - reliable at early boot
+            # Note: hvc0 doesn't work for console because virtio-serial isn't ready
+            # when kernel tries to open /dev/console, causing init to crash
+            console_params = "console=ttyAMA0 loglevel=7"
         elif use_virtio_console:
             # x86 non-legacy mode: ISA serial disabled, use virtio-console
             console_params = "console=hvc0 loglevel=7"
