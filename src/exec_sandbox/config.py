@@ -71,13 +71,11 @@ class SchedulerConfig(BaseModel):
     max_concurrent_vms: int = Field(
         default=10,
         ge=1,
-        le=100,
         description="Maximum concurrent VMs (each uses ~256-512MB memory)",
     )
     warm_pool_size: int = Field(
         default=0,
         ge=0,
-        le=10,
         description="Pre-booted VMs per language (0 disables warm pool)",
     )
 
@@ -85,7 +83,6 @@ class SchedulerConfig(BaseModel):
     default_memory_mb: int = Field(
         default=256,
         ge=128,
-        le=2048,
         description="Default guest VM memory in MB",
     )
     default_timeout_seconds: int = Field(
