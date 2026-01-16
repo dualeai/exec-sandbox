@@ -265,3 +265,38 @@ async def cleanup_overlay(
             },
         )
         return False
+
+
+async def cleanup_vm_processes(
+    qemu_proc: ProcessWrapper | None,
+    gvproxy_proc: ProcessWrapper | None,
+    vm_id: str,
+    qemu_term_timeout: float = 5.0,
+    qemu_kill_timeout: float = 2.0,
+    gvproxy_term_timeout: float = 3.0,
+    gvproxy_kill_timeout: float = 2.0,
+) -> bool:
+    """Cleanup QEMU and gvproxy processes for a VM.
+
+    Terminates both processes in parallel using SIGTERM → SIGKILL pattern.
+    Used by QemuVM.destroy() and test cleanup.
+
+    Args:
+        qemu_proc: QEMU ProcessWrapper (None safe)
+        gvproxy_proc: gvproxy ProcessWrapper (None safe)
+        vm_id: VM identifier for logging
+        qemu_term_timeout: SIGTERM timeout for QEMU
+        qemu_kill_timeout: SIGKILL timeout for QEMU
+        gvproxy_term_timeout: SIGTERM timeout for gvproxy
+        gvproxy_kill_timeout: SIGKILL timeout for gvproxy
+
+    Returns:
+        True if all processes cleaned successfully, False if any issues occurred
+    """
+    results = await asyncio.gather(
+        cleanup_process(qemu_proc, "QEMU", vm_id, qemu_term_timeout, qemu_kill_timeout),
+        cleanup_process(gvproxy_proc, "gvproxy", vm_id, gvproxy_term_timeout, gvproxy_kill_timeout),
+        return_exceptions=True,
+    )
+    # Check if all succeeded (True) and no exceptions
+    return all(r is True for r in results)

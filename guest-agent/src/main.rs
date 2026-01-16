@@ -38,6 +38,14 @@ const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (pr
 const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
                                     // 12s > 10s health check interval to avoid spurious reconnects
 
+// Host disconnection backoff configuration
+// When the host disconnects from virtio-serial, the kernel returns EPOLLHUP immediately on poll().
+// Without backoff, the agent would busy-loop consuming 100% CPU. Exponential backoff ensures
+// the CPU can enter idle (WFI) state while waiting for host reconnection.
+// Note: Even 1ms sleep allows WFI - the kernel enters idle as soon as no tasks are runnable.
+const INITIAL_BACKOFF_MS: u64 = 50; // Start with 50ms delay
+const MAX_BACKOFF_MS: u64 = 1000; // Cap at 1 second for quick reconnection detection
+
 // Environment variable limits
 const MAX_ENV_VARS: usize = 100; // Max number of environment variables
 const MAX_ENV_VAR_NAME_LENGTH: usize = 256; // Max env var name length
@@ -983,6 +991,37 @@ impl NonBlockingFile {
         Ok(())
     }
 
+    /// Check if the host side of the virtio-serial port is connected.
+    ///
+    /// Uses poll() to detect EPOLLHUP which the kernel's virtio_console driver
+    /// sets when `port->host_connected` is false. This allows the agent to
+    /// detect disconnection without busy-looping on read attempts.
+    ///
+    /// Returns:
+    /// - Ok(true) if host is connected (no POLLHUP)
+    /// - Ok(false) if host is disconnected (POLLHUP set)
+    /// - Err on poll failure
+    fn is_host_connected(&self) -> std::io::Result<bool> {
+        let fd = self.async_fd.get_ref().as_raw_fd();
+
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        // Poll with 0 timeout (non-blocking check)
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // POLLHUP indicates host disconnected (virtio_console sets this when !host_connected)
+        let host_disconnected = (pollfd.revents & libc::POLLHUP) != 0;
+        Ok(!host_disconnected)
+    }
+
     /// Read a line with proper async timeout support.
     ///
     /// Unlike tokio::fs::File::read which uses spawn_blocking (and thus
@@ -1208,6 +1247,10 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
         CMD_PORT_PATH, EVENT_PORT_PATH
     );
 
+    // Exponential backoff state for host disconnection
+    // This prevents busy-looping when host is not connected (EPOLLHUP case)
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+
     loop {
         // Open command port with O_NONBLOCK for proper timeout support
         // Enables detection of hung/stale connections
@@ -1217,11 +1260,47 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
                 f
             }
             Err(e) => {
-                eprintln!("Failed to open command port: {}, retrying in 100ms...", e);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                eprintln!(
+                    "Failed to open command port: {}, retrying in {}ms...",
+                    e, backoff_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
         };
+
+        // Check if host is actually connected before proceeding
+        // The kernel's virtio_console driver sets POLLHUP when host_connected=false.
+        // Without this check, we'd busy-loop on read() returning EOF immediately.
+        match cmd_file.is_host_connected() {
+            Ok(true) => {
+                eprintln!("Host is connected, proceeding with connection setup");
+                // Reset backoff on successful connection
+                backoff_ms = INITIAL_BACKOFF_MS;
+            }
+            Ok(false) => {
+                eprintln!(
+                    "Host not connected (POLLHUP), waiting {}ms before retry...",
+                    backoff_ms
+                );
+                // Drop the file before sleeping to release kernel resources
+                drop(cmd_file);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to check host connection status: {}, retrying in {}ms...",
+                    e, backoff_ms
+                );
+                drop(cmd_file);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                continue;
+            }
+        }
 
         // Open event port (guest → host, write-only)
         // Write port can use tokio::fs::File - writes don't block in the same way
@@ -1231,8 +1310,12 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
                 f
             }
             Err(e) => {
-                eprintln!("Failed to open event port: {}, retrying in 100ms...", e);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                eprintln!(
+                    "Failed to open event port: {}, retrying in {}ms...",
+                    e, backoff_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
         };
@@ -1244,6 +1327,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Connection error: {}, reopening ports...", e);
             // Small delay before reconnecting to give kernel time to release
             tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+            // Don't reset backoff here - if host disconnected, we want to back off
         }
     }
 }

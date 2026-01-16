@@ -64,7 +64,7 @@ from exec_sandbox.permission_utils import (
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
-from exec_sandbox.resource_cleanup import cleanup_process
+from exec_sandbox.resource_cleanup import cleanup_process, cleanup_vm_processes
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
@@ -1305,6 +1305,9 @@ class QemuVM:
         # Step 1: Close communication channel
         with contextlib.suppress(OSError, RuntimeError):
             await self.channel.close()
+
+        # Step 2: Terminate QEMU and gvproxy processes (SIGTERM → SIGKILL)
+        await cleanup_vm_processes(self.process, self.gvproxy_proc, self.vm_id)
 
         # Step 3-4: Parallel cleanup (cgroup + workdir)
         # After QEMU terminates, cleanup tasks are independent
