@@ -237,6 +237,7 @@ class BalloonClient:
         target_mb: int = constants.BALLOON_INFLATE_TARGET_MB,
         timeout: float = constants.BALLOON_INFLATE_TIMEOUT_SECONDS,
         wait_for_target: bool = True,
+        absolute_timeout: float = 30.0,
     ) -> int:
         """Inflate balloon to reduce guest memory for idle pool VMs.
 
@@ -250,69 +251,75 @@ class BalloonClient:
 
         Args:
             target_mb: Target guest memory in MB (default: BALLOON_INFLATE_TARGET_MB)
-            timeout: Operation timeout in seconds
+            timeout: Per-operation timeout in seconds
             wait_for_target: If True, poll until balloon reaches target
+            absolute_timeout: Maximum total time for entire operation including retries
 
         Returns:
             Previous guest memory in MB (for deflate restore)
 
         Raises:
             BalloonError: Inflation failed
+            TimeoutError: Operation exceeded absolute_timeout
         """
-        # Query current size for restore
-        current_mb = await self.query(timeout=timeout)
-        if current_mb is None:
-            logger.warning("Could not query balloon, assuming default memory")
-            current_mb = constants.DEFAULT_MEMORY_MB
+        # Outer timeout protects against unbounded retry loops
+        # The retry loop (10 retries x 0.5s = 5s) can extend if each query times out
+        async with asyncio.timeout(absolute_timeout):
+            # Query current size for restore
+            current_mb = await self.query(timeout=timeout)
+            if current_mb is None:
+                logger.warning("Could not query balloon, assuming default memory")
+                current_mb = constants.DEFAULT_MEMORY_MB
 
-        await self.set_target(target_mb, timeout=timeout)
+            await self.set_target(target_mb, timeout=timeout)
 
-        # Balloon operations are asynchronous - guest needs time to respond.
-        # Poll until target is reached, following QEMU test patterns.
-        if wait_for_target:
+            # Balloon operations are asynchronous - guest needs time to respond.
+            # Poll until target is reached, following QEMU test patterns.
+            if wait_for_target:
 
-            async def _check_balloon() -> int | None:
-                return await self.query(timeout=1.0)
+                async def _check_balloon() -> int | None:
+                    return await self.query(timeout=1.0)
 
-            def _not_at_target(result: int | None) -> bool:
-                """Retry while balloon hasn't reached target."""
-                return result is None or result > target_mb + constants.BALLOON_TOLERANCE_MB
+                def _not_at_target(result: int | None) -> bool:
+                    """Retry while balloon hasn't reached target."""
+                    return result is None or result > target_mb + constants.BALLOON_TOLERANCE_MB
 
-            try:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(10),
-                    wait=wait_fixed(0.5),
-                    retry=retry_if_result(_not_at_target),
-                    before_sleep=before_sleep_log(logger, logging.DEBUG),
-                    reraise=True,
-                ):
-                    with attempt:
-                        actual_mb = await _check_balloon()
-                        if not _not_at_target(actual_mb):
-                            logger.debug(
-                                "Balloon reached target",
-                                extra={"actual_mb": actual_mb, "target_mb": target_mb},
-                            )
-            except RetryError:
-                # Log warning but don't fail - balloon may still be inflating
-                actual_mb = await self.query(timeout=1.0)
-                logger.warning(
-                    "Balloon did not reach target within retry limit",
-                    extra={"actual_mb": actual_mb, "target_mb": target_mb},
-                )
+                try:
+                    async for attempt in AsyncRetrying(
+                        stop=stop_after_attempt(10),
+                        wait=wait_fixed(0.5),
+                        retry=retry_if_result(_not_at_target),
+                        before_sleep=before_sleep_log(logger, logging.DEBUG),
+                        reraise=True,
+                    ):
+                        with attempt:
+                            actual_mb = await _check_balloon()
+                            if not _not_at_target(actual_mb):
+                                logger.debug(
+                                    "Balloon reached target",
+                                    extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                                )
+                except RetryError:
+                    # Log warning but don't fail - balloon may still be inflating
+                    actual_mb = await self.query(timeout=1.0)
+                    logger.warning(
+                        "Balloon did not reach target within retry limit",
+                        extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                    )
 
-        logger.info(
-            "Balloon inflated",
-            extra={"from_mb": current_mb, "to_mb": target_mb},
-        )
+            logger.info(
+                "Balloon inflated",
+                extra={"from_mb": current_mb, "to_mb": target_mb},
+            )
 
-        return current_mb
+            return current_mb
 
     async def deflate(
         self,
         target_mb: int,
         timeout: float = constants.BALLOON_DEFLATE_TIMEOUT_SECONDS,
         wait_for_target: bool = True,
+        absolute_timeout: float = 30.0,
     ) -> None:
         """Deflate balloon to restore guest memory before code execution.
 
@@ -325,52 +332,56 @@ class BalloonClient:
 
         Args:
             target_mb: Target guest memory in MB
-            timeout: Operation timeout in seconds
+            timeout: Per-operation timeout in seconds
             wait_for_target: If True, poll until balloon reaches target
+            absolute_timeout: Maximum total time for entire operation including retries
 
         Raises:
             BalloonError: Deflation failed
+            TimeoutError: Operation exceeded absolute_timeout
         """
-        await self.set_target(target_mb, timeout=timeout)
+        # Outer timeout protects against unbounded retry loops
+        async with asyncio.timeout(absolute_timeout):
+            await self.set_target(target_mb, timeout=timeout)
 
-        # Balloon operations are asynchronous - guest needs time to reclaim memory.
-        # Poll until target is reached, following QEMU test patterns.
-        if wait_for_target:
+            # Balloon operations are asynchronous - guest needs time to reclaim memory.
+            # Poll until target is reached, following QEMU test patterns.
+            if wait_for_target:
 
-            async def _check_balloon() -> int | None:
-                return await self.query(timeout=1.0)
+                async def _check_balloon() -> int | None:
+                    return await self.query(timeout=1.0)
 
-            def _not_at_target(result: int | None) -> bool:
-                """Retry while balloon hasn't reached target (memory still too low)."""
-                return result is None or result < target_mb - constants.BALLOON_TOLERANCE_MB
+                def _not_at_target(result: int | None) -> bool:
+                    """Retry while balloon hasn't reached target (memory still too low)."""
+                    return result is None or result < target_mb - constants.BALLOON_TOLERANCE_MB
 
-            try:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(10),
-                    wait=wait_fixed(0.5),
-                    retry=retry_if_result(_not_at_target),
-                    before_sleep=before_sleep_log(logger, logging.DEBUG),
-                    reraise=True,
-                ):
-                    with attempt:
-                        actual_mb = await _check_balloon()
-                        if not _not_at_target(actual_mb):
-                            logger.debug(
-                                "Balloon reached deflate target",
-                                extra={"actual_mb": actual_mb, "target_mb": target_mb},
-                            )
-            except RetryError:
-                # Log warning but don't fail - balloon may still be deflating
-                actual_mb = await self.query(timeout=1.0)
-                logger.warning(
-                    "Balloon did not reach deflate target within retry limit",
-                    extra={"actual_mb": actual_mb, "target_mb": target_mb},
-                )
+                try:
+                    async for attempt in AsyncRetrying(
+                        stop=stop_after_attempt(10),
+                        wait=wait_fixed(0.5),
+                        retry=retry_if_result(_not_at_target),
+                        before_sleep=before_sleep_log(logger, logging.DEBUG),
+                        reraise=True,
+                    ):
+                        with attempt:
+                            actual_mb = await _check_balloon()
+                            if not _not_at_target(actual_mb):
+                                logger.debug(
+                                    "Balloon reached deflate target",
+                                    extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                                )
+                except RetryError:
+                    # Log warning but don't fail - balloon may still be deflating
+                    actual_mb = await self.query(timeout=1.0)
+                    logger.warning(
+                        "Balloon did not reach deflate target within retry limit",
+                        extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                    )
 
-        logger.info(
-            "Balloon deflated",
-            extra={"target_mb": target_mb},
-        )
+            logger.info(
+                "Balloon deflated",
+                extra={"target_mb": target_mb},
+            )
 
     async def __aenter__(self) -> Self:
         """Enter async context manager, connecting to QMP."""
