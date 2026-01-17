@@ -119,25 +119,6 @@ fn wait_for_block_device(path: &str) -> bool {
     false
 }
 
-fn wait_for_char_device(path: &str) -> bool {
-    // Wait for char device by attempting to open it (avoids TOCTOU race)
-    // O_RDONLY | O_NONBLOCK: non-blocking open to check device availability
-    let path_cstr = match CString::new(path) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    for delay_us in [5000, 10000, 20000, 40000, 80000] {
-        let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd >= 0 {
-            unsafe { libc::close(fd) };
-            return true;
-        }
-        thread::sleep(Duration::from_micros(delay_us));
-    }
-    false
-}
-
 fn wait_for_virtio_ports() -> bool {
     // Wait for virtio-ports directory to have entries
     // Uses any() to stop at first entry (more efficient than count())
@@ -158,13 +139,29 @@ fn setup_zram(kver: &str) {
     load_module(&format!("{}/crypto/lz4.ko.gz", m));
     load_module(&format!("{}/drivers/block/zram/zram.ko.gz", m));
 
+    // Wait briefly for zram device to appear (fixes race condition)
+    for _ in 0..10 {
+        if Path::new("/sys/block/zram0").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
     if !Path::new("/sys/block/zram0").exists() {
         return;
     }
 
-    // echo "lz4" > /sys/block/zram0/comp_algorithm || echo "lzo" > ...
-    if fs::write("/sys/block/zram0/comp_algorithm", "lz4").is_err() {
-        let _ = fs::write("/sys/block/zram0/comp_algorithm", "lzo");
+    // Use proper fallback chain: lz4 -> lzo-rle -> lzo
+    let algorithms = ["lz4", "lzo-rle", "lzo"];
+    let mut algo_set = false;
+    for algo in algorithms {
+        if fs::write("/sys/block/zram0/comp_algorithm", algo).is_ok() {
+            algo_set = true;
+            break;
+        }
+    }
+    if !algo_set {
+        return;
     }
 
     // MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
@@ -184,28 +181,38 @@ fn setup_zram(kver: &str) {
 
     // ZRAM_SIZE=$((MEM_KB * 512))
     let zram_size = mem_kb * 512;
-    let _ = fs::write("/sys/block/zram0/disksize", zram_size.to_string());
+    if fs::write("/sys/block/zram0/disksize", zram_size.to_string()).is_err() {
+        return;
+    }
 
     // mkswap /dev/zram0 - write swap signature
-    if let Ok(mut f) = fs::OpenOptions::new().write(true).open("/dev/zram0") {
+    let header_result = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new().write(true).open("/dev/zram0")?;
         let mut header = vec![0u8; 4096];
         // SWAPSPACE2 signature at offset 4086
         header[4086..4096].copy_from_slice(b"SWAPSPACE2");
-        // version = 1
-        header[1024] = 1;
+        // version = 1 (write as u32)
+        header[1024..1028].copy_from_slice(&1u32.to_le_bytes());
         // last_page
         let pages = (zram_size / 4096) as u32;
         header[1028..1032].copy_from_slice(&pages.to_le_bytes());
-        let _ = f.write_all(&header);
+        f.write_all(&header)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if header_result.is_err() {
+        return;
     }
 
     // swapon -p 100 /dev/zram0
     let dev = CString::new("/dev/zram0").unwrap();
-    unsafe {
-        libc::syscall(syscall_nr::SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100);
+    let ret = unsafe { libc::syscall(syscall_nr::SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) };
+    if ret < 0 {
+        return;
     }
 
-    // VM tuning
+    // VM tuning (these can fail silently - non-critical)
     let _ = fs::write("/proc/sys/vm/page-cluster", "0");
     let _ = fs::write("/proc/sys/vm/swappiness", "180");
     let _ = fs::write(
@@ -415,6 +422,9 @@ fn main() {
     mount("sysfs", "/sys", "sysfs", 0, "");
     mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");
 
+    // Redirect stdout/stderr early (so errors are visible)
+    redirect_to_console();
+
     // Get kernel version
     let kver = match get_kernel_version() {
         Some(v) => v,
@@ -446,12 +456,6 @@ fn main() {
     if !wait_for_block_device("/dev/vda") {
         error("timeout waiting for /dev/vda");
     }
-
-    // Wait for /dev/hvc0 (may not exist on all platforms)
-    wait_for_char_device("/dev/hvc0");
-
-    // Redirect stdout/stderr to console
-    redirect_to_console();
 
     // Wait for virtio-serial ports
     wait_for_virtio_ports();
