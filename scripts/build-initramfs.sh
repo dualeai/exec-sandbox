@@ -75,12 +75,16 @@ mknod -m 666 "$INITRAMFS_DIR/dev/ttyAMA0" c 204 64 2>/dev/null || true
 # - virtio_balloon: for memory balloon (snapshot size optimization)
 # - ext4 + dependencies (jbd2, mbcache, crc16, crc32c): for ext4 filesystem
 # - zram + lz4: for compressed swap (memory optimization)
+#
+# Modules are extracted UNCOMPRESSED for faster boot:
+# - Outer LZ4 compression handles size reduction
+# - Skips userspace gzip decompression during boot
 echo "Extracting kernel modules..."
 docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
     apk add --no-cache linux-virt >/dev/null 2>&1
     # Get kernel version
     KVER=\$(ls /lib/modules/)
-    # Create a tar of the required modules
+    # Create a tar of the required modules (decompressed for fast loading)
     cd /lib/modules/\$KVER
     tar -cf - \
         kernel/drivers/block/virtio_blk.ko.gz \
@@ -100,6 +104,9 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
         kernel/crypto/lz4.ko.gz \
         2>/dev/null || true
 " | tar -xf - -C "$INITRAMFS_DIR/lib/modules/" 2>/dev/null || true
+
+# Decompress modules for faster boot (skip gzip decompression at runtime)
+find "$INITRAMFS_DIR/lib/modules" -name "*.ko.gz" -exec gunzip -f {} \;
 
 # Create the kernel version directory structure
 KVER=$(docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "apk add --no-cache linux-virt >/dev/null 2>&1; ls /lib/modules/")

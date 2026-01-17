@@ -10,9 +10,6 @@ categories = ["virtualization"]
 
 [dependencies]
 libc = "0.2"
-flate2 = { version = "1.0", default-features = false, features = [
-    "rust_backend",
-] }
 
 [profile.release]
 opt-level = "z"   # Optimize for size

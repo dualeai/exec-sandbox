@@ -2,7 +2,6 @@
 //!
 //! Pure Rust port of images/minimal-init.sh - no busybox dependency.
 
-use flate2::read::GzDecoder;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -64,15 +63,14 @@ fn mount_move(source: &str, target: &str) -> i32 {
 }
 
 fn load_module(path: &str) {
-    // if [ -f "$mod_path" ]; then
-    let file = match File::open(path) {
+    // Read uncompressed module directly (modules decompressed at build time)
+    let mut file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return,
     };
 
-    let mut decoder = GzDecoder::new(file);
     let mut data = Vec::new();
-    if decoder.read_to_end(&mut data).is_err() {
+    if file.read_to_end(&mut data).is_err() {
         return;
     }
 
@@ -100,6 +98,12 @@ fn get_kernel_version() -> Option<String> {
     )
 }
 
+fn cmdline_has(flag: &str) -> bool {
+    fs::read_to_string("/proc/cmdline")
+        .map(|s| s.split_whitespace().any(|arg| arg == flag))
+        .unwrap_or(false)
+}
+
 fn wait_for_block_device(path: &str) -> bool {
     // Wait for block device by attempting to open it (avoids TOCTOU race)
     // O_RDONLY | O_NONBLOCK: non-blocking open to check device availability
@@ -108,7 +112,8 @@ fn wait_for_block_device(path: &str) -> bool {
         Err(_) => return false,
     };
 
-    for delay_us in [5000, 10000, 20000, 40000, 80000] {
+    // Fast exponential backoff: 1+2+4+8+16+32 = 63ms max (was 155ms)
+    for delay_us in [1000, 2000, 4000, 8000, 16000, 32000] {
         let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         if fd >= 0 {
             unsafe { libc::close(fd) };
@@ -122,7 +127,8 @@ fn wait_for_block_device(path: &str) -> bool {
 fn wait_for_virtio_ports() -> bool {
     // Wait for virtio-ports directory to have entries
     // Uses any() to stop at first entry (more efficient than count())
-    for delay_us in [5000, 10000, 20000, 40000, 80000] {
+    // Fast exponential backoff: 1+2+4+8+16+32 = 63ms max (was 155ms)
+    for delay_us in [1000, 2000, 4000, 8000, 16000, 32000] {
         if let Ok(mut entries) = fs::read_dir("/sys/class/virtio-ports") {
             if entries.any(|e| e.is_ok()) {
                 return true;
@@ -135,16 +141,17 @@ fn wait_for_virtio_ports() -> bool {
 
 fn setup_zram(kver: &str) {
     let m = format!("/lib/modules/{}/kernel", kver);
-    load_module(&format!("{}/lib/lz4/lz4_compress.ko.gz", m));
-    load_module(&format!("{}/crypto/lz4.ko.gz", m));
-    load_module(&format!("{}/drivers/block/zram/zram.ko.gz", m));
+    load_module(&format!("{}/lib/lz4/lz4_compress.ko", m));
+    load_module(&format!("{}/crypto/lz4.ko", m));
+    load_module(&format!("{}/drivers/block/zram/zram.ko", m));
 
     // Wait briefly for zram device to appear (fixes race condition)
-    for _ in 0..10 {
+    // 20 iterations × 1ms = 20ms max (was 50ms)
+    for _ in 0..20 {
         if Path::new("/sys/block/zram0").exists() {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
 
     if !Path::new("/sys/block/zram0").exists() {
@@ -186,6 +193,7 @@ fn setup_zram(kver: &str) {
     }
 
     // mkswap /dev/zram0 - write swap signature
+    // No sync needed - zram is memory-backed
     let header_result = (|| -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new().write(true).open("/dev/zram0")?;
         let mut header = vec![0u8; 4096];
@@ -196,9 +204,7 @@ fn setup_zram(kver: &str) {
         // last_page
         let pages = (zram_size / 4096) as u32;
         header[1028..1032].copy_from_slice(&pages.to_le_bytes());
-        f.write_all(&header)?;
-        f.sync_all()?;
-        Ok(())
+        f.write_all(&header)
     })();
 
     if header_result.is_err() {
@@ -434,20 +440,34 @@ fn main() {
         }
     };
 
-    // Load modules (same order as shell script)
+    // Load modules - check cmdline for optional modules
     let m = format!("/lib/modules/{}/kernel", kver);
-    load_module(&format!("{}/drivers/virtio/virtio_mmio.ko.gz", m));
-    load_module(&format!("{}/drivers/block/virtio_blk.ko.gz", m));
-    load_module(&format!("{}/net/core/failover.ko.gz", m));
-    load_module(&format!("{}/drivers/net/net_failover.ko.gz", m));
-    load_module(&format!("{}/drivers/net/virtio_net.ko.gz", m));
-    load_module(&format!("{}/drivers/virtio/virtio_balloon.ko.gz", m));
-    load_module(&format!("{}/lib/crc16.ko.gz", m));
-    load_module(&format!("{}/crypto/crc32c_generic.ko.gz", m));
-    load_module(&format!("{}/lib/libcrc32c.ko.gz", m));
-    load_module(&format!("{}/fs/mbcache.ko.gz", m));
-    load_module(&format!("{}/fs/jbd2/jbd2.ko.gz", m));
-    load_module(&format!("{}/fs/ext4/ext4.ko.gz", m));
+    let need_net = cmdline_has("init.net=1");
+    let need_balloon = cmdline_has("init.balloon=1");
+
+    // Core virtio (always needed)
+    load_module(&format!("{}/drivers/virtio/virtio_mmio.ko", m));
+    load_module(&format!("{}/drivers/block/virtio_blk.ko", m));
+
+    // Network modules (only if init.net=1)
+    if need_net {
+        load_module(&format!("{}/net/core/failover.ko", m));
+        load_module(&format!("{}/drivers/net/net_failover.ko", m));
+        load_module(&format!("{}/drivers/net/virtio_net.ko", m));
+    }
+
+    // Balloon (only if init.balloon=1)
+    if need_balloon {
+        load_module(&format!("{}/drivers/virtio/virtio_balloon.ko", m));
+    }
+
+    // Filesystem modules (always needed)
+    load_module(&format!("{}/lib/crc16.ko", m));
+    load_module(&format!("{}/crypto/crc32c_generic.ko", m));
+    load_module(&format!("{}/lib/libcrc32c.ko", m));
+    load_module(&format!("{}/fs/mbcache.ko", m));
+    load_module(&format!("{}/fs/jbd2/jbd2.ko", m));
+    load_module(&format!("{}/fs/ext4/ext4.ko", m));
 
     // Setup zram swap
     setup_zram(&kver);
@@ -472,11 +492,6 @@ fn main() {
         }
     }
 
-    // Verify guest-agent exists
-    if !Path::new("/mnt/usr/local/bin/guest-agent").exists() {
-        error("guest-agent not found");
-        fallback_shell();
-    }
-
+    // No existence check - execv will fail if guest-agent missing
     switch_root();
 }
