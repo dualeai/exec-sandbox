@@ -20,6 +20,7 @@ from exec_sandbox.vm_manager import (
     _check_hvf_available,
     _check_kvm_available,
     _check_tsc_deadline,
+    _check_tsc_deadline_linux,
     _check_tsc_deadline_macos,
     _kernel_validated,
     _probe_cache,
@@ -959,6 +960,96 @@ class TestEmulationMode:
             assert expected_output in result.stdout, f"Expected '{expected_output}' in stdout: {result.stdout}"
         finally:
             await emulation_vm_manager.destroy_vm(vm)
+
+
+# ============================================================================
+# Unit Tests - TSC_DEADLINE Detection for Linux
+# ============================================================================
+
+
+class TestTscDeadlineLinux:
+    """Tests for TSC_DEADLINE detection on Linux via /proc/cpuinfo."""
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_with_feature(self) -> None:
+        """Linux with tsc_deadline_timer in cpuinfo returns True."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            cpuinfo_content = """processor	: 0
+vendor_id	: GenuineIntel
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep tsc_deadline_timer sse sse2
+"""
+            mock_file = AsyncMock()
+            mock_file.__aenter__.return_value.read = AsyncMock(return_value=cpuinfo_content)
+
+            with patch("aiofiles.os.path.exists", return_value=True):
+                with patch("aiofiles.open", return_value=mock_file):
+                    result = await _check_tsc_deadline_linux()
+                    assert result is True
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_without_feature(self) -> None:
+        """Linux without tsc_deadline_timer in cpuinfo returns False."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            cpuinfo_content = """processor	: 0
+vendor_id	: GenuineIntel
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
+"""
+            mock_file = AsyncMock()
+            mock_file.__aenter__.return_value.read = AsyncMock(return_value=cpuinfo_content)
+
+            with patch("aiofiles.os.path.exists", return_value=True):
+                with patch("aiofiles.open", return_value=mock_file):
+                    result = await _check_tsc_deadline_linux()
+                    assert result is False
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_cpuinfo_not_exists(self) -> None:
+        """/proc/cpuinfo not existing returns False gracefully."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            with patch("aiofiles.os.path.exists", return_value=False):
+                result = await _check_tsc_deadline_linux()
+                assert result is False
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_read_error(self) -> None:
+        """OSError reading /proc/cpuinfo returns False gracefully."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            with patch("aiofiles.os.path.exists", return_value=True):
+                with patch("aiofiles.open", side_effect=OSError("Permission denied")):
+                    result = await _check_tsc_deadline_linux()
+                    assert result is False
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
 
 
 # ============================================================================
