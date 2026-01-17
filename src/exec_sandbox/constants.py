@@ -221,3 +221,16 @@ Benchmarked on NVMe SSD (30 overlays):
 
 OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS: Final[float] = 0.5
 """Interval between replenishment checks."""
+
+# ============================================================================
+# QEMU Storage Daemon
+# ============================================================================
+
+QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout for QMP socket operations."""
+
+QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS: Final[float] = 10.0
+"""Timeout waiting for daemon to become ready."""
+
+QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS: Final[float] = 30.0
+"""Timeout waiting for async blockdev-create jobs to complete."""

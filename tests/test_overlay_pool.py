@@ -10,6 +10,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from exec_sandbox import constants
 
 from .conftest import skip_unless_hwaccel
@@ -47,35 +49,16 @@ class TestOverlayPoolPureLogic:
         pool = OverlayPool(max_concurrent_vms=-10, pool_dir=tmp_path / "pool")
         assert pool.pool_size == -5  # Stored as-is, but treated as disabled
 
-    async def test_acquire_when_pool_empty_creates_ondemand(self, tmp_path: Path) -> None:
-        """Acquire creates overlay on-demand when pool is empty (returns False)."""
-        from exec_sandbox.overlay_pool import OverlayPool
-
-        pool = OverlayPool(max_concurrent_vms=0, pool_dir=tmp_path / "pool")
-        target = tmp_path / "target.qcow2"
-
-        # Mock create_qcow2_overlay since we don't have a real base image
-        with patch("exec_sandbox.overlay_pool.create_qcow2_overlay", new_callable=AsyncMock) as mock_create:
-            result = await pool.acquire(Path("/fake/base.qcow2"), target)
-
-        # Returns False (not from pool) but overlay was created
-        assert result is False
-        mock_create.assert_called_once()
-
-    async def test_acquire_before_startup_creates_ondemand(self, tmp_path: Path) -> None:
-        """Acquire before startup creates overlay on-demand."""
+    async def test_acquire_before_startup_fails(self, tmp_path: Path) -> None:
+        """Acquire before startup raises RuntimeError - daemon required."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
-        # No startup() called
+        # No startup() called - daemon not started
         target = tmp_path / "target.qcow2"
 
-        with patch("exec_sandbox.overlay_pool.create_qcow2_overlay", new_callable=AsyncMock) as mock_create:
-            result = await pool.acquire(Path("/fake/base.qcow2"), target)
-
-        # Returns False (not from pool) but overlay was created
-        assert result is False
-        mock_create.assert_called_once()
+        with pytest.raises(RuntimeError, match="Daemon must be started"):
+            await pool.acquire(Path("/fake/base.qcow2"), target)
 
     async def test_startup_with_zero_pool_size_is_noop(self, tmp_path: Path) -> None:
         """Startup with pool_size=0 doesn't create directory or start tasks."""
@@ -189,29 +172,6 @@ class TestOverlayPoolPureLogic:
 class TestOverlayPoolErrorHandling:
     """Tests for error handling - mocks needed to simulate failures."""
 
-    async def test_qemu_img_failure_during_startup_continues(self, tmp_path: Path) -> None:
-        """Startup continues even if some overlay creations fail."""
-        from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
-
-        pool = OverlayPool(max_concurrent_vms=6, pool_dir=tmp_path / "pool")
-        call_count = 0
-
-        async def failing_create(base: Path, overlay: Path) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                raise QemuImgError("Simulated disk full")
-            # Remaining calls succeed
-            overlay.parent.mkdir(parents=True, exist_ok=True)
-            overlay.write_text("valid")
-
-        with patch("exec_sandbox.overlay_pool.create_qcow2_overlay", side_effect=failing_create):
-            await pool.startup([Path("/fake/base.qcow2")])
-
-        # Should have attempted all 3 creations despite failures (pool_size = 6 * 0.5 = 3)
-        assert call_count == 3
-        await pool.shutdown()
-
     async def test_rename_failure_falls_back_to_ondemand(self, tmp_path: Path) -> None:
         """Failed rename (cross-filesystem) cleans up and creates on-demand.
 
@@ -219,12 +179,13 @@ class TestOverlayPoolErrorHandling:
         requires cross-filesystem setup which is environment-dependent.
         """
         from exec_sandbox.overlay_pool import OverlayPool
+        from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 
         pool_dir = tmp_path / "pool"
         pool_dir.mkdir(parents=True)
         pool = OverlayPool(max_concurrent_vms=2, pool_dir=pool_dir)
 
-        # Setup: create a file in the pool queue
+        # Setup: create a file in the pool queue and mock daemon
         base_image = Path("/fake/base.qcow2")
         pool._pools[str(base_image)] = asyncio.Queue(maxsize=1)
         overlay = pool_dir / "test.qcow2"
@@ -232,16 +193,17 @@ class TestOverlayPoolErrorHandling:
         await pool._pools[str(base_image)].put(overlay)
         pool._started = True
 
-        # Test: rename fails, should cleanup and fall back to on-demand
-        with (
-            patch("aiofiles.os.rename", side_effect=OSError("Cross-device link")),
-            patch("exec_sandbox.overlay_pool.create_qcow2_overlay", new_callable=AsyncMock) as mock_create,
-        ):
+        # Mock daemon for on-demand creation
+        mock_daemon = AsyncMock(spec=QemuStorageDaemon)
+        pool._daemon = mock_daemon
+
+        # Test: rename fails, should cleanup and fall back to on-demand via daemon
+        with patch("aiofiles.os.rename", side_effect=OSError("Cross-device link")):
             result = await pool.acquire(base_image, tmp_path / "target.qcow2")
 
         assert result is False  # Not from pool (created on-demand)
         assert not overlay.exists()  # Orphaned overlay cleaned up
-        mock_create.assert_called_once()  # Fell back to on-demand
+        mock_daemon.create_overlay.assert_called_once()  # Fell back to daemon
         await pool.shutdown()
 
     async def test_shutdown_handles_rmtree_failure(self, tmp_path: Path) -> None:
@@ -417,8 +379,7 @@ class TestOverlayPoolIntegration:
         """Full integration: VM boots successfully with pooled overlay."""
         from exec_sandbox.models import Language
 
-        await vm_manager.initialize()
-
+        # vm_manager fixture already calls initialize() and shutdown()
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test",
@@ -430,7 +391,6 @@ class TestOverlayPoolIntegration:
             assert "hello from pool" in result.stdout
         finally:
             await vm_manager.destroy_vm(vm)
-            await vm_manager.shutdown()
 
     async def test_fallback_to_ondemand_when_pool_exhausted(self, make_vm_settings, tmp_path: Path) -> None:
         """VM still boots when pool is empty (fallback to _create_overlay)."""

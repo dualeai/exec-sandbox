@@ -9,7 +9,10 @@ Architecture:
 - Pool directory under tempfile.gettempdir() for same-filesystem atomic rename
 - Background replenishment maintains pool size after allocations
 - Graceful fallback to on-demand creation when pool is exhausted
+- Uses qemu-storage-daemon for fast overlay creation (~4ms vs ~39ms)
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -23,6 +26,7 @@ import aiofiles.os
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError
 
 logger = get_logger(__name__)
 
@@ -38,10 +42,10 @@ class QemuImgError(Exception):
 async def create_qcow2_overlay(base_image: Path, overlay_path: Path) -> None:
     """Create qcow2 overlay with copy-on-write backing file.
 
-    Single source of truth for overlay creation options. Used by:
-    - VmManager._create_overlay (on-demand VM creation)
-    - OverlayPool._create_and_enqueue (pre-pooled overlays)
+    Subprocess-based overlay creation using qemu-img. Used by:
     - SnapshotManager (snapshot creation)
+
+    Note: OverlayPool uses QemuStorageDaemon for faster overlay creation.
 
     Options rationale:
     - lazy_refcounts=on: Faster writes, metadata crash-consistent via fsync
@@ -129,11 +133,18 @@ class OverlayPool:
         self._started = False
         # Semaphore to limit concurrent overlay creation (throttles both startup and replenishment)
         self._creation_sem = asyncio.Semaphore(constants.OVERLAY_POOL_REPLENISH_BATCH_SIZE)
+        # qemu-storage-daemon for fast overlay creation
+        self._daemon: QemuStorageDaemon | None = None
 
     @property
     def pool_size(self) -> int:
         """Get configured pool size per base image."""
         return self._pool_size
+
+    @property
+    def daemon_enabled(self) -> bool:
+        """Whether qemu-storage-daemon is active for fast overlay creation."""
+        return self._daemon is not None and self._daemon.started
 
     def _discover_base_images(self) -> list[Path]:
         """Discover all base images in images_path.
@@ -186,6 +197,10 @@ class OverlayPool:
             )
             return
 
+        # Start qemu-storage-daemon for fast overlay creation
+        self._daemon = QemuStorageDaemon()
+        await self._daemon.start()
+
         # Initialize pools for each base image
         for base_image in base_images:
             key = str(base_image.resolve())
@@ -213,11 +228,12 @@ class OverlayPool:
                 "pool_size": self._pool_size,
                 "base_images": [str(p) for p in base_images],
                 "pool_dir": str(self._pool_dir),
+                "daemon_enabled": self._daemon is not None,
             },
         )
 
     async def shutdown(self) -> None:
-        """Clean shutdown: cancel tasks, cleanup pool directory."""
+        """Clean shutdown: cancel tasks, stop daemon, cleanup pool directory."""
         if not self._started:
             return
 
@@ -232,6 +248,11 @@ class OverlayPool:
         if self._replenish_tasks:
             await asyncio.gather(*self._replenish_tasks, return_exceptions=True)
         self._replenish_tasks.clear()
+
+        # Stop qemu-storage-daemon
+        if self._daemon:
+            await self._daemon.stop()
+            self._daemon = None
 
         # Clean up pool directory
         if self._pool_dir.exists():
@@ -259,11 +280,12 @@ class OverlayPool:
 
         Returns:
             True if acquired from pool (fast path, <1ms),
-            False if created on-demand (slow path, 30-430ms)
+            False if created on-demand (slow path, ~8ms via daemon)
 
         Raises:
             FileExistsError: target_path already exists
-            QemuImgError: Failed to create overlay (only possible on slow path)
+            RuntimeError: Daemon not started (call startup() first)
+            QemuStorageDaemonError: Failed to create overlay via daemon
         """
         # Prevent silent overwrite of existing files
         if target_path.exists():
@@ -311,8 +333,10 @@ class OverlayPool:
                 extra={"base_image": key, "pool_size": self._pool_size},
             )
 
-        # Slow path: create overlay on-demand
-        await create_qcow2_overlay(base_image, target_path)
+        # Slow path: create overlay on-demand via daemon
+        if self._daemon is None:
+            raise RuntimeError("Daemon must be started before acquire - call startup() first")
+        await self._daemon.create_overlay(base_image, target_path)
         return False
 
     async def _create_and_enqueue(self, base_image: Path, key: str) -> None:
@@ -329,7 +353,11 @@ class OverlayPool:
             try:
                 # Generate unique filename
                 overlay_path = self._pool_dir / f"overlay-{uuid4()}.qcow2"
-                await create_qcow2_overlay(base_image, overlay_path)
+
+                # Create overlay via daemon
+                if self._daemon is None:
+                    raise RuntimeError("Daemon must be started")
+                await self._daemon.create_overlay(base_image, overlay_path)
 
                 # Add to pool (non-blocking, may fail if full)
                 pool = self._pools.get(key)
@@ -340,7 +368,7 @@ class OverlayPool:
                         # Pool is full, clean up extra overlay
                         with contextlib.suppress(OSError):
                             overlay_path.unlink()
-            except (OSError, QemuImgError) as e:
+            except (OSError, QemuStorageDaemonError) as e:
                 logger.warning(
                     "Failed to create pooled overlay",
                     extra={"base_image": str(base_image), "error": str(e)},
@@ -389,7 +417,7 @@ class OverlayPool:
 
             except asyncio.CancelledError:
                 break
-            except (OSError, QemuImgError) as e:
+            except (OSError, QemuStorageDaemonError) as e:
                 logger.warning(
                     "Replenishment error",
                     extra={"base_image": key, "error": str(e)},

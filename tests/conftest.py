@@ -137,11 +137,18 @@ def vm_settings(images_dir: Path):
 
 
 @pytest.fixture
-def vm_manager(vm_settings):
-    """VmManager with hardware acceleration."""
+async def vm_manager(vm_settings) -> AsyncGenerator:
+    """VmManager with hardware acceleration (initialized).
+
+    Automatically calls initialize() to start the overlay pool daemon,
+    and shutdown() for cleanup.
+    """
     from exec_sandbox.vm_manager import VmManager
 
-    return VmManager(vm_settings)  # type: ignore[arg-type]
+    manager = VmManager(vm_settings)  # type: ignore[arg-type]
+    await manager.initialize()
+    yield manager
+    await manager.shutdown()
 
 
 @pytest.fixture
@@ -158,11 +165,18 @@ def emulation_settings(images_dir: Path):
 
 
 @pytest.fixture
-def emulation_vm_manager(emulation_settings):
-    """VmManager configured for software emulation."""
+async def emulation_vm_manager(emulation_settings) -> AsyncGenerator:
+    """VmManager configured for software emulation (initialized).
+
+    Automatically calls initialize() to start the overlay pool daemon,
+    and shutdown() for cleanup.
+    """
     from exec_sandbox.vm_manager import VmManager
 
-    return VmManager(emulation_settings)  # type: ignore[arg-type]
+    manager = VmManager(emulation_settings)  # type: ignore[arg-type]
+    await manager.initialize()
+    yield manager
+    await manager.shutdown()
 
 
 @pytest.fixture
