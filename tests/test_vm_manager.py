@@ -19,6 +19,7 @@ from exec_sandbox.vm_manager import (
     VmState,
     _check_hvf_available,
     _check_kvm_available,
+    _check_tsc_deadline,
     _check_tsc_deadline_macos,
     _kernel_validated,
     _probe_cache,
@@ -1062,8 +1063,8 @@ class TestTscDeadlineMacOS:
             _probe_cache.tsc_deadline = original_tsc
 
     @pytest.mark.asyncio
-    async def test_tsc_deadline_macos_cached(self) -> None:
-        """TSC_DEADLINE result is cached."""
+    async def test_tsc_deadline_cached(self) -> None:
+        """TSC_DEADLINE result is cached (caching is in _check_tsc_deadline, not platform-specific functions)."""
         from exec_sandbox.vm_manager import _probe_cache
 
         # Save original cache value
@@ -1073,11 +1074,13 @@ class TestTscDeadlineMacOS:
             # Set cached value
             _probe_cache.tsc_deadline = True
 
-            # Should return cached value without calling sysctl
+            # Should return cached value without calling sysctl or reading /proc/cpuinfo
             with patch("asyncio.create_subprocess_exec") as mock_exec:
-                result = await _check_tsc_deadline_macos()
-                assert result is True
-                mock_exec.assert_not_called()
+                with patch("aiofiles.open") as mock_open:
+                    result = await _check_tsc_deadline()
+                    assert result is True
+                    mock_exec.assert_not_called()
+                    mock_open.assert_not_called()
         finally:
             # Restore cache
             _probe_cache.tsc_deadline = original_tsc
