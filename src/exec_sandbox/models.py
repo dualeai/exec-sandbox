@@ -40,6 +40,11 @@ class TimingBreakdown(BaseModel):
         default=None,
         description="Time for channel.connect() in milliseconds (host-measured)",
     )
+    # Granular setup timing (for tracing/profiling)
+    overlay_ms: int | None = Field(
+        default=None,
+        description="Time for overlay acquisition (pool hit <1ms, on-demand 30-400ms)",
+    )
     # Granular boot timing (for tracing/profiling)
     qemu_cmd_build_ms: int | None = Field(
         default=None,

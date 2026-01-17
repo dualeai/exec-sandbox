@@ -200,6 +200,9 @@ class Scheduler:
                 destroy_tasks = [self._vm_manager.destroy_vm(vm) for vm in active_vms.values()]
                 await asyncio.gather(*destroy_tasks, return_exceptions=True)
 
+            # Shutdown VmManager (includes overlay pool cleanup)
+            await self._vm_manager.shutdown()
+
         self._started = False
         logger.info("Scheduler shutdown complete")
 
@@ -282,11 +285,11 @@ class Scheduler:
         if packages and self.config.enable_package_validation:
             await self._validate_packages(packages, language)
 
-        # Check L2 snapshot cache for disk caching
-        # ALL VMs (base images + packages) are cached to L2 for fast subsequent access
-        # First run is slow (creates snapshot), subsequent runs benefit from cached packages
+        # Check L2 snapshot cache for disk caching (only if packages specified)
+        # Only use snapshots when packages need to be installed - empty packages case
+        # benefits from overlay pool pre-caching which requires using the original base image
         snapshot_path: Path | None = None
-        if self._snapshot_manager:
+        if self._snapshot_manager and packages:
             snapshot_path = await self._get_or_create_snapshot(language, packages, memory)
             logger.info(
                 "Snapshot cache result",
@@ -343,6 +346,9 @@ class Scheduler:
                 # For cold boot: use actual setup/boot times from VM
                 setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
                 boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+                # Granular setup timing
+                overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
+                # Granular boot timing
                 qemu_cmd_build_ms = vm.qemu_cmd_build_ms if is_cold_boot and vm.qemu_cmd_build_ms is not None else 0
                 gvproxy_start_ms = vm.gvproxy_start_ms if is_cold_boot and vm.gvproxy_start_ms is not None else 0
                 qemu_fork_ms = vm.qemu_fork_ms if is_cold_boot and vm.qemu_fork_ms is not None else 0
@@ -361,6 +367,7 @@ class Scheduler:
                         execute_ms=execute_ms,
                         total_ms=total_ms,
                         connect_ms=result.timing.connect_ms,
+                        overlay_ms=overlay_ms,
                         qemu_cmd_build_ms=qemu_cmd_build_ms,
                         gvproxy_start_ms=gvproxy_start_ms,
                         qemu_fork_ms=qemu_fork_ms,

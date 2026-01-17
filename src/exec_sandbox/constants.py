@@ -195,3 +195,29 @@ BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 
 BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout for balloon deflate operation (restoring guest memory before execution)."""
+
+# ============================================================================
+# Overlay Pool
+# ============================================================================
+
+OVERLAY_POOL_SIZE_RATIO: Final[float] = 0.5
+"""Overlay pool size as ratio of max_concurrent_vms (50%).
+
+With 10 max VMs, pool will have 5 pre-created overlays per base image.
+Higher ratio = more pool hits, lower ratio = less disk usage.
+"""
+
+OVERLAY_POOL_REPLENISH_BATCH_SIZE: Final[int] = 8
+"""Max concurrent overlay creations during startup and replenishment.
+
+Benchmarked on NVMe SSD (30 overlays):
+- 4: 0.50s (59.8/sec) - too conservative
+- 8: 0.41s (73.2/sec) - 22% faster, good balance
+- 16: 0.36s (82.9/sec) - 38% faster but aggressive
+- 32: 0.42s (71.7/sec) - contention kicks in
+
+8 balances throughput vs compatibility with slower storage.
+"""
+
+OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS: Final[float] = 0.5
+"""Interval between replenishment checks."""

@@ -44,6 +44,7 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.hash_utils import crc32, crc64
 from exec_sandbox.models import Language
+from exec_sandbox.overlay_pool import QemuImgError, create_qcow2_overlay
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 
@@ -573,50 +574,18 @@ class SnapshotManager:
         Raises:
             SnapshotError: qemu-img command failed
         """
-        cmd = [
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            str(base_image),
-            "-o",
-            # Performance Optimization: Extended L2 Entries (QEMU 5.2+)
-            # Divides 128KB clusters into 32 x 4KB subclusters for granular allocation
-            # Benefits:
-            # - 10-15x faster IOPS during package install (CoW with backing files)
-            # - Reduces write amplification (partial cluster updates)
-            # - Smaller snapshots (less data duplication)
-            # Trade-offs:
-            # - Requires QEMU ≥5.2 (we have 10.1.2 ✓)
-            # - Incompatible with QEMU <5.2 (not a concern, internal use only)
-            # - cluster_size must be ≥16KB (128KB chosen for balance)
-            # L2 cache: Default 32MB sufficient (needs only ~128KB for 500MB image)
-            "lazy_refcounts=on,extended_l2=on,cluster_size=128k",
-            str(snapshot_path),
-        ]
-
-        proc = ProcessWrapper(
-            await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        )
-        _stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
+        try:
+            await create_qcow2_overlay(base_image, snapshot_path)
+        except QemuImgError as e:
             raise SnapshotError(
-                f"qemu-img create failed: {stderr.decode()}",
+                str(e),
                 context={
                     "cache_key": cache_key,
                     "language": language,
                     "packages": packages,
                     "tenant_id": tenant_id,
                 },
-            )
+            ) from e
 
     async def _monitor_vm_death(self, vm: QemuVM, cache_key: str) -> None:
         """Monitor VM process for unexpected death.

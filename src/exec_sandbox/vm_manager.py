@@ -54,6 +54,7 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
 from exec_sandbox.permission_utils import (
     can_access,
     chmod_async,
@@ -897,6 +898,8 @@ class QemuVM:
         # Timing instrumentation (set by VmManager.create_vm)
         self._setup_ms: int | None = None  # Resource setup time
         self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
+        # Granular setup timing (for tracing)
+        self._overlay_ms: int | None = None  # Overlay acquisition time
         # Granular boot timing (for tracing)
         self._qemu_cmd_build_ms: int | None = None
         self._gvproxy_start_ms: int | None = None
@@ -912,6 +915,16 @@ class QemuVM:
     def setup_ms(self, value: int) -> None:
         """Set resource setup time in milliseconds."""
         self._setup_ms = value
+
+    @property
+    def overlay_ms(self) -> int | None:
+        """Get overlay acquisition time in milliseconds."""
+        return self._overlay_ms
+
+    @overlay_ms.setter
+    def overlay_ms(self, value: int) -> None:
+        """Set overlay acquisition time in milliseconds."""
+        self._overlay_ms = value
 
     @property
     def boot_ms(self) -> int | None:
@@ -1399,6 +1412,12 @@ class VmManager:
         self._vms: dict[str, QemuVM] = {}  # vm_id → VM object
         self._vms_lock = asyncio.Lock()  # Protect registry access
 
+        # Overlay pool for fast VM boot (auto-manages base image discovery and pooling)
+        self._overlay_pool = OverlayPool(
+            max_concurrent_vms=settings.max_concurrent_vms,
+            images_path=settings.base_images_dir,
+        )
+
     async def initialize(self) -> None:
         """Run async system probes and complete initialization.
 
@@ -1425,6 +1444,9 @@ class VmManager:
         # Pre-flight check: validate kernel and initramfs exist (cached)
         await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
 
+        # Start overlay pool (discovers base images internally)
+        await self._overlay_pool.startup()
+
         self._initialized = True
 
         # Log registry initialization (empty on startup, even after crash)
@@ -1446,6 +1468,13 @@ class VmManager:
             Copy of VM registry (vm_id → QemuVM)
         """
         return dict(self._vms)
+
+    async def shutdown(self) -> None:
+        """Shutdown VmManager and cleanup resources (overlay pool).
+
+        Should be called when the VmManager is no longer needed.
+        """
+        await self._overlay_pool.shutdown()
 
     async def create_vm(  # noqa: PLR0912, PLR0915
         self,
@@ -1562,29 +1591,34 @@ class VmManager:
 
             # Unified setup phase: overlay + cgroup (gvproxy moved to boot phase)
             # This reduces setup contention under high concurrency
+            overlay_ms = 0  # Default for direct_write mode (no overlay)
             if direct_write_target:
                 # Direct write mode - VM writes directly to target file (no overlay)
                 # Used for L2 snapshot creation where disk changes are written directly
                 workdir.use_qemu_vm_user = False  # target file owned by current user
                 cgroup_path = await cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg)
+            # Normal mode - create overlay backed by base image
+            # This allows the backing image to remain read-only and shareable
+            # Pool handles fast path (from pool) or slow path (on-demand) internally
             else:
-                # Normal mode - create overlay backed by base image
-                # This allows the backing image to remain read-only and shareable
-                overlay_result, cgroup_result = await asyncio.gather(
-                    self._create_overlay(base_image, workdir.overlay_image),
+                overlay_start = asyncio.get_event_loop().time()
+                try:
+                    await self._overlay_pool.acquire(base_image, workdir.overlay_image)
+                except QemuImgError as e:
+                    raise VmError(str(e)) from e
+                overlay_ms = round((asyncio.get_event_loop().time() - overlay_start) * 1000)
+                # Apply permissions in parallel with cgroup setup
+                perm_result, cgroup_result = await asyncio.gather(
+                    self._apply_overlay_permissions(base_image, workdir.overlay_image),
                     cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     return_exceptions=True,
                 )
-
-                # Check for failures
-                if isinstance(overlay_result, BaseException):
-                    raise overlay_result
+                if isinstance(perm_result, BaseException):
+                    raise perm_result
                 if isinstance(cgroup_result, BaseException):
                     raise cgroup_result
-
-                # Type narrowing: after BaseException checks
                 cgroup_path = cgroup_result
-                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
+                workdir.use_qemu_vm_user = perm_result
             setup_complete_time = asyncio.get_event_loop().time()
 
             # Step 5: Build QEMU command (always Linux in container)
@@ -1764,6 +1798,8 @@ class VmManager:
                 # Store timing on VM for scheduler to use
                 vm.setup_ms = round((setup_complete_time - start_time) * 1000)
                 vm.boot_ms = round((boot_complete_time - setup_complete_time) * 1000)
+                # Granular setup timing
+                vm.overlay_ms = overlay_ms
                 # Granular boot timing
                 vm.qemu_cmd_build_ms = qemu_cmd_build_ms
                 vm.gvproxy_start_ms = gvproxy_start_ms
@@ -1851,6 +1887,8 @@ class VmManager:
                     "setup_ms": vm.setup_ms,
                     "boot_ms": vm.boot_ms,
                     "total_boot_ms": total_boot_ms,
+                    # Granular setup breakdown
+                    "overlay_ms": overlay_ms,
                     # Granular boot breakdown
                     "qemu_cmd_build_ms": qemu_cmd_build_ms,
                     "gvproxy_start_ms": gvproxy_start_ms,
@@ -2264,47 +2302,17 @@ class VmManager:
             return AccelType.HVF
         return AccelType.TCG
 
-    async def _create_overlay(self, base_image: Path, overlay_image: Path) -> bool:
-        """Create ephemeral qcow2 overlay with CoW backing file.
+    async def _apply_overlay_permissions(self, base_image: Path, overlay_image: Path) -> bool:
+        """Apply permissions to overlay (chown/chmod for qemu-vm isolation).
 
         Args:
-            base_image: Base qcow2 image (backing file)
-            overlay_image: Ephemeral overlay to create
+            base_image: Base qcow2 image (needs read permission for qemu-vm)
+            overlay_image: Overlay image (will be chowned to qemu-vm if possible)
 
         Returns:
             True if overlay was chowned to qemu-vm (QEMU should run as qemu-vm),
             False if overlay is owned by current user (QEMU should run as current user)
-
-        Raises:
-            VmError: qemu-img command failed
         """
-        cmd = [
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            str(base_image),
-            "-o",
-            "lazy_refcounts=on,extended_l2=on,cluster_size=128k",
-            str(overlay_image),
-        ]
-
-        proc = ProcessWrapper(
-            await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        )
-        _stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            raise VmError(f"qemu-img create failed: {stderr.decode()}")
-
         # Change ownership to qemu-vm user for process isolation (optional hardening)
         # Only if: Linux + qemu-vm user exists + can run sudo -u qemu-vm
         # The stronger probe_sudo_as_qemu_vm() ensures we can actually execute as qemu-vm
