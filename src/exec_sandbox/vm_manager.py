@@ -20,8 +20,6 @@ Performance Optimizations (QEMU 10.0+):
 
 import asyncio
 import contextlib
-import ctypes
-import errno
 import json
 import logging
 import os
@@ -672,53 +670,71 @@ async def _probe_io_uring_support() -> bool:
             except (ValueError, OSError) as e:
                 logger.warning("Failed to read io_uring_disabled sysctl", extra={"error": str(e)})
 
-        # Check 2: Syscall probe (most reliable)
+        # Check 2: Syscall probe via subprocess (avoids blocking event loop)
+        # Uses subprocess to prevent blocking - ctypes syscall would block the event loop
+        # Exit codes: 0=available (EINVAL/EFAULT), 1=not available (ENOSYS), 2=blocked (EPERM), 3=error
         try:
-            libc = ctypes.CDLL(None, use_errno=True)
+            probe_script = """
+import ctypes
+import errno
+import sys
 
-            # __NR_io_uring_setup syscall number: 425
-            nr_io_uring_setup = 425
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    # __NR_io_uring_setup = 425
+    result = libc.syscall(425, 0, None)
+    if result == -1:
+        err = ctypes.get_errno()
+        if err == errno.ENOSYS:
+            sys.exit(1)  # Not available
+        if err in (errno.EINVAL, errno.EFAULT):
+            sys.exit(0)  # Available (kernel recognized syscall)
+        if err == errno.EPERM:
+            sys.exit(2)  # Blocked by seccomp/container
+        sys.exit(3)  # Unexpected error
+    sys.exit(0)  # Available
+except Exception:
+    sys.exit(3)  # Error
+"""
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                probe_script,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
 
-            # Call io_uring_setup(0, NULL) - should fail with EINVAL if supported
-            result = libc.syscall(nr_io_uring_setup, 0, None)
-
-            if result == -1:
-                err = ctypes.get_errno()
-                if err == errno.ENOSYS:
-                    logger.info(
-                        "io_uring syscall not available (ENOSYS)",
-                        extra={"kernel": platform.release()},
-                    )
-                    _probe_cache.io_uring = False
-                    return False
-                if err in (errno.EINVAL, errno.EFAULT):
-                    # Both indicate io_uring syscall is recognized and available:
-                    # - EINVAL: kernel validated params and rejected entries=0
-                    # - EFAULT: kernel tried to access params pointer (NULL)
-                    logger.info(
-                        "io_uring syscall available",
-                        extra={"kernel": platform.release(), "probe_errno": err},
-                    )
-                    _probe_cache.io_uring = True
-                    return True
-                if err == errno.EPERM:
-                    logger.warning(
-                        "io_uring blocked by seccomp/container policy",
-                        extra={"errno": err},
-                    )
-                    _probe_cache.io_uring = False
-                    return False
+            if proc.returncode == 0:
+                logger.info(
+                    "io_uring syscall available",
+                    extra={"kernel": platform.release()},
+                )
+                _probe_cache.io_uring = True
+                return True
+            if proc.returncode == 1:
+                logger.info(
+                    "io_uring syscall not available (ENOSYS)",
+                    extra={"kernel": platform.release()},
+                )
+                _probe_cache.io_uring = False
+                return False
+            if proc.returncode == 2:  # noqa: PLR2004
                 logger.warning(
-                    "io_uring probe failed with unexpected error",
-                    extra={"errno": err, "error": os.strerror(err)},
+                    "io_uring blocked by seccomp/container policy",
+                    extra={"kernel": platform.release()},
                 )
                 _probe_cache.io_uring = False
                 return False
 
-            _probe_cache.io_uring = True
-            return True
+            logger.warning(
+                "io_uring probe failed with unexpected result",
+                extra={"exit_code": proc.returncode},
+            )
+            _probe_cache.io_uring = False
+            return False
 
-        except (OSError, ValueError, RuntimeError) as e:
+        except (OSError, TimeoutError) as e:
             logger.warning(
                 "io_uring syscall probe failed",
                 extra={"error": str(e), "error_type": type(e).__name__},
