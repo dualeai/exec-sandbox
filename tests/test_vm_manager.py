@@ -16,6 +16,7 @@ from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.vm_manager import (
     VALID_STATE_TRANSITIONS,
+    QemuVM,
     VmState,
     _check_hvf_available,
     _check_kvm_available,
@@ -1342,3 +1343,102 @@ class TestIdentifierValidation:
         for identifier in whitespace_identifiers:
             with pytest.raises(ValueError, match="invalid characters"):
                 _validate_identifier(identifier, "test_id")
+
+
+# ============================================================================
+# State Race Protection Tests
+# ============================================================================
+
+
+class TestExecuteStateRace:
+    """Tests for state race protection in execute() method.
+
+    Verifies that execute() correctly handles the case where destroy() is called
+    between the state lock release and the start of I/O operations.
+    """
+
+    async def test_execute_rejects_destroying_state(self) -> None:
+        """execute() raises VmError if state is DESTROYING (caught by initial check)."""
+        # Create a minimal mock VM
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.DESTROYING
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        with pytest.raises(VmError) as exc_info:
+            await vm.execute(code="print('hello')", timeout_seconds=5)
+
+        # Initial check catches non-READY state
+        assert "Cannot execute in state destroying" in str(exc_info.value)
+
+    async def test_execute_rejects_destroyed_state(self) -> None:
+        """execute() raises VmError if state is DESTROYED (caught by initial check)."""
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.DESTROYED
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        with pytest.raises(VmError) as exc_info:
+            await vm.execute(code="print('hello')", timeout_seconds=5)
+
+        # Initial check catches non-READY state
+        assert "Cannot execute in state destroyed" in str(exc_info.value)
+
+    async def test_state_race_check_catches_destroying(self) -> None:
+        """The defensive state check catches DESTROYING after lock release.
+
+        This test simulates the race condition by using a side effect to change
+        state to DESTROYING right after the lock is released but before I/O.
+        """
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.READY
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        # Use a real state change to trigger the race condition check
+        # We patch the state after transition to EXECUTING
+        original_state = VmState.EXECUTING
+        race_triggered = False
+
+        def change_state_to_destroying():
+            """Side effect that simulates destroy() being called."""
+            nonlocal race_triggered
+            if vm._state == VmState.EXECUTING:
+                vm._state = VmState.DESTROYING
+                race_triggered = True
+
+        # Patch the ExecuteCodeRequest to trigger state change before I/O
+        with patch("exec_sandbox.vm_manager.ExecuteCodeRequest") as mock_request:
+            mock_request.side_effect = lambda **kwargs: (change_state_to_destroying(), None)[1] or AsyncMock()
+
+            with pytest.raises(VmError) as exc_info:
+                await vm.execute(code="print('hello')", timeout_seconds=5)
+
+            assert race_triggered, "Race condition was not triggered"
+            assert "VM destroyed during execution start" in str(exc_info.value)
+            assert exc_info.value.context["current_state"] == "destroying"
+
+    async def test_state_race_check_catches_destroyed(self) -> None:
+        """The defensive state check catches DESTROYED after lock release."""
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.READY
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        def change_state_to_destroyed():
+            """Side effect that simulates destroy() completing."""
+            if vm._state == VmState.EXECUTING:
+                vm._state = VmState.DESTROYED
+
+        with patch("exec_sandbox.vm_manager.ExecuteCodeRequest") as mock_request:
+            mock_request.side_effect = lambda **kwargs: (change_state_to_destroyed(), None)[1] or AsyncMock()
+
+            with pytest.raises(VmError) as exc_info:
+                await vm.execute(code="print('hello')", timeout_seconds=5)
+
+            assert "VM destroyed during execution start" in str(exc_info.value)
+            assert exc_info.value.context["current_state"] == "destroyed"

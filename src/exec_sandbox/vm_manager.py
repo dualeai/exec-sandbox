@@ -1213,6 +1213,19 @@ class QemuVM:
         )
 
         try:
+            # Re-check state before expensive I/O operations
+            # Between lock release and here, destroy() could have been called
+            # which would transition state to DESTROYING or DESTROYED
+            # Note: pyright doesn't understand async race conditions, so we suppress the warning
+            if self._state in (VmState.DESTROYING, VmState.DESTROYED):  # type: ignore[comparison-overlap]
+                raise VmError(
+                    "VM destroyed during execution start",
+                    context={
+                        "vm_id": self.vm_id,
+                        "current_state": self._state.value,
+                    },
+                )
+
             # Connect to guest via TCP with timing
             # Fixed init timeout (connection establishment, independent of execution timeout)
             connect_start = asyncio.get_event_loop().time()
