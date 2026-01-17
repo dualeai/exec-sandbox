@@ -187,7 +187,7 @@ jobs:
 
   guest-agent:
     name: guest-agent (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       matrix:
         arch: [x86_64, aarch64]
@@ -207,7 +207,7 @@ jobs:
 
   tiny-init:
     name: tiny-init (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       matrix:
         arch: [x86_64, aarch64]
@@ -231,7 +231,7 @@ jobs:
 
   vm-images:
     name: VM Images (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     needs: [guest-agent, tiny-init]
     strategy:
       matrix:
