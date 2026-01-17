@@ -13,10 +13,8 @@ Architecture:
 - Auto-cleanup on shutdown
 
 Usage:
-    daemon = QemuStorageDaemon()
-    await daemon.start()
-    await daemon.create_overlay(base_image, overlay_path)
-    await daemon.stop()
+    async with QemuStorageDaemon() as daemon:
+        await daemon.create_overlay(base_image, overlay_path)
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ import secrets
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Self, cast
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
@@ -495,3 +493,14 @@ class QemuStorageDaemon:
                 await asyncio.wait_for(self._process.wait(), timeout=2.0)
 
         self._process = None
+
+    async def __aenter__(self) -> Self:
+        """Enter async context manager, starting the daemon."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, stopping the daemon."""
+        await self.stop()

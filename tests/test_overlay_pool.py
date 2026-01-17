@@ -49,93 +49,93 @@ class TestOverlayPoolPureLogic:
         pool = OverlayPool(max_concurrent_vms=-10, pool_dir=tmp_path / "pool")
         assert pool.pool_size == -5  # Stored as-is, but treated as disabled
 
-    async def test_acquire_before_startup_fails(self, tmp_path: Path) -> None:
-        """Acquire before startup raises RuntimeError - daemon required."""
+    async def test_acquire_before_start_fails(self, tmp_path: Path) -> None:
+        """Acquire before start raises RuntimeError - daemon required."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
-        # No startup() called - daemon not started
+        # No start() called - daemon not started
         target = tmp_path / "target.qcow2"
 
         with pytest.raises(RuntimeError, match="Daemon must be started"):
             await pool.acquire(Path("/fake/base.qcow2"), target)
 
-    async def test_startup_with_zero_pool_size_is_noop(self, tmp_path: Path) -> None:
-        """Startup with pool_size=0 doesn't create directory or start tasks."""
+    async def test_start_with_zero_pool_size_is_noop(self, tmp_path: Path) -> None:
+        """start() with pool_size=0 doesn't create directory or start tasks."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool_dir = tmp_path / "overlay-pool"
         pool = OverlayPool(max_concurrent_vms=0, pool_dir=pool_dir)
 
-        await pool.startup([Path("/fake/base.qcow2")])
+        await pool.start([Path("/fake/base.qcow2")])
 
         assert not pool_dir.exists()
         assert len(pool._replenish_tasks) == 0
-        await pool.shutdown()
+        await pool.stop()
 
-    async def test_startup_with_negative_pool_size_is_noop(self, tmp_path: Path) -> None:
-        """Startup with negative pool_size is noop."""
+    async def test_start_with_negative_pool_size_is_noop(self, tmp_path: Path) -> None:
+        """start() with negative pool_size is noop."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool_dir = tmp_path / "pool"
         pool = OverlayPool(max_concurrent_vms=-10, pool_dir=pool_dir)
 
-        await pool.startup([Path("/fake/base.qcow2")])
+        await pool.start([Path("/fake/base.qcow2")])
 
         assert not pool_dir.exists()
-        await pool.shutdown()
+        await pool.stop()
 
     async def test_empty_base_images_list(self, tmp_path: Path) -> None:
-        """Startup with empty base images list creates directory but no pools."""
+        """start() with empty base images list creates directory but no pools."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
-        await pool.startup([])  # Empty list
+        await pool.start([])  # Empty list
 
         assert len(pool._pools) == 0
         assert pool._started
-        await pool.shutdown()
+        await pool.stop()
 
-    async def test_double_shutdown_is_safe(self, tmp_path: Path) -> None:
-        """Calling shutdown twice doesn't error (idempotent)."""
+    async def test_double_stop_is_safe(self, tmp_path: Path) -> None:
+        """Calling stop() twice doesn't error (idempotent)."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=0, pool_dir=tmp_path / "pool")
-        await pool.startup([])
+        await pool.start([])
 
-        await pool.shutdown()
-        await pool.shutdown()  # Should not raise
+        await pool.stop()
+        await pool.stop()  # Should not raise
 
-    async def test_double_startup_raises_error(self, tmp_path: Path) -> None:
-        """Calling startup() twice without shutdown raises RuntimeError."""
+    async def test_double_start_raises_error(self, tmp_path: Path) -> None:
+        """Calling start() twice without stop() raises RuntimeError."""
         import pytest
 
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
-        await pool.startup([])
+        await pool.start([])
 
         with pytest.raises(RuntimeError, match="already started"):
-            await pool.startup([])
+            await pool.start([])
 
-        await pool.shutdown()
+        await pool.stop()
 
-    async def test_startup_restart_after_shutdown(self, tmp_path: Path) -> None:
-        """Pool can restart after shutdown (shutdown_event is cleared)."""
+    async def test_start_restart_after_stop(self, tmp_path: Path) -> None:
+        """Pool can restart after stop (shutdown_event is cleared)."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
 
         # First lifecycle
-        await pool.startup([])
+        await pool.start([])
         assert pool._started
-        await pool.shutdown()
+        await pool.stop()
         assert not pool._started
 
         # Second lifecycle - should work
-        await pool.startup([])
+        await pool.start([])
         assert pool._started
-        await pool.shutdown()
+        await pool.stop()
 
     async def test_acquire_existing_target_raises_error(self, tmp_path: Path) -> None:
         """Acquire raises FileExistsError if target_path already exists."""
@@ -157,7 +157,7 @@ class TestOverlayPoolPureLogic:
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
 
         with patch("aiofiles.os.makedirs", side_effect=PermissionError("Access denied")):
-            await pool.startup([Path("/fake/base.qcow2")])
+            await pool.start([Path("/fake/base.qcow2")])
 
         # Pool should NOT be started (graceful degradation)
         assert not pool._started
@@ -204,23 +204,23 @@ class TestOverlayPoolErrorHandling:
         assert result is False  # Not from pool (created on-demand)
         assert not overlay.exists()  # Orphaned overlay cleaned up
         mock_daemon.create_overlay.assert_called_once()  # Fell back to daemon
-        await pool.shutdown()
+        await pool.stop()
 
-    async def test_shutdown_handles_rmtree_failure(self, tmp_path: Path) -> None:
-        """Shutdown completes even if directory cleanup fails."""
+    async def test_stop_handles_rmtree_failure(self, tmp_path: Path) -> None:
+        """stop() completes even if directory cleanup fails."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool_dir = tmp_path / "pool"
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=pool_dir)
 
         # Use empty startup (no base images = no qemu-img calls needed)
-        await pool.startup([])
+        await pool.start([])
 
         # Manually create directory to simulate state after real startup
         pool_dir.mkdir(parents=True, exist_ok=True)
 
         with patch("shutil.rmtree", side_effect=OSError("Permission denied")):
-            await pool.shutdown()  # Should not raise
+            await pool.stop()  # Should not raise
 
         assert not pool._started
 
@@ -235,7 +235,7 @@ class TestOverlayPoolIntegration:
     """Integration tests with real qemu-img - no mocking."""
 
     async def test_full_lifecycle(self, vm_settings, tmp_path: Path) -> None:
-        """Test complete lifecycle: startup → acquire → shutdown."""
+        """Test complete lifecycle: start → acquire → stop."""
         from exec_sandbox.overlay_pool import OverlayPool
         from exec_sandbox.vm_manager import VmManager
 
@@ -243,7 +243,7 @@ class TestOverlayPoolIntegration:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         # Verify pool has overlays
         key = str(base_image.resolve())
@@ -257,7 +257,7 @@ class TestOverlayPoolIntegration:
         assert target.exists()
         assert pool._pools[key].qsize() == 1  # One less in pool
 
-        await pool.shutdown()
+        await pool.stop()
         assert not (tmp_path / "pool").exists()  # Cleaned up
 
     async def test_acquired_overlay_has_correct_backing_file(self, vm_settings, tmp_path: Path) -> None:
@@ -269,7 +269,7 @@ class TestOverlayPoolIntegration:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=2, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         target = tmp_path / "acquired.qcow2"
         await pool.acquire(base_image, target)
@@ -285,7 +285,7 @@ class TestOverlayPoolIntegration:
         stdout, _ = await proc.communicate()
         assert str(base_image) in stdout.decode()
 
-        await pool.shutdown()
+        await pool.stop()
 
     async def test_pool_exhaustion_creates_ondemand(self, vm_settings, tmp_path: Path) -> None:
         """Acquiring more than pool_size creates on-demand (returns False but succeeds)."""
@@ -296,7 +296,7 @@ class TestOverlayPoolIntegration:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         # Acquire all 2 from pool, then 1 on-demand
         t1 = tmp_path / "t1.qcow2"
@@ -312,7 +312,7 @@ class TestOverlayPoolIntegration:
         assert t2.exists()
         assert t3.exists()
 
-        await pool.shutdown()
+        await pool.stop()
 
     async def test_concurrent_acquires_all_succeed(self, vm_settings, tmp_path: Path) -> None:
         """Concurrent acquires all succeed (some from pool, rest on-demand)."""
@@ -323,7 +323,7 @@ class TestOverlayPoolIntegration:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         # 10 concurrent acquires for 5 in pool
         targets = [tmp_path / f"target-{i}.qcow2" for i in range(10)]
@@ -337,7 +337,7 @@ class TestOverlayPoolIntegration:
         sizes = [t.stat().st_size for t in targets]
         assert all(s > 0 for s in sizes)
 
-        await pool.shutdown()
+        await pool.stop()
 
     async def test_multiple_base_images(self, vm_settings, tmp_path: Path) -> None:
         """Pool handles multiple different base images."""
@@ -349,7 +349,7 @@ class TestOverlayPoolIntegration:
         js_base = vm_manager.get_base_image("javascript")
 
         pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
-        await pool.startup([python_base, js_base])
+        await pool.start([python_base, js_base])
 
         # Should have pools for both
         assert pool._pools[str(python_base.resolve())].qsize() == 2
@@ -373,13 +373,13 @@ class TestOverlayPoolIntegration:
             stdout, _ = await proc.communicate()
             assert str(base) in stdout.decode()
 
-        await pool.shutdown()
+        await pool.stop()
 
     async def test_vm_boots_with_pooled_overlay(self, vm_manager, vm_settings) -> None:
         """Full integration: VM boots successfully with pooled overlay."""
         from exec_sandbox.models import Language
 
-        # vm_manager fixture already calls initialize() and shutdown()
+        # vm_manager fixture already calls start() and stop()
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test",
@@ -400,10 +400,7 @@ class TestOverlayPoolIntegration:
         # max_concurrent_vms=4 → pool_size=2
         settings = make_vm_settings(max_concurrent_vms=4)
 
-        vm_manager = VmManager(settings)
-        await vm_manager.initialize()
-
-        try:
+        async with VmManager(settings) as vm_manager:
             # Create 3 VMs (exhausts pool of 2, forces 1 on-demand)
             vms = []
             for i in range(3):
@@ -420,10 +417,9 @@ class TestOverlayPoolIntegration:
             for vm in vms:
                 result = await vm.execute("print(1)", timeout_seconds=30)
                 assert "1" in result.stdout
-        finally:
+
             for vm in vms:
                 await vm_manager.destroy_vm(vm)
-            await vm_manager.shutdown()
 
     async def test_get_stats(self, vm_settings, tmp_path: Path) -> None:
         """get_stats returns accurate pool sizes."""
@@ -434,7 +430,7 @@ class TestOverlayPoolIntegration:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=6, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         stats = pool.get_stats()
         assert stats[str(base_image.resolve())] == 3
@@ -445,4 +441,4 @@ class TestOverlayPoolIntegration:
         stats = pool.get_stats()
         assert stats[str(base_image.resolve())] == 2
 
-        await pool.shutdown()
+        await pool.stop()

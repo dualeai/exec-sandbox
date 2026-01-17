@@ -249,7 +249,7 @@ class TestOverlayPoolWithDaemon:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         try:
             assert pool.daemon_enabled is True
@@ -261,7 +261,7 @@ class TestOverlayPoolWithDaemon:
             assert result is True  # From pool
             assert target.exists()
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_daemon_stopped_on_pool_shutdown(self, vm_settings, tmp_path: Path) -> None:
         """Daemon is stopped when pool shuts down."""
@@ -272,11 +272,11 @@ class TestOverlayPoolWithDaemon:
         base_image = vm_manager.get_base_image("python")
 
         pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
-        await pool.startup([base_image])
+        await pool.start([base_image])
 
         assert pool.daemon_enabled is True
 
-        await pool.shutdown()
+        await pool.stop()
 
         assert pool.daemon_enabled is False
         assert pool._daemon is None
@@ -299,9 +299,7 @@ class TestQemuStorageDaemonErrors:
         yield d
         await d.stop()
 
-    async def test_create_overlay_nonexistent_base_image_fails(
-        self, daemon: QemuStorageDaemon, tmp_path: Path
-    ) -> None:
+    async def test_create_overlay_nonexistent_base_image_fails(self, daemon: QemuStorageDaemon, tmp_path: Path) -> None:
         """create_overlay with nonexistent base fails fast with clear error."""
         nonexistent = tmp_path / "does-not-exist.qcow2"
         overlay = tmp_path / "overlay.qcow2"
@@ -312,9 +310,7 @@ class TestQemuStorageDaemonErrors:
         # Overlay should not exist
         assert not overlay.exists()
 
-    async def test_create_overlay_invalid_base_image_fails(
-        self, daemon: QemuStorageDaemon, tmp_path: Path
-    ) -> None:
+    async def test_create_overlay_invalid_base_image_fails(self, daemon: QemuStorageDaemon, tmp_path: Path) -> None:
         """create_overlay with invalid qcow2 base fails fast with clear error."""
         # Create a fake base image (not qcow2 - will be detected as "raw" format)
         fake_base = tmp_path / "fake-base.qcow2"

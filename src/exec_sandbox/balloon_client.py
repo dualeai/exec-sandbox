@@ -10,14 +10,10 @@ Architecture:
 - Deflating the balloon returns memory to the host
 
 Usage:
-    client = BalloonClient(qmp_socket_path, expected_uid)
-    await client.connect()
-    try:
+    async with BalloonClient(qmp_socket_path, expected_uid) as client:
         await client.deflate(target_mb=64)  # Reduce guest memory to 64MB
         # ... VM waits in pool ...
         await client.inflate(target_mb=256)  # Restore memory before execution
-    finally:
-        await client.disconnect()
 """
 
 from __future__ import annotations
@@ -26,7 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from tenacity import (
     AsyncRetrying,
@@ -134,8 +130,8 @@ class BalloonClient:
                 await self._cleanup()
                 raise BalloonError(f"QMP connection failed: {e}") from e
 
-    async def disconnect(self) -> None:
-        """Disconnect from QMP socket."""
+    async def close(self) -> None:
+        """Close the QMP connection."""
         async with self._lock:
             await self._cleanup()
 
@@ -375,3 +371,14 @@ class BalloonClient:
             "Balloon deflated",
             extra={"target_mb": target_mb},
         )
+
+    async def __aenter__(self) -> Self:
+        """Enter async context manager, connecting to QMP."""
+        await self.connect()
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, closing the QMP connection."""
+        await self.close()

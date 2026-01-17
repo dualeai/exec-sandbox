@@ -26,15 +26,13 @@ Memory Optimization (Balloon):
 Example:
     ```python
     # In Scheduler
-    warm_pool = WarmVMPool(vm_manager, config, snapshot_manager)
-    await warm_pool.startup()  # Pre-boot VMs
-
-    # Per execution
-    vm = await warm_pool.get_vm("python", packages=[])
-    if vm:  # Warm hit (1-2ms)
-        result = await vm.execute(...)
-    else:  # Cold fallback (400ms)
-        vm = await vm_manager.create_vm(...)
+    async with WarmVMPool(vm_manager, config, snapshot_manager) as warm_pool:
+        # Per execution
+        vm = await warm_pool.get_vm("python", packages=[])
+        if vm:  # Warm hit (1-2ms)
+            result = await vm.execute(...)
+        else:  # Cold fallback (400ms)
+            vm = await vm_manager.create_vm(...)
     ```
 """
 
@@ -43,7 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from tenacity import (
     AsyncRetrying,
@@ -161,8 +159,8 @@ class WarmVMPool:
             },
         )
 
-    async def startup(self) -> None:
-        """Pre-boot VMs on service startup (parallel).
+    async def start(self) -> None:
+        """Start the warm VM pool by pre-booting VMs (parallel).
 
         Boots all VMs in parallel for faster startup.
         Logs progress for operational visibility.
@@ -264,10 +262,10 @@ class WarmVMPool:
             )
             return None
 
-    async def shutdown(self) -> None:
-        """Drain and destroy all warm VMs (blocking).
+    async def stop(self) -> None:
+        """Stop the warm VM pool: drain and destroy all VMs.
 
-        Shutdown sequence:
+        Stop sequence:
         1. Signal health check to stop
         2. Wait for health check task
         3. Drain all pools and destroy VMs (parallel)
@@ -469,16 +467,12 @@ class WarmVMPool:
         """
         try:
             expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
-            client = BalloonClient(vm.qmp_socket, expected_uid)
-            await client.connect()
-            try:
+            async with BalloonClient(vm.qmp_socket, expected_uid) as client:
                 await client.inflate(target_mb=constants.BALLOON_INFLATE_TARGET_MB)
                 logger.debug(
                     "Balloon inflated for warm pool VM",
                     extra={"vm_id": vm.vm_id, "target_mb": constants.BALLOON_INFLATE_TARGET_MB},
                 )
-            finally:
-                await client.disconnect()
         except (BalloonError, OSError, TimeoutError) as e:
             # Graceful degradation: log and continue
             logger.warning(
@@ -505,16 +499,12 @@ class WarmVMPool:
         """
         try:
             expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
-            client = BalloonClient(vm.qmp_socket, expected_uid)
-            await client.connect()
-            try:
+            async with BalloonClient(vm.qmp_socket, expected_uid) as client:
                 await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB, wait_for_target=False)
                 logger.debug(
                     "Balloon deflated for warm pool VM",
                     extra={"vm_id": vm.vm_id, "target_mb": constants.DEFAULT_MEMORY_MB},
                 )
-            finally:
-                await client.disconnect()
         except (BalloonError, OSError, TimeoutError) as e:
             # Graceful degradation: log and continue (VM may be memory-constrained)
             logger.warning(
@@ -747,3 +737,14 @@ class WarmVMPool:
         # Unreachable: AsyncRetrying either returns from within or raises
         # But required for type checker (mypy/pyright) to see all paths return
         raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
+
+    async def __aenter__(self) -> Self:
+        """Enter async context manager, starting the pool."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, stopping the pool."""
+        await self.stop()

@@ -19,6 +19,7 @@ import contextlib
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Self
 from uuid import uuid4
 
 import aiofiles.os
@@ -100,14 +101,10 @@ class OverlayPool:
     Base images are auto-discovered from images_path matching pattern *-base-*.qcow2.
 
     Usage:
-        pool = OverlayPool(max_concurrent_vms=10, images_path=base_images_dir)
-        await pool.startup()
-
-        # Always returns an overlay - fast if from pool, slow if created on-demand
-        pool_hit = await pool.acquire(base_image, target_path)
-        # pool_hit indicates if it was from pool (for metrics), but overlay is ready
-
-        await pool.shutdown()
+        async with OverlayPool(max_concurrent_vms=10, images_path=base_images_dir) as pool:
+            # Always returns an overlay - fast if from pool, slow if created on-demand
+            pool_hit = await pool.acquire(base_image, target_path)
+            # pool_hit indicates if it was from pool (for metrics), but overlay is ready
     """
 
     def __init__(
@@ -163,8 +160,8 @@ class OverlayPool:
         matches = [p.resolve() for p in self._images_path.glob("*-base-*.qcow2")]
         return sorted(matches)
 
-    async def startup(self, base_images: list[Path] | None = None) -> None:
-        """Pre-create overlays for base images.
+    async def start(self, base_images: list[Path] | None = None) -> None:
+        """Start the overlay pool and pre-create overlays for base images.
 
         If base_images is None, auto-discovers from images_path using WARM_POOL_LANGUAGES.
 
@@ -172,10 +169,10 @@ class OverlayPool:
             base_images: Optional explicit list of base image paths (for testing)
 
         Raises:
-            RuntimeError: If startup() is called when pool is already started
+            RuntimeError: If start() is called when pool is already started
         """
         if self._started:
-            raise RuntimeError("Overlay pool already started - call shutdown() first")
+            raise RuntimeError("Overlay pool already started - call stop() first")
 
         # Clear shutdown event to allow restart after previous shutdown
         self._shutdown_event.clear()
@@ -228,12 +225,12 @@ class OverlayPool:
                 "pool_size": self._pool_size,
                 "base_images": [str(p) for p in base_images],
                 "pool_dir": str(self._pool_dir),
-                "daemon_enabled": self._daemon is not None,
+                "daemon_enabled": self.daemon_enabled,
             },
         )
 
-    async def shutdown(self) -> None:
-        """Clean shutdown: cancel tasks, stop daemon, cleanup pool directory."""
+    async def stop(self) -> None:
+        """Stop the overlay pool: cancel tasks, stop daemon, cleanup pool directory."""
         if not self._started:
             return
 
@@ -284,7 +281,7 @@ class OverlayPool:
 
         Raises:
             FileExistsError: target_path already exists
-            RuntimeError: Daemon not started (call startup() first)
+            RuntimeError: Daemon not started (call start() first)
             QemuStorageDaemonError: Failed to create overlay via daemon
         """
         # Prevent silent overwrite of existing files
@@ -335,7 +332,7 @@ class OverlayPool:
 
         # Slow path: create overlay on-demand via daemon
         if self._daemon is None:
-            raise RuntimeError("Daemon must be started before acquire - call startup() first")
+            raise RuntimeError("Daemon must be started before acquire - call start() first")
         await self._daemon.create_overlay(base_image, target_path)
         return False
 
@@ -430,3 +427,14 @@ class OverlayPool:
             Dict mapping base image paths to current pool sizes
         """
         return {key: pool.qsize() for key, pool in self._pools.items()}
+
+    async def __aenter__(self) -> Self:
+        """Enter async context manager, starting the pool."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, stopping the pool."""
+        await self.stop()

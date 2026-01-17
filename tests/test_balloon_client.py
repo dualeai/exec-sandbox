@@ -157,8 +157,8 @@ class TestBalloonClientUnit:
         cmd = json.loads(balloon_call.strip())
         assert cmd["arguments"]["value"] == 256 * 1024 * 1024
 
-    async def test_disconnect_closes_writer(self, qmp_socket: Path, mock_connect_and_verify: Any) -> None:
-        """Test disconnect properly closes the connection."""
+    async def test_close_closes_writer(self, qmp_socket: Path, mock_connect_and_verify: Any) -> None:
+        """Test close properly closes the connection."""
         _mock, reader, writer = mock_connect_and_verify
 
         greeting = b'{"QMP": {}}\n'
@@ -167,7 +167,7 @@ class TestBalloonClientUnit:
 
         client = BalloonClient(qmp_socket, expected_uid=1000)
         await client.connect()
-        await client.disconnect()
+        await client.close()
 
         assert not client._connected
         writer.close.assert_called_once()

@@ -207,6 +207,17 @@ class TcpChannel:
             self._writer = None
             self._reader = None
 
+    async def __aenter__(self) -> "TcpChannel":
+        """Enter async context manager, connecting to guest."""
+        await self.connect(timeout_seconds=5)
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, closing connection."""
+        await self.close()
+
 
 class UnixSocketChannel:
     """
@@ -450,6 +461,17 @@ class UnixSocketChannel:
         """Get the stream reader (for direct access when needed)."""
         return self._reader
 
+    async def __aenter__(self) -> "UnixSocketChannel":
+        """Enter async context manager, connecting to guest."""
+        await self.connect(timeout_seconds=5)
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, closing connection."""
+        await self.close()
+
 
 class DualPortChannel:
     """
@@ -662,6 +684,17 @@ class DualPortChannel:
             self._cmd_channel.close(),
             self._event_channel.close(),
         )
+
+    async def __aenter__(self) -> "DualPortChannel":
+        """Enter async context manager, connecting to guest."""
+        await self.connect(timeout_seconds=5)
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, closing connection."""
+        await self.close()
 
 
 @asynccontextmanager

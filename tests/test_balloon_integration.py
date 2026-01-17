@@ -33,7 +33,7 @@ What We Test
 - VM remains responsive after balloon operations (can execute code)
 - MemAvailable decreases after inflate (memory is actually reclaimed)
 - Inflate/deflate cycles don't crash the VM
-- Error handling (not connected, double connect/disconnect)
+- Error handling (not connected, double connect/close)
 
 What We Don't Test
 ------------------
@@ -184,7 +184,7 @@ class TestBalloonInsideVM:
                     f"reduction={reduction}MB, balloon={actual_balloon}MB"
                 )
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -234,7 +234,7 @@ class TestBalloonInsideVM:
                 )
                 assert "OK:150" in result.stdout, f"Failed after deflate: {result.stdout}"
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -286,7 +286,7 @@ class TestBalloonEdgeCases:
                 assert result.exit_code == 0, f"VM unresponsive after extreme inflate+deflate, actual_mb={actual_mb}"
                 assert "alive" in result.stdout
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -325,7 +325,7 @@ class TestBalloonEdgeCases:
                 assert actual_mb <= max_expected, f"Expected <={max_expected}MB (clamped), got {actual_mb}MB"
                 assert actual_mb >= min_expected, f"Expected >={min_expected}MB after deflate, got {actual_mb}MB"
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -369,7 +369,7 @@ class TestBalloonEdgeCases:
                 assert result.exit_code == 0, f"VM unresponsive after rapid cycling: {result.stderr}"
                 assert "stable" in result.stdout
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -409,7 +409,7 @@ class TestBalloonEdgeCases:
                 assert result.exit_code == 0
                 assert "idempotent" in result.stdout
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -465,7 +465,7 @@ class TestBalloonMemoryPressure:
                 )
                 assert result.exit_code == 0
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -529,18 +529,18 @@ class TestBalloonErrorHandling:
             mem = await client.query()
             assert mem is not None
 
-            await client.disconnect()
+            await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def test_double_disconnect_safe(self, vm_manager) -> None:
-        """Disconnecting twice should be safe."""
+    async def test_double_close_safe(self, vm_manager) -> None:
+        """Closing twice should be safe."""
         vm_memory = constants.DEFAULT_MEMORY_MB
 
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test",
-            task_id="balloon-double-disconnect",
+            task_id="balloon-double-close",
             memory_mb=vm_memory,
             allow_network=False,
             allowed_domains=None,
@@ -551,9 +551,9 @@ class TestBalloonErrorHandling:
             client = BalloonClient(vm.qmp_socket, expected_uid)
 
             await client.connect()
-            await client.disconnect()
-            # Second disconnect should not raise
-            await client.disconnect()
+            await client.close()
+            # Second close should not raise
+            await client.close()
         finally:
             await vm_manager.destroy_vm(vm)
 
@@ -625,6 +625,6 @@ class TestBalloonWarmPoolSimulation:
                 assert "OK:150" in result.stdout, "Post-deflate allocation failed"
 
             finally:
-                await client.disconnect()
+                await client.close()
         finally:
             await vm_manager.destroy_vm(vm)

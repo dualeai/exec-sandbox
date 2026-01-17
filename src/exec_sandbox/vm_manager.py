@@ -1383,11 +1383,10 @@ class VmManager:
     - cgroup v2 resource limits
 
     Usage:
-        manager = VmManager(settings)
-        await manager.initialize()  # Run async system probes
-        vm = await manager.create_vm(Language.PYTHON, "tenant-123", "task-456")
-        result = await vm.execute("print('hello')", timeout_seconds=30)
-        await manager.destroy_vm(vm)
+        async with VmManager(settings) as manager:
+            vm = await manager.create_vm(Language.PYTHON, "tenant-123", "task-456")
+            result = await vm.execute("print('hello')", timeout_seconds=30)
+            await manager.destroy_vm(vm)
     """
 
     def __init__(self, settings: Settings):
@@ -1396,7 +1395,7 @@ class VmManager:
         Args:
             settings: Service configuration (paths, limits, etc.)
 
-        Note: Call `await initialize()` after construction to run async system probes.
+        Note: Call `await start()` after construction to run async system probes.
 
         Note on crash recovery:
             VM registry is in-memory only. If service crashes, registry is lost
@@ -1418,8 +1417,8 @@ class VmManager:
             images_path=settings.base_images_dir,
         )
 
-    async def initialize(self) -> None:
-        """Run async system probes and complete initialization.
+    async def start(self) -> None:
+        """Start VmManager and run async system probes.
 
         This method runs all async system capability probes and caches their results
         at module level. This prevents cache stampede when multiple VMs start
@@ -1445,7 +1444,7 @@ class VmManager:
         await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
 
         # Start overlay pool (discovers base images internally)
-        await self._overlay_pool.startup()
+        await self._overlay_pool.start()
 
         self._initialized = True
 
@@ -1469,12 +1468,23 @@ class VmManager:
         """
         return dict(self._vms)
 
-    async def shutdown(self) -> None:
-        """Shutdown VmManager and cleanup resources (overlay pool).
+    async def stop(self) -> None:
+        """Stop VmManager and cleanup resources (overlay pool).
 
         Should be called when the VmManager is no longer needed.
         """
-        await self._overlay_pool.shutdown()
+        await self._overlay_pool.stop()
+
+    async def __aenter__(self) -> "VmManager":
+        """Enter async context manager, starting the manager."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, stopping the manager."""
+        await self.stop()
 
     async def create_vm(  # noqa: PLR0912, PLR0915
         self,

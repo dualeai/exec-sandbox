@@ -209,19 +209,19 @@ class TestHealthCheckPoolUnit:
 class TestWarmVMPoolIntegration:
     """Integration tests for WarmVMPool with real QEMU VMs."""
 
-    async def test_pool_startup_shutdown(self, vm_manager) -> None:
-        """Pool starts and shuts down cleanly."""
+    async def test_pool_start_stop(self, vm_manager) -> None:
+        """Pool starts and stops cleanly."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         # Pools should be populated
         assert pool.pools[Language.PYTHON].qsize() > 0
 
-        await pool.shutdown()
+        await pool.stop()
 
         # Pools should be empty
         assert pool.pools[Language.PYTHON].qsize() == 0
@@ -234,7 +234,7 @@ class TestWarmVMPoolIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             # Get VM from pool (should be instant)
@@ -247,7 +247,7 @@ class TestWarmVMPoolIntegration:
             await vm_manager.destroy_vm(vm)
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_get_vm_with_packages_returns_none(self, vm_manager) -> None:
         """Get VM with packages returns None (not eligible for warm pool)."""
@@ -256,7 +256,7 @@ class TestWarmVMPoolIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             # Get VM with packages - should return None
@@ -264,7 +264,7 @@ class TestWarmVMPoolIntegration:
             assert vm is None
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
 
 # ============================================================================
@@ -283,7 +283,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             # Get a VM from pool
@@ -297,7 +297,7 @@ class TestHealthcheckIntegration:
             await vm_manager.destroy_vm(vm)
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_health_check_pool_preserves_healthy_vms(self, vm_manager) -> None:
         """_health_check_pool keeps healthy VMs in pool."""
@@ -306,7 +306,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             # Wait for VMs to stabilize after startup balloon inflation
@@ -327,7 +327,7 @@ class TestHealthcheckIntegration:
             assert final_size == initial_size
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_drain_pool_restores_vms_after_health_check(self, vm_manager) -> None:
         """VMs drained for health check are restored to pool."""
@@ -336,7 +336,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             python_pool = pool.pools[Language.PYTHON]
@@ -367,23 +367,23 @@ class TestHealthcheckIntegration:
             assert python_pool.qsize() == initial_size
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
-    async def test_health_check_loop_stops_on_shutdown(self, vm_manager) -> None:
-        """Health check loop exits cleanly when shutdown is signaled."""
+    async def test_health_check_loop_stops_on_stop(self, vm_manager) -> None:
+        """Health check loop exits cleanly when stop is signaled."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         # Health task should be running
         assert pool._health_task is not None
         assert not pool._health_task.done()
 
-        # Shutdown should stop health task
-        await pool.shutdown()
+        # stop() should stop health task
+        await pool.stop()
 
         assert pool._health_task.done()
         assert pool._shutdown_event.is_set()
@@ -405,7 +405,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             # Get a VM from pool
@@ -430,7 +430,7 @@ class TestHealthcheckIntegration:
             assert is_healthy is False
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_mixed_pool_healthy_and_killed_vms(self, vm_manager) -> None:
         """Health check correctly handles mix of healthy and killed VMs.
@@ -567,7 +567,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             # Get a VM from pool
@@ -618,7 +618,7 @@ class TestHealthcheckIntegration:
             await vm_manager.destroy_vm(vm)
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_vm_killed_during_health_check(self, vm_manager) -> None:
         """Health check handles VM dying mid-check gracefully.
@@ -634,7 +634,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             vm = await pool.get_vm(Language.PYTHON, packages=[])
@@ -659,7 +659,7 @@ class TestHealthcheckIntegration:
             assert isinstance(health_result, bool), f"Expected bool, got {type(health_result)}: {health_result}"
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_multiple_consecutive_health_checks_after_kill(self, vm_manager) -> None:
         """Multiple health checks on killed VM all return False.
@@ -673,7 +673,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             vm = await pool.get_vm(Language.PYTHON, packages=[])
@@ -692,7 +692,7 @@ class TestHealthcheckIntegration:
                 assert is_healthy is False, f"Check {i + 1} should return False"
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
     async def test_check_and_restore_only_restores_healthy(self, vm_manager) -> None:
         """_check_and_restore_vm only puts healthy VMs back in pool.
@@ -706,7 +706,7 @@ class TestHealthcheckIntegration:
         config = SchedulerConfig(max_concurrent_vms=4)
         pool = WarmVMPool(vm_manager, config)
 
-        await pool.startup()
+        await pool.start()
 
         try:
             python_pool = pool.pools[Language.PYTHON]
@@ -729,7 +729,7 @@ class TestHealthcheckIntegration:
             assert python_pool.qsize() == 0  # VM NOT restored to pool
 
         finally:
-            await pool.shutdown()
+            await pool.stop()
 
 
 # ============================================================================

@@ -20,9 +20,8 @@ GUEST_AGENT_READ_TIMEOUT_MS = 12000
 @pytest.fixture
 async def vm_manager(make_vm_manager):
     """Create a VmManager for testing."""
-    manager = make_vm_manager()
-    await manager.initialize()
-    yield manager
+    async with make_vm_manager() as manager:
+        yield manager
 
 
 class TestGuestAgentReconnect:

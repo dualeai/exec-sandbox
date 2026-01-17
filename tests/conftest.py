@@ -10,7 +10,7 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
-from exec_sandbox.vm_manager import check_fast_balloon_available, check_hwaccel_available
+from exec_sandbox.vm_manager import VmManager, check_fast_balloon_available, check_hwaccel_available
 
 # ============================================================================
 # Shared Skip Markers
@@ -137,18 +137,14 @@ def vm_settings(images_dir: Path):
 
 
 @pytest.fixture
-async def vm_manager(vm_settings) -> AsyncGenerator:
-    """VmManager with hardware acceleration (initialized).
+async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
+    """VmManager with hardware acceleration (started).
 
-    Automatically calls initialize() to start the overlay pool daemon,
-    and shutdown() for cleanup.
+    Automatically calls start() to start the overlay pool daemon,
+    and stop() for cleanup.
     """
-    from exec_sandbox.vm_manager import VmManager
-
-    manager = VmManager(vm_settings)  # type: ignore[arg-type]
-    await manager.initialize()
-    yield manager
-    await manager.shutdown()
+    async with VmManager(vm_settings) as manager:  # type: ignore[arg-type]
+        yield manager
 
 
 @pytest.fixture
@@ -165,18 +161,14 @@ def emulation_settings(images_dir: Path):
 
 
 @pytest.fixture
-async def emulation_vm_manager(emulation_settings) -> AsyncGenerator:
-    """VmManager configured for software emulation (initialized).
+async def emulation_vm_manager(emulation_settings) -> AsyncGenerator[VmManager, None]:
+    """VmManager configured for software emulation (started).
 
-    Automatically calls initialize() to start the overlay pool daemon,
-    and shutdown() for cleanup.
+    Automatically calls start() to start the overlay pool daemon,
+    and stop() for cleanup.
     """
-    from exec_sandbox.vm_manager import VmManager
-
-    manager = VmManager(emulation_settings)  # type: ignore[arg-type]
-    await manager.initialize()
-    yield manager
-    await manager.shutdown()
+    async with VmManager(emulation_settings) as manager:  # type: ignore[arg-type]
+        yield manager
 
 
 @pytest.fixture

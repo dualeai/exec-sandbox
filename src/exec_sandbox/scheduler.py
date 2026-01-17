@@ -150,7 +150,7 @@ class Scheduler:
         from exec_sandbox.vm_manager import VmManager  # noqa: PLC0415
 
         self._vm_manager = VmManager(self._settings)
-        await self._vm_manager.initialize()  # Pre-warms all system probe caches
+        await self._vm_manager.start()  # Pre-warms all system probe caches
 
         # Initialize SnapshotManager (L2 local cache always available, L3 S3 optional)
         from exec_sandbox.snapshot_manager import SnapshotManager  # noqa: PLC0415
@@ -162,7 +162,7 @@ class Scheduler:
             from exec_sandbox.warm_vm_pool import WarmVMPool  # noqa: PLC0415
 
             self._warm_pool = WarmVMPool(self._vm_manager, self.config, self._snapshot_manager)
-            await self._warm_pool.startup()
+            await self._warm_pool.start()
 
         self._started = True
         logger.info("Scheduler started successfully")
@@ -182,12 +182,12 @@ class Scheduler:
         """
         logger.info("Shutting down scheduler")
 
-        # Shutdown WarmVMPool first (drains VMs)
+        # Stop WarmVMPool first (drains VMs)
         if self._warm_pool:
             try:
-                await self._warm_pool.shutdown()
+                await self._warm_pool.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
-                logger.error("WarmVMPool shutdown error", extra={"error": str(e)})
+                logger.error("WarmVMPool stop error", extra={"error": str(e)})
 
         # Destroy any remaining VMs
         if self._vm_manager:
@@ -200,8 +200,8 @@ class Scheduler:
                 destroy_tasks = [self._vm_manager.destroy_vm(vm) for vm in active_vms.values()]
                 await asyncio.gather(*destroy_tasks, return_exceptions=True)
 
-            # Shutdown VmManager (includes overlay pool cleanup)
-            await self._vm_manager.shutdown()
+            # Stop VmManager (includes overlay pool cleanup)
+            await self._vm_manager.stop()
 
         self._started = False
         logger.info("Scheduler shutdown complete")

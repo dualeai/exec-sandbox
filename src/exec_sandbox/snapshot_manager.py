@@ -21,7 +21,7 @@ import errno
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import aiofiles
 import aiofiles.os
@@ -886,6 +886,29 @@ class SnapshotManager:
             region_name=self.settings.s3_region,
             endpoint_url=self.settings.s3_endpoint_url,
         )
+
+    async def stop(self) -> None:
+        """Stop SnapshotManager and wait for background upload tasks to complete.
+
+        Should be called when the SnapshotManager is no longer needed.
+        Ensures all S3 uploads finish before stopping.
+        """
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+
+    async def __aenter__(self) -> Self:
+        """Enter async context manager.
+
+        No async initialization needed - returns self immediately.
+        """
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, stopping and waiting for background tasks."""
+        await self.stop()
 
 
 # Import VmState for type checking in finally block
