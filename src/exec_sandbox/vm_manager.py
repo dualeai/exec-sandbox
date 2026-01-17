@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import sys
 from collections.abc import Callable
@@ -76,6 +77,35 @@ logger = get_logger(__name__)
 # See: linux/kvm.h - these are stable ABI
 _KVM_GET_API_VERSION = 0xAE00
 _KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
+
+# Security: Identifier validation pattern
+# Only alphanumeric, underscore, and hyphen allowed to prevent:
+# - Shell command injection via malicious tenant_id/task_id
+# - Path traversal attacks (no '..', '/')
+# - Socket path manipulation
+_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_IDENTIFIER_MAX_LENGTH = 128  # Reasonable limit for identifiers
+
+
+def _validate_identifier(value: str, name: str) -> None:
+    """Validate identifier contains only safe characters.
+
+    Prevents shell injection and path traversal attacks by ensuring identifiers
+    (tenant_id, task_id) contain only alphanumeric characters, underscores, and hyphens.
+
+    Args:
+        value: The identifier value to validate
+        name: Human-readable name for error messages
+
+    Raises:
+        ValueError: If identifier contains invalid characters or is too long
+    """
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+    if len(value) > _IDENTIFIER_MAX_LENGTH:
+        raise ValueError(f"{name} too long: {len(value)} > {_IDENTIFIER_MAX_LENGTH}")
+    if not _IDENTIFIER_PATTERN.match(value):
+        raise ValueError(f"{name} contains invalid characters (only [a-zA-Z0-9_-] allowed): {value!r}")
 
 
 def _log_task_exception(task: asyncio.Task[None]) -> None:
@@ -1564,6 +1594,11 @@ class VmManager:
         """
         # Start timing
         start_time = asyncio.get_event_loop().time()
+
+        # Security: Validate identifiers to prevent shell injection and path traversal
+        # Must be done BEFORE any use of tenant_id/task_id in paths, commands, or IDs
+        _validate_identifier(tenant_id, "tenant_id")
+        _validate_identifier(task_id, "task_id")
 
         # Step 0: Validate kernel and initramfs exist (cached, one-time check)
         await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)

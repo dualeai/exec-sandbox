@@ -25,6 +25,7 @@ from exec_sandbox.vm_manager import (
     _kernel_validated,
     _probe_cache,
     _probe_qemu_accelerators,
+    _validate_identifier,
     _validate_kernel_initramfs,
     check_hwaccel_available,
 )
@@ -1216,3 +1217,128 @@ class TestGvproxyWrapperBinarySelection:
         with patch("exec_sandbox.asset_downloader.get_os_name", return_value="linux"):
             with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="arm64"):
                 assert get_gvproxy_suffix() == "linux-arm64"
+
+
+# ============================================================================
+# Security Tests - Identifier Validation
+# ============================================================================
+
+
+class TestIdentifierValidation:
+    """Security tests for tenant_id and task_id validation to prevent injection attacks."""
+
+    def test_valid_identifiers(self) -> None:
+        """Test that valid identifiers are accepted."""
+        valid_identifiers = [
+            "tenant123",
+            "task-1",
+            "my_task",
+            "UPPERCASE",
+            "MixedCase123",
+            "a",
+            "123",
+            "a-b_c",
+        ]
+        for identifier in valid_identifiers:
+            # Should not raise
+            _validate_identifier(identifier, "test_id")
+
+    def test_empty_identifier_rejected(self) -> None:
+        """Test that empty identifier is rejected."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            _validate_identifier("", "test_id")
+
+    def test_identifier_too_long_rejected(self) -> None:
+        """Test that overly long identifier is rejected."""
+        long_id = "a" * 129  # > 128 chars
+        with pytest.raises(ValueError, match="too long"):
+            _validate_identifier(long_id, "test_id")
+
+    def test_identifier_max_length_accepted(self) -> None:
+        """Test that identifier at max length is accepted."""
+        max_id = "a" * 128  # Exactly 128 chars
+        # Should not raise
+        _validate_identifier(max_id, "test_id")
+
+    def test_shell_injection_characters_rejected(self) -> None:
+        """Test that shell metacharacters are rejected to prevent command injection."""
+        malicious_identifiers = [
+            "tenant;rm -rf /",
+            "task$(whoami)",
+            "task`id`",
+            "task|cat /etc/passwd",
+            "task&echo pwned",
+            "task>file",
+            "task<file",
+            "task\nid",
+            "task\tid",
+        ]
+        for identifier in malicious_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_path_traversal_characters_rejected(self) -> None:
+        """Test that path traversal characters are rejected."""
+        malicious_identifiers = [
+            "../../../etc/passwd",
+            "..\\..\\windows",
+            "task/../../root",
+            "task\\path",
+            "/absolute/path",
+        ]
+        for identifier in malicious_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_special_characters_rejected(self) -> None:
+        """Test that various special characters are rejected."""
+        special_chars = [
+            "task@domain",
+            "task#1",
+            "task$var",
+            "task%1",
+            "task^x",
+            "task*",
+            "task+1",
+            "task=val",
+            "task[0]",
+            "task{1}",
+            "task!",
+            "task~",
+            "task'",
+            'task"',
+            "task,1",
+            "task.1",
+            "task?",
+            "task:1",
+        ]
+        for identifier in special_chars:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_unicode_characters_rejected(self) -> None:
+        """Test that Unicode characters are rejected."""
+        unicode_identifiers = [
+            "task日本語",
+            "задача",
+            "tâche",
+            "任务",
+            "tenant\u0000null",
+        ]
+        for identifier in unicode_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_whitespace_rejected(self) -> None:
+        """Test that whitespace is rejected."""
+        whitespace_identifiers = [
+            "task 1",
+            " task",
+            "task ",
+            "task\t1",
+            "task\n1",
+            "task\r\n1",
+        ]
+        for identifier in whitespace_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
