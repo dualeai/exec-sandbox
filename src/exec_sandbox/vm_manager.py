@@ -77,6 +77,26 @@ _KVM_GET_API_VERSION = 0xAE00
 _KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
 
 
+def _log_task_exception(task: asyncio.Task[None]) -> None:
+    """Log exceptions from background tasks.
+
+    Callback for asyncio.Task.add_done_callback() that properly logs any
+    unhandled exceptions from background tasks. Prevents silent failures.
+
+    Args:
+        task: The completed asyncio task to check for exceptions
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Background task failed",
+            extra={"task_name": task.get_name()},
+            exc_info=exc,
+        )
+
+
 class VmState(Enum):
     """VM lifecycle states."""
 
@@ -1596,6 +1616,8 @@ class VmManager:
         gvproxy_proc: ProcessWrapper | None = None
         gvproxy_log_task: asyncio.Task[None] | None = None
         qemu_proc: ProcessWrapper | None = None
+        qemu_log_task: asyncio.Task[None] | None = None
+        console_log: TextIO | None = None
         vm_created = False  # Flag to skip cleanup if VM successfully created
 
         # IMPORTANT: Always use gvproxy for network-enabled VMs
@@ -1769,12 +1791,24 @@ class VmManager:
                 # Background task to drain QEMU output (prevent 64KB pipe deadlock)
                 # Started AFTER crash check to ensure we can capture error output
                 console_log_path = workdir.console_log
-                console_log = console_log_path.open("w", buffering=1)  # Line buffering for sync writes
+
+                # Open file asynchronously to avoid blocking the event loop
+                # The file handle itself stays synchronous for simple write callbacks
+                loop = asyncio.get_running_loop()
+                console_log = await loop.run_in_executor(
+                    None,
+                    lambda: console_log_path.open("w", buffering=1),  # Line buffering
+                )
+
+                # Capture in local variable for type narrowing (console_log is definitely not None here)
+                # Type assertion: we just opened the file above, so console_log is a valid TextIO
+                assert console_log is not None  # noqa: S101 - type narrowing, not runtime check
+                _console_log: TextIO = console_log
 
                 def write_to_console(line: str) -> None:
                     """Write line to console log file and structured logs."""
                     try:
-                        console_log.write(f"[{vm_id}] {line}\n")
+                        _console_log.write(f"[{vm_id}] {line}\n")
                     except OSError as e:
                         logger.error(f"Console write failed: {e}", extra={"context_id": vm_id})
 
@@ -1787,7 +1821,7 @@ class VmManager:
                         stderr_handler=write_to_console,
                     )
                 )
-                qemu_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                qemu_log_task.add_done_callback(_log_task_exception)
 
             except (OSError, FileNotFoundError) as e:
                 raise VmError(
@@ -1944,6 +1978,18 @@ class VmManager:
                         "gvproxy_started": gvproxy_proc is not None,
                     },
                 )
+
+                # Close console log file if opened (prevent resource leak)
+                if console_log is not None:
+                    with contextlib.suppress(OSError):
+                        console_log.close()
+
+                # Cancel log drain task if started
+                if qemu_log_task is not None and not qemu_log_task.done():
+                    qemu_log_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await qemu_log_task
+
                 # Remove from registry if it was added (defensive - always try)
                 async with self._vms_lock:
                     self._vms.pop(vm_id, None)
@@ -2090,7 +2136,7 @@ class VmManager:
                 ),
             )
         )
-        gvproxy_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        gvproxy_log_task.add_done_callback(_log_task_exception)
 
         # Wait for gvproxy to signal readiness (timeout after 5 seconds)
         try:
