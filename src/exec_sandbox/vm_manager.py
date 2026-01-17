@@ -67,6 +67,7 @@ from exec_sandbox.resource_cleanup import cleanup_process, cleanup_vm_processes
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
+from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 logger = get_logger(__name__)
@@ -932,81 +933,81 @@ class QemuVM:
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
         # Timing instrumentation (set by VmManager.create_vm)
-        self._setup_ms: int | None = None  # Resource setup time
-        self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
-        # Granular setup timing (for tracing)
-        self._overlay_ms: int | None = None  # Overlay acquisition time
-        # Granular boot timing (for tracing)
-        self._qemu_cmd_build_ms: int | None = None
-        self._gvproxy_start_ms: int | None = None
-        self._qemu_fork_ms: int | None = None
-        self._guest_wait_ms: int | None = None
+        self.timing = VmTiming()
+
+    # -------------------------------------------------------------------------
+    # Timing properties (backwards-compatible accessors to VmTiming)
+    # -------------------------------------------------------------------------
 
     @property
     def setup_ms(self) -> int | None:
         """Get resource setup time in milliseconds."""
-        return self._setup_ms
+        return self.timing.setup_ms
 
     @setup_ms.setter
     def setup_ms(self, value: int) -> None:
         """Set resource setup time in milliseconds."""
-        self._setup_ms = value
+        self.timing.setup_ms = value
 
     @property
     def overlay_ms(self) -> int | None:
         """Get overlay acquisition time in milliseconds."""
-        return self._overlay_ms
+        return self.timing.overlay_ms
 
     @overlay_ms.setter
     def overlay_ms(self, value: int) -> None:
         """Set overlay acquisition time in milliseconds."""
-        self._overlay_ms = value
+        self.timing.overlay_ms = value
 
     @property
     def boot_ms(self) -> int | None:
         """Get VM boot time in milliseconds."""
-        return self._boot_ms
+        return self.timing.boot_ms
 
     @boot_ms.setter
     def boot_ms(self, value: int) -> None:
         """Set VM boot time in milliseconds."""
-        self._boot_ms = value
+        self.timing.boot_ms = value
 
     @property
     def qemu_cmd_build_ms(self) -> int | None:
         """Time for pre-launch setup (command build, socket cleanup, channel creation)."""
-        return self._qemu_cmd_build_ms
+        return self.timing.qemu_cmd_build_ms
 
     @qemu_cmd_build_ms.setter
     def qemu_cmd_build_ms(self, value: int) -> None:
-        self._qemu_cmd_build_ms = value
+        self.timing.qemu_cmd_build_ms = value
 
     @property
     def gvproxy_start_ms(self) -> int | None:
         """Time to start gvproxy (0 if network disabled)."""
-        return self._gvproxy_start_ms
+        return self.timing.gvproxy_start_ms
 
     @gvproxy_start_ms.setter
     def gvproxy_start_ms(self, value: int) -> None:
-        self._gvproxy_start_ms = value
+        self.timing.gvproxy_start_ms = value
 
     @property
     def qemu_fork_ms(self) -> int | None:
         """Time for QEMU process fork/exec."""
-        return self._qemu_fork_ms
+        return self.timing.qemu_fork_ms
 
     @qemu_fork_ms.setter
     def qemu_fork_ms(self, value: int) -> None:
-        self._qemu_fork_ms = value
+        self.timing.qemu_fork_ms = value
 
     @property
     def guest_wait_ms(self) -> int | None:
         """Time waiting for guest agent (kernel + initramfs + agent init)."""
-        return self._guest_wait_ms
+        return self.timing.guest_wait_ms
 
     @guest_wait_ms.setter
     def guest_wait_ms(self, value: int) -> None:
-        self._guest_wait_ms = value
+        self.timing.guest_wait_ms = value
+
+    # -------------------------------------------------------------------------
+    # Other VM properties
+    # -------------------------------------------------------------------------
 
     @property
     def overlay_image(self) -> Path:
