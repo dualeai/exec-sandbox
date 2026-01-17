@@ -43,8 +43,8 @@ jobs:
           uv run pyright .
           uv run -m vulture src/ scripts/ --min-confidence 80
 
-  static-rust:
-    name: Static / Rust
+  static-rust-guest-agent:
+    name: Static / Rust (guest-agent)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -57,6 +57,24 @@ jobs:
         with:
           components: rustfmt, clippy
           cache-workspaces: guest-agent
+
+      - name: Static checks
+        run: make test-static
+
+  static-rust-tiny-init:
+    name: Static / Rust (tiny-init)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tiny-init
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache-workspaces: tiny-init
 
       - name: Static checks
         run: make test-static
@@ -142,10 +160,38 @@ jobs:
             images/dist/guest-agent-linux-${{ matrix.image_arch }}.hash
           retention-days: 7
 
+  build-tiny-init:
+    name: Build / tiny-init (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            image_arch: x86_64
+          - arch: arm64
+            image_arch: aarch64
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      - name: Build
+        uses: ./.github/actions/build-tiny-init
+        with:
+          arch: ${{ matrix.image_arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-init-${{ matrix.arch }}
+          path: |
+            images/dist/tiny-init-${{ matrix.image_arch }}
+            images/dist/tiny-init-${{ matrix.image_arch }}.hash
+          retention-days: 7
+
   build-vm-images:
     name: Build / VM images (${{ matrix.arch }})
     runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
-    needs: build-guest-agent
+    needs: [build-guest-agent, build-tiny-init]
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -161,6 +207,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: guest-agent-${{ matrix.arch }}
+          path: images/dist/
+
+      - name: Download tiny-init
+        uses: actions/download-artifact@v4
+        with:
+          name: tiny-init-${{ matrix.arch }}
           path: images/dist/
 
       - name: Build

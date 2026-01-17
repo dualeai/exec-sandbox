@@ -2,8 +2,8 @@
 # Build VM images (kernel + qcow2) using Docker
 #
 # Orchestrates the build of all VM image components:
-#   1. guest-agent (Rust binary)
-#   2. kernel + initramfs (from Alpine)
+#   1. guest-agent + tiny-init (Rust binaries, in parallel)
+#   2. kernel + initramfs (from Alpine, needs tiny-init)
 #   3. qcow2 disk images (python, node, raw variants)
 #
 # All build commands run inside Linux containers with the repo mounted.
@@ -33,15 +33,19 @@ build_for_arch() {
 
     echo "=== Building for $arch ==="
 
-    # Step 1+2: Build guest-agent and extract kernel in parallel
-    echo "[$arch] Building guest-agent + extracting kernel..."
+    # Step 1: Build guest-agent and tiny-init in parallel
+    echo "[$arch] Building guest-agent + tiny-init..."
     "$SCRIPT_DIR/build-guest-agent.sh" "$arch" &
     local pid_agent=$!
-    "$SCRIPT_DIR/extract-kernel.sh" "$arch" &
-    local pid_kernel=$!
+    "$SCRIPT_DIR/build-tiny-init.sh" "$arch" &
+    local pid_init=$!
 
     wait $pid_agent || { echo "[$arch] Guest-agent build failed" >&2; return 1; }
-    wait $pid_kernel || { echo "[$arch] Kernel extraction failed" >&2; return 1; }
+    wait $pid_init || { echo "[$arch] tiny-init build failed" >&2; return 1; }
+
+    # Step 2: Extract kernel + build initramfs (needs tiny-init)
+    echo "[$arch] Extracting kernel + building initramfs..."
+    "$SCRIPT_DIR/extract-kernel.sh" "$arch" || { echo "[$arch] Kernel extraction failed" >&2; return 1; }
 
     # Step 3: Build qcow2 images (parallelized inside build-qcow2.sh)
     echo "[$arch] Building qcow2 images..."

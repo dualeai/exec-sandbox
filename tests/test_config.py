@@ -34,58 +34,46 @@ class TestSchedulerConfigValidation:
         assert config.enable_package_validation is True
 
     def test_max_concurrent_vms_range(self) -> None:
-        """max_concurrent_vms must be 1-100."""
+        """max_concurrent_vms must be >= 1."""
         # Valid: min
         config = SchedulerConfig(max_concurrent_vms=1)
         assert config.max_concurrent_vms == 1
 
-        # Valid: max
-        config = SchedulerConfig(max_concurrent_vms=100)
-        assert config.max_concurrent_vms == 100
+        # Valid: large value (no upper bound)
+        config = SchedulerConfig(max_concurrent_vms=1000)
+        assert config.max_concurrent_vms == 1000
 
         # Invalid: 0
         with pytest.raises(ValidationError):
             SchedulerConfig(max_concurrent_vms=0)
 
-        # Invalid: > 100
-        with pytest.raises(ValidationError):
-            SchedulerConfig(max_concurrent_vms=101)
-
     def test_warm_pool_size_range(self) -> None:
-        """warm_pool_size must be 0-10."""
+        """warm_pool_size must be >= 0."""
         # Valid: 0 (disabled)
         config = SchedulerConfig(warm_pool_size=0)
         assert config.warm_pool_size == 0
 
-        # Valid: 10
-        config = SchedulerConfig(warm_pool_size=10)
-        assert config.warm_pool_size == 10
+        # Valid: large value (no upper bound)
+        config = SchedulerConfig(warm_pool_size=100)
+        assert config.warm_pool_size == 100
 
         # Invalid: negative
         with pytest.raises(ValidationError):
             SchedulerConfig(warm_pool_size=-1)
 
-        # Invalid: > 10
-        with pytest.raises(ValidationError):
-            SchedulerConfig(warm_pool_size=11)
-
     def test_default_memory_mb_range(self) -> None:
-        """default_memory_mb must be 128-2048."""
+        """default_memory_mb must be >= 128."""
         # Valid: min
         config = SchedulerConfig(default_memory_mb=128)
         assert config.default_memory_mb == 128
 
-        # Valid: max
-        config = SchedulerConfig(default_memory_mb=2048)
-        assert config.default_memory_mb == 2048
+        # Valid: large value (no upper bound)
+        config = SchedulerConfig(default_memory_mb=8192)
+        assert config.default_memory_mb == 8192
 
         # Invalid: < 128
         with pytest.raises(ValidationError):
             SchedulerConfig(default_memory_mb=127)
-
-        # Invalid: > 2048
-        with pytest.raises(ValidationError):
-            SchedulerConfig(default_memory_mb=2049)
 
     def test_default_timeout_seconds_range(self) -> None:
         """default_timeout_seconds must be 1-300."""

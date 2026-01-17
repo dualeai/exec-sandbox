@@ -54,14 +54,15 @@ compute_kernel_hash() {
     echo "alpine=$ALPINE_VERSION arch=$arch kernel=$kernel_ver" | sha256sum | cut -d' ' -f1
 }
 
-# Compute hash for initramfs inputs (kernel hash + init script + build script)
+# Compute hash for initramfs inputs (kernel hash + tiny-init binary + build script)
 compute_initramfs_hash() {
     local arch=$1
     local kernel_ver
     kernel_ver=$(get_kernel_version "$arch")
     (
         echo "alpine=$ALPINE_VERSION arch=$arch kernel=$kernel_ver"
-        cat "$REPO_ROOT/images/minimal-init.sh" 2>/dev/null || true
+        # Include tiny-init binary hash (if it exists)
+        sha256sum "$OUTPUT_DIR/tiny-init-$arch" 2>/dev/null || echo "tiny-init-not-built"
         cat "$SCRIPT_DIR/build-initramfs.sh" 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }

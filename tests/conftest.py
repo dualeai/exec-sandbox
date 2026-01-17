@@ -10,7 +10,7 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
-from exec_sandbox.vm_manager import check_fast_balloon_available, check_hwaccel_available
+from exec_sandbox.vm_manager import VmManager, check_fast_balloon_available, check_hwaccel_available
 
 # ============================================================================
 # Shared Skip Markers
@@ -137,11 +137,14 @@ def vm_settings(images_dir: Path):
 
 
 @pytest.fixture
-def vm_manager(vm_settings):
-    """VmManager with hardware acceleration."""
-    from exec_sandbox.vm_manager import VmManager
+async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
+    """VmManager with hardware acceleration (started).
 
-    return VmManager(vm_settings)  # type: ignore[arg-type]
+    Automatically calls start() to start the overlay pool daemon,
+    and stop() for cleanup.
+    """
+    async with VmManager(vm_settings) as manager:  # type: ignore[arg-type]
+        yield manager
 
 
 @pytest.fixture
@@ -158,11 +161,14 @@ def emulation_settings(images_dir: Path):
 
 
 @pytest.fixture
-def emulation_vm_manager(emulation_settings):
-    """VmManager configured for software emulation."""
-    from exec_sandbox.vm_manager import VmManager
+async def emulation_vm_manager(emulation_settings) -> AsyncGenerator[VmManager, None]:
+    """VmManager configured for software emulation (started).
 
-    return VmManager(emulation_settings)  # type: ignore[arg-type]
+    Automatically calls start() to start the overlay pool daemon,
+    and stop() for cleanup.
+    """
+    async with VmManager(emulation_settings) as manager:  # type: ignore[arg-type]
+        yield manager
 
 
 @pytest.fixture

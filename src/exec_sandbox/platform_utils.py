@@ -7,12 +7,12 @@ Provides PID-reuse safe process management wrappers.
 import asyncio
 import contextlib
 import platform
-import time
 from enum import Enum, auto
 from functools import cache
 from typing import Literal
 
 import psutil
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
 class HostOS(Enum):
@@ -156,14 +156,22 @@ class ProcessWrapper:
         self.psutil_proc: psutil.Process | None = None
 
         # Wrap with psutil for PID-reuse safe monitoring
-        # Retry a few times to handle race conditions on free-threaded Python
-        # where the process may not be immediately visible to psutil
+        # Use exponential backoff to handle race conditions where the process
+        # may not be immediately visible to psutil (especially on free-threaded
+        # Python where scheduling differs). Retries: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms
         if async_proc.pid:
-            for _ in range(3):
-                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                    self.psutil_proc = psutil.Process(async_proc.pid)
-                    break
-                time.sleep(0.001)  # 1ms retry delay
+            try:
+                for attempt in Retrying(
+                    stop=stop_after_attempt(7),
+                    wait=wait_exponential(multiplier=0.001, min=0.001, max=0.064),
+                    retry=retry_if_exception_type((psutil.NoSuchProcess, psutil.AccessDenied)),
+                    reraise=True,
+                ):
+                    with attempt:
+                        self.psutil_proc = psutil.Process(async_proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Process not visible after retries - fallback to returncode-based checks
+                pass
 
     async def is_running(self) -> bool:
         """Check if process is still running (PID-reuse safe).

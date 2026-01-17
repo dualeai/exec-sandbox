@@ -150,7 +150,7 @@ class Scheduler:
         from exec_sandbox.vm_manager import VmManager  # noqa: PLC0415
 
         self._vm_manager = VmManager(self._settings)
-        await self._vm_manager.initialize()
+        await self._vm_manager.start()  # Pre-warms all system probe caches
 
         # Initialize SnapshotManager (L2 local cache always available, L3 S3 optional)
         from exec_sandbox.snapshot_manager import SnapshotManager  # noqa: PLC0415
@@ -162,7 +162,7 @@ class Scheduler:
             from exec_sandbox.warm_vm_pool import WarmVMPool  # noqa: PLC0415
 
             self._warm_pool = WarmVMPool(self._vm_manager, self.config, self._snapshot_manager)
-            await self._warm_pool.startup()
+            await self._warm_pool.start()
 
         self._started = True
         logger.info("Scheduler started successfully")
@@ -182,12 +182,12 @@ class Scheduler:
         """
         logger.info("Shutting down scheduler")
 
-        # Shutdown WarmVMPool first (drains VMs)
+        # Stop WarmVMPool first (drains VMs)
         if self._warm_pool:
             try:
-                await self._warm_pool.shutdown()
+                await self._warm_pool.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
-                logger.error("WarmVMPool shutdown error", extra={"error": str(e)})
+                logger.error("WarmVMPool stop error", extra={"error": str(e)})
 
         # Destroy any remaining VMs
         if self._vm_manager:
@@ -199,6 +199,9 @@ class Scheduler:
                 )
                 destroy_tasks = [self._vm_manager.destroy_vm(vm) for vm in active_vms.values()]
                 await asyncio.gather(*destroy_tasks, return_exceptions=True)
+
+            # Stop VmManager (includes overlay pool cleanup)
+            await self._vm_manager.stop()
 
         self._started = False
         logger.info("Scheduler shutdown complete")
@@ -282,11 +285,11 @@ class Scheduler:
         if packages and self.config.enable_package_validation:
             await self._validate_packages(packages, language)
 
-        # Check L2 snapshot cache for disk caching
-        # ALL VMs (base images + packages) are cached to L2 for fast subsequent access
-        # First run is slow (creates snapshot), subsequent runs benefit from cached packages
+        # Check L2 snapshot cache for disk caching (only if packages specified)
+        # Only use snapshots when packages need to be installed - empty packages case
+        # benefits from overlay pool pre-caching which requires using the original base image
         snapshot_path: Path | None = None
-        if self._snapshot_manager:
+        if self._snapshot_manager and packages:
             snapshot_path = await self._get_or_create_snapshot(language, packages, memory)
             logger.info(
                 "Snapshot cache result",
@@ -343,6 +346,13 @@ class Scheduler:
                 # For cold boot: use actual setup/boot times from VM
                 setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
                 boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+                # Granular setup timing
+                overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
+                # Granular boot timing
+                qemu_cmd_build_ms = vm.qemu_cmd_build_ms if is_cold_boot and vm.qemu_cmd_build_ms is not None else 0
+                gvproxy_start_ms = vm.gvproxy_start_ms if is_cold_boot and vm.gvproxy_start_ms is not None else 0
+                qemu_fork_ms = vm.qemu_fork_ms if is_cold_boot and vm.qemu_fork_ms is not None else 0
+                guest_wait_ms = vm.guest_wait_ms if is_cold_boot and vm.guest_wait_ms is not None else 0
 
                 return ExecutionResult(
                     stdout=result.stdout,
@@ -356,7 +366,12 @@ class Scheduler:
                         boot_ms=boot_ms,
                         execute_ms=execute_ms,
                         total_ms=total_ms,
-                        connect_ms=result.timing.connect_ms,  # Pass through from VM
+                        connect_ms=result.timing.connect_ms,
+                        overlay_ms=overlay_ms,
+                        qemu_cmd_build_ms=qemu_cmd_build_ms,
+                        gvproxy_start_ms=gvproxy_start_ms,
+                        qemu_fork_ms=qemu_fork_ms,
+                        guest_wait_ms=guest_wait_ms,
                     ),
                     warm_pool_hit=not is_cold_boot,
                     spawn_ms=result.spawn_ms,  # Pass through from guest

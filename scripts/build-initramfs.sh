@@ -4,12 +4,11 @@ set -euo pipefail
 # Build minimal initramfs for QEMU microVM
 #
 # Features:
-# - Static busybox (for mount, switch_root)
-# - Minimal init script (~15 lines)
+# - tiny-init: single static Rust binary (~50-100KB vs 1MB busybox)
 # - LZ4 compression (5x faster than gzip)
-# - Size: ~1-2 MB vs Alpine's 9.3 MB
+# - Size: ~500KB vs Alpine's 9.3 MB
 #
-# Expected boot time savings: 50-100ms
+# Expected boot time savings: 100-150ms
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGES_DIR="$SCRIPT_DIR/../images"
@@ -47,22 +46,14 @@ trap "rm -rf $INITRAMFS_DIR" EXIT
 # Create directory structure
 mkdir -p "$INITRAMFS_DIR"/{bin,dev,proc,sys,tmp,mnt,lib/modules}
 
-# Get static busybox from Alpine
-# Install busybox-static package which provides a fully static binary
-docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
-    apk add --no-cache busybox-static >/dev/null 2>&1
-    cat /bin/busybox.static
-" > "$INITRAMFS_DIR/bin/busybox"
-chmod 755 "$INITRAMFS_DIR/bin/busybox"
-
-# Create busybox symlinks for commands used in init script
-# Note: mkswap and swapon added for zram swap setup
-for cmd in sh mount umount switch_root sleep usleep insmod modprobe gzip uname rm ls cat mkdir basename ln head mkswap swapon awk; do
-    ln -s busybox "$INITRAMFS_DIR/bin/$cmd"
-done
-
-# Copy minimal init script
-cp "$IMAGES_DIR/minimal-init.sh" "$INITRAMFS_DIR/init"
+# Copy tiny-init binary (pre-built by build-tiny-init.sh)
+TINY_INIT="$OUTPUT_DIR/tiny-init-$ARCH_NAME"
+if [ ! -f "$TINY_INIT" ]; then
+    echo "ERROR: tiny-init binary not found: $TINY_INIT"
+    echo "Run: ./scripts/build-tiny-init.sh $ARCH_NAME"
+    exit 1
+fi
+cp "$TINY_INIT" "$INITRAMFS_DIR/init"
 chmod 755 "$INITRAMFS_DIR/init"
 
 # Create essential device nodes
@@ -84,12 +75,16 @@ mknod -m 666 "$INITRAMFS_DIR/dev/ttyAMA0" c 204 64 2>/dev/null || true
 # - virtio_balloon: for memory balloon (snapshot size optimization)
 # - ext4 + dependencies (jbd2, mbcache, crc16, crc32c): for ext4 filesystem
 # - zram + lz4: for compressed swap (memory optimization)
+#
+# Modules are extracted UNCOMPRESSED for faster boot:
+# - Outer LZ4 compression handles size reduction
+# - Skips userspace gzip decompression during boot
 echo "Extracting kernel modules..."
 docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
     apk add --no-cache linux-virt >/dev/null 2>&1
     # Get kernel version
     KVER=\$(ls /lib/modules/)
-    # Create a tar of the required modules
+    # Create a tar of the required modules (decompressed for fast loading)
     cd /lib/modules/\$KVER
     tar -cf - \
         kernel/drivers/block/virtio_blk.ko.gz \
@@ -106,10 +101,12 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
         kernel/crypto/crc32c_generic.ko.gz \
         kernel/drivers/block/zram/zram.ko.gz \
         kernel/lib/lz4/lz4_compress.ko.gz \
-        kernel/lib/lz4/lz4hc_compress.ko.gz \
         kernel/crypto/lz4.ko.gz \
-        modules.dep modules.alias modules.symbols 2>/dev/null || true
+        2>/dev/null || true
 " | tar -xf - -C "$INITRAMFS_DIR/lib/modules/" 2>/dev/null || true
+
+# Decompress modules for faster boot (skip gzip decompression at runtime)
+find "$INITRAMFS_DIR/lib/modules" -name "*.ko.gz" -exec gunzip -f {} \;
 
 # Create the kernel version directory structure
 KVER=$(docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "apk add --no-cache linux-virt >/dev/null 2>&1; ls /lib/modules/")

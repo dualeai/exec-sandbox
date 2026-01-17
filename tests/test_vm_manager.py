@@ -16,13 +16,17 @@ from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.vm_manager import (
     VALID_STATE_TRANSITIONS,
+    QemuVM,
     VmState,
     _check_hvf_available,
     _check_kvm_available,
+    _check_tsc_deadline,
+    _check_tsc_deadline_linux,
     _check_tsc_deadline_macos,
     _kernel_validated,
     _probe_cache,
     _probe_qemu_accelerators,
+    _validate_identifier,
     _validate_kernel_initramfs,
     check_hwaccel_available,
 )
@@ -961,6 +965,96 @@ class TestEmulationMode:
 
 
 # ============================================================================
+# Unit Tests - TSC_DEADLINE Detection for Linux
+# ============================================================================
+
+
+class TestTscDeadlineLinux:
+    """Tests for TSC_DEADLINE detection on Linux via /proc/cpuinfo."""
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_with_feature(self) -> None:
+        """Linux with tsc_deadline_timer in cpuinfo returns True."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            cpuinfo_content = """processor	: 0
+vendor_id	: GenuineIntel
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep tsc_deadline_timer sse sse2
+"""
+            mock_file = AsyncMock()
+            mock_file.__aenter__.return_value.read = AsyncMock(return_value=cpuinfo_content)
+
+            with patch("aiofiles.os.path.exists", return_value=True):
+                with patch("aiofiles.open", return_value=mock_file):
+                    result = await _check_tsc_deadline_linux()
+                    assert result is True
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_without_feature(self) -> None:
+        """Linux without tsc_deadline_timer in cpuinfo returns False."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            cpuinfo_content = """processor	: 0
+vendor_id	: GenuineIntel
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
+"""
+            mock_file = AsyncMock()
+            mock_file.__aenter__.return_value.read = AsyncMock(return_value=cpuinfo_content)
+
+            with patch("aiofiles.os.path.exists", return_value=True):
+                with patch("aiofiles.open", return_value=mock_file):
+                    result = await _check_tsc_deadline_linux()
+                    assert result is False
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_cpuinfo_not_exists(self) -> None:
+        """/proc/cpuinfo not existing returns False gracefully."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            with patch("aiofiles.os.path.exists", return_value=False):
+                result = await _check_tsc_deadline_linux()
+                assert result is False
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+    @pytest.mark.asyncio
+    async def test_tsc_deadline_linux_read_error(self) -> None:
+        """OSError reading /proc/cpuinfo returns False gracefully."""
+        from exec_sandbox.vm_manager import _probe_cache
+
+        original_tsc = _probe_cache.tsc_deadline
+
+        try:
+            _probe_cache.tsc_deadline = None
+
+            with patch("aiofiles.os.path.exists", return_value=True):
+                with patch("aiofiles.open", side_effect=OSError("Permission denied")):
+                    result = await _check_tsc_deadline_linux()
+                    assert result is False
+        finally:
+            _probe_cache.tsc_deadline = original_tsc
+
+
+# ============================================================================
 # Unit Tests - TSC_DEADLINE Detection for macOS
 # ============================================================================
 
@@ -1062,8 +1156,8 @@ class TestTscDeadlineMacOS:
             _probe_cache.tsc_deadline = original_tsc
 
     @pytest.mark.asyncio
-    async def test_tsc_deadline_macos_cached(self) -> None:
-        """TSC_DEADLINE result is cached."""
+    async def test_tsc_deadline_cached(self) -> None:
+        """TSC_DEADLINE result is cached (caching is in _check_tsc_deadline, not platform-specific functions)."""
         from exec_sandbox.vm_manager import _probe_cache
 
         # Save original cache value
@@ -1073,11 +1167,13 @@ class TestTscDeadlineMacOS:
             # Set cached value
             _probe_cache.tsc_deadline = True
 
-            # Should return cached value without calling sysctl
+            # Should return cached value without calling sysctl or reading /proc/cpuinfo
             with patch("asyncio.create_subprocess_exec") as mock_exec:
-                result = await _check_tsc_deadline_macos()
-                assert result is True
-                mock_exec.assert_not_called()
+                with patch("aiofiles.open") as mock_open:
+                    result = await _check_tsc_deadline()
+                    assert result is True
+                    mock_exec.assert_not_called()
+                    mock_open.assert_not_called()
         finally:
             # Restore cache
             _probe_cache.tsc_deadline = original_tsc
@@ -1122,3 +1218,227 @@ class TestGvproxyWrapperBinarySelection:
         with patch("exec_sandbox.asset_downloader.get_os_name", return_value="linux"):
             with patch("exec_sandbox.asset_downloader.get_arch_name", return_value="arm64"):
                 assert get_gvproxy_suffix() == "linux-arm64"
+
+
+# ============================================================================
+# Security Tests - Identifier Validation
+# ============================================================================
+
+
+class TestIdentifierValidation:
+    """Security tests for tenant_id and task_id validation to prevent injection attacks."""
+
+    def test_valid_identifiers(self) -> None:
+        """Test that valid identifiers are accepted."""
+        valid_identifiers = [
+            "tenant123",
+            "task-1",
+            "my_task",
+            "UPPERCASE",
+            "MixedCase123",
+            "a",
+            "123",
+            "a-b_c",
+        ]
+        for identifier in valid_identifiers:
+            # Should not raise
+            _validate_identifier(identifier, "test_id")
+
+    def test_empty_identifier_rejected(self) -> None:
+        """Test that empty identifier is rejected."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            _validate_identifier("", "test_id")
+
+    def test_identifier_too_long_rejected(self) -> None:
+        """Test that overly long identifier is rejected."""
+        long_id = "a" * 129  # > 128 chars
+        with pytest.raises(ValueError, match="too long"):
+            _validate_identifier(long_id, "test_id")
+
+    def test_identifier_max_length_accepted(self) -> None:
+        """Test that identifier at max length is accepted."""
+        max_id = "a" * 128  # Exactly 128 chars
+        # Should not raise
+        _validate_identifier(max_id, "test_id")
+
+    def test_shell_injection_characters_rejected(self) -> None:
+        """Test that shell metacharacters are rejected to prevent command injection."""
+        malicious_identifiers = [
+            "tenant;rm -rf /",
+            "task$(whoami)",
+            "task`id`",
+            "task|cat /etc/passwd",
+            "task&echo pwned",
+            "task>file",
+            "task<file",
+            "task\nid",
+            "task\tid",
+        ]
+        for identifier in malicious_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_path_traversal_characters_rejected(self) -> None:
+        """Test that path traversal characters are rejected."""
+        malicious_identifiers = [
+            "../../../etc/passwd",
+            "..\\..\\windows",
+            "task/../../root",
+            "task\\path",
+            "/absolute/path",
+        ]
+        for identifier in malicious_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_special_characters_rejected(self) -> None:
+        """Test that various special characters are rejected."""
+        special_chars = [
+            "task@domain",
+            "task#1",
+            "task$var",
+            "task%1",
+            "task^x",
+            "task*",
+            "task+1",
+            "task=val",
+            "task[0]",
+            "task{1}",
+            "task!",
+            "task~",
+            "task'",
+            'task"',
+            "task,1",
+            "task.1",
+            "task?",
+            "task:1",
+        ]
+        for identifier in special_chars:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_unicode_characters_rejected(self) -> None:
+        """Test that Unicode characters are rejected."""
+        unicode_identifiers = [
+            "task日本語",
+            "задача",
+            "tâche",
+            "任务",
+            "tenant\u0000null",
+        ]
+        for identifier in unicode_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+    def test_whitespace_rejected(self) -> None:
+        """Test that whitespace is rejected."""
+        whitespace_identifiers = [
+            "task 1",
+            " task",
+            "task ",
+            "task\t1",
+            "task\n1",
+            "task\r\n1",
+        ]
+        for identifier in whitespace_identifiers:
+            with pytest.raises(ValueError, match="invalid characters"):
+                _validate_identifier(identifier, "test_id")
+
+
+# ============================================================================
+# State Race Protection Tests
+# ============================================================================
+
+
+class TestExecuteStateRace:
+    """Tests for state race protection in execute() method.
+
+    Verifies that execute() correctly handles the case where destroy() is called
+    between the state lock release and the start of I/O operations.
+    """
+
+    async def test_execute_rejects_destroying_state(self) -> None:
+        """execute() raises VmError if state is DESTROYING (caught by initial check)."""
+        # Create a minimal mock VM
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.DESTROYING
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        with pytest.raises(VmError) as exc_info:
+            await vm.execute(code="print('hello')", timeout_seconds=5)
+
+        # Initial check catches non-READY state
+        assert "Cannot execute in state destroying" in str(exc_info.value)
+
+    async def test_execute_rejects_destroyed_state(self) -> None:
+        """execute() raises VmError if state is DESTROYED (caught by initial check)."""
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.DESTROYED
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        with pytest.raises(VmError) as exc_info:
+            await vm.execute(code="print('hello')", timeout_seconds=5)
+
+        # Initial check catches non-READY state
+        assert "Cannot execute in state destroyed" in str(exc_info.value)
+
+    async def test_state_race_check_catches_destroying(self) -> None:
+        """The defensive state check catches DESTROYING after lock release.
+
+        This test simulates the race condition by using a side effect to change
+        state to DESTROYING right after the lock is released but before I/O.
+        """
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.READY
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        # Use a real state change to trigger the race condition check
+        # We patch the state after transition to EXECUTING
+        original_state = VmState.EXECUTING
+        race_triggered = False
+
+        def change_state_to_destroying():
+            """Side effect that simulates destroy() being called."""
+            nonlocal race_triggered
+            if vm._state == VmState.EXECUTING:
+                vm._state = VmState.DESTROYING
+                race_triggered = True
+
+        # Patch the ExecuteCodeRequest to trigger state change before I/O
+        with patch("exec_sandbox.vm_manager.ExecuteCodeRequest") as mock_request:
+            mock_request.side_effect = lambda **kwargs: (change_state_to_destroying(), None)[1] or AsyncMock()
+
+            with pytest.raises(VmError) as exc_info:
+                await vm.execute(code="print('hello')", timeout_seconds=5)
+
+            assert race_triggered, "Race condition was not triggered"
+            assert "VM destroyed during execution start" in str(exc_info.value)
+            assert exc_info.value.context["current_state"] == "destroying"
+
+    async def test_state_race_check_catches_destroyed(self) -> None:
+        """The defensive state check catches DESTROYED after lock release."""
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.READY
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-123"
+        vm.language = "python"
+
+        def change_state_to_destroyed():
+            """Side effect that simulates destroy() completing."""
+            if vm._state == VmState.EXECUTING:
+                vm._state = VmState.DESTROYED
+
+        with patch("exec_sandbox.vm_manager.ExecuteCodeRequest") as mock_request:
+            mock_request.side_effect = lambda **kwargs: (change_state_to_destroyed(), None)[1] or AsyncMock()
+
+            with pytest.raises(VmError) as exc_info:
+                await vm.execute(code="print('hello')", timeout_seconds=5)
+
+            assert "VM destroyed during execution start" in str(exc_info.value)
+            assert exc_info.value.context["current_state"] == "destroyed"

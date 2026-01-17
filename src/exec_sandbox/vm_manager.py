@@ -20,12 +20,11 @@ Performance Optimizations (QEMU 10.0+):
 
 import asyncio
 import contextlib
-import ctypes
-import errno
 import json
 import logging
 import os
 import platform
+import re
 import signal
 import sys
 from collections.abc import Callable
@@ -54,6 +53,7 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
 from exec_sandbox.permission_utils import (
     can_access,
     chmod_async,
@@ -68,6 +68,7 @@ from exec_sandbox.resource_cleanup import cleanup_process, cleanup_vm_processes
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, read_log_tail
+from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 logger = get_logger(__name__)
@@ -76,6 +77,55 @@ logger = get_logger(__name__)
 # See: linux/kvm.h - these are stable ABI
 _KVM_GET_API_VERSION = 0xAE00
 _KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
+
+# Security: Identifier validation pattern
+# Only alphanumeric, underscore, and hyphen allowed to prevent:
+# - Shell command injection via malicious tenant_id/task_id
+# - Path traversal attacks (no '..', '/')
+# - Socket path manipulation
+_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_IDENTIFIER_MAX_LENGTH = 128  # Reasonable limit for identifiers
+
+
+def _validate_identifier(value: str, name: str) -> None:
+    """Validate identifier contains only safe characters.
+
+    Prevents shell injection and path traversal attacks by ensuring identifiers
+    (tenant_id, task_id) contain only alphanumeric characters, underscores, and hyphens.
+
+    Args:
+        value: The identifier value to validate
+        name: Human-readable name for error messages
+
+    Raises:
+        ValueError: If identifier contains invalid characters or is too long
+    """
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+    if len(value) > _IDENTIFIER_MAX_LENGTH:
+        raise ValueError(f"{name} too long: {len(value)} > {_IDENTIFIER_MAX_LENGTH}")
+    if not _IDENTIFIER_PATTERN.match(value):
+        raise ValueError(f"{name} contains invalid characters (only [a-zA-Z0-9_-] allowed): {value!r}")
+
+
+def _log_task_exception(task: asyncio.Task[None]) -> None:
+    """Log exceptions from background tasks.
+
+    Callback for asyncio.Task.add_done_callback() that properly logs any
+    unhandled exceptions from background tasks. Prevents silent failures.
+
+    Args:
+        task: The completed asyncio task to check for exceptions
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Background task failed",
+            extra={"task_name": task.get_name()},
+            exc_info=exc,
+        )
 
 
 class VmState(Enum):
@@ -125,9 +175,14 @@ class _ProbeCache:
 
     Uses a class to avoid global statements while maintaining module-level caching.
     Locks are lazily initialized to ensure they're created in the right event loop.
+
+    The locks prevent cache stampede when multiple VMs start concurrently - without
+    them, all VMs would run the detection subprocess simultaneously instead of
+    sharing the cached result.
     """
 
     __slots__ = (
+        "_locks",
         "hvf",
         "io_uring",
         "kvm",
@@ -143,6 +198,17 @@ class _ProbeCache:
         self.qemu_accels: set[str] | None = None  # Accelerators available in QEMU binary
         self.tsc_deadline: bool | None = None
         self.unshare: bool | None = None
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def get_lock(self, name: str) -> asyncio.Lock:
+        """Get or create a lock for the given probe (lazy initialization).
+
+        Locks must be created lazily because asyncio.Lock requires an event loop,
+        which may not exist at module import time.
+        """
+        if name not in self._locks:
+            self._locks[name] = asyncio.Lock()
+        return self._locks[name]
 
 
 # Module-level cache instance
@@ -167,62 +233,68 @@ async def _probe_qemu_accelerators() -> set[str]:
     Returns:
         Set of available accelerator names (e.g., {"tcg", "kvm"} or {"tcg", "hvf"})
     """
-    # Fast path: return cached result
+    # Fast path: return cached result (no lock needed)
     if _probe_cache.qemu_accels is not None:
         return _probe_cache.qemu_accels
 
-    # Determine QEMU binary based on host architecture
-    arch = detect_host_arch()
-    qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            qemu_bin,
-            "-accel",
-            "help",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-
-        if proc.returncode != 0:
-            logger.warning(
-                "QEMU accelerator probe failed",
-                extra={"qemu_bin": qemu_bin, "returncode": proc.returncode},
-            )
-            _probe_cache.qemu_accels = set()
+    # Slow path: acquire lock to prevent stampede, then check cache again
+    async with _probe_cache.get_lock("qemu_accels"):
+        # Double-check after acquiring lock (another task may have populated cache)
+        if _probe_cache.qemu_accels is not None:
             return _probe_cache.qemu_accels
 
-        # Parse output: "Accelerators supported in QEMU binary:\ntcg\nkvm\n"
-        # or "tcg\nhvf\n" on macOS
-        output = stdout.decode().strip()
-        accels: set[str] = set()
-        for raw_line in output.split("\n"):
-            accel_name = raw_line.strip().lower()
-            # Skip header line and empty lines
-            if accel_name and not accel_name.startswith("accelerator"):
-                accels.add(accel_name)
+        # Determine QEMU binary based on host architecture
+        arch = detect_host_arch()
+        qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
 
-        _probe_cache.qemu_accels = accels
-        logger.debug(
-            "QEMU accelerator probe complete",
-            extra={"qemu_bin": qemu_bin, "accelerators": sorted(accels)},
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                qemu_bin,
+                "-accel",
+                "help",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-    except FileNotFoundError:
-        logger.warning(
-            "QEMU binary not found for accelerator probe",
-            extra={"qemu_bin": qemu_bin},
-        )
-        _probe_cache.qemu_accels = set()
-    except (OSError, TimeoutError) as e:
-        logger.warning(
-            "QEMU accelerator probe failed",
-            extra={"qemu_bin": qemu_bin, "error": str(e)},
-        )
-        _probe_cache.qemu_accels = set()
+            if proc.returncode != 0:
+                logger.warning(
+                    "QEMU accelerator probe failed",
+                    extra={"qemu_bin": qemu_bin, "returncode": proc.returncode},
+                )
+                _probe_cache.qemu_accels = set()
+                return _probe_cache.qemu_accels
 
-    return _probe_cache.qemu_accels
+            # Parse output: "Accelerators supported in QEMU binary:\ntcg\nkvm\n"
+            # or "tcg\nhvf\n" on macOS
+            output = stdout.decode().strip()
+            accels: set[str] = set()
+            for raw_line in output.split("\n"):
+                accel_name = raw_line.strip().lower()
+                # Skip header line and empty lines
+                if accel_name and not accel_name.startswith("accelerator"):
+                    accels.add(accel_name)
+
+            _probe_cache.qemu_accels = accels
+            logger.debug(
+                "QEMU accelerator probe complete",
+                extra={"qemu_bin": qemu_bin, "accelerators": sorted(accels)},
+            )
+
+        except FileNotFoundError:
+            logger.warning(
+                "QEMU binary not found for accelerator probe",
+                extra={"qemu_bin": qemu_bin},
+            )
+            _probe_cache.qemu_accels = set()
+        except (OSError, TimeoutError) as e:
+            logger.warning(
+                "QEMU accelerator probe failed",
+                extra={"qemu_bin": qemu_bin, "error": str(e)},
+            )
+            _probe_cache.qemu_accels = set()
+
+        return _probe_cache.qemu_accels
 
 
 async def _check_kvm_available() -> bool:
@@ -268,72 +340,78 @@ async def _check_kvm_available() -> bool:
         True if both kernel and QEMU verify KVM is available
         False otherwise (falls back to TCG software emulation)
     """
-    # Fast path: return cached result
+    # Fast path: return cached result (no lock needed)
     if _probe_cache.kvm is not None:
         return _probe_cache.kvm
 
-    kvm_path = "/dev/kvm"
-    if not await aiofiles.os.path.exists(kvm_path):
-        logger.debug("KVM not available: /dev/kvm does not exist")
-        _probe_cache.kvm = False
-        return False
+    # Slow path: acquire lock to prevent stampede, then check cache again
+    async with _probe_cache.get_lock("kvm"):
+        # Double-check after acquiring lock (another task may have populated cache)
+        if _probe_cache.kvm is not None:
+            return _probe_cache.kvm
 
-    # Check if we can actually access /dev/kvm (not just that it exists)
-    # This catches permission issues that would cause QEMU to fail or hang
-    # See: https://github.com/actions/runner-images/issues/8542
-    if not await can_access(kvm_path, os.R_OK | os.W_OK):
-        logger.debug("KVM not available: permission denied on /dev/kvm")
-        _probe_cache.kvm = False
-        return False
-
-    # Actually try to open /dev/kvm and check API version via subprocess
-    # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
-    # Uses subprocess to avoid blocking the event loop with ioctl()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-c",
-            f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode != 0:
-            logger.warning("KVM device accessible but ioctl failed")
+        kvm_path = "/dev/kvm"
+        if not await aiofiles.os.path.exists(kvm_path):
+            logger.debug("KVM not available: /dev/kvm does not exist")
             _probe_cache.kvm = False
             return False
 
-        api_version = int(stdout.decode().strip())
-        if api_version != _KVM_API_VERSION_EXPECTED:
+        # Check if we can actually access /dev/kvm (not just that it exists)
+        # This catches permission issues that would cause QEMU to fail or hang
+        # See: https://github.com/actions/runner-images/issues/8542
+        if not await can_access(kvm_path, os.R_OK | os.W_OK):
+            logger.debug("KVM not available: permission denied on /dev/kvm")
+            _probe_cache.kvm = False
+            return False
+
+        # Actually try to open /dev/kvm and check API version via subprocess
+        # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
+        # Uses subprocess to avoid blocking the event loop with ioctl()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode != 0:
+                logger.warning("KVM device accessible but ioctl failed")
+                _probe_cache.kvm = False
+                return False
+
+            api_version = int(stdout.decode().strip())
+            if api_version != _KVM_API_VERSION_EXPECTED:
+                logger.warning(
+                    "KVM available but unexpected API version",
+                    extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
+                )
+                _probe_cache.kvm = False
+                return False
+
+            logger.debug("KVM ioctl check passed", extra={"api_version": api_version})
+
+        except (OSError, TimeoutError, ValueError) as e:
+            logger.debug("KVM not available: failed to verify /dev/kvm", extra={"error": str(e)})
+            _probe_cache.kvm = False
+            return False
+
+        # Layer 2: Verify QEMU binary has KVM support compiled in
+        # Even if /dev/kvm works, QEMU may not have KVM support or may fail to initialize it
+        # See: https://github.com/orgs/community/discussions/8305 (GitHub Actions KVM issues)
+        qemu_accels = await _probe_qemu_accelerators()
+        if "kvm" not in qemu_accels:
             logger.warning(
-                "KVM available but unexpected API version",
-                extra={"api_version": api_version, "expected": _KVM_API_VERSION_EXPECTED},
+                "KVM not available: QEMU binary does not support KVM accelerator",
+                extra={"available_accelerators": sorted(qemu_accels)},
             )
             _probe_cache.kvm = False
             return False
 
-        logger.debug("KVM ioctl check passed", extra={"api_version": api_version})
-
-    except (OSError, TimeoutError, ValueError) as e:
-        logger.debug("KVM not available: failed to verify /dev/kvm", extra={"error": str(e)})
-        _probe_cache.kvm = False
-        return False
-
-    # Layer 2: Verify QEMU binary has KVM support compiled in
-    # Even if /dev/kvm works, QEMU may not have KVM support or may fail to initialize it
-    # See: https://github.com/orgs/community/discussions/8305 (GitHub Actions KVM issues)
-    qemu_accels = await _probe_qemu_accelerators()
-    if "kvm" not in qemu_accels:
-        logger.warning(
-            "KVM not available: QEMU binary does not support KVM accelerator",
-            extra={"available_accelerators": sorted(qemu_accels)},
-        )
-        _probe_cache.kvm = False
-        return False
-
-    logger.debug("KVM available and working (kernel + QEMU verified)")
-    _probe_cache.kvm = True
-    return _probe_cache.kvm
+        logger.debug("KVM available and working (kernel + QEMU verified)")
+        _probe_cache.kvm = True
+        return _probe_cache.kvm
 
 
 async def _check_hvf_available() -> bool:
@@ -352,48 +430,54 @@ async def _check_hvf_available() -> bool:
         True if HVF is available and can be used
         False otherwise (falls back to TCG software emulation)
     """
-    # Fast path: return cached result
+    # Fast path: return cached result (no lock needed)
     if _probe_cache.hvf is not None:
         return _probe_cache.hvf
 
-    try:
-        # sysctl kern.hv_support returns 1 if Hypervisor.framework is available
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/sbin/sysctl",
-            "-n",
-            "kern.hv_support",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
+    # Slow path: acquire lock to prevent stampede, then check cache again
+    async with _probe_cache.get_lock("hvf"):
+        # Double-check after acquiring lock (another task may have populated cache)
+        if _probe_cache.hvf is not None:
+            return _probe_cache.hvf
 
-        if not hvf_kernel_support:
-            logger.debug("HVF not available: kern.hv_support is not enabled")
+        try:
+            # sysctl kern.hv_support returns 1 if Hypervisor.framework is available
+            proc = await asyncio.create_subprocess_exec(
+                "/usr/sbin/sysctl",
+                "-n",
+                "kern.hv_support",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
+
+            if not hvf_kernel_support:
+                logger.debug("HVF not available: kern.hv_support is not enabled")
+                _probe_cache.hvf = False
+                return False
+
+            logger.debug("HVF kernel support check passed")
+
+        except (OSError, TimeoutError) as e:
+            logger.debug("HVF not available: sysctl check failed", extra={"error": str(e)})
             _probe_cache.hvf = False
             return False
 
-        logger.debug("HVF kernel support check passed")
+        # Layer 2: Verify QEMU binary has HVF support compiled in
+        # Even if kern.hv_support is enabled, QEMU may not have HVF support
+        qemu_accels = await _probe_qemu_accelerators()
+        if "hvf" not in qemu_accels:
+            logger.warning(
+                "HVF not available: QEMU binary does not support HVF accelerator",
+                extra={"available_accelerators": sorted(qemu_accels)},
+            )
+            _probe_cache.hvf = False
+            return False
 
-    except (OSError, TimeoutError) as e:
-        logger.debug("HVF not available: sysctl check failed", extra={"error": str(e)})
-        _probe_cache.hvf = False
-        return False
-
-    # Layer 2: Verify QEMU binary has HVF support compiled in
-    # Even if kern.hv_support is enabled, QEMU may not have HVF support
-    qemu_accels = await _probe_qemu_accelerators()
-    if "hvf" not in qemu_accels:
-        logger.warning(
-            "HVF not available: QEMU binary does not support HVF accelerator",
-            extra={"available_accelerators": sorted(qemu_accels)},
-        )
-        _probe_cache.hvf = False
-        return False
-
-    logger.debug("HVF available and working (kernel + QEMU verified)")
-    _probe_cache.hvf = True
-    return _probe_cache.hvf
+        logger.debug("HVF available and working (kernel + QEMU verified)")
+        _probe_cache.hvf = True
+        return _probe_cache.hvf
 
 
 def check_hwaccel_available() -> bool:
@@ -477,7 +561,7 @@ def check_fast_balloon_available() -> bool:
     # On Linux x86_64, TSC_DEADLINE absence indicates degraded nested virt
     # See: https://www.qemu.org/docs/master/system/i386/microvm.html
     if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
-        return asyncio.run(_check_tsc_deadline_available())
+        return asyncio.run(_check_tsc_deadline())
 
     # On macOS, HVF availability implies not nested (macOS doesn't support nested virt)
     # If we got here, HVF is available, so balloon should be fast
@@ -490,7 +574,7 @@ def check_fast_balloon_available() -> bool:
     return host_os == HostOS.LINUX and host_arch == HostArch.AARCH64
 
 
-async def _check_tsc_deadline_available() -> bool:
+async def _check_tsc_deadline() -> bool:
     """Check if TSC_DEADLINE CPU feature is available (cached).
 
     TSC_DEADLINE is required to disable PIT (i8254) and PIC (i8259) in microvm.
@@ -501,25 +585,44 @@ async def _check_tsc_deadline_available() -> bool:
     be exposed to the guest, causing boot hangs if PIT/PIC are disabled.
 
     See: https://www.qemu.org/docs/master/system/i386/microvm.html
-    "if your host's CPUs have the TSC_DEADLINE feature, you can also disable
-    both the i8259 PIC and the i8254 PIT"
 
     Returns:
         True if TSC_DEADLINE is available, False otherwise
     """
-    # Fast path: return cached result
+    # Fast path: return cached result (no lock needed)
     if _probe_cache.tsc_deadline is not None:
         return _probe_cache.tsc_deadline
 
-    # TSC_DEADLINE is x86-only
-    if detect_host_arch() != HostArch.X86_64:
+    # Slow path: acquire lock to prevent stampede
+    async with _probe_cache.get_lock("tsc_deadline"):
+        # Double-check after acquiring lock
+        if _probe_cache.tsc_deadline is not None:
+            return _probe_cache.tsc_deadline
+
+        # TSC_DEADLINE is x86-only
+        if detect_host_arch() != HostArch.X86_64:
+            _probe_cache.tsc_deadline = False
+            return False
+
+        # Dispatch to platform-specific implementation
+        host_os = detect_host_os()
+        if host_os == HostOS.LINUX:
+            return await _check_tsc_deadline_linux()
+        if host_os == HostOS.MACOS:
+            return await _check_tsc_deadline_macos()
+
+        # Unknown platform
         _probe_cache.tsc_deadline = False
         return False
 
-    # Check /proc/cpuinfo for tsc_deadline_timer flag
+
+async def _check_tsc_deadline_linux() -> bool:
+    """Linux-specific TSC_DEADLINE check via /proc/cpuinfo.
+
+    Note: Called from _check_tsc_deadline() which handles caching and locking.
+    """
     cpuinfo_path = "/proc/cpuinfo"
     if not await aiofiles.os.path.exists(cpuinfo_path):
-        # Not on Linux or /proc not mounted
         _probe_cache.tsc_deadline = False
         return False
 
@@ -530,13 +633,13 @@ async def _check_tsc_deadline_available() -> bool:
         # Format: "flags : fpu vme ... tsc_deadline_timer ..."
         for line in cpuinfo.split("\n"):
             if line.startswith("flags"):
-                has_tsc_deadline = "tsc_deadline_timer" in line.split()
-                _probe_cache.tsc_deadline = has_tsc_deadline
-                if has_tsc_deadline:
+                has_tsc = "tsc_deadline_timer" in line.split()
+                _probe_cache.tsc_deadline = has_tsc
+                if has_tsc:
                     logger.debug("TSC_DEADLINE available (can disable PIT/PIC)")
                 else:
                     logger.debug("TSC_DEADLINE not available (keeping PIT/PIC enabled)")
-                return has_tsc_deadline
+                return has_tsc
     except OSError as e:
         logger.warning("Failed to read /proc/cpuinfo for TSC_DEADLINE check", extra={"error": str(e)})
 
@@ -545,25 +648,11 @@ async def _check_tsc_deadline_available() -> bool:
 
 
 async def _check_tsc_deadline_macos() -> bool:
-    """Check if TSC_DEADLINE CPU feature is available on macOS (cached).
+    """macOS-specific TSC_DEADLINE check via sysctl.
 
-    Uses sysctl to query CPU features on Intel Macs.
-    ARM64 Macs don't have TSC_DEADLINE (ARM uses different timer mechanism).
-
-    Returns:
-        True if TSC_DEADLINE is available, False otherwise
+    Note: Called from _check_tsc_deadline() which handles caching and locking.
     """
-    # Fast path: return cached result
-    if _probe_cache.tsc_deadline is not None:
-        return _probe_cache.tsc_deadline
-
-    # TSC_DEADLINE is x86-only concept
-    if detect_host_arch() != HostArch.X86_64:
-        _probe_cache.tsc_deadline = False
-        return False
-
     try:
-        # machdep.cpu.features contains CPU feature flags on Intel Macs
         proc = await asyncio.create_subprocess_exec(
             "/usr/sbin/sysctl",
             "-n",
@@ -574,7 +663,6 @@ async def _check_tsc_deadline_macos() -> bool:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode == 0:
             features = stdout.decode().upper()
-            # TSC_DEADLINE or TSCDEAD in CPU features
             has_tsc = "TSC_DEADLINE" in features or "TSCDEAD" in features
             _probe_cache.tsc_deadline = has_tsc
             if has_tsc:
@@ -595,91 +683,115 @@ async def _probe_io_uring_support() -> bool:
     Returns:
         True if io_uring fully available, False otherwise
     """
-    # Fast path: return cached result
+    # Fast path: return cached result (no lock needed)
     if _probe_cache.io_uring is not None:
         return _probe_cache.io_uring
 
-    # io_uring is Linux-only - immediately return False on other platforms
-    if detect_host_os() != HostOS.LINUX:
-        _probe_cache.io_uring = False
-        return False
+    # Slow path: acquire lock to prevent stampede
+    async with _probe_cache.get_lock("io_uring"):
+        # Double-check after acquiring lock
+        if _probe_cache.io_uring is not None:
+            return _probe_cache.io_uring
 
-    # Check 1: Sysctl restrictions (kernel 5.12+)
-    sysctl_path = "/proc/sys/kernel/io_uring_disabled"
-    if await aiofiles.os.path.exists(sysctl_path):
+        # io_uring is Linux-only - immediately return False on other platforms
+        if detect_host_os() != HostOS.LINUX:
+            _probe_cache.io_uring = False
+            return False
+
+        # Check 1: Sysctl restrictions (kernel 5.12+)
+        sysctl_path = "/proc/sys/kernel/io_uring_disabled"
+        if await aiofiles.os.path.exists(sysctl_path):
+            try:
+                async with aiofiles.open(sysctl_path) as f:
+                    content = await f.read()
+                disabled_value = int(content.strip())
+                # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
+                if disabled_value == 2:  # noqa: PLR2004
+                    logger.info(
+                        "io_uring disabled via sysctl",
+                        extra={"sysctl_value": disabled_value},
+                    )
+                    _probe_cache.io_uring = False
+                    return False
+                if disabled_value == 1:
+                    logger.debug(
+                        "io_uring restricted to CAP_SYS_ADMIN",
+                        extra={"sysctl_value": disabled_value},
+                    )
+            except (ValueError, OSError) as e:
+                logger.warning("Failed to read io_uring_disabled sysctl", extra={"error": str(e)})
+
+        # Check 2: Syscall probe via subprocess (avoids blocking event loop)
+        # Uses subprocess to prevent blocking - ctypes syscall would block the event loop
+        # Exit codes: 0=available (EINVAL/EFAULT), 1=not available (ENOSYS), 2=blocked (EPERM), 3=error
         try:
-            async with aiofiles.open(sysctl_path) as f:
-                content = await f.read()
-            disabled_value = int(content.strip())
-            # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
-            if disabled_value == 2:  # noqa: PLR2004
+            probe_script = """
+import ctypes
+import errno
+import sys
+
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    # __NR_io_uring_setup = 425
+    result = libc.syscall(425, 0, None)
+    if result == -1:
+        err = ctypes.get_errno()
+        if err == errno.ENOSYS:
+            sys.exit(1)  # Not available
+        if err in (errno.EINVAL, errno.EFAULT):
+            sys.exit(0)  # Available (kernel recognized syscall)
+        if err == errno.EPERM:
+            sys.exit(2)  # Blocked by seccomp/container
+        sys.exit(3)  # Unexpected error
+    sys.exit(0)  # Available
+except Exception:
+    sys.exit(3)  # Error
+"""
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                probe_script,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+
+            if proc.returncode == 0:
                 logger.info(
-                    "io_uring disabled via sysctl",
-                    extra={"sysctl_value": disabled_value},
+                    "io_uring syscall available",
+                    extra={"kernel": platform.release()},
                 )
-                _probe_cache.io_uring = False
-                return False
-            if disabled_value == 1:
-                logger.debug(
-                    "io_uring restricted to CAP_SYS_ADMIN",
-                    extra={"sysctl_value": disabled_value},
-                )
-        except (ValueError, OSError) as e:
-            logger.warning("Failed to read io_uring_disabled sysctl", extra={"error": str(e)})
-
-    # Check 2: Syscall probe (most reliable)
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-
-        # __NR_io_uring_setup syscall number: 425
-        nr_io_uring_setup = 425
-
-        # Call io_uring_setup(0, NULL) - should fail with EINVAL if supported
-        result = libc.syscall(nr_io_uring_setup, 0, None)
-
-        if result == -1:
-            err = ctypes.get_errno()
-            if err == errno.ENOSYS:
+                _probe_cache.io_uring = True
+                return True
+            if proc.returncode == 1:
                 logger.info(
                     "io_uring syscall not available (ENOSYS)",
                     extra={"kernel": platform.release()},
                 )
                 _probe_cache.io_uring = False
                 return False
-            if err in (errno.EINVAL, errno.EFAULT):
-                # Both indicate io_uring syscall is recognized and available:
-                # - EINVAL: kernel validated params and rejected entries=0
-                # - EFAULT: kernel tried to access params pointer (NULL)
-                logger.info(
-                    "io_uring syscall available",
-                    extra={"kernel": platform.release(), "probe_errno": err},
-                )
-                _probe_cache.io_uring = True
-                return True
-            if err == errno.EPERM:
+            if proc.returncode == 2:  # noqa: PLR2004
                 logger.warning(
                     "io_uring blocked by seccomp/container policy",
-                    extra={"errno": err},
+                    extra={"kernel": platform.release()},
                 )
                 _probe_cache.io_uring = False
                 return False
+
             logger.warning(
-                "io_uring probe failed with unexpected error",
-                extra={"errno": err, "error": os.strerror(err)},
+                "io_uring probe failed with unexpected result",
+                extra={"exit_code": proc.returncode},
             )
             _probe_cache.io_uring = False
             return False
 
-        _probe_cache.io_uring = True
-        return True
-
-    except (OSError, ValueError, RuntimeError) as e:
-        logger.warning(
-            "io_uring syscall probe failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
-        )
-        _probe_cache.io_uring = False
-        return False
+        except (OSError, TimeoutError) as e:
+            logger.warning(
+                "io_uring syscall probe failed",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
+            _probe_cache.io_uring = False
+            return False
 
 
 async def _probe_unshare_support() -> bool:
@@ -694,46 +806,52 @@ async def _probe_unshare_support() -> bool:
     Returns:
         True if unshare works, False otherwise (skip namespace isolation)
     """
-    # Fast path: return cached result
+    # Fast path: return cached result (no lock needed)
     if _probe_cache.unshare is not None:
         return _probe_cache.unshare
 
-    # Skip on non-Linux - unshare is Linux-specific
-    if detect_host_os() == HostOS.MACOS:
-        _probe_cache.unshare = False
-        return False
+    # Slow path: acquire lock to prevent stampede
+    async with _probe_cache.get_lock("unshare"):
+        # Double-check after acquiring lock
+        if _probe_cache.unshare is not None:
+            return _probe_cache.unshare
 
-    try:
-        # Test unshare with minimal namespaces (pid requires fork)
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/bin/unshare",
-            "--pid",
-            "--fork",
-            "--",
-            "/usr/bin/true",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        # Skip on non-Linux - unshare is Linux-specific
+        if detect_host_os() == HostOS.MACOS:
+            _probe_cache.unshare = False
+            return False
 
-        if proc.returncode == 0:
-            logger.info("unshare available (namespace isolation enabled)")
-            _probe_cache.unshare = True
-        else:
-            stderr_text = stderr.decode().strip() if stderr else ""
+        try:
+            # Test unshare with minimal namespaces (pid requires fork)
+            proc = await asyncio.create_subprocess_exec(
+                "/usr/bin/unshare",
+                "--pid",
+                "--fork",
+                "--",
+                "/usr/bin/true",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+
+            if proc.returncode == 0:
+                logger.info("unshare available (namespace isolation enabled)")
+                _probe_cache.unshare = True
+            else:
+                stderr_text = stderr.decode().strip() if stderr else ""
+                logger.warning(
+                    "unshare unavailable (namespace isolation disabled)",
+                    extra={"exit_code": proc.returncode, "stderr": stderr_text[:200]},
+                )
+                _probe_cache.unshare = False
+        except (OSError, TimeoutError) as e:
             logger.warning(
-                "unshare unavailable (namespace isolation disabled)",
-                extra={"exit_code": proc.returncode, "stderr": stderr_text[:200]},
+                "unshare probe failed",
+                extra={"error": str(e), "error_type": type(e).__name__},
             )
             _probe_cache.unshare = False
-    except (OSError, TimeoutError) as e:
-        logger.warning(
-            "unshare probe failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
-        )
-        _probe_cache.unshare = False
 
-    return _probe_cache.unshare
+        return _probe_cache.unshare
 
 
 # Pre-flight validation cache keyed by (kernel_path, arch)
@@ -845,28 +963,81 @@ class QemuVM:
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
         # Timing instrumentation (set by VmManager.create_vm)
-        self._setup_ms: int | None = None  # Resource setup time
-        self._boot_ms: int | None = None  # VM boot time (kernel + guest-agent)
+        self.timing = VmTiming()
+
+    # -------------------------------------------------------------------------
+    # Timing properties (backwards-compatible accessors to VmTiming)
+    # -------------------------------------------------------------------------
 
     @property
     def setup_ms(self) -> int | None:
         """Get resource setup time in milliseconds."""
-        return self._setup_ms
+        return self.timing.setup_ms
 
     @setup_ms.setter
     def setup_ms(self, value: int) -> None:
         """Set resource setup time in milliseconds."""
-        self._setup_ms = value
+        self.timing.setup_ms = value
+
+    @property
+    def overlay_ms(self) -> int | None:
+        """Get overlay acquisition time in milliseconds."""
+        return self.timing.overlay_ms
+
+    @overlay_ms.setter
+    def overlay_ms(self, value: int) -> None:
+        """Set overlay acquisition time in milliseconds."""
+        self.timing.overlay_ms = value
 
     @property
     def boot_ms(self) -> int | None:
         """Get VM boot time in milliseconds."""
-        return self._boot_ms
+        return self.timing.boot_ms
 
     @boot_ms.setter
     def boot_ms(self, value: int) -> None:
         """Set VM boot time in milliseconds."""
-        self._boot_ms = value
+        self.timing.boot_ms = value
+
+    @property
+    def qemu_cmd_build_ms(self) -> int | None:
+        """Time for pre-launch setup (command build, socket cleanup, channel creation)."""
+        return self.timing.qemu_cmd_build_ms
+
+    @qemu_cmd_build_ms.setter
+    def qemu_cmd_build_ms(self, value: int) -> None:
+        self.timing.qemu_cmd_build_ms = value
+
+    @property
+    def gvproxy_start_ms(self) -> int | None:
+        """Time to start gvproxy (0 if network disabled)."""
+        return self.timing.gvproxy_start_ms
+
+    @gvproxy_start_ms.setter
+    def gvproxy_start_ms(self, value: int) -> None:
+        self.timing.gvproxy_start_ms = value
+
+    @property
+    def qemu_fork_ms(self) -> int | None:
+        """Time for QEMU process fork/exec."""
+        return self.timing.qemu_fork_ms
+
+    @qemu_fork_ms.setter
+    def qemu_fork_ms(self, value: int) -> None:
+        self.timing.qemu_fork_ms = value
+
+    @property
+    def guest_wait_ms(self) -> int | None:
+        """Time waiting for guest agent (kernel + initramfs + agent init)."""
+        return self.timing.guest_wait_ms
+
+    @guest_wait_ms.setter
+    def guest_wait_ms(self, value: int) -> None:
+        self.timing.guest_wait_ms = value
+
+    # -------------------------------------------------------------------------
+    # Other VM properties
+    # -------------------------------------------------------------------------
 
     @property
     def overlay_image(self) -> Path:
@@ -1042,6 +1213,19 @@ class QemuVM:
         )
 
         try:
+            # Re-check state before expensive I/O operations
+            # Between lock release and here, destroy() could have been called
+            # which would transition state to DESTROYING or DESTROYED
+            # Note: pyright doesn't understand async race conditions, so we suppress the warning
+            if self._state in (VmState.DESTROYING, VmState.DESTROYED):  # type: ignore[comparison-overlap]
+                raise VmError(
+                    "VM destroyed during execution start",
+                    context={
+                        "vm_id": self.vm_id,
+                        "current_state": self._state.value,
+                    },
+                )
+
             # Connect to guest via TCP with timing
             # Fixed init timeout (connection establishment, independent of execution timeout)
             connect_start = asyncio.get_event_loop().time()
@@ -1279,11 +1463,10 @@ class VmManager:
     - cgroup v2 resource limits
 
     Usage:
-        manager = VmManager(settings)
-        await manager.initialize()  # Run async system probes
-        vm = await manager.create_vm(Language.PYTHON, "tenant-123", "task-456")
-        result = await vm.execute("print('hello')", timeout_seconds=30)
-        await manager.destroy_vm(vm)
+        async with VmManager(settings) as manager:
+            vm = await manager.create_vm(Language.PYTHON, "tenant-123", "task-456")
+            result = await vm.execute("print('hello')", timeout_seconds=30)
+            await manager.destroy_vm(vm)
     """
 
     def __init__(self, settings: Settings):
@@ -1292,7 +1475,7 @@ class VmManager:
         Args:
             settings: Service configuration (paths, limits, etc.)
 
-        Note: Call `await initialize()` after construction to run async system probes.
+        Note: Call `await start()` after construction to run async system probes.
 
         Note on crash recovery:
             VM registry is in-memory only. If service crashes, registry is lost
@@ -1308,25 +1491,40 @@ class VmManager:
         self._vms: dict[str, QemuVM] = {}  # vm_id → VM object
         self._vms_lock = asyncio.Lock()  # Protect registry access
 
-    async def initialize(self) -> None:
-        """Run async system probes and complete initialization.
+        # Overlay pool for fast VM boot (auto-manages base image discovery and pooling)
+        self._overlay_pool = OverlayPool(
+            max_concurrent_vms=settings.max_concurrent_vms,
+            images_path=settings.base_images_dir,
+        )
 
-        This method runs all async system capability probes (HVF, unshare, qemu-vm user)
-        and logs the initialization status. Must be called before creating VMs.
+    async def start(self) -> None:
+        """Start VmManager and run async system probes.
 
-        The probes are cached at module level, so subsequent calls are fast no-ops.
+        This method runs all async system capability probes and caches their results
+        at module level. This prevents cache stampede when multiple VMs start
+        concurrently - all probes are pre-warmed here instead of racing during VM creation.
+
+        Must be called before creating VMs.
         """
         if self._initialized:
             return
 
         # Run all async probes concurrently (they cache their results at module level)
-        io_uring_available, unshare_available = await asyncio.gather(
+        # This prevents cache stampede when multiple VMs start concurrently
+        accel_type, io_uring_available, unshare_available = await asyncio.gather(
+            self._detect_accel_type(),  # Pre-warms HVF/KVM + QEMU accelerator caches
             _probe_io_uring_support(),
             _probe_unshare_support(),
         )
 
+        # Pre-warm TSC deadline (unified function handles arch/OS dispatch)
+        await _check_tsc_deadline()
+
         # Pre-flight check: validate kernel and initramfs exist (cached)
         await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
+
+        # Start overlay pool (discovers base images internally)
+        await self._overlay_pool.start()
 
         self._initialized = True
 
@@ -1335,9 +1533,10 @@ class VmManager:
             "VM registry initialized",
             extra={
                 "max_concurrent_vms": self.settings.max_concurrent_vms,
+                "accel_type": accel_type.value,
                 "io_uring_available": io_uring_available,
                 "unshare_available": unshare_available,
-                "note": "Any zombie QEMU processes from crashes will timeout naturally (max 2min)",
+                "note": "All system probes pre-warmed (stampede prevention)",
             },
         )
 
@@ -1348,6 +1547,24 @@ class VmManager:
             Copy of VM registry (vm_id → QemuVM)
         """
         return dict(self._vms)
+
+    async def stop(self) -> None:
+        """Stop VmManager and cleanup resources (overlay pool).
+
+        Should be called when the VmManager is no longer needed.
+        """
+        await self._overlay_pool.stop()
+
+    async def __aenter__(self) -> "VmManager":
+        """Enter async context manager, starting the manager."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
+    ) -> None:
+        """Exit async context manager, stopping the manager."""
+        await self.stop()
 
     async def create_vm(  # noqa: PLR0912, PLR0915
         self,
@@ -1390,6 +1607,11 @@ class VmManager:
         """
         # Start timing
         start_time = asyncio.get_event_loop().time()
+
+        # Security: Validate identifiers to prevent shell injection and path traversal
+        # Must be done BEFORE any use of tenant_id/task_id in paths, commands, or IDs
+        _validate_identifier(tenant_id, "tenant_id")
+        _validate_identifier(task_id, "task_id")
 
         # Step 0: Validate kernel and initramfs exist (cached, one-time check)
         await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
@@ -1443,6 +1665,8 @@ class VmManager:
         gvproxy_proc: ProcessWrapper | None = None
         gvproxy_log_task: asyncio.Task[None] | None = None
         qemu_proc: ProcessWrapper | None = None
+        qemu_log_task: asyncio.Task[None] | None = None
+        console_log: TextIO | None = None
         vm_created = False  # Flag to skip cleanup if VM successfully created
 
         # IMPORTANT: Always use gvproxy for network-enabled VMs
@@ -1464,32 +1688,38 @@ class VmManager:
 
             # Unified setup phase: overlay + cgroup (gvproxy moved to boot phase)
             # This reduces setup contention under high concurrency
+            overlay_ms = 0  # Default for direct_write mode (no overlay)
             if direct_write_target:
                 # Direct write mode - VM writes directly to target file (no overlay)
                 # Used for L2 snapshot creation where disk changes are written directly
                 workdir.use_qemu_vm_user = False  # target file owned by current user
                 cgroup_path = await cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg)
+            # Normal mode - create overlay backed by base image
+            # This allows the backing image to remain read-only and shareable
+            # Pool handles fast path (from pool) or slow path (on-demand) internally
             else:
-                # Normal mode - create overlay backed by base image
-                # This allows the backing image to remain read-only and shareable
-                overlay_result, cgroup_result = await asyncio.gather(
-                    self._create_overlay(base_image, workdir.overlay_image),
+                overlay_start = asyncio.get_event_loop().time()
+                try:
+                    await self._overlay_pool.acquire(base_image, workdir.overlay_image)
+                except QemuImgError as e:
+                    raise VmError(str(e)) from e
+                overlay_ms = round((asyncio.get_event_loop().time() - overlay_start) * 1000)
+                # Apply permissions in parallel with cgroup setup
+                perm_result, cgroup_result = await asyncio.gather(
+                    self._apply_overlay_permissions(base_image, workdir.overlay_image),
                     cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
                     return_exceptions=True,
                 )
-
-                # Check for failures
-                if isinstance(overlay_result, BaseException):
-                    raise overlay_result
+                if isinstance(perm_result, BaseException):
+                    raise perm_result
                 if isinstance(cgroup_result, BaseException):
                     raise cgroup_result
-
-                # Type narrowing: after BaseException checks
                 cgroup_path = cgroup_result
-                workdir.use_qemu_vm_user = overlay_result  # bool from _create_overlay
+                workdir.use_qemu_vm_user = perm_result
             setup_complete_time = asyncio.get_event_loop().time()
 
             # Step 5: Build QEMU command (always Linux in container)
+            qemu_cmd_start = asyncio.get_event_loop().time()
             qemu_cmd = await self._build_linux_cmd(
                 language,
                 vm_id,
@@ -1529,8 +1759,11 @@ class VmManager:
             # ulimit works on Linux, macOS, BSD (POSIX)
             if not cgroup.is_cgroup_available(cgroup_path):
                 qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, memory_mb)
+            qemu_cmd_build_ms = round((asyncio.get_event_loop().time() - qemu_cmd_start) * 1000)
 
             # Boot phase: Start gvproxy BEFORE QEMU (if network enabled)
+            gvproxy_start_time = asyncio.get_event_loop().time()
+            gvproxy_start_ms = 0
             # gvproxy must create socket before QEMU connects to it
             # Moved from setup phase to boot phase to reduce contention under high concurrency
             if allow_network:
@@ -1541,17 +1774,27 @@ class VmManager:
                 gvproxy_proc, gvproxy_log_task = await self._start_gvproxy(vm_id, allowed_domains, language, workdir)
                 # Attach gvproxy to cgroup for resource limits
                 await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
+                gvproxy_start_ms = round((asyncio.get_event_loop().time() - gvproxy_start_time) * 1000)
 
             # Step 7: Launch QEMU
+            qemu_start_time = asyncio.get_event_loop().time()
             try:
+                # Set umask 007 for qemu-vm user to create sockets with 0660 permissions
+                # This is done via preexec_fn to avoid shell injection (no 'sh -c' needed)
+                def _set_umask_007() -> None:
+                    os.umask(0o007)
+
                 qemu_proc = ProcessWrapper(
                     await asyncio.create_subprocess_exec(
                         *qemu_cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         start_new_session=True,  # Create new process group for proper cleanup
+                        preexec_fn=_set_umask_007 if workdir.use_qemu_vm_user else None,
                     )
                 )
+                # Capture fork time immediately after subprocess creation
+                qemu_fork_ms = round((asyncio.get_event_loop().time() - qemu_start_time) * 1000)
 
                 # Attach process to cgroup (only if cgroups available)
                 await cgroup.attach_if_available(cgroup_path, qemu_proc.pid)
@@ -1597,12 +1840,24 @@ class VmManager:
                 # Background task to drain QEMU output (prevent 64KB pipe deadlock)
                 # Started AFTER crash check to ensure we can capture error output
                 console_log_path = workdir.console_log
-                console_log = console_log_path.open("w", buffering=1)  # Line buffering for sync writes
+
+                # Open file asynchronously to avoid blocking the event loop
+                # The file handle itself stays synchronous for simple write callbacks
+                loop = asyncio.get_running_loop()
+                console_log = await loop.run_in_executor(
+                    None,
+                    lambda: console_log_path.open("w", buffering=1),  # Line buffering
+                )
+
+                # Capture in local variable for type narrowing (console_log is definitely not None here)
+                # Type assertion: we just opened the file above, so console_log is a valid TextIO
+                assert console_log is not None  # noqa: S101 - type narrowing, not runtime check
+                _console_log: TextIO = console_log
 
                 def write_to_console(line: str) -> None:
                     """Write line to console log file and structured logs."""
                     try:
-                        console_log.write(f"[{vm_id}] {line}\n")
+                        _console_log.write(f"[{vm_id}] {line}\n")
                     except OSError as e:
                         logger.error(f"Console write failed: {e}", extra={"context_id": vm_id})
 
@@ -1615,7 +1870,7 @@ class VmManager:
                         stderr_handler=write_to_console,
                     )
                 )
-                qemu_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                qemu_log_task.add_done_callback(_log_task_exception)
 
             except (OSError, FileNotFoundError) as e:
                 raise VmError(
@@ -1628,6 +1883,7 @@ class VmManager:
                 ) from e
 
             # Step 8: Wait for guest agent ready
+            guest_wait_start = asyncio.get_event_loop().time()
             vm = QemuVM(
                 vm_id,
                 qemu_proc,
@@ -1653,9 +1909,17 @@ class VmManager:
             try:
                 await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
                 boot_complete_time = asyncio.get_event_loop().time()
+                guest_wait_ms = round((boot_complete_time - guest_wait_start) * 1000)
                 # Store timing on VM for scheduler to use
                 vm.setup_ms = round((setup_complete_time - start_time) * 1000)
                 vm.boot_ms = round((boot_complete_time - setup_complete_time) * 1000)
+                # Granular setup timing
+                vm.overlay_ms = overlay_ms
+                # Granular boot timing
+                vm.qemu_cmd_build_ms = qemu_cmd_build_ms
+                vm.gvproxy_start_ms = gvproxy_start_ms
+                vm.qemu_fork_ms = qemu_fork_ms
+                vm.guest_wait_ms = guest_wait_ms
                 # Transition to READY state after boot completes
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
@@ -1738,6 +2002,13 @@ class VmManager:
                     "setup_ms": vm.setup_ms,
                     "boot_ms": vm.boot_ms,
                     "total_boot_ms": total_boot_ms,
+                    # Granular setup breakdown
+                    "overlay_ms": overlay_ms,
+                    # Granular boot breakdown
+                    "qemu_cmd_build_ms": qemu_cmd_build_ms,
+                    "gvproxy_start_ms": gvproxy_start_ms,
+                    "qemu_fork_ms": qemu_fork_ms,
+                    "guest_wait_ms": guest_wait_ms,
                 },
             )
 
@@ -1756,6 +2027,18 @@ class VmManager:
                         "gvproxy_started": gvproxy_proc is not None,
                     },
                 )
+
+                # Close console log file if opened (prevent resource leak)
+                if console_log is not None:
+                    with contextlib.suppress(OSError):
+                        console_log.close()
+
+                # Cancel log drain task if started
+                if qemu_log_task is not None and not qemu_log_task.done():
+                    qemu_log_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await qemu_log_task
+
                 # Remove from registry if it was added (defensive - always try)
                 async with self._vms_lock:
                     self._vms.pop(vm_id, None)
@@ -1902,7 +2185,7 @@ class VmManager:
                 ),
             )
         )
-        gvproxy_log_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        gvproxy_log_task.add_done_callback(_log_task_exception)
 
         # Wait for gvproxy to signal readiness (timeout after 5 seconds)
         try:
@@ -2146,47 +2429,17 @@ class VmManager:
             return AccelType.HVF
         return AccelType.TCG
 
-    async def _create_overlay(self, base_image: Path, overlay_image: Path) -> bool:
-        """Create ephemeral qcow2 overlay with CoW backing file.
+    async def _apply_overlay_permissions(self, base_image: Path, overlay_image: Path) -> bool:
+        """Apply permissions to overlay (chown/chmod for qemu-vm isolation).
 
         Args:
-            base_image: Base qcow2 image (backing file)
-            overlay_image: Ephemeral overlay to create
+            base_image: Base qcow2 image (needs read permission for qemu-vm)
+            overlay_image: Overlay image (will be chowned to qemu-vm if possible)
 
         Returns:
             True if overlay was chowned to qemu-vm (QEMU should run as qemu-vm),
             False if overlay is owned by current user (QEMU should run as current user)
-
-        Raises:
-            VmError: qemu-img command failed
         """
-        cmd = [
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            str(base_image),
-            "-o",
-            "lazy_refcounts=on,extended_l2=on,cluster_size=128k",
-            str(overlay_image),
-        ]
-
-        proc = ProcessWrapper(
-            await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        )
-        _stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            raise VmError(f"qemu-img create failed: {stderr.decode()}")
-
         # Change ownership to qemu-vm user for process isolation (optional hardening)
         # Only if: Linux + qemu-vm user exists + can run sudo -u qemu-vm
         # The stronger probe_sudo_as_qemu_vm() ensures we can actually execute as qemu-vm
@@ -2360,7 +2613,7 @@ class VmManager:
                 #
                 # See: https://www.qemu.org/docs/master/system/i386/microvm.html
                 # =============================================================
-                tsc_available = await _check_tsc_deadline_available()
+                tsc_available = await _check_tsc_deadline()
                 if tsc_available:
                     # Full optimization: TSC_DEADLINE available, use non-legacy mode
                     machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
@@ -2385,7 +2638,7 @@ class VmManager:
                 # Note: dump-guest-core=off not included - may not be supported on macOS QEMU
                 if self.arch == HostArch.X86_64:
                     # Intel Mac: check TSC_DEADLINE availability
-                    tsc_available = await _check_tsc_deadline_macos()
+                    tsc_available = await _check_tsc_deadline()
                     if tsc_available:
                         # Full optimization: TSC_DEADLINE available, disable legacy devices
                         machine_type = (
@@ -2480,14 +2733,18 @@ class VmManager:
         # │ x86 microvm + TSC       │ hvc0        │ Non-legacy, virtio-console     │
         # │ x86 microvm - TSC       │ ttyS0       │ Legacy mode, ISA serial        │
         # │ x86 pc (TCG only)       │ ttyS0       │ Software emulation fallback    │
-        # │ ARM64 virt              │ hvc0        │ No ISA serial on ARM           │
+        # │ ARM64 virt              │ ttyAMA0     │ PL011 UART (always available)  │
         # └─────────────────────────┴─────────────┴────────────────────────────────┘
-        # ttyS0 (ISA serial) is used when we need reliable early boot console
-        # hvc0 (virtio-console) is used when ISA serial is disabled
+        # ttyS0 (ISA serial) is used when we need reliable early boot console (x86)
+        # ttyAMA0 (PL011 UART) is used for ARM64 virt machine
+        # hvc0 (virtio-console) is NOT reliable for kernel console on ARM64 because
+        # it requires virtio-serial driver initialization (not available at early boot)
         # See: https://blog.memzero.de/toying-with-virtio/
         if self.arch == HostArch.AARCH64:
-            # ARM64 virt machine has no ISA serial, must use virtio-console
-            console_params = "console=hvc0 loglevel=7"
+            # ARM64 virt machine has PL011 UART (ttyAMA0) - reliable at early boot
+            # Note: hvc0 doesn't work for console because virtio-serial isn't ready
+            # when kernel tries to open /dev/console, causing init to crash
+            console_params = "console=ttyAMA0 loglevel=7"
         elif use_virtio_console:
             # x86 non-legacy mode: ISA serial disabled, use virtio-console
             console_params = "console=hvc0 loglevel=7"
@@ -2537,6 +2794,10 @@ class VmManager:
                 # See: https://www.qemu.org/docs/master/system/i386/microvm.html
                 # =============================================================
                 f"{console_params} root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce"
+                # init.net=1: load network modules (only when allow_network=True)
+                # init.balloon=1: load balloon module (always, needed for warm pool)
+                + (" init.net=1" if allow_network else "")
+                + " init.balloon=1"
                 # tsc=reliable only for x86_64 (TSC is x86-specific, ARM uses CNTVCT_EL0)
                 + (" tsc=reliable" if self.arch == HostArch.X86_64 else ""),
             ]
@@ -2760,20 +3021,18 @@ class VmManager:
         # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
         # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
         if workdir.use_qemu_vm_user:
+            # SECURITY: Avoid shell injection by not using 'sh -c'.
+            # Instead, we use direct exec with preexec_fn to set umask.
             # stdbuf -oL forces line-buffered stdout to ensure console output is captured
-            # immediately rather than being block-buffered (which happens with piped stdout)
-            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security
+            # immediately rather than being block-buffered (which happens with piped stdout).
+            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security.
             #
-            # umask 007: Create chardev sockets with owner+group permissions (0660).
+            # umask 007 is set via preexec_fn at subprocess creation time.
+            # Creates chardev sockets with owner+group permissions (0660).
             # Host user must be in 'qemu-vm' group to connect to sockets owned by 'qemu-vm'.
             # More secure than 0666 (world-writable). Follows libvirt group membership pattern.
-            # Note: CI uses 'sg qemu-vm' to activate group membership since usermod -aG
-            # doesn't take effect until next login.
-            import shlex  # noqa: PLC0415
-
-            qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_args)
-            cmd.extend(["sudo", "-u", "qemu-vm", "sh", "-c", f"umask 007 && exec stdbuf -oL {qemu_cmd_str}"])
-            return cmd  # Already added qemu_args via sh -c
+            cmd.extend(["sudo", "-u", "qemu-vm", "stdbuf", "-oL", *qemu_args])
+            return cmd
 
         cmd.extend(qemu_args)
 
@@ -2891,28 +3150,18 @@ class VmManager:
                         if death_task in done:
                             # QEMU died - cancel guest and retrieve exception
                             guest_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
+                            # Suppress ALL exceptions - we're about to re-raise VmError from death_task.
+                            # Race condition: guest_task may also have completed with an exception
+                            # (e.g., IncompleteReadError) which we must suppress to avoid masking VmError.
+                            # Use BaseException to also catch CancelledError (not a subclass of Exception in Python 3.8+).
+                            with contextlib.suppress(BaseException):
                                 await guest_task
                             await death_task  # Re-raise VmError
 
                         # Guest task completed - check result (raises if failed, triggering retry)
                         await guest_task
 
-                # Success - cancel death monitor
-                death_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await death_task
-
         except TimeoutError:
-            # Clean up in-flight tasks
-            for task in (death_task, guest_task):
-                if task is not None and not task.done():
-                    task.cancel()
-            for task in (death_task, guest_task):
-                if task is not None:
-                    with contextlib.suppress(asyncio.CancelledError, OSError, RuntimeError):
-                        await task
-
             # Flush console log before reading to ensure all buffered content is written
             if vm.console_log:
                 with contextlib.suppress(OSError):
@@ -2932,3 +3181,15 @@ class VmManager:
             )
 
             raise TimeoutError(f"Guest agent not ready after {timeout}s") from None
+
+        finally:
+            # Always clean up tasks to prevent "Task exception was never retrieved" warnings.
+            # This handles all exit paths: success, TimeoutError, VmError, and any other exception.
+            # Use BaseException to catch CancelledError (which is not a subclass of Exception in Python 3.8+).
+            for task in (death_task, guest_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (death_task, guest_task):
+                if task is not None:
+                    with contextlib.suppress(BaseException):
+                        await task
