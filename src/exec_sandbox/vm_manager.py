@@ -1708,12 +1708,18 @@ class VmManager:
             # Step 7: Launch QEMU
             qemu_start_time = asyncio.get_event_loop().time()
             try:
+                # Set umask 007 for qemu-vm user to create sockets with 0660 permissions
+                # This is done via preexec_fn to avoid shell injection (no 'sh -c' needed)
+                def _set_umask_007() -> None:
+                    os.umask(0o007)
+
                 qemu_proc = ProcessWrapper(
                     await asyncio.create_subprocess_exec(
                         *qemu_cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         start_new_session=True,  # Create new process group for proper cleanup
+                        preexec_fn=_set_umask_007 if workdir.use_qemu_vm_user else None,
                     )
                 )
                 # Capture fork time immediately after subprocess creation
@@ -2916,20 +2922,18 @@ class VmManager:
         # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
         # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
         if workdir.use_qemu_vm_user:
+            # SECURITY: Avoid shell injection by not using 'sh -c'.
+            # Instead, we use direct exec with preexec_fn to set umask.
             # stdbuf -oL forces line-buffered stdout to ensure console output is captured
-            # immediately rather than being block-buffered (which happens with piped stdout)
-            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security
+            # immediately rather than being block-buffered (which happens with piped stdout).
+            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security.
             #
-            # umask 007: Create chardev sockets with owner+group permissions (0660).
+            # umask 007 is set via preexec_fn at subprocess creation time.
+            # Creates chardev sockets with owner+group permissions (0660).
             # Host user must be in 'qemu-vm' group to connect to sockets owned by 'qemu-vm'.
             # More secure than 0666 (world-writable). Follows libvirt group membership pattern.
-            # Note: CI uses 'sg qemu-vm' to activate group membership since usermod -aG
-            # doesn't take effect until next login.
-            import shlex  # noqa: PLC0415
-
-            qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_args)
-            cmd.extend(["sudo", "-u", "qemu-vm", "sh", "-c", f"umask 007 && exec stdbuf -oL {qemu_cmd_str}"])
-            return cmd  # Already added qemu_args via sh -c
+            cmd.extend(["sudo", "-u", "qemu-vm", "stdbuf", "-oL", *qemu_args])
+            return cmd
 
         cmd.extend(qemu_args)
 
