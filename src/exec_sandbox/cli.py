@@ -34,6 +34,7 @@ from exec_sandbox import (
     VmTimeoutError,
     __version__,
 )
+from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
 
 # Exit codes following Unix conventions
 EXIT_SUCCESS = 0
@@ -583,7 +584,30 @@ def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool) ->
         click.echo(click.style(f"✗ {result.error}", fg="red"), err=True)
 
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+# ============================================================================
+# CLI Group
+# ============================================================================
+
+
+@click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(__version__, "-V", "--version", prog_name="exec-sandbox")
+@click.pass_context
+def cli(ctx: click.Context) -> None:
+    """exec-sandbox: Execute code in isolated VM sandboxes.
+
+    Run 'sbx run --help' or 'sbx prefetch --help' for subcommand details.
+    """
+    # If no subcommand provided and no arguments, show help
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+# ============================================================================
+# Run Command
+# ============================================================================
+
+
+@cli.command(name="run", context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("sources", nargs=-1)
 @click.option(
     "-l",
@@ -615,8 +639,7 @@ def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool) ->
     show_default=True,
     help="Maximum concurrent VMs for multi-input",
 )
-@click.version_option(__version__, "-V", "--version", prog_name="exec-sandbox")
-def main(
+def run_command(
     sources: tuple[str, ...],
     language: str | None,
     inline_codes: tuple[str, ...],
@@ -636,15 +659,15 @@ def main(
     SOURCES can be one or more of:
 
     \b
-      - Inline code:  sbx 'print("hello")'
-      - File path:    sbx script.py
-      - Stdin:        echo 'print(1)' | sbx -
+      - Inline code:  sbx run 'print("hello")'
+      - File path:    sbx run script.py
+      - Stdin:        echo 'print(1)' | sbx run -
 
     Multiple sources run concurrently (use -j to limit concurrency):
 
     \b
-      sbx 'print(1)' 'print(2)' script.py    # Run 3 sources
-      sbx -j 5 *.py                          # Max 5 concurrent VMs
+      sbx run 'print(1)' 'print(2)' script.py    # Run 3 sources
+      sbx run -j 5 *.py                          # Max 5 concurrent VMs
 
     Language is auto-detected from file extension (.py, .js, .sh)
     or defaults to Python. Use -l to override for all sources.
@@ -652,14 +675,14 @@ def main(
     Examples:
 
     \b
-      sbx 'print("hello")'                    # Simple Python
-      sbx -l javascript 'console.log("hi")'   # Explicit language
-      sbx script.py                           # Run file
-      sbx -p requests 'import requests; ...'  # With package
-      sbx --network --allow-domain api.example.com script.py
-      echo 'print(42)' | sbx -                # From stdin
-      sbx --json 'print("test")' | jq .       # JSON output
-      sbx -c 'print(1)' -c 'print(2)'         # Multiple via -c flag
+      sbx run 'print("hello")'                    # Simple Python
+      sbx run -l javascript 'console.log("hi")'   # Explicit language
+      sbx run script.py                           # Run file
+      sbx run -p requests 'import requests; ...'  # With package
+      sbx run --network --allow-domain api.example.com script.py
+      echo 'print(42)' | sbx run -                # From stdin
+      sbx run --json 'print("test")' | jq .       # JSON output
+      sbx run -c 'print(1)' -c 'print(2)'         # Multiple via -c flag
     """
     # Merge inline codes with positional sources
     all_sources: list[str] = list(inline_codes) + list(sources)
@@ -718,6 +741,95 @@ def main(
         )
 
     sys.exit(exit_code)
+
+
+# ============================================================================
+# Prefetch Command
+# ============================================================================
+
+
+@cli.command(name="prefetch", context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--arch",
+    type=click.Choice(["x86_64", "aarch64"]),
+    default=None,
+    help="Target architecture (default: current machine)",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Suppress progress output")
+def prefetch_command(arch: str | None, quiet: bool) -> NoReturn:
+    """Pre-download VM assets for offline use.
+
+    Downloads all required assets (kernel, initramfs, gvproxy, base images)
+    to the cache directory. Useful for container builds before running with
+    EXEC_SANDBOX_OFFLINE=1.
+
+    Examples:
+
+    \b
+      sbx prefetch                    # Download all assets for current arch
+      sbx prefetch --arch aarch64     # Cross-arch prefetch for multi-arch Docker
+      sbx prefetch -q                 # Quiet mode (CI/Docker)
+
+    Dockerfile example:
+
+    \b
+      RUN sbx prefetch -q
+      ENV EXEC_SANDBOX_OFFLINE=1
+    """
+    result: PrefetchResult = asyncio.run(prefetch_all_assets(arch=arch))
+    _display_prefetch_result(result, quiet=quiet)
+    sys.exit(EXIT_SUCCESS if result.success else 1)
+
+
+def _display_prefetch_result(result: PrefetchResult, quiet: bool) -> None:
+    """Display prefetch result to the user."""
+    if quiet and result.success:
+        return
+
+    if not quiet:
+        click.echo(f"Prefetching exec-sandbox assets for {result.arch}...")
+        for name in result.downloaded:
+            click.echo(f"  {name}: done")
+        for name, _ in result.errors:
+            click.echo(f"  {name}: failed", err=True)
+
+    if result.errors:
+        click.echo("\nError: Download failed\n", err=True)
+        for name, error in result.errors:
+            click.echo(f"  Failed to download {name}: {error}", err=True)
+        click.echo(
+            "\n  Suggestions:\n    - Check your network connection\n    - Set GITHUB_TOKEN for higher rate limits",
+            err=True,
+        )
+    elif not quiet and result.cache_dir:
+        click.echo(f"\nDone. Cache: {result.cache_dir}")
+
+
+# ============================================================================
+# Entry Point with Backward Compatibility
+# ============================================================================
+
+# Known subcommands and flags that should NOT trigger implicit 'run'
+_KNOWN_SUBCOMMANDS = {"prefetch", "run", "--help", "-h", "--version", "-V"}
+
+
+def main() -> NoReturn:
+    """Entry point with backward compatibility.
+
+    For backward compatibility, if the first argument is not a known subcommand
+    or flag, we automatically insert 'run' so that:
+
+        sbx 'print(1)'  ->  sbx run 'print(1)'
+
+    This preserves the original CLI behavior while supporting new subcommands.
+    """
+    if len(sys.argv) > 1 and sys.argv[1] not in _KNOWN_SUBCOMMANDS:
+        # Insert 'run' as the subcommand for backward compatibility
+        sys.argv.insert(1, "run")
+    cli()
+    # cli() will sys.exit() via subcommands, but for bare 'sbx' (help display),
+    # we need to exit here
+    sys.exit(0)
 
 
 if __name__ == "__main__":

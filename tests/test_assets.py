@@ -855,3 +855,132 @@ class TestErrorCases:
         ):
             with pytest.raises(PermissionError):
                 await _find_asset("vmlinuz-x86_64")
+
+
+# =============================================================================
+# Prefetch All Assets Tests
+# =============================================================================
+
+
+class TestPrefetchAllAssets:
+    """Tests for prefetch_all_assets() function."""
+
+    async def test_prefetch_downloads_all_assets(self, tmp_path: Path) -> None:
+        """prefetch_all_assets downloads all required assets."""
+        from exec_sandbox.assets import prefetch_all_assets
+        from exec_sandbox.models import Language
+
+        with (
+            patch("exec_sandbox.assets.ensure_registry_loaded") as mock_registry,
+            patch("exec_sandbox.assets.fetch_kernel") as mock_kernel,
+            patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
+            patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
+            patch("exec_sandbox.assets.fetch_base_image") as mock_base,
+            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+        ):
+            mock_registry.return_value = None
+            mock_kernel.return_value = tmp_path / "vmlinuz"
+            mock_initramfs.return_value = tmp_path / "initramfs"
+            mock_gvproxy.return_value = tmp_path / "gvproxy"
+            mock_base.return_value = tmp_path / "base.qcow2"
+
+            result = await prefetch_all_assets()
+
+            assert result.success is True
+            assert result.cache_dir == tmp_path
+            mock_registry.assert_called_once()
+            mock_kernel.assert_called_once()
+            mock_initramfs.assert_called_once()
+            mock_gvproxy.assert_called_once()
+            # Base images for all supported languages
+            assert mock_base.call_count == len(Language)
+
+    async def test_prefetch_with_arch(self, tmp_path: Path) -> None:
+        """prefetch_all_assets respects arch parameter."""
+        from exec_sandbox.assets import prefetch_all_assets
+
+        with (
+            patch("exec_sandbox.assets.ensure_registry_loaded") as mock_registry,
+            patch("exec_sandbox.assets.fetch_kernel") as mock_kernel,
+            patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
+            patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
+            patch("exec_sandbox.assets.fetch_base_image") as mock_base,
+            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+        ):
+            mock_registry.return_value = None
+            mock_kernel.return_value = tmp_path / "vmlinuz"
+            mock_initramfs.return_value = tmp_path / "initramfs"
+            mock_gvproxy.return_value = tmp_path / "gvproxy"
+            mock_base.return_value = tmp_path / "base.qcow2"
+
+            result = await prefetch_all_assets(arch="aarch64")
+
+            assert result.success is True
+            assert result.arch == "aarch64"
+            # Verify arch was passed to kernel and initramfs
+            mock_kernel.assert_called_once()
+            assert mock_kernel.call_args.kwargs.get("arch") == "aarch64"
+            mock_initramfs.assert_called_once()
+            assert mock_initramfs.call_args.kwargs.get("arch") == "aarch64"
+
+    async def test_prefetch_returns_error_on_registry_failure(self) -> None:
+        """prefetch_all_assets returns failure result if registry load fails."""
+        from exec_sandbox.assets import prefetch_all_assets
+
+        with patch(
+            "exec_sandbox.assets.ensure_registry_loaded",
+            side_effect=OSError("Network error"),
+        ):
+            result = await prefetch_all_assets()
+
+            assert result.success is False
+            assert len(result.errors) == 1
+            assert result.errors[0][0] == "registry"
+
+    async def test_prefetch_returns_error_on_download_failure(self, tmp_path: Path) -> None:
+        """prefetch_all_assets returns failure result if any download fails."""
+        from exec_sandbox.assets import prefetch_all_assets
+
+        with (
+            patch("exec_sandbox.assets.ensure_registry_loaded") as mock_registry,
+            patch("exec_sandbox.assets.fetch_kernel") as mock_kernel,
+            patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
+            patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
+            patch("exec_sandbox.assets.fetch_base_image") as mock_base,
+        ):
+            mock_registry.return_value = None
+            mock_kernel.return_value = tmp_path / "vmlinuz"
+            mock_initramfs.side_effect = Exception("Download failed")  # Fail initramfs
+            mock_gvproxy.return_value = tmp_path / "gvproxy"
+            mock_base.return_value = tmp_path / "base.qcow2"
+
+            result = await prefetch_all_assets()
+
+            assert result.success is False
+            assert any(name == "initramfs" for name, _ in result.errors)
+
+    async def test_prefetch_collects_all_errors(self, tmp_path: Path) -> None:
+        """prefetch_all_assets collects and reports all errors."""
+        from exec_sandbox.assets import prefetch_all_assets
+
+        with (
+            patch("exec_sandbox.assets.ensure_registry_loaded") as mock_registry,
+            patch("exec_sandbox.assets.fetch_kernel") as mock_kernel,
+            patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
+            patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
+            patch("exec_sandbox.assets.fetch_base_image") as mock_base,
+        ):
+            mock_registry.return_value = None
+            mock_kernel.side_effect = Exception("Kernel download failed")
+            mock_initramfs.side_effect = Exception("Initramfs download failed")
+            mock_gvproxy.return_value = tmp_path / "gvproxy"
+            mock_base.return_value = tmp_path / "base.qcow2"
+
+            result = await prefetch_all_assets()
+
+            # Should fail and have collected both errors
+            assert result.success is False
+            assert len(result.errors) == 2
+            error_names = {name for name, _ in result.errors}
+            assert "kernel" in error_names
+            assert "initramfs" in error_names

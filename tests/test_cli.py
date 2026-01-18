@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from exec_sandbox import ExecutionResult, Language, TimingBreakdown, __version__
+from exec_sandbox.assets import PrefetchResult
 from exec_sandbox.cli import (
     EXIT_CLI_ERROR,
     EXIT_SANDBOX_ERROR,
@@ -19,12 +20,14 @@ from exec_sandbox.cli import (
     MultiSourceResult,
     SourceInput,
     _compute_multi_exit_code,
+    cli,
     detect_language,
     format_error,
     format_multi_result_json,
     format_result_json,
-    main,
     parse_env_vars,
+    prefetch_command,
+    run_command,
     truncate_source,
 )
 
@@ -186,7 +189,7 @@ class TestCliHelp:
 
     def test_help_flag(self, runner: CliRunner) -> None:
         """Shows help with --help flag."""
-        result = runner.invoke(main, ["--help"])
+        result = runner.invoke(run_command, ["--help"])
         assert result.exit_code == 0
         assert "Execute code in an isolated VM sandbox" in result.output
         assert "--language" in result.output
@@ -194,7 +197,7 @@ class TestCliHelp:
 
     def test_short_help_flag(self, runner: CliRunner) -> None:
         """Shows help with -h flag."""
-        result = runner.invoke(main, ["-h"])
+        result = runner.invoke(run_command, ["-h"])
         assert result.exit_code == 0
         assert "Execute code" in result.output
 
@@ -204,7 +207,7 @@ class TestCliVersion:
 
     def test_version_flag(self, runner: CliRunner) -> None:
         """Shows version with --version flag."""
-        result = runner.invoke(main, ["--version"])
+        result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
         assert __version__ in result.output
 
@@ -214,21 +217,21 @@ class TestCliArgumentParsing:
 
     def test_no_args_shows_error(self, runner: CliRunner) -> None:
         """Shows error when no arguments provided."""
-        result = runner.invoke(main, [])
+        result = runner.invoke(run_command, [])
         assert result.exit_code == EXIT_CLI_ERROR
         assert "No code provided" in result.output
 
     def test_empty_code_shows_error(self, runner: CliRunner) -> None:
         """Shows error for empty code."""
         # Empty string argument passes through but results in empty code
-        result = runner.invoke(main, [""])
+        result = runner.invoke(run_command, [""])
         assert result.exit_code == EXIT_CLI_ERROR
         # Either "Empty code" or "No code" depending on how Click handles empty strings
         assert "Empty code" in result.output or "No code" in result.output
 
     def test_whitespace_only_code_shows_error(self, runner: CliRunner) -> None:
         """Shows error for whitespace-only code."""
-        result = runner.invoke(main, ["   "])
+        result = runner.invoke(run_command, ["   "])
         assert result.exit_code == EXIT_CLI_ERROR
         assert "Empty code provided" in result.output
 
@@ -245,7 +248,7 @@ class TestCliCodeExecution:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print('hello')"])
+            result = runner.invoke(run_command, ["print('hello')"])
 
             assert result.exit_code == 0
             mock_scheduler.run.assert_called_once()
@@ -262,7 +265,7 @@ class TestCliCodeExecution:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-l", "javascript", "console.log('hi')"])
+            result = runner.invoke(run_command, ["-l", "javascript", "console.log('hi')"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -277,7 +280,7 @@ class TestCliCodeExecution:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-c", "print(1)"])
+            result = runner.invoke(run_command, ["-c", "print(1)"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -293,7 +296,7 @@ class TestCliCodeExecution:
             MockScheduler.return_value = mock_scheduler
 
             result = runner.invoke(
-                main,
+                run_command,
                 ["-p", "requests", "-p", "pandas==2.2.0", "import requests"],
             )
 
@@ -311,7 +314,7 @@ class TestCliCodeExecution:
             MockScheduler.return_value = mock_scheduler
 
             result = runner.invoke(
-                main,
+                run_command,
                 ["-e", "KEY=value", "-e", "DEBUG=1", "print(1)"],
             )
 
@@ -328,7 +331,7 @@ class TestCliCodeExecution:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-t", "60", "-m", "512", "print(1)"])
+            result = runner.invoke(run_command, ["-t", "60", "-m", "512", "print(1)"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -345,7 +348,7 @@ class TestCliCodeExecution:
             MockScheduler.return_value = mock_scheduler
 
             result = runner.invoke(
-                main,
+                run_command,
                 [
                     "--network",
                     "--allow-domain",
@@ -372,7 +375,7 @@ class TestCliCodeExecution:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["--json", "print(1)"])
+            result = runner.invoke(run_command, ["--json", "print(1)"])
 
             assert result.exit_code == 0
             # Should be valid JSON
@@ -403,7 +406,7 @@ class TestCliFileInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(test_file)])
+            result = runner.invoke(run_command, [str(test_file)])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -429,7 +432,7 @@ class TestCliFileInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(test_file)])
+            result = runner.invoke(run_command, [str(test_file)])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -448,7 +451,7 @@ class TestCliStdinInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-"], input="print('from stdin')")
+            result = runner.invoke(run_command, ["-"], input="print('from stdin')")
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -469,7 +472,7 @@ class TestCliErrorHandling:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["import fake"])
+            result = runner.invoke(run_command, ["import fake"])
 
             assert result.exit_code == EXIT_CLI_ERROR
             assert "not allowed" in result.output.lower()
@@ -485,7 +488,7 @@ class TestCliErrorHandling:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["import time; time.sleep(100)"])
+            result = runner.invoke(run_command, ["import time; time.sleep(100)"])
 
             assert result.exit_code == EXIT_TIMEOUT
             assert "timed out" in result.output.lower()
@@ -501,7 +504,7 @@ class TestCliErrorHandling:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print(1)"])
+            result = runner.invoke(run_command, ["print(1)"])
 
             assert result.exit_code == EXIT_SANDBOX_ERROR
             assert "sandbox error" in result.output.lower()
@@ -519,7 +522,7 @@ class TestCliNoValidation:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["--no-validation", "print(1)"])
+            result = runner.invoke(run_command, ["--no-validation", "print(1)"])
 
             assert result.exit_code == 0
             # Check that config was created with enable_package_validation=False
@@ -535,7 +538,7 @@ class TestCliVersionShortFlag:
 
     def test_short_version_flag(self, runner: CliRunner) -> None:
         """Shows version with -V flag."""
-        result = runner.invoke(main, ["-V"])
+        result = runner.invoke(cli, ["-V"])
         assert result.exit_code == 0
         assert __version__ in result.output
 
@@ -552,7 +555,7 @@ class TestCliLanguageEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-l", "PYTHON", "print(1)"])
+            result = runner.invoke(run_command, ["-l", "PYTHON", "print(1)"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -560,7 +563,7 @@ class TestCliLanguageEdgeCases:
 
     def test_invalid_language(self, runner: CliRunner) -> None:
         """Rejects invalid language."""
-        result = runner.invoke(main, ["-l", "ruby", "puts 'hello'"])
+        result = runner.invoke(run_command, ["-l", "ruby", "puts 'hello'"])
         assert result.exit_code == EXIT_CLI_ERROR
         assert "ruby" in result.output.lower() or "invalid" in result.output.lower()
 
@@ -573,7 +576,7 @@ class TestCliLanguageEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-l", "raw", "echo hello"])
+            result = runner.invoke(run_command, ["-l", "raw", "echo hello"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -593,7 +596,7 @@ class TestCliFileEdgeCases:
             MockScheduler.return_value = mock_scheduler
 
             # This looks like a file but doesn't exist, so treated as code
-            result = runner.invoke(main, ["/nonexistent/script.py"])
+            result = runner.invoke(run_command, ["/nonexistent/script.py"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -609,7 +612,7 @@ class TestCliFileEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(tmp_path)])
+            result = runner.invoke(run_command, [str(tmp_path)])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -633,7 +636,7 @@ class TestCliFileEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(test_file)])
+            result = runner.invoke(run_command, [str(test_file)])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -656,7 +659,7 @@ class TestCliFileEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(test_file)])
+            result = runner.invoke(run_command, [str(test_file)])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -681,7 +684,7 @@ class TestCliFileEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(test_file)])
+            result = runner.invoke(run_command, [str(test_file)])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -700,7 +703,7 @@ class TestCliCodeEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print(\"hello 'world'\")"])
+            result = runner.invoke(run_command, ["print(\"hello 'world'\")"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -716,7 +719,7 @@ class TestCliCodeEdgeCases:
             MockScheduler.return_value = mock_scheduler
 
             code = "x = 1\nprint(x)"
-            result = runner.invoke(main, [code])
+            result = runner.invoke(run_command, [code])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -732,7 +735,7 @@ class TestCliCodeEdgeCases:
             MockScheduler.return_value = mock_scheduler
 
             code = "print('Hello 世界 🌍')"
-            result = runner.invoke(main, [code])
+            result = runner.invoke(run_command, [code])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -748,7 +751,7 @@ class TestCliCodeEdgeCases:
             MockScheduler.return_value = mock_scheduler
 
             # Both -c and positional provided - both should run
-            result = runner.invoke(main, ["-c", "print('from -c')", "print('from pos')"])
+            result = runner.invoke(run_command, ["-c", "print('from -c')", "print('from pos')"])
 
             assert result.exit_code == 0
             # Both sources should be executed (multi-input mode)
@@ -765,13 +768,13 @@ class TestCliStdinEdgeCases:
 
     def test_stdin_empty_input(self, runner: CliRunner) -> None:
         """Empty stdin shows error."""
-        result = runner.invoke(main, ["-"], input="")
+        result = runner.invoke(run_command, ["-"], input="")
         assert result.exit_code == EXIT_CLI_ERROR
         assert "Empty code provided" in result.output
 
     def test_stdin_whitespace_only(self, runner: CliRunner) -> None:
         """Whitespace-only stdin shows error."""
-        result = runner.invoke(main, ["-"], input="   \n\t\n   ")
+        result = runner.invoke(run_command, ["-"], input="   \n\t\n   ")
         assert result.exit_code == EXIT_CLI_ERROR
         assert "Empty code provided" in result.output
 
@@ -784,7 +787,7 @@ class TestCliStdinEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-l", "javascript", "-"], input="console.log('stdin')")
+            result = runner.invoke(run_command, ["-l", "javascript", "-"], input="console.log('stdin')")
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -803,7 +806,7 @@ class TestCliEnvVarEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-e", "KEY=val!@#$%^&*()", "print(1)"])
+            result = runner.invoke(run_command, ["-e", "KEY=val!@#$%^&*()", "print(1)"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -818,7 +821,7 @@ class TestCliEnvVarEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-e", 'KEY="quoted value"', "print(1)"])
+            result = runner.invoke(run_command, ["-e", 'KEY="quoted value"', "print(1)"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -833,7 +836,7 @@ class TestCliEnvVarEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-e", "123=value", "print(1)"])
+            result = runner.invoke(run_command, ["-e", "123=value", "print(1)"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
@@ -845,24 +848,24 @@ class TestCliTimeoutMemoryEdgeCases:
 
     def test_invalid_timeout_string(self, runner: CliRunner) -> None:
         """Invalid timeout string shows error."""
-        result = runner.invoke(main, ["-t", "abc", "print(1)"])
+        result = runner.invoke(run_command, ["-t", "abc", "print(1)"])
         assert result.exit_code == EXIT_CLI_ERROR
 
     def test_negative_timeout(self, runner: CliRunner) -> None:
         """Negative timeout is rejected by Click (not a valid integer option)."""
-        result = runner.invoke(main, ["-t", "-1", "print(1)"])
+        result = runner.invoke(run_command, ["-t", "-1", "print(1)"])
         # Click treats -1 as another flag, not a value, causing an error
         assert result.exit_code != 0
 
     def test_zero_timeout(self, runner: CliRunner) -> None:
         """Zero timeout fails SchedulerConfig validation."""
-        result = runner.invoke(main, ["-t", "0", "print(1)"])
+        result = runner.invoke(run_command, ["-t", "0", "print(1)"])
         # SchedulerConfig requires timeout >= 1, Pydantic raises ValidationError
         assert result.exit_code != 0
 
     def test_invalid_memory_string(self, runner: CliRunner) -> None:
         """Invalid memory string shows error."""
-        result = runner.invoke(main, ["-m", "abc", "print(1)"])
+        result = runner.invoke(run_command, ["-m", "abc", "print(1)"])
         assert result.exit_code == EXIT_CLI_ERROR
 
 
@@ -887,7 +890,7 @@ class TestCliExitCodePassthrough:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["exit(42)"])
+            result = runner.invoke(run_command, ["exit(42)"])
 
             assert result.exit_code == 42
 
@@ -916,7 +919,7 @@ class TestCliJsonOutputEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["--json", "print(1)"])
+            result = runner.invoke(run_command, ["--json", "print(1)"])
 
             assert result.exit_code == 0
             parsed = json.loads(result.output)
@@ -942,7 +945,7 @@ class TestCliJsonOutputEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["--json", "exit(1)"])
+            result = runner.invoke(run_command, ["--json", "exit(1)"])
 
             assert result.exit_code == 1
             parsed = json.loads(result.output)
@@ -962,7 +965,7 @@ class TestCliQuietMode:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-q", "print(1)"])
+            result = runner.invoke(run_command, ["-q", "print(1)"])
 
             assert result.exit_code == 0
             # In quiet mode, no "Done in Xms" footer
@@ -1141,7 +1144,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print(1)", "print(2)"])
+            result = runner.invoke(run_command, ["print(1)", "print(2)"])
 
             assert result.exit_code == 0
             # Should have been called twice
@@ -1156,7 +1159,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-c", "print(1)", "-c", "print(2)"])
+            result = runner.invoke(run_command, ["-c", "print(1)", "-c", "print(2)"])
 
             assert result.exit_code == 0
             assert mock_scheduler.run.call_count == 2
@@ -1170,7 +1173,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-c", "print(1)", "print(2)"])
+            result = runner.invoke(run_command, ["-c", "print(1)", "print(2)"])
 
             assert result.exit_code == 0
             # -c comes first, then positional
@@ -1196,7 +1199,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(file1), str(file2)])
+            result = runner.invoke(run_command, [str(file1), str(file2)])
 
             assert result.exit_code == 0
             assert mock_scheduler.run.call_count == 2
@@ -1210,7 +1213,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-j", "5", "print(1)", "print(2)"])
+            result = runner.invoke(run_command, ["-j", "5", "print(1)", "print(2)"])
 
             assert result.exit_code == 0
             # Check that config was created with limited concurrency
@@ -1226,7 +1229,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print(1)", "print(2)"])
+            result = runner.invoke(run_command, ["print(1)", "print(2)"])
 
             assert result.exit_code == 0
             config = MockScheduler.call_args[0][0]
@@ -1236,11 +1239,11 @@ class TestCliMultiInput:
     def test_concurrency_bounds(self, runner: CliRunner) -> None:
         """Concurrency is bounded between 1 and MAX_CONCURRENCY."""
         # Test invalid low value
-        result = runner.invoke(main, ["-j", "0", "print(1)"])
+        result = runner.invoke(run_command, ["-j", "0", "print(1)"])
         assert result.exit_code == EXIT_CLI_ERROR
 
         # Test invalid high value
-        result = runner.invoke(main, ["-j", "200", "print(1)"])
+        result = runner.invoke(run_command, ["-j", "200", "print(1)"])
         assert result.exit_code == EXIT_CLI_ERROR
 
     def test_json_output_multi(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
@@ -1254,7 +1257,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["--json", "print(1)", "print(2)"])
+            result = runner.invoke(run_command, ["--json", "print(1)", "print(2)"])
 
             assert result.exit_code == 0
             parsed = json.loads(result.output)
@@ -1265,7 +1268,7 @@ class TestCliMultiInput:
 
     def test_stdin_only_once(self, runner: CliRunner) -> None:
         """Stdin marker can only be used once."""
-        result = runner.invoke(main, ["-", "-"], input="print(1)")
+        result = runner.invoke(run_command, ["-", "-"], input="print(1)")
         assert result.exit_code == EXIT_CLI_ERROR
         assert "once" in result.output.lower()
 
@@ -1278,7 +1281,7 @@ class TestCliMultiInput:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print('hello')"])
+            result = runner.invoke(run_command, ["print('hello')"])
 
             assert result.exit_code == 0
             # Single source: config should have max_concurrent_vms=1
@@ -1308,7 +1311,7 @@ class TestCliMultiInputLanguageDetection:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, [str(py_file), str(js_file)])
+            result = runner.invoke(run_command, [str(py_file), str(js_file)])
 
             assert result.exit_code == 0
             calls = mock_scheduler.run.call_args_list
@@ -1336,7 +1339,7 @@ class TestCliMultiInputLanguageDetection:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["-l", "raw", str(py_file), str(js_file)])
+            result = runner.invoke(run_command, ["-l", "raw", str(py_file), str(js_file)])
 
             assert result.exit_code == 0
             calls = mock_scheduler.run.call_args_list
@@ -1429,7 +1432,7 @@ class TestCliMultiInputExitCodes:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print(1)", "exit(5)"])
+            result = runner.invoke(run_command, ["print(1)", "exit(5)"])
 
             # Should return max(0, 5) = 5
             assert result.exit_code == 5
@@ -1455,6 +1458,156 @@ class TestCliMultiInputExitCodes:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ["print(1)", "import time; time.sleep(100)"])
+            result = runner.invoke(run_command, ["print(1)", "import time; time.sleep(100)"])
 
             assert result.exit_code == EXIT_TIMEOUT
+
+
+# ============================================================================
+# Prefetch Command Tests
+# ============================================================================
+class TestCliPrefetch:
+    """Tests for CLI prefetch command."""
+
+    def test_prefetch_help(self, runner: CliRunner) -> None:
+        """Shows help for prefetch command."""
+        result = runner.invoke(prefetch_command, ["--help"])
+        assert result.exit_code == 0
+        assert "Pre-download VM assets" in result.output
+        assert "--arch" in result.output
+        assert "--quiet" in result.output
+
+    def test_prefetch_downloads_all(self, runner: CliRunner, tmp_path: Path) -> None:
+        """Prefetch downloads all assets."""
+        with patch("exec_sandbox.cli.prefetch_all_assets") as mock_prefetch:
+            mock_prefetch.return_value = PrefetchResult(
+                success=True,
+                arch="aarch64",
+                downloaded=["kernel", "initramfs"],
+                cache_dir=tmp_path,
+            )
+
+            result = runner.invoke(prefetch_command, [])
+
+            assert result.exit_code == 0
+            mock_prefetch.assert_called_once_with(arch=None)
+
+    def test_prefetch_with_arch(self, runner: CliRunner, tmp_path: Path) -> None:
+        """Prefetch respects --arch flag."""
+        with patch("exec_sandbox.cli.prefetch_all_assets") as mock_prefetch:
+            mock_prefetch.return_value = PrefetchResult(
+                success=True,
+                arch="aarch64",
+                downloaded=["kernel", "initramfs"],
+                cache_dir=tmp_path,
+            )
+
+            result = runner.invoke(prefetch_command, ["--arch", "aarch64"])
+
+            assert result.exit_code == 0
+            mock_prefetch.assert_called_once_with(arch="aarch64")
+
+    def test_prefetch_quiet(self, runner: CliRunner, tmp_path: Path) -> None:
+        """Prefetch respects -q flag (suppresses output on success)."""
+        with patch("exec_sandbox.cli.prefetch_all_assets") as mock_prefetch:
+            mock_prefetch.return_value = PrefetchResult(
+                success=True,
+                arch="aarch64",
+                downloaded=["kernel", "initramfs"],
+                cache_dir=tmp_path,
+            )
+
+            result = runner.invoke(prefetch_command, ["-q"])
+
+            assert result.exit_code == 0
+            # Quiet mode should produce no output on success
+            assert result.output == ""
+
+    def test_prefetch_returns_error_on_failure(self, runner: CliRunner) -> None:
+        """Prefetch returns error code on failure."""
+        with patch("exec_sandbox.cli.prefetch_all_assets") as mock_prefetch:
+            mock_prefetch.return_value = PrefetchResult(
+                success=False,
+                arch="aarch64",
+                errors=[("kernel", "Network error")],
+            )
+
+            result = runner.invoke(prefetch_command, [])
+
+            assert result.exit_code == 1
+
+
+# ============================================================================
+# CLI Group Tests (Top-level help and version)
+# ============================================================================
+class TestCliGroup:
+    """Tests for CLI group (top-level commands)."""
+
+    def test_cli_help(self, runner: CliRunner) -> None:
+        """Shows help for main CLI group."""
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "exec-sandbox" in result.output
+        assert "run" in result.output
+        assert "prefetch" in result.output
+
+    def test_cli_version(self, runner: CliRunner) -> None:
+        """Shows version with --version flag."""
+        result = runner.invoke(cli, ["--version"])
+        assert result.exit_code == 0
+        assert __version__ in result.output
+
+    def test_cli_short_version(self, runner: CliRunner) -> None:
+        """Shows version with -V flag."""
+        result = runner.invoke(cli, ["-V"])
+        assert result.exit_code == 0
+        assert __version__ in result.output
+
+    def test_run_subcommand_help(self, runner: CliRunner) -> None:
+        """Shows help for run subcommand."""
+        result = runner.invoke(cli, ["run", "--help"])
+        assert result.exit_code == 0
+        assert "Execute code" in result.output
+        assert "--language" in result.output
+
+    def test_prefetch_subcommand_help(self, runner: CliRunner) -> None:
+        """Shows help for prefetch subcommand."""
+        result = runner.invoke(cli, ["prefetch", "--help"])
+        assert result.exit_code == 0
+        assert "Pre-download VM assets" in result.output
+
+
+# ============================================================================
+# Backward Compatibility Tests
+# ============================================================================
+class TestCliBackwardCompat:
+    """Tests for CLI backward compatibility (implicit run insertion)."""
+
+    def test_explicit_run(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Explicit 'run' subcommand works."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(cli, ["run", "print(1)"])
+
+            assert result.exit_code == 0
+            mock_scheduler.run.assert_called_once()
+
+    def test_explicit_prefetch(self, runner: CliRunner, tmp_path: Path) -> None:
+        """Explicit 'prefetch' subcommand works."""
+        with patch("exec_sandbox.cli.prefetch_all_assets") as mock_prefetch:
+            mock_prefetch.return_value = PrefetchResult(
+                success=True,
+                arch="aarch64",
+                downloaded=["kernel"],
+                cache_dir=tmp_path,
+            )
+
+            result = runner.invoke(cli, ["prefetch"])
+
+            assert result.exit_code == 0
+            mock_prefetch.assert_called_once()

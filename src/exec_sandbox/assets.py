@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiofiles.os
@@ -29,12 +30,14 @@ from exec_sandbox.asset_downloader import (
     get_current_arch,
     get_gvproxy_suffix,
 )
+from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import chmod_executable
 
 logger = get_logger(__name__)
 
 # Public API - only these should be used externally
 __all__ = [
+    "PrefetchResult",
     "ensure_assets",
     "ensure_assets_available",
     "ensure_registry_loaded",
@@ -45,11 +48,23 @@ __all__ = [
     "get_assets",
     "get_gvproxy_path",
     "is_offline_mode",
+    "prefetch_all_assets",
 ]
 
 # GitHub repository info
 GITHUB_OWNER = "dualeai"
 GITHUB_REPO = "exec-sandbox"
+
+
+@dataclass
+class PrefetchResult:
+    """Result of prefetch_all_assets operation."""
+
+    success: bool
+    arch: str
+    downloaded: list[str] = field(default_factory=lambda: [])  # noqa: PIE807
+    errors: list[tuple[str, str]] = field(default_factory=lambda: [])  # noqa: PIE807
+    cache_dir: Path | None = None
 
 
 def _get_asset_version() -> tuple[str, str]:
@@ -471,3 +486,74 @@ async def _find_asset(fname: str, override: Path | None = None) -> Path | None:
             if await aiofiles.os.path.exists(decompressed_path):
                 return decompressed_path
     return None
+
+
+async def prefetch_all_assets(
+    arch: str | None = None,
+) -> PrefetchResult:
+    """
+    Pre-download all VM assets for offline use.
+
+    Downloads kernel, initramfs, gvproxy, and all base images (from BASE_IMAGES)
+    for the specified architecture. Useful for pre-populating cache in container
+    builds before running with EXEC_SANDBOX_OFFLINE=1.
+
+    Args:
+        arch: Target architecture ("x86_64" or "aarch64"). Defaults to current machine.
+
+    Returns:
+        PrefetchResult with success status, downloaded assets, and any errors.
+    """
+    arch = arch or get_current_arch()
+    logger.info("Prefetching all assets", extra={"arch": arch})
+
+    # Load registry first
+    try:
+        await ensure_registry_loaded()
+    except Exception as e:  # noqa: BLE001 - Catch broad exception for robustness
+        logger.error("Failed to load registry", extra={"error": str(e)})
+        return PrefetchResult(
+            success=False,
+            arch=arch,
+            errors=[("registry", str(e))],
+        )
+
+    # Define all assets to fetch - core assets plus base images for all languages
+    asset_tasks: list[tuple[str, asyncio.Task[Path]]] = [
+        ("kernel", asyncio.create_task(fetch_kernel(arch=arch))),
+        ("initramfs", asyncio.create_task(fetch_initramfs(arch=arch))),
+        ("gvproxy", asyncio.create_task(fetch_gvproxy())),
+    ]
+    # Add base images for all supported languages
+    asset_tasks.extend(
+        (f"{lang.value} base", asyncio.create_task(fetch_base_image(lang.value, arch=arch)))
+        for lang in Language
+    )
+
+    # Gather results with exception handling
+    tasks = [task for _, task in asset_tasks]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Process results
+    downloaded: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for (name, _), result in zip(asset_tasks, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning("Asset download failed", extra={"asset": name, "error": str(result)})
+            errors.append((name, str(result)))
+        else:
+            logger.debug("Asset downloaded", extra={"asset": name, "path": str(result)})
+            downloaded.append(name)
+
+    if errors:
+        logger.error("Prefetch completed with errors", extra={"errors": len(errors), "downloaded": len(downloaded)})
+    else:
+        logger.info("Prefetch completed successfully", extra={"downloaded": len(downloaded)})
+
+    return PrefetchResult(
+        success=len(errors) == 0,
+        arch=arch,
+        downloaded=downloaded,
+        errors=errors,
+        cache_dir=get_cache_dir("exec-sandbox") if len(errors) == 0 else None,
+    )
