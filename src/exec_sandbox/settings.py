@@ -47,10 +47,6 @@ class Settings(BaseSettings):
     base_image_python: str = "python:3.14-alpine"
     base_image_node: str = "node:23-alpine"
 
-    # Package validation
-    allow_list_pypi_path: Path = Path("catalogs/pypi_top_10k.json")
-    allow_list_npm_path: Path = Path("catalogs/npm_top_10k.json")
-
     # Limits
     execution_timeout_max: int = constants.MAX_TIMEOUT_SECONDS
     memory_limit_max: int = constants.MAX_MEMORY_MB

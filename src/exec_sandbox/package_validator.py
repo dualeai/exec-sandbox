@@ -48,14 +48,14 @@ class PackageValidator:
 
         Args:
             pypi_allow_list_path: Path to JSON file with PyPI package names (bundled).
-                Defaults to bundled catalogs/pypi_top_10k.json
+                Defaults to bundled resources/pypi_top_10k.json
             npm_allow_list_path: Path to JSON file with npm package names (bundled).
-                Defaults to bundled catalogs/npm_top_10k.json
+                Defaults to bundled resources/npm_top_10k.json
 
         Returns:
             Initialized PackageValidator instance
         """
-        catalogs_dir = Path(__file__).parent / "catalogs"
+        catalogs_dir = Path(__file__).parent / "resources"
         pypi_path = pypi_allow_list_path or catalogs_dir / "pypi_top_10k.json"
         npm_path = npm_allow_list_path or catalogs_dir / "npm_top_10k.json"
 

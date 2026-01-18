@@ -78,9 +78,6 @@ Issues = "https://github.com/dualeai/exec-sandbox/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/exec_sandbox"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"catalogs" = "exec_sandbox/catalogs"
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

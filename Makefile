@@ -46,7 +46,7 @@ upgrade:
 # Build package allow-lists from PyPI and npm registries
 build-catalogs:
 	@echo "📦 Building package catalogs (PyPI + npm top 10k)..."
-	uv run --script scripts/build_package_catalogs.py catalogs
+	uv run --script scripts/build_package_catalogs.py src/exec_sandbox/resources
 
 # ============================================================================
 # Image Building
