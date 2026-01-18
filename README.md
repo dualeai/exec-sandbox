@@ -39,41 +39,41 @@ The `sbx` command provides quick access to sandbox execution from the terminal:
 
 ```bash
 # Run Python code
-sbx 'print("Hello, World!")'
+sbx run 'print("Hello, World!")'
 
 # Run JavaScript
-sbx -l javascript 'console.log("Hello!")'
+sbx run -l javascript 'console.log("Hello!")'
 
 # Run a file (language auto-detected from extension)
-sbx script.py
-sbx app.js
+sbx run script.py
+sbx run app.js
 
 # From stdin
-echo 'print(42)' | sbx -
+echo 'print(42)' | sbx run -
 
 # With packages
-sbx -p requests -p pandas 'import pandas; print(pandas.__version__)'
+sbx run -p requests -p pandas 'import pandas; print(pandas.__version__)'
 
 # With timeout and memory limits
-sbx -t 60 -m 512 long_script.py
+sbx run -t 60 -m 512 long_script.py
 
 # Enable network with domain allowlist
-sbx --network --allow-domain api.example.com fetch_data.py
+sbx run --network --allow-domain api.example.com fetch_data.py
 
 # JSON output for scripting
-sbx --json 'print("test")' | jq .exit_code
+sbx run --json 'print("test")' | jq .exit_code
 
 # Environment variables
-sbx -e API_KEY=secret -e DEBUG=1 script.py
+sbx run -e API_KEY=secret -e DEBUG=1 script.py
 
 # Multiple sources (run concurrently)
-sbx 'print(1)' 'print(2)' script.py
+sbx run 'print(1)' 'print(2)' script.py
 
 # Multiple inline codes
-sbx -c 'print(1)' -c 'print(2)'
+sbx run -c 'print(1)' -c 'print(2)'
 
 # Limit concurrency
-sbx -j 5 *.py
+sbx run -j 5 *.py
 ```
 
 **CLI Options:**
@@ -207,9 +207,29 @@ exec-sandbox requires VM images (kernel, initramfs, qcow2) and binaries (gvproxy
 | `EXEC_SANDBOX_OFFLINE` | Set to `1` to disable auto-download (fail if assets missing) |
 | `EXEC_SANDBOX_ASSET_VERSION` | Force specific release version |
 
+### Pre-downloading for offline use
+
+Use `sbx prefetch` to download all assets ahead of time:
+
+```bash
+sbx prefetch                    # Download all assets for current arch
+sbx prefetch --arch aarch64     # Cross-arch prefetch
+sbx prefetch -q                 # Quiet mode (CI/Docker)
+```
+
+**Dockerfile example:**
+
+```dockerfile
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm
+RUN uv pip install --system exec-sandbox
+RUN sbx prefetch -q
+ENV EXEC_SANDBOX_OFFLINE=1
+# Assets cached, no network needed at runtime
+```
+
 ### Security
 
-Assets are verified against SHA256 checksums and built with [provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds). For offline environments, set `EXEC_SANDBOX_OFFLINE=1` after pre-downloading assets.
+Assets are verified against SHA256 checksums and built with [provenance attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
 
 ## Documentation
 
