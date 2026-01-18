@@ -86,6 +86,10 @@ _KVM_API_VERSION_EXPECTED = 12  # Stable since Linux 2.6.38
 _IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _IDENTIFIER_MAX_LENGTH = 128  # Reasonable limit for identifiers
 
+# QEMU binary extraction pattern for error diagnostics
+# Extracts binary name from shell wrapper commands (e.g., "qemu-system-x86_64")
+_QEMU_BINARY_PATTERN = re.compile(r"(qemu-system-[^\s]+)")
+
 
 def _validate_identifier(value: str, name: str) -> None:
     """Validate identifier contains only safe characters.
@@ -1964,10 +1968,8 @@ class VmManager:
                 if qemu_cmd:
                     if qemu_cmd[0] == "bash" and len(qemu_cmd) > 2:  # noqa: PLR2004
                         # Extract actual QEMU binary from shell command string
-                        import re  # noqa: PLC0415
-
                         shell_cmd_str = qemu_cmd[2]
-                        qemu_match = re.search(r"(qemu-system-[^\s]+)", shell_cmd_str)
+                        qemu_match = _QEMU_BINARY_PATTERN.search(shell_cmd_str)
                         qemu_binary = qemu_match.group(1) if qemu_match else f"bash -c '{shell_cmd_str[:100]}...'"
                     else:
                         qemu_binary = qemu_cmd[0]

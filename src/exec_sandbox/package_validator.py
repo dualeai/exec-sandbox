@@ -15,6 +15,12 @@ import aiofiles
 from exec_sandbox.exceptions import PackageNotAllowedError
 from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
 
+# Package name extraction pattern
+# Matches: alphanumeric, underscore, hyphen, dot followed by version operator
+# Python: ==, ~=, >=, <=, !=, >, <
+# JavaScript: @
+_PACKAGE_NAME_PATTERN = re.compile(r"^([a-zA-Z0-9_\-\.]+)[@=<>~]")
+
 
 class PackageValidator:
     """Validates packages against bundled allow-lists.
@@ -94,13 +100,8 @@ class PackageValidator:
         """
         allow_list = self._allow_lists[language.value]
 
-        # Extract package name before version specifier
-        # Python: split on first ==, ~=, >=, <=, !=, >, <
-        # JavaScript: split on @
-        package_name_pattern = r"^([a-zA-Z0-9_\-\.]+)[@=<>~]"
-
         for package_spec in packages:
-            match = re.match(package_name_pattern, package_spec)
+            match = _PACKAGE_NAME_PATTERN.match(package_spec)
             if not match:
                 # Should never happen due to schema validation, but defensive
                 raise PackageNotAllowedError(

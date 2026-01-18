@@ -6,6 +6,12 @@ python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires
 version_full ?= $(shell $(MAKE) --silent version-full)
 version_small ?= $(shell $(MAKE) --silent version)
 
+# Flamegraph
+PROFILES_DIR := profiles
+PYSPY_RATE := 1000
+PYSPY_BASETEMP := /tmp/pytest-flamegraph
+PYSPY_OUTPUT = $(PROFILES_DIR)/flamegraph_$(shell date +%Y%m%d_%H%M%S).json
+
 version:
 	@bash ./cicd/version.sh -g . -c
 
@@ -121,6 +127,58 @@ bench:
 
 bench-pool:
 	uv run python scripts/benchmark_latency.py -n 10 --pool 8
+
+# ============================================================================
+# Flamegraph Profiling (requires sudo on macOS)
+# ============================================================================
+
+test-flamegraph:
+	@mkdir -p $(PROFILES_DIR)
+	@echo "Profiling tests (requires sudo for py-spy)..."
+	uv run py-spy record \
+		--subprocesses \
+		--rate $(PYSPY_RATE) \
+		--format speedscope \
+		--output $(PYSPY_OUTPUT) \
+		-- uv run pytest tests/ -v -n auto --no-cov --basetemp=$(PYSPY_BASETEMP) -m "not sudo"
+	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
+	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
+
+test-flamegraph-pattern:
+	@mkdir -p $(PROFILES_DIR)
+	@echo "Profiling: $(PATTERN)"
+	uv run py-spy record \
+		--subprocesses \
+		--rate $(PYSPY_RATE) \
+		--format speedscope \
+		--output $(PYSPY_OUTPUT) \
+		-- uv run pytest tests/$(PATTERN) -v -n 0 --no-cov --basetemp=$(PYSPY_BASETEMP)
+	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
+	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
+
+bench-flamegraph:
+	@mkdir -p $(PROFILES_DIR)
+	@echo "Profiling benchmark (requires sudo for py-spy)..."
+	uv run py-spy record \
+		--subprocesses \
+		--rate $(PYSPY_RATE) \
+		--format speedscope \
+		--output $(PYSPY_OUTPUT) \
+		-- uv run python scripts/benchmark_latency.py -n 10
+	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
+	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
+
+bench-pool-flamegraph:
+	@mkdir -p $(PROFILES_DIR)
+	@echo "Profiling benchmark with pool (requires sudo for py-spy)..."
+	uv run py-spy record \
+		--subprocesses \
+		--rate $(PYSPY_RATE) \
+		--format speedscope \
+		--output $(PYSPY_OUTPUT) \
+		-- uv run python scripts/benchmark_latency.py -n 10 --pool 8
+	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
+	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 
 # ============================================================================
 # Building
