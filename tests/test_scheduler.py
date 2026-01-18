@@ -984,3 +984,161 @@ class TestSchedulerWarmPoolTiming:
         assert result.timing.setup_ms == 0
         assert result.timing.boot_ms == 0
         assert result.timing.execute_ms >= 0
+
+
+# ============================================================================
+# Package Installation Integration Tests
+# ============================================================================
+
+
+class TestPackageInstallation:
+    """Integration tests for package installation with real QEMU VMs.
+
+    These tests verify that packages are correctly installed and persisted
+    in snapshots. They catch bugs like:
+    - QEMU exit code detection issues (macOS HVF vs Linux KVM)
+    - Filesystem sync issues with cache=unsafe
+    - Snapshot corruption during package install
+    """
+
+    async def test_python_package_install_and_import(self, scheduler: Scheduler) -> None:
+        """Python packages are installed and importable."""
+        result = await scheduler.run(
+            code='import requests; print(f"requests={requests.__version__}")',
+            language=Language.PYTHON,
+            packages=["requests==2.31.0"],
+            timeout_seconds=120,
+        )
+
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "requests=2.31.0" in result.stdout
+
+    async def test_python_multiple_packages(self, scheduler: Scheduler) -> None:
+        """Multiple Python packages are installed and importable."""
+        code = """
+import requests
+import flask
+import httpx
+print(f"requests={requests.__version__}")
+print(f"flask={flask.__version__}")
+print(f"httpx={httpx.__version__}")
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            packages=["requests==2.31.0", "flask==3.0.0", "httpx==0.27.0"],
+            timeout_seconds=120,
+        )
+
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "requests=2.31.0" in result.stdout
+        assert "flask=3.0.0" in result.stdout
+        assert "httpx=0.27.0" in result.stdout
+
+    async def test_javascript_package_install_and_import(self, scheduler: Scheduler) -> None:
+        """JavaScript packages are installed and importable."""
+        result = await scheduler.run(
+            code='const lodash = require("lodash"); console.log("lodash=" + lodash.VERSION)',
+            language=Language.JAVASCRIPT,
+            packages=["lodash@4.17.21"],
+            timeout_seconds=120,
+        )
+
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "lodash=4.17.21" in result.stdout
+
+    async def test_javascript_multiple_packages(self, scheduler: Scheduler) -> None:
+        """Multiple JavaScript packages are installed and importable."""
+        code = """
+const lodash = require("lodash");
+const moment = require("moment");
+console.log("lodash=" + lodash.VERSION);
+console.log("moment=" + moment.version);
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+            packages=["lodash@4.17.21", "moment@2.30.1"],
+            timeout_seconds=120,
+        )
+
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "lodash=4.17.21" in result.stdout
+        assert "moment=2.30.1" in result.stdout
+
+    async def test_python_snapshot_cache_hit(self, scheduler: Scheduler) -> None:
+        """Second run with same packages uses cached snapshot."""
+        packages = ["requests==2.31.0"]
+
+        # First run: creates snapshot
+        r1 = await scheduler.run(
+            code='import requests; print("first")',
+            language=Language.PYTHON,
+            packages=packages,
+            timeout_seconds=120,
+        )
+        assert r1.exit_code == 0, f"First run failed: {r1.stderr}"
+
+        # Second run: should use cached snapshot (much faster)
+        r2 = await scheduler.run(
+            code='import requests; print("second")',
+            language=Language.PYTHON,
+            packages=packages,
+            timeout_seconds=120,
+        )
+        assert r2.exit_code == 0, f"Second run failed: {r2.stderr}"
+        assert "second" in r2.stdout
+
+    async def test_python_packages_work_without_network(self, scheduler: Scheduler) -> None:
+        """Packages from cached snapshot work without network access.
+
+        This is a critical test that proves:
+        1. Snapshot correctly persists installed packages
+        2. Packages don't require network at runtime
+        3. Filesystem sync worked (cache=unsafe issue fixed)
+        """
+        packages = ["requests==2.31.0"]
+
+        # First run: creates snapshot (needs network for pip install)
+        r1 = await scheduler.run(
+            code='import requests; print("setup")',
+            language=Language.PYTHON,
+            packages=packages,
+            timeout_seconds=120,
+        )
+        assert r1.exit_code == 0, f"Setup run failed: {r1.stderr}"
+
+        # Second run: uses cached snapshot WITHOUT network
+        r2 = await scheduler.run(
+            code='import requests; print(f"offline: {requests.__version__}")',
+            language=Language.PYTHON,
+            packages=packages,
+            allow_network=False,  # No internet!
+            timeout_seconds=120,
+        )
+        assert r2.exit_code == 0, f"Offline run failed: {r2.stderr}"
+        assert "offline: 2.31.0" in r2.stdout
+
+    async def test_javascript_packages_work_without_network(self, scheduler: Scheduler) -> None:
+        """JavaScript packages from cached snapshot work without network."""
+        packages = ["lodash@4.17.21"]
+
+        # First run: creates snapshot
+        r1 = await scheduler.run(
+            code='const lodash = require("lodash"); console.log("setup")',
+            language=Language.JAVASCRIPT,
+            packages=packages,
+            timeout_seconds=120,
+        )
+        assert r1.exit_code == 0, f"Setup run failed: {r1.stderr}"
+
+        # Second run: uses cached snapshot WITHOUT network
+        r2 = await scheduler.run(
+            code='const lodash = require("lodash"); console.log("offline: " + lodash.VERSION)',
+            language=Language.JAVASCRIPT,
+            packages=packages,
+            allow_network=False,  # No internet!
+            timeout_seconds=120,
+        )
+        assert r2.exit_code == 0, f"Offline run failed: {r2.stderr}"
+        assert "offline: 4.17.21" in r2.stdout

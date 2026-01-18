@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import PackageNotAllowedError, SandboxError, SnapshotError, VmError
+from exec_sandbox.exceptions import SandboxError, SnapshotError, VmError
 from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.settings import Settings
 
@@ -423,14 +423,7 @@ class Scheduler:
         from exec_sandbox.package_validator import PackageValidator  # noqa: PLC0415
 
         validator = await PackageValidator.create()
-        for package in packages:
-            # Extract package name (strip version specifier)
-            name = package.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0].split("[")[0]
-            if not validator.is_allowed(name, language.value):
-                raise PackageNotAllowedError(
-                    f"Package '{name}' not in allowlist for {language.value}",
-                    context={"package": name, "language": language.value},
-                )
+        validator.validate(packages, language)
 
     async def _get_or_create_snapshot(self, language: str, packages: list[str], memory_mb: int) -> Path | None:
         """Get cached snapshot or create new one with packages.

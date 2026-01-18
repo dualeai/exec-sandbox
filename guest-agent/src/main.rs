@@ -496,6 +496,13 @@ async fn install_packages(
     let duration_ms = start.elapsed().as_millis() as u64;
     let exit_code = status.code().unwrap_or(-1);
 
+    // Sync filesystem to ensure package files are persisted
+    // Critical for snapshots with cache=unsafe (QEMU may exit before lazy writeback)
+    // This adds ~5-10ms but guarantees data integrity
+    if exit_code == 0 {
+        unsafe { libc::sync() };
+    }
+
     // Stream all captured output (batched for efficiency)
     if !stdout_lines.is_empty() {
         let chunk = OutputChunk {
