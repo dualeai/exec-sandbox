@@ -458,13 +458,55 @@ class SnapshotManager:
                     raise
 
                 # Step 4: Shutdown QEMU process cleanly
+                # Track if we initiated the shutdown (vs QEMU dying unexpectedly)
+                we_initiated_shutdown = False
                 if vm.process.returncode is None:
+                    # QEMU still running - we'll terminate it
+                    we_initiated_shutdown = True
                     await vm.process.terminate()
                     try:
                         await asyncio.wait_for(vm.process.wait(), timeout=5.0)
                     except TimeoutError:
                         await vm.process.kill()
                         await vm.process.wait()
+                else:
+                    # QEMU already dead - wait to get the exit code
+                    await vm.process.wait()
+
+                # Verify QEMU exited cleanly after package installation
+                # Expected exit codes when WE initiated shutdown:
+                #   -15: SIGTERM (our terminate() call)
+                #   -9: SIGKILL (our kill() call after timeout)
+                # If QEMU exited on its own (we_initiated_shutdown=False), ANY exit code
+                # is suspicious because it means QEMU died during package installation
+                # before we could properly shut it down. This can cause corrupt snapshots
+                # if filesystem data wasn't synced to disk.
+                if we_initiated_shutdown:
+                    # We terminated QEMU - expect clean exit codes
+                    # Note: QEMU with -no-reboot exits with code 0 on SIGTERM (not -15)
+                    # because it handles the signal gracefully and performs cleanup.
+                    # This is expected behavior on macOS with HVF.
+                    if vm.process.returncode not in {0, -9, -15}:
+                        raise VmError(
+                            f"QEMU exited unexpectedly after terminate (exit code {vm.process.returncode})",
+                            context={
+                                "cache_key": cache_key,
+                                "exit_code": vm.process.returncode,
+                                "language": language,
+                                "packages": packages,
+                            },
+                        )
+                else:
+                    # QEMU died on its own - this is always unexpected during snapshot creation
+                    raise VmError(
+                        f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
+                        context={
+                            "cache_key": cache_key,
+                            "exit_code": vm.process.returncode,
+                            "language": language,
+                            "packages": packages,
+                        },
+                    )
 
                 # Step 5: Clean up resources
                 # With direct_write_target, we wrote directly to snapshot_path
