@@ -31,6 +31,11 @@ logger = get_logger(__name__)
 # Using 16MB to handle large outputs with JSON overhead
 STREAM_BUFFER_LIMIT = 16 * 1024 * 1024  # 16MB
 
+# Cached TypeAdapter for StreamingMessage discriminated union
+# Performance: Avoids rebuilding validators on every message (1000s of allocations per execution)
+# Pydantic TypeAdapter is expensive to construct - caching eliminates this overhead in hot paths
+_STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+
 
 @runtime_checkable
 class GuestChannel(Protocol):
@@ -154,9 +159,8 @@ class TcpChannel:
             # Receive response (read until newline)
             response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
 
-            # Deserialize JSON to StreamingMessage
-            streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-            return streaming_adapter.validate_json(response_data.decode().strip())
+            # Deserialize JSON to StreamingMessage (direct bytes, no decode/strip allocation)
+            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
 
         except TimeoutError:
             # TimeoutError means no data received in time, but connection is still valid.
@@ -182,17 +186,13 @@ class TcpChannel:
         self._writer.write(request_json.encode())
         await self._writer.drain()
 
-        # Type adapter for discriminated union
-        streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-
         # Read and yield messages until completion or error
         while True:
             # Read next JSON line
             response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-            raw_json = response_data.decode().strip()
 
-            # Parse as streaming message
-            message = streaming_adapter.validate_json(raw_json)
+            # Parse as streaming message (direct bytes, no decode/strip allocation)
+            message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
             yield message
 
             # Stop if complete or error
@@ -350,9 +350,8 @@ class UnixSocketChannel:
             # Receive response (read until newline)
             response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
 
-            # Deserialize JSON to StreamingMessage
-            streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-            return streaming_adapter.validate_json(response_data.decode().strip())
+            # Deserialize JSON to StreamingMessage (direct bytes, no decode/strip allocation)
+            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
 
         except TimeoutError:
             # TimeoutError means no data received in time, but connection is still valid.
@@ -399,17 +398,13 @@ class UnixSocketChannel:
         except TimeoutError as e:
             raise RuntimeError("Write queue full - guest agent not draining") from e
 
-        # Type adapter for discriminated union
-        streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-
         # Read and yield messages until completion or error
         while True:
             # Read next JSON line
             response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-            raw_json = response_data.decode().strip()
 
-            # Parse as streaming message
-            message = streaming_adapter.validate_json(raw_json)
+            # Parse as streaming message (direct bytes, no decode/strip allocation)
+            message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
             yield message
 
             # Stop if complete or error
@@ -588,9 +583,6 @@ class DualPortChannel:
         if not self._event_channel.is_connected():
             raise RuntimeError("Event channel not connected")
 
-        # Type adapter for discriminated union
-        streaming_adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-
         reader = self._event_channel.get_reader()
         if not reader:
             raise RuntimeError("Event channel reader not available")
@@ -599,10 +591,9 @@ class DualPortChannel:
         while True:
             # Read next JSON line from event channel
             response_data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=float(timeout))
-            raw_json = response_data.decode().strip()
 
-            # Parse as streaming message
-            message = streaming_adapter.validate_json(raw_json)
+            # Parse as streaming message (direct bytes, no decode/strip allocation)
+            message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
             yield message
 
             # Stop if complete or error
