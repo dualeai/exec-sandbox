@@ -12,7 +12,7 @@ Secure code execution in isolated lightweight VMs (QEMU microVMs). Python librar
 
 - **Hardware isolation** - Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
 - **Fast startup** - 400ms fresh start, 1-2ms with pre-started VMs (warm pool)
-- **Simple API** - Just `Scheduler` and `run()`, async-friendly
+- **Simple API** - Just `Scheduler` and `run()`, async-friendly; plus `sbx` CLI for quick testing
 - **Streaming output** - Real-time output as code runs
 - **Smart caching** - Local + S3 remote cache for VM snapshots
 - **Network control** - Disabled by default, optional domain allowlisting
@@ -33,7 +33,59 @@ apt install qemu-system          # Ubuntu/Debian
 
 ## Quick Start
 
-### Basic Execution
+### CLI
+
+The `sbx` command provides quick access to sandbox execution from the terminal:
+
+```bash
+# Run Python code
+sbx 'print("Hello, World!")'
+
+# Run JavaScript
+sbx -l javascript 'console.log("Hello!")'
+
+# Run a file (language auto-detected from extension)
+sbx script.py
+sbx app.js
+
+# From stdin
+echo 'print(42)' | sbx -
+
+# With packages
+sbx -p requests -p pandas 'import pandas; print(pandas.__version__)'
+
+# With timeout and memory limits
+sbx -t 60 -m 512 long_script.py
+
+# Enable network with domain allowlist
+sbx --network --allow-domain api.example.com fetch_data.py
+
+# JSON output for scripting
+sbx --json 'print("test")' | jq .exit_code
+
+# Environment variables
+sbx -e API_KEY=secret -e DEBUG=1 script.py
+```
+
+**CLI Options:**
+
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--language` | `-l` | python, javascript, raw | auto-detect |
+| `--code` | `-c` | Inline code (alternative to positional) | - |
+| `--package` | `-p` | Package to install (repeatable) | - |
+| `--timeout` | `-t` | Timeout in seconds | 30 |
+| `--memory` | `-m` | Memory in MB | 256 |
+| `--env` | `-e` | Environment variable KEY=VALUE (repeatable) | - |
+| `--network` | | Enable network access | false |
+| `--allow-domain` | | Allowed domain (repeatable) | - |
+| `--json` | | JSON output | false |
+| `--quiet` | `-q` | Suppress progress output | false |
+| `--no-validation` | | Skip package allowlist validation | false |
+
+### Python API
+
+#### Basic Execution
 
 ```python
 from exec_sandbox import Scheduler
@@ -47,7 +99,7 @@ async with Scheduler() as scheduler:
     print(result.exit_code)  # 0
 ```
 
-### With Packages
+#### With Packages
 
 First run installs and creates snapshot; subsequent runs restore in <400ms.
 
@@ -61,7 +113,7 @@ async with Scheduler() as scheduler:
     print(result.stdout)  # 2.2.0
 ```
 
-### Streaming Output
+#### Streaming Output
 
 ```python
 async with Scheduler() as scheduler:
@@ -73,7 +125,7 @@ async with Scheduler() as scheduler:
     )
 ```
 
-### Network Access
+#### Network Access
 
 ```python
 async with Scheduler() as scheduler:
@@ -85,7 +137,7 @@ async with Scheduler() as scheduler:
     )
 ```
 
-### Production Configuration
+#### Production Configuration
 
 ```python
 from exec_sandbox import Scheduler, SchedulerConfig
@@ -103,7 +155,7 @@ async with Scheduler(config) as scheduler:
     result = await scheduler.run(...)
 ```
 
-### Error Handling
+#### Error Handling
 
 ```python
 from exec_sandbox import Scheduler, VmTimeoutError, PackageNotAllowedError, SandboxError

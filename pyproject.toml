@@ -44,10 +44,15 @@ dependencies = [
     "aiohttp~=3.11",  # For async HTTP downloads from GitHub Releases
     "aiojobs~=1.3",
     "backports.zstd ; python_version<'3.14'",  # PEP-784 backport for zstd decompression
+    "click~=8.0",  # CLI framework
     "psutil~=7.2",
     "qemu-qmp~=0.0.5",  # Async QMP client for QEMU memory snapshots
     "tenacity~=8.0",
 ]
+
+[project.scripts]
+sbx = "exec_sandbox.cli:main"
+exec-sandbox = "exec_sandbox.cli:main"
 
 [project.optional-dependencies]
 s3 = [
