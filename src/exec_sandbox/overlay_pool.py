@@ -165,6 +165,9 @@ class OverlayPool:
 
         If base_images is None, auto-discovers from images_path using WARM_POOL_LANGUAGES.
 
+        The daemon is always started (needed for on-demand overlay creation in acquire()),
+        but pre-creation and replenishment are only enabled when pool_size > 0.
+
         Args:
             base_images: Optional explicit list of base image paths (for testing)
 
@@ -177,12 +180,20 @@ class OverlayPool:
         # Clear shutdown event to allow restart after previous shutdown
         self._shutdown_event.clear()
 
+        # Start qemu-storage-daemon (always needed for on-demand overlay creation)
+        self._daemon = QemuStorageDaemon()
+        await self._daemon.start()
+
+        self._started = True
+
+        # Skip pre-creation when pool is disabled
+        if self._pool_size <= 0:
+            logger.debug("Overlay pool pre-creation disabled (pool_size=0), daemon started for on-demand creation")
+            return
+
         # Auto-discover if not provided
         if base_images is None:
             base_images = self._discover_base_images()
-        if self._pool_size <= 0:
-            logger.debug("Overlay pool disabled (pool_size=0)")
-            return
 
         # Create pool directory (graceful degradation on permission errors)
         try:
@@ -193,10 +204,6 @@ class OverlayPool:
                 extra={"pool_dir": str(self._pool_dir), "error": str(e)},
             )
             return
-
-        # Start qemu-storage-daemon for fast overlay creation
-        self._daemon = QemuStorageDaemon()
-        await self._daemon.start()
 
         # Initialize pools for each base image
         for base_image in base_images:
@@ -210,8 +217,6 @@ class OverlayPool:
             for _ in range(self._pool_size)
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
-
-        self._started = True
 
         # Start background replenishment tasks
         for base_image in base_images:

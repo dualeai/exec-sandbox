@@ -60,8 +60,8 @@ class TestOverlayPoolPureLogic:
         with pytest.raises(RuntimeError, match="Daemon must be started"):
             await pool.acquire(Path("/fake/base.qcow2"), target)
 
-    async def test_start_with_zero_pool_size_is_noop(self, tmp_path: Path) -> None:
-        """start() with pool_size=0 doesn't create directory or start tasks."""
+    async def test_start_with_zero_pool_size_starts_daemon_only(self, tmp_path: Path) -> None:
+        """start() with pool_size=0 starts daemon but doesn't create pool directory or tasks."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool_dir = tmp_path / "overlay-pool"
@@ -69,12 +69,16 @@ class TestOverlayPoolPureLogic:
 
         await pool.start([Path("/fake/base.qcow2")])
 
+        # Daemon is started (for on-demand creation in acquire)
+        assert pool._started
+        assert pool._daemon is not None
+        # But no pool directory or replenish tasks
         assert not pool_dir.exists()
         assert len(pool._replenish_tasks) == 0
         await pool.stop()
 
-    async def test_start_with_negative_pool_size_is_noop(self, tmp_path: Path) -> None:
-        """start() with negative pool_size is noop."""
+    async def test_start_with_negative_pool_size_starts_daemon_only(self, tmp_path: Path) -> None:
+        """start() with negative pool_size starts daemon but no pre-creation."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool_dir = tmp_path / "pool"
@@ -82,6 +86,8 @@ class TestOverlayPoolPureLogic:
 
         await pool.start([Path("/fake/base.qcow2")])
 
+        assert pool._started
+        assert pool._daemon is not None
         assert not pool_dir.exists()
         await pool.stop()
 
@@ -150,8 +156,8 @@ class TestOverlayPoolPureLogic:
         with pytest.raises(FileExistsError, match="already exists"):
             await pool.acquire(Path("/fake/base.qcow2"), target)
 
-    async def test_mkdir_permission_error_disables_pool(self, tmp_path: Path) -> None:
-        """Permission error during mkdir gracefully disables pool."""
+    async def test_mkdir_permission_error_disables_pool_precreation(self, tmp_path: Path) -> None:
+        """Permission error during mkdir disables pool pre-creation but daemon stays started."""
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(max_concurrent_vms=10, pool_dir=tmp_path / "pool")
@@ -159,9 +165,12 @@ class TestOverlayPoolPureLogic:
         with patch("aiofiles.os.makedirs", side_effect=PermissionError("Access denied")):
             await pool.start([Path("/fake/base.qcow2")])
 
-        # Pool should NOT be started (graceful degradation)
-        assert not pool._started
+        # Daemon is started (for on-demand creation)
+        assert pool._started
+        assert pool._daemon is not None
+        # But no pools are created due to mkdir failure
         assert len(pool._pools) == 0
+        await pool.stop()
 
 
 # ============================================================================
@@ -259,6 +268,39 @@ class TestOverlayPoolIntegration:
 
         await pool.stop()
         assert not (tmp_path / "pool").exists()  # Cleaned up
+
+    async def test_acquire_with_zero_pool_size_creates_on_demand(self, vm_settings, tmp_path: Path) -> None:
+        """Test acquire works with pool_size=0 (CLI single-VM mode).
+
+        This is a regression test for the bug where max_concurrent_vms=1 (CLI mode)
+        resulted in pool_size=0, and start() didn't initialize the daemon, causing
+        acquire() to fail with "Daemon must be started before acquire".
+        """
+        from exec_sandbox.overlay_pool import OverlayPool
+        from exec_sandbox.vm_manager import VmManager
+
+        vm_manager = VmManager(vm_settings)
+        base_image = vm_manager.get_base_image("python")
+
+        # max_concurrent_vms=1 → pool_size = int(1 * 0.5) = 0
+        pool = OverlayPool(max_concurrent_vms=1, pool_dir=tmp_path / "pool")
+        await pool.start([base_image])
+
+        # Daemon should be started even with pool_size=0
+        assert pool._started
+        assert pool._daemon is not None
+        # No pre-created overlays (pool_size=0)
+        assert len(pool._pools) == 0
+
+        # Acquire should work via on-demand creation
+        target = tmp_path / "acquired.qcow2"
+        result = await pool.acquire(base_image, target)
+
+        # Returns False because created on-demand (not from pool)
+        assert result is False
+        assert target.exists()
+
+        await pool.stop()
 
     async def test_acquired_overlay_has_correct_backing_file(self, vm_settings, tmp_path: Path) -> None:
         """Acquired overlay references correct base image."""
