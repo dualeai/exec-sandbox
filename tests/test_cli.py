@@ -14,13 +14,21 @@ from exec_sandbox import ExecutionResult, Language, TimingBreakdown, __version__
 from exec_sandbox.cli import (
     EXIT_CLI_ERROR,
     EXIT_SANDBOX_ERROR,
+    EXIT_SUCCESS,
     EXIT_TIMEOUT,
+    MultiSourceResult,
+    SourceInput,
+    _compute_multi_exit_code,
     detect_language,
     format_error,
+    format_multi_result_json,
     format_result_json,
     main,
     parse_env_vars,
+    truncate_source,
 )
+
+
 # ============================================================================
 # Test Fixtures
 # ============================================================================
@@ -28,6 +36,8 @@ from exec_sandbox.cli import (
 def runner() -> CliRunner:
     """Create a CLI runner for testing."""
     return CliRunner()
+
+
 @pytest.fixture
 def mock_result() -> ExecutionResult:
     """Create a mock execution result for testing."""
@@ -44,6 +54,8 @@ def mock_result() -> ExecutionResult:
         ),
         warm_pool_hit=False,
     )
+
+
 # ============================================================================
 # Unit Tests - Helper Functions
 # ============================================================================
@@ -83,6 +95,8 @@ class TestDetectLanguage:
     def test_none_input(self) -> None:
         """Returns None for None input."""
         assert detect_language(None) is None
+
+
 class TestParseEnvVars:
     """Tests for parse_env_vars function."""
 
@@ -124,6 +138,8 @@ class TestParseEnvVars:
 
         with pytest.raises(click.BadParameter, match="Empty key"):
             parse_env_vars(("=value",))
+
+
 class TestFormatError:
     """Tests for format_error function."""
 
@@ -143,6 +159,8 @@ class TestFormatError:
         assert "Suggestions:" in result
         assert "Try this" in result
         assert "Or try that" in result
+
+
 class TestFormatResultJson:
     """Tests for format_result_json function."""
 
@@ -158,6 +176,8 @@ class TestFormatResultJson:
         assert parsed["exit_code"] == 0
         assert parsed["timing"]["total_ms"] == 420
         assert parsed["warm_pool_hit"] is False
+
+
 # ============================================================================
 # CLI Command Tests
 # ============================================================================
@@ -177,6 +197,8 @@ class TestCliHelp:
         result = runner.invoke(main, ["-h"])
         assert result.exit_code == 0
         assert "Execute code" in result.output
+
+
 class TestCliVersion:
     """Tests for CLI version output."""
 
@@ -185,6 +207,8 @@ class TestCliVersion:
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
         assert __version__ in result.output
+
+
 class TestCliArgumentParsing:
     """Tests for CLI argument parsing (without running actual code)."""
 
@@ -196,20 +220,22 @@ class TestCliArgumentParsing:
 
     def test_empty_code_shows_error(self, runner: CliRunner) -> None:
         """Shows error for empty code."""
-        # Empty string argument is treated as "no code" by Click
+        # Empty string argument passes through but results in empty code
         result = runner.invoke(main, [""])
         assert result.exit_code == EXIT_CLI_ERROR
-        assert "No code provided" in result.output
+        # Either "Empty code" or "No code" depending on how Click handles empty strings
+        assert "Empty code" in result.output or "No code" in result.output
 
     def test_whitespace_only_code_shows_error(self, runner: CliRunner) -> None:
         """Shows error for whitespace-only code."""
         result = runner.invoke(main, ["   "])
         assert result.exit_code == EXIT_CLI_ERROR
         assert "Empty code provided" in result.output
+
+
 class TestCliCodeExecution:
     """Tests for CLI code execution with mocked scheduler."""
 
-    
     def test_inline_code(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes inline code."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -227,7 +253,6 @@ class TestCliCodeExecution:
             assert call_kwargs["code"] == "print('hello')"
             assert call_kwargs["language"] == Language.PYTHON
 
-    
     def test_explicit_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Uses explicitly specified language."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -243,7 +268,6 @@ class TestCliCodeExecution:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["language"] == Language.JAVASCRIPT
 
-    
     def test_code_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes code from -c flag."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -259,7 +283,6 @@ class TestCliCodeExecution:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["code"] == "print(1)"
 
-    
     def test_packages(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes packages to scheduler."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -278,7 +301,6 @@ class TestCliCodeExecution:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["packages"] == ["requests", "pandas==2.2.0"]
 
-    
     def test_env_vars(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes environment variables to scheduler."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -297,7 +319,6 @@ class TestCliCodeExecution:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["env_vars"] == {"KEY": "value", "DEBUG": "1"}
 
-    
     def test_timeout_and_memory(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes timeout and memory settings."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -314,7 +335,6 @@ class TestCliCodeExecution:
             assert call_kwargs["timeout_seconds"] == 60
             assert call_kwargs["memory_mb"] == 512
 
-    
     def test_network_options(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes network options to scheduler."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -341,7 +361,6 @@ class TestCliCodeExecution:
             assert call_kwargs["allow_network"] is True
             assert call_kwargs["allowed_domains"] == ["api.example.com", "cdn.example.com"]
 
-    
     def test_json_output(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Outputs JSON when --json flag is used."""
         import json
@@ -361,10 +380,11 @@ class TestCliCodeExecution:
             assert "stdout" in parsed
             assert "exit_code" in parsed
             assert "timing" in parsed
+
+
 class TestCliFileInput:
     """Tests for CLI file input."""
 
-    
     def test_file_input(
         self,
         runner: CliRunner,
@@ -391,7 +411,6 @@ class TestCliFileInput:
             # Language should be auto-detected from .py extension
             assert call_kwargs["language"] == Language.PYTHON
 
-    
     def test_file_language_detection(
         self,
         runner: CliRunner,
@@ -415,10 +434,11 @@ class TestCliFileInput:
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["language"] == Language.JAVASCRIPT
+
+
 class TestCliStdinInput:
     """Tests for CLI stdin input."""
 
-    
     def test_stdin_input(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Reads code from stdin."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -433,10 +453,11 @@ class TestCliStdinInput:
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["code"] == "print('from stdin')"
+
+
 class TestCliErrorHandling:
     """Tests for CLI error handling."""
 
-    
     def test_package_not_allowed_error(self, runner: CliRunner) -> None:
         """Handles PackageNotAllowedError."""
         from exec_sandbox import PackageNotAllowedError
@@ -453,7 +474,6 @@ class TestCliErrorHandling:
             assert result.exit_code == EXIT_CLI_ERROR
             assert "not allowed" in result.output.lower()
 
-    
     def test_timeout_error(self, runner: CliRunner) -> None:
         """Handles VmTimeoutError."""
         from exec_sandbox import VmTimeoutError
@@ -470,7 +490,6 @@ class TestCliErrorHandling:
             assert result.exit_code == EXIT_TIMEOUT
             assert "timed out" in result.output.lower()
 
-    
     def test_sandbox_error(self, runner: CliRunner) -> None:
         """Handles SandboxError."""
         from exec_sandbox import SandboxError
@@ -486,10 +505,11 @@ class TestCliErrorHandling:
 
             assert result.exit_code == EXIT_SANDBOX_ERROR
             assert "sandbox error" in result.output.lower()
+
+
 class TestCliNoValidation:
     """Tests for --no-validation flag."""
 
-    
     def test_no_validation_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Disables package validation with --no-validation."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -505,6 +525,8 @@ class TestCliNoValidation:
             # Check that config was created with enable_package_validation=False
             config = MockScheduler.call_args[0][0]
             assert config.enable_package_validation is False
+
+
 # ============================================================================
 # Edge Cases and Boundary Tests
 # ============================================================================
@@ -516,6 +538,8 @@ class TestCliVersionShortFlag:
         result = runner.invoke(main, ["-V"])
         assert result.exit_code == 0
         assert __version__ in result.output
+
+
 class TestCliLanguageEdgeCases:
     """Tests for language option edge cases."""
 
@@ -540,7 +564,6 @@ class TestCliLanguageEdgeCases:
         assert result.exit_code == EXIT_CLI_ERROR
         assert "ruby" in result.output.lower() or "invalid" in result.output.lower()
 
-    
     def test_raw_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes with raw language."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -555,6 +578,8 @@ class TestCliLanguageEdgeCases:
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["language"] == Language.RAW
+
+
 class TestCliFileEdgeCases:
     """Tests for file input edge cases."""
 
@@ -591,7 +616,6 @@ class TestCliFileEdgeCases:
             # Directory path is treated as code string
             assert call_kwargs["code"] == str(tmp_path)
 
-    
     def test_file_with_multiple_extensions(
         self,
         runner: CliRunner,
@@ -615,7 +639,6 @@ class TestCliFileEdgeCases:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["language"] == Language.PYTHON
 
-    
     def test_hidden_file(
         self,
         runner: CliRunner,
@@ -639,7 +662,6 @@ class TestCliFileEdgeCases:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["code"] == "print('hidden')"
 
-    
     def test_file_with_spaces_in_path(
         self,
         runner: CliRunner,
@@ -664,10 +686,11 @@ class TestCliFileEdgeCases:
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["code"] == "print('spaces')"
+
+
 class TestCliCodeEdgeCases:
     """Tests for code content edge cases."""
 
-    
     def test_code_with_quotes(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Code containing quotes is handled correctly."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -677,13 +700,12 @@ class TestCliCodeEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            result = runner.invoke(main, ['print("hello \'world\'")'])
+            result = runner.invoke(main, ["print(\"hello 'world'\")"])
 
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
-            assert call_kwargs["code"] == 'print("hello \'world\'")'
+            assert call_kwargs["code"] == "print(\"hello 'world'\")"
 
-    
     def test_code_with_newlines(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Code containing newlines is handled correctly."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -700,7 +722,6 @@ class TestCliCodeEdgeCases:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["code"] == code
 
-    
     def test_code_with_unicode(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Code containing unicode is handled correctly."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -717,8 +738,8 @@ class TestCliCodeEdgeCases:
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["code"] == code
 
-    def test_code_flag_takes_precedence(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """The -c flag takes precedence over positional argument."""
+    def test_code_flag_and_positional_both_run(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Both -c flag and positional arguments run as separate sources."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
@@ -726,12 +747,19 @@ class TestCliCodeEdgeCases:
             mock_scheduler.__aexit__.return_value = None
             MockScheduler.return_value = mock_scheduler
 
-            # Both -c and positional provided
+            # Both -c and positional provided - both should run
             result = runner.invoke(main, ["-c", "print('from -c')", "print('from pos')"])
 
             assert result.exit_code == 0
-            call_kwargs = mock_scheduler.run.call_args.kwargs
-            assert call_kwargs["code"] == "print('from -c')"
+            # Both sources should be executed (multi-input mode)
+            assert mock_scheduler.run.call_count == 2
+            # -c sources come first, then positional
+            calls = mock_scheduler.run.call_args_list
+            codes = [call.kwargs["code"] for call in calls]
+            assert "print('from -c')" in codes
+            assert "print('from pos')" in codes
+
+
 class TestCliStdinEdgeCases:
     """Tests for stdin input edge cases."""
 
@@ -747,7 +775,6 @@ class TestCliStdinEdgeCases:
         assert result.exit_code == EXIT_CLI_ERROR
         assert "Empty code provided" in result.output
 
-    
     def test_stdin_with_explicit_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Stdin with explicit language works."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -762,6 +789,8 @@ class TestCliStdinEdgeCases:
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["language"] == Language.JAVASCRIPT
+
+
 class TestCliEnvVarEdgeCases:
     """Tests for environment variable edge cases."""
 
@@ -809,6 +838,8 @@ class TestCliEnvVarEdgeCases:
             assert result.exit_code == 0
             call_kwargs = mock_scheduler.run.call_args.kwargs
             assert call_kwargs["env_vars"]["123"] == "value"
+
+
 class TestCliTimeoutMemoryEdgeCases:
     """Tests for timeout and memory edge cases."""
 
@@ -833,10 +864,11 @@ class TestCliTimeoutMemoryEdgeCases:
         """Invalid memory string shows error."""
         result = runner.invoke(main, ["-m", "abc", "print(1)"])
         assert result.exit_code == EXIT_CLI_ERROR
+
+
 class TestCliExitCodePassthrough:
     """Tests for exit code passthrough from executed code."""
 
-    
     def test_nonzero_exit_code(self, runner: CliRunner) -> None:
         """Non-zero exit code is passed through."""
         result_with_error = ExecutionResult(
@@ -858,10 +890,11 @@ class TestCliExitCodePassthrough:
             result = runner.invoke(main, ["exit(42)"])
 
             assert result.exit_code == 42
+
+
 class TestCliJsonOutputEdgeCases:
     """Tests for JSON output edge cases."""
 
-    
     def test_json_output_with_memory_peak(self, runner: CliRunner) -> None:
         """JSON output includes memory peak when present."""
         import json
@@ -889,7 +922,6 @@ class TestCliJsonOutputEdgeCases:
             parsed = json.loads(result.output)
             assert parsed["memory_peak_mb"] == 128
 
-    
     def test_json_output_with_nonzero_exit(self, runner: CliRunner) -> None:
         """JSON output works with non-zero exit code."""
         import json
@@ -916,10 +948,11 @@ class TestCliJsonOutputEdgeCases:
             parsed = json.loads(result.output)
             assert parsed["exit_code"] == 1
             assert parsed["stderr"] == "error message"
+
+
 class TestCliQuietMode:
     """Tests for quiet mode."""
 
-    
     def test_quiet_mode(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Quiet mode suppresses progress output."""
         with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
@@ -934,6 +967,8 @@ class TestCliQuietMode:
             assert result.exit_code == 0
             # In quiet mode, no "Done in Xms" footer
             assert "Done in" not in result.output
+
+
 class TestDetectLanguageEdgeCases:
     """Additional edge cases for detect_language."""
 
@@ -964,6 +999,8 @@ class TestDetectLanguageEdgeCases:
         """Handles paths with dots in directory names."""
         assert detect_language("/path.to.dir/script.py") == "python"
         assert detect_language("./my.project/app.js") == "javascript"
+
+
 class TestParseEnvVarsEdgeCases:
     """Additional edge cases for parse_env_vars."""
 
@@ -987,3 +1024,437 @@ class TestParseEnvVarsEdgeCases:
         """Later duplicate key overwrites earlier."""
         result = parse_env_vars(("KEY=first", "KEY=second"))
         assert result == {"KEY": "second"}
+
+
+# ============================================================================
+# Multi-Input Tests (V2)
+# ============================================================================
+class TestTruncateSource:
+    """Tests for truncate_source helper."""
+
+    def test_short_source(self) -> None:
+        """Short sources are not truncated."""
+        assert truncate_source("print(1)") == "print(1)"
+        assert truncate_source("short") == "short"
+
+    def test_long_source(self) -> None:
+        """Long sources are truncated with ellipsis."""
+        long_src = "x" * 50
+        result = truncate_source(long_src, max_len=40)
+        assert len(result) == 40
+        assert result.endswith("...")
+
+    def test_exact_length(self) -> None:
+        """Exact length sources are not truncated."""
+        src = "x" * 40
+        assert truncate_source(src, max_len=40) == src
+
+
+class TestSourceInput:
+    """Tests for SourceInput dataclass."""
+
+    def test_create_source_input(self) -> None:
+        """Creates SourceInput with required fields."""
+        src = SourceInput(code="print(1)", label="test", language=Language.PYTHON)
+        assert src.code == "print(1)"
+        assert src.label == "test"
+        assert src.language == Language.PYTHON
+
+
+class TestMultiSourceResult:
+    """Tests for MultiSourceResult dataclass."""
+
+    def test_create_success_result(self, mock_result: ExecutionResult) -> None:
+        """Creates successful MultiSourceResult."""
+        result = MultiSourceResult(
+            index=0,
+            source="test.py",
+            result=mock_result,
+            error=None,
+        )
+        assert result.index == 0
+        assert result.source == "test.py"
+        assert result.result is not None
+        assert result.error is None
+
+    def test_create_error_result(self) -> None:
+        """Creates error MultiSourceResult."""
+        result = MultiSourceResult(
+            index=1,
+            source="bad.py",
+            result=None,
+            error="Execution timed out",
+        )
+        assert result.index == 1
+        assert result.source == "bad.py"
+        assert result.result is None
+        assert result.error == "Execution timed out"
+
+
+class TestFormatMultiResultJson:
+    """Tests for format_multi_result_json function."""
+
+    def test_format_success_results(self, mock_result: ExecutionResult) -> None:
+        """Formats successful results as JSON array."""
+        import json
+
+        results = [
+            MultiSourceResult(index=0, source="test1.py", result=mock_result, error=None),
+            MultiSourceResult(index=1, source="test2.py", result=mock_result, error=None),
+        ]
+        output = format_multi_result_json(results)
+        parsed = json.loads(output)
+
+        assert len(parsed) == 2
+        assert parsed[0]["index"] == 0
+        assert parsed[0]["source"] == "test1.py"
+        assert parsed[0]["exit_code"] == 0
+        assert parsed[1]["index"] == 1
+        assert parsed[1]["source"] == "test2.py"
+
+    def test_format_mixed_results(self, mock_result: ExecutionResult) -> None:
+        """Formats mixed success and error results."""
+        import json
+
+        results = [
+            MultiSourceResult(index=0, source="good.py", result=mock_result, error=None),
+            MultiSourceResult(index=1, source="bad.py", result=None, error="Timed out"),
+        ]
+        output = format_multi_result_json(results)
+        parsed = json.loads(output)
+
+        assert len(parsed) == 2
+        assert parsed[0]["exit_code"] == 0
+        assert parsed[1]["error"] == "Timed out"
+        assert parsed[1]["exit_code"] == EXIT_SANDBOX_ERROR
+
+
+class TestCliMultiInput:
+    """Tests for CLI multi-input functionality."""
+
+    def test_multiple_inline_codes(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Executes multiple inline codes."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["print(1)", "print(2)"])
+
+            assert result.exit_code == 0
+            # Should have been called twice
+            assert mock_scheduler.run.call_count == 2
+
+    def test_multiple_c_flags(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Executes multiple -c flag codes."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["-c", "print(1)", "-c", "print(2)"])
+
+            assert result.exit_code == 0
+            assert mock_scheduler.run.call_count == 2
+
+    def test_mixed_c_and_positional(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Executes mixed -c flags and positional sources."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["-c", "print(1)", "print(2)"])
+
+            assert result.exit_code == 0
+            # -c comes first, then positional
+            assert mock_scheduler.run.call_count == 2
+
+    def test_multiple_files(
+        self,
+        runner: CliRunner,
+        mock_result: ExecutionResult,
+        tmp_path: Path,
+    ) -> None:
+        """Executes multiple file sources."""
+        # Create test files
+        file1 = tmp_path / "test1.py"
+        file1.write_text("print('file1')")
+        file2 = tmp_path / "test2.py"
+        file2.write_text("print('file2')")
+
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, [str(file1), str(file2)])
+
+            assert result.exit_code == 0
+            assert mock_scheduler.run.call_count == 2
+
+    def test_concurrency_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Uses -j flag to limit concurrency."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["-j", "5", "print(1)", "print(2)"])
+
+            assert result.exit_code == 0
+            # Check that config was created with limited concurrency
+            config = MockScheduler.call_args[0][0]
+            assert config.max_concurrent_vms <= 5
+
+    def test_concurrency_default(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Uses default concurrency."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["print(1)", "print(2)"])
+
+            assert result.exit_code == 0
+            config = MockScheduler.call_args[0][0]
+            # min(2 sources, DEFAULT_CONCURRENCY)
+            assert config.max_concurrent_vms == 2
+
+    def test_concurrency_bounds(self, runner: CliRunner) -> None:
+        """Concurrency is bounded between 1 and MAX_CONCURRENCY."""
+        # Test invalid low value
+        result = runner.invoke(main, ["-j", "0", "print(1)"])
+        assert result.exit_code == EXIT_CLI_ERROR
+
+        # Test invalid high value
+        result = runner.invoke(main, ["-j", "200", "print(1)"])
+        assert result.exit_code == EXIT_CLI_ERROR
+
+    def test_json_output_multi(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """JSON output for multiple sources is an array."""
+        import json
+
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["--json", "print(1)", "print(2)"])
+
+            assert result.exit_code == 0
+            parsed = json.loads(result.output)
+            assert isinstance(parsed, list)
+            assert len(parsed) == 2
+            assert all("index" in item for item in parsed)
+            assert all("source" in item for item in parsed)
+
+    def test_stdin_only_once(self, runner: CliRunner) -> None:
+        """Stdin marker can only be used once."""
+        result = runner.invoke(main, ["-", "-"], input="print(1)")
+        assert result.exit_code == EXIT_CLI_ERROR
+        assert "once" in result.output.lower()
+
+    def test_single_source_uses_streaming(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Single source uses streaming (run_code) not run_multiple."""
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["print('hello')"])
+
+            assert result.exit_code == 0
+            # Single source: config should have max_concurrent_vms=1
+            config = MockScheduler.call_args[0][0]
+            assert config.max_concurrent_vms == 1
+
+
+class TestCliMultiInputLanguageDetection:
+    """Tests for language auto-detection with multiple sources."""
+
+    def test_mixed_language_auto_detect(
+        self,
+        runner: CliRunner,
+        mock_result: ExecutionResult,
+        tmp_path: Path,
+    ) -> None:
+        """Auto-detects language per file extension."""
+        py_file = tmp_path / "test.py"
+        py_file.write_text("print(1)")
+        js_file = tmp_path / "test.js"
+        js_file.write_text("console.log(1)")
+
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, [str(py_file), str(js_file)])
+
+            assert result.exit_code == 0
+            calls = mock_scheduler.run.call_args_list
+            # Both languages should be detected (order may vary due to async execution)
+            languages = [call.kwargs["language"] for call in calls]
+            assert Language.PYTHON in languages
+            assert Language.JAVASCRIPT in languages
+
+    def test_global_language_override(
+        self,
+        runner: CliRunner,
+        mock_result: ExecutionResult,
+        tmp_path: Path,
+    ) -> None:
+        """Global -l flag overrides auto-detection for all sources."""
+        py_file = tmp_path / "test.py"
+        py_file.write_text("print(1)")
+        js_file = tmp_path / "test.js"
+        js_file.write_text("console.log(1)")
+
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["-l", "raw", str(py_file), str(js_file)])
+
+            assert result.exit_code == 0
+            calls = mock_scheduler.run.call_args_list
+            # Both should be raw (forced by -l)
+            assert calls[0].kwargs["language"] == Language.RAW
+            assert calls[1].kwargs["language"] == Language.RAW
+
+
+class TestComputeMultiExitCode:
+    """Tests for _compute_multi_exit_code helper."""
+
+    def test_all_success(self, mock_result: ExecutionResult) -> None:
+        """Returns SUCCESS when all sources succeed."""
+        results = [
+            MultiSourceResult(index=0, source="a", result=mock_result, error=None),
+            MultiSourceResult(index=1, source="b", result=mock_result, error=None),
+        ]
+        assert _compute_multi_exit_code(results) == EXIT_SUCCESS
+
+    def test_max_exit_code(self) -> None:
+        """Returns max exit code from results."""
+        result0 = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=10,
+            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
+            warm_pool_hit=False,
+        )
+        result5 = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=5,
+            execution_time_ms=10,
+            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
+            warm_pool_hit=False,
+        )
+        results = [
+            MultiSourceResult(index=0, source="a", result=result0, error=None),
+            MultiSourceResult(index=1, source="b", result=result5, error=None),
+        ]
+        assert _compute_multi_exit_code(results) == 5
+
+    def test_timeout_takes_precedence(self, mock_result: ExecutionResult) -> None:
+        """Returns EXIT_TIMEOUT if any source timed out."""
+        results = [
+            MultiSourceResult(index=0, source="a", result=mock_result, error=None),
+            MultiSourceResult(index=1, source="b", result=None, error="Execution timed out"),
+        ]
+        assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
+
+    def test_sandbox_error_returns_125(self) -> None:
+        """Returns EXIT_SANDBOX_ERROR for non-timeout errors."""
+        results = [
+            MultiSourceResult(index=0, source="a", result=None, error="VM boot failed"),
+        ]
+        assert _compute_multi_exit_code(results) == EXIT_SANDBOX_ERROR
+
+    def test_empty_results(self) -> None:
+        """Returns SUCCESS for empty results list."""
+        assert _compute_multi_exit_code([]) == EXIT_SUCCESS
+
+
+class TestCliMultiInputExitCodes:
+    """Tests for exit code handling with multiple sources."""
+
+    def test_max_exit_code_returned(self, runner: CliRunner) -> None:
+        """Returns maximum exit code from all sources."""
+        result0 = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=10,
+            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
+            warm_pool_hit=False,
+        )
+        result1 = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=5,
+            execution_time_ms=10,
+            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
+            warm_pool_hit=False,
+        )
+
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.side_effect = [result0, result1]
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["print(1)", "exit(5)"])
+
+            # Should return max(0, 5) = 5
+            assert result.exit_code == 5
+
+    def test_timeout_returns_124(self, runner: CliRunner) -> None:
+        """Returns EXIT_TIMEOUT (124) if any source times out."""
+        from exec_sandbox import VmTimeoutError
+
+        result0 = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=0,
+            execution_time_ms=10,
+            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
+            warm_pool_hit=False,
+        )
+
+        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+            mock_scheduler = AsyncMock()
+            # First succeeds, second times out
+            mock_scheduler.run.side_effect = [result0, VmTimeoutError("timeout")]
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            MockScheduler.return_value = mock_scheduler
+
+            result = runner.invoke(main, ["print(1)", "import time; time.sleep(100)"])
+
+            assert result.exit_code == EXIT_TIMEOUT

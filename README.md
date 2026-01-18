@@ -65,6 +65,15 @@ sbx --json 'print("test")' | jq .exit_code
 
 # Environment variables
 sbx -e API_KEY=secret -e DEBUG=1 script.py
+
+# Multiple sources (run concurrently)
+sbx 'print(1)' 'print(2)' script.py
+
+# Multiple inline codes
+sbx -c 'print(1)' -c 'print(2)'
+
+# Limit concurrency
+sbx -j 5 *.py
 ```
 
 **CLI Options:**
@@ -72,7 +81,7 @@ sbx -e API_KEY=secret -e DEBUG=1 script.py
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
 | `--language` | `-l` | python, javascript, raw | auto-detect |
-| `--code` | `-c` | Inline code (alternative to positional) | - |
+| `--code` | `-c` | Inline code (repeatable, alternative to positional) | - |
 | `--package` | `-p` | Package to install (repeatable) | - |
 | `--timeout` | `-t` | Timeout in seconds | 30 |
 | `--memory` | `-m` | Memory in MB | 256 |
@@ -82,6 +91,7 @@ sbx -e API_KEY=secret -e DEBUG=1 script.py
 | `--json` | | JSON output | false |
 | `--quiet` | `-q` | Suppress progress output | false |
 | `--no-validation` | | Skip package allowlist validation | false |
+| `--concurrency` | `-j` | Max concurrent VMs for multi-input | 10 |
 
 ### Python API
 
