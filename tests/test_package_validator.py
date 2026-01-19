@@ -569,8 +569,8 @@ class TestSecurityCases:
         # These use characters that look similar but are different
         # Most will fail on invalid spec since they use non-ASCII
         homoglyphs = [
-            "pаndas==2.0.0",  # Cyrillic 'а' instead of Latin 'a'
-            "pandаs==2.0.0",  # Cyrillic 'а'
+            "pаndas==2.0.0",  # noqa: RUF001, RUF003 - Intentional Cyrillic 'а'
+            "pandаs==2.0.0",  # noqa: RUF001, RUF003 - Intentional Cyrillic 'а'
         ]
         for attack in homoglyphs:
             with pytest.raises(PackageNotAllowedError):
