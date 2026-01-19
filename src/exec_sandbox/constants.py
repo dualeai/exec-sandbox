@@ -33,6 +33,15 @@ MAX_TIMEOUT_SECONDS: Final[int] = 300
 VM_BOOT_TIMEOUT_SECONDS: Final[int] = 30
 """VM boot timeout in seconds (guest agent ready check)."""
 
+VM_BOOT_MAX_RETRIES: Final[int] = 3
+"""Maximum retry attempts for VM boot failures (CPU contention resilience)."""
+
+VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.02
+"""Minimum backoff between VM boot retries (20ms base)."""
+
+VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
+"""Maximum backoff between VM boot retries (500ms cap with jitter)."""
+
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent (TCP)."""
 

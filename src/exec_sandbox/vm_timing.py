@@ -45,6 +45,9 @@ class VmTiming:
     qemu_fork_ms: int | None = None
     guest_wait_ms: int | None = None
 
+    # Retry tracking (for CPU contention resilience)
+    boot_retries: int | None = None  # 0 = succeeded first try, 1+ = number of retries
+
     def to_dict(self) -> dict[str, int]:
         """Convert to dict with only non-None values.
 

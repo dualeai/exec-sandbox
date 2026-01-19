@@ -51,7 +51,6 @@ class TestSchedulerInit:
         assert scheduler._vm_manager is None
         assert scheduler._snapshot_manager is None
         assert scheduler._warm_pool is None
-        assert scheduler._semaphore is None
 
 
 class TestSchedulerContextManager:
@@ -183,7 +182,6 @@ class TestSchedulerIntegration:
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._started is True
             assert scheduler._vm_manager is not None
-            assert scheduler._semaphore is not None
 
         # After exit
         assert scheduler._started is False

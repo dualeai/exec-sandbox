@@ -39,6 +39,7 @@ from tenacity import (
     AsyncRetrying,
     before_sleep_log,
     retry_if_exception_type,
+    stop_after_attempt,
     wait_random_exponential,
 )
 
@@ -1495,6 +1496,7 @@ class VmManager:
 
         self._vms: dict[str, QemuVM] = {}  # vm_id → VM object
         self._vms_lock = asyncio.Lock()  # Protect registry access
+        self._semaphore = asyncio.Semaphore(settings.max_concurrent_vms)  # Backpressure
 
         # Overlay pool for fast VM boot (auto-manages base image discovery and pooling)
         self._overlay_pool = OverlayPool(
@@ -1571,7 +1573,7 @@ class VmManager:
         """Exit async context manager, stopping the manager."""
         await self.stop()
 
-    async def create_vm(  # noqa: PLR0912, PLR0915
+    async def create_vm(
         self,
         language: Language,
         tenant_id: str,
@@ -1582,7 +1584,71 @@ class VmManager:
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
     ) -> QemuVM:
-        """Create and boot QEMU microVM.
+        """Create and boot QEMU microVM with automatic retry on transient failures.
+
+        Wraps _create_vm_impl with tenacity retry logic to handle CPU contention
+        during boot. Uses exponential backoff with full jitter to prevent
+        thundering herd on retry.
+
+        Args:
+            language: Programming language (python or javascript)
+            tenant_id: Tenant identifier for isolation
+            task_id: Task identifier
+            backing_image: Base image for overlay (default: language base image)
+            memory_mb: Memory limit in MB (128-2048, default 512)
+            allow_network: Enable network access (default: False, isolated)
+            allowed_domains: Whitelist of allowed domains if allow_network=True
+            direct_write_target: If set, write directly to this file (no overlay).
+                Used for snapshot creation. Mutually exclusive with backing_image.
+
+        Returns:
+            QemuVM handle for code execution
+
+        Raises:
+            VmError: VM creation failed after all retries
+            asyncio.TimeoutError: VM boot timeout after all retries
+        """
+        async with self._semaphore:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(constants.VM_BOOT_MAX_RETRIES),
+                wait=wait_random_exponential(
+                    min=constants.VM_BOOT_RETRY_MIN_SECONDS,
+                    max=constants.VM_BOOT_RETRY_MAX_SECONDS,
+                ),
+                retry=retry_if_exception_type((VmError, TimeoutError)),
+                before_sleep=before_sleep_log(logger, logging.WARNING),
+                reraise=True,
+            ):
+                with attempt:
+                    vm = await self._create_vm_impl(
+                        language=language,
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        backing_image=backing_image,
+                        memory_mb=memory_mb,
+                        allow_network=allow_network,
+                        allowed_domains=allowed_domains,
+                        direct_write_target=direct_write_target,
+                    )
+                    # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
+                    vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
+                    return vm
+
+        # Unreachable: AsyncRetrying either returns or raises
+        raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
+
+    async def _create_vm_impl(  # noqa: PLR0912, PLR0915
+        self,
+        language: Language,
+        tenant_id: str,
+        task_id: str,
+        backing_image: Path | None = None,
+        memory_mb: int = constants.DEFAULT_MEMORY_MB,
+        allow_network: bool = False,
+        allowed_domains: list[str] | None = None,
+        direct_write_target: Path | None = None,
+    ) -> QemuVM:
+        """Create and boot QEMU microVM (implementation).
 
         Workflow:
         1. Generate unique VM ID and CID

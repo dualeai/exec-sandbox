@@ -62,6 +62,11 @@ class TimingBreakdown(BaseModel):
         default=None,
         description="Time waiting for guest agent to become ready (kernel + initramfs + agent init)",
     )
+    # Retry tracking (for CPU contention resilience)
+    boot_retries: int = Field(
+        default=0,
+        description="Number of boot retries (0=first attempt succeeded or warm pool, 1+=retries needed due to CPU contention)",
+    )
 
 
 class ExecutionResult(BaseModel):

@@ -35,6 +35,10 @@ def _float_list() -> list[float]:
     return []
 
 
+def _int_list() -> list[int]:
+    return []
+
+
 @dataclass
 class TimingStats:
     """Collected timing measurements."""
@@ -56,6 +60,8 @@ class TimingStats:
     gvproxy_start: list[float] = field(default_factory=_float_list)
     qemu_fork: list[float] = field(default_factory=_float_list)
     guest_wait: list[float] = field(default_factory=_float_list)
+    # Retry tracking
+    boot_retries: list[int] = field(default_factory=_int_list)
     warm_hits: int = 0
     cold_boots: int = 0
 
@@ -88,6 +94,8 @@ def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -
         stats.qemu_fork.append(result.timing.qemu_fork_ms)
     if result.timing.guest_wait_ms is not None:
         stats.guest_wait.append(result.timing.guest_wait_ms)
+    # Retry tracking
+    stats.boot_retries.append(result.timing.boot_retries)
     if result.warm_pool_hit:
         stats.warm_hits += 1
     else:
@@ -169,7 +177,7 @@ def fmt_stats(values: list[float]) -> str:
     return f"{median:.0f} / {p95:.0f}"
 
 
-def print_stats(name: str, stats: TimingStats) -> None:
+def print_stats(name: str, stats: TimingStats) -> None:  # noqa: PLR0912
     """Print timing statistics (all metrics are per-VM)."""
     if not stats.e2e:
         print(f"\n{name}: No data")
@@ -213,6 +221,11 @@ def print_stats(name: str, stats: TimingStats) -> None:
 
     if stats.guest_exec:
         print(f"    Guest time: {fmt_stats(stats.guest_exec)} ms")
+
+    # Retry stats
+    total_retries = sum(stats.boot_retries)
+    retried_count = sum(1 for r in stats.boot_retries if r > 0)
+    print(f"  Boot retries: {total_retries} total ({retried_count}/{len(stats.boot_retries)} VMs needed retry)")
 
 
 async def main() -> None:
