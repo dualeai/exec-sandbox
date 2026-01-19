@@ -68,6 +68,7 @@ from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exce
 from exec_sandbox.system_probes import (
     _check_tsc_deadline,  # pyright: ignore[reportPrivateUsage]
     _probe_io_uring_support,  # pyright: ignore[reportPrivateUsage]
+    _probe_qemu_version,  # pyright: ignore[reportPrivateUsage]
     _probe_unshare_support,  # pyright: ignore[reportPrivateUsage]
     _validate_kernel_initramfs,  # pyright: ignore[reportPrivateUsage]
     detect_accel_type,
@@ -171,10 +172,11 @@ class VmManager:
 
         # Run all async probes concurrently (they cache their results at module level)
         # This prevents cache stampede when multiple VMs start concurrently
-        accel_type, io_uring_available, unshare_available = await asyncio.gather(
+        accel_type, io_uring_available, unshare_available, qemu_version = await asyncio.gather(
             self._detect_accel_type(),  # Pre-warms HVF/KVM + QEMU accelerator caches
             _probe_io_uring_support(),
             _probe_unshare_support(),
+            _probe_qemu_version(),  # Pre-warm QEMU version for netdev reconnect
         )
 
         # Pre-warm TSC deadline (unified function handles arch/OS dispatch)
@@ -196,6 +198,7 @@ class VmManager:
                 "accel_type": accel_type.value,
                 "io_uring_available": io_uring_available,
                 "unshare_available": unshare_available,
+                "qemu_version": ".".join(map(str, qemu_version)) if qemu_version else None,
                 "note": "All system probes pre-warmed (stampede prevention)",
             },
         )

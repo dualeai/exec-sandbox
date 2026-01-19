@@ -327,6 +327,561 @@ class TestQemuAcceleratorProbe:
         assert _probe_cache.qemu_accels is None
 
 
+# ============================================================================
+# Unit Tests - QEMU Version Probe
+# ============================================================================
+
+
+class TestQemuVersionProbe:
+    """Tests for _probe_qemu_version() - QEMU binary version detection.
+
+    This probe detects QEMU version to select appropriate netdev reconnect parameter:
+    - QEMU 9.2+: reconnect-ms (milliseconds)
+    - QEMU 8.0-9.1: reconnect (seconds)
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        _probe_cache.qemu_version = None
+
+    # ========================================================================
+    # Normal Cases - Happy path scenarios
+    # ========================================================================
+
+    async def test_probe_parses_standard_version(self) -> None:
+        """Probe parses standard QEMU version output."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"QEMU emulator version 8.2.0\n", b""))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result == (8, 2, 0)
+
+    async def test_probe_result_is_cached(self) -> None:
+        """Subsequent calls return cached result."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        _probe_cache.qemu_version = (10, 0, 0)
+        result = await _probe_qemu_version()
+        assert result == (10, 0, 0)
+
+    async def test_probe_parses_qemu_9_2(self) -> None:
+        """Probe correctly identifies QEMU 9.2 (reconnect-ms threshold)."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"QEMU emulator version 9.2.0\n", b""))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result == (9, 2, 0)
+        assert result >= (9, 2, 0)  # Threshold check
+
+    # ========================================================================
+    # Edge Cases - Version formats
+    # ========================================================================
+
+    async def test_probe_parses_two_part_version(self) -> None:
+        """Probe handles version without patch number (e.g., 10.0)."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"QEMU emulator version 10.0\n", b""))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result == (10, 0, 0)
+
+    async def test_probe_parses_homebrew_suffix(self) -> None:
+        """Probe handles Homebrew version suffix."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"QEMU emulator version 8.2.0 (Homebrew)\n", b""))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result == (8, 2, 0)
+
+    async def test_probe_parses_dev_version(self) -> None:
+        """Probe handles development version with git hash."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"QEMU emulator version 10.0.0 (v10.0.0-123-gabcdef)\n", b""))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result == (10, 0, 0)
+
+    async def test_probe_parses_debian_suffix(self) -> None:
+        """Probe handles Debian/Ubuntu version suffix."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(
+            return_value=(b"QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1)\n", b"")
+        )
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result == (8, 2, 2)
+
+    # ========================================================================
+    # Error Cases
+    # ========================================================================
+
+    async def test_probe_returns_none_on_missing_binary(self) -> None:
+        """Probe returns None when QEMU binary not found."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.side_effect = FileNotFoundError()
+            result = await _probe_qemu_version()
+
+        assert result is None
+
+    async def test_probe_returns_none_on_timeout(self) -> None:
+        """Probe returns None on timeout."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result is None
+
+    async def test_probe_returns_none_on_unparseable_output(self) -> None:
+        """Probe returns None when version cannot be parsed."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"Unknown output\n", b""))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result is None
+
+    async def test_probe_returns_none_on_nonzero_exit(self) -> None:
+        """Probe returns None when QEMU returns non-zero exit code."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"error"))
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await _probe_qemu_version()
+
+        assert result is None
+
+    async def test_probe_returns_none_on_oserror(self) -> None:
+        """Probe returns None on OSError."""
+        from exec_sandbox.system_probes import _probe_qemu_version
+
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
+            mock_exec.side_effect = OSError("Permission denied")
+            result = await _probe_qemu_version()
+
+        assert result is None
+
+    # ========================================================================
+    # Version Comparison Tests
+    # ========================================================================
+
+    async def test_version_tuple_comparison_works(self) -> None:
+        """Verify tuple comparison works correctly for version checks."""
+        # These are the actual comparisons used in qemu_cmd.py
+        assert (9, 2, 0) >= (9, 2, 0)  # QEMU 9.2.0 uses reconnect-ms
+        assert (9, 2, 1) >= (9, 2, 0)  # QEMU 9.2.1 uses reconnect-ms
+        assert (10, 0, 0) >= (9, 2, 0)  # QEMU 10.0.0 uses reconnect-ms
+        assert not (9, 1, 0) >= (9, 2, 0)  # QEMU 9.1.0 uses reconnect
+        assert not (8, 2, 0) >= (9, 2, 0)  # QEMU 8.2.0 uses reconnect
+
+        assert (8, 2, 0) >= (8, 0, 0)  # QEMU 8.2.0 uses reconnect
+        assert (9, 1, 0) >= (8, 0, 0)  # QEMU 9.1.0 uses reconnect
+        assert not (7, 2, 0) >= (8, 0, 0)  # QEMU 7.x doesn't have reconnect
+
+    async def test_cache_cleared_between_tests(self) -> None:
+        """Verify cache is properly cleared (test isolation)."""
+        assert _probe_cache.qemu_version is None
+
+
+# ============================================================================
+# Unit Tests - Netdev Reconnect Parameter
+# ============================================================================
+
+
+class TestNetdevReconnect:
+    """Tests for netdev reconnect parameter based on QEMU version.
+
+    The reconnect parameter helps recover from transient socket disconnections
+    between QEMU and gvproxy (which can cause DNS resolution failures).
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        _probe_cache.qemu_version = None
+
+    async def test_netdev_uses_reconnect_ms_for_qemu_9_2(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 9.2+ uses reconnect-ms parameter."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-9-2")
+        try:
+            with patch("exec_sandbox.qemu_cmd._probe_qemu_version", return_value=(9, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-reconnect-9-2",
+                    workdir=workdir,
+                    memory_mb=256,
+                    allow_network=True,
+                )
+
+            # Find the netdev argument
+            netdev_arg = None
+            for i, arg in enumerate(cmd):
+                if arg == "-netdev" and i + 1 < len(cmd):
+                    netdev_arg = cmd[i + 1]
+                    break
+
+            assert netdev_arg is not None, "netdev argument not found in command"
+            assert "stream,id=net0" in netdev_arg
+            assert "reconnect-ms=250" in netdev_arg
+            assert "reconnect=1" not in netdev_arg
+        finally:
+            await workdir.cleanup()
+
+    async def test_netdev_uses_reconnect_for_qemu_8_x(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 8.x uses reconnect parameter (seconds)."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-8-x")
+        try:
+            with patch("exec_sandbox.qemu_cmd._probe_qemu_version", return_value=(8, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-reconnect-8-x",
+                    workdir=workdir,
+                    memory_mb=256,
+                    allow_network=True,
+                )
+
+            # Find the netdev argument
+            netdev_arg = None
+            for i, arg in enumerate(cmd):
+                if arg == "-netdev" and i + 1 < len(cmd):
+                    netdev_arg = cmd[i + 1]
+                    break
+
+            assert netdev_arg is not None, "netdev argument not found in command"
+            assert "stream,id=net0" in netdev_arg
+            assert "reconnect=1" in netdev_arg
+            assert "reconnect-ms" not in netdev_arg
+        finally:
+            await workdir.cleanup()
+
+    async def test_netdev_uses_reconnect_ms_for_qemu_10(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 10.0+ uses reconnect-ms parameter (reconnect removed)."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-10")
+        try:
+            with patch("exec_sandbox.qemu_cmd._probe_qemu_version", return_value=(10, 0, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-reconnect-10",
+                    workdir=workdir,
+                    memory_mb=256,
+                    allow_network=True,
+                )
+
+            # Find the netdev argument
+            netdev_arg = None
+            for i, arg in enumerate(cmd):
+                if arg == "-netdev" and i + 1 < len(cmd):
+                    netdev_arg = cmd[i + 1]
+                    break
+
+            assert netdev_arg is not None, "netdev argument not found in command"
+            assert "stream,id=net0" in netdev_arg
+            assert "reconnect-ms=250" in netdev_arg
+            assert "reconnect=1" not in netdev_arg
+        finally:
+            await workdir.cleanup()
+
+    async def test_netdev_no_reconnect_when_version_unknown(self, vm_settings, tmp_path: Path) -> None:
+        """No reconnect when QEMU version cannot be detected."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-unknown")
+        try:
+            with patch("exec_sandbox.qemu_cmd._probe_qemu_version", return_value=None):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-reconnect-unknown",
+                    workdir=workdir,
+                    memory_mb=256,
+                    allow_network=True,
+                )
+
+            # Find the netdev argument
+            netdev_arg = None
+            for i, arg in enumerate(cmd):
+                if arg == "-netdev" and i + 1 < len(cmd):
+                    netdev_arg = cmd[i + 1]
+                    break
+
+            assert netdev_arg is not None, "netdev argument not found in command"
+            assert "stream,id=net0" in netdev_arg
+            assert "reconnect" not in netdev_arg
+        finally:
+            await workdir.cleanup()
+
+    async def test_netdev_no_reconnect_for_qemu_7(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 7.x (pre-8.0) doesn't have reconnect parameter."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-7")
+        try:
+            with patch("exec_sandbox.qemu_cmd._probe_qemu_version", return_value=(7, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-reconnect-7",
+                    workdir=workdir,
+                    memory_mb=256,
+                    allow_network=True,
+                )
+
+            # Find the netdev argument
+            netdev_arg = None
+            for i, arg in enumerate(cmd):
+                if arg == "-netdev" and i + 1 < len(cmd):
+                    netdev_arg = cmd[i + 1]
+                    break
+
+            assert netdev_arg is not None, "netdev argument not found in command"
+            assert "stream,id=net0" in netdev_arg
+            assert "reconnect" not in netdev_arg
+        finally:
+            await workdir.cleanup()
+
+    async def test_netdev_no_reconnect_when_network_disabled(self, vm_settings, tmp_path: Path) -> None:
+        """No netdev at all when network is disabled."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-no-network")
+        try:
+            with patch("exec_sandbox.qemu_cmd._probe_qemu_version", return_value=(9, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-no-network",
+                    workdir=workdir,
+                    memory_mb=256,
+                    allow_network=False,
+                )
+
+            # Should not have any netdev argument
+            netdev_found = any(arg == "-netdev" for arg in cmd)
+            assert not netdev_found, "netdev should not be present when network is disabled"
+        finally:
+            await workdir.cleanup()
+
+
+# ============================================================================
+# Integration Tests - Netdev Reconnect with Real VM
+# ============================================================================
+
+
+class TestNetdevReconnectIntegration:
+    """Integration tests for QEMU netdev reconnect behavior with real VMs.
+
+    Tests that QEMU automatically reconnects to gvproxy after socket disconnect,
+    which helps recover from transient gvproxy crashes or socket EOF errors.
+    """
+
+    async def test_network_recovers_after_gvproxy_restart(self, vm_manager) -> None:
+        """QEMU reconnects to gvproxy after socket disconnect.
+
+        Simulates the real-world scenario where gvproxy crashes or socket EOF
+        occurs. With the reconnect parameter, QEMU should automatically reconnect
+        when gvproxy is restarted on the same socket path.
+
+        Test steps:
+        1. Create VM with network, verify initial connectivity
+        2. Kill gvproxy (simulates crash/EOF)
+        3. Remove stale socket file
+        4. Restart gvproxy on same socket path
+        5. Wait for QEMU to reconnect
+        6. Verify network connectivity is restored
+        """
+        from exec_sandbox.gvproxy import start_gvproxy
+        from exec_sandbox.models import Language
+
+        vm = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test-reconnect",
+            task_id="integration",
+            memory_mb=256,
+            allow_network=True,
+            allowed_domains=["example.com"],
+        )
+
+        try:
+            # Step 1: Verify initial network connectivity
+            result1 = await vm.execute(
+                code=(
+                    "import socket\n"
+                    "s = socket.create_connection(('example.com', 80), timeout=10)\n"
+                    "s.close()\n"
+                    "print('INITIAL_OK')"
+                ),
+                timeout_seconds=30,
+            )
+            assert result1.exit_code == 0, f"Initial connection failed: {result1.stderr}"
+            assert "INITIAL_OK" in result1.stdout
+
+            # Step 2: Kill gvproxy (simulates socket EOF / crash)
+            assert vm.gvproxy_proc is not None, "VM should have gvproxy process"
+            old_gvproxy = vm.gvproxy_proc
+            await old_gvproxy.terminate()
+            await old_gvproxy.wait()
+
+            # Step 3: Remove stale socket file (create_unix_socket doesn't do this)
+            socket_path = vm.workdir.gvproxy_socket
+            if socket_path.exists():
+                socket_path.unlink()
+
+            # Step 4: Restart gvproxy on same socket path
+            new_proc, _new_log_task = await start_gvproxy(
+                vm_id=vm.vm_id,
+                allowed_domains=["example.com"],
+                language=vm.language.value,
+                workdir=vm.workdir,
+            )
+            vm.gvproxy_proc = new_proc
+            # Note: We don't cancel old log task here since gvproxy is dead,
+            # the task will complete naturally when pipes close
+
+            # Step 5: Wait for QEMU to reconnect
+            # reconnect-ms=250 (QEMU 9.2+) or reconnect=1 (QEMU 8.x)
+            # Use 3s to be safe across all versions
+            await asyncio.sleep(3)
+
+            # Step 6: Verify network connectivity is restored
+            result2 = await vm.execute(
+                code=(
+                    "import socket\n"
+                    "s = socket.create_connection(('example.com', 80), timeout=10)\n"
+                    "s.close()\n"
+                    "print('RECONNECT_OK')"
+                ),
+                timeout_seconds=30,
+            )
+            assert result2.exit_code == 0, f"Reconnect failed: {result2.stderr}"
+            assert "RECONNECT_OK" in result2.stdout
+
+        finally:
+            await vm_manager.destroy_vm(vm)
+
+    async def test_dns_resolution_after_gvproxy_restart(self, vm_manager) -> None:
+        """DNS resolution works after gvproxy restart.
+
+        This specifically tests the DNS resolution path since the original issue
+        was DNS failures due to socket EOF between QEMU and gvproxy.
+        """
+        from exec_sandbox.gvproxy import start_gvproxy
+        from exec_sandbox.models import Language
+
+        vm = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test-dns-reconnect",
+            task_id="dns-integration",
+            memory_mb=256,
+            allow_network=True,
+            allowed_domains=["example.com"],
+        )
+
+        try:
+            # Verify initial DNS resolution
+            result1 = await vm.execute(
+                code=(
+                    "import socket\n"
+                    "ip = socket.gethostbyname('example.com')\n"
+                    "print(f'INITIAL_DNS_OK:{ip}')"
+                ),
+                timeout_seconds=30,
+            )
+            assert result1.exit_code == 0, f"Initial DNS failed: {result1.stderr}"
+            assert "INITIAL_DNS_OK:" in result1.stdout
+
+            # Kill and restart gvproxy
+            assert vm.gvproxy_proc is not None
+            await vm.gvproxy_proc.terminate()
+            await vm.gvproxy_proc.wait()
+
+            socket_path = vm.workdir.gvproxy_socket
+            if socket_path.exists():
+                socket_path.unlink()
+
+            new_proc, _ = await start_gvproxy(
+                vm_id=vm.vm_id,
+                allowed_domains=["example.com"],
+                language=vm.language.value,
+                workdir=vm.workdir,
+            )
+            vm.gvproxy_proc = new_proc
+
+            await asyncio.sleep(3)
+
+            # Verify DNS still works after reconnect
+            result2 = await vm.execute(
+                code=(
+                    "import socket\n"
+                    "ip = socket.gethostbyname('example.com')\n"
+                    "print(f'RECONNECT_DNS_OK:{ip}')"
+                ),
+                timeout_seconds=30,
+            )
+            assert result2.exit_code == 0, f"DNS after reconnect failed: {result2.stderr}"
+            assert "RECONNECT_DNS_OK:" in result2.stdout
+
+        finally:
+            await vm_manager.destroy_vm(vm)
+
+
 class TestTwoLayerKvmDetection:
     """Tests for 2-layer KVM detection (kernel + QEMU verification)."""
 

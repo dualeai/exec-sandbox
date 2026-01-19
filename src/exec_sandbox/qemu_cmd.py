@@ -12,6 +12,7 @@ from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
     _check_tsc_deadline,  # pyright: ignore[reportPrivateUsage]
     _probe_io_uring_support,  # pyright: ignore[reportPrivateUsage]
+    _probe_qemu_version,  # pyright: ignore[reportPrivateUsage]
     _probe_unshare_support,  # pyright: ignore[reportPrivateUsage]
     detect_accel_type,
 )
@@ -544,10 +545,23 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # virtio-net configuration (optional, internet access only)
     if allow_network:
+        # Build netdev options with reconnect for socket resilience
+        # Helps recover from transient gvproxy disconnections (DNS failures, socket EOF)
+        netdev_opts = f"stream,id=net0,addr.type=unix,addr.path={workdir.gvproxy_socket}"
+
+        # Add reconnect parameter (version-dependent)
+        # - QEMU 9.2+: reconnect-ms (milliseconds), reconnect removed in 10.0
+        # - QEMU 8.0-9.1: reconnect (seconds), minimum 1s
+        qemu_version = await _probe_qemu_version()
+        if qemu_version is not None and qemu_version >= (9, 2, 0):
+            netdev_opts += ",reconnect-ms=250"  # 250ms - balanced recovery
+        elif qemu_version is not None and qemu_version >= (8, 0, 0):
+            netdev_opts += ",reconnect=1"  # 1s minimum (integer-only param)
+
         qemu_args.extend(
             [
                 "-netdev",
-                f"stream,id=net0,addr.type=unix,addr.path={workdir.gvproxy_socket}",
+                netdev_opts,
                 "-device",
                 f"virtio-net-{virtio_suffix},netdev=net0,mq=off,csum=off,gso=off,host_tso4=off,host_tso6=off,mrg_rxbuf=off,ctrl_rx=off,guest_announce=off",
             ]

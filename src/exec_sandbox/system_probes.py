@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 
@@ -33,6 +34,7 @@ __all__ = [
     "_probe_cache",
     "_probe_io_uring_support",
     "_probe_qemu_accelerators",
+    "_probe_qemu_version",
     "_probe_unshare_support",
     "_validate_kernel_initramfs",
     "check_fast_balloon_available",
@@ -63,6 +65,7 @@ class _ProbeCache:
         "io_uring",
         "kvm",
         "qemu_accels",
+        "qemu_version",
         "tsc_deadline",
         "unshare",
     )
@@ -72,6 +75,7 @@ class _ProbeCache:
         self.io_uring: bool | None = None
         self.kvm: bool | None = None
         self.qemu_accels: set[str] | None = None  # Accelerators available in QEMU binary
+        self.qemu_version: tuple[int, int, int] | None = None  # QEMU semver (major, minor, patch)
         self.tsc_deadline: bool | None = None
         self.unshare: bool | None = None
         self._locks: dict[str, asyncio.Lock] = {}
@@ -171,6 +175,64 @@ async def _probe_qemu_accelerators() -> set[str]:
             _probe_cache.qemu_accels = set()
 
         return _probe_cache.qemu_accels
+
+
+async def _probe_qemu_version() -> tuple[int, int, int] | None:
+    """Probe QEMU binary version (cached).
+
+    Returns:
+        Semver tuple (major, minor, patch), or None if detection fails.
+        Example: (8, 2, 0) for QEMU 8.2.0
+
+    Tuples compare naturally as semver: (9, 2, 0) >= (9, 2, 0) works correctly.
+    """
+    # Fast path: return cached result (no lock needed)
+    if _probe_cache.qemu_version is not None:
+        return _probe_cache.qemu_version
+
+    # Slow path: acquire lock to prevent stampede, then check cache again
+    async with _probe_cache.get_lock("qemu_version"):
+        # Double-check after acquiring lock (another task may have populated cache)
+        if _probe_cache.qemu_version is not None:
+            return _probe_cache.qemu_version
+
+        # Determine QEMU binary based on host architecture
+        arch = detect_host_arch()
+        qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                qemu_bin,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+
+            if proc.returncode != 0:
+                logger.warning("QEMU version probe failed", extra={"returncode": proc.returncode})
+                return None
+
+            # Parse "QEMU emulator version X.Y.Z" (handles suffixes like "(Homebrew)")
+            output = stdout.decode().strip()
+            match = re.search(r"QEMU emulator version (\d+)\.(\d+)(?:\.(\d+))?", output)
+            if match:
+                major = int(match.group(1))
+                minor = int(match.group(2))
+                patch = int(match.group(3)) if match.group(3) else 0
+                _probe_cache.qemu_version = (major, minor, patch)
+                logger.debug("QEMU version detected", extra={"version": f"{major}.{minor}.{patch}"})
+                return _probe_cache.qemu_version
+
+            logger.warning("Could not parse QEMU version", extra={"output": output[:100]})
+            return None
+
+        except FileNotFoundError:
+            logger.warning("QEMU binary not found", extra={"qemu_bin": qemu_bin})
+            return None
+        except (OSError, TimeoutError) as e:
+            logger.warning("QEMU version probe failed", extra={"error": str(e)})
+            return None
 
 
 async def _check_kvm_available() -> bool:
