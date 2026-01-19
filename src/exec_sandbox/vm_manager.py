@@ -2251,11 +2251,13 @@ class VmManager:
                 },
             ) from e
 
-        # Close parent's copy of FD (child has its own via pass_fds)
-        parent_sock.close()
-
         # Wait for gvproxy to be ready (virtualnetwork.New() must complete before QEMU connects)
         # gvproxy prints "Listening on QEMU socket" after initialization is complete
+        #
+        # IMPORTANT: Keep parent_sock open until gvproxy signals readiness.
+        # On macOS HVF, closing the parent's socket reference before gvproxy calls
+        # net.FileListener() can cause the FD to be in an inconsistent state,
+        # leading to "cannot read size from socket: EOF" errors when QEMU connects.
         #
         # Design note: We use stdout event detection instead of polling or kqueue/inotify.
         # - Polling (asyncio.sleep loop): Would add 5-20ms latency between socket creation and detection
@@ -2286,6 +2288,7 @@ class VmManager:
         try:
             await asyncio.wait_for(ready_event.wait(), timeout=5.0)
         except TimeoutError:
+            parent_sock.close()
             await proc.terminate()
             await proc.wait()
             raise VmGvproxyError(
@@ -2296,6 +2299,10 @@ class VmManager:
                     "socket_path": str(socket_path),
                 },
             ) from None
+
+        # Close parent's copy of FD now that gvproxy is fully initialized
+        # (child has its own via pass_fds, socket stays alive)
+        parent_sock.close()
 
         # Grant qemu-vm user access to socket via ACL (more secure than chmod 666)
         # Only needed on Linux when qemu-vm user exists; skipped on macOS
