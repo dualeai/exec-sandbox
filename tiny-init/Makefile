@@ -20,7 +20,7 @@ test-unit:
 	$(DOCKER_RUN) cargo test --release
 
 lint:
-	$(DOCKER_RUN) sh -c "rustup component add rustfmt clippy && cargo fmt && cargo clippy --fix --allow-dirty --allow-staged"
+	$(DOCKER_RUN) sh -c "rustup component add rustfmt clippy && cargo fmt && cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs"
 
 build:
 	$(DOCKER_RUN) cargo build --release
