@@ -1418,7 +1418,30 @@ fn setup_init_environment() {
             .args(["route", "add", "default", "via", "192.168.127.1"])
             .status();
 
+        // Note: /etc/resolv.conf is pre-configured in qcow2 image (see build-qcow2.sh)
         eprintln!("Network configured: 192.168.127.2/24 via 192.168.127.1");
+
+        // Verify gvproxy connectivity (exponential backoff: 50+100+200+400+800+1000+1000 = 3550ms max)
+        // Ping the gateway to ensure gvproxy is reachable before package install
+        let mut gvproxy_ok = false;
+        for delay_ms in [50, 100, 200, 400, 800, 1000, 1000] {
+            let result = StdCommand::new("ping")
+                .args(["-c", "1", "-W", "1", "192.168.127.1"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(status) = result {
+                if status.success() {
+                    eprintln!("gvproxy connectivity verified");
+                    gvproxy_ok = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        if !gvproxy_ok {
+            eprintln!("Warning: gvproxy not reachable, package install may fail");
+        }
     } else {
         eprintln!("Warning: eth0 not found, network unavailable");
     }

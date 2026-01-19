@@ -37,7 +37,8 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 
 # Package lists for each variant
 # Common: essential tools for AI agent workflows
-COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file"
+# iputils: provides ping for guest-agent gvproxy connectivity check at boot
+COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file iputils"
 
 # Python: add build tools for C extensions (numpy, pandas, etc.)
 PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev"
