@@ -66,13 +66,13 @@ from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
 from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, read_log_tail
 from exec_sandbox.system_probes import (
-    _check_tsc_deadline,  # pyright: ignore[reportPrivateUsage]
-    _probe_io_uring_support,  # pyright: ignore[reportPrivateUsage]
-    _probe_qemu_version,  # pyright: ignore[reportPrivateUsage]
-    _probe_unshare_support,  # pyright: ignore[reportPrivateUsage]
-    _validate_kernel_initramfs,  # pyright: ignore[reportPrivateUsage]
+    check_tsc_deadline,
     detect_accel_type,
+    probe_io_uring_support,
+    probe_qemu_version,
+    probe_unshare_support,
 )
+from exec_sandbox.validation import validate_kernel_initramfs
 from exec_sandbox.vm_types import AccelType, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
@@ -174,16 +174,16 @@ class VmManager:
         # This prevents cache stampede when multiple VMs start concurrently
         accel_type, io_uring_available, unshare_available, qemu_version = await asyncio.gather(
             self._detect_accel_type(),  # Pre-warms HVF/KVM + QEMU accelerator caches
-            _probe_io_uring_support(),
-            _probe_unshare_support(),
-            _probe_qemu_version(),  # Pre-warm QEMU version for netdev reconnect
+            probe_io_uring_support(),
+            probe_unshare_support(),
+            probe_qemu_version(),  # Pre-warm QEMU version for netdev reconnect
         )
 
         # Pre-warm TSC deadline (unified function handles arch/OS dispatch)
-        await _check_tsc_deadline()
+        await check_tsc_deadline()
 
         # Pre-flight check: validate kernel and initramfs exist (cached)
-        await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
+        await validate_kernel_initramfs(self.settings.kernel_path, self.arch)
 
         # Start overlay pool (discovers base images internally)
         await self._overlay_pool.start()
@@ -358,7 +358,7 @@ class VmManager:
         _validate_identifier(task_id, "task_id")
 
         # Step 0: Validate kernel and initramfs exist (cached, one-time check)
-        await _validate_kernel_initramfs(self.settings.kernel_path, self.arch)
+        await validate_kernel_initramfs(self.settings.kernel_path, self.arch)
         arch_suffix = "aarch64" if self.arch == HostArch.AARCH64 else "x86_64"
         kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
         initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"

@@ -10,11 +10,11 @@ from exec_sandbox import cgroup, constants
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
-    _check_tsc_deadline,  # pyright: ignore[reportPrivateUsage]
-    _probe_io_uring_support,  # pyright: ignore[reportPrivateUsage]
-    _probe_qemu_version,  # pyright: ignore[reportPrivateUsage]
-    _probe_unshare_support,  # pyright: ignore[reportPrivateUsage]
+    check_tsc_deadline,
     detect_accel_type,
+    probe_io_uring_support,
+    probe_qemu_version,
+    probe_unshare_support,
 )
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
@@ -159,7 +159,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
-            tsc_available = await _check_tsc_deadline()
+            tsc_available = await check_tsc_deadline()
             if tsc_available:
                 # Full optimization: TSC_DEADLINE available, use non-legacy mode
                 machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
@@ -184,7 +184,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # Note: dump-guest-core=off not included - may not be supported on macOS QEMU
             if arch == HostArch.X86_64:
                 # Intel Mac: check TSC_DEADLINE availability
-                tsc_available = await _check_tsc_deadline()
+                tsc_available = await check_tsc_deadline()
                 if tsc_available:
                     # Full optimization: TSC_DEADLINE available, disable legacy devices
                     machine_type = (
@@ -220,7 +220,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Layer 5: Linux namespaces (optional - requires capabilities or user namespaces)
     cmd: list[str] = []
-    if detect_host_os() != HostOS.MACOS and await _probe_unshare_support():
+    if detect_host_os() != HostOS.MACOS and await probe_unshare_support():
         if allow_network:
             unshare_args = ["unshare", "--pid", "--mount", "--uts", "--ipc", "--fork"]
             cmd.extend([*unshare_args, "--"])
@@ -361,7 +361,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
 
     # Determine AIO mode based on cached startup probe
-    io_uring_available = await _probe_io_uring_support()
+    io_uring_available = await probe_io_uring_support()
     aio_mode = "io_uring" if io_uring_available else "threads"
     if not io_uring_available:
         logger.debug(
@@ -552,7 +552,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # Add reconnect parameter (version-dependent)
         # - QEMU 9.2+: reconnect-ms (milliseconds), reconnect removed in 10.0
         # - QEMU 8.0-9.1: reconnect (seconds), minimum 1s
-        qemu_version = await _probe_qemu_version()
+        qemu_version = await probe_qemu_version()
         if qemu_version is not None and qemu_version >= (9, 2, 0):
             netdev_opts += ",reconnect-ms=250"  # 250ms - balanced recovery
         elif qemu_version is not None and qemu_version >= (8, 0, 0):
