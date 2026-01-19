@@ -258,6 +258,7 @@ except MemoryError:
         assert "PASS" in result.stdout
         assert "exceeded available by" in result.stdout
 
+    @pytest.mark.slow
     async def test_swap_usage_correlates_with_allocation(self, scheduler: Scheduler) -> None:
         """Swap usage should increase proportionally as memory pressure grows."""
         result = await scheduler.run(
@@ -452,6 +453,7 @@ print('PASS: Balloon driver functional')
 class TestConcurrentVMs:
     """Tests for multiple VMs running concurrently with memory features."""
 
+    @pytest.mark.slow
     async def test_concurrent_vms_with_heavy_memory_pressure(self, images_dir: Path) -> None:
         """Concurrent VMs should each handle 180MB allocation."""
         config = SchedulerConfig(
