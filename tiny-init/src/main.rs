@@ -145,13 +145,14 @@ fn setup_zram(kver: &str) {
     load_module(&format!("{}/crypto/lz4.ko", m));
     load_module(&format!("{}/drivers/block/zram/zram.ko", m));
 
-    // Wait briefly for zram device to appear (fixes race condition)
-    // 20 iterations × 1ms = 20ms max (was 50ms)
-    for _ in 0..20 {
+    // Wait for zram device to appear after module load
+    // Exponential backoff: 1+2+4+8+16+32 = 63ms max (consistent with other wait loops)
+    // CI runners with nested virtualization need longer than 20ms
+    for delay_us in [1000, 2000, 4000, 8000, 16000, 32000] {
         if Path::new("/sys/block/zram0").exists() {
             break;
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_micros(delay_us));
     }
 
     if !Path::new("/sys/block/zram0").exists() {
