@@ -484,3 +484,17 @@ jobs:
       - name: Functional tests (macOS)
         if: matrix.platform.os == 'macos'
         run: make test-func
+
+      - name: Slow tests (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Move into delegated cgroup subtree so QEMU child processes can be managed
+          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          # Remove nproc limit for current shell (PAM limits only apply to new logins)
+          sudo prlimit --pid $$ --nproc=unlimited:unlimited
+          # Activate qemu-vm group membership for socket access
+          sg qemu-vm -c "make test-slow"
+
+      - name: Slow tests (macOS)
+        if: matrix.platform.os == 'macos'
+        run: make test-slow

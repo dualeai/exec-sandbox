@@ -97,6 +97,7 @@ addopts = [
 ]
 markers = [
     "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
+    "slow: marks tests as slow running (deselect with -m 'not slow')",
 ]
 
 [tool.pyright]
