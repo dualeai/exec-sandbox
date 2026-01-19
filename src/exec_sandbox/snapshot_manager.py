@@ -498,15 +498,26 @@ class SnapshotManager:
                             },
                         )
                 else:
-                    # QEMU died on its own - this is always unexpected during snapshot creation
-                    raise VmQemuCrashError(
-                        f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
-                        context={
-                            "cache_key": cache_key,
-                            "exit_code": vm.process.returncode,
-                            "language": language,
-                            "packages": packages,
-                        },
+                    # QEMU died on its own before we could terminate it
+                    # Exit code 0 is acceptable if install completed successfully (we reached here)
+                    # because the guest may have shut down cleanly after:
+                    # 1. Package installation completed
+                    # 2. Guest called sync() to persist filesystem changes
+                    # 3. Guest decided to halt (idle timeout, clean shutdown, etc.)
+                    # Non-zero exit codes still indicate a problem (crash, signal, etc.)
+                    if vm.process.returncode != 0:
+                        raise VmQemuCrashError(
+                            f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
+                            context={
+                                "cache_key": cache_key,
+                                "exit_code": vm.process.returncode,
+                                "language": language,
+                                "packages": packages,
+                            },
+                        )
+                    logger.info(
+                        "QEMU exited cleanly (code 0) after install completed",
+                        extra={"cache_key": cache_key, "language": language},
                     )
 
                 # Step 5: Clean up resources

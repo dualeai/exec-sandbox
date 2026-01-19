@@ -1089,16 +1089,29 @@ class VmManager:
             await vm.process.wait()
 
             # macOS HVF: Clean QEMU exit (code 0) is expected with -no-reboot
+            # when VM shuts down normally after execution completes.
             host_os = detect_host_os()
-            match host_os:
-                case HostOS.MACOS if vm.process.returncode == 0:
-                    logger.info(
-                        "QEMU process exited cleanly (expected on macOS HVF with -no-reboot)",
-                        extra={"vm_id": vm.vm_id, "exit_code": 0},
-                    )
-                    return
-                case _:
-                    pass
+            if host_os == HostOS.MACOS and vm.process.returncode == 0:
+                logger.info(
+                    "QEMU process exited cleanly (expected on macOS with -no-reboot)",
+                    extra={"vm_id": vm.vm_id, "exit_code": 0},
+                )
+                return
+
+            # TCG emulation: Exit code 0 during boot indicates timing race on
+            # ARM64 GIC/virtio-MMIO initialization (translation cache pressure,
+            # single-threaded TCG throughput limits). Log as warning for visibility,
+            # then raise VmQemuCrashError to trigger outer retry with fresh VM.
+            accel_type = await detect_accel_type()
+            if accel_type == AccelType.TCG and vm.process.returncode == 0:
+                logger.warning(
+                    "QEMU TCG exited with code 0 during boot (timing race, will retry)",
+                    extra={"vm_id": vm.vm_id, "exit_code": 0, "host_os": host_os.value},
+                )
+                raise VmQemuCrashError(
+                    "QEMU TCG exited with code 0 during boot (timing race on virtio-mmio init)",
+                    context={"vm_id": vm.vm_id, "exit_code": 0, "accel_type": "tcg"},
+                )
 
             # Process died - capture output
             stdout_text, stderr_text = await self._capture_qemu_output(vm.process)
