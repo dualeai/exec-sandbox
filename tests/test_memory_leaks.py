@@ -78,7 +78,8 @@ async def test_no_memory_leak_without_network(iterations: int, images_dir: Path)
         tasks = [scheduler.run(code="print('ok')", language=Language.PYTHON) for _ in range(iterations)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        successes = sum(1 for r in results if not isinstance(r, Exception) and r.exit_code == 0)
+        # Use BaseException to catch CancelledError (BaseException, not Exception in Python 3.8+)
+        successes = sum(1 for r in results if not isinstance(r, BaseException) and r.exit_code == 0)
         assert successes >= iterations * 0.9, f"Only {successes}/{iterations} succeeded"
 
     gc.collect()
@@ -113,7 +114,8 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        successes = sum(1 for r in results if not isinstance(r, Exception) and r.exit_code == 0)
+        # Use BaseException to catch CancelledError (BaseException, not Exception in Python 3.8+)
+        successes = sum(1 for r in results if not isinstance(r, BaseException) and r.exit_code == 0)
         assert successes >= iterations * 0.9, f"Only {successes}/{iterations} succeeded"
 
     gc.collect()
@@ -200,7 +202,8 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
 
         peak_rss = await tracker.stop()
 
-        successes = sum(1 for r in results if not isinstance(r, Exception) and r.exit_code == 0)
+        # Use BaseException to catch CancelledError (BaseException, not Exception in Python 3.8+)
+        successes = sum(1 for r in results if not isinstance(r, BaseException) and r.exit_code == 0)
         assert successes >= concurrent_vms * 0.9, f"Only {successes}/{concurrent_vms} succeeded"
 
     peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
