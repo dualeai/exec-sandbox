@@ -276,7 +276,7 @@ jobs:
   # ==========================================================================
 
   test-python:
-    name: Test / Python ${{ matrix.python-version }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
+    name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
     needs: [build-gvproxy-wrapper, build-vm-images]
     env:
@@ -286,6 +286,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14", "3.14t"]
+        test-type: [func, sudo, slow]
         platform:
           - os: linux
             arch: x64
@@ -459,7 +460,7 @@ jobs:
           echo -e "[Slice]\nTasksMax=infinity" | sudo tee /etc/systemd/system/user-.slice.d/90-tasksmax.conf
           sudo systemctl daemon-reload
 
-      - name: Functional tests (Linux)
+      - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'
         run: |
           # Move into delegated cgroup subtree so QEMU child processes can be managed
@@ -469,32 +470,18 @@ jobs:
           # prlimit requires sudo to raise limits above current hard limit
           sudo prlimit --pid $$ --nproc=unlimited:unlimited
           # Activate qemu-vm group membership for socket access (chardev sockets are 0660)
-          sg qemu-vm -c "make test-func"
+          # Sudo tests require elevated privileges
+          if [ "${{ matrix.test-type }}" = "sudo" ]; then
+            sudo env "PATH=$PATH" sg qemu-vm -c "make test-${{ matrix.test-type }}"
+          else
+            sg qemu-vm -c "make test-${{ matrix.test-type }}"
+          fi
 
-      - name: Sudo tests (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Move into delegated cgroup subtree so QEMU child processes can be managed
-          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          # Remove nproc limit for current shell (PAM limits only apply to new logins)
-          sudo prlimit --pid $$ --nproc=unlimited:unlimited
-          # Activate qemu-vm group membership for socket access, run with sudo for privileged tests
-          sudo env "PATH=$PATH" sg qemu-vm -c "make test-sudo"
-
-      - name: Functional tests (macOS)
+      - name: Run tests (macOS)
         if: matrix.platform.os == 'macos'
-        run: make test-func
-
-      - name: Slow tests (Linux)
-        if: matrix.platform.os == 'linux'
         run: |
-          # Move into delegated cgroup subtree so QEMU child processes can be managed
-          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          # Remove nproc limit for current shell (PAM limits only apply to new logins)
-          sudo prlimit --pid $$ --nproc=unlimited:unlimited
-          # Activate qemu-vm group membership for socket access
-          sg qemu-vm -c "make test-slow"
-
-      - name: Slow tests (macOS)
-        if: matrix.platform.os == 'macos'
-        run: make test-slow
+          if [ "${{ matrix.test-type }}" = "sudo" ]; then
+            sudo make test-${{ matrix.test-type }}
+          else
+            make test-${{ matrix.test-type }}
+          fi
