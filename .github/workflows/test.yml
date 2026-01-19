@@ -462,6 +462,7 @@ jobs:
 
       - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'
+        timeout-minutes: 60
         run: |
           # Move into delegated cgroup subtree so QEMU child processes can be managed
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
@@ -479,6 +480,7 @@ jobs:
 
       - name: Run tests (macOS)
         if: matrix.platform.os == 'macos'
+        timeout-minutes: 60
         run: |
           if [ "${{ matrix.test-type }}" = "sudo" ]; then
             sudo make test-${{ matrix.test-type }}

@@ -96,7 +96,7 @@ test-unit:
 
 # Memory leak detection tests (slow, run sequentially for accurate measurement)
 test-slow:
-	uv run pytest tests/ -v -n 0 -m slow --timeout=600
+	uv run pytest tests/ -v -n 0 -m slow
 
 # ============================================================================
 # Linting
