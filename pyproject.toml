@@ -106,7 +106,7 @@ typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
 include = ["src", "scripts"]
-exclude = [".venv", "tests"]
+exclude = [".venv*", "tests"]
 stubPath = "stubs"
 
 [tool.ruff]
