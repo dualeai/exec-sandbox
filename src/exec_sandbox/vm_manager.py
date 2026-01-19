@@ -64,6 +64,7 @@ from exec_sandbox.permission_utils import (
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.resource_cleanup import cleanup_process, cleanup_vm_processes
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
@@ -1705,7 +1706,7 @@ class VmManager:
                 overlay_start = asyncio.get_event_loop().time()
                 try:
                     await self._overlay_pool.acquire(base_image, workdir.overlay_image)
-                except QemuImgError as e:
+                except (QemuImgError, QemuStorageDaemonError) as e:
                     raise VmError(str(e)) from e
                 overlay_ms = round((asyncio.get_event_loop().time() - overlay_start) * 1000)
                 # Apply permissions in parallel with cgroup setup
