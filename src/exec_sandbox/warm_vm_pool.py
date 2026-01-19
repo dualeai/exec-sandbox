@@ -166,7 +166,7 @@ class WarmVMPool:
         Logs progress for operational visibility.
 
         Raises:
-            VmError: If critical number of VMs fail to boot
+            VmTransientError: If critical number of VMs fail to boot
         """
         logger.info(
             "Starting warm VM pool",

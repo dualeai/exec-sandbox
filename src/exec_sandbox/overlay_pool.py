@@ -26,18 +26,11 @@ import aiofiles.os
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.exceptions import VmOverlayError as QemuImgError
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError
 
 logger = get_logger(__name__)
-
-
-class QemuImgError(Exception):
-    """qemu-img command failed."""
-
-    def __init__(self, message: str, stderr: str = "") -> None:
-        super().__init__(message)
-        self.stderr = stderr
 
 
 async def create_qcow2_overlay(base_image: Path, overlay_path: Path) -> None:

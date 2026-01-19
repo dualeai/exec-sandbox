@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import SandboxError, SnapshotError, VmError
+from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.settings import Settings
 
@@ -456,7 +456,7 @@ class Scheduler:
                 },
             )
             return snapshot_path
-        except (OSError, RuntimeError, TimeoutError, ConnectionError, SnapshotError, VmError) as e:
+        except (OSError, RuntimeError, TimeoutError, ConnectionError, SandboxError) as e:
             # Graceful degradation: log error, continue without snapshot
             logger.warning(
                 "Snapshot creation failed, continuing without cache",

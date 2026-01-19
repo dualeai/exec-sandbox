@@ -46,7 +46,17 @@ from tenacity import (
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.dns_filter import generate_dns_zones_json
-from exec_sandbox.exceptions import VmError, VmTimeoutError
+from exec_sandbox.exceptions import (
+    VmBootTimeoutError,
+    VmCapacityError,
+    VmConfigError,
+    VmDependencyError,
+    VmGvproxyError,
+    VmOverlayError,
+    VmPermanentError,
+    VmQemuCrashError,
+    VmTransientError,
+)
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     PingRequest,
@@ -879,12 +889,12 @@ async def _validate_kernel_initramfs(kernel_path: Path, arch: HostArch) -> None:
     initramfs = kernel_path / f"initramfs-{arch_suffix}"
 
     if not await aiofiles.os.path.exists(kernel):
-        raise VmError(
+        raise VmDependencyError(
             f"Kernel not found: {kernel}",
             context={"kernel_path": str(kernel), "arch": arch_suffix},
         )
     if not await aiofiles.os.path.exists(initramfs):
-        raise VmError(
+        raise VmDependencyError(
             f"Initramfs not found: {initramfs}",
             context={"initramfs_path": str(initramfs), "arch": arch_suffix},
         )
@@ -1104,13 +1114,13 @@ class QemuVM:
             new_state: Target state to transition to
 
         Raises:
-            VmError: If transition is invalid for current state
+            VmPermanentError: If transition is invalid for current state
         """
         async with self._state_lock:
             # Validate transition is allowed from current state
             allowed_transitions = VALID_STATE_TRANSITIONS.get(self._state, set())
             if new_state not in allowed_transitions:
-                raise VmError(
+                raise VmPermanentError(
                     f"Invalid state transition: {self._state.value} → {new_state.value}",
                     context={
                         "vm_id": self.vm_id,
@@ -1169,13 +1179,13 @@ class QemuVM:
             ExecutionResult with stdout, stderr, exit code, and resource usage
 
         Raises:
-            VmError: VM not in READY state or communication failed
-            VmTimeoutError: Execution exceeded timeout_seconds
+            VmPermanentError: VM not in READY state or communication failed
+            VmBootTimeoutError: Execution exceeded timeout_seconds
         """
         # Validate VM is in READY state before execution (atomic check-and-set)
         async with self._state_lock:
             if self._state != VmState.READY:
-                raise VmError(
+                raise VmPermanentError(
                     f"Cannot execute in state {self._state.value}, must be READY",
                     context={
                         "vm_id": self.vm_id,
@@ -1187,7 +1197,7 @@ class QemuVM:
             # Validate transition to EXECUTING (inline to avoid lock re-acquisition)
             allowed_transitions = VALID_STATE_TRANSITIONS.get(self._state, set())
             if VmState.EXECUTING not in allowed_transitions:
-                raise VmError(
+                raise VmPermanentError(
                     f"Invalid state transition: {self._state.value} → {VmState.EXECUTING.value}",
                     context={
                         "vm_id": self.vm_id,
@@ -1224,7 +1234,7 @@ class QemuVM:
             # which would transition state to DESTROYING or DESTROYED
             # Note: pyright doesn't understand async race conditions, so we suppress the warning
             if self._state in (VmState.DESTROYING, VmState.DESTROYED):  # type: ignore[comparison-overlap]
-                raise VmError(
+                raise VmPermanentError(
                     "VM destroyed during execution start",
                     context={
                         "vm_id": self.vm_id,
@@ -1343,7 +1353,7 @@ class QemuVM:
             # Success - transition back to READY for reuse (if not destroyed)
             try:
                 await self.transition_state(VmState.READY)
-            except VmError as e:
+            except VmPermanentError as e:
                 # VM destroyed while executing, skip transition
                 logger.debug(
                     "VM destroyed during execution, skipping READY transition",
@@ -1359,7 +1369,7 @@ class QemuVM:
             # Re-raise to propagate cancellation
             raise
         except TimeoutError as e:
-            raise VmTimeoutError(
+            raise VmBootTimeoutError(
                 f"VM {self.vm_id} execution exceeded {timeout_seconds}s timeout",
                 context={
                     "vm_id": self.vm_id,
@@ -1368,7 +1378,7 @@ class QemuVM:
                 },
             ) from e
         except (OSError, json.JSONDecodeError) as e:
-            raise VmError(
+            raise VmTransientError(
                 f"VM {self.vm_id} communication failed: {e}",
                 context={
                     "vm_id": self.vm_id,
@@ -1415,7 +1425,7 @@ class QemuVM:
             # Validate transition to DESTROYING (inline to avoid lock re-acquisition)
             allowed_transitions = VALID_STATE_TRANSITIONS.get(self._state, set())
             if VmState.DESTROYING not in allowed_transitions:
-                raise VmError(
+                raise VmPermanentError(
                     f"Invalid state transition: {self._state.value} → {VmState.DESTROYING.value}",
                     context={
                         "vm_id": self.vm_id,
@@ -1605,7 +1615,8 @@ class VmManager:
             QemuVM handle for code execution
 
         Raises:
-            VmError: VM creation failed after all retries
+            VmTransientError: VM creation failed (retried, then re-raised)
+            VmPermanentError: VM creation failed (not retryable)
             asyncio.TimeoutError: VM boot timeout after all retries
         """
         async with self._semaphore:
@@ -1615,7 +1626,8 @@ class VmManager:
                     min=constants.VM_BOOT_RETRY_MIN_SECONDS,
                     max=constants.VM_BOOT_RETRY_MAX_SECONDS,
                 ),
-                retry=retry_if_exception_type((VmError, TimeoutError)),
+                # Only retry transient errors - permanent errors (config, capacity, dependency) should fail immediately
+                retry=retry_if_exception_type((VmTransientError, TimeoutError)),
                 before_sleep=before_sleep_log(logger, logging.WARNING),
                 reraise=True,
             ):
@@ -1673,7 +1685,13 @@ class VmManager:
             QemuVM handle for code execution
 
         Raises:
-            VmError: VM creation failed
+            VmConfigError: Invalid configuration (mutually exclusive args)
+            VmDependencyError: Missing kernel, image, or qemu-vm user
+            VmOverlayError: Overlay creation failed
+            VmQemuCrashError: QEMU crashed during startup
+            VmBootTimeoutError: Guest agent not ready in time
+            VmCapacityError: VM pool at capacity
+            VmGvproxyError: gvproxy startup failed
             asyncio.TimeoutError: VM boot timeout (>5s)
         """
         # Start timing
@@ -1695,7 +1713,7 @@ class VmManager:
 
         # Validate mutual exclusivity
         if backing_image and direct_write_target:
-            raise VmError("backing_image and direct_write_target are mutually exclusive")
+            raise VmConfigError("backing_image and direct_write_target are mutually exclusive")
 
         # Step 1.5: Create working directory for all VM temp files
         # Uses tempfile.mkdtemp() for atomic, secure directory creation (mode 0700)
@@ -1773,7 +1791,7 @@ class VmManager:
                 try:
                     await self._overlay_pool.acquire(base_image, workdir.overlay_image)
                 except (QemuImgError, QemuStorageDaemonError) as e:
-                    raise VmError(str(e)) from e
+                    raise VmOverlayError(str(e)) from e
                 overlay_ms = round((asyncio.get_event_loop().time() - overlay_start) * 1000)
                 # Apply permissions in parallel with cgroup setup
                 perm_result, cgroup_result = await asyncio.gather(
@@ -1817,7 +1835,7 @@ class VmManager:
                 expected_uid = get_qemu_vm_uid()
                 if expected_uid is None:
                     # qemu-vm user expected but doesn't exist - configuration error
-                    raise VmError(
+                    raise VmDependencyError(
                         "qemu-vm user required for socket authentication but not found",
                         {"use_qemu_vm_user": True},
                     )
@@ -1894,7 +1912,7 @@ class VmManager:
                     )
 
                     max_bytes = constants.QEMU_OUTPUT_MAX_BYTES
-                    raise VmError(
+                    raise VmQemuCrashError(
                         f"QEMU crashed immediately (exit code {qemu_proc.returncode}). "
                         f"stderr: {stderr_text[:max_bytes] if stderr_text else '(empty)'}, "
                         f"stdout: {stdout_text[:max_bytes] if stdout_text else '(empty)'}",
@@ -1944,7 +1962,7 @@ class VmManager:
                 qemu_log_task.add_done_callback(_log_task_exception)
 
             except (OSError, FileNotFoundError) as e:
-                raise VmError(
+                raise VmDependencyError(
                     f"Failed to launch QEMU: {e}",
                     context={
                         "vm_id": vm_id,
@@ -1971,7 +1989,9 @@ class VmManager:
             # Step 8a: Register VM in registry (before BOOTING to ensure tracking)
             async with self._vms_lock:
                 if len(self._vms) >= self.settings.max_concurrent_vms:
-                    raise VmError(f"VM pool full: {len(self._vms)}/{self.settings.max_concurrent_vms} VMs active")
+                    raise VmCapacityError(
+                        f"VM pool full: {len(self._vms)}/{self.settings.max_concurrent_vms} VMs active"
+                    )
                 self._vms[vm.vm_id] = vm
 
             # Transition to BOOTING state
@@ -2041,7 +2061,7 @@ class VmManager:
                     else:
                         qemu_binary = qemu_cmd[0]
 
-                raise VmError(
+                raise VmBootTimeoutError(
                     f"Guest agent not ready after {constants.VM_BOOT_TIMEOUT_SECONDS}s: {e}. "
                     f"qemu_binary={qemu_binary}, qemu_running={qemu_proc.returncode is None}, "
                     f"returncode={qemu_proc.returncode}, "
@@ -2156,7 +2176,8 @@ class VmManager:
             Tuple of (gvproxy_process, gvproxy_log_task)
 
         Raises:
-            VmError: Failed to start gvproxy-wrapper
+            VmGvproxyError: Failed to create socket or start gvproxy-wrapper
+            VmDependencyError: gvproxy-wrapper binary not found
         """
         socket_path = workdir.gvproxy_socket
 
@@ -2179,7 +2200,7 @@ class VmManager:
             parent_sock = create_unix_socket(str(socket_path))
             socket_fd = parent_sock.fileno()
         except OSError as e:
-            raise VmError(
+            raise VmGvproxyError(
                 f"Failed to create gvproxy socket: {e}",
                 context={
                     "vm_id": vm_id,
@@ -2194,7 +2215,7 @@ class VmManager:
         gvproxy_binary = await get_gvproxy_path()
         if gvproxy_binary is None:
             parent_sock.close()
-            raise VmError(
+            raise VmDependencyError(
                 "gvproxy-wrapper binary not found. "
                 "Either enable auto_download_assets=True in SchedulerConfig, "
                 "or run 'make build' to build it locally."
@@ -2215,7 +2236,7 @@ class VmManager:
             )
         except (OSError, FileNotFoundError) as e:
             parent_sock.close()
-            raise VmError(
+            raise VmGvproxyError(
                 f"Failed to start gvproxy-wrapper: {e}",
                 context={
                     "vm_id": vm_id,
@@ -2262,7 +2283,7 @@ class VmManager:
         except TimeoutError:
             await proc.terminate()
             await proc.wait()
-            raise VmError(
+            raise VmGvproxyError(
                 "gvproxy-wrapper did not become ready in time",
                 context={
                     "vm_id": vm_id,
@@ -2455,7 +2476,8 @@ class VmManager:
             Path to base qcow2 image
 
         Raises:
-            VmError: Base image not found
+            VmConfigError: Unknown language
+            VmDependencyError: Base image not found
         """
         # Pattern prefixes for each language
         patterns = {
@@ -2466,12 +2488,12 @@ class VmManager:
 
         pattern = patterns.get(language)
         if not pattern:
-            raise VmError(f"Unknown language: {language}")
+            raise VmConfigError(f"Unknown language: {language}")
 
         # Find matching images
         matches = list(self.settings.base_images_dir.glob(pattern))
         if not matches:
-            raise VmError(
+            raise VmDependencyError(
                 f"Base image not found for language: {language}. "
                 f"Pattern: {pattern}, dir: {self.settings.base_images_dir}"
             )
@@ -3117,7 +3139,7 @@ class VmManager:
             timeout: Maximum wait time in seconds
 
         Raises:
-            VmError: QEMU process died
+            VmQemuCrashError: QEMU process died during boot
             asyncio.TimeoutError: Guest not ready within timeout
         """
 
@@ -3160,7 +3182,7 @@ class VmManager:
             )
             stderr_preview = stderr_text[:200] if stderr_text else "(empty)"
             console_preview = console_output[-constants.CONSOLE_LOG_PREVIEW_BYTES :] if console_output else "(empty)"
-            raise VmError(
+            raise VmQemuCrashError(
                 f"QEMU process died (exit code {vm.process.returncode}, {signal_name}). "
                 f"stderr: {stderr_preview}, console: {console_preview}"
             )

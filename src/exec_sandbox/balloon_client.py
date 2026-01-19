@@ -38,13 +38,10 @@ from exec_sandbox import constants
 if TYPE_CHECKING:
     from pathlib import Path
 from exec_sandbox._logging import get_logger
+from exec_sandbox.exceptions import BalloonTransientError as BalloonError
 from exec_sandbox.socket_auth import connect_and_verify
 
 logger = get_logger(__name__)
-
-
-class BalloonError(Exception):
-    """Balloon operation failed."""
 
 
 class BalloonClient:

@@ -18,7 +18,7 @@ import aiofiles
 import aiofiles.os
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import VmError
+from exec_sandbox.exceptions import VmDependencyError
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 logger = get_logger(__name__)
@@ -238,7 +238,7 @@ async def setup_cgroup(
                 extra={"vm_id": vm_id, "path": str(cgroup_path), "errno": e.errno},
             )
             return Path(f"/tmp/cgroup-{vm_id}")  # noqa: S108
-        raise VmError(f"Failed to setup cgroup: {e}") from e
+        raise VmDependencyError(f"Failed to setup cgroup: {e}") from e
 
     return cgroup_path
 
@@ -256,13 +256,13 @@ async def attach_to_cgroup(cgroup_path: Path, pid: int) -> None:
         pid: Process ID to attach
 
     Raises:
-        VmError: Failed to attach process
+        VmDependencyError: Failed to attach process
     """
     try:
         async with aiofiles.open(cgroup_path / "cgroup.procs", "w") as f:
             await f.write(str(pid))
     except (OSError, PermissionError) as e:
-        raise VmError(f"Failed to attach PID {pid} to cgroup: {e}") from e
+        raise VmDependencyError(f"Failed to attach PID {pid} to cgroup: {e}") from e
 
 
 async def attach_if_available(cgroup_path: Path | None, pid: int | None) -> bool:

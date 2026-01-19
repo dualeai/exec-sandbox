@@ -526,8 +526,7 @@ async def prefetch_all_assets(
     ]
     # Add base images for all supported languages
     asset_tasks.extend(
-        (f"{lang.value} base", asyncio.create_task(fetch_base_image(lang.value, arch=arch)))
-        for lang in Language
+        (f"{lang.value} base", asyncio.create_task(fetch_base_image(lang.value, arch=arch))) for lang in Language
     )
 
     # Gather results with exception handling
