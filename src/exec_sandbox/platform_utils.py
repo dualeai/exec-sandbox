@@ -196,6 +196,14 @@ class ProcessWrapper:
         - Sleeping (waiting for I/O)
         - Stopped (SIGSTOP/SIGTSTP - frozen but alive)
 
+        Use is_stopped() to specifically detect frozen processes that won't
+        respond to communication.
+
+        Process state guide:
+        - Running/Sleeping: is_running()=True,  is_stopped()=False → can communicate
+        - Stopped (SIGSTOP): is_running()=True,  is_stopped()=True  → cannot communicate
+        - Terminated:        is_running()=False, is_stopped()=False → process gone
+
         Returns:
             True if process exists (even if stopped), False if terminated
         """
@@ -211,6 +219,39 @@ class ProcessWrapper:
             ):
                 with attempt:
                     return self.psutil_proc.is_running()  # type: ignore[union-attr]
+            return False
+
+        try:
+            return await asyncio.to_thread(_check)
+        except _PSUTIL_TRANSIENT_ERRORS:
+            return False
+
+    async def is_stopped(self) -> bool:
+        """Check if process is stopped/frozen (SIGSTOP/SIGTSTP).
+
+        Stopped processes are alive but won't respond to communication.
+        Use this to detect frozen VMs before attempting health checks.
+
+        Process state guide:
+        - Running/Sleeping: is_running()=True,  is_stopped()=False → can communicate
+        - Stopped (SIGSTOP): is_running()=True,  is_stopped()=True  → cannot communicate
+        - Terminated:        is_running()=False, is_stopped()=False → process gone
+
+        Returns:
+            True if process is in stopped state, False otherwise
+        """
+        if not self.psutil_proc:
+            return False
+
+        def _check() -> bool:
+            for attempt in Retrying(
+                stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
+                wait=wait_exponential(multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX),
+                retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
+                reraise=True,
+            ):
+                with attempt:
+                    return self.psutil_proc.status() == psutil.STATUS_STOPPED  # type: ignore[union-attr]
             return False
 
         try:

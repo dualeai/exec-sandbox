@@ -682,8 +682,15 @@ class WarmVMPool:
         Returns:
             True if healthy, False otherwise
         """
-        # Fast fail: Check if QEMU process is still running before socket check
-        # This catches killed VMs immediately without waiting for socket timeouts
+        # Check stopped first, if stopped, process exists but can't communicate
+        if await vm.process.is_stopped():
+            logger.warning(
+                "VM process is stopped (SIGSTOP/frozen)",
+                extra={"vm_id": vm.vm_id},
+            )
+            return False
+
+        # Then check running, catches terminated processes
         if not await vm.process.is_running():
             logger.warning(
                 "VM process not running (killed or crashed)",
