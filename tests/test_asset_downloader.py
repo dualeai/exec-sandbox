@@ -342,13 +342,12 @@ class TestRetrieve:
 
         # Peak memory should be bounded by:
         # - 64KB chunk buffer
-        # - ~130KB Python file I/O baseline overhead
+        # - ~200KB aiofiles I/O overhead (buffering layers)
         # - IncrementalHasher internal state
-        # - asyncio.to_thread overhead (~100KB)
-        # - Free-threaded Python (3.14t+) has ~150KB additional overhead
+        # - Free-threaded Python (3.14t+) has ~400KB additional overhead (biased ref counting)
         # - ARM64 has ~300KB additional overhead (16KB page size vs 4KB on x86_64)
-        # Empirically: ~350KB for 64KB chunks, ~550KB on 3.14t, ~900KB on ARM64
-        max_allowed = 1024 * 1024  # 1MB - proves streaming works for 4MB file
+        # Empirically: ~220KB baseline, ~900KB on ARM64, ~1400KB on 3.14t+ARM64
+        max_allowed = 1536 * 1024  # 1.5MB - proves streaming works for 4MB file
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "
             f"for {file_size / 1024 / 1024:.0f}MB file. Streaming may be broken."
