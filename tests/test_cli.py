@@ -241,12 +241,12 @@ class TestCliCodeExecution:
 
     def test_inline_code(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes inline code."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print('hello')"])
 
@@ -258,12 +258,12 @@ class TestCliCodeExecution:
 
     def test_explicit_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Uses explicitly specified language."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-l", "javascript", "console.log('hi')"])
 
@@ -273,12 +273,12 @@ class TestCliCodeExecution:
 
     def test_code_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes code from -c flag."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-c", "print(1)"])
 
@@ -288,12 +288,12 @@ class TestCliCodeExecution:
 
     def test_packages(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes packages to scheduler."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(
                 run_command,
@@ -306,12 +306,12 @@ class TestCliCodeExecution:
 
     def test_env_vars(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes environment variables to scheduler."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(
                 run_command,
@@ -324,12 +324,12 @@ class TestCliCodeExecution:
 
     def test_timeout_and_memory(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes timeout and memory settings."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-t", "60", "-m", "512", "print(1)"])
 
@@ -340,12 +340,12 @@ class TestCliCodeExecution:
 
     def test_network_options(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Passes network options to scheduler."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(
                 run_command,
@@ -368,12 +368,12 @@ class TestCliCodeExecution:
         """Outputs JSON when --json flag is used."""
         import json
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["--json", "print(1)"])
 
@@ -399,12 +399,12 @@ class TestCliFileInput:
         test_file = tmp_path / "test.py"
         test_file.write_text("print('from file')")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(test_file)])
 
@@ -425,12 +425,12 @@ class TestCliFileInput:
         test_file = tmp_path / "app.js"
         test_file.write_text("console.log('hello')")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(test_file)])
 
@@ -444,12 +444,12 @@ class TestCliStdinInput:
 
     def test_stdin_input(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Reads code from stdin."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-"], input="print('from stdin')")
 
@@ -465,12 +465,12 @@ class TestCliErrorHandling:
         """Handles PackageNotAllowedError."""
         from exec_sandbox import PackageNotAllowedError
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.side_effect = PackageNotAllowedError("fake-package")
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["import fake"])
 
@@ -481,12 +481,12 @@ class TestCliErrorHandling:
         """Handles VmTimeoutError."""
         from exec_sandbox import VmTimeoutError
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.side_effect = VmTimeoutError("Execution timed out")
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["import time; time.sleep(100)"])
 
@@ -497,12 +497,12 @@ class TestCliErrorHandling:
         """Handles SandboxError."""
         from exec_sandbox import SandboxError
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.side_effect = SandboxError("VM boot failed")
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print(1)"])
 
@@ -515,18 +515,18 @@ class TestCliNoValidation:
 
     def test_no_validation_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Disables package validation with --no-validation."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["--no-validation", "print(1)"])
 
             assert result.exit_code == 0
             # Check that config was created with enable_package_validation=False
-            config = MockScheduler.call_args[0][0]
+            config = scheduler_cls.call_args[0][0]
             assert config.enable_package_validation is False
 
 
@@ -548,12 +548,12 @@ class TestCliLanguageEdgeCases:
 
     def test_language_case_insensitive(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Language option is case insensitive."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-l", "PYTHON", "print(1)"])
 
@@ -569,12 +569,12 @@ class TestCliLanguageEdgeCases:
 
     def test_raw_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes with raw language."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-l", "raw", "echo hello"])
 
@@ -588,12 +588,12 @@ class TestCliFileEdgeCases:
 
     def test_nonexistent_file_treated_as_code(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Non-existent file path is treated as inline code."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             # This looks like a file but doesn't exist, so treated as code
             result = runner.invoke(run_command, ["/nonexistent/script.py"])
@@ -605,12 +605,12 @@ class TestCliFileEdgeCases:
 
     def test_directory_treated_as_code(self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path) -> None:
         """Directory path is treated as inline code (not a file)."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(tmp_path)])
 
@@ -629,12 +629,12 @@ class TestCliFileEdgeCases:
         test_file = tmp_path / "test.backup.py"
         test_file.write_text("print('multi ext')")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(test_file)])
 
@@ -652,12 +652,12 @@ class TestCliFileEdgeCases:
         test_file = tmp_path / ".hidden.py"
         test_file.write_text("print('hidden')")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(test_file)])
 
@@ -677,12 +677,12 @@ class TestCliFileEdgeCases:
         test_file = subdir / "my script.py"
         test_file.write_text("print('spaces')")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(test_file)])
 
@@ -696,12 +696,12 @@ class TestCliCodeEdgeCases:
 
     def test_code_with_quotes(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Code containing quotes is handled correctly."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print(\"hello 'world'\")"])
 
@@ -711,12 +711,12 @@ class TestCliCodeEdgeCases:
 
     def test_code_with_newlines(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Code containing newlines is handled correctly."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             code = "x = 1\nprint(x)"
             result = runner.invoke(run_command, [code])
@@ -727,12 +727,12 @@ class TestCliCodeEdgeCases:
 
     def test_code_with_unicode(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Code containing unicode is handled correctly."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             code = "print('Hello 世界 🌍')"
             result = runner.invoke(run_command, [code])
@@ -743,12 +743,12 @@ class TestCliCodeEdgeCases:
 
     def test_code_flag_and_positional_both_run(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Both -c flag and positional arguments run as separate sources."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             # Both -c and positional provided - both should run
             result = runner.invoke(run_command, ["-c", "print('from -c')", "print('from pos')"])
@@ -780,12 +780,12 @@ class TestCliStdinEdgeCases:
 
     def test_stdin_with_explicit_language(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Stdin with explicit language works."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-l", "javascript", "-"], input="console.log('stdin')")
 
@@ -799,12 +799,12 @@ class TestCliEnvVarEdgeCases:
 
     def test_env_var_special_characters_in_value(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Env var with special characters in value."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-e", "KEY=val!@#$%^&*()", "print(1)"])
 
@@ -814,12 +814,12 @@ class TestCliEnvVarEdgeCases:
 
     def test_env_var_with_quotes_in_value(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Env var with quotes in value."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-e", 'KEY="quoted value"', "print(1)"])
 
@@ -829,12 +829,12 @@ class TestCliEnvVarEdgeCases:
 
     def test_env_var_numeric_key(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Env var with numeric key."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-e", "123=value", "print(1)"])
 
@@ -883,12 +883,12 @@ class TestCliExitCodePassthrough:
             warm_pool_hit=False,
         )
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = result_with_error
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["exit(42)"])
 
@@ -912,12 +912,12 @@ class TestCliJsonOutputEdgeCases:
             warm_pool_hit=False,
         )
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = result_with_memory
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["--json", "print(1)"])
 
@@ -938,12 +938,12 @@ class TestCliJsonOutputEdgeCases:
             warm_pool_hit=False,
         )
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = result_with_error
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["--json", "exit(1)"])
 
@@ -958,12 +958,12 @@ class TestCliQuietMode:
 
     def test_quiet_mode(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Quiet mode suppresses progress output."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-q", "print(1)"])
 
@@ -1137,12 +1137,12 @@ class TestCliMultiInput:
 
     def test_multiple_inline_codes(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes multiple inline codes."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print(1)", "print(2)"])
 
@@ -1152,12 +1152,12 @@ class TestCliMultiInput:
 
     def test_multiple_c_flags(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes multiple -c flag codes."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-c", "print(1)", "-c", "print(2)"])
 
@@ -1166,12 +1166,12 @@ class TestCliMultiInput:
 
     def test_mixed_c_and_positional(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Executes mixed -c flags and positional sources."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-c", "print(1)", "print(2)"])
 
@@ -1192,12 +1192,12 @@ class TestCliMultiInput:
         file2 = tmp_path / "test2.py"
         file2.write_text("print('file2')")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(file1), str(file2)])
 
@@ -1206,33 +1206,33 @@ class TestCliMultiInput:
 
     def test_concurrency_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Uses -j flag to limit concurrency."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-j", "5", "print(1)", "print(2)"])
 
             assert result.exit_code == 0
             # Check that config was created with limited concurrency
-            config = MockScheduler.call_args[0][0]
+            config = scheduler_cls.call_args[0][0]
             assert config.max_concurrent_vms <= 5
 
     def test_concurrency_default(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Uses default concurrency."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print(1)", "print(2)"])
 
             assert result.exit_code == 0
-            config = MockScheduler.call_args[0][0]
+            config = scheduler_cls.call_args[0][0]
             # min(2 sources, DEFAULT_CONCURRENCY)
             assert config.max_concurrent_vms == 2
 
@@ -1250,12 +1250,12 @@ class TestCliMultiInput:
         """JSON output for multiple sources is an array."""
         import json
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["--json", "print(1)", "print(2)"])
 
@@ -1274,18 +1274,18 @@ class TestCliMultiInput:
 
     def test_single_source_uses_streaming(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Single source uses streaming (run_code) not run_multiple."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print('hello')"])
 
             assert result.exit_code == 0
             # Single source: config should have max_concurrent_vms=1
-            config = MockScheduler.call_args[0][0]
+            config = scheduler_cls.call_args[0][0]
             assert config.max_concurrent_vms == 1
 
 
@@ -1304,12 +1304,12 @@ class TestCliMultiInputLanguageDetection:
         js_file = tmp_path / "test.js"
         js_file.write_text("console.log(1)")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, [str(py_file), str(js_file)])
 
@@ -1332,12 +1332,12 @@ class TestCliMultiInputLanguageDetection:
         js_file = tmp_path / "test.js"
         js_file.write_text("console.log(1)")
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["-l", "raw", str(py_file), str(js_file)])
 
@@ -1425,12 +1425,12 @@ class TestCliMultiInputExitCodes:
             warm_pool_hit=False,
         )
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.side_effect = [result0, result1]
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print(1)", "exit(5)"])
 
@@ -1450,13 +1450,13 @@ class TestCliMultiInputExitCodes:
             warm_pool_hit=False,
         )
 
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             # First succeeds, second times out
             mock_scheduler.run.side_effect = [result0, VmTimeoutError("timeout")]
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(run_command, ["print(1)", "import time; time.sleep(100)"])
 
@@ -1585,12 +1585,12 @@ class TestCliBackwardCompat:
 
     def test_explicit_run(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Explicit 'run' subcommand works."""
-        with patch("exec_sandbox.cli.Scheduler") as MockScheduler:
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_scheduler = AsyncMock()
             mock_scheduler.run.return_value = mock_result
             mock_scheduler.__aenter__.return_value = mock_scheduler
             mock_scheduler.__aexit__.return_value = None
-            MockScheduler.return_value = mock_scheduler
+            scheduler_cls.return_value = mock_scheduler
 
             result = runner.invoke(cli, ["run", "print(1)"])
 
