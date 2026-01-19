@@ -64,8 +64,9 @@ if TYPE_CHECKING:
     from tenacity.wait import wait_base
 
     from exec_sandbox.config import SchedulerConfig
+    from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.snapshot_manager import SnapshotManager
-    from exec_sandbox.vm_manager import QemuVM, VmManager
+    from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
 

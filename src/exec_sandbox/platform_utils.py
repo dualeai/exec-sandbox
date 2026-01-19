@@ -178,7 +178,9 @@ class ProcessWrapper:
             try:
                 for attempt in Retrying(
                     stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
-                    wait=wait_exponential(multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX),
+                    wait=wait_exponential(
+                        multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX
+                    ),
                     retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
                     reraise=True,
                 ):
@@ -213,7 +215,9 @@ class ProcessWrapper:
         def _check() -> bool:
             for attempt in Retrying(
                 stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
-                wait=wait_exponential(multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX),
+                wait=wait_exponential(
+                    multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX
+                ),
                 retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
                 reraise=True,
             ):
@@ -246,7 +250,9 @@ class ProcessWrapper:
         def _check() -> bool:
             for attempt in Retrying(
                 stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
-                wait=wait_exponential(multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX),
+                wait=wait_exponential(
+                    multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX
+                ),
                 retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
                 reraise=True,
             ):

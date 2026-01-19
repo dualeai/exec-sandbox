@@ -14,10 +14,8 @@ import pytest
 from exec_sandbox.exceptions import VmError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
-from exec_sandbox.vm_manager import (
-    VALID_STATE_TRANSITIONS,
-    QemuVM,
-    VmState,
+from exec_sandbox.qemu_vm import QemuVM
+from exec_sandbox.system_probes import (
     _check_hvf_available,
     _check_kvm_available,
     _check_tsc_deadline,
@@ -26,10 +24,11 @@ from exec_sandbox.vm_manager import (
     _kernel_validated,
     _probe_cache,
     _probe_qemu_accelerators,
-    _validate_identifier,
     _validate_kernel_initramfs,
     check_hwaccel_available,
 )
+from exec_sandbox.vm_manager import _validate_identifier
+from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
 from tests.conftest import skip_unless_hwaccel, skip_unless_linux, skip_unless_macos
 
 # ============================================================================
@@ -181,7 +180,7 @@ class TestQemuAcceleratorProbe:
 
     async def test_probe_with_missing_qemu_binary(self) -> None:
         """Probe returns empty set when QEMU binary is not found."""
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             mock_exec.side_effect = FileNotFoundError("qemu-system-x86_64 not found")
             _probe_cache.qemu_accels = None  # Clear cache
             result = await _probe_qemu_accelerators()
@@ -193,7 +192,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.returncode = 1
         mock_proc.communicate = AsyncMock(return_value=(b"", b"error"))
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert result == set()
@@ -204,7 +203,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.returncode = 0
         mock_proc.communicate = AsyncMock(return_value=(b"", b""))
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert result == set()
@@ -215,7 +214,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.returncode = 0
         mock_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\n", b""))
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert result == set()
@@ -225,7 +224,7 @@ class TestQemuAcceleratorProbe:
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert result == set()
@@ -242,7 +241,7 @@ class TestQemuAcceleratorProbe:
             return_value=(b"Accelerators supported in QEMU binary:\n  tcg  \n  kvm  \n\n", b"")
         )
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert "tcg" in result
@@ -257,7 +256,7 @@ class TestQemuAcceleratorProbe:
             return_value=(b"Accelerators supported in QEMU binary:\nTCG\nKVM\nHvF\n", b"")
         )
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert "tcg" in result
@@ -275,7 +274,7 @@ class TestQemuAcceleratorProbe:
             return_value=(b"Accelerators supported in QEMU binary:\ntcg\nxen\nwhpx\nnvmm\n", b"")
         )
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert "tcg" in result
@@ -291,7 +290,7 @@ class TestQemuAcceleratorProbe:
             return_value=(b"Accelerators supported in QEMU binary:\r\ntcg\r\nkvm\r\n", b"")
         )
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             # strip() handles \r\n
@@ -303,7 +302,7 @@ class TestQemuAcceleratorProbe:
 
     async def test_probe_with_oserror(self) -> None:
         """Probe returns empty set on OSError."""
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             mock_exec.side_effect = OSError("Permission denied")
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
@@ -317,7 +316,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.returncode = 0
         mock_proc.communicate = AsyncMock(return_value=(f"Accelerators supported:\n{accels}\n".encode(), b""))
 
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
             _probe_cache.qemu_accels = None
             result = await _probe_qemu_accelerators()
             assert len(result) == 1000
@@ -341,9 +340,9 @@ class TestTwoLayerKvmDetection:
         """KVM detection fails if QEMU doesn't have KVM compiled in."""
         # Mock Layer 1 passing (kernel check)
         with (
-            patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", return_value=True),
-            patch("exec_sandbox.vm_manager.can_access", return_value=True),
-            patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec,
+            patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=True),
+            patch("exec_sandbox.system_probes.can_access", return_value=True),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
         ):
             # First call: ioctl check passes
             ioctl_proc = AsyncMock()
@@ -363,9 +362,9 @@ class TestTwoLayerKvmDetection:
     async def test_kvm_passes_when_both_layers_pass(self) -> None:
         """KVM detection passes when both kernel and QEMU verify KVM."""
         with (
-            patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", return_value=True),
-            patch("exec_sandbox.vm_manager.can_access", return_value=True),
-            patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec,
+            patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=True),
+            patch("exec_sandbox.system_probes.can_access", return_value=True),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
         ):
             # First call: ioctl check passes
             ioctl_proc = AsyncMock()
@@ -385,7 +384,7 @@ class TestTwoLayerKvmDetection:
     @skip_unless_linux
     async def test_kvm_fails_when_dev_kvm_missing(self) -> None:
         """KVM detection fails early if /dev/kvm doesn't exist."""
-        with patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", return_value=False):
+        with patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=False):
             _probe_cache.kvm = None
             result = await _check_kvm_available()
             assert result is False
@@ -402,7 +401,7 @@ class TestTwoLayerHvfDetection:
 
     async def test_hvf_fails_when_qemu_lacks_hvf_support(self) -> None:
         """HVF detection fails if QEMU doesn't have HVF compiled in."""
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             # First call: sysctl check passes
             sysctl_proc = AsyncMock()
             sysctl_proc.returncode = 0
@@ -420,7 +419,7 @@ class TestTwoLayerHvfDetection:
 
     async def test_hvf_passes_when_both_layers_pass(self) -> None:
         """HVF detection passes when both kernel and QEMU verify HVF."""
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             # First call: sysctl check passes
             sysctl_proc = AsyncMock()
             sysctl_proc.returncode = 0
@@ -438,7 +437,7 @@ class TestTwoLayerHvfDetection:
 
     async def test_hvf_fails_when_kernel_check_fails(self) -> None:
         """HVF detection fails early if kern.hv_support is 0."""
-        with patch("exec_sandbox.vm_manager.asyncio.create_subprocess_exec") as mock_exec:
+        with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             sysctl_proc = AsyncMock()
             sysctl_proc.returncode = 0
             sysctl_proc.communicate = AsyncMock(return_value=(b"0\n", b""))
@@ -530,7 +529,7 @@ class TestKernelInitramfsValidation:
         assert (vm_settings.kernel_path, arch) in _kernel_validated
 
         # Second call - should use cache, mock should NOT be called
-        with patch("exec_sandbox.vm_manager.aiofiles.os.path.exists", new_callable=AsyncMock) as mock_exists:
+        with patch("exec_sandbox.system_probes.aiofiles.os.path.exists", new_callable=AsyncMock) as mock_exists:
             await _validate_kernel_initramfs(vm_settings.kernel_path, arch)
             mock_exists.assert_not_called()
 
@@ -673,7 +672,7 @@ class TestAllImageTypes:
         This test verifies that when hardware acceleration is available,
         we actually use it (not accidentally falling back to TCG).
         """
-        from exec_sandbox.vm_manager import _check_hvf_available, _check_kvm_available
+        from exec_sandbox.system_probes import _check_hvf_available, _check_kvm_available
 
         vm = await vm_manager.create_vm(
             language=Language.RAW,
@@ -975,7 +974,7 @@ class TestTscDeadlineLinux:
     @pytest.mark.asyncio
     async def test_tsc_deadline_linux_with_feature(self) -> None:
         """Linux with tsc_deadline_timer in cpuinfo returns True."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         original_tsc = _probe_cache.tsc_deadline
 
@@ -999,7 +998,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep tsc_deadline_timer sse sse2
     @pytest.mark.asyncio
     async def test_tsc_deadline_linux_without_feature(self) -> None:
         """Linux without tsc_deadline_timer in cpuinfo returns False."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         original_tsc = _probe_cache.tsc_deadline
 
@@ -1023,7 +1022,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
     @pytest.mark.asyncio
     async def test_tsc_deadline_linux_cpuinfo_not_exists(self) -> None:
         """/proc/cpuinfo not existing returns False gracefully."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         original_tsc = _probe_cache.tsc_deadline
 
@@ -1039,7 +1038,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
     @pytest.mark.asyncio
     async def test_tsc_deadline_linux_read_error(self) -> None:
         """OSError reading /proc/cpuinfo returns False gracefully."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         original_tsc = _probe_cache.tsc_deadline
 
@@ -1065,7 +1064,7 @@ class TestTscDeadlineMacOS:
     @pytest.mark.asyncio
     async def test_tsc_deadline_macos_arm64_returns_false(self) -> None:
         """ARM64 Macs always return False for TSC_DEADLINE (ARM uses different timer)."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         # Save original cache value
         original_tsc = _probe_cache.tsc_deadline
@@ -1074,7 +1073,7 @@ class TestTscDeadlineMacOS:
             # Clear cache
             _probe_cache.tsc_deadline = None
 
-            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.AARCH64):
+            with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.AARCH64):
                 result = await _check_tsc_deadline_macos()
                 assert result is False
         finally:
@@ -1084,7 +1083,7 @@ class TestTscDeadlineMacOS:
     @pytest.mark.asyncio
     async def test_tsc_deadline_macos_x86_64_with_tsc(self) -> None:
         """Intel Mac with TSC_DEADLINE returns True."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         # Save original cache value
         original_tsc = _probe_cache.tsc_deadline
@@ -1093,7 +1092,7 @@ class TestTscDeadlineMacOS:
             # Clear cache
             _probe_cache.tsc_deadline = None
 
-            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.X86_64):
+            with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.X86_64):
                 mock_proc = AsyncMock()
                 mock_proc.returncode = 0
                 mock_proc.communicate = AsyncMock(
@@ -1110,7 +1109,7 @@ class TestTscDeadlineMacOS:
     @pytest.mark.asyncio
     async def test_tsc_deadline_macos_x86_64_without_tsc(self) -> None:
         """Intel Mac without TSC_DEADLINE returns False."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         # Save original cache value
         original_tsc = _probe_cache.tsc_deadline
@@ -1119,7 +1118,7 @@ class TestTscDeadlineMacOS:
             # Clear cache
             _probe_cache.tsc_deadline = None
 
-            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.X86_64):
+            with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.X86_64):
                 mock_proc = AsyncMock()
                 mock_proc.returncode = 0
                 mock_proc.communicate = AsyncMock(return_value=(b"FPU VME DE PSE TSC MSR PAE MCE SSE SSE2", b""))
@@ -1134,7 +1133,7 @@ class TestTscDeadlineMacOS:
     @pytest.mark.asyncio
     async def test_tsc_deadline_macos_sysctl_failure(self) -> None:
         """sysctl failure returns False gracefully."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         # Save original cache value
         original_tsc = _probe_cache.tsc_deadline
@@ -1143,7 +1142,7 @@ class TestTscDeadlineMacOS:
             # Clear cache
             _probe_cache.tsc_deadline = None
 
-            with patch("exec_sandbox.vm_manager.detect_host_arch", return_value=HostArch.X86_64):
+            with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.X86_64):
                 mock_proc = AsyncMock()
                 mock_proc.returncode = 1  # sysctl failed
                 mock_proc.communicate = AsyncMock(return_value=(b"", b""))
@@ -1158,7 +1157,7 @@ class TestTscDeadlineMacOS:
     @pytest.mark.asyncio
     async def test_tsc_deadline_cached(self) -> None:
         """TSC_DEADLINE result is cached (caching is in _check_tsc_deadline, not platform-specific functions)."""
-        from exec_sandbox.vm_manager import _probe_cache
+        from exec_sandbox.system_probes import _probe_cache
 
         # Save original cache value
         original_tsc = _probe_cache.tsc_deadline
@@ -1411,7 +1410,7 @@ class TestExecuteStateRace:
                 race_triggered = True
 
         # Patch the ExecuteCodeRequest to trigger state change before I/O
-        with patch("exec_sandbox.vm_manager.ExecuteCodeRequest") as mock_request:
+        with patch("exec_sandbox.qemu_vm.ExecuteCodeRequest") as mock_request:
             mock_request.side_effect = lambda **kwargs: (change_state_to_destroying(), None)[1] or AsyncMock()
 
             with pytest.raises(VmError) as exc_info:
@@ -1434,7 +1433,7 @@ class TestExecuteStateRace:
             if vm._state == VmState.EXECUTING:
                 vm._state = VmState.DESTROYED
 
-        with patch("exec_sandbox.vm_manager.ExecuteCodeRequest") as mock_request:
+        with patch("exec_sandbox.qemu_vm.ExecuteCodeRequest") as mock_request:
             mock_request.side_effect = lambda **kwargs: (change_state_to_destroyed(), None)[1] or AsyncMock()
 
             with pytest.raises(VmError) as exc_info:

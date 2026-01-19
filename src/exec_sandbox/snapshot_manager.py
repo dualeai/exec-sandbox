@@ -49,7 +49,8 @@ from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 
 if TYPE_CHECKING:
-    from exec_sandbox.vm_manager import QemuVM, VmManager
+    from exec_sandbox.qemu_vm import QemuVM
+    from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
 
@@ -954,4 +955,4 @@ class SnapshotManager:
 
 
 # Import VmState for type checking in finally block
-from exec_sandbox.vm_manager import VmState  # noqa: E402
+from exec_sandbox.vm_types import VmState  # noqa: E402

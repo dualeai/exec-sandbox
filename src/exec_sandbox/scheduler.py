@@ -54,8 +54,9 @@ from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.settings import Settings
 
 if TYPE_CHECKING:
+    from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.snapshot_manager import SnapshotManager
-    from exec_sandbox.vm_manager import QemuVM, VmManager
+    from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.warm_vm_pool import WarmVMPool
 
 logger = get_logger(__name__)

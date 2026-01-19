@@ -11,7 +11,8 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
-from exec_sandbox.vm_manager import VmManager, check_fast_balloon_available, check_hwaccel_available
+from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available
+from exec_sandbox.vm_manager import VmManager
 
 # ============================================================================
 # Shared Skip Markers
