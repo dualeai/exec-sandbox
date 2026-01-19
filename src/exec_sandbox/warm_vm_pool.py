@@ -341,6 +341,7 @@ class WarmVMPool:
             language: Programming language enum
             index: VM index in pool (for unique ID)
         """
+        vm: QemuVM | None = None
         try:
             vm = await self._boot_warm_vm(language, index)
 
@@ -358,6 +359,10 @@ class WarmVMPool:
                 },
             )
         except Exception as e:
+            # CRITICAL: destroy VM to release semaphore slot if creation succeeded
+            if vm is not None:
+                with contextlib.suppress(Exception):
+                    await self.vm_manager.destroy_vm(vm)
             logger.error(
                 "Failed to boot warm VM",
                 extra={"language": language.value, "index": index, "error": str(e)},
@@ -430,6 +435,7 @@ class WarmVMPool:
             language: Programming language enum to replenish
         """
         async with self._replenish_semaphores[language]:
+            vm: QemuVM | None = None
             try:
                 # Check if pool already full (now atomic with boot due to semaphore)
                 if self.pools[language].full():
@@ -449,6 +455,10 @@ class WarmVMPool:
                 )
 
             except Exception as e:
+                # CRITICAL: destroy VM to release semaphore slot if creation succeeded
+                if vm is not None:
+                    with contextlib.suppress(Exception):
+                        await self.vm_manager.destroy_vm(vm)
                 logger.error(
                     "Failed to replenish warm pool",
                     extra={"language": language.value, "error": str(e)},

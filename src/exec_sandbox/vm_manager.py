@@ -48,7 +48,6 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.dns_filter import generate_dns_zones_json
 from exec_sandbox.exceptions import (
     VmBootTimeoutError,
-    VmCapacityError,
     VmConfigError,
     VmDependencyError,
     VmGvproxyError,
@@ -980,6 +979,8 @@ class QemuVM:
         self._state_lock = asyncio.Lock()
         # Timing instrumentation (set by VmManager.create_vm)
         self.timing = VmTiming()
+        # Tracks if this VM owns a semaphore permit (prevents double-release in destroy)
+        self.holds_semaphore_slot = False
 
     # -------------------------------------------------------------------------
     # Timing properties (backwards-compatible accessors to VmTiming)
@@ -1619,7 +1620,9 @@ class VmManager:
             VmPermanentError: VM creation failed (not retryable)
             asyncio.TimeoutError: VM boot timeout after all retries
         """
-        async with self._semaphore:
+        # Acquire semaphore manually - hold until VM is destroyed (lifecycle-bound)
+        await self._semaphore.acquire()
+        try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.VM_BOOT_MAX_RETRIES),
                 wait=wait_random_exponential(
@@ -1644,10 +1647,16 @@ class VmManager:
                     )
                     # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
                     vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
+                    # Mark VM as holding semaphore slot (released in destroy_vm)
+                    vm.holds_semaphore_slot = True
                     return vm
 
-        # Unreachable: AsyncRetrying either returns or raises
-        raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
+            # Unreachable: AsyncRetrying either returns or raises
+            raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
+        except BaseException:
+            # Release semaphore on failure - VM was not created successfully
+            self._semaphore.release()
+            raise
 
     async def _create_vm_impl(  # noqa: PLR0912, PLR0915
         self,
@@ -1690,7 +1699,6 @@ class VmManager:
             VmOverlayError: Overlay creation failed
             VmQemuCrashError: QEMU crashed during startup
             VmBootTimeoutError: Guest agent not ready in time
-            VmCapacityError: VM pool at capacity
             VmGvproxyError: gvproxy startup failed
             asyncio.TimeoutError: VM boot timeout (>5s)
         """
@@ -1986,12 +1994,9 @@ class VmManager:
                 console_log,
             )
 
-            # Step 8a: Register VM in registry (before BOOTING to ensure tracking)
+            # Register VM in registry (before BOOTING to ensure tracking)
+            # Note: Capacity is enforced by semaphore in create_vm(), not here
             async with self._vms_lock:
-                if len(self._vms) >= self.settings.max_concurrent_vms:
-                    raise VmCapacityError(
-                        f"VM pool full: {len(self._vms)}/{self.settings.max_concurrent_vms} VMs active"
-                    )
                 self._vms[vm.vm_id] = vm
 
             # Transition to BOOTING state
@@ -2443,6 +2448,10 @@ class VmManager:
             # ALWAYS remove from registry, even on failure
             async with self._vms_lock:
                 self._vms.pop(vm.vm_id, None)
+            # Release semaphore slot only if this VM held one (prevents double-release)
+            if vm.holds_semaphore_slot:
+                vm.holds_semaphore_slot = False
+                self._semaphore.release()
 
     async def _capture_qemu_output(self, process: ProcessWrapper) -> tuple[str, str]:
         """Capture stdout/stderr from QEMU process.
