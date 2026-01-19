@@ -933,6 +933,50 @@ class TestReplenishRaceCondition:
             # Semaphore should be released after cancellation
             assert not pool._replenish_semaphores[Language.PYTHON].locked()
 
+    async def test_vm_destroyed_on_cancellation_after_creation(self, unit_test_vm_manager) -> None:
+        """VM is destroyed when task is cancelled AFTER VM creation (during pool.put)."""
+        from unittest.mock import AsyncMock, patch
+
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(max_concurrent_vms=4, warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        created_vm = AsyncMock()
+        created_vm.vm_id = "created-then-cancelled"
+        destroy_called = asyncio.Event()
+        put_started = asyncio.Event()
+
+        async def instant_boot(language: Language, index: int) -> AsyncMock:
+            return created_vm
+
+        async def mock_destroy(vm) -> None:
+            destroy_called.set()
+
+        # Mock put() to block after signaling it started
+        async def slow_put(vm):
+            put_started.set()
+            await asyncio.sleep(10)  # Will be cancelled
+
+        with (
+            patch.object(pool, "_boot_warm_vm", side_effect=instant_boot),
+            patch.object(pool.vm_manager, "destroy_vm", side_effect=mock_destroy),
+            patch.object(pool.pools[Language.PYTHON], "put", side_effect=slow_put),
+        ):
+            task = asyncio.create_task(pool._replenish_pool(Language.PYTHON))
+
+            # Wait for put() to start
+            await asyncio.wait_for(put_started.wait(), timeout=1.0)
+
+            # Cancel while blocked in put() - VM has been created but not added to pool
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            # VM should have been destroyed due to CancelledError handling
+            await asyncio.sleep(0.01)
+            assert destroy_called.is_set(), "VM should be destroyed on cancellation"
+
     async def test_empty_pool_replenish(self, unit_test_vm_manager) -> None:
         """Replenish on completely empty pool works correctly."""
         from unittest.mock import patch

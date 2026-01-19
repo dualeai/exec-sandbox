@@ -273,10 +273,20 @@ class WarmVMPool:
         """
         logger.info("Shutting down warm VM pool")
 
-        # Stop health check
+        # Stop health check with timeout to prevent indefinite wait
+        # Timeout must be > health check interval (10s) to allow current iteration to complete
         self._shutdown_event.set()
         if self._health_task:
-            await self._health_task
+            try:
+                await asyncio.wait_for(
+                    self._health_task,
+                    timeout=constants.WARM_POOL_HEALTH_CHECK_INTERVAL + 2.0,
+                )
+            except TimeoutError:
+                logger.warning("Health check task timed out during shutdown, cancelling")
+                self._health_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._health_task
 
         # Drain and destroy all VMs in parallel
         destroy_tasks: list[asyncio.Task[bool]] = []
@@ -295,12 +305,20 @@ class WarmVMPool:
             results: list[bool | BaseException] = await asyncio.gather(*destroy_tasks, return_exceptions=True)
             destroyed_count = sum(1 for r in results if r is True)
 
-        # Cancel pending replenish tasks (wait for cancellation to complete)
-        # Copy set to avoid "Set changed size during iteration" error
-        for task in list(self._replenish_tasks):
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task  # Expected during shutdown
+        # Cancel pending replenish tasks and await all together
+        # CRITICAL: Using asyncio.gather() ensures all gather children complete before continuing.
+        # When asyncio.gather() is cancelled, it cancels child tasks but does NOT await their
+        # completion. Python 3.14 has stricter detection of these orphaned tasks.
+        tasks_to_cancel = list(self._replenish_tasks)
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+
+        # Await ALL cancelled tasks together to ensure gather futures complete
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        self._replenish_tasks.clear()
 
         logger.info("Warm VM pool shutdown complete", extra={"destroyed_vms": destroyed_count})
 
@@ -453,6 +471,15 @@ class WarmVMPool:
                     "Warm pool replenished",
                     extra={"language": language.value, "vm_id": vm.vm_id, "pool_size": self.pools[language].qsize()},
                 )
+
+            except asyncio.CancelledError:
+                # CancelledError is BaseException, not caught by 'except Exception'
+                # Cleanup VM if creation succeeded before cancellation
+                if vm is not None:
+                    with contextlib.suppress(Exception):
+                        await self.vm_manager.destroy_vm(vm)
+                logger.debug("Replenish task cancelled", extra={"language": language.value})
+                raise  # Re-raise cancellation to propagate shutdown
 
             except Exception as e:
                 # CRITICAL: destroy VM to release semaphore slot if creation succeeded

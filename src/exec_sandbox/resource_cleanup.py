@@ -7,6 +7,7 @@ Used by VmManager for VM lifecycle management.
 import asyncio
 import contextlib
 from pathlib import Path
+from typing import Any
 
 import aiofiles
 import aiofiles.os
@@ -16,6 +17,21 @@ from exec_sandbox.permission_utils import sudo_rm
 from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
+
+# Module-level set to hold references to background zombie reaping tasks
+# Prevents garbage collection of fire-and-forget tasks
+# See: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+_zombie_reap_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _cleanup_zombie_task(task: asyncio.Task[Any]) -> None:
+    """Remove completed task from tracking set and log any exceptions."""
+    _zombie_reap_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning(
+            "Zombie reaping task failed",
+            extra={"error": str(task.exception())},
+        )
 
 
 async def cleanup_process(
@@ -57,8 +73,10 @@ async def cleanup_process(
                 f"{name} already terminated",
                 extra={"context_id": context_id, "returncode": proc.returncode},
             )
-            # Ensure zombie is reaped
-            _ = asyncio.create_task(proc.wait())  # noqa: RUF006
+            # Ensure zombie is reaped - track task to prevent GC
+            task = asyncio.create_task(proc.wait())
+            _zombie_reap_tasks.add(task)
+            task.add_done_callback(_cleanup_zombie_task)
             return True
 
         # Phase 1: SIGTERM (graceful shutdown) - async, non-blocking
@@ -95,12 +113,14 @@ async def cleanup_process(
                 extra={"context_id": context_id, "kill_timeout": kill_timeout, "pid": proc.pid},
             )
 
-            # Still try to reap in background to prevent zombie
+            # Still try to reap in background to prevent zombie - track task to prevent GC
             async def drain_and_wait() -> None:
                 with contextlib.suppress(OSError, TimeoutError, asyncio.CancelledError):
                     await proc.wait_with_timeout(timeout=30)  # 30s timeout for zombie reaping
 
-            _ = asyncio.create_task(drain_and_wait())  # noqa: RUF006
+            task = asyncio.create_task(drain_and_wait())
+            _zombie_reap_tasks.add(task)
+            task.add_done_callback(_cleanup_zombie_task)
             return False
 
     except ProcessLookupError:

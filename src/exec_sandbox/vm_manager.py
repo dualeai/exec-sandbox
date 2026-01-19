@@ -2356,27 +2356,42 @@ class VmManager:
         """
         logger.info("Starting comprehensive resource cleanup", extra={"vm_id": vm_id})
         results: dict[str, bool] = {}
+        was_cancelled = False
 
         # Phase 1: Kill processes in parallel (independent operations)
-        process_results = await asyncio.gather(
-            cleanup_process(
-                proc=qemu_proc,
-                name="QEMU",
-                context_id=vm_id,
-                term_timeout=5.0,
-                kill_timeout=2.0,
-            ),
-            cleanup_process(
-                proc=gvproxy_proc,
-                name="gvproxy",
-                context_id=vm_id,
-                term_timeout=3.0,
-                kill_timeout=2.0,
-            ),
-            return_exceptions=True,
-        )
-        results["qemu"] = process_results[0] if isinstance(process_results[0], bool) else False
-        results["gvproxy"] = process_results[1] if isinstance(process_results[1], bool) else False
+        # Shield cleanup from cancellation to ensure resources are fully released
+        # NOTE: asyncio.shield() still raises CancelledError AFTER the shielded operation
+        # completes if the outer task was cancelled. We must catch this to ensure Phase 2 runs.
+        try:
+            process_results = await asyncio.shield(
+                asyncio.gather(
+                    cleanup_process(
+                        proc=qemu_proc,
+                        name="QEMU",
+                        context_id=vm_id,
+                        term_timeout=5.0,
+                        kill_timeout=2.0,
+                    ),
+                    cleanup_process(
+                        proc=gvproxy_proc,
+                        name="gvproxy",
+                        context_id=vm_id,
+                        term_timeout=3.0,
+                        kill_timeout=2.0,
+                    ),
+                    return_exceptions=True,
+                )
+            )
+            results["qemu"] = process_results[0] if isinstance(process_results[0], bool) else False
+            results["gvproxy"] = process_results[1] if isinstance(process_results[1], bool) else False
+        except asyncio.CancelledError:
+            # Shield completed but outer task was cancelled - continue to Phase 2 anyway
+            logger.debug(
+                "Cleanup Phase 1 completed but task was cancelled, continuing to Phase 2", extra={"vm_id": vm_id}
+            )
+            results["qemu"] = False
+            results["gvproxy"] = False
+            was_cancelled = True
 
         # Phase 2: Cleanup workdir and cgroup in parallel (after processes dead)
         # workdir.cleanup() removes overlay, sockets, and console log in one operation
@@ -2385,30 +2400,40 @@ class VmManager:
                 return True
             return await workdir.cleanup()
 
-        file_results = await asyncio.gather(
-            cleanup_workdir(),
-            cgroup.cleanup_cgroup(
-                cgroup_path=cgroup_path,
-                context_id=vm_id,
-            ),
-            return_exceptions=True,
-        )
-        results["workdir"] = file_results[0] if isinstance(file_results[0], bool) else False
-        results["cgroup"] = file_results[1] if isinstance(file_results[1], bool) else False
+        # Shield file cleanup from cancellation to ensure resources are fully released
+        try:
+            file_results = await asyncio.shield(
+                asyncio.gather(
+                    cleanup_workdir(),
+                    cgroup.cleanup_cgroup(
+                        cgroup_path=cgroup_path,
+                        context_id=vm_id,
+                    ),
+                    return_exceptions=True,
+                )
+            )
+            results["workdir"] = file_results[0] if isinstance(file_results[0], bool) else False
+            results["cgroup"] = file_results[1] if isinstance(file_results[1], bool) else False
+        except asyncio.CancelledError:
+            logger.debug("Cleanup Phase 2 completed but task was cancelled", extra={"vm_id": vm_id})
+            results["workdir"] = False
+            results["cgroup"] = False
+            was_cancelled = True
 
         # Log summary
         success_count = sum(results.values())
         total_count = len(results)
-        if success_count == total_count:
+        if success_count == total_count and not was_cancelled:
             logger.info("Cleanup completed successfully", extra={"vm_id": vm_id, "results": results})
         else:
             logger.warning(
-                "Cleanup completed with errors",
+                "Cleanup completed with errors" if not was_cancelled else "Cleanup completed (task was cancelled)",
                 extra={
                     "vm_id": vm_id,
                     "results": results,
                     "success": success_count,
                     "total": total_count,
+                    "was_cancelled": was_cancelled,
                 },
             )
 
