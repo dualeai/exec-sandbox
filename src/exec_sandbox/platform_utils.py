@@ -139,6 +139,21 @@ def get_arch_name(convention: Literal["kernel", "go"] = "kernel") -> str:
             raise ValueError(f"Unsupported architecture: {arch}")
 
 
+# Transient psutil exceptions that may occur during process inspection
+# Used for retry logic and error handling in ProcessWrapper
+_PSUTIL_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
+    psutil.NoSuchProcess,
+    psutil.AccessDenied,
+)
+
+# Retry configuration for psutil operations
+# Exponential backoff: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms (7 attempts, ~127ms total)
+_PSUTIL_RETRY_ATTEMPTS = 7
+_PSUTIL_RETRY_MULTIPLIER = 0.001
+_PSUTIL_RETRY_MIN = 0.001
+_PSUTIL_RETRY_MAX = 0.064
+
+
 class ProcessWrapper:
     """PID-reuse safe process wrapper using psutil.
 
@@ -162,34 +177,45 @@ class ProcessWrapper:
         if async_proc.pid:
             try:
                 for attempt in Retrying(
-                    stop=stop_after_attempt(7),
-                    wait=wait_exponential(multiplier=0.001, min=0.001, max=0.064),
-                    retry=retry_if_exception_type((psutil.NoSuchProcess, psutil.AccessDenied)),
+                    stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
+                    wait=wait_exponential(multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX),
+                    retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
                     reraise=True,
                 ):
                     with attempt:
                         self.psutil_proc = psutil.Process(async_proc.pid)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except _PSUTIL_TRANSIENT_ERRORS:
                 # Process not visible after retries - fallback to returncode-based checks
                 pass
 
     async def is_running(self) -> bool:
-        """Check if process is still running (PID-reuse safe).
+        """Check if process exists and hasn't terminated (PID-reuse safe).
 
-        Async version prevents blocking event loop on system/kernel hangs.
-        Uses asyncio.to_thread() to run blocking psutil call in thread pool.
+        Returns True for processes in ANY non-terminated state, including:
+        - Running (normal execution)
+        - Sleeping (waiting for I/O)
+        - Stopped (SIGSTOP/SIGTSTP - frozen but alive)
 
         Returns:
-            True if process is running, False otherwise
+            True if process exists (even if stopped), False if terminated
         """
         if not self.psutil_proc:
             return self.async_proc.returncode is None
 
-        # Run blocking psutil call in thread pool (Python 3.9+)
-        # Protects against system/kernel hangs blocking event loop
+        def _check() -> bool:
+            for attempt in Retrying(
+                stop=stop_after_attempt(_PSUTIL_RETRY_ATTEMPTS),
+                wait=wait_exponential(multiplier=_PSUTIL_RETRY_MULTIPLIER, min=_PSUTIL_RETRY_MIN, max=_PSUTIL_RETRY_MAX),
+                retry=retry_if_exception_type(_PSUTIL_TRANSIENT_ERRORS),
+                reraise=True,
+            ):
+                with attempt:
+                    return self.psutil_proc.is_running()  # type: ignore[union-attr]
+            return False
+
         try:
-            return await asyncio.to_thread(self.psutil_proc.is_running)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return await asyncio.to_thread(_check)
+        except _PSUTIL_TRANSIENT_ERRORS:
             return False
 
     @property
