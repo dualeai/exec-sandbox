@@ -329,6 +329,9 @@ jobs:
       - name: Install QEMU (Linux)
         if: matrix.platform.os == 'linux'
         run: |
+          # Remove Microsoft repos that can cause 403 errors (we don't need Azure CLI etc.)
+          # See: https://github.com/actions/runner-images/issues/9733
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
           # On Ubuntu 24.04+, qemu-system-x86_64-microvm binary is included in qemu-system-x86 package
           # The microvm binary is optimized for direct kernel boot with microvm machine type
