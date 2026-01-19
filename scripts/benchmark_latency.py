@@ -177,7 +177,7 @@ def fmt_stats(values: list[float]) -> str:
     return f"{median:.0f} / {p95:.0f}"
 
 
-def print_stats(name: str, stats: TimingStats) -> None:  # noqa: PLR0912
+def print_stats(name: str, stats: TimingStats) -> None:
     """Print timing statistics (all metrics are per-VM)."""
     if not stats.e2e:
         print(f"\n{name}: No data")
