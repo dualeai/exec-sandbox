@@ -16,6 +16,7 @@ from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.system_probes import (
+    NOT_CACHED,
     _check_tsc_deadline_linux,  # pyright: ignore[reportPrivateUsage]
     _check_tsc_deadline_macos,  # pyright: ignore[reportPrivateUsage]
     check_hvf_available,
@@ -131,7 +132,7 @@ class TestQemuAcceleratorProbe:
     @pytest.fixture(autouse=True)
     def clear_qemu_cache(self) -> None:
         """Clear QEMU accelerator cache before each test."""
-        probe_cache.qemu_accels = None
+        probe_cache.reset("qemu_accels")
 
     # ========================================================================
     # Normal Cases - Happy path scenarios
@@ -184,7 +185,7 @@ class TestQemuAcceleratorProbe:
         """Probe returns empty set when QEMU binary is not found."""
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             mock_exec.side_effect = FileNotFoundError("qemu-system-x86_64 not found")
-            probe_cache.qemu_accels = None  # Clear cache
+            probe_cache.reset("qemu_accels")  # Clear cache
             result = await probe_qemu_accelerators()
             assert result == set()
 
@@ -195,7 +196,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.communicate = AsyncMock(return_value=(b"", b"error"))
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert result == set()
 
@@ -206,7 +207,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.communicate = AsyncMock(return_value=(b"", b""))
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert result == set()
 
@@ -217,7 +218,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.communicate = AsyncMock(return_value=(b"Accelerators supported in QEMU binary:\n", b""))
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert result == set()
 
@@ -227,7 +228,7 @@ class TestQemuAcceleratorProbe:
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert result == set()
 
@@ -244,7 +245,7 @@ class TestQemuAcceleratorProbe:
         )
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert "tcg" in result
             assert "kvm" in result
@@ -259,7 +260,7 @@ class TestQemuAcceleratorProbe:
         )
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert "tcg" in result
             assert "kvm" in result
@@ -277,7 +278,7 @@ class TestQemuAcceleratorProbe:
         )
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert "tcg" in result
             assert "xen" in result
@@ -293,7 +294,7 @@ class TestQemuAcceleratorProbe:
         )
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             # strip() handles \r\n
             assert "tcg" in result or "tcg\r" in result  # Verify parsing works
@@ -306,7 +307,7 @@ class TestQemuAcceleratorProbe:
         """Probe returns empty set on OSError."""
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
             mock_exec.side_effect = OSError("Permission denied")
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert result == set()
 
@@ -319,14 +320,13 @@ class TestQemuAcceleratorProbe:
         mock_proc.communicate = AsyncMock(return_value=(f"Accelerators supported:\n{accels}\n".encode(), b""))
 
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc):
-            probe_cache.qemu_accels = None
+            probe_cache.reset("qemu_accels")
             result = await probe_qemu_accelerators()
             assert len(result) == 1000
 
     async def test_cache_cleared_between_tests(self) -> None:
         """Verify cache is properly cleared (test isolation)."""
-        # This test verifies the fixture works
-        assert probe_cache.qemu_accels is None
+        assert probe_cache.qemu_accels is NOT_CACHED
 
 
 # ============================================================================
@@ -525,7 +525,7 @@ class TestQemuVersionProbe:
 
     async def test_cache_cleared_between_tests(self) -> None:
         """Verify cache is properly cleared (test isolation)."""
-        assert probe_cache.qemu_version is None
+        assert probe_cache.qemu_version is NOT_CACHED
 
 
 # ============================================================================
@@ -882,8 +882,8 @@ class TestTwoLayerKvmDetection:
     @pytest.fixture(autouse=True)
     def clear_caches(self) -> None:
         """Clear all relevant caches before each test."""
-        probe_cache.kvm = None
-        probe_cache.qemu_accels = None
+        probe_cache.reset("kvm")
+        probe_cache.reset("qemu_accels")
 
     async def test_kvm_fails_when_qemu_lacks_kvm_support(self) -> None:
         """KVM detection fails if QEMU doesn't have KVM compiled in."""
@@ -934,7 +934,7 @@ class TestTwoLayerKvmDetection:
     async def test_kvm_fails_when_dev_kvm_missing(self) -> None:
         """KVM detection fails early if /dev/kvm doesn't exist."""
         with patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=False):
-            probe_cache.kvm = None
+            probe_cache.reset("kvm")
             result = await check_kvm_available()
             assert result is False
 
@@ -945,8 +945,8 @@ class TestTwoLayerHvfDetection:
     @pytest.fixture(autouse=True)
     def clear_caches(self) -> None:
         """Clear all relevant caches before each test."""
-        probe_cache.hvf = None
-        probe_cache.qemu_accels = None
+        probe_cache.reset("hvf")
+        probe_cache.reset("qemu_accels")
 
     async def test_hvf_fails_when_qemu_lacks_hvf_support(self) -> None:
         """HVF detection fails if QEMU doesn't have HVF compiled in."""
@@ -1003,9 +1003,9 @@ class TestCheckHwaccelAvailable:
     @pytest.fixture(autouse=True)
     def clear_caches(self) -> None:
         """Clear all relevant caches before each test."""
-        probe_cache.kvm = None
-        probe_cache.hvf = None
-        probe_cache.qemu_accels = None
+        probe_cache.reset("kvm")
+        probe_cache.reset("hvf")
+        probe_cache.reset("qemu_accels")
 
     def test_returns_boolean(self) -> None:
         """check_hwaccel_available returns a boolean."""
@@ -1526,7 +1526,7 @@ class TestTscDeadlineLinux:
         original_tsc = probe_cache.tsc_deadline
 
         try:
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             cpuinfo_content = """processor	: 0
 vendor_id	: GenuineIntel
@@ -1550,7 +1550,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep tsc_deadline_timer sse sse2
         original_tsc = probe_cache.tsc_deadline
 
         try:
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             cpuinfo_content = """processor	: 0
 vendor_id	: GenuineIntel
@@ -1574,7 +1574,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
         original_tsc = probe_cache.tsc_deadline
 
         try:
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             with patch("aiofiles.os.path.exists", return_value=False):
                 result = await _check_tsc_deadline_linux()
@@ -1590,7 +1590,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
         original_tsc = probe_cache.tsc_deadline
 
         try:
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             with patch("aiofiles.os.path.exists", return_value=True):
                 with patch("aiofiles.open", side_effect=OSError("Permission denied")):
@@ -1618,7 +1618,7 @@ class TestTscDeadlineMacOS:
 
         try:
             # Clear cache
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.AARCH64):
                 result = await _check_tsc_deadline_macos()
@@ -1637,7 +1637,7 @@ class TestTscDeadlineMacOS:
 
         try:
             # Clear cache
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.X86_64):
                 mock_proc = AsyncMock()
@@ -1663,7 +1663,7 @@ class TestTscDeadlineMacOS:
 
         try:
             # Clear cache
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.X86_64):
                 mock_proc = AsyncMock()
@@ -1687,7 +1687,7 @@ class TestTscDeadlineMacOS:
 
         try:
             # Clear cache
-            probe_cache.tsc_deadline = None
+            probe_cache.reset("tsc_deadline")
 
             with patch("exec_sandbox.system_probes.detect_host_arch", return_value=HostArch.X86_64):
                 mock_proc = AsyncMock()
