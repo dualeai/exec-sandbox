@@ -503,6 +503,11 @@ fn switch_root() -> ! {
     let args: [*const libc::c_char; 2] = [prog.as_ptr(), std::ptr::null()];
     unsafe { libc::execv(prog.as_ptr(), args.as_ptr()) };
 
+    // execv only returns on error - report errno for debugging
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+    // Common errno: 2=ENOENT, 8=ENOEXEC (wrong arch), 13=EACCES, 14=EFAULT
+    log_fmt!("[init] execv failed: errno={}", errno);
+
     error("execv guest-agent failed");
     fallback_shell();
 }
