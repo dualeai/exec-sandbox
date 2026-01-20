@@ -59,6 +59,7 @@ from exec_sandbox.permission_utils import (
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
+from exec_sandbox.process_registry import register_process, unregister_process
 from exec_sandbox.qemu_cmd import build_qemu_cmd
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.qemu_vm import QemuVM
@@ -546,6 +547,8 @@ class VmManager:
                     expose_ports=expose_ports if expose_ports else None,
                     block_outbound=is_mode1,  # Mode 1: block all guest-initiated outbound
                 )
+                # Register for emergency cleanup on Ctrl+C (force kill on second interrupt)
+                register_process(gvproxy_proc)
                 # Attach gvproxy to cgroup for resource limits
                 await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
                 gvproxy_start_ms = round((asyncio.get_event_loop().time() - gvproxy_start_time) * 1000)
@@ -567,6 +570,8 @@ class VmManager:
                         preexec_fn=_set_umask_007 if workdir.use_qemu_vm_user else None,
                     )
                 )
+                # Register for emergency cleanup on Ctrl+C (force kill on second interrupt)
+                register_process(qemu_proc)
                 # Capture fork time immediately after subprocess creation
                 qemu_fork_ms = round((asyncio.get_event_loop().time() - qemu_start_time) * 1000)
 
@@ -894,6 +899,9 @@ class VmManager:
             )
             results["qemu"] = process_results[0] if isinstance(process_results[0], bool) else False
             results["gvproxy"] = process_results[1] if isinstance(process_results[1], bool) else False
+            # Unregister from emergency cleanup registry
+            unregister_process(qemu_proc)
+            unregister_process(gvproxy_proc)
         except asyncio.CancelledError:
             # Shield completed but outer task was cancelled - continue to Phase 2 anyway
             logger.debug(
@@ -902,6 +910,9 @@ class VmManager:
             results["qemu"] = False
             results["gvproxy"] = False
             was_cancelled = True
+            # Still unregister even on cancellation
+            unregister_process(qemu_proc)
+            unregister_process(gvproxy_proc)
 
         # Phase 2: Cleanup workdir and cgroup in parallel (after processes dead)
         # workdir.cleanup() removes overlay, sockets, and console log in one operation

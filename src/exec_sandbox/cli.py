@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import sys
+import termios
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +39,88 @@ from exec_sandbox import (
     __version__,
 )
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
+from exec_sandbox.process_registry import force_kill_all, get_tracked_count
+
+
+def _create_terminal_monitor(stop_event: threading.Event) -> None:
+    """Background thread to keep ISIG enabled so Ctrl+C generates SIGINT."""
+    try:
+        tty_fd = sys.stdin.fileno()
+        while not stop_event.is_set():
+            try:
+                attrs = termios.tcgetattr(tty_fd)
+                lflag = attrs[3]
+                if not (lflag & termios.ISIG):
+                    # ISIG was disabled - re-enable it
+                    attrs[3] = lflag | termios.ISIG
+                    termios.tcsetattr(tty_fd, termios.TCSANOW, attrs)
+            except (OSError, termios.error):
+                pass  # Terminal not available or error reading settings
+            stop_event.wait(0.1)  # Check every 100ms
+    except (OSError, ValueError):
+        pass  # Thread cleanup, stdin closed, or invalid fd
+
+
+def _run_with_interrupt_handling(coro: Any) -> Any:
+    """Run coroutine with proper Ctrl+C handling.
+
+    Does NOT use asyncio.run() because it overrides signal handlers.
+    Spawns a background thread to keep terminal ISIG enabled.
+
+    - First Ctrl+C: Cancels main task, cleanup (__aexit__) runs
+    - Second Ctrl+C: Force kill all child process groups immediately
+    """
+    interrupt_count = [0]
+    main_task: asyncio.Task[Any] | None = None
+    loop: asyncio.AbstractEventLoop | None = None
+    stop_monitor = threading.Event()
+
+    def handle_sigint(_signum: int, _frame: Any) -> None:
+        interrupt_count[0] += 1
+        if interrupt_count[0] > 1:
+            count = get_tracked_count()
+            if count > 0:
+                click.echo(f"\nForce killing {count} VM process(es)...", err=True)
+                force_kill_all()
+            sys.exit(130)
+        click.echo("\nInterrupted. Shutting down (Ctrl+C again to force)...", err=True)
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
+        if loop is not None:
+            loop.call_soon_threadsafe(lambda: None)
+
+    original_handler = signal.signal(signal.SIGINT, handle_sigint)
+    monitor_thread = threading.Thread(target=_create_terminal_monitor, args=(stop_monitor,), daemon=True)
+    monitor_thread.start()
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            main_task = loop.create_task(coro)
+            return loop.run_until_complete(main_task)
+        except asyncio.CancelledError:
+            sys.exit(130)
+        finally:
+            _cleanup_event_loop(loop)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    finally:
+        stop_monitor.set()
+        signal.signal(signal.SIGINT, original_handler)
+
+
+def _cleanup_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Clean up asyncio event loop, cancelling pending tasks."""
+    try:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    finally:
+        loop.close()
+
 
 # Exit codes following Unix conventions
 EXIT_SUCCESS = 0
@@ -794,7 +879,7 @@ def run_command(
     # Single source: use original streaming behavior
     if len(resolved_sources) == 1:
         src_input = resolved_sources[0]
-        exit_code = asyncio.run(
+        exit_code = _run_with_interrupt_handling(
             run_code(
                 code=src_input.code,
                 language=src_input.language,
@@ -812,7 +897,7 @@ def run_command(
         )
     else:
         # Multiple sources: use concurrent execution
-        exit_code = asyncio.run(
+        exit_code = _run_with_interrupt_handling(
             run_multiple(
                 sources=resolved_sources,
                 packages=list(packages),
