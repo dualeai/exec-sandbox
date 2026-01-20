@@ -39,10 +39,10 @@ The `sbx` command provides quick access to sandbox execution from the terminal:
 
 ```bash
 # Run Python code
-sbx run 'print("Hello, World!")'
+sbx run 'print("Hello from sandbox")'
 
 # Run JavaScript
-sbx run -l javascript 'console.log("Hello!")'
+sbx run -l javascript 'console.log("Hello from sandbox")'
 
 # Run a file (language auto-detected from extension)
 sbx run script.py
