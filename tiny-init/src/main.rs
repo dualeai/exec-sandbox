@@ -3,8 +3,8 @@
 //! Pure Rust port of images/minimal-init.sh - no busybox dependency.
 
 use std::ffi::CString;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::thread;
@@ -13,13 +13,13 @@ use std::time::Duration;
 // Syscall numbers
 #[cfg(target_arch = "x86_64")]
 mod syscall_nr {
-    pub const INIT_MODULE: libc::c_long = 175;
+    pub const FINIT_MODULE: libc::c_long = 313;
     pub const SWAPON: libc::c_long = 167;
 }
 
 #[cfg(target_arch = "aarch64")]
 mod syscall_nr {
-    pub const INIT_MODULE: libc::c_long = 105;
+    pub const FINIT_MODULE: libc::c_long = 273;
     pub const SWAPON: libc::c_long = 224;
 }
 
@@ -92,20 +92,21 @@ fn mount_move(source: &str, target: &str) -> i32 {
 fn load_module(path: &str, debug: bool) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
 
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
+    let path_cstr = match CString::new(path) {
+        Ok(p) => p,
+        Err(_) => {
             if debug {
-                log_fmt!("[module] {}: not found ({})", name, e);
+                log_fmt!("[module] {}: invalid path", name);
             }
             return false;
         }
     };
 
-    let mut data = Vec::new();
-    if let Err(e) = file.read_to_end(&mut data) {
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
         if debug {
-            log_fmt!("[module] {}: read error ({})", name, e);
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            log_fmt!("[module] {}: open failed (errno={})", name, errno);
         }
         return false;
     }
@@ -113,12 +114,14 @@ fn load_module(path: &str, debug: bool) -> bool {
     let params = CString::new("").unwrap();
     let ret = unsafe {
         libc::syscall(
-            syscall_nr::INIT_MODULE,
-            data.as_ptr(),
-            data.len(),
+            syscall_nr::FINIT_MODULE,
+            fd,
             params.as_ptr(),
+            0 as libc::c_int,
         )
     };
+
+    unsafe { libc::close(fd) };
 
     if ret == 0 {
         if debug {

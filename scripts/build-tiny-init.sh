@@ -17,6 +17,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
 RUST_VERSION="${RUST_VERSION:-1.83}"
 
+# NOTE: Check periodically if -Zbuild-std and panic_immediate_abort have been stabilized.
+# When stable, we can add: RUSTFLAGS="-Cpanic=immediate-abort" cargo build -Zbuild-std=std,panic_abort
+# This would reduce binary size by ~30-50%. Track: https://github.com/rust-lang/rust/issues/115022
+
 # Buildx cache configuration (for CI)
 # Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
 # Example: BUILDX_CACHE_FROM="type=gha" BUILDX_CACHE_TO="type=gha,mode=max"
