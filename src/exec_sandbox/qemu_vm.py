@@ -16,7 +16,7 @@ from exec_sandbox import cgroup, constants
 from exec_sandbox.exceptions import VmBootTimeoutError, VmPermanentError, VmTransientError
 from exec_sandbox.guest_agent_protocol import ExecuteCodeRequest
 from exec_sandbox.guest_channel import GuestChannel
-from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, TimingBreakdown
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
 from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
@@ -108,6 +108,9 @@ class QemuVM:
         self.timing = VmTiming()
         # Tracks if this VM owns a semaphore permit (prevents double-release in destroy)
         self.holds_semaphore_slot = False
+        # Port forwarding - set by VmManager after boot
+        # Stores the resolved port mappings for result reporting
+        self.exposed_ports: list[ExposedPort] = []
 
     # -------------------------------------------------------------------------
     # Timing properties (backwards-compatible accessors to VmTiming)

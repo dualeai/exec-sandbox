@@ -4,7 +4,7 @@ go 1.24.1
 
 require github.com/containers/gvisor-tap-vsock v0.8.7
 
-replace github.com/containers/gvisor-tap-vsock => github.com/dualeai/gvisor-tap-vsock v0.8.7-dualeai.2
+replace github.com/containers/gvisor-tap-vsock => github.com/dualeai/gvisor-tap-vsock v0.8.7-dualeai.3
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect

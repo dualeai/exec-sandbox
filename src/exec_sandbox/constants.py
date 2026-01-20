@@ -243,3 +243,19 @@ QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS: Final[float] = 10.0
 
 QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS: Final[float] = 30.0
 """Timeout waiting for async blockdev-create jobs to complete."""
+
+# ============================================================================
+# Port Forwarding
+# ============================================================================
+
+MAX_EXPOSED_PORTS: Final[int] = 10
+"""Maximum number of ports that can be exposed per VM."""
+
+PORT_FORWARD_MIN_HOST_PORT: Final[int] = 1024
+"""Minimum host port for port forwarding (unprivileged ports only)."""
+
+PORT_FORWARD_BIND_HOST: Final[str] = "127.0.0.1"
+"""Host address to bind forwarded ports to (localhost only for security)."""
+
+GVPROXY_API_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout for gvproxy HTTP API requests (port forward expose/unexpose)."""

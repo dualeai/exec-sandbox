@@ -1,8 +1,51 @@
 """Data models for exec-sandbox."""
 
+from __future__ import annotations
+
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+
+class PortMapping(BaseModel):
+    """Port mapping configuration: internal (guest) → external (host).
+
+    Used to specify which ports to expose from the guest VM to the host.
+
+    Examples:
+        # Expose guest port 8080 on host port 3000
+        PortMapping(internal=8080, external=3000)
+
+        # Expose guest port 5000 on a dynamically allocated host port
+        PortMapping(internal=5000)  # external will be auto-assigned
+    """
+
+    internal: int = Field(ge=1, le=65535, description="Port inside VM (guest listens on)")
+    external: int | None = Field(
+        default=None,
+        ge=1024,
+        le=65535,
+        description="Port on host (None=dynamic, auto-assigned by OS)",
+    )
+    protocol: Literal["tcp", "udp"] = Field(default="tcp", description="Transport protocol")
+
+
+class ExposedPort(BaseModel):
+    """Active port mapping after allocation.
+
+    Represents a resolved port mapping with the actual allocated host port.
+    """
+
+    internal: int = Field(description="Port inside VM")
+    external: int = Field(description="Allocated port on host")
+    host: str = Field(default="127.0.0.1", description="Host bind address")
+    protocol: Literal["tcp", "udp"] = Field(default="tcp", description="Transport protocol")
+
+    @property
+    def url(self) -> str:
+        """Get HTTP URL for this exposed port."""
+        return f"http://{self.host}:{self.external}"
 
 
 class Language(str, Enum):
@@ -88,4 +131,9 @@ class ExecutionResult(BaseModel):
     process_ms: int | None = Field(
         default=None,
         description="Time from spawn to process exit in milliseconds (guest-reported)",
+    )
+    # Port forwarding: exposed ports accessible from host
+    exposed_ports: list[ExposedPort] = Field(
+        default_factory=lambda: [],  # noqa: PIE807 - lambda needed for pyright type inference
+        description="List of ports exposed from guest to host (empty if no port forwarding configured)",
     )

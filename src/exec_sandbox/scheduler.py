@@ -50,7 +50,8 @@ from typing import TYPE_CHECKING, Self
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
-from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
+from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.settings import Settings
 
 if TYPE_CHECKING:
@@ -213,6 +214,7 @@ class Scheduler:
         memory_mb: int | None = None,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
+        expose_ports: list[PortMapping | int] | None = None,
         env_vars: dict[str, str] | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
@@ -232,18 +234,24 @@ class Scheduler:
             allow_network: Enable network access for the VM. Default: False.
             allowed_domains: Whitelist of domains if allow_network=True.
                 If None/empty and allow_network=True, all domains allowed.
+            expose_ports: List of ports to expose from guest to host.
+                Can be PortMapping objects or integers (shorthand for internal port).
+                Works independently of allow_network:
+                - Mode 1 (allow_network=False): Port forwarding via QEMU hostfwd (no internet)
+                - Mode 2 (allow_network=True): Port forwarding via gvproxy API (with internet)
             env_vars: Environment variables to set in the VM.
             on_stdout: Callback for stdout chunks (streaming). Called as chunks arrive.
             on_stderr: Callback for stderr chunks (streaming). Called as chunks arrive.
 
         Returns:
-            ExecutionResult with stdout, stderr, exit_code, and timing info.
+            ExecutionResult with stdout, stderr, exit_code, timing info, and exposed_ports.
 
         Raises:
             SandboxError: Scheduler not started.
             PackageNotAllowedError: Package not in allowlist.
             VmError: VM creation or execution failed.
             VmTimeoutError: Execution exceeded timeout.
+            ValueError: Too many exposed ports or invalid port numbers.
 
         Example:
             ```python
@@ -257,6 +265,14 @@ class Scheduler:
                 language="python",
                 packages=["numpy==1.26.0"],
             )
+
+            # With port forwarding (no internet)
+            result = await scheduler.run(
+                "python -m http.server 8080",
+                language="python",
+                expose_ports=[PortMapping(internal=8080, external=3000)],
+            )
+            print(result.exposed_ports[0].url)  # http://127.0.0.1:3000
 
             # With streaming
             result = await scheduler.run(
@@ -277,6 +293,17 @@ class Scheduler:
         timeout = timeout_seconds or self.config.default_timeout_seconds
         memory = memory_mb or self.config.default_memory_mb
         packages = packages or []
+
+        # Resolve port mappings (allocate ephemeral ports for those without explicit external)
+        resolved_ports: list[ExposedPort] = []
+        if expose_ports:
+            resolved_ports = resolve_port_mappings(expose_ports)
+            logger.info(
+                "Resolved port mappings",
+                extra={
+                    "ports": [(p.internal, p.external) for p in resolved_ports],
+                },
+            )
 
         # Validate packages against allowlist
         if packages and self.config.enable_package_validation:
@@ -299,7 +326,9 @@ class Scheduler:
         is_cold_boot = False
         try:
             # Try warm pool first (instant allocation)
-            if self._warm_pool and not packages:
+            # Warm pool VMs don't have networking, so skip if networking is needed
+            needs_network: bool = allow_network or bool(resolved_ports)
+            if self._warm_pool and not packages and not needs_network:
                 lang_enum = Language(language)
                 vm = await self._warm_pool.get_vm(lang_enum, packages)
 
@@ -321,6 +350,7 @@ class Scheduler:
                     memory_mb=memory,
                     allow_network=allow_network,
                     allowed_domains=allowed_domains,
+                    expose_ports=resolved_ports if resolved_ports else None,
                 )
 
             # Execute code
@@ -375,6 +405,7 @@ class Scheduler:
                 warm_pool_hit=not is_cold_boot,
                 spawn_ms=result.spawn_ms,  # Pass through from guest
                 process_ms=result.process_ms,  # Pass through from guest
+                exposed_ports=resolved_ports,  # Port forwarding mappings
             )
 
         finally:

@@ -49,7 +49,7 @@ from exec_sandbox.exceptions import (
 from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.gvproxy import start_gvproxy
-from exec_sandbox.models import Language
+from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
 from exec_sandbox.permission_utils import (
     chmod_async,
@@ -239,6 +239,7 @@ class VmManager:
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
+        expose_ports: list[ExposedPort] | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -256,6 +257,9 @@ class VmManager:
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, write directly to this file (no overlay).
                 Used for snapshot creation. Mutually exclusive with backing_image.
+            expose_ports: List of ports to expose from guest to host.
+                Mode 1: Works without allow_network (QEMU hostfwd, no internet).
+                Mode 2: Works with allow_network (gvproxy API, with internet).
 
         Returns:
             QemuVM handle for code execution
@@ -291,6 +295,7 @@ class VmManager:
                         allow_network=allow_network,
                         allowed_domains=allowed_domains,
                         direct_write_target=direct_write_target,
+                        expose_ports=expose_ports,
                     )
                     # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
                     vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
@@ -315,6 +320,7 @@ class VmManager:
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
+        expose_ports: list[ExposedPort] | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM (implementation).
 
@@ -336,6 +342,9 @@ class VmManager:
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, write directly to this file (no overlay).
                 Used for snapshot creation. Mutually exclusive with backing_image.
+            expose_ports: List of ports to expose from guest to host.
+                Mode 1: Works without allow_network (QEMU hostfwd, no internet).
+                Mode 2: Works with allow_network (gvproxy API, with internet).
 
         Returns:
             QemuVM handle for code execution
@@ -460,6 +469,9 @@ class VmManager:
 
             # Step 5: Build QEMU command (always Linux in container)
             qemu_cmd_start = asyncio.get_event_loop().time()
+            # Pass expose_ports for Mode 1 (port-only via hostfwd) OR Mode 2 (handled by gvproxy API)
+            # Mode 1: QEMU user-mode networking with hostfwd (no internet, no gvproxy)
+            # Mode 2: gvproxy handles port forwarding via API (with internet)
             qemu_cmd = await build_qemu_cmd(
                 self.settings,
                 self.arch,
@@ -467,6 +479,7 @@ class VmManager:
                 workdir,
                 memory_mb,
                 allow_network,
+                expose_ports=expose_ports,
             )
 
             # Step 6: Create dual-port Unix socket communication channel for guest agent
@@ -506,12 +519,33 @@ class VmManager:
             gvproxy_start_ms = 0
             # gvproxy must create socket before QEMU connects to it
             # Moved from setup phase to boot phase to reduce contention under high concurrency
-            if allow_network:
+            # Start gvproxy for:
+            #   - Mode 1: expose_ports only (use empty allowed_domains to block all DNS = no internet)
+            #   - Mode 2: expose_ports + allow_network (use provided allowed_domains)
+            #   - Mode 3: allow_network only (use provided allowed_domains)
+            needs_gvproxy = allow_network or bool(expose_ports)
+            if needs_gvproxy:
+                # Mode 1: Block all DNS and outbound connections (port-forward only)
+                # Mode 2/3: Use provided allowed_domains, allow outbound to those domains
+                is_mode1 = bool(expose_ports) and not allow_network
+                effective_allowed_domains = allowed_domains if allow_network else []
                 logger.info(
                     "Starting gvproxy-wrapper in boot phase (before QEMU)",
-                    extra={"vm_id": vm_id, "allowed_domains": allowed_domains},
+                    extra={
+                        "vm_id": vm_id,
+                        "allowed_domains": effective_allowed_domains,
+                        "mode": "Mode 1 (port-forward only)" if is_mode1 else "Mode 2/3 (internet)",
+                        "block_outbound": is_mode1,
+                    },
                 )
-                gvproxy_proc, gvproxy_log_task = await start_gvproxy(vm_id, allowed_domains, language, workdir)
+                gvproxy_proc, gvproxy_log_task = await start_gvproxy(
+                    vm_id,
+                    effective_allowed_domains,
+                    language,
+                    workdir,
+                    expose_ports=expose_ports if expose_ports else None,
+                    block_outbound=is_mode1,  # Mode 1: block all guest-initiated outbound
+                )
                 # Attach gvproxy to cgroup for resource limits
                 await cgroup.attach_if_available(cgroup_path, gvproxy_proc.pid)
                 gvproxy_start_ms = round((asyncio.get_event_loop().time() - gvproxy_start_time) * 1000)
@@ -659,6 +693,13 @@ class VmManager:
                 vm.gvproxy_start_ms = gvproxy_start_ms
                 vm.qemu_fork_ms = qemu_fork_ms
                 vm.guest_wait_ms = guest_wait_ms
+
+                # Store exposed ports on VM for result reporting
+                # Note: For Mode 2 (gvproxy), port forwards are configured at gvproxy startup
+                # For Mode 1 (QEMU hostfwd), port forwards are configured in QEMU command
+                if expose_ports:
+                    vm.exposed_ports = expose_ports
+
                 # Transition to READY state after boot completes
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:

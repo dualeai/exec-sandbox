@@ -7,6 +7,7 @@ and VM configuration.
 import logging
 
 from exec_sandbox import cgroup, constants
+from exec_sandbox.models import ExposedPort
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
@@ -29,6 +30,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     workdir: VmWorkingDirectory,
     memory_mb: int,
     allow_network: bool,
+    expose_ports: list[ExposedPort] | None = None,
 ) -> list[str]:
     """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -38,7 +40,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         vm_id: Unique VM identifier
         workdir: VM working directory containing overlay and socket paths
         memory_mb: Guest VM memory in MB
-        allow_network: Enable network access
+        allow_network: Enable network access via gvproxy (outbound internet)
+        expose_ports: List of ports to expose from guest to host.
+            When set without allow_network, uses QEMU user-mode networking
+            with hostfwd (Mode 1). When set with allow_network, port
+            forwarding is handled by gvproxy API (Mode 2).
 
     Returns:
         QEMU command as list of strings
@@ -338,9 +344,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
             f"{console_params} root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce"
-            # init.net=1: load network modules (only when allow_network=True)
+            # init.net=1: load network modules when networking is needed
+            # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
             # init.balloon=1: load balloon module (always, needed for warm pool)
-            + (" init.net=1" if allow_network else "")
+            + (" init.net=1" if (allow_network or expose_ports) else "")
             + " init.balloon=1"
             # tsc=reliable only for x86_64 (TSC is x86-specific, ARM uses CNTVCT_EL0)
             + (" tsc=reliable" if arch == HostArch.X86_64 else ""),
@@ -543,8 +550,28 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # virtio-net configuration (optional, internet access only)
-    if allow_network:
+    # =============================================================
+    # Network Configuration: Three Modes (all via gvproxy)
+    # =============================================================
+    # All modes use gvproxy with socket networking for fast boot (~300ms).
+    # SLIRP was removed because it's ~40x slower (~11s boot).
+    #
+    # Mode 1: Port forwarding only (expose_ports + no allow_network)
+    #   - Uses gvproxy with empty allowed_domains (blocks all DNS = no internet)
+    #   - Port forwarding handled by gvproxy at startup
+    #
+    # Mode 2: Port forwarding with internet (expose_ports + allow_network)
+    #   - Uses gvproxy with allowed_domains for DNS filtering
+    #   - Port forwarding handled by gvproxy at startup
+    #
+    # Mode 3: Internet only (allow_network, no expose_ports)
+    #   - Standard gvproxy configuration
+    #
+    # =============================================================
+
+    needs_network = allow_network or bool(expose_ports)
+    if needs_network:
+        # All modes use socket networking to gvproxy (fast ~300ms boot)
         # Build netdev options with reconnect for socket resilience
         # Helps recover from transient gvproxy disconnections (DNS failures, socket EOF)
         netdev_opts = f"stream,id=net0,addr.type=unix,addr.path={workdir.gvproxy_socket}"
@@ -557,6 +584,22 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             netdev_opts += ",reconnect-ms=250"  # 250ms - balanced recovery
         elif qemu_version is not None and qemu_version >= (8, 0, 0):
             netdev_opts += ",reconnect=1"  # 1s minimum (integer-only param)
+
+        mode_desc = (
+            "Mode 1 (port-forward only, no internet)"
+            if expose_ports and not allow_network
+            else "Mode 2 (port-forward + internet)"
+            if expose_ports and allow_network
+            else "Mode 3 (internet only)"
+        )
+        logger.info(
+            f"Configuring socket networking via gvproxy ({mode_desc})",
+            extra={
+                "vm_id": vm_id,
+                "expose_ports": [(p.internal, p.external) for p in expose_ports] if expose_ports else None,
+                "allow_network": allow_network,
+            },
+        )
 
         qemu_args.extend(
             [

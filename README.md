@@ -60,6 +60,15 @@ sbx run -t 60 -m 512 long_script.py
 # Enable network with domain allowlist
 sbx run --network --allow-domain api.example.com fetch_data.py
 
+# Expose ports (guest:8080 → host:dynamic)
+sbx run --expose 8080 --json 'print("ready")' | jq '.exposed_ports[0].url'
+
+# Expose with explicit host port (guest:8080 → host:3000)
+sbx run --expose 8080:3000 --json 'print("ready")' | jq '.exposed_ports[0].external'
+
+# Start HTTP server with port forwarding (runs until timeout)
+sbx run -t 60 --expose 8080 'import http.server; http.server.test(port=8080, bind="0.0.0.0")'
+
 # JSON output for scripting
 sbx run --json 'print("test")' | jq .exit_code
 
@@ -88,6 +97,7 @@ sbx run -j 5 *.py
 | `--env` | `-e` | Environment variable KEY=VALUE (repeatable) | - |
 | `--network` | | Enable network access | false |
 | `--allow-domain` | | Allowed domain (repeatable) | - |
+| `--expose` | | Expose port `INTERNAL[:EXTERNAL][/PROTOCOL]` (repeatable) | - |
 | `--json` | | JSON output | false |
 | `--quiet` | `-q` | Suppress progress output | false |
 | `--no-validation` | | Skip package allowlist validation | false |
@@ -146,6 +156,39 @@ async with Scheduler() as scheduler:
         allowed_domains=["httpbin.org"],  # Domain allowlist
     )
 ```
+
+#### Port Forwarding
+
+Expose VM ports to the host for health checks, API testing, or service validation.
+
+```python
+from exec_sandbox import Scheduler, PortMapping
+
+async with Scheduler() as scheduler:
+    # Port forwarding without internet (isolated)
+    result = await scheduler.run(
+        code="print('server ready')",
+        expose_ports=[PortMapping(internal=8080, external=3000)],  # Guest:8080 → Host:3000
+        allow_network=False,  # No outbound internet
+    )
+    print(result.exposed_ports[0].url)  # http://127.0.0.1:3000
+
+    # Dynamic port allocation (OS assigns external port)
+    result = await scheduler.run(
+        code="print('server ready')",
+        expose_ports=[8080],  # external=None → OS assigns port
+    )
+    print(result.exposed_ports[0].external)  # e.g., 52341
+
+    # Long-running server with port forwarding
+    result = await scheduler.run(
+        code="import http.server; http.server.test(port=8080, bind='0.0.0.0')",
+        expose_ports=[PortMapping(internal=8080)],
+        timeout_seconds=60,  # Server runs until timeout
+    )
+```
+
+**Security:** Port forwarding works independently of internet access. When `allow_network=False`, guest VMs cannot initiate outbound connections (DNS blocked, direct IP blocked), but host-to-guest port forwarding still works.
 
 #### Production Configuration
 
@@ -277,6 +320,7 @@ VMs include automatic memory optimization (no configuration required):
 | `timing.boot_ms` | int | VM boot time |
 | `timing.execute_ms` | int | Code execution |
 | `timing.total_ms` | int | End-to-end time |
+| `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
 ## Exceptions
 
@@ -329,6 +373,10 @@ default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
 # Network without domain restrictions is risky
 allow_network=True                              # Full internet access
 allow_network=True, allowed_domains=["api.example.com"]  # Controlled
+
+# Port forwarding binds to localhost only
+expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
+# If you need external access, use a reverse proxy on the host
 ```
 
 ## Limits
@@ -340,6 +388,7 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 | Max stderr | 100KB |
 | Max packages | 50 |
 | Max env vars | 100 |
+| Max exposed ports | 10 |
 | Execution timeout | 1-300s |
 | VM memory | 128-2048MB |
 | Max concurrent VMs | 1-100 |
@@ -362,6 +411,7 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 - Network disabled by default - requires explicit `allow_network=True`
 - Domain allowlisting - only specified domains accessible when network enabled
 - Package validation - only top 10k Python/JavaScript packages allowed by default
+- Port forwarding isolation - when `expose_ports` is used without `allow_network`, guest cannot initiate any outbound connections (DNS and direct IP blocked)
 
 ## Requirements
 

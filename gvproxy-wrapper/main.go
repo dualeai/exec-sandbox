@@ -15,9 +15,11 @@ import (
 )
 
 var (
-	listenFD = flag.Int("listen-fd", -1, "Pre-bound socket FD (socket activation from parent process)")
-	dnsZones = flag.String("dns-zones", "", "DNS zones JSON configuration")
-	debug    = flag.Bool("debug", false, "Enable debug logging")
+	listenFD      = flag.Int("listen-fd", -1, "Pre-bound socket FD (socket activation from parent process)")
+	dnsZones      = flag.String("dns-zones", "", "DNS zones JSON configuration")
+	portForward   = flag.String("port-forward", "", "Port forwards JSON: {\"local\": \"remote\"} e.g. {\"127.0.0.1:8080\": \"192.168.127.2:8080\"}")
+	blockOutbound = flag.Bool("block-outbound", false, "Block all guest-initiated outbound connections (Mode 1: port-forward only)")
+	debug         = flag.Bool("debug", false, "Enable debug logging")
 )
 
 func main() {
@@ -39,6 +41,16 @@ func main() {
 		}
 	}
 
+	// Parse port forwards from JSON
+	// Format: {"local_addr:port": "remote_addr:port", ...}
+	// Example: {"127.0.0.1:8080": "192.168.127.2:8080"}
+	var forwards map[string]string
+	if *portForward != "" {
+		if err := json.Unmarshal([]byte(*portForward), &forwards); err != nil {
+			log.Fatalf("Error parsing port forwards: %v", err)
+		}
+	}
+
 	// Build configuration
 	config := types.Configuration{
 		Debug:             *debug,
@@ -48,6 +60,8 @@ func main() {
 		GatewayMacAddress: "5a:94:ef:e4:0c:dd",
 		DNS:               zones,
 		Protocol:          types.QemuProtocol,
+		Forwards:          forwards,       // Port forwarding: host -> guest
+		BlockAllOutbound:  *blockOutbound, // Block guest-initiated outbound (Mode 1)
 	}
 
 	if *debug {
@@ -79,6 +93,9 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("Listening on QEMU socket: (pre-bound FD %d)", *listenFD)
+	if *blockOutbound {
+		log.Printf("Outbound blocking enabled (Mode 1: port-forward only, no internet)")
+	}
 	if len(zones) > 0 {
 		log.Printf("DNS filtering enabled with %d zone(s)", len(zones))
 		for i, zone := range zones {

@@ -5,10 +5,12 @@ the gvproxy-wrapper process that provides network connectivity with DNS filterin
 """
 
 import asyncio
+import json
 import logging
 
 from exec_sandbox.dns_filter import generate_dns_zones_json
 from exec_sandbox.exceptions import VmDependencyError, VmGvproxyError
+from exec_sandbox.models import ExposedPort
 from exec_sandbox.permission_utils import grant_qemu_vm_access
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.socket_auth import create_unix_socket
@@ -23,6 +25,8 @@ async def start_gvproxy(
     allowed_domains: list[str] | None,
     language: str,
     workdir: VmWorkingDirectory,
+    expose_ports: list[ExposedPort] | None = None,
+    block_outbound: bool = False,
 ) -> tuple[ProcessWrapper, asyncio.Task[None]]:
     r"""Start gvproxy-wrapper with DNS filtering for this VM.
 
@@ -43,11 +47,27 @@ async def start_gvproxy(
     the 100-300ms polling latency that was required when gvproxy created
     the socket itself.
 
+    Port Forwarding (Mode 1 & 2)
+    ============================
+    When expose_ports is provided, gvproxy-wrapper is started with
+    port forwards configured via the -port-forward flag. The port
+    forwards are set up at gvproxy startup time via the Forwards
+    configuration field in gvisor-tap-vsock.
+
+    Outbound Blocking (Mode 1)
+    ==========================
+    When block_outbound is True, all guest-initiated outbound TCP/UDP
+    connections are blocked at the gvproxy level. This provides true
+    network isolation while still allowing host-to-guest port forwarding.
+    DNS is also blocked (returns 0.0.0.0) via empty allowed_domains.
+
     Args:
         vm_id: Unique VM identifier
         allowed_domains: Whitelist of allowed domains
         language: Programming language (for default registries)
         workdir: VM working directory containing socket paths
+        expose_ports: List of ports to expose (Mode 1/2 port forwarding)
+        block_outbound: Block all guest-initiated outbound connections (Mode 1)
 
     Returns:
         Tuple of (gvproxy_process, gvproxy_log_task)
@@ -97,14 +117,46 @@ async def start_gvproxy(
             "Either enable auto_download_assets=True in SchedulerConfig, "
             "or run 'make build' to build it locally."
         )
+
+    # Build gvproxy-wrapper command arguments
+    gvproxy_args = [
+        str(gvproxy_binary),
+        "-listen-fd",
+        str(socket_fd),
+        "-dns-zones",
+        dns_zones_json,
+    ]
+
+    # Add outbound blocking for Mode 1 (port-forward only, no internet)
+    # This blocks all guest-initiated TCP/UDP connections at the gvproxy level
+    if block_outbound:
+        gvproxy_args.append("-block-outbound")
+        logger.info(
+            "Enabling outbound blocking (Mode 1: port-forward only)",
+            extra={"vm_id": vm_id},
+        )
+
+    # Add port forwarding configuration if needed (Mode 1/2)
+    # Port forwards are configured at gvproxy startup via the Forwards config field
+    # Format: {"local_addr:port": "guest_ip:port", ...}
+    # Guest IP in gvproxy is always 192.168.127.2
+    if expose_ports:
+        forwards_dict = {f"{p.host}:{p.external}": f"192.168.127.2:{p.internal}" for p in expose_ports}
+        port_forward_json = json.dumps(forwards_dict)
+        gvproxy_args.extend(["-port-forward", port_forward_json])
+        logger.info(
+            "Configuring gvproxy port forwarding (Mode 2)",
+            extra={
+                "vm_id": vm_id,
+                "expose_ports": [(p.internal, p.external) for p in expose_ports],
+                "forwards": forwards_dict,
+            },
+        )
+
     try:
         proc = ProcessWrapper(
             await asyncio.create_subprocess_exec(
-                str(gvproxy_binary),
-                "-listen-fd",
-                str(socket_fd),
-                "-dns-zones",
-                dns_zones_json,
+                *gvproxy_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,  # Create new process group for proper cleanup
@@ -186,6 +238,8 @@ async def start_gvproxy(
             "vm_id": vm_id,
             "socket": str(socket_path),
             "dns_filtering": True,
+            "port_forwarding": expose_ports is not None and len(expose_ports) > 0,
+            "block_outbound": block_outbound,
         },
     )
 

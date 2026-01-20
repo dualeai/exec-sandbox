@@ -78,10 +78,23 @@ def test_generate_dns_zones_json_custom():
     assert len(zones[0]["records"]) == 1
 
 
-def test_generate_dns_zones_json_empty():
-    """Test JSON generation with no domains."""
+def test_generate_dns_zones_json_empty_blocks_all():
+    """Test JSON generation with empty domains blocks ALL DNS (Mode 1 behavior).
+
+    When allowed_domains=[] (empty list), all DNS should be blocked.
+    This is used for Mode 1 (port forwarding without internet).
+    """
     zones_json = generate_dns_zones_json([], "python")
 
+    # Empty list = block all DNS (zone with defaultIP=0.0.0.0 and no records)
+    assert "0.0.0.0" in zones_json
+    assert '"records":[]' in zones_json
+
+
+def test_generate_dns_zones_json_none_uses_defaults_or_no_filter():
+    """Test JSON generation with None uses language defaults or no filtering."""
+    # For raw language (no defaults), None means no filtering
+    zones_json = generate_dns_zones_json(None, "raw")
     assert zones_json == "[]"
 
 

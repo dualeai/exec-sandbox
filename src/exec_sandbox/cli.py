@@ -28,6 +28,7 @@ from exec_sandbox import (
     ExecutionResult,
     Language,
     PackageNotAllowedError,
+    PortMapping,
     SandboxError,
     Scheduler,
     SchedulerConfig,
@@ -113,6 +114,68 @@ def parse_env_vars(env_vars: tuple[str, ...]) -> dict[str, str]:
     return result
 
 
+def parse_port_mappings(port_specs: tuple[str, ...]) -> list[PortMapping]:
+    """Parse port mapping specifications.
+
+    Formats:
+        8080           - Internal port only (external auto-assigned)
+        8080:3000      - Internal:external
+        8080:3000/udp  - With protocol
+
+    Args:
+        port_specs: Tuple of port specification strings
+
+    Returns:
+        List of PortMapping objects
+
+    Raises:
+        click.BadParameter: If format is invalid
+    """
+    result: list[PortMapping] = []
+    for spec in port_specs:
+        port_spec = spec  # Avoid overwriting loop variable
+        try:
+            # Check for protocol suffix
+            protocol = "tcp"
+            if "/" in port_spec:
+                port_spec, protocol = port_spec.rsplit("/", 1)
+                if protocol not in ("tcp", "udp"):
+                    raise click.BadParameter(
+                        f"Invalid protocol: '{protocol}'. Use 'tcp' or 'udp'.",
+                        param_hint="'--expose'",
+                    )
+
+            # Parse internal:external or just internal
+            if ":" in port_spec:
+                parts = port_spec.split(":")
+                if len(parts) != 2:  # noqa: PLR2004
+                    raise click.BadParameter(
+                        f"Invalid port format: '{spec}'. Use INTERNAL or INTERNAL:EXTERNAL.",
+                        param_hint="'--expose'",
+                    )
+                internal, external = int(parts[0]), int(parts[1])
+                result.append(
+                    PortMapping(internal=internal, external=external, protocol=protocol)  # type: ignore[arg-type]
+                )
+            else:
+                internal = int(port_spec)
+                result.append(PortMapping(internal=internal, protocol=protocol))  # type: ignore[arg-type]
+
+        except ValueError as e:
+            if "int()" in str(e) or "invalid literal" in str(e):
+                raise click.BadParameter(
+                    f"Invalid port number in: '{spec}'. Ports must be integers.",
+                    param_hint="'--expose'",
+                ) from e
+            # Re-raise pydantic validation errors
+            raise click.BadParameter(
+                f"Invalid port mapping: '{spec}'. {e}",
+                param_hint="'--expose'",
+            ) from e
+
+    return result
+
+
 def format_error(title: str, message: str, suggestions: list[str] | None = None) -> str:
     """Format an error message following What → Why → Fix pattern.
 
@@ -167,6 +230,11 @@ def _result_to_dict(result: ExecutionResult) -> dict[str, Any]:
 
     if result.external_memory_peak_mb is not None:
         output["memory_peak_mb"] = result.external_memory_peak_mb
+
+    if result.exposed_ports:
+        output["exposed_ports"] = [
+            {"internal": p.internal, "external": p.external, "host": p.host, "url": p.url} for p in result.exposed_ports
+        ]
 
     return output
 
@@ -305,6 +373,7 @@ async def run_code(
     env_vars: dict[str, str],
     network: bool,
     allowed_domains: list[str],
+    expose_ports: list[PortMapping] | None,
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -320,6 +389,7 @@ async def run_code(
         env_vars: Environment variables
         network: Enable network
         allowed_domains: Allowed domains for network
+        expose_ports: Ports to expose from guest to host
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
@@ -353,6 +423,7 @@ async def run_code(
                 memory_mb=memory,
                 allow_network=network,
                 allowed_domains=list(allowed_domains) if allowed_domains else None,
+                expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
                 env_vars=env_vars if env_vars else None,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
@@ -418,6 +489,7 @@ async def run_multiple(
     env_vars: dict[str, str],
     network: bool,
     allowed_domains: list[str],
+    expose_ports: list[PortMapping] | None,
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -433,6 +505,7 @@ async def run_multiple(
         env_vars: Environment variables
         network: Enable network
         allowed_domains: Allowed domains for network
+        expose_ports: Ports to expose from guest to host
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
@@ -466,6 +539,7 @@ async def run_multiple(
                         memory_mb=memory,
                         allow_network=network,
                         allowed_domains=list(allowed_domains) if allowed_domains else None,
+                        expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
                         env_vars=env_vars if env_vars else None,
                     )
                     return MultiSourceResult(
@@ -628,6 +702,12 @@ def cli(ctx: click.Context) -> None:
 @click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
 @click.option("--network", is_flag=True, help="Enable network access")
 @click.option("--allow-domain", "allowed_domains", multiple=True, help="Allowed domain (repeatable)")
+@click.option(
+    "--expose",
+    "expose_ports",
+    multiple=True,
+    help="Expose port: INTERNAL or INTERNAL:EXTERNAL or INTERNAL:EXTERNAL/PROTOCOL (repeatable)",
+)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress output")
 @click.option("--no-validation", is_flag=True, help="Skip package validation")
@@ -649,6 +729,7 @@ def run_command(
     env_vars: tuple[str, ...],
     network: bool,
     allowed_domains: tuple[str, ...],
+    expose_ports: tuple[str, ...],
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -701,6 +782,12 @@ def run_command(
     except click.BadParameter as exc:
         raise click.UsageError(str(exc)) from exc
 
+    # Parse port mappings
+    try:
+        parsed_ports = parse_port_mappings(expose_ports) if expose_ports else None
+    except click.BadParameter as exc:
+        raise click.UsageError(str(exc)) from exc
+
     # Build list of SourceInput objects
     resolved_sources = [_resolve_source(src, language) for src in all_sources]
 
@@ -717,6 +804,7 @@ def run_command(
                 env_vars=parsed_env_vars,
                 network=network,
                 allowed_domains=list(allowed_domains),
+                expose_ports=parsed_ports,
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
@@ -733,6 +821,7 @@ def run_command(
                 env_vars=parsed_env_vars,
                 network=network,
                 allowed_domains=list(allowed_domains),
+                expose_ports=parsed_ports,
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,

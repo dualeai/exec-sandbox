@@ -72,17 +72,19 @@ from exec_sandbox.exceptions import (
     VmTimeoutError,
     VmTransientError,
 )
-from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
 
 __all__ = [
     "BalloonTransientError",
     "CommunicationError",
     "ExecutionResult",
+    "ExposedPort",
     "GuestAgentError",
     "Language",
     "PackageNotAllowedError",
     "PermanentError",
+    "PortMapping",
     "SandboxDependencyError",
     "SandboxError",
     "Scheduler",
