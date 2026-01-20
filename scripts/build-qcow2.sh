@@ -21,7 +21,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-IMAGES_DIR="$REPO_ROOT/images"
 
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.2}"
 PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-build-standalone
@@ -251,6 +250,7 @@ create_python_rootfs() {
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $PYTHON_PKGS"
+    # shellcheck disable=SC2086  # Word splitting is intentional for package list
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $PYTHON_PKGS
 
     echo "  Downloading Python $PYTHON_VERSION + uv $UV_VERSION in parallel..."
@@ -316,6 +316,7 @@ create_node_rootfs() {
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $NODE_PKGS"
+    # shellcheck disable=SC2086  # Word splitting is intentional for package list
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $NODE_PKGS
 
     # Copy bun from official image
@@ -340,6 +341,7 @@ create_raw_rootfs() {
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $RAW_PKGS"
+    # shellcheck disable=SC2086  # Word splitting is intentional for package list
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $RAW_PKGS
 }
 

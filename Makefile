@@ -26,7 +26,7 @@ version-pypi:
 # ============================================================================
 
 install-sys:
-	brew install qemu
+	brew install qemu shellcheck
 
 install:
 	uv venv --python $(python_version) --allow-existing
@@ -75,6 +75,7 @@ test-static:
 	uv run ruff check .
 	uv run pyright .
 	uv run -m vulture src/ scripts/ --min-confidence 80
+	shellcheck scripts/*.sh cicd/*.sh
 	$(MAKE) --directory guest-agent test-static
 	$(MAKE) --directory tiny-init test-static
 	$(MAKE) --directory gvproxy-wrapper test-static

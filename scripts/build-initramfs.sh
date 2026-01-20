@@ -41,7 +41,7 @@ echo "Building minimal initramfs for $ARCH_NAME..."
 
 # Create temp directory for initramfs
 INITRAMFS_DIR=$(mktemp -d)
-trap "rm -rf $INITRAMFS_DIR" EXIT
+trap 'rm -rf "$INITRAMFS_DIR"' EXIT
 
 # Create directory structure
 mkdir -p "$INITRAMFS_DIR"/{bin,dev,proc,sys,tmp,mnt,lib/modules}
@@ -137,12 +137,12 @@ if [ "$MAGIC" != "28b52ffd" ]; then
     exit 1
 fi
 
-# Report size
-NEW_SIZE=$(ls -lh "$OUTPUT_DIR/initramfs-$ARCH_NAME" | awk '{print $5}')
+# Report size (use du for portable human-readable size)
+NEW_SIZE=$(du -h "$OUTPUT_DIR/initramfs-$ARCH_NAME" | cut -f1)
 echo "Built minimal initramfs: $OUTPUT_DIR/initramfs-$ARCH_NAME ($NEW_SIZE)"
 
 # Show size comparison if old initramfs exists
 if [ -f "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" ]; then
-    OLD_SIZE=$(ls -lh "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" | awk '{print $5}')
+    OLD_SIZE=$(du -h "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" | cut -f1)
     echo "  (was $OLD_SIZE with Alpine's stock initramfs)"
 fi
