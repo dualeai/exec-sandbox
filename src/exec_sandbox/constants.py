@@ -33,6 +33,15 @@ MAX_TIMEOUT_SECONDS: Final[int] = 300
 VM_BOOT_TIMEOUT_SECONDS: Final[int] = 30
 """VM boot timeout in seconds (guest agent ready check)."""
 
+VM_BOOT_MAX_RETRIES: Final[int] = 3
+"""Maximum retry attempts for VM boot failures (CPU contention resilience)."""
+
+VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.02
+"""Minimum backoff between VM boot retries (20ms base)."""
+
+VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
+"""Maximum backoff between VM boot retries (500ms cap with jitter)."""
+
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent (TCP)."""
 
@@ -234,3 +243,19 @@ QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS: Final[float] = 10.0
 
 QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS: Final[float] = 30.0
 """Timeout waiting for async blockdev-create jobs to complete."""
+
+# ============================================================================
+# Port Forwarding
+# ============================================================================
+
+MAX_EXPOSED_PORTS: Final[int] = 10
+"""Maximum number of ports that can be exposed per VM."""
+
+PORT_FORWARD_MIN_HOST_PORT: Final[int] = 1024
+"""Minimum host port for port forwarding (unprivileged ports only)."""
+
+PORT_FORWARD_BIND_HOST: Final[str] = "127.0.0.1"
+"""Host address to bind forwarded ports to (localhost only for security)."""
+
+GVPROXY_API_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout for gvproxy HTTP API requests (port forward expose/unexpose)."""

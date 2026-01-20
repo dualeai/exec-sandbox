@@ -3,8 +3,8 @@
 //! Pure Rust port of images/minimal-init.sh - no busybox dependency.
 
 use std::ffi::CString;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::thread;
@@ -13,13 +13,13 @@ use std::time::Duration;
 // Syscall numbers
 #[cfg(target_arch = "x86_64")]
 mod syscall_nr {
-    pub const INIT_MODULE: libc::c_long = 175;
+    pub const FINIT_MODULE: libc::c_long = 313;
     pub const SWAPON: libc::c_long = 167;
 }
 
 #[cfg(target_arch = "aarch64")]
 mod syscall_nr {
-    pub const INIT_MODULE: libc::c_long = 105;
+    pub const FINIT_MODULE: libc::c_long = 273;
     pub const SWAPON: libc::c_long = 224;
 }
 
@@ -29,6 +29,33 @@ const MS_NOATIME: libc::c_ulong = 0x400;
 
 // Swap flags
 const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
+
+/// Write to stderr using raw syscall (safe before Rust stdio init).
+///
+/// # Why not eprintln!?
+///
+/// When running as PID 1 (init) in an initramfs, Rust's `std::io::stderr()`
+/// causes SIGSEGV because:
+/// - Lazy initialization of stdio may access invalid memory before console setup
+/// - Internal mutexes/TLS may not be properly initialized
+/// - File descriptors 0/1/2 may not exist yet
+///
+/// This macro uses raw `libc::write(fd=2)` which:
+/// - Is a direct syscall with no Rust runtime dependencies
+/// - Returns -1 (EBADF) instead of crashing if fd 2 doesn't exist
+/// - Works immediately, even before /dev is mounted
+///
+/// See: https://github.com/rust-lang/rust/issues/24821
+/// See: https://rust-lang.github.io/rfcs/1014-stdout-existential-crisis.html
+macro_rules! log_fmt {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            libc::write(2, b"\n".as_ptr() as *const libc::c_void, 1);
+        }
+    }};
+}
 
 fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: &str) -> i32 {
     let source = CString::new(source).unwrap();
@@ -62,27 +89,58 @@ fn mount_move(source: &str, target: &str) -> i32 {
     }
 }
 
-fn load_module(path: &str) {
-    // Read uncompressed module directly (modules decompressed at build time)
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return,
+fn load_module(path: &str, debug: bool) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+
+    let path_cstr = match CString::new(path) {
+        Ok(p) => p,
+        Err(_) => {
+            if debug {
+                log_fmt!("[module] {}: invalid path", name);
+            }
+            return false;
+        }
     };
 
-    let mut data = Vec::new();
-    if file.read_to_end(&mut data).is_err() {
-        return;
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        if debug {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            log_fmt!("[module] {}: open failed (errno={})", name, errno);
+        }
+        return false;
     }
 
     let params = CString::new("").unwrap();
-    // insmod - ignore errors (2>/dev/null)
-    unsafe {
+    let ret = unsafe {
         libc::syscall(
-            syscall_nr::INIT_MODULE,
-            data.as_ptr(),
-            data.len(),
+            syscall_nr::FINIT_MODULE,
+            fd,
             params.as_ptr(),
-        );
+            0 as libc::c_int,
+        )
+    };
+
+    unsafe { libc::close(fd) };
+
+    if ret == 0 {
+        if debug {
+            log_fmt!("[module] {}: ok", name);
+        }
+        true
+    } else {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        if errno == 17 {
+            if debug {
+                log_fmt!("[module] {}: built-in", name);
+            }
+            true
+        } else {
+            if debug {
+                log_fmt!("[module] {}: errno={}", name, errno);
+            }
+            false
+        }
     }
 }
 
@@ -140,21 +198,40 @@ fn wait_for_virtio_ports() -> bool {
 }
 
 fn setup_zram(kver: &str) {
-    let m = format!("/lib/modules/{}/kernel", kver);
-    load_module(&format!("{}/lib/lz4/lz4_compress.ko", m));
-    load_module(&format!("{}/crypto/lz4.ko", m));
-    load_module(&format!("{}/drivers/block/zram/zram.ko", m));
+    log_fmt!("[zram] setup starting (kernel {})", kver);
 
-    // Wait briefly for zram device to appear (fixes race condition)
-    // 20 iterations × 1ms = 20ms max (was 50ms)
-    for _ in 0..20 {
+    let m = format!("/lib/modules/{}/kernel", kver);
+
+    // Load modules with logging
+    let lz4_compress_ok = load_module(&format!("{}/lib/lz4/lz4_compress.ko", m), true);
+    load_module(&format!("{}/crypto/lz4.ko", m), true);
+    let zram_ok = load_module(&format!("{}/drivers/block/zram/zram.ko", m), true);
+
+    if !zram_ok && !lz4_compress_ok {
+        log_fmt!("[zram] module load failed, aborting");
+        return;
+    }
+
+    // Wait for zram device to appear after module load
+    // Exponential backoff: 1+2+4+8+16+32+64+128 = 255ms max
+    // CI runners with nested virtualization may need longer waits
+    log_fmt!("[zram] waiting for /sys/block/zram0...");
+    let wait_times = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000];
+    let mut total_wait_ms = 0u64;
+    for delay_us in wait_times {
         if Path::new("/sys/block/zram0").exists() {
+            log_fmt!("[zram] device appeared after {}ms", total_wait_ms);
             break;
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_micros(delay_us));
+        total_wait_ms += delay_us / 1000;
     }
 
     if !Path::new("/sys/block/zram0").exists() {
+        log_fmt!(
+            "[zram] device not found after {}ms, aborting",
+            total_wait_ms
+        );
         return;
     }
 
@@ -163,11 +240,13 @@ fn setup_zram(kver: &str) {
     let mut algo_set = false;
     for algo in algorithms {
         if fs::write("/sys/block/zram0/comp_algorithm", algo).is_ok() {
+            log_fmt!("[zram] compression: {}", algo);
             algo_set = true;
             break;
         }
     }
     if !algo_set {
+        log_fmt!("[zram] failed to set compression algorithm, aborting");
         return;
     }
 
@@ -183,14 +262,17 @@ fn setup_zram(kver: &str) {
         .unwrap_or(0);
 
     if mem_kb == 0 {
+        log_fmt!("[zram] failed to read MemTotal, aborting");
         return;
     }
 
     // ZRAM_SIZE=$((MEM_KB * 512))
     let zram_size = mem_kb * 512;
     if fs::write("/sys/block/zram0/disksize", zram_size.to_string()).is_err() {
+        log_fmt!("[zram] failed to set disksize, aborting");
         return;
     }
+    log_fmt!("[zram] disksize: {} bytes (mem: {}KB)", zram_size, mem_kb);
 
     // mkswap /dev/zram0 - write swap signature
     // No sync needed - zram is memory-backed
@@ -207,7 +289,8 @@ fn setup_zram(kver: &str) {
         f.write_all(&header)
     })();
 
-    if header_result.is_err() {
+    if let Err(e) = header_result {
+        log_fmt!("[zram] mkswap failed: {}, aborting", e);
         return;
     }
 
@@ -215,8 +298,12 @@ fn setup_zram(kver: &str) {
     let dev = CString::new("/dev/zram0").unwrap();
     let ret = unsafe { libc::syscall(syscall_nr::SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) };
     if ret < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        log_fmt!("[zram] swapon failed (errno={}), aborting", errno);
         return;
     }
+
+    log_fmt!("[zram] swap enabled");
 
     // VM tuning (these can fail silently - non-critical)
     let _ = fs::write("/proc/sys/vm/page-cluster", "0");
@@ -226,6 +313,8 @@ fn setup_zram(kver: &str) {
         (mem_kb * 4 / 100).to_string(),
     );
     let _ = fs::write("/proc/sys/vm/overcommit_memory", "0");
+
+    log_fmt!("[zram] setup complete");
 }
 
 fn setup_virtio_ports() {
@@ -283,7 +372,7 @@ fn redirect_to_console() {
 }
 
 fn error(msg: &str) {
-    eprintln!("[init] ERROR: {}", msg);
+    log_fmt!("[init] ERROR: {}", msg);
 }
 
 fn fallback_shell() -> ! {
@@ -417,6 +506,11 @@ fn switch_root() -> ! {
     let args: [*const libc::c_char; 2] = [prog.as_ptr(), std::ptr::null()];
     unsafe { libc::execv(prog.as_ptr(), args.as_ptr()) };
 
+    // execv only returns on error - report errno for debugging
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+    // Common errno: 2=ENOENT, 8=ENOEXEC (wrong arch), 13=EACCES, 14=EFAULT
+    log_fmt!("[init] execv failed: errno={}", errno);
+
     error("execv guest-agent failed");
     fallback_shell();
 }
@@ -446,28 +540,28 @@ fn main() {
     let need_balloon = cmdline_has("init.balloon=1");
 
     // Core virtio (always needed)
-    load_module(&format!("{}/drivers/virtio/virtio_mmio.ko", m));
-    load_module(&format!("{}/drivers/block/virtio_blk.ko", m));
+    load_module(&format!("{}/drivers/virtio/virtio_mmio.ko", m), false);
+    load_module(&format!("{}/drivers/block/virtio_blk.ko", m), false);
 
     // Network modules (only if init.net=1)
     if need_net {
-        load_module(&format!("{}/net/core/failover.ko", m));
-        load_module(&format!("{}/drivers/net/net_failover.ko", m));
-        load_module(&format!("{}/drivers/net/virtio_net.ko", m));
+        load_module(&format!("{}/net/core/failover.ko", m), false);
+        load_module(&format!("{}/drivers/net/net_failover.ko", m), false);
+        load_module(&format!("{}/drivers/net/virtio_net.ko", m), false);
     }
 
     // Balloon (only if init.balloon=1)
     if need_balloon {
-        load_module(&format!("{}/drivers/virtio/virtio_balloon.ko", m));
+        load_module(&format!("{}/drivers/virtio/virtio_balloon.ko", m), false);
     }
 
     // Filesystem modules (always needed)
-    load_module(&format!("{}/lib/crc16.ko", m));
-    load_module(&format!("{}/crypto/crc32c_generic.ko", m));
-    load_module(&format!("{}/lib/libcrc32c.ko", m));
-    load_module(&format!("{}/fs/mbcache.ko", m));
-    load_module(&format!("{}/fs/jbd2/jbd2.ko", m));
-    load_module(&format!("{}/fs/ext4/ext4.ko", m));
+    load_module(&format!("{}/lib/crc16.ko", m), false);
+    load_module(&format!("{}/crypto/crc32c_generic.ko", m), false);
+    load_module(&format!("{}/lib/libcrc32c.ko", m), false);
+    load_module(&format!("{}/fs/mbcache.ko", m), false);
+    load_module(&format!("{}/fs/jbd2/jbd2.ko", m), false);
+    load_module(&format!("{}/fs/ext4/ext4.ko", m), false);
 
     // Setup zram swap
     setup_zram(&kver);

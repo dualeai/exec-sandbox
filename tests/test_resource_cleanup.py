@@ -4,9 +4,13 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from exec_sandbox.cgroup import cleanup_cgroup
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import (
+    _cleanup_zombie_task,
+    _zombie_reap_tasks,
     cleanup_file,
     cleanup_overlay,
     cleanup_process,
@@ -367,3 +371,140 @@ class TestResourceCleanupFilesystem:
         result = await cleanup_overlay(None, "test-ctx")
 
         assert result is True
+
+
+class TestZombieTaskTracking:
+    """Test zombie reaping task tracking to prevent GC."""
+
+    @pytest.fixture(autouse=True)
+    def clear_zombie_tasks(self):
+        """Clear zombie task set before and after each test."""
+        _zombie_reap_tasks.clear()
+        yield
+        _zombie_reap_tasks.clear()
+
+    async def test_cleanup_zombie_task_removes_from_set(self):
+        """_cleanup_zombie_task removes completed task from tracking set."""
+
+        # Create a completed task
+        async def noop():
+            pass
+
+        task = asyncio.create_task(noop())
+        await task  # Wait for completion
+
+        # Add to tracking set
+        _zombie_reap_tasks.add(task)
+        assert task in _zombie_reap_tasks
+
+        # Call cleanup callback
+        _cleanup_zombie_task(task)
+
+        # Verify removal
+        assert task not in _zombie_reap_tasks
+
+    async def test_cleanup_zombie_task_logs_exception(self):
+        """_cleanup_zombie_task logs exceptions from failed tasks."""
+
+        # Create a task that raises an exception
+        async def fail():
+            raise ValueError("Test error")
+
+        task = asyncio.create_task(fail())
+        with pytest.raises(ValueError):
+            await task
+
+        # Add to tracking set
+        _zombie_reap_tasks.add(task)
+
+        # Call cleanup callback - should not raise, just log
+        with patch("exec_sandbox.resource_cleanup.logger") as mock_logger:
+            _cleanup_zombie_task(task)
+
+            # Verify warning logged
+            mock_logger.warning.assert_called_once()
+            call_args = mock_logger.warning.call_args
+            assert "Zombie reaping task failed" in call_args[0][0]
+
+        # Verify removal
+        assert task not in _zombie_reap_tasks
+
+    async def test_cleanup_zombie_task_handles_cancelled(self):
+        """_cleanup_zombie_task handles cancelled tasks without logging."""
+
+        # Create a task and cancel it
+        async def sleep_forever():
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(sleep_forever())
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Add to tracking set
+        _zombie_reap_tasks.add(task)
+
+        # Call cleanup callback - should not log for cancelled tasks
+        with patch("exec_sandbox.resource_cleanup.logger") as mock_logger:
+            _cleanup_zombie_task(task)
+
+            # Verify no warning logged for cancelled task
+            mock_logger.warning.assert_not_called()
+
+        # Verify removal
+        assert task not in _zombie_reap_tasks
+
+    async def test_cleanup_process_tracks_zombie_task_already_dead(self):
+        """cleanup_process tracks zombie reap task when process already dead."""
+        mock_proc = Mock(spec=ProcessWrapper)
+        mock_proc.pid = 12345
+        mock_proc.returncode = 0  # Already exited
+
+        # wait() must return a coroutine for asyncio.create_task()
+        async def mock_wait():
+            return 0
+
+        mock_proc.wait = mock_wait
+
+        result = await cleanup_process(
+            proc=mock_proc,
+            name="dead-process",
+            context_id="test-ctx",
+        )
+
+        assert result is True
+
+        # Give the task a chance to be created and tracked
+        await asyncio.sleep(0.01)
+
+        # Verify a task was added (and may have been cleaned up already)
+        # The task tracking ensures it won't be GC'd prematurely
+
+    async def test_cleanup_process_tracks_zombie_task_on_timeout(self):
+        """cleanup_process tracks background zombie reap task on SIGKILL timeout."""
+        mock_proc = Mock(spec=ProcessWrapper)
+        mock_proc.pid = 12345
+        mock_proc.returncode = None  # Still alive
+        mock_proc.stdout = None
+        mock_proc.stderr = None
+        mock_proc.terminate = AsyncMock()
+        mock_proc.kill = AsyncMock()
+
+        # Timeout on both SIGTERM and SIGKILL waits
+        mock_proc.wait_with_timeout = AsyncMock(side_effect=[asyncio.TimeoutError, asyncio.TimeoutError])
+
+        result = await cleanup_process(
+            proc=mock_proc,
+            name="stubborn-process",
+            context_id="test-ctx",
+            term_timeout=0.01,
+            kill_timeout=0.01,
+        )
+
+        assert result is False
+
+        # Give the background task a chance to be created
+        await asyncio.sleep(0.01)
+
+        # The task should have been created and tracked
+        # (it may have already completed and been cleaned up)

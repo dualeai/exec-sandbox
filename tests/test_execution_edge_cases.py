@@ -217,8 +217,13 @@ while True:
         exec_time = result.execution_time_ms or 0
         assert result.exit_code != 0 or exec_time >= 2500
 
+    @skip_unless_hwaccel
     async def test_infinite_output_times_out(self, scheduler: Scheduler) -> None:
-        """Infinite output is killed by timeout."""
+        """Infinite output is killed by timeout.
+
+        Note: Requires hardware acceleration because TCG is 10-50x slower,
+        making the 3s timeout elapse before the VM can produce any output.
+        """
         code = """
 while True:
     print("spam")

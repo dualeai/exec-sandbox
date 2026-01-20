@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Features:
 # - tiny-init: single static Rust binary (~50-100KB vs 1MB busybox)
-# - LZ4 compression (5x faster than gzip)
+# - zstd compression (~30% smaller than LZ4)
 # - Size: ~500KB vs Alpine's 9.3 MB
 #
 # Expected boot time savings: 100-150ms
@@ -41,7 +41,7 @@ echo "Building minimal initramfs for $ARCH_NAME..."
 
 # Create temp directory for initramfs
 INITRAMFS_DIR=$(mktemp -d)
-trap "rm -rf $INITRAMFS_DIR" EXIT
+trap 'rm -rf "$INITRAMFS_DIR"' EXIT
 
 # Create directory structure
 mkdir -p "$INITRAMFS_DIR"/{bin,dev,proc,sys,tmp,mnt,lib/modules}
@@ -76,17 +76,20 @@ mknod -m 666 "$INITRAMFS_DIR/dev/ttyAMA0" c 204 64 2>/dev/null || true
 # - ext4 + dependencies (jbd2, mbcache, crc16, crc32c): for ext4 filesystem
 # - zram + lz4: for compressed swap (memory optimization)
 #
-# Modules are extracted UNCOMPRESSED for faster boot:
-# - Outer LZ4 compression handles size reduction
+# Modules are extracted UNCOMPRESSED and STRIPPED for faster boot:
+# - Outer zstd compression handles size reduction
 # - Skips userspace gzip decompression during boot
+# - Strip removes debug symbols (~8% reduction)
 echo "Extracting kernel modules..."
 docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
-    apk add --no-cache linux-virt >/dev/null 2>&1
+    apk add --no-cache linux-virt binutils >/dev/null 2>&1
     # Get kernel version
     KVER=\$(ls /lib/modules/)
-    # Create a tar of the required modules (decompressed for fast loading)
+    # Create temp dir for processing
+    TMPDIR=\$(mktemp -d)
     cd /lib/modules/\$KVER
-    tar -cf - \
+    # Copy required modules
+    for mod in \
         kernel/drivers/block/virtio_blk.ko.gz \
         kernel/drivers/virtio/virtio_mmio.ko.gz \
         kernel/drivers/virtio/virtio_balloon.ko.gz \
@@ -101,12 +104,18 @@ docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "
         kernel/crypto/crc32c_generic.ko.gz \
         kernel/drivers/block/zram/zram.ko.gz \
         kernel/lib/lz4/lz4_compress.ko.gz \
-        kernel/crypto/lz4.ko.gz \
-        2>/dev/null || true
+        kernel/crypto/lz4.ko.gz
+    do
+        mkdir -p \$TMPDIR/\$(dirname \$mod)
+        cp \$mod \$TMPDIR/\$mod 2>/dev/null || true
+    done
+    # Decompress modules
+    find \$TMPDIR -name '*.ko.gz' -exec gunzip -f {} \;
+    # Strip debug symbols (~8% reduction)
+    find \$TMPDIR -name '*.ko' -exec strip --strip-unneeded {} \;
+    # Create tar archive
+    cd \$TMPDIR && tar -cf - .
 " | tar -xf - -C "$INITRAMFS_DIR/lib/modules/" 2>/dev/null || true
-
-# Decompress modules for faster boot (skip gzip decompression at runtime)
-find "$INITRAMFS_DIR/lib/modules" -name "*.ko.gz" -exec gunzip -f {} \;
 
 # Create the kernel version directory structure
 KVER=$(docker run --rm --platform "$DOCKER_PLATFORM" alpine:3.21 sh -c "apk add --no-cache linux-virt >/dev/null 2>&1; ls /lib/modules/")
@@ -116,25 +125,24 @@ if [ -d "$INITRAMFS_DIR/lib/modules/kernel" ]; then
     mv "$INITRAMFS_DIR/lib/modules/modules."* "$INITRAMFS_DIR/lib/modules/$KVER/" 2>/dev/null || true
 fi
 
-# Create cpio archive with LZ4 compression (5x faster decompression than gzip)
-# Alpine's linux-virt kernel has CONFIG_RD_LZ4=y built-in
-# -l flag creates legacy LZ4 format required by Linux kernel
+# Create cpio archive with zstd compression (~30% smaller than LZ4)
+# Alpine's linux-virt kernel has CONFIG_RD_ZSTD=y built-in
 cd "$INITRAMFS_DIR"
-find . | cpio -o -H newc --quiet 2>/dev/null | lz4 -9 -l > "$OUTPUT_DIR/initramfs-$ARCH_NAME"
+find . | cpio -o -H newc --quiet 2>/dev/null | zstd -19 > "$OUTPUT_DIR/initramfs-$ARCH_NAME"
 
-# Verify LZ4 legacy format (magic: 02 21 4C 18) required by Linux kernel
+# Verify zstd format (magic: 28 b5 2f fd)
 MAGIC=$(od -A n -t x1 -N 4 "$OUTPUT_DIR/initramfs-$ARCH_NAME" | tr -d ' ')
-if [ "$MAGIC" != "02214c18" ]; then
-    echo "ERROR: Invalid LZ4 format (got $MAGIC, expected 02214c18)"
+if [ "$MAGIC" != "28b52ffd" ]; then
+    echo "ERROR: Invalid zstd format (got $MAGIC, expected 28b52ffd)"
     exit 1
 fi
 
-# Report size
-NEW_SIZE=$(ls -lh "$OUTPUT_DIR/initramfs-$ARCH_NAME" | awk '{print $5}')
+# Report size (use du for portable human-readable size)
+NEW_SIZE=$(du -h "$OUTPUT_DIR/initramfs-$ARCH_NAME" | cut -f1)
 echo "Built minimal initramfs: $OUTPUT_DIR/initramfs-$ARCH_NAME ($NEW_SIZE)"
 
 # Show size comparison if old initramfs exists
 if [ -f "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" ]; then
-    OLD_SIZE=$(ls -lh "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" | awk '{print $5}')
+    OLD_SIZE=$(du -h "$OUTPUT_DIR/initramfs-$ARCH_NAME.alpine-backup" | cut -f1)
     echo "  (was $OLD_SIZE with Alpine's stock initramfs)"
 fi

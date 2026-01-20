@@ -28,8 +28,9 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
-from exec_sandbox.vm_manager import QemuVM, VmManager
+from exec_sandbox.vm_manager import VmManager
 from tests.conftest import skip_unless_hwaccel
 
 

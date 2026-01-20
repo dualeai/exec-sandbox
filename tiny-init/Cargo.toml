@@ -12,8 +12,9 @@ categories = ["virtualization"]
 libc = "0.2"
 
 [profile.release]
-opt-level = "z"   # Optimize for size
-lto = true        # Link-time optimization
-codegen-units = 1 # Better optimization
-strip = true      # Strip symbols
-panic = "abort"   # Abort on panic (smaller binary, no unwinding)
+opt-level = "z"       # Optimize for size
+lto = true            # Link-time optimization
+codegen-units = 1     # Better optimization
+strip = true          # Strip symbols
+panic = "abort"       # Abort on panic (smaller binary, no unwinding)
+overflow-checks = false  # Disable overflow checks (~5% smaller binary)

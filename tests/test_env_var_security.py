@@ -19,7 +19,7 @@ from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_manager import VmManager
 
 if TYPE_CHECKING:
-    from exec_sandbox.vm_manager import QemuVM
+    from exec_sandbox.qemu_vm import QemuVM
 
 
 class TestEnvVarSecurityIntegration:
@@ -175,7 +175,7 @@ class TestGuestAgentControlCharValidation:
     @pytest.fixture
     async def running_vm(self, vm_manager: VmManager) -> AsyncGenerator["QemuVM", None]:
         """Create a VM and yield it for testing."""
-        from exec_sandbox.vm_manager import QemuVM
+        from exec_sandbox.qemu_vm import QemuVM  # noqa: TC001
 
         vm: QemuVM = await vm_manager.create_vm(
             language=Language.PYTHON,

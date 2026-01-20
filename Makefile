@@ -26,7 +26,7 @@ version-pypi:
 # ============================================================================
 
 install-sys:
-	brew install qemu
+	brew install qemu shellcheck
 
 install:
 	uv venv --python $(python_version) --allow-existing
@@ -75,13 +75,14 @@ test-static:
 	uv run ruff check .
 	uv run pyright .
 	uv run -m vulture src/ scripts/ --min-confidence 80
+	shellcheck scripts/*.sh cicd/*.sh
 	$(MAKE) --directory guest-agent test-static
 	$(MAKE) --directory tiny-init test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
-# All tests together for accurate coverage measurement (excludes sudo tests)
+# All tests together for accurate coverage measurement (excludes sudo and slow tests)
 test-func:
-	uv run pytest tests/ -v -n auto -m "not sudo"
+	uv run pytest tests/ -v -n auto -m "not sudo and not slow"
 
 # Tests requiring sudo privileges (run separately with elevated permissions)
 test-sudo:
@@ -93,6 +94,10 @@ test-unit:
 	$(MAKE) --directory guest-agent test-unit
 	$(MAKE) --directory tiny-init test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
+
+# Memory leak detection tests (slow, run sequentially for accurate measurement)
+test-slow:
+	uv run pytest tests/ -v -n 0 -m slow
 
 # ============================================================================
 # Linting

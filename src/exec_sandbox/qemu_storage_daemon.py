@@ -31,6 +31,7 @@ from typing import Any, Self, cast
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.exceptions import VmOverlayError as QemuStorageDaemonError
 from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
@@ -43,14 +44,6 @@ class QmpJob:
     id: str
     status: str
     error: str | None = None
-
-
-class QemuStorageDaemonError(Exception):
-    """Error from qemu-storage-daemon."""
-
-    def __init__(self, message: str, error_class: str | None = None) -> None:
-        super().__init__(message)
-        self.error_class = error_class
 
 
 class QemuStorageDaemon:

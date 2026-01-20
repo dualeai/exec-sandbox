@@ -15,10 +15,21 @@ from exec_sandbox import Scheduler, SchedulerConfig
 from exec_sandbox.models import ExecutionResult
 from exec_sandbox.warm_vm_pool import Language
 
+from .conftest import skip_unless_fast_balloon
+
 # Maximum concurrent VMs for stress tests. QEMU creates 5-15 threads per VM;
 # with pytest-xdist this can exhaust thread limits (SIGABRT). Value of 3 is
 # safe while still testing concurrency.
 _MAX_CONCURRENT_VMS = 3
+
+# Memory-intensive tests that push VMs to near-maximum utilization (250MB in 256MB VM)
+# require fast balloon/memory operations. On x64 CI runners with nested virtualization
+# (GitHub Actions on Azure), these operations are 50-100x slower due to missing
+# TSC_DEADLINE timer support, causing timeouts and VM crashes. These tests are skipped
+# on degraded environments via skip_unless_fast_balloon and run on:
+# - ARM64 Linux (native KVM, no nested virt penalty)
+# - macOS (HVF, no nested virt)
+# - Local development with native KVM/HVF
 
 # ============================================================================
 # zram Tests
@@ -258,8 +269,15 @@ except MemoryError:
         assert "PASS" in result.stdout
         assert "exceeded available by" in result.stdout
 
+    @pytest.mark.slow
+    @skip_unless_fast_balloon
     async def test_swap_usage_correlates_with_allocation(self, scheduler: Scheduler) -> None:
-        """Swap usage should increase proportionally as memory pressure grows."""
+        """Swap usage should increase proportionally as memory pressure grows.
+
+        Allocates 250MB in stages (50MB increments) in a 256MB VM, verifying that
+        zram swap activates and increases by at least 30MB. Skipped on nested
+        virtualization (x64 CI) where memory operations are too slow.
+        """
         result = await scheduler.run(
             code="""
 def get_swap_used_kb():
@@ -452,8 +470,16 @@ print('PASS: Balloon driver functional')
 class TestConcurrentVMs:
     """Tests for multiple VMs running concurrently with memory features."""
 
+    @pytest.mark.slow
+    @skip_unless_fast_balloon
     async def test_concurrent_vms_with_heavy_memory_pressure(self, images_dir: Path) -> None:
-        """Concurrent VMs should each handle 180MB allocation."""
+        """Concurrent VMs should each handle 180MB allocation.
+
+        Runs 3 VMs simultaneously, each allocating 180MB in a 256MB VM (70%
+        utilization). Tests that zram enables memory expansion under concurrent
+        load. Skipped on nested virtualization (x64 CI) where memory operations
+        are too slow.
+        """
         config = SchedulerConfig(
             default_memory_mb=256,
             default_timeout_seconds=90,

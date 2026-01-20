@@ -35,7 +35,7 @@ else:
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmError
+from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmQemuCrashError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     InstallPackagesRequest,
@@ -49,7 +49,8 @@ from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 
 if TYPE_CHECKING:
-    from exec_sandbox.vm_manager import QemuVM, VmManager
+    from exec_sandbox.qemu_vm import QemuVM
+    from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
 
@@ -379,7 +380,7 @@ class SnapshotManager:
 
         Raises:
             SnapshotError: Creation failed
-            VmError: VM crashed during snapshot creation
+            VmQemuCrashError: VM crashed during snapshot creation
         """
         start_time = asyncio.get_event_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
@@ -487,7 +488,7 @@ class SnapshotManager:
                     # because it handles the signal gracefully and performs cleanup.
                     # This is expected behavior on macOS with HVF.
                     if vm.process.returncode not in {0, -9, -15}:
-                        raise VmError(
+                        raise VmQemuCrashError(
                             f"QEMU exited unexpectedly after terminate (exit code {vm.process.returncode})",
                             context={
                                 "cache_key": cache_key,
@@ -497,15 +498,26 @@ class SnapshotManager:
                             },
                         )
                 else:
-                    # QEMU died on its own - this is always unexpected during snapshot creation
-                    raise VmError(
-                        f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
-                        context={
-                            "cache_key": cache_key,
-                            "exit_code": vm.process.returncode,
-                            "language": language,
-                            "packages": packages,
-                        },
+                    # QEMU died on its own before we could terminate it
+                    # Exit code 0 is acceptable if install completed successfully (we reached here)
+                    # because the guest may have shut down cleanly after:
+                    # 1. Package installation completed
+                    # 2. Guest called sync() to persist filesystem changes
+                    # 3. Guest decided to halt (idle timeout, clean shutdown, etc.)
+                    # Non-zero exit codes still indicate a problem (crash, signal, etc.)
+                    if vm.process.returncode != 0:
+                        raise VmQemuCrashError(
+                            f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
+                            context={
+                                "cache_key": cache_key,
+                                "exit_code": vm.process.returncode,
+                                "language": language,
+                                "packages": packages,
+                            },
+                        )
+                    logger.info(
+                        "QEMU exited cleanly (code 0) after install completed",
+                        extra={"cache_key": cache_key, "language": language},
                     )
 
                 # Step 5: Clean up resources
@@ -524,7 +536,7 @@ class SnapshotManager:
                 raise
 
             # Handle VM death during snapshot creation
-            except VmError as e:
+            except VmTransientError as e:
                 # Wrap VM error in SnapshotError
                 # Cleanup handled by finally block
                 raise SnapshotError(
@@ -640,13 +652,13 @@ class SnapshotManager:
             cache_key: Snapshot cache key
 
         Raises:
-            VmError: VM process died unexpectedly
+            VmQemuCrashError: VM process died unexpectedly
         """
         # Wait for QEMU process to exit (blocks until death)
         returncode = await vm.process.wait()
 
         # Process died → raise error to cancel sibling tasks
-        raise VmError(
+        raise VmQemuCrashError(
             f"VM process died during snapshot creation (exit code {returncode})",
             context={
                 "cache_key": cache_key,
@@ -954,4 +966,4 @@ class SnapshotManager:
 
 
 # Import VmState for type checking in finally block
-from exec_sandbox.vm_manager import VmState  # noqa: E402
+from exec_sandbox.vm_types import VmState  # noqa: E402

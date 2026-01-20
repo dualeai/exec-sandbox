@@ -161,7 +161,8 @@ def generate_dns_zones_json(
     """Generate gvproxy DNS zones JSON.
 
     Args:
-        allowed_domains: Custom allowed domains, or None for language defaults
+        allowed_domains: Custom allowed domains, empty list to block ALL DNS,
+                        or None for language defaults
         language: Programming language (for default package registries)
 
     Returns:
@@ -171,21 +172,31 @@ def generate_dns_zones_json(
         >>> json_str = generate_dns_zones_json(None, "python")
         >>> "pypi.org" in json_str
         True
+        >>> json_str = generate_dns_zones_json([], "python")  # Block all DNS
+        >>> "0.0.0.0" in json_str
+        True
     """
-    # Auto-expand package domains if not specified
+    # Auto-expand package domains if not specified (None = use defaults)
     if allowed_domains is None:
         if language == "python":
             allowed_domains = PYTHON_PACKAGE_DOMAINS.copy()
         elif language == "javascript":
             allowed_domains = NPM_PACKAGE_DOMAINS.copy()
         else:
-            allowed_domains = []
+            # No language-specific defaults, no filtering
+            return "[]"
 
-    # No domains = no filtering
-    if not allowed_domains:
-        return "[]"
+    # Empty list = block ALL DNS (for Mode 1: port-forward only, no internet)
+    # This creates a zone with defaultIP=0.0.0.0 and no records = all DNS blocked
+    if len(allowed_domains) == 0:
+        zone = DNSZone(
+            name="",  # Root zone - matches all queries
+            records=[],  # No allowed records
+            defaultIP="0.0.0.0",  # Block everything  # noqa: S104
+        )
+        return json.dumps([zone.model_dump()], separators=(",", ":"))
 
-    # Create DNS zone
+    # Create DNS zone with allowed domains
     zone = create_dns_zone(allowed_domains)
 
     # Serialize to JSON (gvproxy expects array of zones)

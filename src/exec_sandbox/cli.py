@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import sys
+import termios
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +31,7 @@ from exec_sandbox import (
     ExecutionResult,
     Language,
     PackageNotAllowedError,
+    PortMapping,
     SandboxError,
     Scheduler,
     SchedulerConfig,
@@ -35,6 +39,88 @@ from exec_sandbox import (
     __version__,
 )
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
+from exec_sandbox.process_registry import force_kill_all, get_tracked_count
+
+
+def _create_terminal_monitor(stop_event: threading.Event) -> None:
+    """Background thread to keep ISIG enabled so Ctrl+C generates SIGINT."""
+    try:
+        tty_fd = sys.stdin.fileno()
+        while not stop_event.is_set():
+            try:
+                attrs = termios.tcgetattr(tty_fd)
+                lflag = attrs[3]
+                if not (lflag & termios.ISIG):
+                    # ISIG was disabled - re-enable it
+                    attrs[3] = lflag | termios.ISIG
+                    termios.tcsetattr(tty_fd, termios.TCSANOW, attrs)
+            except (OSError, termios.error):
+                pass  # Terminal not available or error reading settings
+            stop_event.wait(0.1)  # Check every 100ms
+    except (OSError, ValueError):
+        pass  # Thread cleanup, stdin closed, or invalid fd
+
+
+def _run_with_interrupt_handling(coro: Any) -> Any:
+    """Run coroutine with proper Ctrl+C handling.
+
+    Does NOT use asyncio.run() because it overrides signal handlers.
+    Spawns a background thread to keep terminal ISIG enabled.
+
+    - First Ctrl+C: Cancels main task, cleanup (__aexit__) runs
+    - Second Ctrl+C: Force kill all child process groups immediately
+    """
+    interrupt_count = [0]
+    main_task: asyncio.Task[Any] | None = None
+    loop: asyncio.AbstractEventLoop | None = None
+    stop_monitor = threading.Event()
+
+    def handle_sigint(_signum: int, _frame: Any) -> None:
+        interrupt_count[0] += 1
+        if interrupt_count[0] > 1:
+            count = get_tracked_count()
+            if count > 0:
+                click.echo(f"\nForce killing {count} VM process(es)...", err=True)
+                force_kill_all()
+            sys.exit(130)
+        click.echo("\nInterrupted. Shutting down (Ctrl+C again to force)...", err=True)
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
+        if loop is not None:
+            loop.call_soon_threadsafe(lambda: None)
+
+    original_handler = signal.signal(signal.SIGINT, handle_sigint)
+    monitor_thread = threading.Thread(target=_create_terminal_monitor, args=(stop_monitor,), daemon=True)
+    monitor_thread.start()
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            main_task = loop.create_task(coro)
+            return loop.run_until_complete(main_task)
+        except asyncio.CancelledError:
+            sys.exit(130)
+        finally:
+            _cleanup_event_loop(loop)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    finally:
+        stop_monitor.set()
+        signal.signal(signal.SIGINT, original_handler)
+
+
+def _cleanup_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Clean up asyncio event loop, cancelling pending tasks."""
+    try:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    finally:
+        loop.close()
+
 
 # Exit codes following Unix conventions
 EXIT_SUCCESS = 0
@@ -113,6 +199,68 @@ def parse_env_vars(env_vars: tuple[str, ...]) -> dict[str, str]:
     return result
 
 
+def parse_port_mappings(port_specs: tuple[str, ...]) -> list[PortMapping]:
+    """Parse port mapping specifications.
+
+    Formats:
+        8080           - Internal port only (external auto-assigned)
+        8080:3000      - Internal:external
+        8080:3000/udp  - With protocol
+
+    Args:
+        port_specs: Tuple of port specification strings
+
+    Returns:
+        List of PortMapping objects
+
+    Raises:
+        click.BadParameter: If format is invalid
+    """
+    result: list[PortMapping] = []
+    for spec in port_specs:
+        port_spec = spec  # Avoid overwriting loop variable
+        try:
+            # Check for protocol suffix
+            protocol = "tcp"
+            if "/" in port_spec:
+                port_spec, protocol = port_spec.rsplit("/", 1)
+                if protocol not in ("tcp", "udp"):
+                    raise click.BadParameter(
+                        f"Invalid protocol: '{protocol}'. Use 'tcp' or 'udp'.",
+                        param_hint="'--expose'",
+                    )
+
+            # Parse internal:external or just internal
+            if ":" in port_spec:
+                parts = port_spec.split(":")
+                if len(parts) != 2:  # noqa: PLR2004
+                    raise click.BadParameter(
+                        f"Invalid port format: '{spec}'. Use INTERNAL or INTERNAL:EXTERNAL.",
+                        param_hint="'--expose'",
+                    )
+                internal, external = int(parts[0]), int(parts[1])
+                result.append(
+                    PortMapping(internal=internal, external=external, protocol=protocol)  # type: ignore[arg-type]
+                )
+            else:
+                internal = int(port_spec)
+                result.append(PortMapping(internal=internal, protocol=protocol))  # type: ignore[arg-type]
+
+        except ValueError as e:
+            if "int()" in str(e) or "invalid literal" in str(e):
+                raise click.BadParameter(
+                    f"Invalid port number in: '{spec}'. Ports must be integers.",
+                    param_hint="'--expose'",
+                ) from e
+            # Re-raise pydantic validation errors
+            raise click.BadParameter(
+                f"Invalid port mapping: '{spec}'. {e}",
+                param_hint="'--expose'",
+            ) from e
+
+    return result
+
+
 def format_error(title: str, message: str, suggestions: list[str] | None = None) -> str:
     """Format an error message following What → Why → Fix pattern.
 
@@ -167,6 +315,11 @@ def _result_to_dict(result: ExecutionResult) -> dict[str, Any]:
 
     if result.external_memory_peak_mb is not None:
         output["memory_peak_mb"] = result.external_memory_peak_mb
+
+    if result.exposed_ports:
+        output["exposed_ports"] = [
+            {"internal": p.internal, "external": p.external, "host": p.host, "url": p.url} for p in result.exposed_ports
+        ]
 
     return output
 
@@ -305,6 +458,7 @@ async def run_code(
     env_vars: dict[str, str],
     network: bool,
     allowed_domains: list[str],
+    expose_ports: list[PortMapping] | None,
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -320,6 +474,7 @@ async def run_code(
         env_vars: Environment variables
         network: Enable network
         allowed_domains: Allowed domains for network
+        expose_ports: Ports to expose from guest to host
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
@@ -353,6 +508,7 @@ async def run_code(
                 memory_mb=memory,
                 allow_network=network,
                 allowed_domains=list(allowed_domains) if allowed_domains else None,
+                expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
                 env_vars=env_vars if env_vars else None,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
@@ -418,6 +574,7 @@ async def run_multiple(
     env_vars: dict[str, str],
     network: bool,
     allowed_domains: list[str],
+    expose_ports: list[PortMapping] | None,
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -433,6 +590,7 @@ async def run_multiple(
         env_vars: Environment variables
         network: Enable network
         allowed_domains: Allowed domains for network
+        expose_ports: Ports to expose from guest to host
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
@@ -466,6 +624,7 @@ async def run_multiple(
                         memory_mb=memory,
                         allow_network=network,
                         allowed_domains=list(allowed_domains) if allowed_domains else None,
+                        expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
                         env_vars=env_vars if env_vars else None,
                     )
                     return MultiSourceResult(
@@ -628,6 +787,12 @@ def cli(ctx: click.Context) -> None:
 @click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
 @click.option("--network", is_flag=True, help="Enable network access")
 @click.option("--allow-domain", "allowed_domains", multiple=True, help="Allowed domain (repeatable)")
+@click.option(
+    "--expose",
+    "expose_ports",
+    multiple=True,
+    help="Expose port: INTERNAL or INTERNAL:EXTERNAL or INTERNAL:EXTERNAL/PROTOCOL (repeatable)",
+)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress output")
 @click.option("--no-validation", is_flag=True, help="Skip package validation")
@@ -649,6 +814,7 @@ def run_command(
     env_vars: tuple[str, ...],
     network: bool,
     allowed_domains: tuple[str, ...],
+    expose_ports: tuple[str, ...],
     json_output: bool,
     quiet: bool,
     no_validation: bool,
@@ -701,13 +867,19 @@ def run_command(
     except click.BadParameter as exc:
         raise click.UsageError(str(exc)) from exc
 
+    # Parse port mappings
+    try:
+        parsed_ports = parse_port_mappings(expose_ports) if expose_ports else None
+    except click.BadParameter as exc:
+        raise click.UsageError(str(exc)) from exc
+
     # Build list of SourceInput objects
     resolved_sources = [_resolve_source(src, language) for src in all_sources]
 
     # Single source: use original streaming behavior
     if len(resolved_sources) == 1:
         src_input = resolved_sources[0]
-        exit_code = asyncio.run(
+        exit_code = _run_with_interrupt_handling(
             run_code(
                 code=src_input.code,
                 language=src_input.language,
@@ -717,6 +889,7 @@ def run_command(
                 env_vars=parsed_env_vars,
                 network=network,
                 allowed_domains=list(allowed_domains),
+                expose_ports=parsed_ports,
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
@@ -724,7 +897,7 @@ def run_command(
         )
     else:
         # Multiple sources: use concurrent execution
-        exit_code = asyncio.run(
+        exit_code = _run_with_interrupt_handling(
             run_multiple(
                 sources=resolved_sources,
                 packages=list(packages),
@@ -733,6 +906,7 @@ def run_command(
                 env_vars=parsed_env_vars,
                 network=network,
                 allowed_domains=list(allowed_domains),
+                expose_ports=parsed_ports,
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,

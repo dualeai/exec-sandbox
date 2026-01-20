@@ -97,6 +97,11 @@ addopts = [
 ]
 markers = [
     "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
+    "slow: marks tests as slow running (deselect with -m 'not slow')",
+]
+filterwarnings = [
+    # Catch pending task warnings early - Python 3.14 has stricter detection
+    "error:Task was destroyed but it is pending:RuntimeWarning",
 ]
 
 [tool.pyright]
@@ -105,7 +110,7 @@ typeCheckingMode = "strict"
 venv = ".venv"
 venvPath = "."
 include = ["src", "scripts"]
-exclude = [".venv", "tests"]
+exclude = [".venv*", "tests"]
 stubPath = "stubs"
 
 [tool.ruff]

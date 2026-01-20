@@ -276,7 +276,7 @@ jobs:
   # ==========================================================================
 
   test-python:
-    name: Test / Python ${{ matrix.python-version }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
+    name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
     needs: [build-gvproxy-wrapper, build-vm-images]
     env:
@@ -286,6 +286,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14", "3.14t"]
+        test-type: [func, sudo, slow]
         platform:
           - os: linux
             arch: x64
@@ -328,6 +329,9 @@ jobs:
       - name: Install QEMU (Linux)
         if: matrix.platform.os == 'linux'
         run: |
+          # Remove Microsoft repos that can cause 403 errors (we don't need Azure CLI etc.)
+          # See: https://github.com/actions/runner-images/issues/9733
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
           # On Ubuntu 24.04+, qemu-system-x86_64-microvm binary is included in qemu-system-x86 package
           # The microvm binary is optimized for direct kernel boot with microvm machine type
@@ -459,8 +463,9 @@ jobs:
           echo -e "[Slice]\nTasksMax=infinity" | sudo tee /etc/systemd/system/user-.slice.d/90-tasksmax.conf
           sudo systemctl daemon-reload
 
-      - name: Functional tests (Linux)
+      - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'
+        timeout-minutes: 60
         run: |
           # Move into delegated cgroup subtree so QEMU child processes can be managed
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
@@ -469,18 +474,19 @@ jobs:
           # prlimit requires sudo to raise limits above current hard limit
           sudo prlimit --pid $$ --nproc=unlimited:unlimited
           # Activate qemu-vm group membership for socket access (chardev sockets are 0660)
-          sg qemu-vm -c "make test-func"
+          # Sudo tests require elevated privileges
+          if [ "${{ matrix.test-type }}" = "sudo" ]; then
+            sudo env "PATH=$PATH" sg qemu-vm -c "make test-${{ matrix.test-type }}"
+          else
+            sg qemu-vm -c "make test-${{ matrix.test-type }}"
+          fi
 
-      - name: Sudo tests (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Move into delegated cgroup subtree so QEMU child processes can be managed
-          echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          # Remove nproc limit for current shell (PAM limits only apply to new logins)
-          sudo prlimit --pid $$ --nproc=unlimited:unlimited
-          # Activate qemu-vm group membership for socket access, run with sudo for privileged tests
-          sudo env "PATH=$PATH" sg qemu-vm -c "make test-sudo"
-
-      - name: Functional tests (macOS)
+      - name: Run tests (macOS)
         if: matrix.platform.os == 'macos'
-        run: make test-func
+        timeout-minutes: 60
+        run: |
+          if [ "${{ matrix.test-type }}" = "sudo" ]; then
+            sudo make test-${{ matrix.test-type }}
+          else
+            make test-${{ matrix.test-type }}
+          fi

@@ -1,6 +1,31 @@
 """Exception hierarchy for exec-sandbox.
 
 All exceptions inherit from SandboxError base class.
+
+Hierarchy:
+    SandboxError (base)
+    ├── TransientError (retryable marker base)
+    │   ├── VmTransientError
+    │   │   ├── VmBootTimeoutError     ← guest agent not ready
+    │   │   ├── VmOverlayError         ← overlay creation failed
+    │   │   ├── VmQemuCrashError       ← QEMU crashed on startup
+    │   │   ├── VmGvproxyError         ← gvproxy startup issues
+    │   │   └── VmCapacityError        ← pool full (temporary)
+    │   ├── BalloonTransientError      ← balloon operations
+    │   └── CommunicationTransientError ← socket/network transient issues
+    ├── PermanentError (non-retryable marker base)
+    │   └── VmPermanentError
+    │       ├── VmConfigError          ← invalid configuration
+    │       └── VmDependencyError      ← missing binary/image
+    └── ... (other existing exceptions)
+
+Backward Compatibility:
+    VmError = VmPermanentError
+    VmTimeoutError = VmBootTimeoutError
+    VmBootError = VmTransientError
+    QemuImgError = VmOverlayError
+    QemuStorageDaemonError = VmOverlayError
+    BalloonError = BalloonTransientError
 """
 
 from typing import Any
@@ -31,28 +56,155 @@ class SandboxDependencyError(SandboxError):
     """
 
 
-class VmError(SandboxError):
-    """VM operation failed.
+# =============================================================================
+# Transient vs Permanent Error Base Classes
+# =============================================================================
 
-    Raised when a virtual machine operation encounters an error during
-    execution, including failures in start, stop, or runtime operations.
+
+class TransientError(SandboxError):
+    """Base for transient errors that may succeed on retry.
+
+    Use this as a marker base class to identify errors that are
+    potentially recoverable through retry (e.g., resource contention,
+    temporary network issues, CPU overload).
     """
 
 
-class VmTimeoutError(VmError):
-    """VM operation timed out.
+class PermanentError(SandboxError):
+    """Base for permanent errors that won't succeed on retry.
 
-    Raised when a virtual machine operation exceeds its allocated time limit,
-    such as boot timeout or execution timeout.
+    Use this as a marker base class to identify errors that are
+    not recoverable through retry (e.g., configuration errors,
+    missing dependencies, capacity limits).
     """
 
 
-class VmBootError(VmError):
-    """VM failed to boot.
+# =============================================================================
+# VM Transient Errors (retryable)
+# =============================================================================
 
-    Raised when a virtual machine fails to complete its boot sequence,
-    including kernel initialization or guest agent startup failures.
+
+class VmTransientError(TransientError):
+    """Transient VM errors - may succeed on retry.
+
+    Base class for VM errors that are potentially recoverable,
+    such as resource contention, CPU overload, or transient failures.
     """
+
+
+class VmBootTimeoutError(VmTransientError):
+    """VM boot timed out - may succeed under lower load.
+
+    Raised when the guest agent doesn't become ready within the timeout.
+    This is often caused by CPU contention and may succeed on retry.
+    """
+
+
+class VmOverlayError(VmTransientError):
+    """Overlay creation failed - transient resource issue.
+
+    Raised when qemu-img or qemu-storage-daemon fails to create an overlay.
+    Absorbs both QemuImgError and QemuStorageDaemonError for unified handling.
+
+    Attributes:
+        stderr: Standard error output from qemu-img (if available)
+        error_class: QMP error class from qemu-storage-daemon (if available)
+    """
+
+    def __init__(
+        self,
+        message: str,
+        context: dict[str, Any] | None = None,
+        stderr: str = "",
+        error_class: str | None = None,
+    ):
+        super().__init__(message, context)
+        self.stderr = stderr
+        self.error_class = error_class
+
+
+class VmQemuCrashError(VmTransientError):
+    """QEMU crashed during startup - CPU contention.
+
+    Raised when QEMU exits unexpectedly during boot. This is often
+    caused by resource pressure and may succeed on retry.
+    """
+
+
+class VmGvproxyError(VmTransientError):
+    """gvproxy startup/socket issues.
+
+    Raised when gvproxy fails to start or create its socket.
+    May be transient due to resource contention.
+    """
+
+
+# =============================================================================
+# VM Permanent Errors (non-retryable)
+# =============================================================================
+
+
+class VmPermanentError(PermanentError):
+    """Permanent VM errors - won't succeed on retry.
+
+    Base class for VM errors that are not recoverable through retry,
+    such as configuration errors or missing dependencies.
+    """
+
+
+class VmConfigError(VmPermanentError):
+    """Invalid VM configuration.
+
+    Raised when VM configuration is invalid (e.g., mutually exclusive
+    options, invalid parameters).
+    """
+
+
+class VmCapacityError(VmTransientError):
+    """VM pool at capacity.
+
+    Raised when the VM pool is full and cannot accept new VMs.
+    This is a transient error - with exponential backoff, capacity
+    may become available as other VMs complete and are destroyed.
+    """
+
+
+class VmDependencyError(VmPermanentError):
+    """Required dependency missing.
+
+    Raised when a required binary, image, or system user is not available.
+    This is a permanent error that requires system configuration changes.
+    """
+
+
+# =============================================================================
+# Communication Errors
+# =============================================================================
+
+
+class BalloonTransientError(TransientError):
+    """Balloon operation failed - may succeed on retry.
+
+    Raised when balloon memory control operations fail.
+    These are often transient and may succeed on retry.
+    """
+
+
+# =============================================================================
+# Backward Compatibility Aliases (Public API)
+# =============================================================================
+
+# These aliases maintain backward compatibility with the public API.
+# Old code using these names will continue to work.
+VmError = VmPermanentError
+VmTimeoutError = VmBootTimeoutError
+VmBootError = VmTransientError
+
+# Internal aliases for import compatibility in other modules.
+# These allow existing code to import QemuImgError, etc. from exceptions.
+QemuImgError = VmOverlayError
+QemuStorageDaemonError = VmOverlayError
+BalloonError = BalloonTransientError
 
 
 class SnapshotError(SandboxError):

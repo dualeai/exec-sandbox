@@ -21,7 +21,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-IMAGES_DIR="$REPO_ROOT/images"
 
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.2}"
 PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-build-standalone
@@ -37,7 +36,8 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 
 # Package lists for each variant
 # Common: essential tools for AI agent workflows
-COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file"
+# iputils: provides ping for guest-agent gvproxy connectivity check at boot
+COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file iputils"
 
 # Python: add build tools for C extensions (numpy, pandas, etc.)
 PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev"
@@ -173,26 +173,60 @@ save_hash() {
 # Build functions
 # =============================================================================
 
-# Find guest-agent binary for target arch
+# Find and verify guest-agent binary for target architecture.
+#
+# IMPORTANT: This function verifies the binary's ELF architecture matches the
+# requested target. This prevents a subtle bug where a cached binary of the
+# wrong architecture gets embedded in the qcow2 image, causing execv() to fail
+# with ENOEXEC (errno=8) at boot time.
+#
+# Args:
+#   $1 - target_arch: "x86_64" or "aarch64"
+#
+# Returns:
+#   Prints path to verified binary on stdout
+#   Exits with error if no valid binary found
+#
+# Search order:
+#   1. images/dist/guest-agent-linux-{arch} (CI build output)
+#   2. guest-agent/target/{arch}-unknown-linux-musl/release/guest-agent (local cross-compile)
+#
+# Note: We intentionally do NOT fall back to target/release/guest-agent (without
+# arch qualifier) as that binary's architecture depends on how it was built and
+# could silently be wrong.
 find_guest_agent() {
     local target_arch=$1
     local rust_target="${target_arch}-unknown-linux-musl"
 
+    # Map target_arch to ELF architecture string used by `file` command
+    local elf_arch
+    case "$target_arch" in
+        x86_64)  elf_arch="x86-64" ;;
+        aarch64) elf_arch="ARM aarch64" ;;
+        *) echo "Unknown architecture: $target_arch" >&2; exit 1 ;;
+    esac
+
+    # Search paths - only arch-qualified paths to prevent wrong-arch bugs
     local paths=(
         "$OUTPUT_DIR/guest-agent-linux-$target_arch"
         "$REPO_ROOT/guest-agent/target/$rust_target/release/guest-agent"
-        "$REPO_ROOT/guest-agent/target/release/guest-agent"
     )
 
     for p in "${paths[@]}"; do
         if [ -f "$p" ]; then
+            # Verify binary architecture matches target
+            if ! file "$p" | grep -q "$elf_arch"; then
+                echo "WARNING: $p exists but is wrong architecture (expected $elf_arch)" >&2
+                echo "  Actual: $(file "$p")" >&2
+                continue
+            fi
             echo "$p"
             return 0
         fi
     done
 
     echo "Guest agent not found for $target_arch" >&2
-    echo "Build with: cd guest-agent && cargo build --release --target $rust_target" >&2
+    echo "Build with: ./scripts/build-guest-agent.sh $target_arch" >&2
     exit 1
 }
 
@@ -216,6 +250,7 @@ create_python_rootfs() {
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $PYTHON_PKGS"
+    # shellcheck disable=SC2086  # Word splitting is intentional for package list
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $PYTHON_PKGS
 
     echo "  Downloading Python $PYTHON_VERSION + uv $UV_VERSION in parallel..."
@@ -281,6 +316,7 @@ create_node_rootfs() {
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $NODE_PKGS"
+    # shellcheck disable=SC2086  # Word splitting is intentional for package list
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $NODE_PKGS
 
     # Copy bun from official image
@@ -305,6 +341,7 @@ create_raw_rootfs() {
 
     # Create Alpine rootfs with packages (BuildKit cached)
     echo "  Creating Alpine base + installing packages: $RAW_PKGS"
+    # shellcheck disable=SC2086  # Word splitting is intentional for package list
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $RAW_PKGS
 }
 

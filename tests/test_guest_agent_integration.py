@@ -10,7 +10,8 @@ import asyncio
 import pytest
 
 from exec_sandbox.models import Language
-from exec_sandbox.vm_manager import VmManager, VmState
+from exec_sandbox.vm_manager import VmManager  # noqa: TC001
+from exec_sandbox.vm_types import VmState
 
 # Guest agent READ_TIMEOUT_MS is 12000ms (12 seconds)
 # We wait longer than that to trigger the timeout/reconnect

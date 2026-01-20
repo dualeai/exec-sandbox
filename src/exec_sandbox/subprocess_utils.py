@@ -128,3 +128,27 @@ async def drain_subprocess_output(
             tg.create_task(read_stdout())
         if process.stderr:
             tg.create_task(read_stderr())
+
+
+def log_task_exception(task: asyncio.Task[None]) -> None:
+    """Log exceptions from background tasks.
+
+    Callback for asyncio.Task.add_done_callback() that properly logs any
+    unhandled exceptions from background tasks. Prevents silent failures.
+
+    Usage:
+        task = asyncio.create_task(some_coroutine())
+        task.add_done_callback(log_task_exception)
+
+    Args:
+        task: The completed asyncio task to check for exceptions
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Background task failed",
+            extra={"task_name": task.get_name()},
+            exc_info=exc,
+        )

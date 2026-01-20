@@ -49,13 +49,15 @@ from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import SandboxError, SnapshotError, VmError
-from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.exceptions import SandboxError
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
+from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.settings import Settings
 
 if TYPE_CHECKING:
+    from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.snapshot_manager import SnapshotManager
-    from exec_sandbox.vm_manager import QemuVM, VmManager
+    from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.warm_vm_pool import WarmVMPool
 
 logger = get_logger(__name__)
@@ -99,7 +101,6 @@ class Scheduler:
         self._snapshot_manager: SnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
         self._started = False
-        self._semaphore: asyncio.Semaphore | None = None
 
     async def __aenter__(self) -> Self:
         """Start scheduler and initialize resources.
@@ -143,10 +144,7 @@ class Scheduler:
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
 
-        # Initialize backpressure semaphore
-        self._semaphore = asyncio.Semaphore(self.config.max_concurrent_vms)
-
-        # Initialize VmManager
+        # Initialize VmManager (handles backpressure internally via semaphore)
         from exec_sandbox.vm_manager import VmManager  # noqa: PLC0415
 
         self._vm_manager = VmManager(self._settings)
@@ -216,6 +214,7 @@ class Scheduler:
         memory_mb: int | None = None,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
+        expose_ports: list[PortMapping | int] | None = None,
         env_vars: dict[str, str] | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
@@ -235,18 +234,24 @@ class Scheduler:
             allow_network: Enable network access for the VM. Default: False.
             allowed_domains: Whitelist of domains if allow_network=True.
                 If None/empty and allow_network=True, all domains allowed.
+            expose_ports: List of ports to expose from guest to host.
+                Can be PortMapping objects or integers (shorthand for internal port).
+                Works independently of allow_network:
+                - Mode 1 (allow_network=False): Port forwarding via QEMU hostfwd (no internet)
+                - Mode 2 (allow_network=True): Port forwarding via gvproxy API (with internet)
             env_vars: Environment variables to set in the VM.
             on_stdout: Callback for stdout chunks (streaming). Called as chunks arrive.
             on_stderr: Callback for stderr chunks (streaming). Called as chunks arrive.
 
         Returns:
-            ExecutionResult with stdout, stderr, exit_code, and timing info.
+            ExecutionResult with stdout, stderr, exit_code, timing info, and exposed_ports.
 
         Raises:
             SandboxError: Scheduler not started.
             PackageNotAllowedError: Package not in allowlist.
             VmError: VM creation or execution failed.
             VmTimeoutError: Execution exceeded timeout.
+            ValueError: Too many exposed ports or invalid port numbers.
 
         Example:
             ```python
@@ -261,6 +266,14 @@ class Scheduler:
                 packages=["numpy==1.26.0"],
             )
 
+            # With port forwarding (no internet)
+            result = await scheduler.run(
+                "python -m http.server 8080",
+                language="python",
+                expose_ports=[PortMapping(internal=8080, external=3000)],
+            )
+            print(result.exposed_ports[0].url)  # http://127.0.0.1:3000
+
             # With streaming
             result = await scheduler.run(
                 "for i in range(5): print(i)",
@@ -273,13 +286,24 @@ class Scheduler:
             raise SandboxError("Scheduler not started. Use: async with Scheduler() as scheduler:")
 
         # Type narrowing (guaranteed by _started check)
-        if self._vm_manager is None or self._semaphore is None or self._settings is None:
+        if self._vm_manager is None or self._settings is None:
             raise SandboxError("Scheduler resources not initialized")
 
         # Apply defaults
         timeout = timeout_seconds or self.config.default_timeout_seconds
         memory = memory_mb or self.config.default_memory_mb
         packages = packages or []
+
+        # Resolve port mappings (allocate ephemeral ports for those without explicit external)
+        resolved_ports: list[ExposedPort] = []
+        if expose_ports:
+            resolved_ports = resolve_port_mappings(expose_ports)
+            logger.info(
+                "Resolved port mappings",
+                extra={
+                    "ports": [(p.internal, p.external) for p in resolved_ports],
+                },
+            )
 
         # Validate packages against allowlist
         if packages and self.config.enable_package_validation:
@@ -296,92 +320,98 @@ class Scheduler:
                 extra={"snapshot_path": str(snapshot_path) if snapshot_path else None},
             )
 
-        # Acquire semaphore (backpressure)
-        async with self._semaphore:
-            vm: QemuVM | None = None
-            run_start_time = asyncio.get_event_loop().time()
-            is_cold_boot = False
-            try:
-                # Try warm pool first (instant allocation)
-                if self._warm_pool and not packages:
-                    lang_enum = Language(language)
-                    vm = await self._warm_pool.get_vm(lang_enum, packages)
+        # Backpressure handled by VmManager.create_vm() semaphore
+        vm: QemuVM | None = None
+        run_start_time = asyncio.get_event_loop().time()
+        is_cold_boot = False
+        try:
+            # Try warm pool first (instant allocation)
+            # Warm pool VMs don't have networking, so skip if networking is needed
+            needs_network: bool = allow_network or bool(resolved_ports)
+            if self._warm_pool and not packages and not needs_network:
+                lang_enum = Language(language)
+                vm = await self._warm_pool.get_vm(lang_enum, packages)
 
-                # Cold boot if no warm VM available
-                if vm is None:
-                    is_cold_boot = True
+            # Cold boot if no warm VM available
+            if vm is None:
+                is_cold_boot = True
 
-                    # Auto-download base image if needed
-                    if self.config.auto_download_assets:
-                        from exec_sandbox.assets import fetch_base_image  # noqa: PLC0415
+                # Auto-download base image if needed
+                if self.config.auto_download_assets:
+                    from exec_sandbox.assets import fetch_base_image  # noqa: PLC0415
 
-                        await fetch_base_image(language)
+                    await fetch_base_image(language)
 
-                    vm = await self._vm_manager.create_vm(
-                        language=language,
-                        tenant_id="exec-sandbox",
-                        task_id=f"run-{id(code)}",
-                        backing_image=snapshot_path,
-                        memory_mb=memory,
-                        allow_network=allow_network,
-                        allowed_domains=allowed_domains,
-                    )
-
-                # Execute code
-                execute_start_time = asyncio.get_event_loop().time()
-                result = await vm.execute(
-                    code=code,
-                    timeout_seconds=timeout,
-                    env_vars=env_vars,
-                    on_stdout=on_stdout,
-                    on_stderr=on_stderr,
-                )
-                execute_end_time = asyncio.get_event_loop().time()
-
-                # Calculate timing
-                execute_ms = round((execute_end_time - execute_start_time) * 1000)
-                total_ms = round((execute_end_time - run_start_time) * 1000)
-
-                # For warm pool: setup/boot are "free" (happened at service startup)
-                # For cold boot: use actual setup/boot times from VM
-                setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
-                boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
-                # Granular setup timing
-                overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
-                # Granular boot timing
-                qemu_cmd_build_ms = vm.qemu_cmd_build_ms if is_cold_boot and vm.qemu_cmd_build_ms is not None else 0
-                gvproxy_start_ms = vm.gvproxy_start_ms if is_cold_boot and vm.gvproxy_start_ms is not None else 0
-                qemu_fork_ms = vm.qemu_fork_ms if is_cold_boot and vm.qemu_fork_ms is not None else 0
-                guest_wait_ms = vm.guest_wait_ms if is_cold_boot and vm.guest_wait_ms is not None else 0
-
-                return ExecutionResult(
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    exit_code=result.exit_code,
-                    execution_time_ms=result.execution_time_ms,
-                    external_cpu_time_ms=result.external_cpu_time_ms,
-                    external_memory_peak_mb=result.external_memory_peak_mb,
-                    timing=TimingBreakdown(
-                        setup_ms=setup_ms,
-                        boot_ms=boot_ms,
-                        execute_ms=execute_ms,
-                        total_ms=total_ms,
-                        connect_ms=result.timing.connect_ms,
-                        overlay_ms=overlay_ms,
-                        qemu_cmd_build_ms=qemu_cmd_build_ms,
-                        gvproxy_start_ms=gvproxy_start_ms,
-                        qemu_fork_ms=qemu_fork_ms,
-                        guest_wait_ms=guest_wait_ms,
-                    ),
-                    warm_pool_hit=not is_cold_boot,
-                    spawn_ms=result.spawn_ms,  # Pass through from guest
-                    process_ms=result.process_ms,  # Pass through from guest
+                vm = await self._vm_manager.create_vm(
+                    language=language,
+                    tenant_id="exec-sandbox",
+                    task_id=f"run-{id(code)}",
+                    backing_image=snapshot_path,
+                    memory_mb=memory,
+                    allow_network=allow_network,
+                    allowed_domains=allowed_domains,
+                    expose_ports=resolved_ports if resolved_ports else None,
                 )
 
-            finally:
-                # Always destroy VM (never reused)
-                if vm is not None:
-                    await self._vm_manager.destroy_vm(vm)
+            # Execute code
+            execute_start_time = asyncio.get_event_loop().time()
+            result = await vm.execute(
+                code=code,
+                timeout_seconds=timeout,
+                env_vars=env_vars,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+            )
+            execute_end_time = asyncio.get_event_loop().time()
+
+            # Calculate timing
+            execute_ms = round((execute_end_time - execute_start_time) * 1000)
+            total_ms = round((execute_end_time - run_start_time) * 1000)
+
+            # For warm pool: setup/boot are "free" (happened at service startup)
+            # For cold boot: use actual setup/boot times from VM
+            setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
+            boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+            # Granular setup timing
+            overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
+            # Granular boot timing
+            qemu_cmd_build_ms = vm.qemu_cmd_build_ms if is_cold_boot and vm.qemu_cmd_build_ms is not None else 0
+            gvproxy_start_ms = vm.gvproxy_start_ms if is_cold_boot and vm.gvproxy_start_ms is not None else 0
+            qemu_fork_ms = vm.qemu_fork_ms if is_cold_boot and vm.qemu_fork_ms is not None else 0
+            guest_wait_ms = vm.guest_wait_ms if is_cold_boot and vm.guest_wait_ms is not None else 0
+            # Retry tracking (0 for warm pool since no boot retry needed)
+            boot_retries = vm.timing.boot_retries if is_cold_boot and vm.timing.boot_retries is not None else 0
+
+            return ExecutionResult(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code,
+                execution_time_ms=result.execution_time_ms,
+                external_cpu_time_ms=result.external_cpu_time_ms,
+                external_memory_peak_mb=result.external_memory_peak_mb,
+                timing=TimingBreakdown(
+                    setup_ms=setup_ms,
+                    boot_ms=boot_ms,
+                    execute_ms=execute_ms,
+                    total_ms=total_ms,
+                    connect_ms=result.timing.connect_ms,
+                    overlay_ms=overlay_ms,
+                    qemu_cmd_build_ms=qemu_cmd_build_ms,
+                    gvproxy_start_ms=gvproxy_start_ms,
+                    qemu_fork_ms=qemu_fork_ms,
+                    guest_wait_ms=guest_wait_ms,
+                    boot_retries=boot_retries,
+                ),
+                warm_pool_hit=not is_cold_boot,
+                spawn_ms=result.spawn_ms,  # Pass through from guest
+                process_ms=result.process_ms,  # Pass through from guest
+                exposed_ports=resolved_ports,  # Port forwarding mappings
+            )
+
+        finally:
+            # Always destroy VM (never reused)
+            if vm is not None:
+                await self._vm_manager.destroy_vm(vm)
 
     def _create_settings(self) -> Settings:
         """Create Settings from SchedulerConfig.
@@ -458,7 +488,7 @@ class Scheduler:
                 },
             )
             return snapshot_path
-        except (OSError, RuntimeError, TimeoutError, ConnectionError, SnapshotError, VmError) as e:
+        except (OSError, RuntimeError, TimeoutError, ConnectionError, SandboxError) as e:
             # Graceful degradation: log error, continue without snapshot
             logger.warning(
                 "Snapshot creation failed, continuing without cache",

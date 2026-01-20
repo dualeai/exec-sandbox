@@ -50,34 +50,60 @@ For S3 snapshot caching:
 
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
+    BalloonTransientError,
     CommunicationError,
     GuestAgentError,
     PackageNotAllowedError,
+    PermanentError,
     SandboxDependencyError,
     SandboxError,
     SnapshotError,
+    TransientError,
     VmBootError,
+    VmBootTimeoutError,
+    VmCapacityError,
+    VmConfigError,
+    VmDependencyError,
     VmError,
+    VmGvproxyError,
+    VmOverlayError,
+    VmPermanentError,
+    VmQemuCrashError,
     VmTimeoutError,
+    VmTransientError,
 )
-from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
 
 __all__ = [
+    "BalloonTransientError",
     "CommunicationError",
     "ExecutionResult",
+    "ExposedPort",
     "GuestAgentError",
     "Language",
     "PackageNotAllowedError",
+    "PermanentError",
+    "PortMapping",
     "SandboxDependencyError",
     "SandboxError",
     "Scheduler",
     "SchedulerConfig",
     "SnapshotError",
     "TimingBreakdown",
+    "TransientError",
     "VmBootError",
+    "VmBootTimeoutError",
+    "VmCapacityError",
+    "VmConfigError",
+    "VmDependencyError",
     "VmError",
+    "VmGvproxyError",
+    "VmOverlayError",
+    "VmPermanentError",
+    "VmQemuCrashError",
     "VmTimeoutError",
+    "VmTransientError",
 ]
 
 from importlib.metadata import PackageNotFoundError, version
