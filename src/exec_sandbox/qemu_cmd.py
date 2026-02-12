@@ -557,15 +557,15 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # SLIRP was removed because it's ~40x slower (~11s boot).
     #
     # Mode 1: Port forwarding only (expose_ports + no allow_network)
-    #   - Uses gvproxy with empty allowed_domains (blocks all DNS = no internet)
+    #   - Uses gvproxy with BlockAllOutbound (no internet)
     #   - Port forwarding handled by gvproxy at startup
     #
     # Mode 2: Port forwarding with internet (expose_ports + allow_network)
-    #   - Uses gvproxy with allowed_domains for DNS filtering
+    #   - Uses gvproxy with OutboundAllow filtering (DNS + TLS)
     #   - Port forwarding handled by gvproxy at startup
     #
     # Mode 3: Internet only (allow_network, no expose_ports)
-    #   - Standard gvproxy configuration
+    #   - Standard gvproxy configuration with OutboundAllow filtering
     #
     # =============================================================
 

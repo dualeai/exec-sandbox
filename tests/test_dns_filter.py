@@ -1,4 +1,4 @@
-"""Tests for DNS zone configuration (dns_filter.py)."""
+"""Tests for outbound allow configuration (dns_filter.py)."""
 
 import json
 
@@ -7,121 +7,77 @@ import pytest
 from exec_sandbox.dns_filter import (
     NPM_PACKAGE_DOMAINS,
     PYTHON_PACKAGE_DOMAINS,
-    create_dns_records,
-    create_dns_zone,
-    generate_dns_zones_json,
-    parse_dns_zones_json,
+    create_outbound_patterns,
+    generate_outbound_allow_json,
 )
 
 
-def test_create_dns_records():
-    """Test DNS record creation from domain list."""
-    records = create_dns_records(["pypi.org", "example.com"])
+def test_create_outbound_patterns():
+    """Test outbound pattern creation from domain list."""
+    patterns = create_outbound_patterns(["pypi.org", "example.com"])
 
-    assert len(records) == 2
-    assert records[0].name == "pypi.org"
+    assert len(patterns) == 2
     # Regexp matches domain and all subdomains, with optional trailing dot
-    assert records[0].Regexp == r"^(.*\.)?pypi\.org\.?$"
-
-    assert records[1].name == "example.com"
-    assert records[1].Regexp == r"^(.*\.)?example\.com\.?$"
+    assert patterns[0] == r"^(.*\.)?pypi\.org\.?$"
+    assert patterns[1] == r"^(.*\.)?example\.com\.?$"
 
 
-def test_create_dns_zone():
-    """Test DNS zone creation."""
-    zone = create_dns_zone(["pypi.org", "npm.org"], zone_name="test-zone")
-
-    assert zone.name == "test-zone"
-    assert len(zone.records) == 2
-    assert zone.defaultIP == "0.0.0.0"  # Block others by default
-
-
-def test_create_dns_zone_allow_others():
-    """Test DNS zone with allow others mode."""
-    zone = create_dns_zone(["pypi.org"], block_others=False)
-
-    assert zone.defaultIP == "8.8.8.8"  # Forward others to DNS
-
-
-def test_generate_dns_zones_json_python():
+def test_generate_outbound_allow_json_python():
     """Test JSON generation for Python defaults."""
-    zones_json = generate_dns_zones_json(None, "python")
+    json_str = generate_outbound_allow_json(None, "python")
 
-    assert "pypi.org" in zones_json
-    assert "files.pythonhosted.org" in zones_json
+    # Verify valid JSON with correct number of patterns
+    patterns = json.loads(json_str)
+    assert len(patterns) == len(PYTHON_PACKAGE_DOMAINS)
+    # Each pattern is a regex string containing the escaped domain
+    assert all(isinstance(p, str) for p in patterns)
+    assert any("pypi" in p for p in patterns)
+    assert any("pythonhosted" in p for p in patterns)
 
-    # Verify valid JSON
-    zones = json.loads(zones_json)
-    assert len(zones) == 1
-    assert len(zones[0]["records"]) == len(PYTHON_PACKAGE_DOMAINS)
 
-
-def test_generate_dns_zones_json_javascript():
+def test_generate_outbound_allow_json_javascript():
     """Test JSON generation for JavaScript defaults."""
-    zones_json = generate_dns_zones_json(None, "javascript")
+    json_str = generate_outbound_allow_json(None, "javascript")
 
-    assert "registry.npmjs.org" in zones_json
-
-    zones = json.loads(zones_json)
-    assert len(zones) == 1
-    assert len(zones[0]["records"]) == len(NPM_PACKAGE_DOMAINS)
+    patterns = json.loads(json_str)
+    assert len(patterns) == len(NPM_PACKAGE_DOMAINS)
+    assert any("npmjs" in p for p in patterns)
 
 
-def test_generate_dns_zones_json_custom():
+def test_generate_outbound_allow_json_custom():
     """Test JSON generation with custom domains."""
-    zones_json = generate_dns_zones_json(["custom.com"], "python")
+    json_str = generate_outbound_allow_json(["custom.com"], "python")
 
-    assert "custom.com" in zones_json
-    assert "pypi.org" not in zones_json  # Custom overrides defaults
+    patterns = json.loads(json_str)
+    assert len(patterns) == 1
+    assert "custom" in patterns[0]
+    assert "pypi" not in patterns[0]  # Custom overrides defaults
 
-    zones = json.loads(zones_json)
-    assert len(zones[0]["records"]) == 1
 
+def test_generate_outbound_allow_json_empty_blocks_all():
+    """Test JSON generation with empty domains returns empty array.
 
-def test_generate_dns_zones_json_empty_blocks_all():
-    """Test JSON generation with empty domains blocks ALL DNS (Mode 1 behavior).
-
-    When allowed_domains=[] (empty list), all DNS should be blocked.
-    This is used for Mode 1 (port forwarding without internet).
+    When allowed_domains=[] (empty list), OutboundAllow is empty.
+    Actual blocking is handled by the BlockAllOutbound flag separately.
     """
-    zones_json = generate_dns_zones_json([], "python")
-
-    # Empty list = block all DNS (zone with defaultIP=0.0.0.0 and no records)
-    assert "0.0.0.0" in zones_json
-    assert '"records":[]' in zones_json
+    json_str = generate_outbound_allow_json([], "python")
+    assert json_str == "[]"
 
 
-def test_generate_dns_zones_json_none_uses_defaults_or_no_filter():
+def test_generate_outbound_allow_json_none_uses_defaults_or_no_filter():
     """Test JSON generation with None uses language defaults or no filtering."""
     # For raw language (no defaults), None means no filtering
-    zones_json = generate_dns_zones_json(None, "raw")
-    assert zones_json == "[]"
-
-
-def test_parse_dns_zones_json():
-    """Test parsing DNS zones JSON."""
-    zones_json = generate_dns_zones_json(["test.com"], "python")
-    zones = parse_dns_zones_json(zones_json)
-
-    assert len(zones) == 1
-    assert zones[0].name == ""  # Default zone_name is empty string
-    assert len(zones[0].records) == 1
-    assert zones[0].records[0].name == "test.com"
-
-
-def test_parse_dns_zones_json_invalid():
-    """Test parsing invalid JSON."""
-    with pytest.raises(ValueError, match="Invalid DNS zones JSON"):
-        parse_dns_zones_json("invalid json")
+    json_str = generate_outbound_allow_json(None, "raw")
+    assert json_str == "[]"
 
 
 def test_regex_pattern_escapes_dots():
     """Test that dots in domains are properly escaped for regex."""
-    records = create_dns_records(["example.com"])
+    patterns = create_outbound_patterns(["example.com"])
 
     # Should escape dots and match domain + subdomains + optional trailing dot
-    assert r"\." in records[0].Regexp
-    assert records[0].Regexp == r"^(.*\.)?example\.com\.?$"
+    assert r"\." in patterns[0]
+    assert patterns[0] == r"^(.*\.)?example\.com\.?$"
 
 
 # =============================================================================
@@ -144,50 +100,50 @@ class TestDomainValidation:
             "123.example.com",
         ]
         # Should not raise
-        records = create_dns_records(valid_domains)
-        assert len(records) == len(valid_domains)
+        patterns = create_outbound_patterns(valid_domains)
+        assert len(patterns) == len(valid_domains)
 
     def test_invalid_domain_empty(self):
         """Test that empty domain is rejected."""
         with pytest.raises(ValueError, match="cannot be empty"):
-            create_dns_records([""])
+            create_outbound_patterns([""])
 
     def test_invalid_domain_too_long(self):
         """Test that overly long domain is rejected."""
         long_domain = "a" * 250 + ".com"  # > 253 chars
         with pytest.raises(ValueError, match="too long"):
-            create_dns_records([long_domain])
+            create_outbound_patterns([long_domain])
 
     def test_invalid_domain_single_label(self):
         """Test that single-label domain is rejected."""
         with pytest.raises(ValueError, match="at least 2 labels"):
-            create_dns_records(["localhost"])
+            create_outbound_patterns(["localhost"])
 
     def test_invalid_domain_empty_label(self):
         """Test that domain with empty label is rejected."""
         with pytest.raises(ValueError, match="empty label"):
-            create_dns_records(["bad..domain.com"])
+            create_outbound_patterns(["bad..domain.com"])
 
     def test_invalid_domain_label_too_long(self):
         """Test that domain with label > 63 chars is rejected."""
         long_label = "a" * 64 + ".com"
         with pytest.raises(ValueError, match="label too long"):
-            create_dns_records([long_label])
+            create_outbound_patterns([long_label])
 
     def test_invalid_domain_starts_with_hyphen(self):
         """Test that domain label starting with hyphen is rejected."""
         with pytest.raises(ValueError, match="Invalid domain label"):
-            create_dns_records(["-invalid.com"])
+            create_outbound_patterns(["-invalid.com"])
 
     def test_invalid_domain_ends_with_hyphen(self):
         """Test that domain label ending with hyphen is rejected."""
         with pytest.raises(ValueError, match="Invalid domain label"):
-            create_dns_records(["invalid-.com"])
+            create_outbound_patterns(["invalid-.com"])
 
     def test_invalid_domain_tld_with_numbers(self):
         """Test that TLD with numbers is rejected."""
         with pytest.raises(ValueError, match="TLD must be alphabetic"):
-            create_dns_records(["example.123"])
+            create_outbound_patterns(["example.123"])
 
     def test_invalid_domain_special_characters(self):
         """Test that domain with special characters is rejected."""
@@ -201,7 +157,7 @@ class TestDomainValidation:
         ]
         for domain in invalid_domains:
             with pytest.raises(ValueError):
-                create_dns_records([domain])
+                create_outbound_patterns([domain])
 
     def test_regex_injection_prevention(self):
         """Test that regex metacharacters in domains are rejected."""
@@ -217,16 +173,16 @@ class TestDomainValidation:
         ]
         for domain in malicious_domains:
             with pytest.raises(ValueError):
-                create_dns_records([domain])
+                create_outbound_patterns([domain])
 
     def test_unicode_domain_rejected(self):
         """Test that Unicode/IDN domains are rejected (must use punycode)."""
         # Unicode domains should be converted to punycode before validation
         with pytest.raises(ValueError):
-            create_dns_records(["例え.jp"])  # Japanese characters
+            create_outbound_patterns(["例え.jp"])  # Japanese characters
 
     def test_trailing_dot_handled(self):
         """Test that domains with trailing dots are handled correctly."""
         # FQDN format with trailing dot should be handled
-        records = create_dns_records(["example.com."])
-        assert len(records) == 1
+        patterns = create_outbound_patterns(["example.com."])
+        assert len(patterns) == 1

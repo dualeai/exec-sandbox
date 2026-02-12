@@ -1,14 +1,14 @@
-"""gvproxy-wrapper lifecycle management for DNS filtering.
+"""gvproxy-wrapper lifecycle management for outbound filtering.
 
 Provides the start_gvproxy function which handles starting and waiting for
-the gvproxy-wrapper process that provides network connectivity with DNS filtering.
+the gvproxy-wrapper process that provides network connectivity with outbound filtering.
 """
 
 import asyncio
 import json
 import logging
 
-from exec_sandbox.dns_filter import generate_dns_zones_json
+from exec_sandbox.dns_filter import generate_outbound_allow_json
 from exec_sandbox.exceptions import VmDependencyError, VmGvproxyError
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.permission_utils import grant_qemu_vm_access
@@ -28,16 +28,16 @@ async def start_gvproxy(
     expose_ports: list[ExposedPort] | None = None,
     block_outbound: bool = False,
 ) -> tuple[ProcessWrapper, asyncio.Task[None]]:
-    r"""Start gvproxy-wrapper with DNS filtering for this VM.
+    r"""Start gvproxy-wrapper with outbound filtering for this VM.
 
     Architecture Decision: gvisor-tap-vsock over alternatives
     ========================================================
 
     Chosen: gvisor-tap-vsock
-    - Built-in DNS filtering via zones (regex-based)
+    - Built-in outbound filtering via OutboundAllow (DNS + TLS, regex-based)
     - Production-ready (Podman default since 2022)
     - 10MB memory overhead per VM
-    - Simple JSON zone configuration
+    - Simple JSON pattern configuration
     - Zero CVEs (vs SLIRP: CVE-2021-3592/3/4/5, CVE-2020-29129/30)
 
     Socket Pre-binding (systemd activation pattern)
@@ -59,7 +59,12 @@ async def start_gvproxy(
     When block_outbound is True, all guest-initiated outbound TCP/UDP
     connections are blocked at the gvproxy level. This provides true
     network isolation while still allowing host-to-guest port forwarding.
-    DNS is also blocked (returns 0.0.0.0) via empty allowed_domains.
+
+    Outbound Filtering (Mode 2)
+    ===========================
+    When allowed_domains is non-empty, OutboundAllow patterns are set.
+    Both DNS resolution and TLS connections are filtered — only domains
+    matching at least one pattern can be resolved and connected to.
 
     Args:
         vm_id: Unique VM identifier
@@ -78,16 +83,16 @@ async def start_gvproxy(
     """
     socket_path = workdir.gvproxy_socket
 
-    # Generate DNS zones JSON configuration
-    dns_zones_json = generate_dns_zones_json(allowed_domains, language)
+    # Generate OutboundAllow patterns JSON
+    outbound_allow_json = generate_outbound_allow_json(allowed_domains, language)
 
     logger.info(
-        "Starting gvproxy-wrapper with DNS filtering",
+        "Starting gvproxy-wrapper with outbound filtering",
         extra={
             "vm_id": vm_id,
             "allowed_domains": allowed_domains,
             "language": language,
-            "dns_zones_json": dns_zones_json,
+            "outbound_allow_json": outbound_allow_json,
         },
     )
 
@@ -123,9 +128,12 @@ async def start_gvproxy(
         str(gvproxy_binary),
         "-listen-fd",
         str(socket_fd),
-        "-dns-zones",
-        dns_zones_json,
     ]
+
+    # Add OutboundAllow patterns for outbound filtering (Mode 2)
+    # Only pass when there are patterns (non-empty JSON array)
+    if outbound_allow_json != "[]":
+        gvproxy_args.extend(["-outbound-allow", outbound_allow_json])
 
     # Add outbound blocking for Mode 1 (port-forward only, no internet)
     # This blocks all guest-initiated TCP/UDP connections at the gvproxy level
@@ -237,7 +245,7 @@ async def start_gvproxy(
         extra={
             "vm_id": vm_id,
             "socket": str(socket_path),
-            "dns_filtering": True,
+            "outbound_filtering": outbound_allow_json != "[]",
             "port_forwarding": expose_ports is not None and len(expose_ports) > 0,
             "block_outbound": block_outbound,
         },

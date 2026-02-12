@@ -1,13 +1,13 @@
-"""DNS zone configuration for gvproxy-wrapper.
+"""Outbound allow configuration for gvproxy-wrapper.
 
-Generates DNS zones JSON for gvproxy DNS filtering.
+Generates OutboundAllow regex patterns for gvproxy outbound filtering.
+Patterns are matched against both DNS queries and TLS SNI.
 """
 
 import json
 import re
-from typing import Final
 
-from pydantic import BaseModel, Field
+from exec_sandbox.constants import NPM_PACKAGE_DOMAINS, PYTHON_PACKAGE_DOMAINS
 
 # Security: Domain validation pattern (RFC 1035 compliant)
 # Prevents ReDoS attacks and regex injection via malicious domain input
@@ -61,120 +61,61 @@ def _validate_domain(domain: str) -> None:
         raise ValueError(f"TLD must be alphabetic only: {tld!r} in {domain!r}")
 
 
-class DNSRecord(BaseModel):
-    """DNS record with regex matching for gvproxy."""
+def create_outbound_patterns(domains: list[str]) -> list[str]:
+    """Create OutboundAllow regex patterns from domain list.
 
-    name: str = Field(description="Domain name")
-    Regexp: str = Field(description="Regex pattern for matching subdomains", alias="Regexp")
-    # Omit IP field - gvproxy will forward to upstream DNS
-
-
-class DNSZone(BaseModel):
-    """DNS zone configuration for gvproxy."""
-
-    name: str = Field(description="Zone name")
-    records: list[DNSRecord] = Field(description="DNS records to allow")
-    defaultIP: str = Field(default="0.0.0.0", description="IP for blocked domains (0.0.0.0 = NXDOMAIN)")  # noqa: N815, S104
-
-
-# Default package registry domains
-PYTHON_PACKAGE_DOMAINS: Final[list[str]] = [
-    "pypi.org",
-    "files.pythonhosted.org",
-]
-
-NPM_PACKAGE_DOMAINS: Final[list[str]] = [
-    "registry.npmjs.org",
-]
-
-
-def create_dns_records(domains: list[str]) -> list[DNSRecord]:
-    """Create DNS records from domain list.
+    Each pattern matches the domain and all its subdomains, with optional
+    trailing dot (FQDN format).
 
     Args:
         domains: List of domain names to whitelist
 
     Returns:
-        List of DNSRecord objects with regex patterns
+        List of regex pattern strings for OutboundAllow
 
     Raises:
         ValueError: If any domain has invalid format (see _validate_domain)
 
     Example:
-        >>> records = create_dns_records(["pypi.org", "example.com"])
-        >>> records[0].name
-        'pypi.org'
-        >>> records[0].Regexp
+        >>> patterns = create_outbound_patterns(["pypi.org", "example.com"])
+        >>> patterns[0]
         '^(.*\\\\.)?pypi\\\\.org\\\\.?$'
     """
-    records: list[DNSRecord] = []
+    patterns: list[str] = []
     for domain in domains:
         # Security: Validate domain format before constructing regex
         # Prevents ReDoS attacks and regex injection
         _validate_domain(domain)
-        records.append(
-            DNSRecord(
-                name=domain,
-                # Match domain AND all subdomains: (.*\.)? makes prefix optional
-                # Matches both "pypi.org" and "www.pypi.org"
-                # Trailing \.? handles FQDN format (e.g., "google.com.")
-                Regexp=f"^(.*\\.)?{domain.replace('.', '\\.')}\\.?$",
-                # No IP field - gvproxy will forward to upstream DNS
-            )
+        patterns.append(
+            # Match domain AND all subdomains: (.*\.)? makes prefix optional
+            # Matches both "pypi.org" and "www.pypi.org"
+            # Trailing \.? handles FQDN format (e.g., "google.com.")
+            f"^(.*\\.)?{domain.replace('.', '\\.')}\\.?$"
         )
-    return records
+    return patterns
 
 
-def create_dns_zone(
-    domains: list[str],
-    zone_name: str = "",  # Empty string creates "." suffix, matches all FQDNs
-    block_others: bool = True,
-) -> DNSZone:
-    """Create DNS zone from domain list.
-
-    Args:
-        domains: List of domain names to whitelist
-        zone_name: Name for the DNS zone
-        block_others: If True, block all non-whitelisted domains
-
-    Returns:
-        DNSZone configured for whitelisting
-
-    Example:
-        >>> zone = create_dns_zone(["pypi.org"])
-        >>> zone.name
-        'allowed'
-        >>> zone.defaultIP
-        '0.0.0.0'
-    """
-    return DNSZone(
-        name=zone_name,
-        records=create_dns_records(domains),
-        defaultIP="0.0.0.0" if block_others else "8.8.8.8",  # noqa: S104
-    )
-
-
-def generate_dns_zones_json(
+def generate_outbound_allow_json(
     allowed_domains: list[str] | None,
     language: str,
 ) -> str:
-    """Generate gvproxy DNS zones JSON.
+    """Generate gvproxy OutboundAllow JSON.
 
     Args:
-        allowed_domains: Custom allowed domains, empty list to block ALL DNS,
+        allowed_domains: Custom allowed domains, empty list to block ALL outbound,
                         or None for language defaults
         language: Programming language (for default package registries)
 
     Returns:
-        JSON string for gvproxy -dns-zones flag
+        JSON string for gvproxy -outbound-allow flag
 
     Example:
-        >>> json_str = generate_dns_zones_json(None, "python")
-        >>> "pypi.org" in json_str
+        >>> json_str = generate_outbound_allow_json(None, "python")
+        >>> "pypi" in json_str
         True
-        >>> json_str = generate_dns_zones_json([], "python")  # Block all DNS
-        >>> "0.0.0.0" in json_str
-        True
+        >>> json_str = generate_outbound_allow_json([], "python")  # Block all
+        >>> json_str
+        '[]'
     """
     # Auto-expand package domains if not specified (None = use defaults)
     if allowed_domains is None:
@@ -186,38 +127,11 @@ def generate_dns_zones_json(
             # No language-specific defaults, no filtering
             return "[]"
 
-    # Empty list = block ALL DNS (for Mode 1: port-forward only, no internet)
-    # This creates a zone with defaultIP=0.0.0.0 and no records = all DNS blocked
+    # Empty list = block ALL outbound (handled by BlockAllOutbound flag,
+    # OutboundAllow stays empty so it doesn't interfere)
     if len(allowed_domains) == 0:
-        zone = DNSZone(
-            name="",  # Root zone - matches all queries
-            records=[],  # No allowed records
-            defaultIP="0.0.0.0",  # Block everything  # noqa: S104
-        )
-        return json.dumps([zone.model_dump()], separators=(",", ":"))
+        return "[]"
 
-    # Create DNS zone with allowed domains
-    zone = create_dns_zone(allowed_domains)
-
-    # Serialize to JSON (gvproxy expects array of zones)
-    zones = [zone.model_dump()]
-    return json.dumps(zones, separators=(",", ":"))  # Compact JSON
-
-
-def parse_dns_zones_json(zones_json: str) -> list[DNSZone]:
-    """Parse gvproxy DNS zones JSON.
-
-    Args:
-        zones_json: JSON string from generate_dns_zones_json
-
-    Returns:
-        List of DNSZone objects
-
-    Raises:
-        ValueError: If JSON is invalid
-    """
-    try:
-        zones_data = json.loads(zones_json)
-        return [DNSZone(**zone) for zone in zones_data]
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
-        raise ValueError(f"Invalid DNS zones JSON: {e}") from e
+    # Create outbound allow patterns
+    patterns = create_outbound_patterns(allowed_domains)
+    return json.dumps(patterns, separators=(",", ":"))

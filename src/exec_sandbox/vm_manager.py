@@ -390,7 +390,7 @@ class VmManager:
 
         # Domain whitelist semantics:
         # - None or [] = no filtering (full internet access)
-        # - list with domains = whitelist filtering via gvproxy
+        # - list with domains = outbound filtering via gvproxy OutboundAllow (DNS + TLS)
         logger.debug(
             "Network configuration",
             extra={
@@ -521,13 +521,13 @@ class VmManager:
             # gvproxy must create socket before QEMU connects to it
             # Moved from setup phase to boot phase to reduce contention under high concurrency
             # Start gvproxy for:
-            #   - Mode 1: expose_ports only (use empty allowed_domains to block all DNS = no internet)
-            #   - Mode 2: expose_ports + allow_network (use provided allowed_domains)
-            #   - Mode 3: allow_network only (use provided allowed_domains)
+            #   - Mode 1: expose_ports only (BlockAllOutbound = no internet)
+            #   - Mode 2: expose_ports + allow_network (OutboundAllow filtering)
+            #   - Mode 3: allow_network only (OutboundAllow filtering)
             needs_gvproxy = allow_network or bool(expose_ports)
             if needs_gvproxy:
-                # Mode 1: Block all DNS and outbound connections (port-forward only)
-                # Mode 2/3: Use provided allowed_domains, allow outbound to those domains
+                # Mode 1: BlockAllOutbound blocks all guest-initiated connections (port-forward only)
+                # Mode 2/3: OutboundAllow filtering for provided allowed_domains
                 is_mode1 = bool(expose_ports) and not allow_network
                 effective_allowed_domains = allowed_domains if allow_network else []
                 logger.info(
