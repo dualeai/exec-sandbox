@@ -15,7 +15,7 @@ Secure code execution in isolated lightweight VMs (QEMU microVMs). Python librar
 - **Simple API** - Just `Scheduler` and `run()`, async-friendly; plus `sbx` CLI for quick testing
 - **Streaming output** - Real-time output as code runs
 - **Smart caching** - Local + S3 remote cache for VM snapshots
-- **Network control** - Disabled by default, optional domain allowlisting
+- **Network control** - Disabled by default, optional domain allowlisting with defense-in-depth filtering (DNS + TLS SNI + DNS cross-validation to prevent spoofing)
 - **Memory optimization** - Compressed memory (zram) + unused memory reclamation (balloon) for ~30% more capacity, ~80% smaller snapshots
 
 ## Installation
@@ -188,7 +188,7 @@ async with Scheduler() as scheduler:
     )
 ```
 
-**Security:** Port forwarding works independently of internet access. When `allow_network=False`, guest VMs cannot initiate outbound connections (DNS blocked, direct IP blocked), but host-to-guest port forwarding still works.
+**Security:** Port forwarding works independently of internet access. When `allow_network=False`, guest VMs cannot initiate outbound connections (all outbound TCP/UDP blocked), but host-to-guest port forwarding still works.
 
 #### Production Configuration
 
@@ -409,9 +409,9 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 
 - VMs are never reused - fresh VM per `run()`, destroyed immediately after
 - Network disabled by default - requires explicit `allow_network=True`
-- Domain allowlisting - only specified domains accessible when network enabled
+- Domain allowlisting with 3-layer outbound filtering — DNS resolution blocked for non-allowed domains, TLS SNI inspection on port 443, and DNS cross-validation to prevent SNI spoofing
 - Package validation - only top 10k Python/JavaScript packages allowed by default
-- Port forwarding isolation - when `expose_ports` is used without `allow_network`, guest cannot initiate any outbound connections (DNS and direct IP blocked)
+- Port forwarding isolation - when `expose_ports` is used without `allow_network`, guest cannot initiate any outbound connections (all outbound TCP/UDP blocked)
 
 ## Requirements
 

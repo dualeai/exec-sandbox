@@ -59,7 +59,7 @@ class QemuVM:
         cgroup_path: cgroup v2 path for resource limits
         workdir: Working directory containing all VM temp files
         overlay_image: Ephemeral qcow2 overlay (property, from workdir)
-        gvproxy_proc: Optional gvproxy-wrapper process for DNS filtering
+        gvproxy_proc: Optional gvproxy-wrapper process for outbound filtering
         gvproxy_socket: Optional QEMU stream socket path (property, from workdir)
         gvproxy_log_task: Optional background task draining gvproxy stdout/stderr
     """

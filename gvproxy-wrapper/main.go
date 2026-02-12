@@ -16,7 +16,7 @@ import (
 
 var (
 	listenFD      = flag.Int("listen-fd", -1, "Pre-bound socket FD (socket activation from parent process)")
-	dnsZones      = flag.String("dns-zones", "", "DNS zones JSON configuration")
+	outboundAllow = flag.String("outbound-allow", "", "OutboundAllow JSON: list of regex patterns for allowed outbound domains (DNS + TLS filtering)")
 	portForward   = flag.String("port-forward", "", "Port forwards JSON: {\"local\": \"remote\"} e.g. {\"127.0.0.1:8080\": \"192.168.127.2:8080\"}")
 	blockOutbound = flag.Bool("block-outbound", false, "Block all guest-initiated outbound connections (Mode 1: port-forward only)")
 	debug         = flag.Bool("debug", false, "Enable debug logging")
@@ -33,11 +33,11 @@ func main() {
 		log.Fatal("Error: -listen-fd flag is required (pre-bound socket FD from parent process)")
 	}
 
-	// Parse DNS zones from JSON
-	var zones []types.Zone
-	if *dnsZones != "" {
-		if err := json.Unmarshal([]byte(*dnsZones), &zones); err != nil {
-			log.Fatalf("Error parsing DNS zones: %v", err)
+	// Parse outbound allow patterns from JSON
+	var allowPatterns []string
+	if *outboundAllow != "" {
+		if err := json.Unmarshal([]byte(*outboundAllow), &allowPatterns); err != nil {
+			log.Fatalf("Error parsing outbound allow patterns: %v", err)
 		}
 	}
 
@@ -58,10 +58,10 @@ func main() {
 		Subnet:            "192.168.127.0/24",
 		GatewayIP:         "192.168.127.1",
 		GatewayMacAddress: "5a:94:ef:e4:0c:dd",
-		DNS:               zones,
 		Protocol:          types.QemuProtocol,
-		Forwards:          forwards,       // Port forwarding: host -> guest
-		BlockAllOutbound:  *blockOutbound, // Block guest-initiated outbound (Mode 1)
+		Forwards:          forwards,        // Port forwarding: host -> guest
+		BlockAllOutbound:  *blockOutbound,  // Block guest-initiated outbound (Mode 1)
+		OutboundAllow:     allowPatterns,   // Outbound filtering: DNS + TLS (Mode 2)
 	}
 
 	if *debug {
@@ -96,10 +96,10 @@ func main() {
 	if *blockOutbound {
 		log.Printf("Outbound blocking enabled (Mode 1: port-forward only, no internet)")
 	}
-	if len(zones) > 0 {
-		log.Printf("DNS filtering enabled with %d zone(s)", len(zones))
-		for i, zone := range zones {
-			log.Printf("  Zone %d: %d record(s), default IP: %s", i+1, len(zone.Records), zone.DefaultIP)
+	if len(allowPatterns) > 0 {
+		log.Printf("Outbound filtering enabled with %d pattern(s)", len(allowPatterns))
+		for i, pattern := range allowPatterns {
+			log.Printf("  Pattern %d: %s", i+1, pattern)
 		}
 	}
 

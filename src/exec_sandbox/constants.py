@@ -99,10 +99,10 @@ TCP_GUEST_PORT: Final[int] = 5000
 """TCP port for guest agent communication."""
 
 # ============================================================================
-# DNS and Domain Filtering
+# Outbound Domain Filtering
 # ============================================================================
-# Note: dnsmasq approach was replaced by gvproxy DNS zones
-# (see vm_manager.py _start_gvproxy for rationale)
+# Note: dnsmasq approach was replaced by gvproxy OutboundAllow (DNS + TLS filtering)
+# (see gvproxy.py start_gvproxy for rationale)
 
 PYTHON_PACKAGE_DOMAINS: Final[list[str]] = [
     "pypi.org",
