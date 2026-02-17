@@ -187,10 +187,10 @@ fn wait_for_virtio_ports() -> bool {
     // Uses any() to stop at first entry (more efficient than count())
     // Fast exponential backoff: 1+2+4+8+16+32 = 63ms max (was 155ms)
     for delay_us in [1000, 2000, 4000, 8000, 16000, 32000] {
-        if let Ok(mut entries) = fs::read_dir("/sys/class/virtio-ports") {
-            if entries.any(|e| e.is_ok()) {
-                return true;
-            }
+        if let Ok(mut entries) = fs::read_dir("/sys/class/virtio-ports")
+            && entries.any(|e| e.is_ok())
+        {
+            return true;
         }
         thread::sleep(Duration::from_micros(delay_us));
     }

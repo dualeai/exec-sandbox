@@ -280,7 +280,9 @@ class TestFileIoBasicOperations:
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("run.sh", script, make_executable=True)
 
-            result = await session.exec("import subprocess; print(subprocess.check_output('/home/user/run.sh').decode(), end='')")
+            result = await session.exec(
+                "import subprocess; print(subprocess.check_output('/home/user/run.sh').decode(), end='')"
+            )
 
             assert result.exit_code == 0
             assert "EXEC_OK" in result.stdout

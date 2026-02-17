@@ -303,9 +303,7 @@ async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Er
         "javascript" => {
             tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER).await?
         }
-        "raw" => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?
-        }
+        "raw" => tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?,
         _ => return Err(format!("Unknown language for REPL: {}", language).into()),
     }
     Ok(())
@@ -963,14 +961,24 @@ async fn handle_write_file(
     let resolved_path = match validate_file_path(path) {
         Ok(p) => p,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Invalid path '{}': {}", path, e), "validation_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Invalid path '{}': {}", path, e),
+                "validation_error",
+            )
+            .await?;
             return Ok(());
         }
     };
 
     // Reject sandbox root itself (can't write to a directory path)
     if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        send_streaming_error(write_tx, "Cannot write to sandbox root directory".to_string(), "validation_error").await?;
+        send_streaming_error(
+            write_tx,
+            "Cannot write to sandbox root directory".to_string(),
+            "validation_error",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -978,7 +986,12 @@ async fn handle_write_file(
     let content = match BASE64.decode(content_base64) {
         Ok(c) => c,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Invalid base64: {}", e), "validation_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Invalid base64: {}", e),
+                "validation_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -987,9 +1000,14 @@ async fn handle_write_file(
     if content.len() > MAX_FILE_SIZE_BYTES {
         send_streaming_error(
             write_tx,
-            format!("File too large: {} bytes (max {})", content.len(), MAX_FILE_SIZE_BYTES),
+            format!(
+                "File too large: {} bytes (max {})",
+                content.len(),
+                MAX_FILE_SIZE_BYTES
+            ),
             "validation_error",
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -997,7 +1015,12 @@ async fn handle_write_file(
     if let Some(parent) = resolved_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        send_streaming_error(write_tx, format!("Failed to create directories: {}", e), "io_error").await?;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to create directories: {}", e),
+            "io_error",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1013,8 +1036,15 @@ async fn handle_write_file(
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = if make_executable { 0o755 } else { 0o644 };
-        if let Err(e) = std::fs::set_permissions(&resolved_path, std::fs::Permissions::from_mode(mode)) {
-            send_streaming_error(write_tx, format!("Failed to set permissions: {}", e), "io_error").await?;
+        if let Err(e) =
+            std::fs::set_permissions(&resolved_path, std::fs::Permissions::from_mode(mode))
+        {
+            send_streaming_error(
+                write_tx,
+                format!("Failed to set permissions: {}", e),
+                "io_error",
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -1028,7 +1058,10 @@ async fn handle_write_file(
     let json = serde_json::to_string(&ack)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
 
     Ok(())
 }
@@ -1042,14 +1075,24 @@ async fn handle_read_file(
     let resolved_path = match validate_file_path(path) {
         Ok(p) => p,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Invalid path '{}': {}", path, e), "validation_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Invalid path '{}': {}", path, e),
+                "validation_error",
+            )
+            .await?;
             return Ok(());
         }
     };
 
     // Reject sandbox root itself
     if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        send_streaming_error(write_tx, "Cannot read a directory".to_string(), "validation_error").await?;
+        send_streaming_error(
+            write_tx,
+            "Cannot read a directory".to_string(),
+            "validation_error",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1057,14 +1100,25 @@ async fn handle_read_file(
     let canonical_path = match std::fs::canonicalize(&resolved_path) {
         Ok(p) => p,
         Err(e) => {
-            send_streaming_error(write_tx, format!("File not found or inaccessible '{}': {}", path, e), "io_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("File not found or inaccessible '{}': {}", path, e),
+                "io_error",
+            )
+            .await?;
             return Ok(());
         }
     };
 
-    let sandbox_canonical = std::fs::canonicalize(SANDBOX_ROOT).unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
+    let sandbox_canonical = std::fs::canonicalize(SANDBOX_ROOT)
+        .unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
     if !canonical_path.starts_with(&sandbox_canonical) {
-        send_streaming_error(write_tx, format!("Path '{}' resolves outside sandbox", path), "validation_error").await?;
+        send_streaming_error(
+            write_tx,
+            format!("Path '{}' resolves outside sandbox", path),
+            "validation_error",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1072,13 +1126,23 @@ async fn handle_read_file(
     let metadata = match std::fs::metadata(&canonical_path) {
         Ok(m) => m,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Cannot read '{}': {}", path, e), "io_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Cannot read '{}': {}", path, e),
+                "io_error",
+            )
+            .await?;
             return Ok(());
         }
     };
 
     if metadata.is_dir() {
-        send_streaming_error(write_tx, format!("'{}' is a directory, not a file", path), "validation_error").await?;
+        send_streaming_error(
+            write_tx,
+            format!("'{}' is a directory, not a file", path),
+            "validation_error",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1086,9 +1150,14 @@ async fn handle_read_file(
     if metadata.len() as usize > MAX_FILE_SIZE_BYTES {
         send_streaming_error(
             write_tx,
-            format!("File too large: {} bytes (max {})", metadata.len(), MAX_FILE_SIZE_BYTES),
+            format!(
+                "File too large: {} bytes (max {})",
+                metadata.len(),
+                MAX_FILE_SIZE_BYTES
+            ),
             "validation_error",
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1098,7 +1167,12 @@ async fn handle_read_file(
         let raw = match std::fs::read(&canonical_path) {
             Ok(r) => r,
             Err(e) => {
-                send_streaming_error(write_tx, format!("Failed to read '{}': {}", path, e), "io_error").await?;
+                send_streaming_error(
+                    write_tx,
+                    format!("Failed to read '{}': {}", path, e),
+                    "io_error",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1116,7 +1190,10 @@ async fn handle_read_file(
     let json = serde_json::to_string(&response_msg)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
 
     Ok(())
 }
@@ -1130,7 +1207,12 @@ async fn handle_list_files(
     let resolved_path = match validate_file_path(path) {
         Ok(p) => p,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Invalid path '{}': {}", path, e), "validation_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Invalid path '{}': {}", path, e),
+                "validation_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1139,7 +1221,12 @@ async fn handle_list_files(
     let read_dir = match std::fs::read_dir(&resolved_path) {
         Ok(rd) => rd,
         Err(e) => {
-            send_streaming_error(write_tx, format!("Cannot list '{}': {}", path, e), "io_error").await?;
+            send_streaming_error(
+                write_tx,
+                format!("Cannot list '{}': {}", path, e),
+                "io_error",
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1173,7 +1260,10 @@ async fn handle_list_files(
     let json = serde_json::to_string(&response_msg)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
-    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
 
     Ok(())
 }
@@ -2242,14 +2332,20 @@ mod tests {
     fn test_validate_file_path_basic() {
         let result = validate_file_path("hello.txt");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/hello.txt"));
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/hello.txt")
+        );
     }
 
     #[test]
     fn test_validate_file_path_nested() {
         let result = validate_file_path("subdir/data.csv");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/subdir/data.csv"));
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/subdir/data.csv")
+        );
     }
 
     #[test]
@@ -2319,7 +2415,10 @@ mod tests {
         // subdir/../file.txt should resolve to /home/user/file.txt (stays under root)
         let result = validate_file_path("subdir/../file.txt");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/file.txt"));
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/file.txt")
+        );
     }
 
     #[test]
@@ -2338,7 +2437,10 @@ mod tests {
     fn test_validate_file_path_hidden_file() {
         let result = validate_file_path(".hidden");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/.hidden"));
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/.hidden")
+        );
     }
 
     #[test]
@@ -2364,7 +2466,11 @@ mod tests {
         let json = r#"{"action":"write_file","path":"test.txt","content_base64":"aGVsbG8=","make_executable":false}"#;
         let cmd: GuestCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            GuestCommand::WriteFile { path, content_base64, make_executable } => {
+            GuestCommand::WriteFile {
+                path,
+                content_base64,
+                make_executable,
+            } => {
                 assert_eq!(path, "test.txt");
                 assert_eq!(content_base64, "aGVsbG8=");
                 assert!(!make_executable);
@@ -2414,7 +2520,9 @@ mod tests {
         let json = r#"{"action":"write_file","path":"run.sh","content_base64":"IyEvYmluL3No","make_executable":true}"#;
         let cmd: GuestCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            GuestCommand::WriteFile { make_executable, .. } => {
+            GuestCommand::WriteFile {
+                make_executable, ..
+            } => {
                 assert!(make_executable);
             }
             _ => panic!("Expected WriteFile"),
@@ -2457,8 +2565,16 @@ mod tests {
             msg_type: "file_list".to_string(),
             path: "".to_string(),
             entries: vec![
-                FileEntry { name: "file.txt".to_string(), is_dir: false, size: 100 },
-                FileEntry { name: "subdir".to_string(), is_dir: true, size: 0 },
+                FileEntry {
+                    name: "file.txt".to_string(),
+                    is_dir: false,
+                    size: 100,
+                },
+                FileEntry {
+                    name: "subdir".to_string(),
+                    is_dir: true,
+                    size: 0,
+                },
             ],
         };
         let json = serde_json::to_string(&list).unwrap();
