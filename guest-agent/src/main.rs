@@ -292,35 +292,48 @@ static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static REPL_STATES: Lazy<TokioMutex<HashMap<String, ReplState>>> =
     Lazy::new(|| TokioMutex::new(HashMap::new()));
 
-/// Write REPL wrapper script to /tmp/ for the given language.
+/// Write REPL wrapper script to SANDBOX_ROOT for the given language.
+/// All languages use SANDBOX_ROOT so package managers (bun, pip) resolve
+/// dependencies installed in the same directory.
 async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Error>> {
     match language {
-        "python" => tokio::fs::write("/tmp/_repl.py", PYTHON_REPL_WRAPPER).await?,
-        "javascript" => tokio::fs::write("/tmp/_repl.mjs", JS_REPL_WRAPPER).await?,
-        "raw" => tokio::fs::write("/tmp/_repl.sh", SHELL_REPL_WRAPPER).await?,
+        "python" => {
+            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER).await?
+        }
+        "javascript" => {
+            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER).await?
+        }
+        "raw" => {
+            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?
+        }
         _ => return Err(format!("Unknown language for REPL: {}", language).into()),
     }
     Ok(())
 }
 
 /// Spawn a fresh REPL process for the given language.
+///
+/// Scripts run from SANDBOX_ROOT so package resolution works naturally:
+///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages
+///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules
 async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
     write_repl_wrapper(language).await?;
 
     let mut cmd = match language {
         "python" => {
             let mut c = Command::new("python3");
-            c.arg("/tmp/_repl.py");
+            c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
+            c.env("PYTHONPATH", format!("{SANDBOX_ROOT}/site-packages"));
             c
         }
         "javascript" => {
             let mut c = Command::new("bun");
-            c.arg("/tmp/_repl.mjs");
+            c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
             c
         }
         "raw" => {
             let mut c = Command::new("sh");
-            c.arg("/tmp/_repl.sh");
+            c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
             c
         }
         _ => return Err(format!("Unknown language for REPL: {}", language).into()),
@@ -533,6 +546,12 @@ async fn send_streaming_error(
 
 // Note: flush_buffers() removed - replaced with spawned task pattern (Nov 2025)
 
+/// Install packages into SANDBOX_ROOT for the given language.
+///
+/// Packages are installed locally (not system-wide) so they persist in snapshots
+/// and are resolved by the REPL via standard language mechanisms:
+///   - Python: `uv pip install --target {SANDBOX_ROOT}/site-packages` + `PYTHONPATH`
+///   - JavaScript: `bun add` in SANDBOX_ROOT + Node `node_modules/` resolution
 async fn install_packages(
     language: &str,
     packages: &[String],
@@ -669,11 +688,12 @@ async fn install_packages(
             let mut c = Command::new("uv");
             c.arg("pip")
                 .arg("install")
-                .arg("--system")
-                .arg("--break-system-packages");
+                .arg("--target")
+                .arg(format!("{SANDBOX_ROOT}/site-packages"));
             for pkg in packages {
                 c.arg(pkg);
             }
+            c.current_dir(SANDBOX_ROOT);
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
@@ -682,10 +702,13 @@ async fn install_packages(
         }
         "javascript" => {
             let mut c = Command::new("bun");
-            c.arg("add").arg("--global");
+            c.arg("add");
             for pkg in packages {
                 c.arg(pkg);
             }
+            // Install to SANDBOX_ROOT where the REPL script lives, so bun
+            // resolves node_modules/ via standard Node resolution
+            c.current_dir(SANDBOX_ROOT);
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
