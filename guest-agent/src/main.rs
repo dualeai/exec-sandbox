@@ -201,7 +201,9 @@ const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'no
 const ctx = createContext({
     console, process, setTimeout, setInterval, clearTimeout, clearInterval,
     Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
+    AbortController, AbortSignal, Event, EventTarget,
     atob, btoa, structuredClone, queueMicrotask,
+    crypto,
     require,
     module: { exports: {} },
     exports: {},
@@ -249,8 +251,10 @@ while (true) {
     if (code === null) break;
     let exitCode = 0;
     try {
-        const result = runInContext(code, ctx, { filename: '<exec>' });
-        // Await promises (handles async functions, Promise.reject, etc.)
+        // Wrap in async IIFE to support top-level await — runInContext
+        // runs code as a Script (not Module) so bare await is a SyntaxError.
+        const wrapped = `(async()=>{${code}\n})()`;
+        const result = runInContext(wrapped, ctx, { filename: '<exec>' });
         if (result && typeof result.then === 'function') {
             await result;
         }
