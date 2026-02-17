@@ -52,6 +52,7 @@ from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.port_forward import resolve_port_mappings
+from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
 
 if TYPE_CHECKING:
@@ -226,7 +227,7 @@ class Scheduler:
 
         Args:
             code: Source code to execute.
-            language: Programming language ("python" or "javascript").
+            language: Programming language ("python", "javascript", or "raw").
             packages: Optional list of packages to install (e.g., ["pandas==2.2.0"]).
                 Validated against allowlist if enable_package_validation=True.
             timeout_seconds: Execution timeout. Default: config.default_timeout_seconds.
@@ -282,77 +283,21 @@ class Scheduler:
             )
             ```
         """
-        if not self._started:
-            raise SandboxError("Scheduler not started. Use: async with Scheduler() as scheduler:")
-
-        # Type narrowing (guaranteed by _started check)
-        if self._vm_manager is None or self._settings is None:
-            raise SandboxError("Scheduler resources not initialized")
-
         # Apply defaults
         timeout = timeout_seconds or self.config.default_timeout_seconds
-        memory = memory_mb or self.config.default_memory_mb
-        packages = packages or []
 
-        # Resolve port mappings (allocate ephemeral ports for those without explicit external)
-        resolved_ports: list[ExposedPort] = []
-        if expose_ports:
-            resolved_ports = resolve_port_mappings(expose_ports)
-            logger.info(
-                "Resolved port mappings",
-                extra={
-                    "ports": [(p.internal, p.external) for p in resolved_ports],
-                },
-            )
+        vm, resolved_ports, is_cold_boot = await self._prepare_vm(
+            language=language,
+            packages=packages,
+            memory_mb=memory_mb,
+            allow_network=allow_network,
+            allowed_domains=allowed_domains,
+            expose_ports=expose_ports,
+            task_id=f"run-{id(code)}",
+        )
 
-        # Validate packages against allowlist
-        if packages and self.config.enable_package_validation:
-            await self._validate_packages(packages, language)
-
-        # Check L2 snapshot cache for disk caching (only if packages specified)
-        # Only use snapshots when packages need to be installed - empty packages case
-        # benefits from overlay pool pre-caching which requires using the original base image
-        snapshot_path: Path | None = None
-        if self._snapshot_manager and packages:
-            snapshot_path = await self._get_or_create_snapshot(language, packages, memory)
-            logger.info(
-                "Snapshot cache result",
-                extra={"snapshot_path": str(snapshot_path) if snapshot_path else None},
-            )
-
-        # Backpressure handled by VmManager.create_vm() semaphore
-        vm: QemuVM | None = None
         run_start_time = asyncio.get_event_loop().time()
-        is_cold_boot = False
         try:
-            # Try warm pool first (instant allocation)
-            # Warm pool VMs don't have networking, so skip if networking is needed
-            needs_network: bool = allow_network or bool(resolved_ports)
-            if self._warm_pool and not packages and not needs_network:
-                lang_enum = Language(language)
-                vm = await self._warm_pool.get_vm(lang_enum, packages)
-
-            # Cold boot if no warm VM available
-            if vm is None:
-                is_cold_boot = True
-
-                # Auto-download base image if needed
-                if self.config.auto_download_assets:
-                    from exec_sandbox.assets import fetch_base_image  # noqa: PLC0415
-
-                    await fetch_base_image(language)
-
-                vm = await self._vm_manager.create_vm(
-                    language=language,
-                    tenant_id="exec-sandbox",
-                    task_id=f"run-{id(code)}",
-                    backing_image=snapshot_path,
-                    memory_mb=memory,
-                    allow_network=allow_network,
-                    allowed_domains=allowed_domains,
-                    expose_ports=resolved_ports if resolved_ports else None,
-                )
-
             # Execute code
             execute_start_time = asyncio.get_event_loop().time()
             result = await vm.execute(
@@ -410,8 +355,191 @@ class Scheduler:
 
         finally:
             # Always destroy VM (never reused)
-            if vm is not None:
+            # _vm_manager guaranteed non-None by _prepare_vm
+            if self._vm_manager is not None:
                 await self._vm_manager.destroy_vm(vm)
+
+    async def session(
+        self,
+        *,
+        language: Language,
+        packages: list[str] | None = None,
+        memory_mb: int | None = None,
+        allow_network: bool = False,
+        allowed_domains: list[str] | None = None,
+        expose_ports: list[PortMapping | int] | None = None,
+        idle_timeout_seconds: int | None = None,
+    ) -> Session:
+        """Create a persistent session for multi-step code execution.
+
+        Returns a Session that keeps the VM alive across multiple exec() calls.
+        State (variables, imports, functions) persists between executions.
+
+        The Session owns the VM lifecycle - the VM is destroyed when the
+        session is closed (explicitly, via context manager, or by idle timeout).
+
+        Args:
+            language: Programming language ("python", "javascript", or "raw").
+            packages: Optional list of packages to install (e.g., ["pandas==2.2.0"]).
+            memory_mb: Guest VM memory in MB. Default: config.default_memory_mb.
+            allow_network: Enable network access for the VM. Default: False.
+            allowed_domains: Whitelist of domains if allow_network=True.
+            expose_ports: List of ports to expose from guest to host.
+            idle_timeout_seconds: Auto-close after inactivity. Default: config setting.
+
+        Returns:
+            Session for executing code. Use as async context manager:
+                async with await scheduler.session(language="python") as sess:
+                    await sess.exec("x = 42")
+                    result = await sess.exec("print(x)")
+
+        Raises:
+            SandboxError: Scheduler not started.
+            PackageNotAllowedError: Package not in allowlist.
+            VmError: VM creation failed.
+
+        Example:
+            ```python
+            async with Scheduler() as scheduler:
+                async with await scheduler.session(language="python") as session:
+                    await session.exec("x = 42")
+                    result = await session.exec("print(x)")
+                    assert result.stdout.strip() == "42"
+                    print(f"exec_count={session.exec_count}")
+            ```
+        """
+        idle_timeout = idle_timeout_seconds or self.config.session_idle_timeout_seconds
+
+        vm, _resolved_ports, _is_cold_boot = await self._prepare_vm(
+            language=language,
+            packages=packages,
+            memory_mb=memory_mb,
+            allow_network=allow_network,
+            allowed_domains=allowed_domains,
+            expose_ports=expose_ports,
+            task_id=f"session-{id(self)}",
+        )
+
+        # _vm_manager guaranteed non-None by _prepare_vm
+        if self._vm_manager is None:
+            raise SandboxError("Scheduler resources not initialized")
+
+        logger.info(
+            "Session created",
+            extra={
+                "vm_id": vm.vm_id,
+                "language": language,
+                "idle_timeout_seconds": idle_timeout,
+            },
+        )
+
+        return Session(
+            vm=vm,
+            vm_manager=self._vm_manager,
+            idle_timeout_seconds=idle_timeout,
+            default_timeout_seconds=self.config.default_timeout_seconds,
+        )
+
+    async def _prepare_vm(
+        self,
+        *,
+        language: Language,
+        packages: list[str] | None,
+        memory_mb: int | None,
+        allow_network: bool,
+        allowed_domains: list[str] | None,
+        expose_ports: list[PortMapping | int] | None,
+        task_id: str,
+    ) -> tuple[QemuVM, list[ExposedPort], bool]:
+        """Create and boot a VM with the given configuration.
+
+        Shared by run() and session() - handles validation, snapshots,
+        warm pool, and cold boot. Returns the VM ready for execution.
+
+        Args:
+            language: Programming language.
+            packages: Packages to install.
+            memory_mb: Guest VM memory in MB (None = use default).
+            allow_network: Enable network access.
+            allowed_domains: Whitelist of domains.
+            expose_ports: Ports to expose from guest to host.
+            task_id: Identifier for this VM (e.g., "run-..." or "session-...").
+
+        Returns:
+            Tuple of (vm, resolved_ports, is_cold_boot).
+
+        Raises:
+            SandboxError: Scheduler not started.
+            PackageNotAllowedError: Package not in allowlist.
+            VmError: VM creation failed.
+        """
+        if not self._started:
+            raise SandboxError("Scheduler not started. Use: async with Scheduler() as scheduler:")
+
+        if self._vm_manager is None or self._settings is None:
+            raise SandboxError("Scheduler resources not initialized")
+
+        # Apply defaults
+        memory = memory_mb or self.config.default_memory_mb
+        packages = packages or []
+
+        # Resolve port mappings (allocate ephemeral ports for those without explicit external)
+        resolved_ports: list[ExposedPort] = []
+        if expose_ports:
+            resolved_ports = resolve_port_mappings(expose_ports)
+            logger.info(
+                "Resolved port mappings",
+                extra={
+                    "ports": [(p.internal, p.external) for p in resolved_ports],
+                },
+            )
+
+        # Validate packages against allowlist
+        if packages and self.config.enable_package_validation:
+            await self._validate_packages(packages, language)
+
+        # Check L2 snapshot cache for disk caching (only if packages specified)
+        # Only use snapshots when packages need to be installed - empty packages case
+        # benefits from overlay pool pre-caching which requires using the original base image
+        snapshot_path: Path | None = None
+        if self._snapshot_manager and packages:
+            snapshot_path = await self._get_or_create_snapshot(language, packages, memory)
+            logger.info(
+                "Snapshot cache result",
+                extra={"snapshot_path": str(snapshot_path) if snapshot_path else None},
+            )
+
+        # Try warm pool first (instant allocation)
+        # Warm pool VMs don't have networking, so skip if networking is needed
+        vm: QemuVM | None = None
+        is_cold_boot = False
+        needs_network: bool = allow_network or bool(resolved_ports)
+        if self._warm_pool and not packages and not needs_network:
+            lang_enum = Language(language)
+            vm = await self._warm_pool.get_vm(lang_enum, packages)
+
+        # Cold boot if no warm VM available
+        if vm is None:
+            is_cold_boot = True
+
+            # Auto-download base image if needed
+            if self.config.auto_download_assets:
+                from exec_sandbox.assets import fetch_base_image  # noqa: PLC0415
+
+                await fetch_base_image(language)
+
+            vm = await self._vm_manager.create_vm(
+                language=language,
+                tenant_id="exec-sandbox",
+                task_id=task_id,
+                backing_image=snapshot_path,
+                memory_mb=memory,
+                allow_network=allow_network,
+                allowed_domains=allowed_domains,
+                expose_ports=resolved_ports if resolved_ports else None,
+            )
+
+        return vm, resolved_ports, is_cold_boot
 
     def _create_settings(self) -> Settings:
         """Create Settings from SchedulerConfig.

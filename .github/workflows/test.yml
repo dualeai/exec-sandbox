@@ -76,8 +76,13 @@ jobs:
           components: rustfmt, clippy
           cache-workspaces: tiny-init
 
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+        working-directory: .
+
       - name: Static checks
-        run: make test-static
+        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-static
 
   static-go:
     name: Static / Go
@@ -146,10 +151,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+
       - name: Build
         uses: ./.github/actions/build-guest-agent
         with:
           arch: ${{ matrix.image_arch }}
+          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -174,10 +184,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+
       - name: Build
         uses: ./.github/actions/build-tiny-init
         with:
           arch: ${{ matrix.image_arch }}
+          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -14,9 +14,10 @@ Hierarchy:
     │   ├── BalloonTransientError      ← balloon operations
     │   └── CommunicationTransientError ← socket/network transient issues
     ├── PermanentError (non-retryable marker base)
-    │   └── VmPermanentError
-    │       ├── VmConfigError          ← invalid configuration
-    │       └── VmDependencyError      ← missing binary/image
+    │   ├── VmPermanentError
+    │   │   ├── VmConfigError          ← invalid configuration
+    │   │   └── VmDependencyError      ← missing binary/image
+    │   └── SessionClosedError         ← session already closed
     └── ... (other existing exceptions)
 
 Backward Compatibility:
@@ -277,6 +278,15 @@ class EnvVarValidationError(SandboxError):
 
     Raised when environment variable names or values contain invalid
     characters (control characters, null bytes) or exceed size limits.
+    """
+
+
+class SessionClosedError(PermanentError):
+    """Raised when attempting to use a session after it has been closed.
+
+    Sessions are closed explicitly via close(), by idle timeout, or
+    when the underlying VM fails. Once closed, all subsequent exec()
+    calls will raise this exception.
     """
 
 

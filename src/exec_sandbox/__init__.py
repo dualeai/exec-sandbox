@@ -3,7 +3,7 @@
 A standalone Python library for executing untrusted code in isolated QEMU microVMs
 with 6-layer security architecture.
 
-Quick Start:
+Quick Start (single execution):
     ```python
     from exec_sandbox import Scheduler
 
@@ -13,6 +13,17 @@ Quick Start:
             language="python",
         )
         print(result.stdout)  # "hello\\n"
+    ```
+
+Session (stateful multi-step execution):
+    ```python
+    from exec_sandbox import Scheduler
+
+    async with Scheduler() as scheduler:
+        async with await scheduler.session(language="python") as session:
+            await session.exec("x = 42")
+            result = await session.exec("print(x)")
+            print(result.stdout)  # "42\\n"
     ```
 
 With Configuration:
@@ -57,6 +68,7 @@ from exec_sandbox.exceptions import (
     PermanentError,
     SandboxDependencyError,
     SandboxError,
+    SessionClosedError,
     SnapshotError,
     TransientError,
     VmBootError,
@@ -74,6 +86,7 @@ from exec_sandbox.exceptions import (
 )
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.session import Session
 
 __all__ = [
     "BalloonTransientError",
@@ -89,6 +102,8 @@ __all__ = [
     "SandboxError",
     "Scheduler",
     "SchedulerConfig",
+    "Session",
+    "SessionClosedError",
     "SnapshotError",
     "TimingBreakdown",
     "TransientError",

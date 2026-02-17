@@ -1,6 +1,7 @@
 # Misc
 name ?= exec_sandbox
 python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires-python)
+rust_version ?= 1.93
 
 # Versions
 version_full ?= $(shell $(MAKE) --silent version-full)
@@ -21,6 +22,9 @@ version-full:
 version-pypi:
 	@bash ./cicd/version.sh -g .
 
+rust-version:
+	@echo $(rust_version)
+
 # ============================================================================
 # Installation
 # ============================================================================
@@ -32,7 +36,7 @@ install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
 	$(MAKE) --directory guest-agent install
-	$(MAKE) --directory tiny-init install
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory gvproxy-wrapper install
 
 install-deps:
@@ -46,7 +50,7 @@ upgrade:
 	uv lock --upgrade --refresh
 	$(MAKE) build-catalogs
 	$(MAKE) --directory guest-agent upgrade
-	$(MAKE) --directory tiny-init upgrade
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) upgrade
 	$(MAKE) --directory gvproxy-wrapper upgrade
 
 # Build package allow-lists from PyPI and npm registries
@@ -60,7 +64,7 @@ build-catalogs:
 
 build-images:
 	@echo "🔨 Building QEMU base images..."
-	./scripts/build-images.sh
+	RUST_VERSION=$(rust_version) ./scripts/build-images.sh
 
 # ============================================================================
 # Testing
@@ -77,7 +81,7 @@ test-static:
 	uv run -m vulture src/ scripts/ --min-confidence 80
 	shellcheck scripts/*.sh cicd/*.sh
 	$(MAKE) --directory guest-agent test-static
-	$(MAKE) --directory tiny-init test-static
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
 # All tests together for accurate coverage measurement (excludes sudo and slow tests)
@@ -92,7 +96,7 @@ test-sudo:
 test-unit:
 	uv run pytest tests/ -v -n auto -m "unit"
 	$(MAKE) --directory guest-agent test-unit
-	$(MAKE) --directory tiny-init test-unit
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
 
 # Memory leak detection tests (slow, run sequentially for accurate measurement)
@@ -107,7 +111,7 @@ lint:
 	uv run ruff format .
 	uv run ruff check --fix .
 	$(MAKE) --directory guest-agent lint
-	$(MAKE) --directory tiny-init lint
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) lint
 	$(MAKE) --directory gvproxy-wrapper lint
 
 # ============================================================================
@@ -191,7 +195,7 @@ bench-pool-flamegraph:
 
 build:
 	$(MAKE) --directory guest-agent build
-	$(MAKE) --directory tiny-init build
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) build
 	$(MAKE) --directory gvproxy-wrapper build
 
 # ============================================================================
@@ -200,6 +204,6 @@ build:
 
 clean:
 	$(MAKE) --directory guest-agent clean
-	$(MAKE) --directory tiny-init clean
+	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) clean
 	$(MAKE) --directory gvproxy-wrapper clean
 	rm -rf .pytest_cache .coverage htmlcov

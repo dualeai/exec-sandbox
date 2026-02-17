@@ -91,6 +91,12 @@ class SchedulerConfig(BaseModel):
         le=300,
         description="Default execution timeout in seconds",
     )
+    session_idle_timeout_seconds: int = Field(
+        default=300,
+        ge=10,
+        le=3600,
+        description="Idle timeout for sessions (auto-destroy after inactivity)",
+    )
 
     # Paths
     images_dir: Path | None = Field(

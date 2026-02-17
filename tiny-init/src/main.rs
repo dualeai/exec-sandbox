@@ -437,8 +437,11 @@ fn switch_root() -> ! {
     }
 
     // Set minimal environment for guest-agent
-    std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
-    std::env::set_var("HOME", "/root");
+    // SAFETY: called at startup before any threads are spawned
+    unsafe {
+        std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
+        std::env::set_var("HOME", "/root");
+    }
 
     // Ensure stdin is valid (open /dev/null if needed)
     let devnull = CString::new("/dev/null").unwrap();

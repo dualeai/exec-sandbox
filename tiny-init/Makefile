@@ -1,6 +1,9 @@
 # tiny-init is Linux-only, so we run all Rust commands in a Docker container
 
-RUST_IMAGE := rust:1.83-slim
+ifndef RUST_VERSION
+$(error RUST_VERSION is not set - invoke from root Makefile)
+endif
+RUST_IMAGE := rust:$(RUST_VERSION)-slim
 DOCKER_RUN := docker run --rm -v $(CURDIR):/workspace -w /workspace $(RUST_IMAGE)
 
 install:

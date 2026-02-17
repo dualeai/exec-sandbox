@@ -12,7 +12,7 @@ Secure code execution in isolated lightweight VMs (QEMU microVMs). Python librar
 
 - **Hardware isolation** - Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
 - **Fast startup** - 400ms fresh start, 1-2ms with pre-started VMs (warm pool)
-- **Simple API** - Just `Scheduler` and `run()`, async-friendly; plus `sbx` CLI for quick testing
+- **Simple API** - `run()` for one-shot execution, `session()` for stateful multi-step workflows; plus `sbx` CLI for quick testing
 - **Streaming output** - Real-time output as code runs
 - **Smart caching** - Local + S3 remote cache for VM snapshots
 - **Network control** - Disabled by default, optional domain allowlisting with defense-in-depth filtering (DNS + TLS SNI + DNS cross-validation to prevent spoofing)
@@ -118,6 +118,38 @@ async with Scheduler() as scheduler:
     print(result.stdout)     # Hello, World!
     print(result.exit_code)  # 0
 ```
+
+#### Sessions (Stateful Multi-Step)
+
+Sessions keep a VM alive across multiple `exec()` calls — variables, imports, and state persist.
+
+```python
+from exec_sandbox import Scheduler
+
+async with Scheduler() as scheduler:
+    async with await scheduler.session(language="python") as session:
+        await session.exec("import math")
+        await session.exec("x = math.pi * 2")
+        result = await session.exec("print(f'{x:.4f}')")
+        print(result.stdout)  # 6.2832
+        print(session.exec_count)  # 3
+```
+
+Sessions support all three languages:
+
+```python
+# JavaScript — variables and functions persist
+async with await scheduler.session(language="javascript") as session:
+    await session.exec("const greet = (name) => `Hello, ${name}!`")
+    result = await session.exec("console.log(greet('World'))")
+
+# Shell — env vars, cwd, and functions persist
+async with await scheduler.session(language="raw") as session:
+    await session.exec("cd /tmp && export MY_VAR=hello")
+    result = await session.exec("echo $MY_VAR from $(pwd)")
+```
+
+Sessions auto-close after idle timeout (default: 300s, configurable via `session_idle_timeout_seconds`).
 
 #### With Packages
 
@@ -290,6 +322,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `warm_pool_size` | 0 | Pre-started VMs (warm pool). Set >0 to enable. Size = `max_concurrent_vms × 25%` per language |
 | `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
+| `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
 | `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache |
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
@@ -344,11 +377,13 @@ VMs include automatic memory optimization (no configuration required):
 ## Pitfalls
 
 ```python
-# VMs are never reused - state doesn't persist
+# run() creates a fresh VM each time - state doesn't persist across calls
 result1 = await scheduler.run("x = 42", language="python")
 result2 = await scheduler.run("print(x)", language="python")  # NameError!
-# Fix: single execution with all code
-await scheduler.run("x = 42; print(x)", language="python")
+# Fix: use sessions for multi-step stateful execution
+async with await scheduler.session(language="python") as session:
+    await session.exec("x = 42")
+    result = await session.exec("print(x)")  # Works! x persists
 
 # Pre-started VMs (warm pool) only work without packages
 config = SchedulerConfig(warm_pool_size=1)
@@ -407,7 +442,7 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 
 **Guarantees:**
 
-- VMs are never reused - fresh VM per `run()`, destroyed immediately after
+- Fresh VM per `run()`, destroyed immediately after. Sessions reuse the same VM across `exec()` calls (same isolation, persistent state)
 - Network disabled by default - requires explicit `allow_network=True`
 - Domain allowlisting with 3-layer outbound filtering — DNS resolution blocked for non-allowed domains, TLS SNI inspection on port 443, and DNS cross-validation to prevent SNI spoofing
 - Package validation - only top 10k Python/JavaScript packages allowed by default

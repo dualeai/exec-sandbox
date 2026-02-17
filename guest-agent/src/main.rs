@@ -3,8 +3,14 @@
 //! Lightweight async agent running inside QEMU microVMs.
 //! Communicates with host via virtio-serial for:
 //! - Package installation (pip, npm)
-//! - Code execution
+//! - Code execution via persistent REPL (Python, JavaScript, Shell)
 //! - Health checks
+//!
+//! All code execution uses persistent REPL wrappers (not per-exec processes).
+//! Each language has a long-lived interpreter process that receives code via
+//! a length-prefixed stdin protocol and signals completion via unique
+//! sentinels on stderr (nanosecond timestamp + counter). State (variables, imports, functions) persists across
+//! executions within the same REPL instance.
 //!
 //! Uses tokio for fully async, non-blocking I/O.
 //! Communication via dual virtio-serial ports:
@@ -17,10 +23,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::Command as StdCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CMD_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.cmd";
@@ -36,7 +44,7 @@ const MAX_REQUEST_SIZE_BYTES: usize = 2_000_000; // 2MB max request JSON
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
 const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
-                                    // 12s > 10s health check interval to avoid spurious reconnects
+// 12s > 10s health check interval to avoid spurious reconnects
 
 // Host disconnection backoff configuration
 // When the host disconnects from virtio-serial, the kernel returns EPOLLHUP immediately on poll().
@@ -139,6 +147,250 @@ static BLOCKED_ENV_VARS: &[&str] = &[
     "MALLOC_TRACE",
     "MALLOC_PERTURB_",
 ];
+
+// =============================================================================
+// Persistent REPL Wrappers
+// =============================================================================
+
+/// Python REPL wrapper: exec() in persistent namespace with sentinel protocol.
+///
+/// Protocol:
+///   Input:  "{sentinel_id} {code_len}\n" + code_bytes on stdin
+///   Output: stdout/stderr from user code, then __SENTINEL_{id}_{exit_code}__\n on stderr
+///
+/// Uses sys.stdin.buffer (binary mode) to read exact byte counts.
+/// Text-mode sys.stdin.read(n) reads n *characters*, which differs from n bytes
+/// for multi-byte UTF-8 (e.g., "café" = 5 chars but 6 bytes), causing deadlocks.
+const PYTHON_REPL_WRAPPER: &str = r#"import sys, traceback
+sys.argv = ['-c']
+ns = {"__name__": "__main__", "__builtins__": __builtins__}
+while True:
+    header = sys.stdin.buffer.readline()
+    if not header:
+        break
+    sentinel_id, code_len = header.decode().strip().split(" ", 1)
+    code = sys.stdin.buffer.read(int(code_len)).decode()
+    exit_code = 0
+    try:
+        compiled = compile(code, "<exec>", "exec")
+        exec(compiled, ns)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stderr.write(f"__SENTINEL_{sentinel_id}_{exit_code}__\n")
+    sys.stderr.flush()
+"#;
+
+/// JavaScript REPL wrapper: vm.runInContext() with sentinel protocol (Bun-compatible).
+///
+/// Uses Uint8Array byte-level I/O for correct byte counts with multi-byte UTF-8.
+/// Same length-prefixed stdin protocol and stderr sentinel as Python wrapper.
+/// Awaits promise results from runInContext to handle async functions and rejections.
+/// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
+const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
+const ctx = createContext({
+    console, process, setTimeout, setInterval, clearTimeout, clearInterval,
+    Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
+    atob, btoa, structuredClone, queueMicrotask,
+    require,
+    module: { exports: {} },
+    exports: {},
+    __filename: '<exec>', __dirname: '/tmp',
+});
+const stdin = Bun.stdin.stream();
+const reader = stdin.getReader();
+let buf = new Uint8Array(0);
+const dec = new TextDecoder();
+function cat(a, b) {
+    const r = new Uint8Array(a.length + b.length);
+    r.set(a); r.set(b, a.length);
+    return r;
+}
+async function readLine() {
+    while (true) {
+        const idx = buf.indexOf(10);
+        if (idx !== -1) {
+            const line = dec.decode(buf.slice(0, idx));
+            buf = buf.slice(idx + 1);
+            return line;
+        }
+        const { done, value } = await reader.read();
+        if (done) return null;
+        buf = cat(buf, value);
+    }
+}
+async function readN(n) {
+    while (buf.length < n) {
+        const { done, value } = await reader.read();
+        if (done) return null;
+        buf = cat(buf, value);
+    }
+    const data = buf.slice(0, n);
+    buf = buf.slice(n);
+    return dec.decode(data);
+}
+while (true) {
+    const header = await readLine();
+    if (header === null) break;
+    const sp = header.indexOf(' ');
+    const sentinelId = header.substring(0, sp);
+    const codeLen = parseInt(header.substring(sp + 1), 10);
+    const code = await readN(codeLen);
+    if (code === null) break;
+    let exitCode = 0;
+    try {
+        const result = runInContext(code, ctx, { filename: '<exec>' });
+        // Await promises (handles async functions, Promise.reject, etc.)
+        if (result && typeof result.then === 'function') {
+            await result;
+        }
+    } catch (e) {
+        process.stderr.write((e && e.stack ? e.stack : String(e)) + '\n');
+        exitCode = 1;
+    }
+    process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
+}
+"#;
+
+/// Shell REPL wrapper: eval with sentinel protocol.
+///
+/// Shell `read` + `head -c` operate on bytes (not characters), so the
+/// length-prefixed protocol is naturally correct for multi-byte UTF-8.
+/// `eval "$code"` maintains shell state (env vars, cwd, functions, aliases).
+const SHELL_REPL_WRAPPER: &str = r#"while read sentinel_id code_len; do
+    code=$(head -c "$code_len")
+    eval "$code"
+    _ec=$?
+    printf "__SENTINEL_%s_%d__\n" "$sentinel_id" "$_ec" >&2
+done
+"#;
+
+/// State for a persistent REPL process.
+struct ReplState {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+}
+
+/// Module-level REPL storage. Persists across 12s guest agent reconnect cycles
+/// (guest agent process stays alive, just reconnects serial port).
+/// Monotonic counter for sentinel IDs. Combined with nanosecond timestamp
+/// to produce unique, unpredictable IDs without the uuid crate dependency.
+static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+static REPL_STATES: Lazy<TokioMutex<HashMap<String, ReplState>>> =
+    Lazy::new(|| TokioMutex::new(HashMap::new()));
+
+/// Write REPL wrapper script to /tmp/ for the given language.
+async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match language {
+        "python" => tokio::fs::write("/tmp/_repl.py", PYTHON_REPL_WRAPPER).await?,
+        "javascript" => tokio::fs::write("/tmp/_repl.mjs", JS_REPL_WRAPPER).await?,
+        "raw" => tokio::fs::write("/tmp/_repl.sh", SHELL_REPL_WRAPPER).await?,
+        _ => return Err(format!("Unknown language for REPL: {}", language).into()),
+    }
+    Ok(())
+}
+
+/// Spawn a fresh REPL process for the given language.
+async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
+    write_repl_wrapper(language).await?;
+
+    let mut cmd = match language {
+        "python" => {
+            let mut c = Command::new("python3");
+            c.arg("/tmp/_repl.py");
+            c
+        }
+        "javascript" => {
+            let mut c = Command::new("bun");
+            c.arg("/tmp/_repl.mjs");
+            c
+        }
+        "raw" => {
+            let mut c = Command::new("sh");
+            c.arg("/tmp/_repl.sh");
+            c
+        }
+        _ => return Err(format!("Unknown language for REPL: {}", language).into()),
+    };
+
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+
+    let mut child = cmd.spawn()?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    eprintln!("Spawned REPL for language={}", language);
+
+    Ok(ReplState {
+        child,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
+/// Build code prefix that sets environment variables for the given language.
+fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, String>) -> String {
+    if env_vars.is_empty() {
+        return code.to_string();
+    }
+
+    let mut full_code = String::new();
+
+    match language {
+        "python" => {
+            full_code.push_str("import os as __os__\n");
+            for (key, value) in env_vars {
+                // Escape backslashes and single quotes for Python string literal
+                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+                full_code.push_str(&format!(
+                    "__os__.environ['{escaped_key}']='{escaped_val}'\n"
+                ));
+            }
+            full_code.push_str("del __os__\n");
+        }
+        "javascript" => {
+            for (key, value) in env_vars {
+                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+                full_code.push_str(&format!("process.env['{escaped_key}']='{escaped_val}';\n"));
+            }
+        }
+        "raw" => {
+            for (key, value) in env_vars {
+                // Shell export syntax requires unquoted identifier keys.
+                // Skip keys that aren't valid POSIX identifiers to avoid broken syntax.
+                if !key
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                    || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    eprintln!("Skipping invalid shell env var key: {:?}", key);
+                    continue;
+                }
+                let escaped_val = value.replace('\'', "'\"'\"'");
+                full_code.push_str(&format!("export {key}='{escaped_val}'\n"));
+            }
+        }
+        _ => {}
+    }
+
+    full_code.push_str(code);
+    full_code
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
@@ -686,7 +938,7 @@ async fn graceful_terminate_process_group(
     child: &mut tokio::process::Child,
     grace_period_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     // Get PID (= PGID when process_group(0) was used at spawn)
     let pid = match child.id() {
@@ -747,6 +999,18 @@ async fn graceful_terminate_process_group(
     Ok(())
 }
 
+/// Execute code via persistent REPL with streaming output.
+///
+/// Flow:
+/// 1. Get or spawn REPL for this language (persists across calls)
+/// 2. Prepend env var setup code, then send via length-prefixed stdin protocol
+/// 3. Stream stdout chunks and buffer stderr lines looking for sentinel
+/// 4. On sentinel: drain remaining stdout, send completion with exit code
+/// 5. On REPL death (EOF): recover exit code via child.wait(), send completion
+/// 6. On timeout: kill REPL (respawned on next call), send timeout error
+///
+/// Sentinel detection uses `find()` (not `starts_with()`) to handle cases where
+/// user stderr without trailing newline gets concatenated with the sentinel line.
 async fn execute_code_streaming(
     language: &str,
     code: &str,
@@ -756,7 +1020,7 @@ async fn execute_code_streaming(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
     use tokio::io::AsyncReadExt;
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
 
     // Validate params
     if let Err(error_message) = validate_execute_params(language, code, timeout, env_vars) {
@@ -766,118 +1030,171 @@ async fn execute_code_streaming(
 
     let start = Instant::now();
 
-    // Granular timing for diagnostics
-    let spawn_ms: Option<u64>;
-    let process_ms: Option<u64>;
-
-    let mut cmd = match language {
-        "python" => {
-            let mut c = Command::new("python3");
-            c.arg("-c").arg(code);
-            // Spawn in new process group for clean termination of all children
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
-            c
+    // Get or create persistent REPL for this language
+    let spawn_start = Instant::now();
+    let mut was_fresh_spawn = false;
+    let mut repl = {
+        let mut states = REPL_STATES.lock().await;
+        match states.remove(language) {
+            Some(mut existing) => {
+                // Check if REPL is still alive
+                match existing.child.try_wait() {
+                    Ok(Some(_)) => {
+                        eprintln!("REPL for {} died, spawning fresh", language);
+                        was_fresh_spawn = true;
+                        spawn_repl(language).await?
+                    }
+                    Ok(None) => existing, // Still alive
+                    Err(_) => {
+                        was_fresh_spawn = true;
+                        spawn_repl(language).await?
+                    }
+                }
+            }
+            None => {
+                was_fresh_spawn = true;
+                spawn_repl(language).await?
+            }
         }
-        "javascript" => {
-            let mut c = Command::new("bun");
-            c.arg("-e").arg(code);
-            // Spawn in new process group for clean termination of all children
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
-            c
-        }
-        "raw" => {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(code);
-            // Spawn in new process group for clean termination of all children
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
-            c
-        }
-        _ => unreachable!(),
+    };
+    let spawn_ms = if was_fresh_spawn {
+        Some(spawn_start.elapsed().as_millis() as u64)
+    } else {
+        Some(0)
     };
 
-    // Set environment variables
-    for (key, value) in env_vars {
-        cmd.env(key, value);
+    // Generate unique sentinel for this execution
+    // Nanosecond timestamp + monotonic counter: unique and long enough
+    // to avoid accidental collision with user stderr output
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let count = SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sentinel_id = format!("{nanos}_{count}");
+    let sentinel_prefix = format!("__SENTINEL_{}_", sentinel_id);
+
+    // Prepend env var setup to user code
+    let full_code = prepend_env_vars(language, code, env_vars);
+    let code_bytes = full_code.as_bytes();
+
+    // Write header + code to REPL stdin
+    let header = format!("{} {}\n", sentinel_id, code_bytes.len());
+    if let Err(e) = repl.stdin.write_all(header.as_bytes()).await {
+        eprintln!("REPL stdin write failed (header): {}", e);
+        let _ = repl.child.kill().await;
+        let _ = repl.child.wait().await;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to send code to REPL: {}", e),
+            "execution_error",
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(e) = repl.stdin.write_all(code_bytes).await {
+        eprintln!("REPL stdin write failed (code): {}", e);
+        let _ = repl.child.kill().await;
+        let _ = repl.child.wait().await;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to send code to REPL: {}", e),
+            "execution_error",
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(e) = repl.stdin.flush().await {
+        eprintln!("REPL stdin flush failed: {}", e);
+        let _ = repl.child.kill().await;
+        let _ = repl.child.wait().await;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to send code to REPL: {}", e),
+            "execution_error",
+        )
+        .await?;
+        return Ok(());
     }
 
-    // Spawn process with timing
-    let spawn_start = Instant::now();
-    let mut child = match cmd.spawn() {
-        Ok(c) => {
-            spawn_ms = Some(spawn_start.elapsed().as_millis() as u64);
-            c
-        }
-        Err(e) => {
-            // spawn_ms stays None on failure
-            send_streaming_error(
-                write_tx,
-                format!("Failed to execute {} code: {}", language, e),
-                "execution_error",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
     let process_start = Instant::now();
 
-    // Get stdout/stderr streams
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    // Stream output until sentinel detected, REPL dies, or timeout
+    let mut stdout_buffer = String::new();
+    let mut stderr_buffer = String::new();
+    let mut stderr_line_buf = String::new();
+    let mut stdout_bytes = [0u8; 8192];
+    let mut stderr_bytes = [0u8; 8192];
+    let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut sentinel_exit_code: Option<i32> = None;
 
-    // Incremental streaming with 50ms batching and 64KB max buffer (Jan 2026 best practice)
-    // - Prevents memory exhaustion on large outputs
-    // - Provides real-time feedback (50ms latency, not 1s)
-    // - Uses backpressure via bounded channel
-    let write_tx_clone = write_tx.clone();
-    let streaming_task = tokio::spawn(async move {
-        let mut stdout_buffer = String::new();
-        let mut stderr_buffer = String::new();
-        let mut stdout_bytes = [0u8; 8192]; // 8KB read chunks
-        let mut stderr_bytes = [0u8; 8192];
-        let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
-        let mut stdout_done = false;
-        let mut stderr_done = false;
+    let timeout_duration = if timeout > 0 {
+        Duration::from_secs(timeout)
+    } else {
+        Duration::from_secs(MAX_TIMEOUT_SECONDS)
+    };
 
+    let loop_result = tokio::time::timeout(timeout_duration, async {
         loop {
             tokio::select! {
                 // Flush timer (50ms) - send buffered data for real-time feel
                 _ = flush_timer.tick() => {
-                    let _ = flush_output_buffer(&write_tx_clone, &mut stdout_buffer, "stdout").await;
-                    let _ = flush_output_buffer(&write_tx_clone, &mut stderr_buffer, "stderr").await;
+                    let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
+                    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
                 }
 
                 // Read stdout
-                result = stdout.read(&mut stdout_bytes), if !stdout_done => {
+                result = repl.stdout.read(&mut stdout_bytes), if !stdout_done => {
                     match result {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
-                            // Use lossy conversion to never drop data (replaces invalid UTF-8 with �)
                             stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
-                            // Flush immediately if buffer exceeds 64KB (backpressure)
                             if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(&write_tx_clone, &mut stdout_buffer, "stdout").await;
+                                let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
                             }
                         }
                         Err(_) => stdout_done = true,
                     }
                 }
 
-                // Read stderr
-                result = stderr.read(&mut stderr_bytes), if !stderr_done => {
+                // Read stderr (with sentinel detection)
+                result = repl.stderr.read(&mut stderr_bytes), if !stderr_done => {
                     match result {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
-                            // Use lossy conversion to never drop data (replaces invalid UTF-8 with �)
-                            stderr_buffer.push_str(&String::from_utf8_lossy(&stderr_bytes[..n]));
-                            // Flush immediately if buffer exceeds 64KB (backpressure)
-                            if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(&write_tx_clone, &mut stderr_buffer, "stderr").await;
+                            let chunk = String::from_utf8_lossy(&stderr_bytes[..n]).into_owned();
+                            stderr_line_buf.push_str(&chunk);
+
+                            // Process complete lines looking for sentinel
+                            while let Some(nl) = stderr_line_buf.find('\n') {
+                                let line = stderr_line_buf[..nl].to_string();
+                                stderr_line_buf = stderr_line_buf[nl + 1..].to_string();
+
+                                // Search for sentinel anywhere in line (not just start)
+                                // User stderr without trailing \n can be concatenated with sentinel
+                                if let Some(sentinel_pos) = line.find(&sentinel_prefix) {
+                                    let sentinel_part = &line[sentinel_pos..];
+                                    if sentinel_part.ends_with("__") {
+                                        // Forward any user stderr before sentinel
+                                        if sentinel_pos > 0 {
+                                            stderr_buffer.push_str(&line[..sentinel_pos]);
+                                        }
+                                        // Parse exit code from __SENTINEL_{id}_{code}__
+                                        let code_str = &sentinel_part
+                                            [sentinel_prefix.len()..sentinel_part.len() - 2];
+                                        sentinel_exit_code =
+                                            Some(code_str.parse::<i32>().unwrap_or(-1));
+                                        continue;
+                                    }
+                                }
+                                // User stderr - buffer for streaming
+                                stderr_buffer.push_str(&line);
+                                stderr_buffer.push('\n');
+                                if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                                    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+                                }
                             }
                         }
                         Err(_) => stderr_done = true,
@@ -885,76 +1202,109 @@ async fn execute_code_streaming(
                 }
             }
 
-            // Exit when both streams are done
+            // Exit conditions
+            if sentinel_exit_code.is_some() {
+                // Sentinel detected - drain any remaining stdout (may still be in pipe)
+                loop {
+                    match tokio::time::timeout(
+                        Duration::from_millis(FLUSH_INTERVAL_MS),
+                        repl.stdout.read(&mut stdout_bytes),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break, // EOF or timeout - done draining
+                        Ok(Ok(n)) => {
+                            stdout_buffer
+                                .push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
+                        }
+                        Ok(Err(_)) => break,
+                    }
+                }
+                break;
+            }
             if stdout_done && stderr_done {
-                // Final flush of any remaining data
-                let _ = flush_output_buffer(&write_tx_clone, &mut stdout_buffer, "stdout").await;
-                let _ = flush_output_buffer(&write_tx_clone, &mut stderr_buffer, "stderr").await;
+                // REPL died (both streams EOF)
                 break;
             }
         }
-    });
+    })
+    .await;
 
-    // Wait for process with timeout
-    let wait_future = child.wait();
-    let wait_result = if timeout > 0 {
-        tokio::time::timeout(Duration::from_secs(timeout), wait_future).await
-    } else {
-        Ok(wait_future.await)
-    };
+    // Flush residual stderr_line_buf (user stderr without trailing newline)
+    if !stderr_line_buf.is_empty() {
+        stderr_buffer.push_str(&stderr_line_buf);
+    }
 
-    let status = match wait_result {
-        Ok(Ok(s)) => {
-            process_ms = Some(process_start.elapsed().as_millis() as u64);
-            s
+    // Final flush of any remaining data
+    let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
+    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let process_ms = Some(process_start.elapsed().as_millis() as u64);
+
+    match loop_result {
+        Ok(()) if sentinel_exit_code.is_some() => {
+            // Normal completion via sentinel - REPL stays alive for reuse
+            let exit_code = sentinel_exit_code.unwrap();
+
+            // Store REPL back for reuse
+            let mut states = REPL_STATES.lock().await;
+            states.insert(language.to_string(), repl);
+
+            let complete = ExecutionComplete {
+                msg_type: "complete".to_string(),
+                exit_code,
+                execution_time_ms: duration_ms,
+                spawn_ms,
+                process_ms,
+            };
+            let json = serde_json::to_string(&complete)?;
+            let mut response = json.into_bytes();
+            response.push(b'\n');
+            write_tx
+                .send(response)
+                .await
+                .map_err(|_| "Write queue closed")?;
         }
-        Ok(Err(e)) => {
-            // Graceful termination: SIGTERM → wait → SIGKILL
-            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
-            streaming_task.abort();
-            send_streaming_error(
-                write_tx,
-                format!("Process wait error: {}", e),
-                "execution_error",
-            )
-            .await?;
-            return Ok(());
+        Ok(()) => {
+            // REPL died (EOF on both streams) - recover exit code
+            let status = repl.child.wait().await;
+            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+
+            eprintln!("REPL for {} died with exit_code={}", language, exit_code);
+
+            let complete = ExecutionComplete {
+                msg_type: "complete".to_string(),
+                exit_code,
+                execution_time_ms: duration_ms,
+                spawn_ms,
+                process_ms,
+            };
+            let json = serde_json::to_string(&complete)?;
+            let mut response = json.into_bytes();
+            response.push(b'\n');
+            write_tx
+                .send(response)
+                .await
+                .map_err(|_| "Write queue closed")?;
         }
         Err(_) => {
-            // Timeout: Graceful termination: SIGTERM → wait → SIGKILL
-            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
-            streaming_task.abort();
+            // Timeout - kill REPL (will be respawned on next exec)
+            eprintln!(
+                "REPL for {} timed out after {}s, killing",
+                language, timeout
+            );
+            let _ =
+                graceful_terminate_process_group(&mut repl.child, TERM_GRACE_PERIOD_SECONDS).await;
+
             send_streaming_error(
                 write_tx,
                 format!("Execution timeout after {}s", timeout),
                 "timeout_error",
             )
             .await?;
-            return Ok(());
         }
-    };
-
-    // Wait for streaming task to complete (captures remaining output after process exit)
-    let _ = streaming_task.await;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let exit_code = status.code().unwrap_or(-1);
-
-    // Send completion message
-    let complete = ExecutionComplete {
-        msg_type: "complete".to_string(),
-        exit_code,
-        execution_time_ms: duration_ms,
-        spawn_ms,
-        process_ms,
-    };
-    let json = serde_json::to_string(&complete)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
+    }
 
     Ok(())
 }
@@ -1347,7 +1697,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Reference: https://github.com/fpco/pid1-rs
 async fn reap_zombies() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     // Create signal stream BEFORE any children are spawned to avoid race conditions
     let mut sigchld = match signal(SignalKind::child()) {
@@ -1386,11 +1736,13 @@ async fn reap_zombies() {
 /// which is unmounted after switch_root.
 fn setup_init_environment() {
     // Set PATH for child processes (uv, python3, bun, etc.)
-    std::env::set_var("PATH", "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    // SAFETY: called at startup before any threads are spawned
+    unsafe { std::env::set_var("PATH", "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") };
     eprintln!("Set PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 
     // Disable uv cache (ephemeral VMs)
-    std::env::set_var("UV_NO_CACHE", "1");
+    // SAFETY: called at startup before any threads are spawned
+    unsafe { std::env::set_var("UV_NO_CACHE", "1") };
     eprintln!("Set UV_NO_CACHE=1");
 
     // Wait for network interface (up to 1 second, 20ms intervals)
@@ -1430,12 +1782,12 @@ fn setup_init_environment() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-            if let Ok(status) = result {
-                if status.success() {
-                    eprintln!("gvproxy connectivity verified");
-                    gvproxy_ok = true;
-                    break;
-                }
+            if let Ok(status) = result
+                && status.success()
+            {
+                eprintln!("gvproxy connectivity verified");
+                gvproxy_ok = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
