@@ -174,6 +174,170 @@ class PeakMemoryTracker:
         return self.peak_rss
 
 
+# =============================================================================
+# File I/O Memory Tests - detect leaks in write_file/read_file paths
+# =============================================================================
+
+# File sizes (MB) shared across all file I/O memory tests
+_FILE_IO_SIZES_MB = [1, 5, 10]
+
+# Overhead ratios — thresholds = file_size_mb x ratio.
+# Start at the tightest defensible values; raise only with CI profiling data.
+#
+# Peak: write path holds raw(1x) + base64(1.33x) + JSON frame(1.37x) = 3.7x
+# simultaneously (qemu_vm.py:566-577).  Read path is lighter (~2.3x).
+_FILE_IO_PEAK_RATIO = 3
+#
+# Leak: after teardown + gc.collect(), all buffers must be freed.
+# Growth should be zero; ratio of 1 gives a noise ceiling equal to one file.
+_FILE_IO_LEAK_RATIO = 1
+
+
+@pytest.fixture(params=_FILE_IO_SIZES_MB, ids=[f"{s}MB" for s in _FILE_IO_SIZES_MB])
+def file_io_size_mb(request: pytest.FixtureRequest) -> int:
+    """File size in MB, shared across all file I/O memory tests."""
+    return request.param
+
+
+async def _file_io_cycle(scheduler: Scheduler, index: int, size_bytes: int) -> None:
+    """Write and read back a file in a fresh session."""
+    content = os.urandom(size_bytes)
+    async with await scheduler.session(language=Language.PYTHON) as session:
+        await session.write_file(f"leak_test_{index}.bin", content)
+        result = await session.read_file(f"leak_test_{index}.bin")
+        assert len(result) == len(content)
+
+
+@pytest.mark.slow
+async def test_no_memory_leak_file_io(iterations: int, file_io_size_mb: int, images_dir: Path) -> None:
+    """Verify host memory returns to baseline after repeated file I/O cycles.
+
+    Each iteration opens a fresh session, writes a file, reads it back,
+    and closes the session.  Threshold reuses _LEAK_THRESHOLD_MB because
+    VM lifecycle overhead dominates (same as existing non-file-IO tests).
+    """
+    size_bytes = file_io_size_mb * 1024 * 1024
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
+
+    config = SchedulerConfig(
+        images_dir=images_dir,
+        warm_pool_size=0,
+        max_concurrent_vms=_MAX_CONCURRENT,
+    )
+
+    async with Scheduler(config) as scheduler:
+        sem = asyncio.Semaphore(_MAX_CONCURRENT)
+
+        async def guarded(i: int) -> None:
+            async with sem:
+                await _file_io_cycle(scheduler, i, size_bytes)
+
+        results = await asyncio.gather(
+            *(guarded(i) for i in range(iterations)),
+            return_exceptions=True,
+        )
+
+        successes = sum(1 for r in results if not isinstance(r, BaseException))
+        assert successes >= iterations * 0.9, f"Only {successes}/{iterations} succeeded"
+
+    gc.collect()
+    gc.collect()
+
+    final_rss = process.memory_info().rss
+    growth_mb = (final_rss - baseline_rss) / 1024 / 1024
+
+    assert growth_mb < _LEAK_THRESHOLD_MB, (
+        f"Memory leak: {growth_mb:.1f}MB growth after {iterations} x {file_io_size_mb}MB "
+        f"file I/O cycles (threshold: {_LEAK_THRESHOLD_MB}MB)"
+    )
+
+
+@pytest.mark.slow
+async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_dir: Path) -> None:
+    """Verify no buffer accumulation across repeated file I/O within one session.
+
+    Single VM, 50 write+read cycles.  Catches asyncio StreamReader buffer
+    inflation, Pydantic model caching, and unreleased base64 temporaries.
+    Threshold: file_size x _FILE_IO_LEAK_RATIO (tight — only buffer leaks).
+    """
+    size_bytes = file_io_size_mb * 1024 * 1024
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
+
+    config = SchedulerConfig(
+        images_dir=images_dir,
+        warm_pool_size=0,
+        max_concurrent_vms=1,
+    )
+
+    async with Scheduler(config) as scheduler:
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            for i in range(50):
+                content = os.urandom(size_bytes)
+                await session.write_file(f"intra_test_{i}.bin", content)
+                result = await session.read_file(f"intra_test_{i}.bin")
+                assert len(result) == len(content)
+
+    gc.collect()
+    gc.collect()
+
+    final_rss = process.memory_info().rss
+    growth_mb = (final_rss - baseline_rss) / 1024 / 1024
+
+    threshold_mb = file_io_size_mb * _FILE_IO_LEAK_RATIO
+    assert growth_mb < threshold_mb, (
+        f"Memory leak: {growth_mb:.1f}MB growth after 50 x {file_io_size_mb}MB "
+        f"intra-session file I/O (threshold: {threshold_mb}MB = "
+        f"{file_io_size_mb}MB x {_FILE_IO_LEAK_RATIO})"
+    )
+
+
+# =============================================================================
+# Peak RAM Tests - measure memory overhead per VM during execution
+# =============================================================================
+
+
+@pytest.mark.slow
+async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path) -> None:
+    """Measure peak RSS during a single write+read cycle.
+
+    Write holds raw + base64 + JSON frame simultaneously (~3.7x).
+    Threshold: file_size x _FILE_IO_PEAK_RATIO.
+    """
+    size_bytes = file_io_size_mb * 1024 * 1024
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
+
+    config = SchedulerConfig(
+        images_dir=images_dir,
+        warm_pool_size=0,
+        max_concurrent_vms=1,
+    )
+
+    tracker = PeakMemoryTracker()
+
+    async with Scheduler(config) as scheduler:
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            tracker.start(baseline_rss)
+            content = os.urandom(size_bytes)
+            await session.write_file("peak_test.bin", content)
+            result = await session.read_file("peak_test.bin")
+            peak_rss = await tracker.stop()
+            assert len(result) == len(content)
+
+    peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
+
+    threshold_mb = file_io_size_mb * _FILE_IO_PEAK_RATIO
+    assert peak_growth_mb < threshold_mb, (
+        f"Peak RAM too high: {peak_growth_mb:.1f}MB for {file_io_size_mb}MB file I/O "
+        f"(threshold: {threshold_mb}MB = {file_io_size_mb}MB x {_FILE_IO_PEAK_RATIO})"
+    )
+
+
 @pytest.mark.slow
 async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_dir: Path) -> None:
     """Measure peak RAM overhead per concurrent VM execution."""
