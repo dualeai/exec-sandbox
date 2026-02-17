@@ -229,7 +229,7 @@ from exec_sandbox import Scheduler, SchedulerConfig
 
 config = SchedulerConfig(
     max_concurrent_vms=20,       # Limit parallel executions
-    warm_pool_size=1,            # Pre-started VMs (warm pool), size = max_concurrent_vms × 25%
+    warm_pool_size=1,            # Pre-started VMs per language (0 disables)
     default_memory_mb=512,       # Per-VM memory
     default_timeout_seconds=60,  # Execution timeout
     s3_bucket="my-snapshots",    # Remote cache for package snapshots
@@ -319,7 +319,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_concurrent_vms` | 10 | Maximum parallel VMs |
-| `warm_pool_size` | 0 | Pre-started VMs (warm pool). Set >0 to enable. Size = `max_concurrent_vms × 25%` per language |
+| `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript). Set >0 to enable |
 | `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
@@ -327,6 +327,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache |
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
+| `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
@@ -353,26 +354,26 @@ VMs include automatic memory optimization (no configuration required):
 | `timing.boot_ms` | int | VM boot time |
 | `timing.execute_ms` | int | Code execution |
 | `timing.total_ms` | int | End-to-end time |
+| `warm_pool_hit` | bool | Whether a pre-started VM was used |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
 ## Exceptions
 
 | Exception | Description |
 |-----------|-------------|
-| `SandboxError` | Base exception |
-| `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3 for S3) |
-| `VmError` | VM operation failed |
-| `VmTimeoutError` | Execution exceeded timeout |
-| `VmBootError` | VM failed to start |
-| `CommunicationError` | VM communication failed |
-| `SocketAuthError` | Socket peer authentication failed |
-| `GuestAgentError` | VM helper process returned error |
+| `SandboxError` | Base exception for all sandbox errors |
+| `TransientError` | Retryable errors — may succeed on retry |
+| `PermanentError` | Non-retryable errors |
+| `VmTimeoutError` | VM boot timed out |
+| `VmCapacityError` | VM pool at capacity |
+| `VmConfigError` | Invalid VM configuration |
+| `SessionClosedError` | Session already closed |
+| `CommunicationError` | Guest communication failed |
+| `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
-| `AssetError` | Asset download/verification error (base) |
-| `AssetDownloadError` | Asset download failed |
-| `AssetChecksumError` | Asset checksum verification failed |
-| `AssetNotFoundError` | Asset not found in registry/release |
+| `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
+| `AssetError` | Asset download/verification failed |
 
 ## Pitfalls
 

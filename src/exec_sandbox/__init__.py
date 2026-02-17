@@ -61,8 +61,13 @@ For S3 snapshot caching:
 
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
+    AssetChecksumError,
+    AssetDownloadError,
+    AssetError,
+    AssetNotFoundError,
     BalloonTransientError,
     CommunicationError,
+    EnvVarValidationError,
     GuestAgentError,
     PackageNotAllowedError,
     PermanentError,
@@ -70,6 +75,7 @@ from exec_sandbox.exceptions import (
     SandboxError,
     SessionClosedError,
     SnapshotError,
+    SocketAuthError,
     TransientError,
     VmBootError,
     VmBootTimeoutError,
@@ -89,8 +95,13 @@ from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.session import Session
 
 __all__ = [
+    "AssetChecksumError",
+    "AssetDownloadError",
+    "AssetError",
+    "AssetNotFoundError",
     "BalloonTransientError",
     "CommunicationError",
+    "EnvVarValidationError",
     "ExecutionResult",
     "ExposedPort",
     "GuestAgentError",
@@ -105,6 +116,7 @@ __all__ = [
     "Session",
     "SessionClosedError",
     "SnapshotError",
+    "SocketAuthError",
     "TimingBreakdown",
     "TransientError",
     "VmBootError",
