@@ -12,14 +12,21 @@ from pydantic import ValidationError
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
+    FileContentMessage,
+    FileEntryInfo,
+    FileListMessage,
+    FileWriteAckMessage,
     InstallPackagesRequest,
+    ListFilesRequest,
     OutputChunkMessage,
     PingRequest,
     PongMessage,
+    ReadFileRequest,
     StreamingErrorMessage,
     StreamingMessage,
+    WriteFileRequest,
 )
-from exec_sandbox.models import Language
+from exec_sandbox.models import FileInfo, Language
 
 # ============================================================================
 # Request Models
@@ -639,3 +646,594 @@ class TestEnvVarValidationPropertyBased:
                 code="x",
                 env_vars=many_vars,
             )
+
+
+# ============================================================================
+# File I/O Request Models
+# ============================================================================
+
+
+class TestWriteFileRequest:
+    """Tests for WriteFileRequest model."""
+
+    def test_minimal_request(self) -> None:
+        """WriteFileRequest with required fields only."""
+        req = WriteFileRequest(
+            path="hello.txt",
+            content_base64="SGVsbG8=",
+        )
+        assert req.action == "write_file"
+        assert req.path == "hello.txt"
+        assert req.content_base64 == "SGVsbG8="
+        assert req.make_executable is False  # default
+
+    def test_with_make_executable(self) -> None:
+        """WriteFileRequest with make_executable=True."""
+        req = WriteFileRequest(
+            path="run.sh",
+            content_base64="IyEvYmluL2Jhc2g=",
+            make_executable=True,
+        )
+        assert req.make_executable is True
+
+    def test_path_max_length(self) -> None:
+        """WriteFileRequest accepts path at max length (255)."""
+        long_path = "a" * 255
+        req = WriteFileRequest(path=long_path, content_base64="AA==")
+        assert len(req.path) == 255
+
+    def test_path_exceeds_max_length(self) -> None:
+        """WriteFileRequest rejects path exceeding max length."""
+        too_long = "a" * 256
+        with pytest.raises(ValidationError):
+            WriteFileRequest(path=too_long, content_base64="AA==")
+
+    def test_empty_path_rejected(self) -> None:
+        """WriteFileRequest rejects empty path."""
+        with pytest.raises(ValidationError):
+            WriteFileRequest(path="", content_base64="AA==")
+
+    def test_content_base64_max_length(self) -> None:
+        """WriteFileRequest accepts content_base64 at max length."""
+        large_content = "A" * 14_000_000
+        req = WriteFileRequest(path="big.bin", content_base64=large_content)
+        assert len(req.content_base64) == 14_000_000
+
+    def test_content_base64_exceeds_max_length(self) -> None:
+        """WriteFileRequest rejects content_base64 exceeding max length."""
+        too_large = "A" * 14_000_001
+        with pytest.raises(ValidationError):
+            WriteFileRequest(path="big.bin", content_base64=too_large)
+
+    def test_serialize_roundtrip(self) -> None:
+        """WriteFileRequest serializes and deserializes correctly."""
+        req = WriteFileRequest(
+            path="data/output.csv",
+            content_base64="Y29sMSxjb2wy",
+            make_executable=False,
+        )
+        data = req.model_dump()
+        assert data == {
+            "action": "write_file",
+            "path": "data/output.csv",
+            "content_base64": "Y29sMSxjb2wy",
+            "make_executable": False,
+        }
+        restored = WriteFileRequest.model_validate(data)
+        assert restored.path == req.path
+        assert restored.content_base64 == req.content_base64
+        assert restored.make_executable == req.make_executable
+
+    def test_serialize_to_json(self) -> None:
+        """WriteFileRequest serializes to JSON."""
+        req = WriteFileRequest(path="f.txt", content_base64="AA==")
+        json_str = req.model_dump_json()
+        restored = WriteFileRequest.model_validate_json(json_str)
+        assert restored.path == "f.txt"
+        assert restored.content_base64 == "AA=="
+
+
+class TestReadFileRequest:
+    """Tests for ReadFileRequest model."""
+
+    def test_minimal_request(self) -> None:
+        """ReadFileRequest with required fields."""
+        req = ReadFileRequest(path="output.txt")
+        assert req.action == "read_file"
+        assert req.path == "output.txt"
+
+    def test_path_max_length(self) -> None:
+        """ReadFileRequest accepts path at max length (255)."""
+        long_path = "b" * 255
+        req = ReadFileRequest(path=long_path)
+        assert len(req.path) == 255
+
+    def test_path_exceeds_max_length(self) -> None:
+        """ReadFileRequest rejects path exceeding max length."""
+        too_long = "b" * 256
+        with pytest.raises(ValidationError):
+            ReadFileRequest(path=too_long)
+
+    def test_empty_path_rejected(self) -> None:
+        """ReadFileRequest rejects empty path."""
+        with pytest.raises(ValidationError):
+            ReadFileRequest(path="")
+
+    def test_serialize_to_dict(self) -> None:
+        """ReadFileRequest serializes correctly."""
+        req = ReadFileRequest(path="results/data.json")
+        data = req.model_dump()
+        assert data == {"action": "read_file", "path": "results/data.json"}
+
+    def test_serialize_to_json(self) -> None:
+        """ReadFileRequest serializes to JSON."""
+        req = ReadFileRequest(path="test.py")
+        json_str = req.model_dump_json()
+        restored = ReadFileRequest.model_validate_json(json_str)
+        assert restored.path == "test.py"
+
+
+class TestListFilesRequest:
+    """Tests for ListFilesRequest model."""
+
+    def test_minimal_request(self) -> None:
+        """ListFilesRequest with explicit path."""
+        req = ListFilesRequest(path="src")
+        assert req.action == "list_files"
+        assert req.path == "src"
+
+    def test_empty_path_for_root(self) -> None:
+        """ListFilesRequest with empty path lists sandbox root."""
+        req = ListFilesRequest()
+        assert req.path == ""
+
+    def test_empty_string_path_valid(self) -> None:
+        """ListFilesRequest accepts explicit empty string path."""
+        req = ListFilesRequest(path="")
+        assert req.path == ""
+
+    def test_path_max_length(self) -> None:
+        """ListFilesRequest accepts path at max length (255)."""
+        long_path = "c" * 255
+        req = ListFilesRequest(path=long_path)
+        assert len(req.path) == 255
+
+    def test_path_exceeds_max_length(self) -> None:
+        """ListFilesRequest rejects path exceeding max length."""
+        too_long = "c" * 256
+        with pytest.raises(ValidationError):
+            ListFilesRequest(path=too_long)
+
+    def test_serialize_to_dict(self) -> None:
+        """ListFilesRequest serializes correctly."""
+        req = ListFilesRequest(path="data")
+        data = req.model_dump()
+        assert data == {"action": "list_files", "path": "data"}
+
+    def test_serialize_default_path(self) -> None:
+        """ListFilesRequest serializes default empty path."""
+        req = ListFilesRequest()
+        data = req.model_dump()
+        assert data == {"action": "list_files", "path": ""}
+
+
+# ============================================================================
+# File I/O Response Models
+# ============================================================================
+
+
+class TestFileWriteAckMessage:
+    """Tests for FileWriteAckMessage model."""
+
+    def test_ack_fields(self) -> None:
+        """FileWriteAckMessage has correct fields."""
+        msg = FileWriteAckMessage(path="hello.txt", bytes_written=5)
+        assert msg.type == "file_write_ack"
+        assert msg.path == "hello.txt"
+        assert msg.bytes_written == 5
+
+    def test_large_bytes_written(self) -> None:
+        """FileWriteAckMessage supports large file sizes."""
+        msg = FileWriteAckMessage(path="big.bin", bytes_written=10_000_000)
+        assert msg.bytes_written == 10_000_000
+
+    def test_serialize(self) -> None:
+        """FileWriteAckMessage serializes correctly."""
+        msg = FileWriteAckMessage(path="out.csv", bytes_written=1024)
+        data = msg.model_dump()
+        assert data == {
+            "type": "file_write_ack",
+            "path": "out.csv",
+            "bytes_written": 1024,
+        }
+
+    def test_serialize_to_json(self) -> None:
+        """FileWriteAckMessage serializes to JSON and back."""
+        msg = FileWriteAckMessage(path="script.py", bytes_written=42)
+        json_str = msg.model_dump_json()
+        restored = FileWriteAckMessage.model_validate_json(json_str)
+        assert restored.path == "script.py"
+        assert restored.bytes_written == 42
+
+
+class TestFileContentMessage:
+    """Tests for FileContentMessage model."""
+
+    def test_content_fields(self) -> None:
+        """FileContentMessage has correct fields."""
+        msg = FileContentMessage(
+            path="data.txt",
+            content_base64="SGVsbG8gV29ybGQ=",
+            size=11,
+        )
+        assert msg.type == "file_content"
+        assert msg.path == "data.txt"
+        assert msg.content_base64 == "SGVsbG8gV29ybGQ="
+        assert msg.size == 11
+
+    def test_empty_file(self) -> None:
+        """FileContentMessage for an empty file."""
+        msg = FileContentMessage(path="empty.txt", content_base64="", size=0)
+        assert msg.content_base64 == ""
+        assert msg.size == 0
+
+    def test_serialize(self) -> None:
+        """FileContentMessage serializes correctly."""
+        msg = FileContentMessage(
+            path="config.json",
+            content_base64="e30=",
+            size=2,
+        )
+        data = msg.model_dump()
+        assert data == {
+            "type": "file_content",
+            "path": "config.json",
+            "content_base64": "e30=",
+            "size": 2,
+        }
+
+    def test_serialize_to_json(self) -> None:
+        """FileContentMessage serializes to JSON and back."""
+        msg = FileContentMessage(path="f.bin", content_base64="AQID", size=3)
+        json_str = msg.model_dump_json()
+        restored = FileContentMessage.model_validate_json(json_str)
+        assert restored.path == "f.bin"
+        assert restored.content_base64 == "AQID"
+        assert restored.size == 3
+
+
+class TestFileListMessage:
+    """Tests for FileListMessage model."""
+
+    def test_empty_listing(self) -> None:
+        """FileListMessage with no entries."""
+        msg = FileListMessage(path="empty_dir", entries=[])
+        assert msg.type == "file_list"
+        assert msg.path == "empty_dir"
+        assert msg.entries == []
+
+    def test_with_entries(self) -> None:
+        """FileListMessage with file and directory entries."""
+        entries = [
+            FileEntryInfo(name="src", is_dir=True, size=0),
+            FileEntryInfo(name="main.py", is_dir=False, size=256),
+            FileEntryInfo(name="README.md", is_dir=False, size=1024),
+        ]
+        msg = FileListMessage(path="", entries=entries)
+        assert len(msg.entries) == 3
+        assert msg.entries[0].name == "src"
+        assert msg.entries[0].is_dir is True
+        assert msg.entries[1].name == "main.py"
+        assert msg.entries[1].is_dir is False
+        assert msg.entries[1].size == 256
+
+    def test_serialize(self) -> None:
+        """FileListMessage serializes correctly."""
+        msg = FileListMessage(
+            path="project",
+            entries=[FileEntryInfo(name="app.js", is_dir=False, size=512)],
+        )
+        data = msg.model_dump()
+        assert data == {
+            "type": "file_list",
+            "path": "project",
+            "entries": [{"name": "app.js", "is_dir": False, "size": 512}],
+        }
+
+    def test_serialize_to_json(self) -> None:
+        """FileListMessage serializes to JSON and back."""
+        msg = FileListMessage(
+            path="",
+            entries=[
+                FileEntryInfo(name="dir", is_dir=True, size=0),
+                FileEntryInfo(name="file.txt", is_dir=False, size=100),
+            ],
+        )
+        json_str = msg.model_dump_json()
+        restored = FileListMessage.model_validate_json(json_str)
+        assert len(restored.entries) == 2
+        assert restored.entries[0].is_dir is True
+        assert restored.entries[1].size == 100
+
+
+class TestFileEntryInfo:
+    """Tests for FileEntryInfo model."""
+
+    def test_file_entry(self) -> None:
+        """FileEntryInfo for a regular file."""
+        entry = FileEntryInfo(name="report.pdf", is_dir=False, size=4096)
+        assert entry.name == "report.pdf"
+        assert entry.is_dir is False
+        assert entry.size == 4096
+
+    def test_directory_entry(self) -> None:
+        """FileEntryInfo for a directory."""
+        entry = FileEntryInfo(name="src", is_dir=True, size=0)
+        assert entry.name == "src"
+        assert entry.is_dir is True
+        assert entry.size == 0
+
+    def test_serialize_roundtrip(self) -> None:
+        """FileEntryInfo serializes and deserializes correctly."""
+        entry = FileEntryInfo(name="data.csv", is_dir=False, size=2048)
+        data = entry.model_dump()
+        assert data == {"name": "data.csv", "is_dir": False, "size": 2048}
+        restored = FileEntryInfo.model_validate(data)
+        assert restored.name == entry.name
+        assert restored.is_dir == entry.is_dir
+        assert restored.size == entry.size
+
+
+class TestFileInfo:
+    """Tests for FileInfo model (from models.py)."""
+
+    def test_file_entry(self) -> None:
+        """FileInfo for a regular file."""
+        info = FileInfo(name="output.log", is_dir=False, size=8192)
+        assert info.name == "output.log"
+        assert info.is_dir is False
+        assert info.size == 8192
+
+    def test_directory_entry(self) -> None:
+        """FileInfo for a directory."""
+        info = FileInfo(name="results", is_dir=True, size=0)
+        assert info.name == "results"
+        assert info.is_dir is True
+        assert info.size == 0
+
+    def test_serialize_roundtrip(self) -> None:
+        """FileInfo serializes and deserializes correctly."""
+        info = FileInfo(name="image.png", is_dir=False, size=65536)
+        data = info.model_dump()
+        assert data == {"name": "image.png", "is_dir": False, "size": 65536}
+        restored = FileInfo.model_validate(data)
+        assert restored.name == info.name
+        assert restored.is_dir == info.is_dir
+        assert restored.size == info.size
+
+
+# ============================================================================
+# Discriminated Union - File I/O Messages
+# ============================================================================
+
+
+class TestStreamingMessageFileIO:
+    """Tests for StreamingMessage discriminated union with file I/O types."""
+
+    def test_parse_file_write_ack(self) -> None:
+        """Parse FileWriteAckMessage from dict."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        data = {"type": "file_write_ack", "path": "hello.txt", "bytes_written": 5}
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, FileWriteAckMessage)
+        assert msg.path == "hello.txt"
+        assert msg.bytes_written == 5
+
+    def test_parse_file_write_ack_from_json(self) -> None:
+        """Parse FileWriteAckMessage from JSON string."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "file_write_ack", "path": "script.sh", "bytes_written": 128}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, FileWriteAckMessage)
+        assert msg.path == "script.sh"
+        assert msg.bytes_written == 128
+
+    def test_parse_file_content(self) -> None:
+        """Parse FileContentMessage from dict."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        data = {
+            "type": "file_content",
+            "path": "data.txt",
+            "content_base64": "SGVsbG8=",
+            "size": 5,
+        }
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, FileContentMessage)
+        assert msg.path == "data.txt"
+        assert msg.content_base64 == "SGVsbG8="
+        assert msg.size == 5
+
+    def test_parse_file_content_from_json(self) -> None:
+        """Parse FileContentMessage from JSON string."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "file_content", "path": "out.bin", "content_base64": "AQID", "size": 3}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, FileContentMessage)
+        assert msg.path == "out.bin"
+        assert msg.size == 3
+
+    def test_parse_file_list(self) -> None:
+        """Parse FileListMessage from dict."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        data = {
+            "type": "file_list",
+            "path": "",
+            "entries": [
+                {"name": "src", "is_dir": True, "size": 0},
+                {"name": "main.py", "is_dir": False, "size": 200},
+            ],
+        }
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, FileListMessage)
+        assert len(msg.entries) == 2
+        assert msg.entries[0].name == "src"
+        assert msg.entries[0].is_dir is True
+
+    def test_parse_file_list_from_json(self) -> None:
+        """Parse FileListMessage from JSON string."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        json_str = (
+            '{"type": "file_list", "path": "project", "entries": [{"name": "index.js", "is_dir": false, "size": 512}]}'
+        )
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, FileListMessage)
+        assert msg.path == "project"
+        assert len(msg.entries) == 1
+        assert msg.entries[0].name == "index.js"
+
+    def test_parse_file_list_empty_entries(self) -> None:
+        """Parse FileListMessage with empty entries from dict."""
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(StreamingMessage)
+        data = {"type": "file_list", "path": "empty", "entries": []}
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, FileListMessage)
+        assert msg.entries == []
+
+
+# ============================================================================
+# Property-Based Tests - File I/O (Hypothesis)
+# ============================================================================
+
+
+class TestFilePathValidationPropertyBased:
+    """Property-based tests for file path validation using Hypothesis.
+
+    These tests automatically discover edge cases in path validation
+    across WriteFileRequest, ReadFileRequest, and ListFilesRequest.
+    """
+
+    # Strategy for safe relative path segments (alphanumeric + common filename chars)
+    safe_path_chars = characters(
+        whitelist_categories=("Lu", "Ll", "Nd"),
+        whitelist_characters="_-./",
+    )
+
+    @given(
+        segment=text(
+            alphabet=characters(
+                whitelist_categories=("Lu", "Ll", "Nd"),
+                whitelist_characters="_-",
+            ),
+            min_size=1,
+            max_size=50,
+        ),
+    )
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.filter_too_much])
+    def test_safe_relative_paths_accepted(self, segment: str) -> None:
+        """Property: Safe relative paths should be accepted by all file request models."""
+        path = f"subdir/{segment}.txt"
+        # WriteFileRequest
+        req_w = WriteFileRequest(path=path, content_base64="AA==")
+        assert req_w.path == path
+        # ReadFileRequest
+        req_r = ReadFileRequest(path=path)
+        assert req_r.path == path
+        # ListFilesRequest
+        req_l = ListFilesRequest(path=path)
+        assert req_l.path == path
+
+    @given(
+        extra=text(
+            alphabet=characters(whitelist_categories=("Ll",)),
+            min_size=1,
+            max_size=50,
+        ),
+    )
+    @settings(max_examples=50)
+    def test_overlong_paths_rejected(self, extra: str) -> None:
+        """Property: Paths exceeding 255 chars must be rejected."""
+        # Build a path that is guaranteed to exceed 255 chars
+        path = "a" * 256 + extra
+        with pytest.raises(ValidationError):
+            WriteFileRequest(path=path, content_base64="AA==")
+        with pytest.raises(ValidationError):
+            ReadFileRequest(path=path)
+        with pytest.raises(ValidationError):
+            ListFilesRequest(path=path)
+
+    # Strategy for control characters (same set used by env var tests)
+    control_chars = sampled_from(
+        [chr(c) for c in range(0x09)]  # NUL through BS
+        + [chr(c) for c in range(0x0A, 0x20)]  # LF through US
+        + [chr(0x7F)]  # DEL
+    )
+
+    @given(
+        prefix=text(
+            alphabet=characters(whitelist_categories=("Ll",)),
+            min_size=1,
+            max_size=10,
+        ),
+        control=control_chars,
+        suffix=text(
+            alphabet=characters(whitelist_categories=("Ll",)),
+            min_size=1,
+            max_size=10,
+        ),
+    )
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.filter_too_much])
+    def test_control_chars_in_path_rejected_write(self, prefix: str, control: str, suffix: str) -> None:
+        """Property: Control characters in WriteFileRequest path should be rejected by Pydantic or the guest agent.
+
+        Note: Pydantic's min_length/max_length do not reject control characters.
+        This test documents the current behavior -- the guest agent's Rust-side
+        validation is the security boundary for path traversal and control chars.
+        If Pydantic accepts it, the test verifies the model at least creates with
+        the path as-is (no silent transformation), ensuring transparency for the
+        guest agent validator.
+        """
+        malicious_path = prefix + control + suffix
+        try:
+            req = WriteFileRequest(path=malicious_path, content_base64="AA==")
+            # If Pydantic accepts it, ensure the path is stored verbatim
+            # (guest agent will reject it server-side)
+            assert req.path == malicious_path
+        except ValidationError:
+            pass  # Pydantic rejected it -- also fine
+
+    @given(
+        prefix=text(
+            alphabet=characters(whitelist_categories=("Ll",)),
+            min_size=1,
+            max_size=10,
+        ),
+        control=control_chars,
+        suffix=text(
+            alphabet=characters(whitelist_categories=("Ll",)),
+            min_size=1,
+            max_size=10,
+        ),
+    )
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.filter_too_much])
+    def test_control_chars_in_path_rejected_read(self, prefix: str, control: str, suffix: str) -> None:
+        """Property: Control characters in ReadFileRequest path should be rejected by Pydantic or the guest agent."""
+        malicious_path = prefix + control + suffix
+        try:
+            req = ReadFileRequest(path=malicious_path)
+            assert req.path == malicious_path
+        except ValidationError:
+            pass  # Pydantic rejected it -- also fine

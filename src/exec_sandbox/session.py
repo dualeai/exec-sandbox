@@ -23,12 +23,18 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable  # noqa: TC003 - Used at runtime for on_stdout/on_stderr parameters
+from collections.abc import (  # noqa: TC003 - Used at runtime for _guard() and on_stdout/on_stderr
+    AsyncIterator,
+    Callable,
+)
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.constants import ASYNC_READ_THRESHOLD_BYTES, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import SessionClosedError
-from exec_sandbox.models import ExecutionResult, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, FileInfo, TimingBreakdown
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -90,6 +96,57 @@ class Session:
         return self._exec_count
 
     # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def _guard(self) -> AsyncIterator[None]:
+        """Acquire exec lock with session lifecycle checks.
+
+        Encapsulates the 4-step preamble shared by all public methods:
+        1. Check closed (fast path, no lock)
+        2. Acquire _exec_lock
+        3. Re-check closed (may have closed while waiting)
+        4. Reset idle timer
+        """
+        if self._closed:
+            raise SessionClosedError("Session is closed")
+        async with self._exec_lock:
+            if self._closed:
+                raise SessionClosedError("Session closed while waiting for lock")
+            self._reset_idle_timer()
+            yield
+
+    async def _resolve_content(self, content: bytes | Path) -> bytes:
+        """Convert bytes | Path to raw bytes with size validation.
+
+        Called BEFORE _guard() so local disk I/O doesn't hold the exec lock.
+
+        TOCTOU note: file may grow between stat() and read_bytes().
+        A post-read size check catches this race.
+        """
+        if isinstance(content, Path):
+            if not content.exists():
+                raise FileNotFoundError(f"Source file not found: {content}")
+            file_size = content.stat().st_size
+            if file_size > MAX_FILE_SIZE_BYTES:
+                raise ValueError(f"File {content.name} is {file_size} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+            raw = (
+                await asyncio.to_thread(content.read_bytes)
+                if file_size > ASYNC_READ_THRESHOLD_BYTES
+                else content.read_bytes()
+            )
+            # TOCTOU guard: file may have grown between stat() and read_bytes()
+            if len(raw) > MAX_FILE_SIZE_BYTES:
+                raise ValueError(
+                    f"File {content.name} grew to {len(raw)} bytes after stat(), exceeds {MAX_FILE_SIZE_BYTES}"
+                )
+            return raw
+        if len(content) > MAX_FILE_SIZE_BYTES:
+            raise ValueError(f"Content is {len(content)} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+        return content
+
+    # -------------------------------------------------------------------------
     # Core API
     # -------------------------------------------------------------------------
 
@@ -120,23 +177,17 @@ class Session:
         Raises:
             SessionClosedError: Session has been closed.
             VmPermanentError: VM communication failed (session auto-closed).
+            VmTransientError: VM communication failed (session auto-closed).
+            VmBootTimeoutError: Execution exceeded timeout (session auto-closed).
 
         Note:
             Execution timeouts (guest agent level) return a result with
             exit_code=-1 and timeout message in stderr — they do NOT raise.
             Only VM-level failures (communication errors) raise exceptions.
         """
-        if self._closed:
-            raise SessionClosedError("Session is closed")
-
         timeout = timeout_seconds or self._default_timeout_seconds
 
-        async with self._exec_lock:
-            if self._closed:
-                raise SessionClosedError("Session closed while waiting for exec lock")
-
-            self._reset_idle_timer()
-
+        async with self._guard():
             execute_start = asyncio.get_event_loop().time()
             try:
                 result = await self._vm.execute(
@@ -175,10 +226,72 @@ class Session:
                 process_ms=result.process_ms,
             )
 
+    # -------------------------------------------------------------------------
+    # File I/O
+    # -------------------------------------------------------------------------
+
+    async def write_file(self, path: str, content: bytes | Path, *, make_executable: bool = False) -> None:
+        """Write a file to the sandbox at the given path.
+
+        Args:
+            path: Relative path in sandbox (e.g., "input.csv", "data/model.pkl").
+            content: File content as bytes or a local Path to read from.
+            make_executable: Set executable permission (0o755 vs 0o644).
+
+        Raises:
+            SessionClosedError: Session has been closed.
+            ValueError: Content exceeds 10MB limit.
+            FileNotFoundError: Path source does not exist.
+            VmPermanentError: Guest agent validation or write failure.
+        """
+        # Resolve content to bytes BEFORE acquiring the lock —
+        # local disk I/O should not block other session operations.
+        raw = await self._resolve_content(content)
+        async with self._guard():
+            await self._vm.write_file(path, raw, make_executable=make_executable)
+
+    async def read_file(self, path: str) -> bytes:
+        """Read a file from the sandbox.
+
+        Args:
+            path: Relative path in sandbox (e.g., "output.csv").
+
+        Returns:
+            Raw file content as bytes.
+
+        Raises:
+            SessionClosedError: Session has been closed.
+            VmPermanentError: File not found or validation failure.
+        """
+        async with self._guard():
+            return await self._vm.read_file(path)
+
+    async def list_files(self, path: str = "") -> list[FileInfo]:
+        """List files in a directory in the sandbox.
+
+        Args:
+            path: Relative path (empty string for sandbox root).
+
+        Returns:
+            List of FileInfo entries with name, is_dir, and size.
+
+        Raises:
+            SessionClosedError: Session has been closed.
+            VmPermanentError: Directory not found or validation failure.
+        """
+        async with self._guard():
+            return await self._vm.list_files(path)
+
     async def close(self) -> None:
         """Close the session and destroy the VM.
 
         Idempotent: safe to call multiple times.
+
+        Concurrency contract: close() does NOT acquire _exec_lock.
+        Setting _closed=True is an atomic flag that _guard() checks at
+        two points (before and after lock acquisition). An in-flight
+        operation that already passed _guard() will complete its VM call
+        before the lock is released. The next operation will see _closed=True.
         """
         if self._closed:
             return
@@ -230,8 +343,9 @@ class Session:
 
     def _cancel_idle_timer(self) -> None:
         """Cancel the idle timeout timer."""
-        if self._idle_timer_task is not None and not self._idle_timer_task.done():
-            self._idle_timer_task.cancel()
+        if self._idle_timer_task is not None:
+            if not self._idle_timer_task.done():
+                self._idle_timer_task.cancel()
             self._idle_timer_task = None
 
     async def _idle_timeout_handler(self) -> None:

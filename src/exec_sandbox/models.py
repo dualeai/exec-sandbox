@@ -8,6 +8,17 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class FileInfo(BaseModel):
+    """File entry from directory listing in the sandbox.
+
+    Returned by Session.list_files() and QemuVM.list_files().
+    """
+
+    name: str = Field(description="File or directory name")
+    is_dir: bool = Field(description="True if entry is a directory")
+    size: int = Field(description="File size in bytes (0 for directories)")
+
+
 class PortMapping(BaseModel):
     """Port mapping configuration: internal (guest) → external (host).
 

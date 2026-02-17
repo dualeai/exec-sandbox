@@ -14,9 +14,17 @@ from typing import TYPE_CHECKING, TextIO
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox.exceptions import VmBootTimeoutError, VmPermanentError, VmTransientError
-from exec_sandbox.guest_agent_protocol import ExecuteCodeRequest
+from exec_sandbox.guest_agent_protocol import (
+    ExecuteCodeRequest,
+    FileContentMessage,
+    FileListMessage,
+    FileWriteAckMessage,
+    ListFilesRequest,
+    ReadFileRequest,
+    StreamingErrorMessage,
+)
 from exec_sandbox.guest_channel import GuestChannel
-from exec_sandbox.models import ExecutionResult, ExposedPort, Language, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, TimingBreakdown
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
 from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
@@ -32,7 +40,7 @@ class QemuVM:
     """Handle to running QEMU microVM.
 
     Lifecycle managed by VmManager.
-    Communicates via TCP.
+    Communicates via GuestChannel (TCP, Unix socket, or dual-port).
 
     Security:
     - Layer 1: Hardware isolation (KVM) or TCG software emulation
@@ -292,12 +300,12 @@ class QemuVM:
         Timeout Architecture (3-layer system):
         1. Init timeout (5s): Connection establishment to guest agent
         2. Soft timeout (timeout_seconds): Guest agent enforcement (sent in request)
-        3. Hard timeout (timeout_seconds + 2s): Host watchdog protection
+        3. Hard timeout (timeout_seconds + EXECUTION_TIMEOUT_MARGIN_SECONDS): Host watchdog
 
         Example: timeout_seconds=30
         - connect(5s) - Fixed init window for socket establishment
-        - send_request(timeout=32s) - 30s soft + 2s margin
-        - Guest enforces 30s, host kills at 32s if guest hangs
+        - send_request(timeout=38s) - 30s soft + 8s margin
+        - Guest enforces 30s, host kills at 38s if guest hangs
 
         Args:
             code: Code to execute in guest VM
@@ -517,6 +525,170 @@ class QemuVM:
                     "error_type": type(e).__name__,
                 },
             ) from e
+
+    # -------------------------------------------------------------------------
+    # File I/O
+    # -------------------------------------------------------------------------
+
+    async def write_file(self, path: str, content: bytes, *, make_executable: bool = False) -> None:
+        """Write a file to the sandbox via guest agent.
+
+        Memory optimization: builds JSON frame manually, staying in bytes throughout.
+        Avoids the Pydantic path which adds str intermediates:
+        .decode("ascii") (bytes→str) + model_dump_json (str→str) + .encode (str→bytes).
+
+        Args:
+            path: Relative path in sandbox (max 255 chars)
+            content: Raw file content (max 10MB)
+            make_executable: Set executable permission (0o755 vs 0o644)
+
+        Raises:
+            VmPermanentError: On validation or write failure
+            VmTransientError: On timeout or communication failure
+        """
+        import base64  # noqa: PLC0415
+
+        # Validate path (mirrors WriteFileRequest Pydantic validators bypassed by manual frame)
+        if not path:
+            raise VmPermanentError(
+                "write_file path must not be empty",
+                context={"vm_id": self.vm_id, "path": path},
+            )
+        if len(path) > constants.MAX_FILE_PATH_LENGTH:
+            raise VmPermanentError(
+                f"write_file path is {len(path)} chars, exceeds {constants.MAX_FILE_PATH_LENGTH}",
+                context={"vm_id": self.vm_id, "path_length": len(path)},
+            )
+
+        # Build JSON frame manually, keeping everything as bytes.
+        # b64encode returns bytes (ASCII-safe), so we can embed directly.
+        # join() pre-calculates total length and allocates once.
+        content_b64 = base64.b64encode(content)
+        frame = b"".join(
+            [
+                b'{"action":"write_file","path":',
+                json.dumps(path).encode(),
+                b',"content_base64":"',
+                content_b64,
+                b'","make_executable":',
+                b"true" if make_executable else b"false",
+                b"}\n",
+            ]
+        )
+
+        try:
+            await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            response = await self.channel.send_raw_request(frame, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+        except TimeoutError as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} write_file timed out for '{path}'",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+        except (OSError, json.JSONDecodeError) as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} write_file communication failed: {e}",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+
+        if isinstance(response, StreamingErrorMessage):
+            raise VmPermanentError(
+                f"write_file failed for '{path}': [{response.error_type}] {response.message}",
+                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
+            )
+
+        if not isinstance(response, FileWriteAckMessage):
+            raise VmPermanentError(
+                f"write_file unexpected response type: {type(response).__name__}",
+                context={"vm_id": self.vm_id, "path": path},
+            )
+
+    async def read_file(self, path: str) -> bytes:
+        """Read a file from the sandbox via guest agent.
+
+        Args:
+            path: Relative path in sandbox (max 255 chars)
+
+        Returns:
+            Raw file content as bytes
+
+        Raises:
+            VmPermanentError: On not-found or validation failure
+            VmTransientError: On timeout or communication failure
+        """
+        import base64  # noqa: PLC0415
+
+        request = ReadFileRequest(path=path)
+
+        try:
+            await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            response = await self.channel.send_request(request, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+        except TimeoutError as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} read_file timed out for '{path}'",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+        except (OSError, json.JSONDecodeError) as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} read_file communication failed: {e}",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+
+        if isinstance(response, StreamingErrorMessage):
+            raise VmPermanentError(
+                f"read_file failed for '{path}': [{response.error_type}] {response.message}",
+                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
+            )
+
+        if not isinstance(response, FileContentMessage):
+            raise VmPermanentError(
+                f"read_file unexpected response type: {type(response).__name__}",
+                context={"vm_id": self.vm_id, "path": path},
+            )
+
+        return base64.b64decode(response.content_base64)
+
+    async def list_files(self, path: str = "") -> list[FileInfo]:
+        """List files in a sandbox directory via guest agent.
+
+        Args:
+            path: Relative path (empty for sandbox root)
+
+        Returns:
+            List of FileInfo entries
+
+        Raises:
+            VmPermanentError: On validation failure
+            VmTransientError: On timeout or communication failure
+        """
+        request = ListFilesRequest(path=path)
+
+        try:
+            await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            response = await self.channel.send_request(request, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+        except TimeoutError as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} list_files timed out for '{path}'",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+        except (OSError, json.JSONDecodeError) as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} list_files communication failed: {e}",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+
+        if isinstance(response, StreamingErrorMessage):
+            raise VmPermanentError(
+                f"list_files failed for '{path}': [{response.error_type}] {response.message}",
+                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
+            )
+
+        if not isinstance(response, FileListMessage):
+            raise VmPermanentError(
+                f"list_files unexpected response type: {type(response).__name__}",
+                context={"vm_id": self.vm_id, "path": path},
+            )
+
+        return [FileInfo(name=e.name, is_dir=e.is_dir, size=e.size) for e in response.entries]
 
     async def _read_cgroup_stats(self) -> tuple[int | None, int | None]:
         """Read external CPU time and peak memory from cgroup v2.

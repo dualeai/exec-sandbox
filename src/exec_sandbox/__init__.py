@@ -90,7 +90,7 @@ from exec_sandbox.exceptions import (
     VmTimeoutError,
     VmTransientError,
 )
-from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, PortMapping, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.session import Session
 
@@ -104,6 +104,7 @@ __all__ = [
     "EnvVarValidationError",
     "ExecutionResult",
     "ExposedPort",
+    "FileInfo",
     "GuestAgentError",
     "Language",
     "PackageNotAllowedError",

@@ -121,6 +121,52 @@ class InstallPackagesRequest(GuestAgentRequest):
 
 
 # ============================================================================
+# File I/O Request Models
+# ============================================================================
+
+
+class WriteFileRequest(GuestAgentRequest):
+    """Write a file to the sandbox.
+
+    Guest agent enforces:
+    - Path length: max 255 chars
+    - Path traversal: no escape from /home/user
+    - File size: max 10MB (base64-encoded in content_base64)
+    - Permissions: 0o644 default, 0o755 with make_executable=True
+
+    Response: FileWriteAckMessage.
+    """
+
+    action: Literal["write_file"] = Field(default="write_file")  # type: ignore[assignment]
+    path: str = Field(min_length=1, max_length=255, description="Relative path in sandbox (max 255 chars)")
+    content_base64: str = Field(
+        max_length=14_000_000,
+        description="Base64-encoded file content (max ~10MB decoded)",
+    )
+    make_executable: bool = Field(default=False, description="Set executable permission (0o755 vs 0o644)")
+
+
+class ReadFileRequest(GuestAgentRequest):
+    """Read a file from the sandbox.
+
+    Response: FileContentMessage.
+    """
+
+    action: Literal["read_file"] = Field(default="read_file")  # type: ignore[assignment]
+    path: str = Field(min_length=1, max_length=255, description="Relative path in sandbox (max 255 chars)")
+
+
+class ListFilesRequest(GuestAgentRequest):
+    """List files in a sandbox directory.
+
+    Response: FileListMessage.
+    """
+
+    action: Literal["list_files"] = Field(default="list_files")  # type: ignore[assignment]
+    path: str = Field(max_length=255, default="", description="Relative path (empty for sandbox root)")
+
+
+# ============================================================================
 # Streaming Response Models
 # ============================================================================
 
@@ -180,8 +226,52 @@ class PongMessage(BaseModel):
     version: str = Field(description="Guest agent version")
 
 
+# ============================================================================
+# File I/O Response Models
+# ============================================================================
+
+
+class FileWriteAckMessage(BaseModel):
+    """Acknowledgment after writing a file to the sandbox."""
+
+    type: Literal["file_write_ack"] = "file_write_ack"
+    path: str = Field(description="Path of written file (relative to sandbox root)")
+    bytes_written: int = Field(description="Number of bytes written")
+
+
+class FileContentMessage(BaseModel):
+    """File content response from reading a sandbox file."""
+
+    type: Literal["file_content"] = "file_content"
+    path: str = Field(description="Path of read file (relative to sandbox root)")
+    content_base64: str = Field(description="Base64-encoded file content")
+    size: int = Field(description="Original file size in bytes (before encoding)")
+
+
+class FileEntryInfo(BaseModel):
+    """File entry in a directory listing (wire format)."""
+
+    name: str = Field(description="File or directory name")
+    is_dir: bool = Field(description="True if entry is a directory")
+    size: int = Field(description="File size in bytes (0 for directories)")
+
+
+class FileListMessage(BaseModel):
+    """Directory listing response from the sandbox."""
+
+    type: Literal["file_list"] = "file_list"
+    path: str = Field(description="Directory path listed (relative to sandbox root)")
+    entries: list[FileEntryInfo] = Field(description="Directory entries")
+
+
 # Discriminated union for streaming messages
 StreamingMessage = Annotated[
-    OutputChunkMessage | ExecutionCompleteMessage | PongMessage | StreamingErrorMessage,
+    OutputChunkMessage
+    | ExecutionCompleteMessage
+    | PongMessage
+    | StreamingErrorMessage
+    | FileWriteAckMessage
+    | FileContentMessage
+    | FileListMessage,
     Field(discriminator="type"),
 ]

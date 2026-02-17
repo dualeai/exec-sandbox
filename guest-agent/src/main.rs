@@ -17,6 +17,7 @@
 //! - /dev/virtio-ports/org.dualeai.cmd (host → guest, read-only)
 //! - /dev/virtio-ports/org.dualeai.event (guest → host, write-only)
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,7 @@ const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install outp
 const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 
 // Connection limits
-const MAX_REQUEST_SIZE_BYTES: usize = 2_000_000; // 2MB max request JSON
+const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max request JSON (10MB file → 13.3MB base64)
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
 const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
@@ -70,6 +71,11 @@ const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300; // 5 min timeout for package i
 // - Backpressure via bounded channel when buffer full
 const FLUSH_INTERVAL_MS: u64 = 50; // 50ms flush interval (not 1s - too slow for real-time)
 const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB max buffer before forced flush
+
+// File I/O limits
+const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB max file size (must match Python MAX_FILE_SIZE_BYTES)
+const MAX_FILE_PATH_LENGTH: usize = 255; // POSIX NAME_MAX
+const SANDBOX_ROOT: &str = "/home/user"; // Sandbox root directory
 
 // Graceful termination configuration
 // - First send SIGTERM to allow process to cleanup (Python atexit, temp files, etc.)
@@ -323,6 +329,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .current_dir(SANDBOX_ROOT)
         .process_group(0);
 
     let mut child = cmd.spawn()?;
@@ -413,6 +420,23 @@ enum GuestCommand {
         #[serde(default)]
         env_vars: HashMap<String, String>,
     },
+
+    #[serde(rename = "write_file")]
+    WriteFile {
+        path: String,
+        content_base64: String,
+        #[serde(default)]
+        make_executable: bool,
+    },
+
+    #[serde(rename = "read_file")]
+    ReadFile { path: String },
+
+    #[serde(rename = "list_files")]
+    ListFiles {
+        #[serde(default)]
+        path: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +473,38 @@ struct StreamingError {
     error_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileWriteAck {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_write_ack"
+    path: String,
+    bytes_written: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FileContent {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_content"
+    path: String,
+    content_base64: String,
+    size: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FileEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FileList {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_list"
+    path: String,
+    entries: Vec<FileEntry>,
 }
 
 // Helper to send streaming error via queue
@@ -799,6 +855,302 @@ async fn install_packages(
         .send(response)
         .await
         .map_err(|_| "Write queue closed")?;
+
+    Ok(())
+}
+
+// =============================================================================
+// File I/O Handlers
+// =============================================================================
+
+/// Validate a relative file path and resolve it under SANDBOX_ROOT.
+///
+/// Security checks:
+/// - Non-empty (except for list_files root)
+/// - Length <= MAX_FILE_PATH_LENGTH
+/// - No null bytes or control characters
+/// - No absolute paths
+/// - Path traversal prevention (.. normalization checked against sandbox root)
+///
+/// For empty path (list_files root), returns SANDBOX_ROOT directly.
+fn validate_file_path(relative_path: &str) -> Result<std::path::PathBuf, String> {
+    // Empty path = sandbox root (valid for list_files)
+    if relative_path.is_empty() {
+        return Ok(std::path::PathBuf::from(SANDBOX_ROOT));
+    }
+
+    // Length check
+    if relative_path.len() > MAX_FILE_PATH_LENGTH {
+        return Err(format!(
+            "Path too long: {} chars (max {})",
+            relative_path.len(),
+            MAX_FILE_PATH_LENGTH
+        ));
+    }
+
+    // Null byte check
+    if relative_path.contains('\0') {
+        return Err("Path contains null byte".to_string());
+    }
+
+    // Control character check
+    if relative_path.chars().any(|c| c.is_control()) {
+        return Err("Path contains control character".to_string());
+    }
+
+    // Absolute path check
+    if relative_path.starts_with('/') {
+        return Err("Absolute paths are not allowed".to_string());
+    }
+
+    // Build resolved path by normalizing components (handle ..)
+    let sandbox_root = std::path::PathBuf::from(SANDBOX_ROOT);
+    let mut resolved = sandbox_root.clone();
+
+    for component in std::path::Path::new(relative_path).components() {
+        match component {
+            std::path::Component::Normal(c) => resolved.push(c),
+            std::path::Component::ParentDir => {
+                // Go up one level, but never above sandbox root
+                if !resolved.pop() || !resolved.starts_with(&sandbox_root) {
+                    return Err("Path traversal outside sandbox".to_string());
+                }
+            }
+            std::path::Component::CurDir => {} // Skip "."
+            _ => return Err("Invalid path component".to_string()),
+        }
+    }
+
+    // Final check: resolved path must be under sandbox root
+    if !resolved.starts_with(&sandbox_root) {
+        return Err("Path traversal outside sandbox".to_string());
+    }
+
+    Ok(resolved)
+}
+
+/// Handle write_file command: decode base64, write to disk.
+async fn handle_write_file(
+    path: &str,
+    content_base64: &str,
+    make_executable: bool,
+    write_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate path
+    let resolved_path = match validate_file_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("Invalid path '{}': {}", path, e), "validation_error").await?;
+            return Ok(());
+        }
+    };
+
+    // Reject sandbox root itself (can't write to a directory path)
+    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+        send_streaming_error(write_tx, "Cannot write to sandbox root directory".to_string(), "validation_error").await?;
+        return Ok(());
+    }
+
+    // Decode base64
+    let content = match BASE64.decode(content_base64) {
+        Ok(c) => c,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("Invalid base64: {}", e), "validation_error").await?;
+            return Ok(());
+        }
+    };
+
+    // Check file size
+    if content.len() > MAX_FILE_SIZE_BYTES {
+        send_streaming_error(
+            write_tx,
+            format!("File too large: {} bytes (max {})", content.len(), MAX_FILE_SIZE_BYTES),
+            "validation_error",
+        ).await?;
+        return Ok(());
+    }
+
+    // Create parent directories
+    if let Some(parent) = resolved_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        send_streaming_error(write_tx, format!("Failed to create directories: {}", e), "io_error").await?;
+        return Ok(());
+    }
+
+    // Write file
+    let bytes_written = content.len();
+    if let Err(e) = std::fs::write(&resolved_path, &content) {
+        send_streaming_error(write_tx, format!("Failed to write file: {}", e), "io_error").await?;
+        return Ok(());
+    }
+
+    // Set permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if make_executable { 0o755 } else { 0o644 };
+        if let Err(e) = std::fs::set_permissions(&resolved_path, std::fs::Permissions::from_mode(mode)) {
+            send_streaming_error(write_tx, format!("Failed to set permissions: {}", e), "io_error").await?;
+            return Ok(());
+        }
+    }
+
+    // Send ack
+    let ack = FileWriteAck {
+        msg_type: "file_write_ack".to_string(),
+        path: path.to_string(),
+        bytes_written,
+    };
+    let json = serde_json::to_string(&ack)?;
+    let mut response = json.into_bytes();
+    response.push(b'\n');
+    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+
+    Ok(())
+}
+
+/// Handle read_file command: read from disk, encode base64.
+async fn handle_read_file(
+    path: &str,
+    write_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate path
+    let resolved_path = match validate_file_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("Invalid path '{}': {}", path, e), "validation_error").await?;
+            return Ok(());
+        }
+    };
+
+    // Reject sandbox root itself
+    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+        send_streaming_error(write_tx, "Cannot read a directory".to_string(), "validation_error").await?;
+        return Ok(());
+    }
+
+    // Canonicalize to follow symlinks and verify still under sandbox root
+    let canonical_path = match std::fs::canonicalize(&resolved_path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("File not found or inaccessible '{}': {}", path, e), "io_error").await?;
+            return Ok(());
+        }
+    };
+
+    let sandbox_canonical = std::fs::canonicalize(SANDBOX_ROOT).unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
+    if !canonical_path.starts_with(&sandbox_canonical) {
+        send_streaming_error(write_tx, format!("Path '{}' resolves outside sandbox", path), "validation_error").await?;
+        return Ok(());
+    }
+
+    // Check it's a regular file
+    let metadata = match std::fs::metadata(&canonical_path) {
+        Ok(m) => m,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("Cannot read '{}': {}", path, e), "io_error").await?;
+            return Ok(());
+        }
+    };
+
+    if metadata.is_dir() {
+        send_streaming_error(write_tx, format!("'{}' is a directory, not a file", path), "validation_error").await?;
+        return Ok(());
+    }
+
+    // Check size before reading
+    if metadata.len() as usize > MAX_FILE_SIZE_BYTES {
+        send_streaming_error(
+            write_tx,
+            format!("File too large: {} bytes (max {})", metadata.len(), MAX_FILE_SIZE_BYTES),
+            "validation_error",
+        ).await?;
+        return Ok(());
+    }
+
+    // Read file content, then encode base64 (drop raw bytes via scoping)
+    let size = metadata.len() as usize;
+    let content_base64 = {
+        let raw = match std::fs::read(&canonical_path) {
+            Ok(r) => r,
+            Err(e) => {
+                send_streaming_error(write_tx, format!("Failed to read '{}': {}", path, e), "io_error").await?;
+                return Ok(());
+            }
+        };
+        BASE64.encode(&raw)
+        // raw is dropped here, freeing memory before JSON serialization
+    };
+
+    // Send response
+    let response_msg = FileContent {
+        msg_type: "file_content".to_string(),
+        path: path.to_string(),
+        content_base64,
+        size,
+    };
+    let json = serde_json::to_string(&response_msg)?;
+    let mut response = json.into_bytes();
+    response.push(b'\n');
+    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
+
+    Ok(())
+}
+
+/// Handle list_files command: read directory entries.
+async fn handle_list_files(
+    path: &str,
+    write_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate path (empty = sandbox root)
+    let resolved_path = match validate_file_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("Invalid path '{}': {}", path, e), "validation_error").await?;
+            return Ok(());
+        }
+    };
+
+    // Read directory
+    let read_dir = match std::fs::read_dir(&resolved_path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            send_streaming_error(write_tx, format!("Cannot list '{}': {}", path, e), "io_error").await?;
+            return Ok(());
+        }
+    };
+
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        entries.push(FileEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: metadata.is_dir(),
+            size: if metadata.is_dir() { 0 } else { metadata.len() },
+        });
+    }
+
+    // Sort entries by name for consistent ordering
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Send response
+    let response_msg = FileList {
+        msg_type: "file_list".to_string(),
+        path: path.to_string(),
+        entries,
+    };
+    let json = serde_json::to_string(&response_msg)?;
+    let mut response = json.into_bytes();
+    response.push(b'\n');
+    write_tx.send(response).await.map_err(|_| "Write queue closed")?;
 
     Ok(())
 }
@@ -1572,6 +1924,36 @@ async fn handle_connection_nonblocking(
                     break Err("execute_code failed".into());
                 }
             }
+            Ok(GuestCommand::WriteFile {
+                path,
+                content_base64,
+                make_executable,
+            }) => {
+                eprintln!(
+                    "Processing: write_file (path={}, content_size={}, executable={})",
+                    path,
+                    content_base64.len(),
+                    make_executable
+                );
+                if handle_write_file(&path, &content_base64, make_executable, &write_tx)
+                    .await
+                    .is_err()
+                {
+                    break Err("write_file failed".into());
+                }
+            }
+            Ok(GuestCommand::ReadFile { path }) => {
+                eprintln!("Processing: read_file (path={})", path);
+                if handle_read_file(&path, &write_tx).await.is_err() {
+                    break Err("read_file failed".into());
+                }
+            }
+            Ok(GuestCommand::ListFiles { path }) => {
+                eprintln!("Processing: list_files (path={})", path);
+                if handle_list_files(&path, &write_tx).await.is_err() {
+                    break Err("list_files failed".into());
+                }
+            }
             Err(e) => {
                 eprintln!("JSON parse error: {}", e);
                 let _ = send_streaming_error(
@@ -1819,4 +2201,246 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CMD_PORT_PATH, EVENT_PORT_PATH
     );
     listen_virtio_serial().await
+}
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // validate_file_path tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_file_path_basic() {
+        let result = validate_file_path("hello.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/hello.txt"));
+    }
+
+    #[test]
+    fn test_validate_file_path_nested() {
+        let result = validate_file_path("subdir/data.csv");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/subdir/data.csv"));
+    }
+
+    #[test]
+    fn test_validate_file_path_deeply_nested() {
+        let result = validate_file_path("a/b/c/d/e.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_traversal_rejected() {
+        let result = validate_file_path("../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_file_path_mid_path_traversal() {
+        let result = validate_file_path("subdir/../../etc/shadow");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_file_path_absolute_rejected() {
+        let result = validate_file_path("/etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Absolute"));
+    }
+
+    #[test]
+    fn test_validate_file_path_empty_returns_sandbox_root() {
+        let result = validate_file_path("");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
+    }
+
+    #[test]
+    fn test_validate_file_path_null_byte_rejected() {
+        let result = validate_file_path("file\x00.txt");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("null byte"));
+    }
+
+    #[test]
+    fn test_validate_file_path_control_chars_rejected() {
+        let result = validate_file_path("file\x01name");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("control character"));
+    }
+
+    #[test]
+    fn test_validate_file_path_too_long() {
+        let long_path = "a".repeat(256);
+        let result = validate_file_path(&long_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too long"));
+    }
+
+    #[test]
+    fn test_validate_file_path_exactly_max_length() {
+        let path = "a".repeat(255);
+        let result = validate_file_path(&path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_dot_dot_normalization() {
+        // subdir/../file.txt should resolve to /home/user/file.txt (stays under root)
+        let result = validate_file_path("subdir/../file.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/file.txt"));
+    }
+
+    #[test]
+    fn test_validate_file_path_double_slash() {
+        let result = validate_file_path("dir//file.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_trailing_slash() {
+        let result = validate_file_path("subdir/");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_hidden_file() {
+        let result = validate_file_path(".hidden");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user/.hidden"));
+    }
+
+    #[test]
+    fn test_validate_file_path_unicode() {
+        let result = validate_file_path("日本語.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_dot_only() {
+        // "." should resolve to sandbox root
+        let result = validate_file_path(".");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
+    }
+
+    // -------------------------------------------------------------------------
+    // GuestCommand deserialization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_deserialize_write_file() {
+        let json = r#"{"action":"write_file","path":"test.txt","content_base64":"aGVsbG8=","make_executable":false}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WriteFile { path, content_base64, make_executable } => {
+                assert_eq!(path, "test.txt");
+                assert_eq!(content_base64, "aGVsbG8=");
+                assert!(!make_executable);
+            }
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_read_file() {
+        let json = r#"{"action":"read_file","path":"output.csv"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ReadFile { path } => {
+                assert_eq!(path, "output.csv");
+            }
+            _ => panic!("Expected ReadFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_files() {
+        let json = r#"{"action":"list_files","path":""}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ListFiles { path } => {
+                assert_eq!(path, "");
+            }
+            _ => panic!("Expected ListFiles"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_files_default_path() {
+        let json = r#"{"action":"list_files"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ListFiles { path } => {
+                assert_eq!(path, "");
+            }
+            _ => panic!("Expected ListFiles"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_write_file_executable() {
+        let json = r#"{"action":"write_file","path":"run.sh","content_base64":"IyEvYmluL3No","make_executable":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WriteFile { make_executable, .. } => {
+                assert!(make_executable);
+            }
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Response serialization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_serialize_file_write_ack() {
+        let ack = FileWriteAck {
+            msg_type: "file_write_ack".to_string(),
+            path: "test.txt".to_string(),
+            bytes_written: 42,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("\"type\":\"file_write_ack\""));
+        assert!(json.contains("\"bytes_written\":42"));
+    }
+
+    #[test]
+    fn test_serialize_file_content() {
+        let content = FileContent {
+            msg_type: "file_content".to_string(),
+            path: "data.csv".to_string(),
+            content_base64: "aGVsbG8=".to_string(),
+            size: 5,
+        };
+        let json = serde_json::to_string(&content).unwrap();
+        assert!(json.contains("\"type\":\"file_content\""));
+        assert!(json.contains("\"content_base64\":\"aGVsbG8=\""));
+        assert!(json.contains("\"size\":5"));
+    }
+
+    #[test]
+    fn test_serialize_file_list() {
+        let list = FileList {
+            msg_type: "file_list".to_string(),
+            path: "".to_string(),
+            entries: vec![
+                FileEntry { name: "file.txt".to_string(), is_dir: false, size: 100 },
+                FileEntry { name: "subdir".to_string(), is_dir: true, size: 0 },
+            ],
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains("\"type\":\"file_list\""));
+        assert!(json.contains("\"file.txt\""));
+        assert!(json.contains("\"subdir\""));
+    }
 }

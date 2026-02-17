@@ -99,6 +99,25 @@ TCP_GUEST_PORT: Final[int] = 5000
 """TCP port for guest agent communication."""
 
 # ============================================================================
+# File I/O
+# ============================================================================
+
+MAX_FILE_SIZE_BYTES: Final[int] = 10 * 1024 * 1024  # 10MB
+"""Maximum file size for read/write operations (base64 overhead: ~13.3MB wire)."""
+
+MAX_FILE_PATH_LENGTH: Final[int] = 255
+"""Maximum file path length (POSIX NAME_MAX)."""
+
+FILE_IO_TIMEOUT_SECONDS: Final[int] = 30
+"""Timeout for file I/O operations in seconds."""
+
+ASYNC_READ_THRESHOLD_BYTES: Final[int] = 1_048_576  # 1MB
+"""Threshold above which file reads use asyncio.to_thread to avoid blocking the event loop."""
+
+GUEST_SANDBOX_DIR: Final[str] = "/home/user"
+"""Root directory for sandbox file operations in the guest VM."""
+
+# ============================================================================
 # Outbound Domain Filtering
 # ============================================================================
 # Note: dnsmasq approach was replaced by gvproxy OutboundAllow (DNS + TLS filtering)

@@ -187,7 +187,7 @@ class TestSessionNormal:
     async def test_context_manager(self, scheduler: Scheduler) -> None:
         """Context manager closes session on exit."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            vm_id = session.vm_id
+            assert session.vm_id  # VM is assigned
             assert not session.closed
         assert session.closed
 
@@ -534,3 +534,49 @@ class TestSessionConcurrency:
             assert "session" in session_result.stdout
             assert run_result.exit_code == 0
             assert "run" in run_result.stdout
+
+
+# =============================================================================
+# TestWorkingDirectory - REPL cwd is /home/user
+# =============================================================================
+class TestWorkingDirectory:
+    """Verify REPL working directory is /home/user for all languages."""
+
+    async def test_python_cwd(self, scheduler: Scheduler) -> None:
+        """Python REPL starts in /home/user."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            result = await session.exec("import os; print(os.getcwd())")
+            assert result.exit_code == 0
+            assert "/home/user" in result.stdout
+
+    async def test_javascript_cwd(self, scheduler: Scheduler) -> None:
+        """JavaScript REPL starts in /home/user."""
+        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+            result = await session.exec("console.log(process.cwd());")
+            assert result.exit_code == 0
+            assert "/home/user" in result.stdout
+
+    async def test_shell_cwd(self, scheduler: Scheduler) -> None:
+        """Shell REPL starts in /home/user."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec("pwd")
+            assert result.exit_code == 0
+            assert "/home/user" in result.stdout
+
+    async def test_run_python_cwd(self, scheduler: Scheduler) -> None:
+        """scheduler.run() also uses /home/user as cwd."""
+        result = await scheduler.run(
+            code="import os; print(os.getcwd())",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "/home/user" in result.stdout
+
+    async def test_run_shell_cwd(self, scheduler: Scheduler) -> None:
+        """scheduler.run() shell also uses /home/user as cwd."""
+        result = await scheduler.run(
+            code="pwd",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "/home/user" in result.stdout

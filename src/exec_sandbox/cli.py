@@ -462,8 +462,13 @@ async def run_code(
     json_output: bool,
     quiet: bool,
     no_validation: bool,
+    upload_files: tuple[tuple[str, str], ...] = (),
+    download_files: tuple[str, ...] = (),
 ) -> int:
     """Execute code in sandbox and return exit code.
+
+    When upload_files or download_files are provided, uses a session to keep the
+    VM alive for file I/O. Otherwise, uses scheduler.run() for full timing breakdown.
 
     Args:
         code: Code to execute
@@ -478,6 +483,8 @@ async def run_code(
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
+        upload_files: Files to upload before execution (guest_path, local_path)
+        download_files: Guest paths to download after execution
 
     Returns:
         Exit code to return from CLI
@@ -500,19 +507,55 @@ async def run_code(
 
     try:
         async with Scheduler(config) as scheduler:
-            result = await scheduler.run(
-                code=code,
-                language=language,
-                packages=list(packages) if packages else None,
-                timeout_seconds=timeout,
-                memory_mb=memory,
-                allow_network=network,
-                allowed_domains=list(allowed_domains) if allowed_domains else None,
-                expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
-                env_vars=env_vars if env_vars else None,
-                on_stdout=on_stdout,
-                on_stderr=on_stderr,
-            )
+            if upload_files or download_files:
+                # Session path: keeps VM alive for file I/O
+                async with await scheduler.session(
+                    language=language,
+                    packages=list(packages) if packages else None,
+                    memory_mb=memory,
+                    allow_network=network,
+                    allowed_domains=list(allowed_domains) if allowed_domains else None,
+                    expose_ports=expose_ports,  # type: ignore[arg-type]
+                ) as session:
+                    # Upload files
+                    for guest_path, local_path in upload_files:
+                        await session.write_file(guest_path, Path(local_path))
+
+                    # Execute code
+                    result = await session.exec(
+                        code,
+                        timeout_seconds=timeout,
+                        env_vars=env_vars if env_vars else None,
+                        on_stdout=on_stdout,
+                        on_stderr=on_stderr,
+                    )
+
+                    # Download files
+                    for guest_path in download_files:
+                        content = await session.read_file(guest_path)
+                        local = Path(guest_path)
+                        local.parent.mkdir(parents=True, exist_ok=True)
+                        local.write_bytes(content)
+                        if not quiet:
+                            click.echo(
+                                click.style(f"  Downloaded: {guest_path} ({len(content)} bytes)", dim=True),
+                                err=True,
+                            )
+            else:
+                # Direct path: scheduler.run() for full timing breakdown
+                result = await scheduler.run(
+                    code=code,
+                    language=language,
+                    packages=list(packages) if packages else None,
+                    timeout_seconds=timeout,
+                    memory_mb=memory,
+                    allow_network=network,
+                    allowed_domains=list(allowed_domains) if allowed_domains else None,
+                    expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
+                    env_vars=env_vars if env_vars else None,
+                    on_stdout=on_stdout,
+                    on_stderr=on_stderr,
+                )
 
         # JSON output mode
         if json_output:
@@ -804,6 +847,20 @@ def cli(ctx: click.Context) -> None:
     show_default=True,
     help="Maximum concurrent VMs for multi-input",
 )
+@click.option(
+    "--upload",
+    "upload_files",
+    multiple=True,
+    nargs=2,
+    type=click.Tuple([str, click.Path(exists=True)]),
+    help="Upload file: GUEST_PATH LOCAL_PATH (repeatable)",
+)
+@click.option(
+    "--download",
+    "download_files",
+    multiple=True,
+    help="Download file from sandbox: GUEST_PATH (repeatable)",
+)
 def run_command(
     sources: tuple[str, ...],
     language: str | None,
@@ -819,6 +876,8 @@ def run_command(
     quiet: bool,
     no_validation: bool,
     concurrency: int,
+    upload_files: tuple[tuple[str, str], ...],
+    download_files: tuple[str, ...],
 ) -> NoReturn:
     """Execute code in an isolated VM sandbox.
 
@@ -849,6 +908,8 @@ def run_command(
       echo 'print(42)' | sbx run -                # From stdin
       sbx run --json 'print("test")' | jq .       # JSON output
       sbx run -c 'print(1)' -c 'print(2)'         # Multiple via -c flag
+      sbx run --upload input.csv ./local.csv -c "print(open('input.csv').read())"
+      sbx run --download output.csv -c "open('output.csv','w').write('data')"
     """
     # Merge inline codes with positional sources
     all_sources: list[str] = list(inline_codes) + list(sources)
@@ -876,7 +937,10 @@ def run_command(
     # Build list of SourceInput objects
     resolved_sources = [_resolve_source(src, language) for src in all_sources]
 
-    # Single source: use original streaming behavior
+    # File I/O requires exactly one source
+    if (upload_files or download_files) and len(resolved_sources) != 1:
+        raise click.UsageError("--upload/--download requires exactly one source.")
+
     if len(resolved_sources) == 1:
         src_input = resolved_sources[0]
         exit_code = _run_with_interrupt_handling(
@@ -893,6 +957,8 @@ def run_command(
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
+                upload_files=upload_files,
+                download_files=download_files,
             )
         )
     else:

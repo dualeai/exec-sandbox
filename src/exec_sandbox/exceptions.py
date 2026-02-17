@@ -285,8 +285,8 @@ class SessionClosedError(PermanentError):
     """Raised when attempting to use a session after it has been closed.
 
     Sessions are closed explicitly via close(), by idle timeout, or
-    when the underlying VM fails. Once closed, all subsequent exec()
-    calls will raise this exception.
+    when the underlying VM fails. Once closed, all subsequent operations
+    (exec, write_file, read_file, list_files) will raise this exception.
     """
 
 

@@ -12,7 +12,7 @@ Secure code execution in isolated lightweight VMs (QEMU microVMs). Python librar
 
 - **Hardware isolation** - Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
 - **Fast startup** - 400ms fresh start, 1-2ms with pre-started VMs (warm pool)
-- **Simple API** - `run()` for one-shot execution, `session()` for stateful multi-step workflows; plus `sbx` CLI for quick testing
+- **Simple API** - `run()` for one-shot execution, `session()` for stateful multi-step workflows with file I/O; plus `sbx` CLI for quick testing
 - **Streaming output** - Real-time output as code runs
 - **Smart caching** - Local + S3 remote cache for VM snapshots
 - **Network control** - Disabled by default, optional domain allowlisting with defense-in-depth filtering (DNS + TLS SNI + DNS cross-validation to prevent spoofing)
@@ -101,6 +101,8 @@ sbx run -j 5 *.py
 | `--json` | | JSON output | false |
 | `--quiet` | `-q` | Suppress progress output | false |
 | `--no-validation` | | Skip package allowlist validation | false |
+| `--upload` | | Upload file `GUEST_PATH LOCAL_PATH` (repeatable) | - |
+| `--download` | | Download file from sandbox `GUEST_PATH` (repeatable) | - |
 | `--concurrency` | `-j` | Max concurrent VMs for multi-input | 10 |
 
 ### Python API
@@ -150,6 +152,43 @@ async with await scheduler.session(language="raw") as session:
 ```
 
 Sessions auto-close after idle timeout (default: 300s, configurable via `session_idle_timeout_seconds`).
+
+#### File I/O
+
+Sessions support reading, writing, and listing files inside the sandbox.
+
+```python
+from pathlib import Path
+from exec_sandbox import Scheduler
+
+async with Scheduler() as scheduler:
+    async with await scheduler.session(language="python") as session:
+        # Write a file into the sandbox
+        await session.write_file("input.csv", b"name,score\nAlice,95\nBob,87")
+
+        # Write from a local file
+        await session.write_file("model.pkl", Path("./local_model.pkl"))
+
+        # Execute code that reads input and writes output
+        await session.exec("data = open('input.csv').read().upper()")
+        await session.exec("open('output.csv', 'w').write(data)")
+
+        # Read a file back from the sandbox
+        content = await session.read_file("output.csv")
+
+        # List files in a directory
+        files = await session.list_files("")  # sandbox root
+        for f in files:
+            print(f"{f.name} {'dir' if f.is_dir else f'{f.size}B'}")
+```
+
+CLI file I/O uses sessions under the hood:
+
+```bash
+# Upload a local file, run code, download the result
+sbx run --upload input.csv ./local.csv --download output.csv \
+  -c "open('output.csv','w').write(open('input.csv').read().upper())"
+```
 
 #### With Packages
 
@@ -357,6 +396,16 @@ VMs include automatic memory optimization (no configuration required):
 | `warm_pool_hit` | bool | Whether a pre-started VM was used |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
+## FileInfo
+
+Returned by `Session.list_files()`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | str | File or directory name |
+| `is_dir` | bool | True if entry is a directory |
+| `size` | int | File size in bytes (0 for directories) |
+
 ## Exceptions
 
 | Exception | Description |
@@ -425,6 +474,8 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 | Max packages | 50 |
 | Max env vars | 100 |
 | Max exposed ports | 10 |
+| Max file size (I/O) | 10MB |
+| Max file path length | 255 chars |
 | Execution timeout | 1-300s |
 | VM memory | 128-2048MB |
 | Max concurrent VMs | 1-100 |

@@ -28,8 +28,8 @@ logger = get_logger(__name__)
 
 # Buffer limit for asyncio readuntil() - must exceed max JSON message size
 # Default asyncio limit is 64KB, but our protocol can send large output chunks
-# Using 16MB to handle large outputs with JSON overhead
-STREAM_BUFFER_LIMIT = 16 * 1024 * 1024  # 16MB
+# Using 20MB to handle large outputs with JSON overhead (10MB file → 13.3MB base64 + JSON)
+STREAM_BUFFER_LIMIT = 20 * 1024 * 1024  # 20MB
 
 # Cached TypeAdapter for StreamingMessage discriminated union
 # Performance: Avoids rebuilding validators on every message (1000s of allocations per execution)
@@ -41,7 +41,7 @@ _STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(Streamin
 class GuestChannel(Protocol):
     """Protocol for guest-host communication.
 
-    Supports TCP transport via port forwarding.
+    Supports TCP, Unix socket, and dual-port transports.
     Uses structural typing (Protocol) instead of inheritance.
     """
 
@@ -57,11 +57,30 @@ class GuestChannel(Protocol):
         """Send JSON request, receive JSON response.
 
         Args:
-            request: Pydantic request model (PingRequest, InstallPackagesRequest)
+            request: Pydantic request model (e.g., PingRequest, ReadFileRequest, ListFilesRequest)
             timeout: Response timeout in seconds (required, no default)
 
         Returns:
-            StreamingMessage (PongMessage for ping, ExecutionCompleteMessage for install_packages)
+            StreamingMessage (e.g., PongMessage, FileContentMessage, FileListMessage)
+        """
+        ...
+
+    async def send_raw_request(
+        self,
+        data: bytes,
+        timeout: int,
+    ) -> StreamingMessage:
+        """Send pre-serialized JSON bytes and receive single response.
+
+        Bypasses Pydantic serialization for performance-critical paths
+        (e.g., large file writes where we build the JSON frame manually).
+
+        Args:
+            data: Pre-serialized JSON bytes (must end with newline)
+            timeout: Response timeout in seconds
+
+        Returns:
+            StreamingMessage parsed from response
         """
         ...
 
@@ -127,7 +146,7 @@ class TcpChannel:
             return
 
         # Connect to host port (QEMU forwards to guest:5000)
-        # Use larger buffer limit to handle 100KB JSON messages from guest agent
+        # Buffer sized for base64-encoded file transfers (see STREAM_BUFFER_LIMIT)
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(self.host, self.port, limit=STREAM_BUFFER_LIMIT),
             timeout=float(timeout_seconds),
@@ -168,6 +187,35 @@ class TcpChannel:
             raise
         except (asyncio.IncompleteReadError, OSError, BrokenPipeError, ConnectionError):
             # Connection actually broken - reset state so caller reconnects on next attempt
+            self._reader = None
+            self._writer = None
+            raise
+
+    async def send_raw_request(
+        self,
+        data: bytes,
+        timeout: int,
+    ) -> StreamingMessage:
+        """Send pre-serialized JSON bytes and receive single response.
+
+        Bypasses Pydantic serialization for performance-critical paths
+        (e.g., large file writes where we build the JSON frame manually).
+        """
+        if not self._reader or not self._writer:
+            raise RuntimeError("Channel not connected")
+        if not data.endswith(b"\n"):
+            raise ValueError("send_raw_request data must end with newline")
+
+        try:
+            self._writer.write(data)
+            await self._writer.drain()
+
+            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
+            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
+
+        except TimeoutError:
+            raise
+        except (asyncio.IncompleteReadError, OSError, BrokenPipeError, ConnectionError):
             self._reader = None
             self._writer = None
             raise
@@ -272,7 +320,7 @@ class UnixSocketChannel:
             return
 
         # Connect to Unix socket with mandatory peer credential verification
-        # Use larger buffer limit to handle 100KB JSON messages from guest agent
+        # Buffer sized for base64-encoded file transfers (see STREAM_BUFFER_LIMIT)
         self._reader, self._writer = await connect_and_verify(
             path=self.socket_path,
             expected_uid=self.expected_uid,
@@ -305,7 +353,7 @@ class UnixSocketChannel:
             except TimeoutError:
                 continue  # Check shutdown flag
             except Exception as e:
-                # Log error with full traceback (2024 best practice)
+                # Log error with full traceback
                 logger.error(
                     "UnixSocketChannel write worker error - connection broken",
                     extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
@@ -366,6 +414,51 @@ class UnixSocketChannel:
             ConnectionError,
         ):
             # Connection actually broken - reset state so caller reconnects on next attempt
+            self._reader = None
+            self._writer = None
+            raise
+
+    async def send_raw_request(
+        self,
+        data: bytes,
+        timeout: int,
+    ) -> StreamingMessage:
+        """Send pre-serialized JSON bytes and receive single response.
+
+        Bypasses Pydantic serialization for performance-critical paths.
+        Queues write to prevent blocking when virtio-serial buffer full.
+        """
+        if not self._reader or not self._writer:
+            raise RuntimeError("Channel not connected")
+        if not data.endswith(b"\n"):
+            raise ValueError("send_raw_request data must end with newline")
+
+        # Validate write worker is alive (fail-fast if crashed)
+        if self._write_task and self._write_task.done():
+            try:
+                self._write_task.result()
+            except Exception as e:
+                raise RuntimeError(f"Write worker crashed: {type(e).__name__}: {e}") from e
+            raise RuntimeError("Write worker exited unexpectedly")
+
+        try:
+            # Queue write instead of blocking (fail-fast if queue full)
+            try:
+                await asyncio.wait_for(self._write_queue.put(data), timeout=5.0)
+            except TimeoutError as e:
+                raise RuntimeError("Write queue full - guest agent not draining") from e
+
+            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
+            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
+
+        except TimeoutError:
+            raise
+        except (
+            asyncio.IncompleteReadError,
+            OSError,
+            BrokenPipeError,
+            ConnectionError,
+        ):
             self._reader = None
             self._writer = None
             raise
@@ -631,6 +724,27 @@ class DualPortChannel:
         # Should never reach here (stream_events always yields at least one message)
         raise RuntimeError("No response from event port")
 
+    async def send_raw_request(
+        self,
+        data: bytes,
+        timeout: int,
+    ) -> StreamingMessage:
+        """Send pre-serialized JSON bytes and receive single response.
+
+        Enqueues raw data on command port and reads first event from event port.
+        """
+        if not data.endswith(b"\n"):
+            raise ValueError("send_raw_request data must end with newline")
+
+        # Enqueue raw bytes on command channel
+        await self._cmd_channel.enqueue_write(data, timeout=5.0)
+
+        # Read first event
+        async for message in self.stream_events(timeout=timeout):
+            return message
+
+        raise RuntimeError("No response from event port")
+
     def stream_messages(
         self,
         request: GuestAgentRequest,
@@ -746,7 +860,5 @@ async def reconnecting_channel(
         # Yield connected channel to caller
         yield channel
     finally:
-        # Cleanup on exit (success or exception)
-        # Note: Not closing here to allow persistent connections for streaming
-        # Caller decides when to close based on use case
+        # Not closing channel here — caller owns the lifecycle
         pass
