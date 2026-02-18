@@ -600,16 +600,15 @@ async def run_code(
                         on_stderr=on_stderr,
                     )
 
-                    # Download files
+                    # Download files (stream directly to disk — zero memory overhead)
                     for guest_path, local_path in download_files:
-                        content = await session.read_file(guest_path)
                         local = Path(local_path)
-                        local.parent.mkdir(parents=True, exist_ok=True)
-                        await asyncio.to_thread(local.write_bytes, content)
+                        await session.read_file(guest_path, destination=local)
                         if not quiet:
+                            file_size = local.stat().st_size
                             click.echo(
                                 click.style(
-                                    f"  Downloaded: {guest_path} -> {local_path} ({len(content)} bytes)", dim=True
+                                    f"  Downloaded: {guest_path} -> {local_path} ({file_size} bytes)", dim=True
                                 ),
                                 err=True,
                             )

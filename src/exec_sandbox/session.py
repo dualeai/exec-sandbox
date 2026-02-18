@@ -23,13 +23,14 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import (  # noqa: TC003 - Used at runtime for _guard() and on_stdout/on_stderr
     AsyncIterator,
     Callable,
 )
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import IO, TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.constants import MAX_FILE_SIZE_BYTES
@@ -117,13 +118,18 @@ class Session:
             self._reset_idle_timer()
             yield
 
-    async def _resolve_content(self, content: bytes | Path) -> bytes:
-        """Convert bytes | Path to raw bytes with size validation.
+    async def _resolve_content(self, content: bytes | Path) -> IO[bytes]:
+        """Convert bytes | Path to a readable binary stream with size validation.
 
         Called BEFORE _guard() so local disk I/O doesn't hold the exec lock.
 
-        TOCTOU note: file may grow between stat() and read_bytes().
-        A post-read size check catches this race.
+        Returns:
+            IO[bytes]: BytesIO for bytes input, open file handle for Path input.
+            Caller is responsible for closing the stream.
+
+        TOCTOU note: for Path, we stat() before open(). The file could grow
+        between stat() and actual reads. The guest agent also enforces the
+        max file size, providing defense in depth.
         """
         if isinstance(content, Path):
             if not content.exists():
@@ -131,16 +137,11 @@ class Session:
             file_size = content.stat().st_size
             if file_size > MAX_FILE_SIZE_BYTES:
                 raise ValueError(f"File {content.name} is {file_size} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
-            raw = await asyncio.to_thread(content.read_bytes)
-            # TOCTOU guard: file may have grown between stat() and read_bytes()
-            if len(raw) > MAX_FILE_SIZE_BYTES:
-                raise ValueError(
-                    f"File {content.name} grew to {len(raw)} bytes after stat(), exceeds {MAX_FILE_SIZE_BYTES}"
-                )
-            return raw
+            # Return open file handle — streams from disk, never loads full content.
+            return content.open("rb")
         if len(content) > MAX_FILE_SIZE_BYTES:
             raise ValueError(f"Content is {len(content)} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
-        return content
+        return io.BytesIO(content)
 
     # -------------------------------------------------------------------------
     # Core API
@@ -232,35 +233,40 @@ class Session:
         Args:
             path: Relative path in sandbox (e.g., "input.csv", "data/model.pkl").
             content: File content as bytes or a local Path to read from.
+                For Path, content is streamed from disk — never fully loaded.
             make_executable: Set executable permission (0o755 vs 0o644).
 
         Raises:
             SessionClosedError: Session has been closed.
-            ValueError: Content exceeds 10MB limit.
+            ValueError: Content exceeds max file size limit.
             FileNotFoundError: Path source does not exist.
             VmPermanentError: Guest agent validation or write failure.
         """
-        # Resolve content to bytes BEFORE acquiring the lock —
+        # Resolve content to a stream BEFORE acquiring the lock —
         # local disk I/O should not block other session operations.
-        raw = await self._resolve_content(content)
-        async with self._guard():
-            await self._vm.write_file(path, raw, make_executable=make_executable)
+        stream = await self._resolve_content(content)
+        try:
+            async with self._guard():
+                await self._vm.write_file(path, stream, make_executable=make_executable)
+        finally:
+            stream.close()
 
-    async def read_file(self, path: str) -> bytes:
-        """Read a file from the sandbox.
+    async def read_file(self, path: str, *, destination: Path) -> None:
+        """Read a file from the sandbox, streaming directly to a local file.
+
+        Decompressed chunks are written directly to *destination* — peak
+        memory is ~128 KB regardless of file size.
 
         Args:
             path: Relative path in sandbox (e.g., "output.csv").
-
-        Returns:
-            Raw file content as bytes.
+            destination: Local file path to stream content into.
 
         Raises:
             SessionClosedError: Session has been closed.
             VmPermanentError: File not found or validation failure.
         """
         async with self._guard():
-            return await self._vm.read_file(path)
+            await self._vm.read_file(path, destination=destination)
 
     async def list_files(self, path: str = "") -> list[FileInfo]:
         """List files in a directory in the sandbox.

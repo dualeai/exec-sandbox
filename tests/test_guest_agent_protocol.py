@@ -9,12 +9,16 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis.strategies import characters, integers, sampled_from, text
 from pydantic import ValidationError
 
+from exec_sandbox.constants import MAX_FILE_PATH_LENGTH
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
-    FileContentMessage,
+    FileChunkRequest,
+    FileChunkResponseMessage,
+    FileEndRequest,
     FileEntryInfo,
     FileListMessage,
+    FileReadCompleteMessage,
     FileWriteAckMessage,
     InstallPackagesRequest,
     ListFilesRequest,
@@ -84,7 +88,7 @@ class TestExecuteCodeRequest:
     def test_language_validation(self) -> None:
         """ExecuteCodeRequest rejects invalid languages."""
         with pytest.raises(ValidationError) as exc_info:
-            ExecuteCodeRequest(language="ruby", code="puts 'hello'")
+            ExecuteCodeRequest(language="ruby", code="puts 'hello'")  # type: ignore[arg-type]
         assert "language" in str(exc_info.value)
 
     def test_timeout_range(self) -> None:
@@ -343,7 +347,7 @@ class TestOutputChunkMessage:
     def test_invalid_type(self) -> None:
         """OutputChunkMessage rejects invalid types."""
         with pytest.raises(ValidationError):
-            OutputChunkMessage(type="stdin", chunk="data")
+            OutputChunkMessage(type="stdin", chunk="data")  # type: ignore[arg-type]
 
     def test_chunk_max_length(self) -> None:
         """OutputChunkMessage enforces 10MB chunk limit."""
@@ -440,7 +444,10 @@ class TestStreamingErrorMessage:
         assert msg.type == "error"
         assert msg.message == "Timeout exceeded"
         assert msg.error_type == "timeout"
+        assert msg.op_id is None
         assert msg.version is None
+        # op_id should not appear in serialized JSON when None (exclude_none mirrors Rust skip_serializing_if)
+        assert "op_id" not in msg.model_dump_json(exclude_none=True)
 
     def test_error_with_version(self) -> None:
         """StreamingErrorMessage with version."""
@@ -450,6 +457,22 @@ class TestStreamingErrorMessage:
             version="1.0.0",
         )
         assert msg.version == "1.0.0"
+
+    def test_error_with_op_id(self) -> None:
+        """StreamingErrorMessage with op_id for file operation error routing."""
+        msg = StreamingErrorMessage(
+            message="Path traversal detected",
+            error_type="validation_error",
+            op_id="abc123",
+            version="1.0.0",
+        )
+        assert msg.op_id == "abc123"
+        assert msg.message == "Path traversal detected"
+        # Round-trip through JSON
+        json_str = msg.model_dump_json()
+        restored = StreamingErrorMessage.model_validate_json(json_str)
+        assert restored.op_id == "abc123"
+        assert restored.message == "Path traversal detected"
 
 
 # ============================================================================
@@ -464,7 +487,7 @@ class TestStreamingMessage:
         """Parse stdout OutputChunkMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "stdout", "chunk": "Hello"}
         msg = adapter.validate_python(data)
         assert isinstance(msg, OutputChunkMessage)
@@ -475,7 +498,7 @@ class TestStreamingMessage:
         """Parse stderr OutputChunkMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "stderr", "chunk": "Error!"}
         msg = adapter.validate_python(data)
         assert isinstance(msg, OutputChunkMessage)
@@ -485,7 +508,7 @@ class TestStreamingMessage:
         """Parse ExecutionCompleteMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "complete", "exit_code": 0, "execution_time_ms": 100}
         msg = adapter.validate_python(data)
         assert isinstance(msg, ExecutionCompleteMessage)
@@ -495,7 +518,7 @@ class TestStreamingMessage:
         """Parse ExecutionCompleteMessage with timing fields from JSON."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         json_str = '{"type": "complete", "exit_code": 0, "execution_time_ms": 100, "spawn_ms": 5, "process_ms": 90}'
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, ExecutionCompleteMessage)
@@ -506,7 +529,7 @@ class TestStreamingMessage:
         """Parse ExecutionCompleteMessage without timing fields (backwards compat)."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         json_str = '{"type": "complete", "exit_code": 0, "execution_time_ms": 42}'
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, ExecutionCompleteMessage)
@@ -517,7 +540,7 @@ class TestStreamingMessage:
         """Parse PongMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "pong", "version": "1.0.0"}
         msg = adapter.validate_python(data)
         assert isinstance(msg, PongMessage)
@@ -527,17 +550,39 @@ class TestStreamingMessage:
         """Parse StreamingErrorMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "error", "message": "Failed", "error_type": "timeout"}
         msg = adapter.validate_python(data)
         assert isinstance(msg, StreamingErrorMessage)
         assert msg.message == "Failed"
 
+    def test_parse_error_with_op_id(self) -> None:
+        """Parse StreamingErrorMessage with op_id from JSON."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "error", "message": "path traversal", "error_type": "validation_error", "op_id": "xyz"}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, StreamingErrorMessage)
+        assert msg.op_id == "xyz"
+        assert msg.message == "path traversal"
+
+    def test_parse_error_without_op_id(self) -> None:
+        """Parse StreamingErrorMessage without op_id (backward compat with old guest agents)."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "error", "message": "timeout", "error_type": "timeout_error"}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, StreamingErrorMessage)
+        assert msg.op_id is None
+        assert msg.message == "timeout"
+
     def test_parse_unknown_type(self) -> None:
         """Reject unknown message type."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "unknown", "data": "something"}
         with pytest.raises(ValidationError):
             adapter.validate_python(data)
@@ -546,7 +591,7 @@ class TestStreamingMessage:
         """Parse StreamingMessage from JSON string."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         json_str = '{"type": "complete", "exit_code": 0, "execution_time_ms": 42}'
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, ExecutionCompleteMessage)
@@ -649,88 +694,124 @@ class TestEnvVarValidationPropertyBased:
 
 
 # ============================================================================
-# File I/O Request Models
+# File I/O Request Models (Streaming Chunked Protocol)
 # ============================================================================
 
 
 class TestWriteFileRequest:
-    """Tests for WriteFileRequest model."""
+    """Tests for WriteFileRequest model (streaming header)."""
 
     def test_minimal_request(self) -> None:
         """WriteFileRequest with required fields only."""
         req = WriteFileRequest(
+            op_id="abc123",
             path="hello.txt",
-            content_base64="SGVsbG8=",
         )
         assert req.action == "write_file"
+        assert req.op_id == "abc123"
         assert req.path == "hello.txt"
-        assert req.content_base64 == "SGVsbG8="
         assert req.make_executable is False  # default
 
     def test_with_make_executable(self) -> None:
         """WriteFileRequest with make_executable=True."""
         req = WriteFileRequest(
+            op_id="abc123",
             path="run.sh",
-            content_base64="IyEvYmluL2Jhc2g=",
             make_executable=True,
         )
         assert req.make_executable is True
 
     def test_path_max_length(self) -> None:
-        """WriteFileRequest accepts path at max length (255)."""
-        long_path = "a" * 255
-        req = WriteFileRequest(path=long_path, content_base64="AA==")
-        assert len(req.path) == 255
+        """WriteFileRequest accepts path at max length."""
+        long_path = "a" * MAX_FILE_PATH_LENGTH
+        req = WriteFileRequest(op_id="test", path=long_path)
+        assert len(req.path) == MAX_FILE_PATH_LENGTH
 
     def test_path_exceeds_max_length(self) -> None:
         """WriteFileRequest rejects path exceeding max length."""
-        too_long = "a" * 256
+        too_long = "a" * (MAX_FILE_PATH_LENGTH + 1)
         with pytest.raises(ValidationError):
-            WriteFileRequest(path=too_long, content_base64="AA==")
+            WriteFileRequest(op_id="test", path=too_long)
 
     def test_empty_path_rejected(self) -> None:
         """WriteFileRequest rejects empty path."""
         with pytest.raises(ValidationError):
-            WriteFileRequest(path="", content_base64="AA==")
-
-    def test_content_base64_max_length(self) -> None:
-        """WriteFileRequest accepts content_base64 at max length."""
-        large_content = "A" * 14_000_000
-        req = WriteFileRequest(path="big.bin", content_base64=large_content)
-        assert len(req.content_base64) == 14_000_000
-
-    def test_content_base64_exceeds_max_length(self) -> None:
-        """WriteFileRequest rejects content_base64 exceeding max length."""
-        too_large = "A" * 14_000_001
-        with pytest.raises(ValidationError):
-            WriteFileRequest(path="big.bin", content_base64=too_large)
+            WriteFileRequest(op_id="test", path="")
 
     def test_serialize_roundtrip(self) -> None:
         """WriteFileRequest serializes and deserializes correctly."""
         req = WriteFileRequest(
+            op_id="abc123",
             path="data/output.csv",
-            content_base64="Y29sMSxjb2wy",
             make_executable=False,
         )
         data = req.model_dump()
         assert data == {
             "action": "write_file",
+            "op_id": "abc123",
             "path": "data/output.csv",
-            "content_base64": "Y29sMSxjb2wy",
             "make_executable": False,
         }
         restored = WriteFileRequest.model_validate(data)
         assert restored.path == req.path
-        assert restored.content_base64 == req.content_base64
+        assert restored.op_id == req.op_id
         assert restored.make_executable == req.make_executable
 
     def test_serialize_to_json(self) -> None:
         """WriteFileRequest serializes to JSON."""
-        req = WriteFileRequest(path="f.txt", content_base64="AA==")
+        req = WriteFileRequest(op_id="test", path="f.txt")
         json_str = req.model_dump_json()
         restored = WriteFileRequest.model_validate_json(json_str)
         assert restored.path == "f.txt"
-        assert restored.content_base64 == "AA=="
+        assert restored.op_id == "test"
+
+
+class TestFileChunkRequest:
+    """Tests for FileChunkRequest model."""
+
+    def test_basic_chunk(self) -> None:
+        """FileChunkRequest with valid fields."""
+        req = FileChunkRequest(op_id="abc123", data="SGVsbG8=")
+        assert req.action == "file_chunk"
+        assert req.op_id == "abc123"
+        assert req.data == "SGVsbG8="
+
+    def test_data_max_length(self) -> None:
+        """FileChunkRequest accepts data at max length (200K)."""
+        large_data = "A" * 200_000
+        req = FileChunkRequest(op_id="test", data=large_data)
+        assert len(req.data) == 200_000
+
+    def test_data_exceeds_max_length(self) -> None:
+        """FileChunkRequest rejects data exceeding max length."""
+        too_large = "A" * 200_001
+        with pytest.raises(ValidationError):
+            FileChunkRequest(op_id="test", data=too_large)
+
+    def test_serialize_to_json(self) -> None:
+        """FileChunkRequest serializes to JSON."""
+        req = FileChunkRequest(op_id="abc", data="AQID")
+        json_str = req.model_dump_json()
+        restored = FileChunkRequest.model_validate_json(json_str)
+        assert restored.op_id == "abc"
+        assert restored.data == "AQID"
+
+
+class TestFileEndRequest:
+    """Tests for FileEndRequest model."""
+
+    def test_basic_end(self) -> None:
+        """FileEndRequest with valid fields."""
+        req = FileEndRequest(op_id="abc123")
+        assert req.action == "file_end"
+        assert req.op_id == "abc123"
+
+    def test_serialize_to_json(self) -> None:
+        """FileEndRequest serializes to JSON."""
+        req = FileEndRequest(op_id="xyz")
+        json_str = req.model_dump_json()
+        restored = FileEndRequest.model_validate_json(json_str)
+        assert restored.op_id == "xyz"
 
 
 class TestReadFileRequest:
@@ -738,39 +819,41 @@ class TestReadFileRequest:
 
     def test_minimal_request(self) -> None:
         """ReadFileRequest with required fields."""
-        req = ReadFileRequest(path="output.txt")
+        req = ReadFileRequest(op_id="abc123", path="output.txt")
         assert req.action == "read_file"
+        assert req.op_id == "abc123"
         assert req.path == "output.txt"
 
     def test_path_max_length(self) -> None:
-        """ReadFileRequest accepts path at max length (255)."""
-        long_path = "b" * 255
-        req = ReadFileRequest(path=long_path)
-        assert len(req.path) == 255
+        """ReadFileRequest accepts path at max length."""
+        long_path = "b" * MAX_FILE_PATH_LENGTH
+        req = ReadFileRequest(op_id="test", path=long_path)
+        assert len(req.path) == MAX_FILE_PATH_LENGTH
 
     def test_path_exceeds_max_length(self) -> None:
         """ReadFileRequest rejects path exceeding max length."""
-        too_long = "b" * 256
+        too_long = "b" * (MAX_FILE_PATH_LENGTH + 1)
         with pytest.raises(ValidationError):
-            ReadFileRequest(path=too_long)
+            ReadFileRequest(op_id="test", path=too_long)
 
     def test_empty_path_rejected(self) -> None:
         """ReadFileRequest rejects empty path."""
         with pytest.raises(ValidationError):
-            ReadFileRequest(path="")
+            ReadFileRequest(op_id="test", path="")
 
     def test_serialize_to_dict(self) -> None:
         """ReadFileRequest serializes correctly."""
-        req = ReadFileRequest(path="results/data.json")
+        req = ReadFileRequest(op_id="abc", path="results/data.json")
         data = req.model_dump()
-        assert data == {"action": "read_file", "path": "results/data.json"}
+        assert data == {"action": "read_file", "op_id": "abc", "path": "results/data.json"}
 
     def test_serialize_to_json(self) -> None:
         """ReadFileRequest serializes to JSON."""
-        req = ReadFileRequest(path="test.py")
+        req = ReadFileRequest(op_id="test", path="test.py")
         json_str = req.model_dump_json()
         restored = ReadFileRequest.model_validate_json(json_str)
         assert restored.path == "test.py"
+        assert restored.op_id == "test"
 
 
 class TestListFilesRequest:
@@ -793,14 +876,14 @@ class TestListFilesRequest:
         assert req.path == ""
 
     def test_path_max_length(self) -> None:
-        """ListFilesRequest accepts path at max length (255)."""
-        long_path = "c" * 255
+        """ListFilesRequest accepts path at max length."""
+        long_path = "c" * MAX_FILE_PATH_LENGTH
         req = ListFilesRequest(path=long_path)
-        assert len(req.path) == 255
+        assert len(req.path) == MAX_FILE_PATH_LENGTH
 
     def test_path_exceeds_max_length(self) -> None:
         """ListFilesRequest rejects path exceeding max length."""
-        too_long = "c" * 256
+        too_long = "c" * (MAX_FILE_PATH_LENGTH + 1)
         with pytest.raises(ValidationError):
             ListFilesRequest(path=too_long)
 
@@ -818,7 +901,7 @@ class TestListFilesRequest:
 
 
 # ============================================================================
-# File I/O Response Models
+# File I/O Response Models (Streaming Chunked Protocol)
 # ============================================================================
 
 
@@ -827,79 +910,97 @@ class TestFileWriteAckMessage:
 
     def test_ack_fields(self) -> None:
         """FileWriteAckMessage has correct fields."""
-        msg = FileWriteAckMessage(path="hello.txt", bytes_written=5)
+        msg = FileWriteAckMessage(op_id="abc123", path="hello.txt", bytes_written=5)
         assert msg.type == "file_write_ack"
+        assert msg.op_id == "abc123"
         assert msg.path == "hello.txt"
         assert msg.bytes_written == 5
 
     def test_large_bytes_written(self) -> None:
         """FileWriteAckMessage supports large file sizes."""
-        msg = FileWriteAckMessage(path="big.bin", bytes_written=10_000_000)
+        msg = FileWriteAckMessage(op_id="test", path="big.bin", bytes_written=10_000_000)
         assert msg.bytes_written == 10_000_000
 
     def test_serialize(self) -> None:
         """FileWriteAckMessage serializes correctly."""
-        msg = FileWriteAckMessage(path="out.csv", bytes_written=1024)
+        msg = FileWriteAckMessage(op_id="abc", path="out.csv", bytes_written=1024)
         data = msg.model_dump()
         assert data == {
             "type": "file_write_ack",
+            "op_id": "abc",
             "path": "out.csv",
             "bytes_written": 1024,
         }
 
     def test_serialize_to_json(self) -> None:
         """FileWriteAckMessage serializes to JSON and back."""
-        msg = FileWriteAckMessage(path="script.py", bytes_written=42)
+        msg = FileWriteAckMessage(op_id="xyz", path="script.py", bytes_written=42)
         json_str = msg.model_dump_json()
         restored = FileWriteAckMessage.model_validate_json(json_str)
+        assert restored.op_id == "xyz"
         assert restored.path == "script.py"
         assert restored.bytes_written == 42
 
 
-class TestFileContentMessage:
-    """Tests for FileContentMessage model."""
+class TestFileChunkResponseMessage:
+    """Tests for FileChunkResponseMessage model."""
 
-    def test_content_fields(self) -> None:
-        """FileContentMessage has correct fields."""
-        msg = FileContentMessage(
-            path="data.txt",
-            content_base64="SGVsbG8gV29ybGQ=",
-            size=11,
-        )
-        assert msg.type == "file_content"
-        assert msg.path == "data.txt"
-        assert msg.content_base64 == "SGVsbG8gV29ybGQ="
-        assert msg.size == 11
-
-    def test_empty_file(self) -> None:
-        """FileContentMessage for an empty file."""
-        msg = FileContentMessage(path="empty.txt", content_base64="", size=0)
-        assert msg.content_base64 == ""
-        assert msg.size == 0
+    def test_chunk_fields(self) -> None:
+        """FileChunkResponseMessage has correct fields."""
+        msg = FileChunkResponseMessage(op_id="abc123", data="SGVsbG8=")
+        assert msg.type == "file_chunk"
+        assert msg.op_id == "abc123"
+        assert msg.data == "SGVsbG8="
 
     def test_serialize(self) -> None:
-        """FileContentMessage serializes correctly."""
-        msg = FileContentMessage(
-            path="config.json",
-            content_base64="e30=",
-            size=2,
-        )
+        """FileChunkResponseMessage serializes correctly."""
+        msg = FileChunkResponseMessage(op_id="test", data="AQID")
         data = msg.model_dump()
         assert data == {
-            "type": "file_content",
-            "path": "config.json",
-            "content_base64": "e30=",
-            "size": 2,
+            "type": "file_chunk",
+            "op_id": "test",
+            "data": "AQID",
         }
 
     def test_serialize_to_json(self) -> None:
-        """FileContentMessage serializes to JSON and back."""
-        msg = FileContentMessage(path="f.bin", content_base64="AQID", size=3)
+        """FileChunkResponseMessage serializes to JSON and back."""
+        msg = FileChunkResponseMessage(op_id="abc", data="SGVsbG8=")
         json_str = msg.model_dump_json()
-        restored = FileContentMessage.model_validate_json(json_str)
+        restored = FileChunkResponseMessage.model_validate_json(json_str)
+        assert restored.op_id == "abc"
+        assert restored.data == "SGVsbG8="
+
+
+class TestFileReadCompleteMessage:
+    """Tests for FileReadCompleteMessage model."""
+
+    def test_complete_fields(self) -> None:
+        """FileReadCompleteMessage has correct fields."""
+        msg = FileReadCompleteMessage(op_id="abc123", path="data.txt", size=1024)
+        assert msg.type == "file_read_complete"
+        assert msg.op_id == "abc123"
+        assert msg.path == "data.txt"
+        assert msg.size == 1024
+
+    def test_serialize(self) -> None:
+        """FileReadCompleteMessage serializes correctly."""
+        msg = FileReadCompleteMessage(op_id="test", path="config.json", size=256)
+        data = msg.model_dump()
+        assert data == {
+            "type": "file_read_complete",
+            "op_id": "test",
+            "path": "config.json",
+            "size": 256,
+        }
+
+    def test_serialize_to_json(self) -> None:
+        """FileReadCompleteMessage serializes to JSON and back."""
+        msg = FileReadCompleteMessage(op_id="xyz", path="f.bin", size=65536)
+        json_str = msg.model_dump_json()
+        restored = FileReadCompleteMessage.model_validate_json(json_str)
+        assert restored.op_id == "xyz"
         assert restored.path == "f.bin"
-        assert restored.content_base64 == "AQID"
-        assert restored.size == 3
+        assert restored.size == 65536
 
 
 class TestFileListMessage:
@@ -1013,7 +1114,7 @@ class TestFileInfo:
 
 
 # ============================================================================
-# Discriminated Union - File I/O Messages
+# Discriminated Union - File I/O Messages (Streaming)
 # ============================================================================
 
 
@@ -1024,10 +1125,11 @@ class TestStreamingMessageFileIO:
         """Parse FileWriteAckMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
-        data = {"type": "file_write_ack", "path": "hello.txt", "bytes_written": 5}
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        data = {"type": "file_write_ack", "op_id": "abc123", "path": "hello.txt", "bytes_written": 5}
         msg = adapter.validate_python(data)
         assert isinstance(msg, FileWriteAckMessage)
+        assert msg.op_id == "abc123"
         assert msg.path == "hello.txt"
         assert msg.bytes_written == 5
 
@@ -1035,46 +1137,64 @@ class TestStreamingMessageFileIO:
         """Parse FileWriteAckMessage from JSON string."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
-        json_str = '{"type": "file_write_ack", "path": "script.sh", "bytes_written": 128}'
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "file_write_ack", "op_id": "test", "path": "script.sh", "bytes_written": 128}'
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, FileWriteAckMessage)
+        assert msg.op_id == "test"
         assert msg.path == "script.sh"
         assert msg.bytes_written == 128
 
-    def test_parse_file_content(self) -> None:
-        """Parse FileContentMessage from dict."""
+    def test_parse_file_chunk(self) -> None:
+        """Parse FileChunkResponseMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
-        data = {
-            "type": "file_content",
-            "path": "data.txt",
-            "content_base64": "SGVsbG8=",
-            "size": 5,
-        }
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        data = {"type": "file_chunk", "op_id": "abc123", "data": "SGVsbG8="}
         msg = adapter.validate_python(data)
-        assert isinstance(msg, FileContentMessage)
-        assert msg.path == "data.txt"
-        assert msg.content_base64 == "SGVsbG8="
-        assert msg.size == 5
+        assert isinstance(msg, FileChunkResponseMessage)
+        assert msg.op_id == "abc123"
+        assert msg.data == "SGVsbG8="
 
-    def test_parse_file_content_from_json(self) -> None:
-        """Parse FileContentMessage from JSON string."""
+    def test_parse_file_chunk_from_json(self) -> None:
+        """Parse FileChunkResponseMessage from JSON string."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
-        json_str = '{"type": "file_content", "path": "out.bin", "content_base64": "AQID", "size": 3}'
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "file_chunk", "op_id": "test", "data": "AQID"}'
         msg = adapter.validate_json(json_str)
-        assert isinstance(msg, FileContentMessage)
-        assert msg.path == "out.bin"
-        assert msg.size == 3
+        assert isinstance(msg, FileChunkResponseMessage)
+        assert msg.op_id == "test"
+        assert msg.data == "AQID"
+
+    def test_parse_file_read_complete(self) -> None:
+        """Parse FileReadCompleteMessage from dict."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        data = {"type": "file_read_complete", "op_id": "abc123", "path": "data.txt", "size": 1024}
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, FileReadCompleteMessage)
+        assert msg.op_id == "abc123"
+        assert msg.path == "data.txt"
+        assert msg.size == 1024
+
+    def test_parse_file_read_complete_from_json(self) -> None:
+        """Parse FileReadCompleteMessage from JSON string."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        json_str = '{"type": "file_read_complete", "op_id": "test", "path": "out.bin", "size": 65536}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, FileReadCompleteMessage)
+        assert msg.op_id == "test"
+        assert msg.size == 65536
 
     def test_parse_file_list(self) -> None:
         """Parse FileListMessage from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {
             "type": "file_list",
             "path": "",
@@ -1093,7 +1213,7 @@ class TestStreamingMessageFileIO:
         """Parse FileListMessage from JSON string."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         json_str = (
             '{"type": "file_list", "path": "project", "entries": [{"name": "index.js", "is_dir": false, "size": 512}]}'
         )
@@ -1107,7 +1227,7 @@ class TestStreamingMessageFileIO:
         """Parse FileListMessage with empty entries from dict."""
         from pydantic import TypeAdapter
 
-        adapter = TypeAdapter(StreamingMessage)
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
         data = {"type": "file_list", "path": "empty", "entries": []}
         msg = adapter.validate_python(data)
         assert isinstance(msg, FileListMessage)
@@ -1147,10 +1267,10 @@ class TestFilePathValidationPropertyBased:
         """Property: Safe relative paths should be accepted by all file request models."""
         path = f"subdir/{segment}.txt"
         # WriteFileRequest
-        req_w = WriteFileRequest(path=path, content_base64="AA==")
+        req_w = WriteFileRequest(op_id="test", path=path)
         assert req_w.path == path
         # ReadFileRequest
-        req_r = ReadFileRequest(path=path)
+        req_r = ReadFileRequest(op_id="test", path=path)
         assert req_r.path == path
         # ListFilesRequest
         req_l = ListFilesRequest(path=path)
@@ -1165,13 +1285,13 @@ class TestFilePathValidationPropertyBased:
     )
     @settings(max_examples=50)
     def test_overlong_paths_rejected(self, extra: str) -> None:
-        """Property: Paths exceeding 255 chars must be rejected."""
-        # Build a path that is guaranteed to exceed 255 chars
-        path = "a" * 256 + extra
+        """Property: Paths exceeding PATH_MAX must be rejected."""
+        # Build a path that is guaranteed to exceed PATH_MAX
+        path = "a" * (MAX_FILE_PATH_LENGTH + 1) + extra
         with pytest.raises(ValidationError):
-            WriteFileRequest(path=path, content_base64="AA==")
+            WriteFileRequest(op_id="test", path=path)
         with pytest.raises(ValidationError):
-            ReadFileRequest(path=path)
+            ReadFileRequest(op_id="test", path=path)
         with pytest.raises(ValidationError):
             ListFilesRequest(path=path)
 
@@ -1208,7 +1328,7 @@ class TestFilePathValidationPropertyBased:
         """
         malicious_path = prefix + control + suffix
         try:
-            req = WriteFileRequest(path=malicious_path, content_base64="AA==")
+            req = WriteFileRequest(op_id="test", path=malicious_path)
             # If Pydantic accepts it, ensure the path is stored verbatim
             # (guest agent will reject it server-side)
             assert req.path == malicious_path
@@ -1233,7 +1353,7 @@ class TestFilePathValidationPropertyBased:
         """Property: Control characters in ReadFileRequest path should be rejected by Pydantic or the guest agent."""
         malicious_path = prefix + control + suffix
         try:
-            req = ReadFileRequest(path=malicious_path)
+            req = ReadFileRequest(op_id="test", path=malicious_path)
             assert req.path == malicious_path
         except ValidationError:
             pass  # Pydantic rejected it -- also fine

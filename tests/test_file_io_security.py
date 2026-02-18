@@ -4,6 +4,8 @@ Tests path traversal attacks, symlink escape, and null byte injection.
 Requires VM (integration tests).
 """
 
+from pathlib import Path
+
 import pytest
 
 from exec_sandbox.exceptions import VmPermanentError
@@ -55,18 +57,18 @@ class TestPathTraversalRead:
     """Path traversal attacks on read_file."""
 
     @pytest.mark.parametrize("path", FILESYSTEM_TRAVERSAL_VECTORS)
-    async def test_read_traversal_rejected(self, scheduler: Scheduler, path: str) -> None:
+    async def test_read_traversal_rejected(self, scheduler: Scheduler, tmp_path: Path, path: str) -> None:
         """read_file rejects filesystem-level path traversal attempts."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             with pytest.raises(VmPermanentError):
-                await session.read_file(path)
+                await session.read_file(path, destination=tmp_path / "out.bin")
 
     @pytest.mark.parametrize("path", WEB_ENCODING_VECTORS)
-    async def test_read_web_encoding_not_found(self, scheduler: Scheduler, path: str) -> None:
+    async def test_read_web_encoding_not_found(self, scheduler: Scheduler, tmp_path: Path, path: str) -> None:
         """Web-encoding tricks fail on read because literal filename doesn't exist."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             with pytest.raises(VmPermanentError):
-                await session.read_file(path)
+                await session.read_file(path, destination=tmp_path / "out.bin")
 
 
 class TestPathTraversalList:
@@ -91,7 +93,7 @@ class TestPathTraversalList:
 class TestSymlinkEscape:
     """Symlink escape attacks on read_file."""
 
-    async def test_symlink_to_etc_passwd(self, scheduler: Scheduler) -> None:
+    async def test_symlink_to_etc_passwd(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """read_file follows symlink but canonicalize catches escape."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Create a symlink pointing outside sandbox
@@ -100,9 +102,9 @@ class TestSymlinkEscape:
 
             # read_file should reject the symlink target
             with pytest.raises(VmPermanentError):
-                await session.read_file("evil_link")
+                await session.read_file("evil_link", destination=tmp_path / "evil.bin")
 
-    async def test_multi_hop_symlink_escape(self, scheduler: Scheduler) -> None:
+    async def test_multi_hop_symlink_escape(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Multi-hop symlink chain that escapes sandbox is rejected."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Create chain: link1 -> link2 -> /etc/passwd
@@ -110,7 +112,7 @@ class TestSymlinkEscape:
             await session.exec("import os; os.symlink('/home/user/link_to_etc/passwd', '/home/user/chain_link')")
 
             with pytest.raises(VmPermanentError):
-                await session.read_file("chain_link")
+                await session.read_file("chain_link", destination=tmp_path / "chain.bin")
 
 
 class TestNullByteInjection:

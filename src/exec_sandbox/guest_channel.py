@@ -1,14 +1,13 @@
 """
 Guest communication channel abstraction.
 
-Supports multiple transports using JSON newline-delimited protocol:
-- Unix socket over virtio-serial (preferred, lower latency)
-- TCP over virtio-net (fallback, universal compatibility)
+Uses JSON newline-delimited protocol over dual virtio-serial Unix sockets
+(DualPortChannel: command + event ports). UnixSocketChannel is the
+single-port building block composed by DualPortChannel.
 """
 
 import asyncio
 import contextlib
-import socket
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Protocol, runtime_checkable
@@ -28,8 +27,14 @@ logger = get_logger(__name__)
 
 # Buffer limit for asyncio readuntil() - must exceed max JSON message size
 # Default asyncio limit is 64KB, but our protocol can send large output chunks
-# Using 20MB to handle large outputs with JSON overhead (10MB file → 13.3MB base64 + JSON)
-STREAM_BUFFER_LIMIT = 20 * 1024 * 1024  # 20MB
+# StreamReader buffer limit — controls when asyncio pauses the transport
+# (TCP backpressure).  Must exceed the largest single message:
+#   - File chunks: ~200KB (128KB compressed → base64 → JSON)
+#   - REPL stdout: ~70KB (64KB buffer + JSON overhead)
+#   - Package output: ~55KB (50KB limit + JSON overhead)
+# 512KB provides >2x headroom for the largest message while keeping
+# memory bounded during file transfers (prevents O(file_size) buffering).
+STREAM_BUFFER_LIMIT = 512 * 1024  # 512KB
 
 # Cached TypeAdapter for StreamingMessage discriminated union
 # Performance: Avoids rebuilding validators on every message (1000s of allocations per execution)
@@ -37,11 +42,84 @@ STREAM_BUFFER_LIMIT = 20 * 1024 * 1024  # 20MB
 _STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
 
 
+class FileOpDispatcher:
+    """Routes event messages by op_id to waiting coroutines.
+
+    Shared multiplexer that reads from the event channel and routes file transfer
+    messages by op_id to per-operation queues. Non-file messages (execution output,
+    pong, errors without op_id) go to a default queue consumed by stream_events().
+    """
+
+    def __init__(self, reader: asyncio.StreamReader):
+        self._reader = reader
+        self._op_queues: dict[str, asyncio.Queue[StreamingMessage]] = {}
+        self._default_queue: asyncio.Queue[StreamingMessage] = asyncio.Queue()
+        self._task: asyncio.Task[None] | None = None
+        self._lock = asyncio.Lock()  # protects _op_queues registration
+
+    def start(self) -> None:
+        """Start the dispatch loop as a background task."""
+        self._task = asyncio.create_task(self._dispatch_loop())
+
+    async def stop(self) -> None:
+        """Stop the dispatch loop."""
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def register_op(self, op_id: str) -> asyncio.Queue[StreamingMessage]:
+        """Register an op_id and return its dedicated bounded queue.
+
+        Bounded to 4 items (~800KB) to provide backpressure through the
+        dispatch loop → StreamReader → TCP transport → guest agent chain.
+        Prevents O(file_size) memory accumulation during reads.
+        """
+        async with self._lock:
+            q: asyncio.Queue[StreamingMessage] = asyncio.Queue(maxsize=4)
+            self._op_queues[op_id] = q
+            return q
+
+    async def unregister_op(self, op_id: str) -> None:
+        """Unregister an op_id (cleanup after operation completes)."""
+        async with self._lock:
+            self._op_queues.pop(op_id, None)
+
+    async def get_default_message(self, timeout: float) -> StreamingMessage:
+        """Get a message from the default queue (non-file-transfer messages)."""
+        return await asyncio.wait_for(self._default_queue.get(), timeout=timeout)
+
+    async def _dispatch_loop(self) -> None:
+        """Read messages from the event channel and route by op_id."""
+        while True:
+            try:
+                data = await self._reader.readuntil(b"\n")
+            except asyncio.IncompleteReadError:
+                break
+            msg = _STREAMING_MESSAGE_ADAPTER.validate_json(data.rstrip(b"\n"))
+            op_id = getattr(msg, "op_id", None)
+            if op_id:
+                # Route to registered op queue, or discard if orphaned.
+                # Late messages after unregister_op() must NOT pollute the
+                # default queue (which feeds stream_events / execution output).
+                queue = self._op_queues.get(op_id)
+                if queue:
+                    await queue.put(msg)
+                else:
+                    logger.debug(
+                        "Discarding message for unregistered op_id",
+                        extra={"op_id": op_id, "msg_type": type(msg).__name__},
+                    )
+            else:
+                await self._default_queue.put(msg)
+
+
 @runtime_checkable
 class GuestChannel(Protocol):
     """Protocol for guest-host communication.
 
-    Supports TCP, Unix socket, and dual-port transports.
+    Supports Unix socket and dual-port transports.
     Uses structural typing (Protocol) instead of inheritance.
     """
 
@@ -61,7 +139,7 @@ class GuestChannel(Protocol):
             timeout: Response timeout in seconds (required, no default)
 
         Returns:
-            StreamingMessage (e.g., PongMessage, FileContentMessage, FileListMessage)
+            StreamingMessage (e.g., PongMessage, FileListMessage)
         """
         ...
 
@@ -82,6 +160,26 @@ class GuestChannel(Protocol):
         Returns:
             StreamingMessage parsed from response
         """
+        ...
+
+    async def enqueue_raw(self, data: bytes) -> None:
+        """Send raw bytes without waiting for response (for multi-message protocols).
+
+        Used for streaming file transfers where multiple messages are sent
+        before a response is expected (header, chunks, end).
+        """
+        ...
+
+    async def register_op(self, op_id: str) -> asyncio.Queue[StreamingMessage]:
+        """Register an op_id for file transfer multiplexing.
+
+        Returns a queue that will receive messages matching this op_id.
+        Must call unregister_op() when done.
+        """
+        ...
+
+    async def unregister_op(self, op_id: str) -> None:
+        """Unregister an op_id after operation completes."""
         ...
 
     def stream_messages(
@@ -110,163 +208,6 @@ class GuestChannel(Protocol):
         ...
 
 
-class TcpChannel:
-    """
-    TCP-based guest communication (user-mode networking).
-
-    Works on:
-    - macOS HVF (no virtio_console kernel module needed)
-    - Linux KVM (portable alternative to vsock)
-    - Windows WHPX (future compatibility)
-
-    Uses QEMU user-mode networking with port forwarding:
-    Host connects to 127.0.0.1:{host_port} -> QEMU forwards to guest:5000
-
-    Security: Host port bound to localhost only (127.0.0.1).
-    """
-
-    def __init__(self, host: str, port: int):
-        """
-        Args:
-            host: Host IP (127.0.0.1 for security - localhost only)
-            port: Host port (forwarded to guest 5000 via QEMU user-mode networking)
-        """
-        self.host = host
-        self.port = port
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-
-    async def connect(self, timeout_seconds: int) -> None:
-        """Connect to guest TCP server via port forward.
-
-        Single connection attempt with timeout (no retry).
-        Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
-        """
-        if self._reader and self._writer:
-            return
-
-        # Connect to host port (QEMU forwards to guest:5000)
-        # Buffer sized for base64-encoded file transfers (see STREAM_BUFFER_LIMIT)
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port, limit=STREAM_BUFFER_LIMIT),
-            timeout=float(timeout_seconds),
-        )
-
-        # Enable TCP_NODELAY for low latency (disable Nagle's algorithm)
-        sock = self._writer.transport.get_extra_info("socket")  # type: ignore[union-attr]
-        if sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    async def send_request(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> StreamingMessage:
-        """Send JSON + newline, receive JSON + newline (same protocol as vsock/serial).
-
-        No retry at this level - caller handles retry logic.
-        """
-        if not self._reader or not self._writer:
-            raise RuntimeError("Channel not connected")
-
-        try:
-            # Serialize Pydantic model to JSON
-            request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-            self._writer.write(request_json.encode())
-            await self._writer.drain()
-
-            # Receive response (read until newline)
-            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-
-            # Deserialize JSON to StreamingMessage (direct bytes, no decode/strip allocation)
-            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-
-        except TimeoutError:
-            # TimeoutError means no data received in time, but connection is still valid.
-            # DO NOT reset - keep connection open for retry.
-            raise
-        except (asyncio.IncompleteReadError, OSError, BrokenPipeError, ConnectionError):
-            # Connection actually broken - reset state so caller reconnects on next attempt
-            self._reader = None
-            self._writer = None
-            raise
-
-    async def send_raw_request(
-        self,
-        data: bytes,
-        timeout: int,
-    ) -> StreamingMessage:
-        """Send pre-serialized JSON bytes and receive single response.
-
-        Bypasses Pydantic serialization for performance-critical paths
-        (e.g., large file writes where we build the JSON frame manually).
-        """
-        if not self._reader or not self._writer:
-            raise RuntimeError("Channel not connected")
-        if not data.endswith(b"\n"):
-            raise ValueError("send_raw_request data must end with newline")
-
-        try:
-            self._writer.write(data)
-            await self._writer.drain()
-
-            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-
-        except TimeoutError:
-            raise
-        except (asyncio.IncompleteReadError, OSError, BrokenPipeError, ConnectionError):
-            self._reader = None
-            self._writer = None
-            raise
-
-    async def stream_messages(
-        self,
-        request: GuestAgentRequest,
-        timeout: int,
-    ) -> AsyncGenerator[StreamingMessage]:
-        """Stream multiple JSON messages for code execution."""
-        if not self._reader or not self._writer:
-            raise RuntimeError("Channel not connected")
-
-        # Send request
-        request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-        self._writer.write(request_json.encode())
-        await self._writer.drain()
-
-        # Read and yield messages until completion or error
-        while True:
-            # Read next JSON line
-            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-
-            # Parse as streaming message (direct bytes, no decode/strip allocation)
-            message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-            yield message
-
-            # Stop if complete or error
-            if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
-                break
-
-    async def close(self) -> None:
-        """Close TCP connection."""
-        if self._writer:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
-
-    async def __aenter__(self) -> "TcpChannel":
-        """Enter async context manager, connecting to guest."""
-        await self.connect(timeout_seconds=5)
-        return self
-
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, closing connection."""
-        await self.close()
-
-
 class UnixSocketChannel:
     """
     Unix socket-based guest communication (virtio-serial).
@@ -281,14 +222,13 @@ class UnixSocketChannel:
     (Path uses SHA-256 hash to stay under 108-byte UNIX socket limit)
 
     Benefits:
-    - 20-30% lower latency than TCP
     - No network namespace issues
     - Works with containerized unprivileged execution
     - Industry standard (libvirt, qemu-ga)
 
     Queueing:
     - Decoupled read/write paths prevent deadlocks
-    - Bounded queue (100 items) provides backpressure
+    - Bounded queue (4 items, ~800KB) provides backpressure for O(chunk_size) memory
     - Background worker handles QEMU throttling
     - Fail-fast (5s) if queue full
     """
@@ -303,7 +243,7 @@ class UnixSocketChannel:
         self.expected_uid = expected_uid
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
         self._write_task: asyncio.Task[None] | None = None
         self._shutdown_event: asyncio.Event = asyncio.Event()
 
@@ -320,7 +260,7 @@ class UnixSocketChannel:
             return
 
         # Connect to Unix socket with mandatory peer credential verification
-        # Buffer sized for base64-encoded file transfers (see STREAM_BUFFER_LIMIT)
+        # Buffer sized for streaming zstd-compressed file chunks (see STREAM_BUFFER_LIMIT)
         self._reader, self._writer = await connect_and_verify(
             path=self.socket_path,
             expected_uid=self.expected_uid,
@@ -367,7 +307,7 @@ class UnixSocketChannel:
         request: GuestAgentRequest,
         timeout: int,
     ) -> StreamingMessage:
-        """Send JSON + newline, receive JSON + newline (same protocol as TCP).
+        """Send JSON + newline, receive JSON + newline.
 
         No retry at this level - caller handles retry logic.
         Queues write to prevent blocking when virtio-serial buffer full.
@@ -618,6 +558,7 @@ class DualPortChannel:
         self.event_socket = event_socket
         self._cmd_channel: UnixSocketChannel = UnixSocketChannel(cmd_socket, expected_uid)
         self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
+        self._dispatcher: FileOpDispatcher | None = None
 
     async def connect(self, timeout_seconds: int) -> None:
         """Connect both command and event ports.
@@ -631,6 +572,13 @@ class DualPortChannel:
             self._event_channel.connect(timeout_seconds),
         )
 
+        # Start the file operation dispatcher on the event channel (once)
+        if not self._dispatcher:
+            reader = self._event_channel.get_reader()
+            if reader:
+                self._dispatcher = FileOpDispatcher(reader)
+                self._dispatcher.start()
+
     async def send_command(
         self,
         request: GuestAgentRequest,
@@ -638,7 +586,7 @@ class DualPortChannel:
     ) -> None:
         """Send command on command port (non-blocking).
 
-        Commands are sent via UnixSocketChannel's send_request but we don't wait for response.
+        Commands are serialized and queued on the command port's write worker.
         Responses come via event port.
 
         Args:
@@ -653,13 +601,28 @@ class DualPortChannel:
         request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
         await self._cmd_channel.enqueue_write(request_json.encode(), timeout=float(timeout))
 
+    async def enqueue_raw(self, data: bytes) -> None:
+        """Send raw bytes on command port without waiting for response."""
+        await self._cmd_channel.enqueue_write(data, timeout=5.0)
+
+    async def register_op(self, op_id: str) -> asyncio.Queue[StreamingMessage]:
+        """Register an op_id for file transfer multiplexing."""
+        if not self._dispatcher:
+            raise RuntimeError("Dispatcher not initialized - channel not connected")
+        return await self._dispatcher.register_op(op_id)
+
+    async def unregister_op(self, op_id: str) -> None:
+        """Unregister an op_id after operation completes."""
+        if self._dispatcher:
+            await self._dispatcher.unregister_op(op_id)
+
     async def stream_events(
         self,
         timeout: int = 300,
     ) -> AsyncGenerator[StreamingMessage]:
-        """Stream events from event port.
+        """Stream events from event port via dispatcher.
 
-        Reads messages from event port until ExecutionCompleteMessage or StreamingErrorMessage.
+        Reads messages from the default queue (non-file-transfer messages).
         Can be called concurrently with send_command() on command port.
 
         Args:
@@ -672,21 +635,12 @@ class DualPortChannel:
             RuntimeError: If event channel not connected
             asyncio.TimeoutError: If no message received within timeout
         """
-        # Validate event channel is connected
-        if not self._event_channel.is_connected():
-            raise RuntimeError("Event channel not connected")
-
-        reader = self._event_channel.get_reader()
-        if not reader:
-            raise RuntimeError("Event channel reader not available")
+        if not self._dispatcher:
+            raise RuntimeError("Dispatcher not initialized - channel not connected")
 
         # Read and yield messages until completion or error
         while True:
-            # Read next JSON line from event channel
-            response_data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=float(timeout))
-
-            # Parse as streaming message (direct bytes, no decode/strip allocation)
-            message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
+            message = await self._dispatcher.get_default_message(timeout=float(timeout))
             yield message
 
             # Stop if complete or error
@@ -784,6 +738,11 @@ class DualPortChannel:
 
         Closes both channels in parallel with graceful queue drain.
         """
+        # Stop dispatcher first
+        if self._dispatcher:
+            await self._dispatcher.stop()
+            self._dispatcher = None
+
         # Close both ports in parallel
         await asyncio.gather(
             self._cmd_channel.close(),

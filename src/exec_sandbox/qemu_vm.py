@@ -8,20 +8,24 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import IO, TYPE_CHECKING, TextIO
+from uuid import uuid4
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox.exceptions import VmBootTimeoutError, VmPermanentError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
-    FileContentMessage,
+    FileChunkResponseMessage,
     FileListMessage,
+    FileReadCompleteMessage,
     FileWriteAckMessage,
     ListFilesRequest,
     ReadFileRequest,
     StreamingErrorMessage,
+    WriteFileRequest,
 )
 from exec_sandbox.guest_channel import GuestChannel
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, TimingBreakdown
@@ -35,12 +39,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Use native zstd module (Python 3.14+) or backports.zstd
+if sys.version_info >= (3, 14):
+    from compression import zstd  # type: ignore[import-not-found]
+else:
+    from backports import zstd  # type: ignore[import-untyped,no-redef]
+
 
 class QemuVM:
     """Handle to running QEMU microVM.
 
     Lifecycle managed by VmManager.
-    Communicates via GuestChannel (TCP, Unix socket, or dual-port).
+    Communicates via GuestChannel (dual-port virtio-serial).
 
     Security:
     - Layer 1: Hardware isolation (KVM) or TCG software emulation
@@ -92,7 +102,7 @@ class QemuVM:
             process: Running QEMU subprocess (ProcessWrapper for PID-reuse safety)
             cgroup_path: cgroup v2 path for cleanup
             workdir: Working directory containing overlay, sockets, and logs
-            channel: Communication channel for TCP guest agent
+            channel: Communication channel for guest agent
             language: Programming language for this VM
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
@@ -289,10 +299,10 @@ class QemuVM:
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
     ) -> ExecutionResult:
-        """Execute code via TCP guest agent communication.
+        """Execute code via guest agent communication.
 
         Implementation:
-        1. Connect to guest via TCP (127.0.0.1 + allocated port)
+        1. Connect to guest via dual-port virtio-serial channel
         2. Send execution request JSON with action, language, code, timeout, env_vars
         3. Wait for result with timeout (cgroup enforced)
         4. Parse result: stdout, stderr, exit_code, memory_mb, execution_time_ms
@@ -381,7 +391,7 @@ class QemuVM:
                     },
                 )
 
-            # Connect to guest via TCP with timing
+            # Connect to guest agent with timing
             # Fixed init timeout (connection establishment, independent of execution timeout)
             connect_start = asyncio.get_event_loop().time()
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
@@ -530,16 +540,23 @@ class QemuVM:
     # File I/O
     # -------------------------------------------------------------------------
 
-    async def write_file(self, path: str, content: bytes, *, make_executable: bool = False) -> None:
-        """Write a file to the sandbox via guest agent.
+    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:
+        """Write a file to the sandbox via streaming zstd-compressed chunks.
 
-        Memory optimization: builds JSON frame manually, staying in bytes throughout.
-        Avoids the Pydantic path which adds str intermediates:
-        .decode("ascii") (bytes→str) + model_dump_json (str→str) + .encode (str→bytes).
+        Protocol:
+        1. Send WriteFileRequest header (with op_id)
+        2. Stream-compress content chunk by chunk as FileChunkRequest messages
+        3. Send FileEndRequest to finalize
+        4. Await FileWriteAckMessage from guest
+
+        Content is read from the stream in 128 KB chunks, compressed
+        incrementally with a shared ZstdCompressor, and sent immediately.
+        Neither the full content nor the full compressed payload is ever
+        held in memory — only the current chunk pair.
 
         Args:
-            path: Relative path in sandbox (max 255 chars)
-            content: Raw file content (max 10MB)
+            path: Relative path in sandbox (PATH_MAX 4096, NAME_MAX 255 per component)
+            content: Readable binary stream (BytesIO for bytes, open file for Path)
             make_executable: Set executable permission (0o755 vs 0o644)
 
         Raises:
@@ -548,7 +565,7 @@ class QemuVM:
         """
         import base64  # noqa: PLC0415
 
-        # Validate path (mirrors WriteFileRequest Pydantic validators bypassed by manual frame)
+        # Validate path
         if not path:
             raise VmPermanentError(
                 "write_file path must not be empty",
@@ -560,25 +577,69 @@ class QemuVM:
                 context={"vm_id": self.vm_id, "path_length": len(path)},
             )
 
-        # Build JSON frame manually, keeping everything as bytes.
-        # b64encode returns bytes (ASCII-safe), so we can embed directly.
-        # join() pre-calculates total length and allocates once.
-        content_b64 = base64.b64encode(content)
-        frame = b"".join(
-            [
-                b'{"action":"write_file","path":',
-                json.dumps(path).encode(),
-                b',"content_base64":"',
-                content_b64,
-                b'","make_executable":',
-                b"true" if make_executable else b"false",
-                b"}\n",
-            ]
-        )
+        op_id = uuid4().hex
 
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            response = await self.channel.send_raw_request(frame, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+            op_queue = await self.channel.register_op(op_id)
+
+            # Send header frame
+            header = WriteFileRequest(op_id=op_id, path=path, make_executable=make_executable)
+            header_bytes = header.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
+            await self.channel.enqueue_raw(header_bytes)
+
+            # Stream-compress content chunk by chunk.  Each 128 KB slice is
+            # read from the stream, compressed, and sent immediately.
+            # file_end MUST be sent even on error, otherwise the guest agent
+            # is left waiting for more chunks (stuck state).
+            chunk_size = constants.FILE_TRANSFER_CHUNK_SIZE
+            compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
+            loop = asyncio.get_running_loop()
+            try:
+                while True:
+                    # Offload to thread pool: content may be a SpooledTemporaryFile
+                    # that has spilled to disk, blocking the event loop.
+                    input_chunk = await loop.run_in_executor(None, content.read, chunk_size)
+                    if not input_chunk:
+                        break
+                    compressed = compressor.compress(input_chunk)
+                    if compressed:
+                        chunk_b64 = base64.b64encode(compressed).decode("ascii")
+                        chunk_frame = (
+                            json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
+                        )
+                        await self.channel.enqueue_raw(chunk_frame)
+
+                # Flush remaining compressed data from the compressor
+                remaining = compressor.flush()
+                if remaining:
+                    chunk_b64 = base64.b64encode(remaining).decode("ascii")
+                    chunk_frame = (
+                        json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
+                    )
+                    await self.channel.enqueue_raw(chunk_frame)
+            finally:
+                # Always send file_end so the guest agent exits its chunk loop.
+                # Suppress errors: channel may already be broken.
+                with contextlib.suppress(Exception):
+                    end_frame = json.dumps({"action": "file_end", "op_id": op_id}).encode() + b"\n"
+                    await self.channel.enqueue_raw(end_frame)
+
+            # Await ack from op_queue
+            response = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+
+            if isinstance(response, StreamingErrorMessage):
+                raise VmPermanentError(
+                    f"write_file failed for '{path}': [{response.error_type}] {response.message}",
+                    context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
+                )
+
+            if not isinstance(response, FileWriteAckMessage):
+                raise VmPermanentError(
+                    f"write_file unexpected response type: {type(response).__name__}",
+                    context={"vm_id": self.vm_id, "path": path},
+                )
+
         except TimeoutError as e:
             raise VmTransientError(
                 f"VM {self.vm_id} write_file timed out for '{path}'",
@@ -589,27 +650,29 @@ class QemuVM:
                 f"VM {self.vm_id} write_file communication failed: {e}",
                 context={"vm_id": self.vm_id, "path": path},
             ) from e
+        finally:
+            await self.channel.unregister_op(op_id)
 
-        if isinstance(response, StreamingErrorMessage):
-            raise VmPermanentError(
-                f"write_file failed for '{path}': [{response.error_type}] {response.message}",
-                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
-            )
+    async def read_file(self, path: str, *, destination: Path) -> None:
+        """Read a file from the sandbox via streaming zstd-compressed chunks.
 
-        if not isinstance(response, FileWriteAckMessage):
-            raise VmPermanentError(
-                f"write_file unexpected response type: {type(response).__name__}",
-                context={"vm_id": self.vm_id, "path": path},
-            )
+        Protocol:
+        1. Send ReadFileRequest (with op_id)
+        2. Receive FileChunkResponseMessage messages (zstd-compressed)
+        3. Receive FileReadCompleteMessage (end of stream)
 
-    async def read_file(self, path: str) -> bytes:
-        """Read a file from the sandbox via guest agent.
+        Each compressed chunk is decompressed immediately on arrival and
+        written to a temp sibling of *destination* (``<dest>.<op_id>.tmp``).
+        The op_id suffix prevents collisions between concurrent transfers
+        targeting the same destination.  On success the temp file is
+        atomically renamed to *destination*, so readers never see a
+        partial / corrupted file.  On error the temp file is removed.
+        Peak memory is bounded by queue depths (4 items x ~200KB = ~800KB),
+        not file size.
 
         Args:
-            path: Relative path in sandbox (max 255 chars)
-
-        Returns:
-            Raw file content as bytes
+            path: Relative path in sandbox (PATH_MAX 4096, NAME_MAX 255 per component)
+            destination: Local file path to stream decompressed content into
 
         Raises:
             VmPermanentError: On not-found or validation failure
@@ -617,11 +680,53 @@ class QemuVM:
         """
         import base64  # noqa: PLC0415
 
-        request = ReadFileRequest(path=path)
+        op_id = uuid4().hex
+        # Temp path scoped by op_id: foo.bin -> foo.bin.<op_id>.tmp
+        # Prevents collisions when concurrent reads target the same destination.
+        tmp_dest = destination.with_suffix(f"{destination.suffix}.{op_id}.tmp")
 
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            response = await self.channel.send_request(request, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+            op_queue = await self.channel.register_op(op_id)
+
+            # Send read request
+            request = ReadFileRequest(op_id=op_id, path=path)
+            request_bytes = request.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
+            await self.channel.enqueue_raw(request_bytes)
+
+            # Stream decompressed chunks to .tmp file.
+            # All disk I/O is offloaded to the thread pool to avoid blocking
+            # the event loop (decompressed chunks can be large).
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: destination.parent.mkdir(parents=True, exist_ok=True))
+            sink = await loop.run_in_executor(None, tmp_dest.open, "wb")
+            decompressor = zstd.ZstdDecompressor()
+            try:
+                while True:
+                    msg = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+
+                    if isinstance(msg, FileChunkResponseMessage):
+                        compressed_chunk = base64.b64decode(msg.data)
+                        decompressed = decompressor.decompress(compressed_chunk)
+                        await loop.run_in_executor(None, sink.write, decompressed)
+                    elif isinstance(msg, FileReadCompleteMessage):
+                        break
+                    elif isinstance(msg, StreamingErrorMessage):
+                        raise VmPermanentError(
+                            f"read_file failed for '{path}': [{msg.error_type}] {msg.message}",
+                            context={"vm_id": self.vm_id, "path": path, "error_type": msg.error_type},
+                        )
+                    else:
+                        raise VmPermanentError(
+                            f"read_file unexpected message type: {type(msg).__name__}",
+                            context={"vm_id": self.vm_id, "path": path},
+                        )
+            finally:
+                await loop.run_in_executor(None, sink.close)
+
+            # Atomic rename — readers never see a partial file.
+            await loop.run_in_executor(None, tmp_dest.rename, destination)
+
         except TimeoutError as e:
             raise VmTransientError(
                 f"VM {self.vm_id} read_file timed out for '{path}'",
@@ -632,20 +737,10 @@ class QemuVM:
                 f"VM {self.vm_id} read_file communication failed: {e}",
                 context={"vm_id": self.vm_id, "path": path},
             ) from e
-
-        if isinstance(response, StreamingErrorMessage):
-            raise VmPermanentError(
-                f"read_file failed for '{path}': [{response.error_type}] {response.message}",
-                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
-            )
-
-        if not isinstance(response, FileContentMessage):
-            raise VmPermanentError(
-                f"read_file unexpected response type: {type(response).__name__}",
-                context={"vm_id": self.vm_id, "path": path},
-            )
-
-        return base64.b64decode(response.content_base64)
+        finally:
+            # Clean up partial .tmp on any failure (no-op after successful rename)
+            tmp_dest.unlink(missing_ok=True)
+            await self.channel.unregister_op(op_id)
 
     async def list_files(self, path: str = "") -> list[FileInfo]:
         """List files in a sandbox directory via guest agent.

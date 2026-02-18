@@ -28,6 +28,7 @@ regex = "1.10"
 once_cell = "1.19" # Replaced lazy_static for faster initialization
 libc = "0.2" # For PID 1 zombie reaping (waitpid)
 base64 = "0.22" # For file I/O content encoding
+zstd = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = "z"   # Optimize for size

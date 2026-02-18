@@ -692,7 +692,7 @@ class SnapshotManager:
         if not packages:
             return
 
-        # Send install_packages command via TCP channel
+        # Send install_packages command via guest agent channel
         request = InstallPackagesRequest(
             language=language,
             packages=packages,

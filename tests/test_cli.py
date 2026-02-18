@@ -1361,7 +1361,11 @@ class TestCliFileIoIntegration:
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_session = AsyncMock()
             mock_session.exec.return_value = mock_result
-            mock_session.read_file.return_value = b"downloaded"
+
+            async def _fake_read(path: str, *, destination: Path) -> None:
+                destination.write_bytes(b"downloaded")
+
+            mock_session.read_file.side_effect = _fake_read
             mock_session.__aenter__.return_value = mock_session
             mock_session.__aexit__.return_value = None
 
@@ -1378,7 +1382,7 @@ class TestCliFileIoIntegration:
                 )
 
                 assert result.exit_code == 0
-                mock_session.read_file.assert_called_once_with("out.csv")
+                mock_session.read_file.assert_called_once_with("out.csv", destination=Path("result.csv"))
                 assert Path("result.csv").read_bytes() == b"downloaded"
 
     def test_download_shorthand_writes_to_basename(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
@@ -1386,7 +1390,11 @@ class TestCliFileIoIntegration:
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_session = AsyncMock()
             mock_session.exec.return_value = mock_result
-            mock_session.read_file.return_value = b"data"
+
+            async def _fake_read(path: str, *, destination: Path) -> None:
+                destination.write_bytes(b"data")
+
+            mock_session.read_file.side_effect = _fake_read
             mock_session.__aenter__.return_value = mock_session
             mock_session.__aexit__.return_value = None
 
@@ -1403,7 +1411,7 @@ class TestCliFileIoIntegration:
                 )
 
                 assert result.exit_code == 0
-                mock_session.read_file.assert_called_once_with("subdir/output.csv")
+                mock_session.read_file.assert_called_once_with("subdir/output.csv", destination=Path("output.csv"))
                 assert Path("output.csv").read_bytes() == b"data"
 
     def test_upload_and_download_together(
@@ -1416,7 +1424,11 @@ class TestCliFileIoIntegration:
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_session = AsyncMock()
             mock_session.exec.return_value = mock_result
-            mock_session.read_file.return_value = b"result"
+
+            async def _fake_read(path: str, *, destination: Path) -> None:
+                destination.write_bytes(b"result")
+
+            mock_session.read_file.side_effect = _fake_read
             mock_session.__aenter__.return_value = mock_session
             mock_session.__aexit__.return_value = None
 
@@ -1441,7 +1453,7 @@ class TestCliFileIoIntegration:
 
                 assert result.exit_code == 0
                 mock_session.write_file.assert_called_once()
-                mock_session.read_file.assert_called_once_with("output.txt")
+                mock_session.read_file.assert_called_once_with("output.txt", destination=Path("result.txt"))
                 assert Path("result.txt").read_bytes() == b"result"
 
     def test_no_file_io_uses_direct_path(self, runner: CliRunner, mock_result: ExecutionResult) -> None:

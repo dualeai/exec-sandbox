@@ -219,7 +219,7 @@ class SnapshotError(SandboxError):
 class CommunicationError(SandboxError):
     """Guest communication failed.
 
-    Raised when communication with the guest VM fails, including TCP
+    Raised when communication with the guest VM fails, including
     connection errors, protocol errors, or guest agent unavailability.
     """
 

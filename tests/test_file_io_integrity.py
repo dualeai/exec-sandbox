@@ -11,9 +11,11 @@ All tests require a real VM via the scheduler fixture.
 
 import hashlib
 import os
+from pathlib import Path
 
 import pytest
 
+from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
@@ -21,7 +23,9 @@ from exec_sandbox.scheduler import Scheduler
 # TestFileIoRoundtrip - Write -> Read with SHA256 verification
 # =============================================================================
 
-# Parametrize sizes: 0B, 1B, 100B, 1KB, 10KB, 100KB, 1MB
+_CHUNK = FILE_TRANSFER_CHUNK_SIZE
+
+# Parametrize sizes: 0B, 1B, 100B, 1KB, 10KB, 100KB, chunk boundaries, 1MB
 ROUNDTRIP_SIZES = [
     (0, "0B"),
     (1, "1B"),
@@ -29,6 +33,11 @@ ROUNDTRIP_SIZES = [
     (1024, "1KB"),
     (10 * 1024, "10KB"),
     (100 * 1024, "100KB"),
+    (_CHUNK - 1, "chunk-1"),
+    (_CHUNK, "chunk"),
+    (_CHUNK + 1, "chunk+1"),
+    (2 * _CHUNK, "2chunks"),
+    (2 * _CHUNK + 1, "2chunks+1"),
     (1024 * 1024, "1MB"),
 ]
 
@@ -41,15 +50,17 @@ class TestFileIoRoundtrip:
         ROUNDTRIP_SIZES,
         ids=[label for _, label in ROUNDTRIP_SIZES],
     )
-    async def test_roundtrip_integrity(self, scheduler: Scheduler, size: int, label: str) -> None:
+    async def test_roundtrip_integrity(self, scheduler: Scheduler, size: int, label: str, tmp_path: Path) -> None:
         """Write random bytes, read back, verify SHA256 hash matches."""
         content = os.urandom(size) if size > 0 else b""
         expected_hash = hashlib.sha256(content).hexdigest()
+        dest = tmp_path / f"roundtrip_{label}.bin"
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file(f"roundtrip_{label}.bin", content)
-            result = await session.read_file(f"roundtrip_{label}.bin")
+            await session.read_file(f"roundtrip_{label}.bin", destination=dest)
 
+        result = dest.read_bytes()
         actual_hash = hashlib.sha256(result).hexdigest()
 
         assert len(result) == size, f"[{label}] Size mismatch: got {len(result)}, expected {size}"
@@ -66,30 +77,32 @@ class TestFileIoRoundtrip:
 class TestFileContentTypes:
     """Tests for various content types surviving the write/read roundtrip."""
 
-    async def test_ascii_roundtrip(self, scheduler: Scheduler) -> None:
+    async def test_ascii_roundtrip(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Plain ASCII text survives roundtrip."""
         content = b"Hello, World! The quick brown fox jumps over the lazy dog. 0123456789"
         expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("ascii.txt", content)
-            result = await session.read_file("ascii.txt")
+            await session.read_file("ascii.txt", destination=tmp_path / "ascii.txt")
 
+        result = (tmp_path / "ascii.txt").read_bytes()
         assert result == content
         assert hashlib.sha256(result).hexdigest() == expected_hash
 
-    async def test_binary_roundtrip(self, scheduler: Scheduler) -> None:
+    async def test_binary_roundtrip(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Random binary data survives roundtrip."""
         content = os.urandom(4096)
         expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("binary.bin", content)
-            result = await session.read_file("binary.bin")
+            await session.read_file("binary.bin", destination=tmp_path / "binary.bin")
 
+        result = (tmp_path / "binary.bin").read_bytes()
         assert hashlib.sha256(result).hexdigest() == expected_hash
 
-    async def test_utf8_emoji_and_cjk(self, scheduler: Scheduler) -> None:
+    async def test_utf8_emoji_and_cjk(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """UTF-8 content with emoji and CJK characters survives roundtrip."""
         text = "Hello World cafe\u0301 \u00f1 \u4f60\u597d \U0001f389\U0001f680\U0001f30d \u3053\u3093\u306b\u3061\u306f \ud55c\uad6d\uc5b4"
         content = text.encode("utf-8")
@@ -97,45 +110,49 @@ class TestFileContentTypes:
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("utf8.txt", content)
-            result = await session.read_file("utf8.txt")
+            await session.read_file("utf8.txt", destination=tmp_path / "utf8.txt")
 
+        result = (tmp_path / "utf8.txt").read_bytes()
         assert result == content
         assert hashlib.sha256(result).hexdigest() == expected_hash
 
-    async def test_null_bytes_in_content(self, scheduler: Scheduler) -> None:
+    async def test_null_bytes_in_content(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Content containing null bytes survives roundtrip."""
         content = b"before\x00middle\x00\x00after\x00"
         expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("nulls.bin", content)
-            result = await session.read_file("nulls.bin")
+            await session.read_file("nulls.bin", destination=tmp_path / "nulls.bin")
 
+        result = (tmp_path / "nulls.bin").read_bytes()
         assert result == content
         assert hashlib.sha256(result).hexdigest() == expected_hash
 
-    async def test_all_256_byte_values(self, scheduler: Scheduler) -> None:
+    async def test_all_256_byte_values(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """All 256 possible byte values survive roundtrip."""
         content = bytes(range(256))
         expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("all_bytes.bin", content)
-            result = await session.read_file("all_bytes.bin")
+            await session.read_file("all_bytes.bin", destination=tmp_path / "all_bytes.bin")
 
+        result = (tmp_path / "all_bytes.bin").read_bytes()
         assert result == content
         assert len(result) == 256
         assert hashlib.sha256(result).hexdigest() == expected_hash
 
-    async def test_newline_variants_survive(self, scheduler: Scheduler) -> None:
+    async def test_newline_variants_survive(self, scheduler: Scheduler, tmp_path: Path) -> None:
         r"""Various newline styles (\n, \r\n, \r) survive roundtrip unchanged."""
         content = b"unix\nwindows\r\nold-mac\rtrailing\n"
         expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("newlines.txt", content)
-            result = await session.read_file("newlines.txt")
+            await session.read_file("newlines.txt", destination=tmp_path / "newlines.txt")
 
+        result = (tmp_path / "newlines.txt").read_bytes()
         assert result == content
         assert hashlib.sha256(result).hexdigest() == expected_hash
         # Verify no newline translation occurred
@@ -166,21 +183,23 @@ class TestCrossOperationVerification:
             assert result.exit_code == 0
             assert "Hello from write_file API" in result.stdout
 
-    async def test_exec_writes_then_read_file(self, scheduler: Scheduler) -> None:
+    async def test_exec_writes_then_read_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """File written by session.exec is readable via read_file."""
+        dest = tmp_path / "from_exec.txt"
         async with await scheduler.session(language=Language.PYTHON) as session:
             result = await session.exec(
                 'with open("/home/user/from_exec.txt", "wb") as f:\n    f.write(b"Hello from exec")'
             )
             assert result.exit_code == 0
 
-            data = await session.read_file("from_exec.txt")
+            await session.read_file("from_exec.txt", destination=dest)
 
-        assert data == b"Hello from exec"
+        assert dest.read_bytes() == b"Hello from exec"
 
-    async def test_write_file_exec_modifies_read_file(self, scheduler: Scheduler) -> None:
+    async def test_write_file_exec_modifies_read_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write via API, modify via exec, read back via API."""
         original = b"original content"
+        dest = tmp_path / "modify_me.txt"
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Write original via API
@@ -196,9 +215,9 @@ class TestCrossOperationVerification:
             assert result.exit_code == 0
 
             # Read back via API
-            data = await session.read_file("modify_me.txt")
+            await session.read_file("modify_me.txt", destination=dest)
 
-        assert data == b"original content plus exec"
+        assert dest.read_bytes() == b"original content plus exec"
 
     async def test_write_binary_exec_verifies_hash(self, scheduler: Scheduler) -> None:
         """Write binary via API, exec computes SHA256, verify it matches."""
@@ -243,15 +262,16 @@ class TestFileIoBasicOperations:
         assert entry.is_dir is False
         assert entry.size == len(content)
 
-    async def test_write_to_subdirectory(self, scheduler: Scheduler) -> None:
+    async def test_write_to_subdirectory(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Writing to a subdirectory path creates intermediate directories."""
         content = b"nested content"
+        dest = tmp_path / "nested_file.txt"
 
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("subdir/nested/file.txt", content)
-            result = await session.read_file("subdir/nested/file.txt")
+            await session.read_file("subdir/nested/file.txt", destination=dest)
 
-        assert result == content
+        assert dest.read_bytes() == content
 
     async def test_list_subdirectory(self, scheduler: Scheduler) -> None:
         """list_files on a subdirectory returns its contents."""
@@ -264,14 +284,15 @@ class TestFileIoBasicOperations:
         assert "a.txt" in names
         assert "b.txt" in names
 
-    async def test_overwrite_file(self, scheduler: Scheduler) -> None:
+    async def test_overwrite_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Overwriting a file replaces its content entirely."""
+        dest = tmp_path / "overwrite.txt"
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("overwrite.txt", b"first version")
             await session.write_file("overwrite.txt", b"second version")
-            result = await session.read_file("overwrite.txt")
+            await session.read_file("overwrite.txt", destination=dest)
 
-        assert result == b"second version"
+        assert dest.read_bytes() == b"second version"
 
     async def test_make_executable(self, scheduler: Scheduler) -> None:
         """File written with make_executable=True can be executed."""

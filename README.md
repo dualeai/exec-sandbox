@@ -477,7 +477,7 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 | Max packages | 50 |
 | Max env vars | 100 |
 | Max exposed ports | 10 |
-| Max file size (I/O) | 10MB |
+| Max file size (I/O) | 50MB |
 | Max file path length | 255 chars |
 | Execution timeout | 1-300s |
 | VM memory | 128-2048MB |

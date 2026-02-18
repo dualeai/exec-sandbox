@@ -41,7 +41,7 @@ const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install outp
 const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 
 // Connection limits
-const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max request JSON (10MB file → 13.3MB base64)
+const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max single request JSON (streaming chunks are ~90KB each)
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
 const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
@@ -73,9 +73,18 @@ const FLUSH_INTERVAL_MS: u64 = 50; // 50ms flush interval (not 1s - too slow for
 const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB max buffer before forced flush
 
 // File I/O limits
-const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB max file size (must match Python MAX_FILE_SIZE_BYTES)
-const MAX_FILE_PATH_LENGTH: usize = 255; // POSIX NAME_MAX
+const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024; // 500 MiB max file size (must match Python MAX_FILE_SIZE_BYTES)
+const MAX_FILE_PATH_LENGTH: usize = 4096; // POSIX PATH_MAX (full relative path)
+const MAX_FILE_NAME_BYTES: usize = 255; // POSIX NAME_MAX (single component, in bytes)
 const SANDBOX_ROOT: &str = "/home/user"; // Sandbox root directory
+
+// File transfer streaming
+// 128KB balances fewer frames (halves syscalls, JSON parses, base64 en/decodes vs 64KB)
+// while staying within virtio queue depth (128-256 descriptors). On-wire size after
+// base64+JSON is ~175KB per frame. The kernel virtio-vsock 4KB→64KB patch (v5.4) showed
+// the biggest throughput win; 64KB→128KB reduces per-transfer CPU overhead further.
+const FILE_TRANSFER_CHUNK_SIZE: usize = 128 * 1024;
+const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
 
 // Graceful termination configuration
 // - First send SIGTERM to allow process to cleanup (Python atexit, temp files, etc.)
@@ -467,14 +476,20 @@ enum GuestCommand {
 
     #[serde(rename = "write_file")]
     WriteFile {
+        op_id: String,
         path: String,
-        content_base64: String,
         #[serde(default)]
         make_executable: bool,
     },
 
     #[serde(rename = "read_file")]
-    ReadFile { path: String },
+    ReadFile { op_id: String, path: String },
+
+    #[serde(rename = "file_chunk")]
+    FileChunk { op_id: String, data: String },
+
+    #[serde(rename = "file_end")]
+    FileEnd { op_id: String },
 
     #[serde(rename = "list_files")]
     ListFiles {
@@ -516,6 +531,8 @@ struct StreamingError {
     message: String,
     error_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    op_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
 }
 
@@ -523,17 +540,26 @@ struct StreamingError {
 struct FileWriteAck {
     #[serde(rename = "type")]
     msg_type: String, // "file_write_ack"
+    op_id: String,
     path: String,
     bytes_written: usize,
 }
 
 #[derive(Debug, Serialize)]
-struct FileContent {
+struct FileChunkResponse {
     #[serde(rename = "type")]
-    msg_type: String, // "file_content"
+    msg_type: String, // "file_chunk"
+    op_id: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FileReadComplete {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_read_complete"
+    op_id: String,
     path: String,
-    content_base64: String,
-    size: usize,
+    size: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -551,16 +577,59 @@ struct FileList {
     entries: Vec<FileEntry>,
 }
 
+/// Wrapper that counts bytes written and enforces a size limit.
+struct CountingWriter<W> {
+    inner: W,
+    count: usize,
+    limit: usize,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.count + buf.len() > self.limit {
+            return Err(std::io::Error::other("file size limit exceeded"));
+        }
+        let n = self.inner.write(buf)?;
+        self.count += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// State for an in-progress streaming file write operation.
+struct WriteFileState {
+    decoder: zstd::stream::write::Decoder<'static, CountingWriter<std::fs::File>>,
+    tmp_path: std::path::PathBuf,
+    final_path: std::path::PathBuf,
+    make_executable: bool,
+    op_id: String,
+    path_display: String, // relative path for error messages
+    finished: bool,
+}
+
+impl Drop for WriteFileState {
+    fn drop(&mut self) {
+        // Clean up temp file if write was not completed (error/disconnect)
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
 // Helper to send streaming error via queue
 async fn send_streaming_error(
     write_tx: &mpsc::Sender<Vec<u8>>,
     message: String,
     error_type: &str,
+    op_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let error = StreamingError {
         msg_type: "error".to_string(),
         message,
         error_type: error_type.to_string(),
+        op_id: op_id.map(|s| s.to_string()),
         version: Some(VERSION.to_string()),
     };
     let json = serde_json::to_string(&error)?;
@@ -600,6 +669,7 @@ async fn install_packages(
                 language
             ),
             "validation_error",
+            None,
         ).await?;
         return Ok(());
     }
@@ -610,6 +680,7 @@ async fn install_packages(
             write_tx,
             "No packages specified for installation".to_string(),
             "validation_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -625,6 +696,7 @@ async fn install_packages(
                 MAX_PACKAGES
             ),
             "validation_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -638,6 +710,7 @@ async fn install_packages(
                 write_tx,
                 "Package name cannot be empty".to_string(),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -653,6 +726,7 @@ async fn install_packages(
                     MAX_PACKAGE_NAME_LENGTH
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -667,6 +741,7 @@ async fn install_packages(
                     pkg
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -678,6 +753,7 @@ async fn install_packages(
                 write_tx,
                 "Package name contains null byte".to_string(),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -692,6 +768,7 @@ async fn install_packages(
                     pkg
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -706,6 +783,7 @@ async fn install_packages(
                     pkg
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -757,6 +835,7 @@ async fn install_packages(
                 write_tx,
                 format!("Failed to execute package manager for {}: {}", language, e),
                 "execution_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -831,6 +910,7 @@ async fn install_packages(
                 write_tx,
                 format!("Process wait error: {}", e),
                 "execution_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -845,6 +925,7 @@ async fn install_packages(
                     PACKAGE_INSTALL_TIMEOUT_SECONDS
                 ),
                 "timeout_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -963,7 +1044,19 @@ fn validate_file_path(relative_path: &str) -> Result<std::path::PathBuf, String>
 
     for component in std::path::Path::new(relative_path).components() {
         match component {
-            std::path::Component::Normal(c) => resolved.push(c),
+            std::path::Component::Normal(c) => {
+                // Per-component byte-length check (NAME_MAX = 255 bytes).
+                // ext4/xfs count UTF-8 bytes, not characters, so a filename
+                // of 100 CJK chars (300 bytes) would exceed the limit.
+                let name_bytes = c.as_encoded_bytes().len();
+                if name_bytes > MAX_FILE_NAME_BYTES {
+                    return Err(format!(
+                        "Filename component too long: {} bytes (max {})",
+                        name_bytes, MAX_FILE_NAME_BYTES
+                    ));
+                }
+                resolved.push(c);
+            }
             std::path::Component::ParentDir => {
                 // Go up one level, but never above sandbox root
                 if !resolved.pop() || !resolved.starts_with(&sandbox_root) {
@@ -983,124 +1076,9 @@ fn validate_file_path(relative_path: &str) -> Result<std::path::PathBuf, String>
     Ok(resolved)
 }
 
-/// Handle write_file command: decode base64, write to disk.
-async fn handle_write_file(
-    path: &str,
-    content_base64: &str,
-    make_executable: bool,
-    write_tx: &mpsc::Sender<Vec<u8>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate path
-    let resolved_path = match validate_file_path(path) {
-        Ok(p) => p,
-        Err(e) => {
-            send_streaming_error(
-                write_tx,
-                format!("Invalid path '{}': {}", path, e),
-                "validation_error",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    // Reject sandbox root itself (can't write to a directory path)
-    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        send_streaming_error(
-            write_tx,
-            "Cannot write to sandbox root directory".to_string(),
-            "validation_error",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // Decode base64
-    let content = match BASE64.decode(content_base64) {
-        Ok(c) => c,
-        Err(e) => {
-            send_streaming_error(
-                write_tx,
-                format!("Invalid base64: {}", e),
-                "validation_error",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    // Check file size
-    if content.len() > MAX_FILE_SIZE_BYTES {
-        send_streaming_error(
-            write_tx,
-            format!(
-                "File too large: {} bytes (max {})",
-                content.len(),
-                MAX_FILE_SIZE_BYTES
-            ),
-            "validation_error",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // Create parent directories
-    if let Some(parent) = resolved_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        send_streaming_error(
-            write_tx,
-            format!("Failed to create directories: {}", e),
-            "io_error",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // Write file
-    let bytes_written = content.len();
-    if let Err(e) = tokio::fs::write(&resolved_path, &content).await {
-        send_streaming_error(write_tx, format!("Failed to write file: {}", e), "io_error").await?;
-        return Ok(());
-    }
-
-    // Set permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if make_executable { 0o755 } else { 0o644 };
-        if let Err(e) =
-            tokio::fs::set_permissions(&resolved_path, std::fs::Permissions::from_mode(mode)).await
-        {
-            send_streaming_error(
-                write_tx,
-                format!("Failed to set permissions: {}", e),
-                "io_error",
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-
-    // Send ack
-    let ack = FileWriteAck {
-        msg_type: "file_write_ack".to_string(),
-        path: path.to_string(),
-        bytes_written,
-    };
-    let json = serde_json::to_string(&ack)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
-
-    Ok(())
-}
-
-/// Handle read_file command: read from disk, encode base64.
+/// Handle read_file command: read from disk, stream as zstd-compressed chunks.
 async fn handle_read_file(
+    op_id: &str,
     path: &str,
     write_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1112,6 +1090,7 @@ async fn handle_read_file(
                 write_tx,
                 format!("Invalid path '{}': {}", path, e),
                 "validation_error",
+                Some(op_id),
             )
             .await?;
             return Ok(());
@@ -1124,6 +1103,7 @@ async fn handle_read_file(
             write_tx,
             "Cannot read a directory".to_string(),
             "validation_error",
+            Some(op_id),
         )
         .await?;
         return Ok(());
@@ -1137,6 +1117,7 @@ async fn handle_read_file(
                 write_tx,
                 format!("File not found or inaccessible '{}': {}", path, e),
                 "io_error",
+                Some(op_id),
             )
             .await?;
             return Ok(());
@@ -1151,6 +1132,7 @@ async fn handle_read_file(
             write_tx,
             format!("Path '{}' resolves outside sandbox", path),
             "validation_error",
+            Some(op_id),
         )
         .await?;
         return Ok(());
@@ -1164,6 +1146,7 @@ async fn handle_read_file(
                 write_tx,
                 format!("Cannot read '{}': {}", path, e),
                 "io_error",
+                Some(op_id),
             )
             .await?;
             return Ok(());
@@ -1175,6 +1158,7 @@ async fn handle_read_file(
             write_tx,
             format!("'{}' is a directory, not a file", path),
             "validation_error",
+            Some(op_id),
         )
         .await?;
         return Ok(());
@@ -1190,38 +1174,81 @@ async fn handle_read_file(
                 MAX_FILE_SIZE_BYTES
             ),
             "validation_error",
+            Some(op_id),
         )
         .await?;
         return Ok(());
     }
 
-    // Read file content, then encode base64 (drop raw bytes via scoping)
-    let size = metadata.len() as usize;
-    let content_base64 = {
-        let raw = match tokio::fs::read(&canonical_path).await {
-            Ok(r) => r,
+    // Read file content (sync) -> stream as compressed chunks
+    let file_size = metadata.len();
+    let file = match std::fs::File::open(&canonical_path) {
+        Ok(f) => f,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Failed to read '{}': {}", path, e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut encoder = match zstd::stream::read::Encoder::new(file, FILE_TRANSFER_ZSTD_LEVEL) {
+        Ok(e) => e,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Compression init failed for '{}': {}", path, e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut buf = vec![0u8; FILE_TRANSFER_CHUNK_SIZE];
+    loop {
+        let n = match std::io::Read::read(&mut encoder, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
             Err(e) => {
                 send_streaming_error(
                     write_tx,
-                    format!("Failed to read '{}': {}", path, e),
+                    format!("Compression error: {}", e),
                     "io_error",
+                    Some(op_id),
                 )
                 .await?;
                 return Ok(());
             }
         };
-        BASE64.encode(&raw)
-        // raw is dropped here, freeing memory before JSON serialization
-    };
+        let chunk_b64 = BASE64.encode(&buf[..n]);
+        let chunk_msg = FileChunkResponse {
+            msg_type: "file_chunk".to_string(),
+            op_id: op_id.to_string(),
+            data: chunk_b64,
+        };
+        let json = serde_json::to_string(&chunk_msg)?;
+        let mut response = json.into_bytes();
+        response.push(b'\n');
+        write_tx
+            .send(response)
+            .await
+            .map_err(|_| "Write queue closed")?;
+    }
 
-    // Send response
-    let response_msg = FileContent {
-        msg_type: "file_content".to_string(),
+    // Send completion
+    let complete_msg = FileReadComplete {
+        msg_type: "file_read_complete".to_string(),
+        op_id: op_id.to_string(),
         path: path.to_string(),
-        content_base64,
-        size,
+        size: file_size,
     };
-    let json = serde_json::to_string(&response_msg)?;
+    let json = serde_json::to_string(&complete_msg)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
     write_tx
@@ -1245,6 +1272,7 @@ async fn handle_list_files(
                 write_tx,
                 format!("Invalid path '{}': {}", path, e),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -1259,6 +1287,7 @@ async fn handle_list_files(
                 write_tx,
                 format!("Cannot list '{}': {}", path, e),
                 "io_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -1519,7 +1548,7 @@ async fn execute_code_streaming(
 
     // Validate params
     if let Err(error_message) = validate_execute_params(language, code, timeout, env_vars) {
-        send_streaming_error(write_tx, error_message, "validation_error").await?;
+        send_streaming_error(write_tx, error_message, "validation_error", None).await?;
         return Ok(());
     }
 
@@ -1583,6 +1612,7 @@ async fn execute_code_streaming(
             write_tx,
             format!("Failed to send code to REPL: {}", e),
             "execution_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -1595,6 +1625,7 @@ async fn execute_code_streaming(
             write_tx,
             format!("Failed to send code to REPL: {}", e),
             "execution_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -1607,6 +1638,7 @@ async fn execute_code_streaming(
             write_tx,
             format!("Failed to send code to REPL: {}", e),
             "execution_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -1796,6 +1828,7 @@ async fn execute_code_streaming(
                 write_tx,
                 format!("Execution timeout after {}s", timeout),
                 "timeout_error",
+                None,
             )
             .await?;
         }
@@ -1968,6 +2001,9 @@ async fn handle_connection_nonblocking(
         }
     });
 
+    // Active streaming file write operations
+    let mut active_writes: HashMap<String, WriteFileState> = HashMap::new();
+
     // Main loop: read requests, queue responses
     let mut line = String::new();
     let result = loop {
@@ -2009,6 +2045,7 @@ async fn handle_connection_nonblocking(
                     bytes_read, MAX_REQUEST_SIZE_BYTES
                 ),
                 "request_error",
+                None,
             )
             .await;
             continue;
@@ -2068,26 +2105,233 @@ async fn handle_connection_nonblocking(
                 }
             }
             Ok(GuestCommand::WriteFile {
+                op_id,
                 path,
-                content_base64,
                 make_executable,
             }) => {
                 eprintln!(
-                    "Processing: write_file (path={}, content_size={}, executable={})",
-                    path,
-                    content_base64.len(),
-                    make_executable
+                    "Processing: write_file (op_id={}, path={}, executable={})",
+                    op_id, path, make_executable
                 );
-                if handle_write_file(&path, &content_base64, make_executable, &write_tx)
-                    .await
-                    .is_err()
+                // Validate path
+                let resolved_path = match validate_file_path(&path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Invalid path '{}': {}", path, e),
+                            "validation_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                // Reject sandbox root itself
+                if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        "Cannot write to sandbox root directory".to_string(),
+                        "validation_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
+                }
+                // Create parent directories (sync)
+                if let Some(parent) = resolved_path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
                 {
-                    break Err("write_file failed".into());
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!("Failed to create directories: {}", e),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
+                }
+                // Temp path: <dir>/.wr.<op_id>.tmp (40 chars max).
+                // Lives in the same directory for atomic rename (same filesystem).
+                // Uses a fixed-length name to avoid NAME_MAX overflow when the
+                // target filename is already near 255 bytes.
+                let tmp_path = resolved_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new(SANDBOX_ROOT))
+                    .join(format!(".wr.{}.tmp", op_id));
+                let file = match std::fs::File::create(&tmp_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Failed to create temp file: {}", e),
+                            "io_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let counting_writer = CountingWriter {
+                    inner: file,
+                    count: 0,
+                    limit: MAX_FILE_SIZE_BYTES,
+                };
+                let decoder = match zstd::stream::write::Decoder::new(counting_writer) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Decompression init failed: {}", e),
+                            "io_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                active_writes.insert(
+                    op_id.clone(),
+                    WriteFileState {
+                        decoder,
+                        tmp_path,
+                        final_path: resolved_path,
+                        make_executable,
+                        op_id,
+                        path_display: path,
+                        finished: false,
+                    },
+                );
+            }
+            Ok(GuestCommand::FileChunk { op_id, data }) => {
+                let state = match active_writes.get_mut(&op_id) {
+                    Some(s) => s,
+                    None => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("No active write for op_id '{}'", op_id),
+                            "protocol_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let decoded = match BASE64.decode(&data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let path_display = state.path_display.clone();
+                        active_writes.remove(&op_id);
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Invalid base64 in chunk for '{}': {}", path_display, e),
+                            "validation_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                if let Err(e) = std::io::Write::write_all(&mut state.decoder, &decoded) {
+                    let path_display = state.path_display.clone();
+                    active_writes.remove(&op_id);
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!("Write error for '{}': {}", path_display, e),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
                 }
             }
-            Ok(GuestCommand::ReadFile { path }) => {
-                eprintln!("Processing: read_file (path={})", path);
-                if handle_read_file(&path, &write_tx).await.is_err() {
+            Ok(GuestCommand::FileEnd { op_id }) => {
+                let mut state = match active_writes.remove(&op_id) {
+                    Some(s) => s,
+                    None => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("No active write for op_id '{}'", op_id),
+                            "protocol_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                // Finalize zstd frame: flush remaining decompressed data
+                if let Err(e) = std::io::Write::flush(&mut state.decoder) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!(
+                            "Decompression finalize error for '{}': {}",
+                            state.path_display, e
+                        ),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    // state dropped here -> Drop cleans up tmp file
+                    continue;
+                }
+                let bytes_written = state.decoder.get_ref().count;
+                // Set permissions on temp file
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if state.make_executable { 0o755 } else { 0o644 };
+                    if let Err(e) = std::fs::set_permissions(
+                        &state.tmp_path,
+                        std::fs::Permissions::from_mode(mode),
+                    ) {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!(
+                                "Failed to set permissions for '{}': {}",
+                                state.path_display, e
+                            ),
+                            "io_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        // state dropped here -> Drop cleans up tmp file
+                        continue;
+                    }
+                }
+                // Atomic rename
+                if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!(
+                            "Failed to finalize write for '{}': {}",
+                            state.path_display, e
+                        ),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    // state dropped here -> Drop cleans up tmp file
+                    continue;
+                }
+                state.finished = true;
+                // Send ack
+                let ack = FileWriteAck {
+                    msg_type: "file_write_ack".to_string(),
+                    op_id: state.op_id.clone(),
+                    path: state.path_display.clone(),
+                    bytes_written,
+                };
+                let json = serde_json::to_string(&ack).unwrap_or_default();
+                let mut response = json.into_bytes();
+                response.push(b'\n');
+                if write_tx.send(response).await.is_err() {
+                    break Err("write queue closed".into());
+                }
+            }
+            Ok(GuestCommand::ReadFile { op_id, path }) => {
+                eprintln!("Processing: read_file (op_id={}, path={})", op_id, path);
+                if handle_read_file(&op_id, &path, &write_tx).await.is_err() {
                     break Err("read_file failed".into());
                 }
             }
@@ -2103,6 +2347,7 @@ async fn handle_connection_nonblocking(
                     &write_tx,
                     format!("Invalid JSON: {}", e),
                     "request_error",
+                    None,
                 )
                 .await;
             }
@@ -2493,16 +2738,17 @@ mod tests {
 
     #[test]
     fn test_deserialize_write_file() {
-        let json = r#"{"action":"write_file","path":"test.txt","content_base64":"aGVsbG8=","make_executable":false}"#;
+        let json =
+            r#"{"action":"write_file","op_id":"abc123","path":"test.txt","make_executable":false}"#;
         let cmd: GuestCommand = serde_json::from_str(json).unwrap();
         match cmd {
             GuestCommand::WriteFile {
+                op_id,
                 path,
-                content_base64,
                 make_executable,
             } => {
+                assert_eq!(op_id, "abc123");
                 assert_eq!(path, "test.txt");
-                assert_eq!(content_base64, "aGVsbG8=");
                 assert!(!make_executable);
             }
             _ => panic!("Expected WriteFile"),
@@ -2511,10 +2757,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_read_file() {
-        let json = r#"{"action":"read_file","path":"output.csv"}"#;
+        let json = r#"{"action":"read_file","op_id":"def456","path":"output.csv"}"#;
         let cmd: GuestCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            GuestCommand::ReadFile { path } => {
+            GuestCommand::ReadFile { op_id, path } => {
+                assert_eq!(op_id, "def456");
                 assert_eq!(path, "output.csv");
             }
             _ => panic!("Expected ReadFile"),
@@ -2547,7 +2794,8 @@ mod tests {
 
     #[test]
     fn test_deserialize_write_file_executable() {
-        let json = r#"{"action":"write_file","path":"run.sh","content_base64":"IyEvYmluL3No","make_executable":true}"#;
+        let json =
+            r#"{"action":"write_file","op_id":"xyz","path":"run.sh","make_executable":true}"#;
         let cmd: GuestCommand = serde_json::from_str(json).unwrap();
         match cmd {
             GuestCommand::WriteFile {
@@ -2559,6 +2807,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_deserialize_file_chunk() {
+        let json = r#"{"action":"file_chunk","op_id":"abc123","data":"SGVsbG8="}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::FileChunk { op_id, data } => {
+                assert_eq!(op_id, "abc123");
+                assert_eq!(data, "SGVsbG8=");
+            }
+            _ => panic!("Expected FileChunk"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_file_end() {
+        let json = r#"{"action":"file_end","op_id":"abc123"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::FileEnd { op_id } => {
+                assert_eq!(op_id, "abc123");
+            }
+            _ => panic!("Expected FileEnd"),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Response serialization tests
     // -------------------------------------------------------------------------
@@ -2567,26 +2840,65 @@ mod tests {
     fn test_serialize_file_write_ack() {
         let ack = FileWriteAck {
             msg_type: "file_write_ack".to_string(),
+            op_id: "test_op".to_string(),
             path: "test.txt".to_string(),
             bytes_written: 42,
         };
         let json = serde_json::to_string(&ack).unwrap();
         assert!(json.contains("\"type\":\"file_write_ack\""));
+        assert!(json.contains("\"op_id\":\"test_op\""));
         assert!(json.contains("\"bytes_written\":42"));
     }
 
     #[test]
-    fn test_serialize_file_content() {
-        let content = FileContent {
-            msg_type: "file_content".to_string(),
-            path: "data.csv".to_string(),
-            content_base64: "aGVsbG8=".to_string(),
-            size: 5,
+    fn test_serialize_file_chunk_response() {
+        let chunk = FileChunkResponse {
+            msg_type: "file_chunk".to_string(),
+            op_id: "abc123".to_string(),
+            data: "SGVsbG8=".to_string(),
         };
-        let json = serde_json::to_string(&content).unwrap();
-        assert!(json.contains("\"type\":\"file_content\""));
-        assert!(json.contains("\"content_base64\":\"aGVsbG8=\""));
-        assert!(json.contains("\"size\":5"));
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"type\":\"file_chunk\""));
+        assert!(json.contains("\"op_id\":\"abc123\""));
+        assert!(json.contains("\"data\":\"SGVsbG8=\""));
+    }
+
+    #[test]
+    fn test_serialize_file_read_complete() {
+        let msg = FileReadComplete {
+            msg_type: "file_read_complete".to_string(),
+            op_id: "def456".to_string(),
+            path: "data.csv".to_string(),
+            size: 1024,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"file_read_complete\""));
+        assert!(json.contains("\"op_id\":\"def456\""));
+        assert!(json.contains("\"size\":1024"));
+    }
+
+    #[test]
+    fn test_serialize_file_write_ack_with_op_id() {
+        let ack = FileWriteAck {
+            msg_type: "file_write_ack".to_string(),
+            op_id: "abc123".to_string(),
+            path: "test.txt".to_string(),
+            bytes_written: 42,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("\"type\":\"file_write_ack\""));
+        assert!(json.contains("\"op_id\":\"abc123\""));
+        assert!(json.contains("\"bytes_written\":42"));
+    }
+
+    #[test]
+    fn test_zstd_roundtrip() {
+        // Compress
+        let data = vec![42u8; FILE_TRANSFER_CHUNK_SIZE];
+        let compressed = zstd::stream::encode_all(&data[..], FILE_TRANSFER_ZSTD_LEVEL).unwrap();
+        // Decompress
+        let decompressed = zstd::stream::decode_all(&compressed[..]).unwrap();
+        assert_eq!(data, decompressed);
     }
 
     #[test]
