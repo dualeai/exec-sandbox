@@ -203,6 +203,7 @@ while True:
 const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
 const transpiler = new Bun.Transpiler({ loader: 'js', replMode: true });
 const ctx = createContext({
+    Bun,
     console, process, setTimeout, setInterval, clearTimeout, clearInterval,
     Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
     AbortController, AbortSignal, Event, EventTarget,
