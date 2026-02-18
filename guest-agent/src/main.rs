@@ -195,9 +195,13 @@ while True:
 ///
 /// Uses Uint8Array byte-level I/O for correct byte counts with multi-byte UTF-8.
 /// Same length-prefixed stdin protocol and stderr sentinel as Python wrapper.
-/// Awaits promise results from runInContext to handle async functions and rejections.
+/// Uses Bun.Transpiler with replMode for proper REPL semantics: last-expression capture
+/// as `{ value: expr }`, const→var hoisting, top-level await via async IIFE wrapping.
+/// Awaits the returned value if thenable (handles fire-and-forget async calls like `main()`).
+/// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
 const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
+const transpiler = new Bun.Transpiler({ loader: 'js', replMode: true });
 const ctx = createContext({
     console, process, setTimeout, setInterval, clearTimeout, clearInterval,
     Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
@@ -208,6 +212,12 @@ const ctx = createContext({
     module: { exports: {} },
     exports: {},
     __filename: '<exec>', __dirname: '/tmp',
+});
+// Catch unhandled rejections from fire-and-forget promises (e.g. on non-last lines).
+// Sets exitCode so the sentinel reports failure.
+let unhandledRejection = null;
+process.on('unhandledRejection', (reason) => {
+    unhandledRejection = reason;
 });
 const stdin = Bun.stdin.stream();
 const reader = stdin.getReader();
@@ -250,16 +260,34 @@ while (true) {
     const code = await readN(codeLen);
     if (code === null) break;
     let exitCode = 0;
+    unhandledRejection = null;
     try {
-        // Wrap in async IIFE to support top-level await — runInContext
-        // runs code as a Script (not Module) so bare await is a SyntaxError.
-        const wrapped = `(async()=>{${code}\n})()`;
-        const result = runInContext(wrapped, ctx, { filename: '<exec>' });
-        if (result && typeof result.then === 'function') {
-            await result;
+        // Bun.Transpiler with replMode transforms code for REPL semantics:
+        // - Wraps in async IIFE for top-level await support
+        // - Captures last expression as { value: (expr) }
+        // - Converts const/let to var for re-declaration across invocations
+        const transformed = transpiler.transformSync(code);
+        if (transformed.length > 0) {
+            let val = runInContext(transformed, ctx, { filename: '<exec>' });
+            // replMode wraps in async IIFE only when code has top-level await;
+            // otherwise runInContext returns { value: expr } directly.
+            if (val && typeof val.then === 'function') {
+                val = await val;
+            }
+            // If the last expression was a Promise (e.g. `main()`),
+            // await it so async work completes before the sentinel.
+            if (val && val.value && typeof val.value.then === 'function') {
+                await val.value;
+            }
         }
     } catch (e) {
         process.stderr.write((e && e.stack ? e.stack : String(e)) + '\n');
+        exitCode = 1;
+    }
+    // Check for unhandled rejections from non-last-expression promises
+    if (unhandledRejection !== null) {
+        const r = unhandledRejection;
+        process.stderr.write((r && r.stack ? r.stack : String(r)) + '\n');
         exitCode = 1;
     }
     process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
