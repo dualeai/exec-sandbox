@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from exec_sandbox.constants import ASYNC_READ_THRESHOLD_BYTES, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
+from exec_sandbox.constants import MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.guest_agent_protocol import (
     FileWriteAckMessage,
@@ -333,26 +333,23 @@ class TestResolveContentNormal:
         result = await session._resolve_content(b"hello")
         assert result == b"hello"
 
-    async def test_path_small_file_sync_read(self, tmp_path: Path) -> None:
-        """Small file (< ASYNC_READ_THRESHOLD_BYTES) is read synchronously."""
+    async def test_path_small_file_read(self, tmp_path: Path) -> None:
+        """Small file is read via asyncio.to_thread."""
         f = tmp_path / "small.txt"
         f.write_bytes(b"small content")
         session, _, _ = _make_session()
         result = await session._resolve_content(f)
         assert result == b"small content"
 
-    async def test_path_large_file_async_read(self, tmp_path: Path) -> None:
-        """File > ASYNC_READ_THRESHOLD_BYTES uses asyncio.to_thread."""
+    async def test_path_large_file_read(self, tmp_path: Path) -> None:
+        """Large file is read via asyncio.to_thread."""
         f = tmp_path / "large.bin"
-        content = b"x" * (ASYNC_READ_THRESHOLD_BYTES + 1)
+        content = b"x" * (2 * 1024 * 1024)  # 2MB
         f.write_bytes(content)
 
         session, _, _ = _make_session()
-        with patch("exec_sandbox.session.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
-            mock_to_thread.return_value = content
-            result = await session._resolve_content(f)
-            mock_to_thread.assert_awaited_once()
-            assert result == content
+        result = await session._resolve_content(f)
+        assert result == content
 
     async def test_write_file_resolve_before_lock(self, tmp_path: Path) -> None:
         """write_file() resolves Path BEFORE acquiring the exec lock.

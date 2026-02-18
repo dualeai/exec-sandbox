@@ -605,7 +605,7 @@ async def run_code(
                         content = await session.read_file(guest_path)
                         local = Path(local_path)
                         local.parent.mkdir(parents=True, exist_ok=True)
-                        local.write_bytes(content)
+                        await asyncio.to_thread(local.write_bytes, content)
                         if not quiet:
                             click.echo(
                                 click.style(

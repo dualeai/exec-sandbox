@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.constants import ASYNC_READ_THRESHOLD_BYTES, MAX_FILE_SIZE_BYTES
+from exec_sandbox.constants import MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.models import ExecutionResult, FileInfo, TimingBreakdown
 
@@ -131,11 +131,7 @@ class Session:
             file_size = content.stat().st_size
             if file_size > MAX_FILE_SIZE_BYTES:
                 raise ValueError(f"File {content.name} is {file_size} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
-            raw = (
-                await asyncio.to_thread(content.read_bytes)
-                if file_size > ASYNC_READ_THRESHOLD_BYTES
-                else content.read_bytes()
-            )
+            raw = await asyncio.to_thread(content.read_bytes)
             # TOCTOU guard: file may have grown between stat() and read_bytes()
             if len(raw) > MAX_FILE_SIZE_BYTES:
                 raise ValueError(

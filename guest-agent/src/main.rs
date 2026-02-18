@@ -1017,7 +1017,7 @@ async fn handle_write_file(
 
     // Create parent directories
     if let Some(parent) = resolved_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
         send_streaming_error(
             write_tx,
@@ -1030,7 +1030,7 @@ async fn handle_write_file(
 
     // Write file
     let bytes_written = content.len();
-    if let Err(e) = std::fs::write(&resolved_path, &content) {
+    if let Err(e) = tokio::fs::write(&resolved_path, &content).await {
         send_streaming_error(write_tx, format!("Failed to write file: {}", e), "io_error").await?;
         return Ok(());
     }
@@ -1041,7 +1041,7 @@ async fn handle_write_file(
         use std::os::unix::fs::PermissionsExt;
         let mode = if make_executable { 0o755 } else { 0o644 };
         if let Err(e) =
-            std::fs::set_permissions(&resolved_path, std::fs::Permissions::from_mode(mode))
+            tokio::fs::set_permissions(&resolved_path, std::fs::Permissions::from_mode(mode)).await
         {
             send_streaming_error(
                 write_tx,
@@ -1101,7 +1101,7 @@ async fn handle_read_file(
     }
 
     // Canonicalize to follow symlinks and verify still under sandbox root
-    let canonical_path = match std::fs::canonicalize(&resolved_path) {
+    let canonical_path = match tokio::fs::canonicalize(&resolved_path).await {
         Ok(p) => p,
         Err(e) => {
             send_streaming_error(
@@ -1114,7 +1114,8 @@ async fn handle_read_file(
         }
     };
 
-    let sandbox_canonical = std::fs::canonicalize(SANDBOX_ROOT)
+    let sandbox_canonical = tokio::fs::canonicalize(SANDBOX_ROOT)
+        .await
         .unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
     if !canonical_path.starts_with(&sandbox_canonical) {
         send_streaming_error(
@@ -1127,7 +1128,7 @@ async fn handle_read_file(
     }
 
     // Check it's a regular file
-    let metadata = match std::fs::metadata(&canonical_path) {
+    let metadata = match tokio::fs::metadata(&canonical_path).await {
         Ok(m) => m,
         Err(e) => {
             send_streaming_error(
@@ -1168,7 +1169,7 @@ async fn handle_read_file(
     // Read file content, then encode base64 (drop raw bytes via scoping)
     let size = metadata.len() as usize;
     let content_base64 = {
-        let raw = match std::fs::read(&canonical_path) {
+        let raw = match tokio::fs::read(&canonical_path).await {
             Ok(r) => r,
             Err(e) => {
                 send_streaming_error(
@@ -1222,7 +1223,7 @@ async fn handle_list_files(
     };
 
     // Read directory
-    let read_dir = match std::fs::read_dir(&resolved_path) {
+    let mut read_dir = match tokio::fs::read_dir(&resolved_path).await {
         Ok(rd) => rd,
         Err(e) => {
             send_streaming_error(
@@ -1236,12 +1237,8 @@ async fn handle_list_files(
     };
 
     let mut entries = Vec::new();
-    for entry in read_dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let metadata = match entry.metadata() {
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let metadata = match entry.metadata().await {
             Ok(m) => m,
             Err(_) => continue,
         };
