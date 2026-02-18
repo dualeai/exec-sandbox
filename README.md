@@ -101,8 +101,8 @@ sbx run -j 5 *.py
 | `--json` | | JSON output | false |
 | `--quiet` | `-q` | Suppress progress output | false |
 | `--no-validation` | | Skip package allowlist validation | false |
-| `--upload` | | Upload file `GUEST_PATH LOCAL_PATH` (repeatable) | - |
-| `--download` | | Download file from sandbox `GUEST_PATH` (repeatable) | - |
+| `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
+| `--download` | | Download file `GUEST:LOCAL` or `GUEST` (repeatable) | - |
 | `--concurrency` | `-j` | Max concurrent VMs for multi-input | 10 |
 
 ### Python API
@@ -186,8 +186,11 @@ CLI file I/O uses sessions under the hood:
 
 ```bash
 # Upload a local file, run code, download the result
-sbx run --upload input.csv ./local.csv --download output.csv \
+sbx run --upload ./local.csv:input.csv --download output.csv:./result.csv \
   -c "open('output.csv','w').write(open('input.csv').read().upper())"
+
+# Download to ./output.csv (shorthand, no local path)
+sbx run --download output.csv -c "open('output.csv','w').write('data')"
 ```
 
 #### With Packages

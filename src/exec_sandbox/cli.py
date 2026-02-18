@@ -261,6 +261,71 @@ def parse_port_mappings(port_specs: tuple[str, ...]) -> list[PortMapping]:
     return result
 
 
+def parse_upload_spec(spec: str) -> tuple[str, str]:
+    """Parse an upload specification in LOCAL:GUEST format.
+
+    Args:
+        spec: Upload spec string, e.g. "./data.csv:data.csv"
+
+    Returns:
+        Tuple of (local_path, guest_path)
+
+    Raises:
+        click.BadParameter: If format is invalid
+    """
+    local, sep, guest = spec.partition(":")
+    if not sep or not guest:
+        raise click.BadParameter(
+            f"Invalid upload format: '{spec}'. Use LOCAL:GUEST format (e.g. ./data.csv:data.csv).",
+            param_hint="'--upload'",
+        )
+    if not local:
+        raise click.BadParameter(
+            f"Empty local path in: '{spec}'. Use LOCAL:GUEST format.",
+            param_hint="'--upload'",
+        )
+    if not Path(local).exists():
+        raise click.BadParameter(
+            f"Local file not found: '{local}'.",
+            param_hint="'--upload'",
+        )
+    return (local, guest)
+
+
+def parse_download_spec(spec: str) -> tuple[str, str]:
+    """Parse a download specification in GUEST:LOCAL or GUEST format.
+
+    Args:
+        spec: Download spec string, e.g. "output.csv:./results/out.csv" or "output.csv"
+
+    Returns:
+        Tuple of (guest_path, local_path)
+
+    Raises:
+        click.BadParameter: If format is invalid
+    """
+    if not spec:
+        raise click.BadParameter(
+            "Empty download path.",
+            param_hint="'--download'",
+        )
+    guest, sep, local = spec.partition(":")
+    if not guest:
+        raise click.BadParameter(
+            f"Empty guest path in: '{spec}'. Use GUEST:LOCAL or GUEST format.",
+            param_hint="'--download'",
+        )
+    if not sep:
+        # Shorthand: GUEST only → download to ./basename(GUEST)
+        local = Path(guest).name
+    if not local:
+        raise click.BadParameter(
+            f"Empty local path in: '{spec}'. Use GUEST:LOCAL format (e.g. output.csv:./out.csv).",
+            param_hint="'--download'",
+        )
+    return (guest, local)
+
+
 def format_error(title: str, message: str, suggestions: list[str] | None = None) -> str:
     """Format an error message following What → Why → Fix pattern.
 
@@ -463,7 +528,7 @@ async def run_code(
     quiet: bool,
     no_validation: bool,
     upload_files: tuple[tuple[str, str], ...] = (),
-    download_files: tuple[str, ...] = (),
+    download_files: tuple[tuple[str, str], ...] = (),
 ) -> int:
     """Execute code in sandbox and return exit code.
 
@@ -483,8 +548,8 @@ async def run_code(
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
-        upload_files: Files to upload before execution (guest_path, local_path)
-        download_files: Guest paths to download after execution
+        upload_files: Files to upload before execution (local_path, guest_path)
+        download_files: Files to download after execution (guest_path, local_path)
 
     Returns:
         Exit code to return from CLI
@@ -518,8 +583,13 @@ async def run_code(
                     expose_ports=expose_ports,  # type: ignore[arg-type]
                 ) as session:
                     # Upload files
-                    for guest_path, local_path in upload_files:
+                    for local_path, guest_path in upload_files:
                         await session.write_file(guest_path, Path(local_path))
+                        if not quiet:
+                            click.echo(
+                                click.style(f"  Uploaded: {local_path} -> {guest_path}", dim=True),
+                                err=True,
+                            )
 
                     # Execute code
                     result = await session.exec(
@@ -531,14 +601,16 @@ async def run_code(
                     )
 
                     # Download files
-                    for guest_path in download_files:
+                    for guest_path, local_path in download_files:
                         content = await session.read_file(guest_path)
-                        local = Path(guest_path)
+                        local = Path(local_path)
                         local.parent.mkdir(parents=True, exist_ok=True)
                         local.write_bytes(content)
                         if not quiet:
                             click.echo(
-                                click.style(f"  Downloaded: {guest_path} ({len(content)} bytes)", dim=True),
+                                click.style(
+                                    f"  Downloaded: {guest_path} -> {local_path} ({len(content)} bytes)", dim=True
+                                ),
                                 err=True,
                             )
             else:
@@ -851,15 +923,13 @@ def cli(ctx: click.Context) -> None:
     "--upload",
     "upload_files",
     multiple=True,
-    nargs=2,
-    type=click.Tuple([str, click.Path(exists=True)]),
-    help="Upload file: GUEST_PATH LOCAL_PATH (repeatable)",
+    help="Upload file LOCAL:GUEST (repeatable)",
 )
 @click.option(
     "--download",
     "download_files",
     multiple=True,
-    help="Download file from sandbox: GUEST_PATH (repeatable)",
+    help="Download file GUEST:LOCAL or GUEST (repeatable)",
 )
 def run_command(
     sources: tuple[str, ...],
@@ -876,7 +946,7 @@ def run_command(
     quiet: bool,
     no_validation: bool,
     concurrency: int,
-    upload_files: tuple[tuple[str, str], ...],
+    upload_files: tuple[str, ...],
     download_files: tuple[str, ...],
 ) -> NoReturn:
     """Execute code in an isolated VM sandbox.
@@ -897,6 +967,13 @@ def run_command(
     Language is auto-detected from file extension (.py, .js, .sh)
     or defaults to Python. Use -l to override for all sources.
 
+    File I/O uses colon-separated paths (LOCAL:GUEST / GUEST:LOCAL):
+
+    \b
+      --upload LOCAL:GUEST      Upload local file to sandbox
+      --download GUEST:LOCAL    Download sandbox file to local path
+      --download GUEST          Download to ./basename(GUEST)
+
     Examples:
 
     \b
@@ -908,7 +985,8 @@ def run_command(
       echo 'print(42)' | sbx run -                # From stdin
       sbx run --json 'print("test")' | jq .       # JSON output
       sbx run -c 'print(1)' -c 'print(2)'         # Multiple via -c flag
-      sbx run --upload input.csv ./local.csv -c "print(open('input.csv').read())"
+      sbx run --upload ./data.csv:data.csv -c "print(open('data.csv').read())"
+      sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
       sbx run --download output.csv -c "open('output.csv','w').write('data')"
     """
     # Merge inline codes with positional sources
@@ -934,11 +1012,21 @@ def run_command(
     except click.BadParameter as exc:
         raise click.UsageError(str(exc)) from exc
 
+    # Parse file I/O specs
+    try:
+        parsed_uploads = tuple(parse_upload_spec(spec) for spec in upload_files)
+    except click.BadParameter as exc:
+        raise click.UsageError(str(exc)) from exc
+    try:
+        parsed_downloads = tuple(parse_download_spec(spec) for spec in download_files)
+    except click.BadParameter as exc:
+        raise click.UsageError(str(exc)) from exc
+
     # Build list of SourceInput objects
     resolved_sources = [_resolve_source(src, language) for src in all_sources]
 
     # File I/O requires exactly one source
-    if (upload_files or download_files) and len(resolved_sources) != 1:
+    if (parsed_uploads or parsed_downloads) and len(resolved_sources) != 1:
         raise click.UsageError("--upload/--download requires exactly one source.")
 
     if len(resolved_sources) == 1:
@@ -957,8 +1045,8 @@ def run_command(
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
-                upload_files=upload_files,
-                download_files=download_files,
+                upload_files=parsed_uploads,
+                download_files=parsed_downloads,
             )
         )
     else:
