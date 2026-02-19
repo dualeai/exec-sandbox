@@ -59,9 +59,9 @@ func main() {
 		GatewayIP:         "192.168.127.1",
 		GatewayMacAddress: "5a:94:ef:e4:0c:dd",
 		Protocol:          types.QemuProtocol,
-		Forwards:          forwards,        // Port forwarding: host -> guest
-		BlockAllOutbound:  *blockOutbound,  // Block guest-initiated outbound (Mode 1)
-		OutboundAllow:     allowPatterns,   // Outbound filtering: DNS + TLS (Mode 2)
+		Forwards:          forwards,       // Port forwarding: host -> guest
+		BlockAllOutbound:  *blockOutbound, // Block guest-initiated outbound (Mode 1)
+		OutboundAllow:     allowPatterns,  // Outbound filtering: DNS + TLS (Mode 2)
 	}
 
 	if *debug {

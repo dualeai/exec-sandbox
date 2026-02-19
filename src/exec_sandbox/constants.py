@@ -43,7 +43,7 @@ VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
 """Maximum backoff between VM boot retries (500ms cap with jitter)."""
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
-"""Timeout for connecting to guest agent (TCP)."""
+"""Timeout for connecting to guest agent."""
 
 EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 8
 """Hard timeout margin above soft timeout (host watchdog protection).
@@ -92,11 +92,30 @@ MAX_STDERR_SIZE: Final[int] = 100_000  # 100KB
 """Maximum stderr capture size in bytes."""
 
 # ============================================================================
-# Communication
+# File I/O
 # ============================================================================
 
-TCP_GUEST_PORT: Final[int] = 5000
-"""TCP port for guest agent communication."""
+MAX_FILE_SIZE_BYTES: Final[int] = 500 * 1024 * 1024  # 500MB
+"""Maximum file size for read/write operations.
+
+With streaming zstd-compressed chunks, neither host nor guest buffers
+the full file in memory (~128 KB peak).  The practical ceiling is guest
+disk free space (rootfs_size + 100 MB), not RAM.
+"""
+
+MAX_FILE_PATH_LENGTH: Final[int] = 4096
+"""Maximum relative file path length in bytes (POSIX PATH_MAX).
+
+Individual filename components are limited to 255 bytes (NAME_MAX) by the
+guest agent's validate_file_path(). This constant covers the full relative path.
+"""
+
+FILE_IO_TIMEOUT_SECONDS: Final[int] = 120
+"""Timeout for file I/O operations in seconds."""
+
+
+GUEST_SANDBOX_DIR: Final[str] = "/home/user"
+"""Root directory for sandbox file operations in the guest VM."""
 
 # ============================================================================
 # Outbound Domain Filtering
@@ -259,3 +278,18 @@ PORT_FORWARD_BIND_HOST: Final[str] = "127.0.0.1"
 
 GVPROXY_API_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout for gvproxy HTTP API requests (port forward expose/unexpose)."""
+
+# ============================================================================
+# File Transfer Streaming
+# ============================================================================
+
+FILE_TRANSFER_CHUNK_SIZE: Final[int] = 128 * 1024  # 128KB
+"""Raw chunk size for streaming file transfers (before zstd compression).
+
+128KB balances fewer frames (halves syscalls, JSON parses, base64 en/decodes
+vs 64KB) while staying within virtio queue depth (128-256 descriptors).
+On-wire size after base64+JSON is ~175KB per frame.
+"""
+
+FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
+"""Zstd compression level for file transfers (1=fast, 22=max; 3=good balance)."""

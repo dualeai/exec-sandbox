@@ -5,8 +5,8 @@ github.com/apparentlymart/go-cidr v1.1.0/go.mod h1:EBcsNrHc3zQeuaeCeCtQruQm+n9/Y
 github.com/armon/go-proxyproto v0.0.0-20210323213023-7e956b284f0a/go.mod h1:QmP9hvJ91BbJmGVGSbutW19IC0Q9phDCLGaomwTJbgU=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dualeai/gvisor-tap-vsock v0.8.8-dualeai.1 h1:xUxcmwPvTsckr0bpLkpL5WxTUavHVeQhcUsVg9Z9hFg=
-github.com/dualeai/gvisor-tap-vsock v0.8.8-dualeai.1/go.mod h1:m/PzhZWAS6T9pCRH1fLkq2OqbEd6QEUZWjm3FS5F+CE=
+github.com/dualeai/gvisor-tap-vsock v0.8.8-dualeai.2 h1:h7J2hCjSALqnQd2dfdahbhGXDN1Uhi7zdAbrKCLTyYA=
+github.com/dualeai/gvisor-tap-vsock v0.8.8-dualeai.2/go.mod h1:m/PzhZWAS6T9pCRH1fLkq2OqbEd6QEUZWjm3FS5F+CE=
 github.com/foxcpp/go-mockdns v1.2.0 h1:omK3OrHRD1IWJz1FuFBCFquhXslXoF17OvBS6JPzZF0=
 github.com/foxcpp/go-mockdns v1.2.0/go.mod h1:IhLeSFGed3mJIAXPH2aiRQB+kqz7oqu8ld2qVbOu7Wk=
 github.com/fsnotify/fsnotify v1.8.0 h1:dAwr6QBTBZIkG8roQaJjGof0pp0EeF+tNV7YBP3F/8M=

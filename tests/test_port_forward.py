@@ -597,7 +597,7 @@ class TestPortForwardingMode2Integration:
             code="""
 import urllib.request
 try:
-    resp = urllib.request.urlopen('http://example.com', timeout=10)
+    resp = urllib.request.urlopen('https://httpbin.org/status/200', timeout=10)
     print(f'STATUS:{resp.status}')
 except Exception as e:
     print(f'ERROR:{type(e).__name__}:{e}')
@@ -605,11 +605,11 @@ except Exception as e:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080)],
             allow_network=True,
-            allowed_domains=["example.com"],
+            allowed_domains=["httpbin.org"],
             timeout_seconds=30,
         )
 
-        # Should be able to reach example.com
+        # Should be able to reach httpbin.org
         assert "STATUS:200" in result.stdout
 
 

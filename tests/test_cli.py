@@ -25,7 +25,9 @@ from exec_sandbox.cli import (
     format_error,
     format_multi_result_json,
     format_result_json,
+    parse_download_spec,
     parse_env_vars,
+    parse_upload_spec,
     prefetch_command,
     run_command,
     truncate_source,
@@ -1032,6 +1034,456 @@ class TestParseEnvVarsEdgeCases:
 # ============================================================================
 # Multi-Input Tests (V2)
 # ============================================================================
+class TestParseUploadSpec:
+    """Tests for parse_upload_spec function."""
+
+    # --- Normal cases ---
+
+    def test_basic_format(self, tmp_path: Path) -> None:
+        """Parses LOCAL:GUEST format."""
+        local_file = tmp_path / "data.csv"
+        local_file.write_text("content")
+        local_path, guest_path = parse_upload_spec(f"{local_file}:data.csv")
+        assert local_path == str(local_file)
+        assert guest_path == "data.csv"
+
+    def test_guest_with_subdirectory(self, tmp_path: Path) -> None:
+        """Parses guest path with subdirectory."""
+        local_file = tmp_path / "input.txt"
+        local_file.write_text("content")
+        local_path, guest_path = parse_upload_spec(f"{local_file}:subdir/input.txt")
+        assert local_path == str(local_file)
+        assert guest_path == "subdir/input.txt"
+
+    def test_relative_local_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Parses relative local path."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "rel.csv").write_text("content")
+        local_path, guest_path = parse_upload_spec("rel.csv:data.csv")
+        assert local_path == "rel.csv"
+        assert guest_path == "data.csv"
+
+    def test_absolute_local_path(self, tmp_path: Path) -> None:
+        """Parses absolute local path."""
+        local_file = tmp_path / "abs.txt"
+        local_file.write_text("content")
+        local_path, guest_path = parse_upload_spec(f"{local_file}:dest.txt")
+        assert local_path == str(local_file)
+        assert guest_path == "dest.txt"
+
+    def test_symlink_local_path(self, tmp_path: Path) -> None:
+        """Follows symlink for local path (exists check passes)."""
+        real = tmp_path / "real.txt"
+        real.write_text("content")
+        link = tmp_path / "link.txt"
+        link.symlink_to(real)
+        local_path, guest_path = parse_upload_spec(f"{link}:data.txt")
+        assert local_path == str(link)
+        assert guest_path == "data.txt"
+
+    # --- Edge cases ---
+
+    def test_multiple_colons_splits_on_first(self, tmp_path: Path) -> None:
+        """Splits on first colon — guest path may contain colons."""
+        local_file = tmp_path / "f.txt"
+        local_file.write_text("content")
+        local_path, guest_path = parse_upload_spec(f"{local_file}:a:b:c")
+        assert local_path == str(local_file)
+        assert guest_path == "a:b:c"
+
+    def test_spaces_in_local_path(self, tmp_path: Path) -> None:
+        """Handles spaces in local path."""
+        local_file = tmp_path / "my file.csv"
+        local_file.write_text("content")
+        local_path, guest_path = parse_upload_spec(f"{local_file}:data.csv")
+        assert local_path == str(local_file)
+        assert guest_path == "data.csv"
+
+    def test_spaces_in_guest_path(self, tmp_path: Path) -> None:
+        """Handles spaces in guest path."""
+        local_file = tmp_path / "f.txt"
+        local_file.write_text("content")
+        _, guest_path = parse_upload_spec(f"{local_file}:my data.csv")
+        assert guest_path == "my data.csv"
+
+    def test_unicode_in_paths(self, tmp_path: Path) -> None:
+        """Handles unicode characters in paths."""
+        local_file = tmp_path / "données.csv"
+        local_file.write_text("content")
+        local_path, guest_path = parse_upload_spec(f"{local_file}:数据.csv")
+        assert local_path == str(local_file)
+        assert guest_path == "数据.csv"
+
+    def test_dotfile_local(self, tmp_path: Path) -> None:
+        """Handles dotfile as local path."""
+        local_file = tmp_path / ".hidden"
+        local_file.write_text("secret")
+        local_path, _ = parse_upload_spec(f"{local_file}:config")
+        assert local_path == str(local_file)
+
+    # --- Error cases ---
+
+    def test_missing_colon(self) -> None:
+        """Rejects spec without colon."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Invalid upload format"):
+            parse_upload_spec("data.csv")
+
+    def test_empty_guest_path(self, tmp_path: Path) -> None:
+        """Rejects empty guest path (trailing colon)."""
+        import click
+
+        local_file = tmp_path / "data.csv"
+        local_file.write_text("content")
+        with pytest.raises(click.BadParameter, match="Invalid upload format"):
+            parse_upload_spec(f"{local_file}:")
+
+    def test_empty_local_path(self) -> None:
+        """Rejects empty local path (leading colon)."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty local path"):
+            parse_upload_spec(":data.csv")
+
+    def test_nonexistent_local_file(self) -> None:
+        """Rejects non-existent local file."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Local file not found"):
+            parse_upload_spec("/nonexistent/file.csv:data.csv")
+
+    def test_just_colon(self) -> None:
+        """Rejects bare colon."""
+        import click
+
+        with pytest.raises(click.BadParameter):
+            parse_upload_spec(":")
+
+    def test_double_colon(self) -> None:
+        """Rejects double colon (empty local)."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty local path"):
+            parse_upload_spec("::")
+
+    def test_local_is_directory(self, tmp_path: Path) -> None:
+        """Accepts directory as local path (exists returns True for dirs).
+
+        The session.write_file will fail later when trying to read content,
+        but parse_upload_spec only checks existence.
+        """
+        subdir = tmp_path / "mydir"
+        subdir.mkdir()
+        # Does not raise — existence check passes for directories
+        local_path, _ = parse_upload_spec(f"{subdir}:data")
+        assert local_path == str(subdir)
+
+    def test_broken_symlink(self, tmp_path: Path) -> None:
+        """Rejects broken symlink (target doesn't exist)."""
+        import click
+
+        link = tmp_path / "broken"
+        link.symlink_to(tmp_path / "nonexistent_target")
+        with pytest.raises(click.BadParameter, match="Local file not found"):
+            parse_upload_spec(f"{link}:data.txt")
+
+
+class TestParseDownloadSpec:
+    """Tests for parse_download_spec function."""
+
+    # --- Normal cases ---
+
+    def test_full_format(self) -> None:
+        """Parses GUEST:LOCAL format."""
+        guest_path, local_path = parse_download_spec("output.csv:./results/out.csv")
+        assert guest_path == "output.csv"
+        assert local_path == "./results/out.csv"
+
+    def test_shorthand_guest_only(self) -> None:
+        """Parses GUEST shorthand (no colon) -> local = basename."""
+        guest_path, local_path = parse_download_spec("output.csv")
+        assert guest_path == "output.csv"
+        assert local_path == "output.csv"
+
+    def test_shorthand_guest_with_subdir(self) -> None:
+        """Parses GUEST with subdir -> local = basename only."""
+        guest_path, local_path = parse_download_spec("subdir/output.csv")
+        assert guest_path == "subdir/output.csv"
+        assert local_path == "output.csv"
+
+    def test_local_absolute_path(self) -> None:
+        """Parses absolute local path."""
+        guest_path, local_path = parse_download_spec("data.csv:/tmp/out.csv")
+        assert guest_path == "data.csv"
+        assert local_path == "/tmp/out.csv"
+
+    def test_local_with_nested_dirs(self) -> None:
+        """Parses local path with nested directories."""
+        guest_path, local_path = parse_download_spec("result.bin:./deep/nested/dir/out.bin")
+        assert guest_path == "result.bin"
+        assert local_path == "./deep/nested/dir/out.bin"
+
+    # --- Edge cases ---
+
+    def test_multiple_colons_splits_on_first(self) -> None:
+        """Splits on first colon — local path may contain colons."""
+        guest_path, local_path = parse_download_spec("data.csv:a:b:c")
+        assert guest_path == "data.csv"
+        assert local_path == "a:b:c"
+
+    def test_spaces_in_guest_path(self) -> None:
+        """Handles spaces in guest path."""
+        guest_path, local_path = parse_download_spec("my file.csv:out.csv")
+        assert guest_path == "my file.csv"
+        assert local_path == "out.csv"
+
+    def test_spaces_in_local_path(self) -> None:
+        """Handles spaces in local path."""
+        guest_path, local_path = parse_download_spec("data.csv:./my output.csv")
+        assert guest_path == "data.csv"
+        assert local_path == "./my output.csv"
+
+    def test_unicode_in_paths(self) -> None:
+        """Handles unicode characters in paths."""
+        guest_path, local_path = parse_download_spec("数据.csv:./données.csv")
+        assert guest_path == "数据.csv"
+        assert local_path == "./données.csv"
+
+    def test_shorthand_deeply_nested_guest(self) -> None:
+        """Shorthand with deep nesting extracts basename."""
+        guest_path, local_path = parse_download_spec("a/b/c/d/result.txt")
+        assert guest_path == "a/b/c/d/result.txt"
+        assert local_path == "result.txt"
+
+    def test_shorthand_dotfile(self) -> None:
+        """Shorthand preserves dotfile basename."""
+        guest_path, local_path = parse_download_spec(".hidden")
+        assert guest_path == ".hidden"
+        assert local_path == ".hidden"
+
+    def test_guest_with_trailing_slash_shorthand(self) -> None:
+        """Guest path with trailing slash — Path strips it, basename is 'subdir'."""
+        guest_path, local_path = parse_download_spec("subdir/")
+        assert guest_path == "subdir/"
+        assert local_path == "subdir"
+
+    # --- Boundary cases ---
+
+    def test_root_path_shorthand(self) -> None:
+        """Guest path '/' — basename is empty, rejected."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty local path"):
+            parse_download_spec("/")
+
+    def test_dot_shorthand(self) -> None:
+        """Guest path '.' — Path('.').name is empty string, caught by validation."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty local path"):
+            parse_download_spec(".")
+
+    def test_dotdot_shorthand(self) -> None:
+        """Guest path '..' — basename is '..', returned as-is (guest agent validates)."""
+        guest_path, local_path = parse_download_spec("..")
+        assert guest_path == ".."
+        assert local_path == ".."
+
+    # --- Error cases ---
+
+    def test_empty_spec(self) -> None:
+        """Rejects empty spec."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty download path"):
+            parse_download_spec("")
+
+    def test_empty_guest_path(self) -> None:
+        """Rejects empty guest path (leading colon)."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty guest path"):
+            parse_download_spec(":./out.csv")
+
+    def test_empty_local_path(self) -> None:
+        """Rejects empty local path (trailing colon)."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty local path"):
+            parse_download_spec("output.csv:")
+
+    def test_just_colon(self) -> None:
+        """Rejects bare colon (both sides empty)."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty guest path"):
+            parse_download_spec(":")
+
+    def test_double_colon(self) -> None:
+        """Rejects double colon (empty guest)."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="Empty guest path"):
+            parse_download_spec("::")
+
+
+class TestCliFileIoIntegration:
+    """Tests for --upload/--download argument flow through CLI to run_code."""
+
+    def test_upload_parsed_and_passed(self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path) -> None:
+        """Upload spec is parsed and tuple flows to session.write_file."""
+        local_file = tmp_path / "data.csv"
+        local_file.write_text("content")
+
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_session = AsyncMock()
+            mock_session.exec.return_value = mock_result
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = None
+
+            mock_scheduler = AsyncMock()
+            mock_scheduler.session.return_value = mock_session
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            scheduler_cls.return_value = mock_scheduler
+
+            result = runner.invoke(
+                run_command,
+                ["--upload", f"{local_file}:input.csv", "-c", "print(1)"],
+            )
+
+            assert result.exit_code == 0
+            mock_session.write_file.assert_called_once_with("input.csv", local_file)
+
+    def test_download_full_parsed_and_passed(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Download GUEST:LOCAL spec flows correctly to session.read_file."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_session = AsyncMock()
+            mock_session.exec.return_value = mock_result
+
+            async def _fake_read(path: str, *, destination: Path) -> None:
+                destination.write_bytes(b"downloaded")
+
+            mock_session.read_file.side_effect = _fake_read
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = None
+
+            mock_scheduler = AsyncMock()
+            mock_scheduler.session.return_value = mock_session
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            scheduler_cls.return_value = mock_scheduler
+
+            with runner.isolated_filesystem():
+                result = runner.invoke(
+                    run_command,
+                    ["--download", "out.csv:./result.csv", "-c", "print(1)"],
+                )
+
+                assert result.exit_code == 0
+                mock_session.read_file.assert_called_once_with("out.csv", destination=Path("result.csv"))
+                assert Path("result.csv").read_bytes() == b"downloaded"
+
+    def test_download_shorthand_writes_to_basename(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Download GUEST shorthand writes to ./basename in cwd."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_session = AsyncMock()
+            mock_session.exec.return_value = mock_result
+
+            async def _fake_read(path: str, *, destination: Path) -> None:
+                destination.write_bytes(b"data")
+
+            mock_session.read_file.side_effect = _fake_read
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = None
+
+            mock_scheduler = AsyncMock()
+            mock_scheduler.session.return_value = mock_session
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            scheduler_cls.return_value = mock_scheduler
+
+            with runner.isolated_filesystem():
+                result = runner.invoke(
+                    run_command,
+                    ["--download", "subdir/output.csv", "-c", "print(1)"],
+                )
+
+                assert result.exit_code == 0
+                mock_session.read_file.assert_called_once_with("subdir/output.csv", destination=Path("output.csv"))
+                assert Path("output.csv").read_bytes() == b"data"
+
+    def test_upload_and_download_together(
+        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path
+    ) -> None:
+        """Upload + download in same command uses session path."""
+        local_file = tmp_path / "input.txt"
+        local_file.write_text("hello")
+
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_session = AsyncMock()
+            mock_session.exec.return_value = mock_result
+
+            async def _fake_read(path: str, *, destination: Path) -> None:
+                destination.write_bytes(b"result")
+
+            mock_session.read_file.side_effect = _fake_read
+            mock_session.__aenter__.return_value = mock_session
+            mock_session.__aexit__.return_value = None
+
+            mock_scheduler = AsyncMock()
+            mock_scheduler.session.return_value = mock_session
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            scheduler_cls.return_value = mock_scheduler
+
+            with runner.isolated_filesystem():
+                result = runner.invoke(
+                    run_command,
+                    [
+                        "--upload",
+                        f"{local_file}:input.txt",
+                        "--download",
+                        "output.txt:result.txt",
+                        "-c",
+                        "print(1)",
+                    ],
+                )
+
+                assert result.exit_code == 0
+                mock_session.write_file.assert_called_once()
+                mock_session.read_file.assert_called_once_with("output.txt", destination=Path("result.txt"))
+                assert Path("result.txt").read_bytes() == b"result"
+
+    def test_no_file_io_uses_direct_path(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """Without --upload/--download, uses scheduler.run() not session."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_scheduler = AsyncMock()
+            mock_scheduler.run.return_value = mock_result
+            mock_scheduler.__aenter__.return_value = mock_scheduler
+            mock_scheduler.__aexit__.return_value = None
+            scheduler_cls.return_value = mock_scheduler
+
+            result = runner.invoke(run_command, ["-c", "print(1)"])
+
+            assert result.exit_code == 0
+            mock_scheduler.run.assert_called_once()
+            mock_scheduler.session.assert_not_called()
+
+    def test_bad_upload_spec_shows_usage_error(self, runner: CliRunner) -> None:
+        """Invalid upload spec surfaces as CLI usage error."""
+        result = runner.invoke(run_command, ["--upload", "nocolon", "-c", "print(1)"])
+        assert result.exit_code == EXIT_CLI_ERROR
+        assert "Invalid upload format" in result.output
+
+    def test_bad_download_spec_shows_usage_error(self, runner: CliRunner) -> None:
+        """Invalid download spec surfaces as CLI usage error."""
+        result = runner.invoke(run_command, ["--download", ":", "-c", "print(1)"])
+        assert result.exit_code == EXIT_CLI_ERROR
+        assert "Empty guest path" in result.output
+
+
 class TestTruncateSource:
     """Tests for truncate_source helper."""
 

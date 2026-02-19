@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-RUST_VERSION="${RUST_VERSION:-1.83}"
+RUST_VERSION="${RUST_VERSION:?RUST_VERSION must be set (exported by root Makefile)}"
 
 # NOTE: Check periodically if -Zbuild-std and panic_immediate_abort have been stabilized.
 # When stable, we can add: RUSTFLAGS="-Cpanic=immediate-abort" cargo build -Zbuild-std=std,panic_abort

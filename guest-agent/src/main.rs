@@ -3,24 +3,33 @@
 //! Lightweight async agent running inside QEMU microVMs.
 //! Communicates with host via virtio-serial for:
 //! - Package installation (pip, npm)
-//! - Code execution
+//! - Code execution via persistent REPL (Python, JavaScript, Shell)
 //! - Health checks
+//!
+//! All code execution uses persistent REPL wrappers (not per-exec processes).
+//! Each language has a long-lived interpreter process that receives code via
+//! a length-prefixed stdin protocol and signals completion via unique
+//! sentinels on stderr (nanosecond timestamp + counter). State (variables, imports, functions) persists across
+//! executions within the same REPL instance.
 //!
 //! Uses tokio for fully async, non-blocking I/O.
 //! Communication via dual virtio-serial ports:
 //! - /dev/virtio-ports/org.dualeai.cmd (host → guest, read-only)
 //! - /dev/virtio-ports/org.dualeai.event (guest → host, write-only)
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::Command as StdCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CMD_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.cmd";
@@ -32,11 +41,11 @@ const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install outp
 const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 
 // Connection limits
-const MAX_REQUEST_SIZE_BYTES: usize = 2_000_000; // 2MB max request JSON
+const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max single request JSON (streaming chunks are ~90KB each)
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
 const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
-                                    // 12s > 10s health check interval to avoid spurious reconnects
+// 12s > 10s health check interval to avoid spurious reconnects
 
 // Host disconnection backoff configuration
 // When the host disconnects from virtio-serial, the kernel returns EPOLLHUP immediately on poll().
@@ -62,6 +71,20 @@ const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300; // 5 min timeout for package i
 // - Backpressure via bounded channel when buffer full
 const FLUSH_INTERVAL_MS: u64 = 50; // 50ms flush interval (not 1s - too slow for real-time)
 const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB max buffer before forced flush
+
+// File I/O limits
+const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024; // 500 MiB max file size (must match Python MAX_FILE_SIZE_BYTES)
+const MAX_FILE_PATH_LENGTH: usize = 4096; // POSIX PATH_MAX (full relative path)
+const MAX_FILE_NAME_BYTES: usize = 255; // POSIX NAME_MAX (single component, in bytes)
+const SANDBOX_ROOT: &str = "/home/user"; // Sandbox root directory
+
+// File transfer streaming
+// 128KB balances fewer frames (halves syscalls, JSON parses, base64 en/decodes vs 64KB)
+// while staying within virtio queue depth (128-256 descriptors). On-wire size after
+// base64+JSON is ~175KB per frame. The kernel virtio-vsock 4KB→64KB patch (v5.4) showed
+// the biggest throughput win; 64KB→128KB reduces per-transfer CPU overhead further.
+const FILE_TRANSFER_CHUNK_SIZE: usize = 128 * 1024;
+const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
 
 // Graceful termination configuration
 // - First send SIGTERM to allow process to cleanup (Python atexit, temp files, etc.)
@@ -140,6 +163,295 @@ static BLOCKED_ENV_VARS: &[&str] = &[
     "MALLOC_PERTURB_",
 ];
 
+// =============================================================================
+// Persistent REPL Wrappers
+// =============================================================================
+
+/// Python REPL wrapper: exec() in persistent namespace with sentinel protocol.
+///
+/// Protocol:
+///   Input:  "{sentinel_id} {code_len}\n" + code_bytes on stdin
+///   Output: stdout/stderr from user code, then __SENTINEL_{id}_{exit_code}__\n on stderr
+///
+/// Uses sys.stdin.buffer (binary mode) to read exact byte counts.
+/// Text-mode sys.stdin.read(n) reads n *characters*, which differs from n bytes
+/// for multi-byte UTF-8 (e.g., "café" = 5 chars but 6 bytes), causing deadlocks.
+const PYTHON_REPL_WRAPPER: &str = r#"import sys, traceback
+sys.argv = ['-c']
+ns = {"__name__": "__main__", "__builtins__": __builtins__}
+while True:
+    header = sys.stdin.buffer.readline()
+    if not header:
+        break
+    sentinel_id, code_len = header.decode().strip().split(" ", 1)
+    code = sys.stdin.buffer.read(int(code_len)).decode()
+    exit_code = 0
+    try:
+        compiled = compile(code, "<exec>", "exec")
+        exec(compiled, ns)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stderr.write(f"__SENTINEL_{sentinel_id}_{exit_code}__\n")
+    sys.stderr.flush()
+"#;
+
+/// JavaScript REPL wrapper: vm.runInContext() with sentinel protocol (Bun-compatible).
+///
+/// Uses Uint8Array byte-level I/O for correct byte counts with multi-byte UTF-8.
+/// Same length-prefixed stdin protocol and stderr sentinel as Python wrapper.
+/// Uses Bun.Transpiler with replMode for proper REPL semantics: last-expression capture
+/// as `{ value: expr }`, const→var hoisting, top-level await via async IIFE wrapping.
+/// Awaits the returned value if thenable (handles fire-and-forget async calls like `main()`).
+/// Catches unhandled promise rejections via process.on('unhandledRejection').
+/// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
+const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
+const transpiler = new Bun.Transpiler({ loader: 'js', replMode: true });
+const ctx = createContext({
+    Bun,
+    console, process, setTimeout, setInterval, clearTimeout, clearInterval,
+    Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
+    AbortController, AbortSignal, Event, EventTarget,
+    atob, btoa, structuredClone, queueMicrotask,
+    crypto,
+    require,
+    module: { exports: {} },
+    exports: {},
+    __filename: '<exec>', __dirname: '/tmp',
+});
+// Catch unhandled rejections from fire-and-forget promises (e.g. on non-last lines).
+// Sets exitCode so the sentinel reports failure.
+let unhandledRejection = null;
+process.on('unhandledRejection', (reason) => {
+    unhandledRejection = reason;
+});
+const stdin = Bun.stdin.stream();
+const reader = stdin.getReader();
+let buf = new Uint8Array(0);
+const dec = new TextDecoder();
+function cat(a, b) {
+    const r = new Uint8Array(a.length + b.length);
+    r.set(a); r.set(b, a.length);
+    return r;
+}
+async function readLine() {
+    while (true) {
+        const idx = buf.indexOf(10);
+        if (idx !== -1) {
+            const line = dec.decode(buf.slice(0, idx));
+            buf = buf.slice(idx + 1);
+            return line;
+        }
+        const { done, value } = await reader.read();
+        if (done) return null;
+        buf = cat(buf, value);
+    }
+}
+async function readN(n) {
+    while (buf.length < n) {
+        const { done, value } = await reader.read();
+        if (done) return null;
+        buf = cat(buf, value);
+    }
+    const data = buf.slice(0, n);
+    buf = buf.slice(n);
+    return dec.decode(data);
+}
+while (true) {
+    const header = await readLine();
+    if (header === null) break;
+    const sp = header.indexOf(' ');
+    const sentinelId = header.substring(0, sp);
+    const codeLen = parseInt(header.substring(sp + 1), 10);
+    const code = await readN(codeLen);
+    if (code === null) break;
+    let exitCode = 0;
+    unhandledRejection = null;
+    try {
+        // Bun.Transpiler with replMode transforms code for REPL semantics:
+        // - Wraps in async IIFE for top-level await support
+        // - Captures last expression as { value: (expr) }
+        // - Converts const/let to var for re-declaration across invocations
+        const transformed = transpiler.transformSync(code);
+        if (transformed.length > 0) {
+            let val = runInContext(transformed, ctx, { filename: '<exec>' });
+            // replMode wraps in async IIFE only when code has top-level await;
+            // otherwise runInContext returns { value: expr } directly.
+            if (val && typeof val.then === 'function') {
+                val = await val;
+            }
+            // If the last expression was a Promise (e.g. `main()`),
+            // await it so async work completes before the sentinel.
+            if (val && val.value && typeof val.value.then === 'function') {
+                await val.value;
+            }
+        }
+    } catch (e) {
+        process.stderr.write((e && e.stack ? e.stack : String(e)) + '\n');
+        exitCode = 1;
+    }
+    // Check for unhandled rejections from non-last-expression promises
+    if (unhandledRejection !== null) {
+        const r = unhandledRejection;
+        process.stderr.write((r && r.stack ? r.stack : String(r)) + '\n');
+        exitCode = 1;
+    }
+    process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
+}
+"#;
+
+/// Shell REPL wrapper: eval with sentinel protocol.
+///
+/// Shell `read` + `head -c` operate on bytes (not characters), so the
+/// length-prefixed protocol is naturally correct for multi-byte UTF-8.
+/// `eval "$code"` maintains shell state (env vars, cwd, functions, aliases).
+const SHELL_REPL_WRAPPER: &str = r#"while read sentinel_id code_len; do
+    code=$(head -c "$code_len")
+    eval "$code"
+    _ec=$?
+    printf "__SENTINEL_%s_%d__\n" "$sentinel_id" "$_ec" >&2
+done
+"#;
+
+/// State for a persistent REPL process.
+struct ReplState {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+}
+
+/// Module-level REPL storage. Persists across 12s guest agent reconnect cycles
+/// (guest agent process stays alive, just reconnects serial port).
+/// Monotonic counter for sentinel IDs. Combined with nanosecond timestamp
+/// to produce unique, unpredictable IDs without the uuid crate dependency.
+static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+static REPL_STATES: Lazy<TokioMutex<HashMap<String, ReplState>>> =
+    Lazy::new(|| TokioMutex::new(HashMap::new()));
+
+/// Write REPL wrapper script to SANDBOX_ROOT for the given language.
+/// All languages use SANDBOX_ROOT so package managers (bun, pip) resolve
+/// dependencies installed in the same directory.
+async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match language {
+        "python" => {
+            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER).await?
+        }
+        "javascript" => {
+            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER).await?
+        }
+        "raw" => tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?,
+        _ => return Err(format!("Unknown language for REPL: {}", language).into()),
+    }
+    Ok(())
+}
+
+/// Spawn a fresh REPL process for the given language.
+///
+/// Scripts run from SANDBOX_ROOT so package resolution works naturally:
+///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages
+///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules
+async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
+    write_repl_wrapper(language).await?;
+
+    let mut cmd = match language {
+        "python" => {
+            let mut c = Command::new("python3");
+            c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
+            c.env("PYTHONPATH", format!("{SANDBOX_ROOT}/site-packages"));
+            c
+        }
+        "javascript" => {
+            let mut c = Command::new("bun");
+            c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
+            c
+        }
+        "raw" => {
+            let mut c = Command::new("sh");
+            c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
+            c
+        }
+        _ => return Err(format!("Unknown language for REPL: {}", language).into()),
+    };
+
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(SANDBOX_ROOT)
+        .process_group(0);
+
+    let mut child = cmd.spawn()?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    eprintln!("Spawned REPL for language={}", language);
+
+    Ok(ReplState {
+        child,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
+/// Build code prefix that sets environment variables for the given language.
+fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, String>) -> String {
+    if env_vars.is_empty() {
+        return code.to_string();
+    }
+
+    let mut full_code = String::new();
+
+    match language {
+        "python" => {
+            full_code.push_str("import os as __os__\n");
+            for (key, value) in env_vars {
+                // Escape backslashes and single quotes for Python string literal
+                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+                full_code.push_str(&format!(
+                    "__os__.environ['{escaped_key}']='{escaped_val}'\n"
+                ));
+            }
+            full_code.push_str("del __os__\n");
+        }
+        "javascript" => {
+            for (key, value) in env_vars {
+                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+                full_code.push_str(&format!("process.env['{escaped_key}']='{escaped_val}';\n"));
+            }
+        }
+        "raw" => {
+            for (key, value) in env_vars {
+                // Shell export syntax requires unquoted identifier keys.
+                // Skip keys that aren't valid POSIX identifiers to avoid broken syntax.
+                if !key
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                    || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    eprintln!("Skipping invalid shell env var key: {:?}", key);
+                    continue;
+                }
+                let escaped_val = value.replace('\'', "'\"'\"'");
+                full_code.push_str(&format!("export {key}='{escaped_val}'\n"));
+            }
+        }
+        _ => {}
+    }
+
+    full_code.push_str(code);
+    full_code
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 enum GuestCommand {
@@ -160,6 +472,29 @@ enum GuestCommand {
         timeout: u64,
         #[serde(default)]
         env_vars: HashMap<String, String>,
+    },
+
+    #[serde(rename = "write_file")]
+    WriteFile {
+        op_id: String,
+        path: String,
+        #[serde(default)]
+        make_executable: bool,
+    },
+
+    #[serde(rename = "read_file")]
+    ReadFile { op_id: String, path: String },
+
+    #[serde(rename = "file_chunk")]
+    FileChunk { op_id: String, data: String },
+
+    #[serde(rename = "file_end")]
+    FileEnd { op_id: String },
+
+    #[serde(rename = "list_files")]
+    ListFiles {
+        #[serde(default)]
+        path: String,
     },
 }
 
@@ -196,7 +531,91 @@ struct StreamingError {
     message: String,
     error_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    op_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileWriteAck {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_write_ack"
+    op_id: String,
+    path: String,
+    bytes_written: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FileChunkResponse {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_chunk"
+    op_id: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FileReadComplete {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_read_complete"
+    op_id: String,
+    path: String,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FileEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FileList {
+    #[serde(rename = "type")]
+    msg_type: String, // "file_list"
+    path: String,
+    entries: Vec<FileEntry>,
+}
+
+/// Wrapper that counts bytes written and enforces a size limit.
+struct CountingWriter<W> {
+    inner: W,
+    count: usize,
+    limit: usize,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.count + buf.len() > self.limit {
+            return Err(std::io::Error::other("file size limit exceeded"));
+        }
+        let n = self.inner.write(buf)?;
+        self.count += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// State for an in-progress streaming file write operation.
+struct WriteFileState {
+    decoder: zstd::stream::write::Decoder<'static, CountingWriter<std::fs::File>>,
+    tmp_path: std::path::PathBuf,
+    final_path: std::path::PathBuf,
+    make_executable: bool,
+    op_id: String,
+    path_display: String, // relative path for error messages
+    finished: bool,
+}
+
+impl Drop for WriteFileState {
+    fn drop(&mut self) {
+        // Clean up temp file if write was not completed (error/disconnect)
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
 }
 
 // Helper to send streaming error via queue
@@ -204,11 +623,13 @@ async fn send_streaming_error(
     write_tx: &mpsc::Sender<Vec<u8>>,
     message: String,
     error_type: &str,
+    op_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let error = StreamingError {
         msg_type: "error".to_string(),
         message,
         error_type: error_type.to_string(),
+        op_id: op_id.map(|s| s.to_string()),
         version: Some(VERSION.to_string()),
     };
     let json = serde_json::to_string(&error)?;
@@ -225,6 +646,12 @@ async fn send_streaming_error(
 
 // Note: flush_buffers() removed - replaced with spawned task pattern (Nov 2025)
 
+/// Install packages into SANDBOX_ROOT for the given language.
+///
+/// Packages are installed locally (not system-wide) so they persist in snapshots
+/// and are resolved by the REPL via standard language mechanisms:
+///   - Python: `uv pip install --target {SANDBOX_ROOT}/site-packages` + `PYTHONPATH`
+///   - JavaScript: `bun add` in SANDBOX_ROOT + Node `node_modules/` resolution
 async fn install_packages(
     language: &str,
     packages: &[String],
@@ -242,6 +669,7 @@ async fn install_packages(
                 language
             ),
             "validation_error",
+            None,
         ).await?;
         return Ok(());
     }
@@ -252,6 +680,7 @@ async fn install_packages(
             write_tx,
             "No packages specified for installation".to_string(),
             "validation_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -267,6 +696,7 @@ async fn install_packages(
                 MAX_PACKAGES
             ),
             "validation_error",
+            None,
         )
         .await?;
         return Ok(());
@@ -280,6 +710,7 @@ async fn install_packages(
                 write_tx,
                 "Package name cannot be empty".to_string(),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -295,6 +726,7 @@ async fn install_packages(
                     MAX_PACKAGE_NAME_LENGTH
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -309,6 +741,7 @@ async fn install_packages(
                     pkg
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -320,6 +753,7 @@ async fn install_packages(
                 write_tx,
                 "Package name contains null byte".to_string(),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -334,6 +768,7 @@ async fn install_packages(
                     pkg
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -348,6 +783,7 @@ async fn install_packages(
                     pkg
                 ),
                 "validation_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -361,11 +797,12 @@ async fn install_packages(
             let mut c = Command::new("uv");
             c.arg("pip")
                 .arg("install")
-                .arg("--system")
-                .arg("--break-system-packages");
+                .arg("--target")
+                .arg(format!("{SANDBOX_ROOT}/site-packages"));
             for pkg in packages {
                 c.arg(pkg);
             }
+            c.current_dir(SANDBOX_ROOT);
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
@@ -374,10 +811,13 @@ async fn install_packages(
         }
         "javascript" => {
             let mut c = Command::new("bun");
-            c.arg("add").arg("--global");
+            c.arg("add");
             for pkg in packages {
                 c.arg(pkg);
             }
+            // Install to SANDBOX_ROOT where the REPL script lives, so bun
+            // resolves node_modules/ via standard Node resolution
+            c.current_dir(SANDBOX_ROOT);
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
@@ -395,6 +835,7 @@ async fn install_packages(
                 write_tx,
                 format!("Failed to execute package manager for {}: {}", language, e),
                 "execution_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -469,6 +910,7 @@ async fn install_packages(
                 write_tx,
                 format!("Process wait error: {}", e),
                 "execution_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -483,6 +925,7 @@ async fn install_packages(
                     PACKAGE_INSTALL_TIMEOUT_SECONDS
                 ),
                 "timeout_error",
+                None,
             )
             .await?;
             return Ok(());
@@ -541,6 +984,339 @@ async fn install_packages(
         process_ms: None,
     };
     let json = serde_json::to_string(&complete)?;
+    let mut response = json.into_bytes();
+    response.push(b'\n');
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
+
+    Ok(())
+}
+
+// =============================================================================
+// File I/O Handlers
+// =============================================================================
+
+/// Validate a relative file path and resolve it under SANDBOX_ROOT.
+///
+/// Security checks:
+/// - Non-empty (except for list_files root)
+/// - Length <= MAX_FILE_PATH_LENGTH
+/// - No null bytes or control characters
+/// - No absolute paths
+/// - Path traversal prevention (.. normalization checked against sandbox root)
+///
+/// For empty path (list_files root), returns SANDBOX_ROOT directly.
+fn validate_file_path(relative_path: &str) -> Result<std::path::PathBuf, String> {
+    // Empty path = sandbox root (valid for list_files)
+    if relative_path.is_empty() {
+        return Ok(std::path::PathBuf::from(SANDBOX_ROOT));
+    }
+
+    // Length check
+    if relative_path.len() > MAX_FILE_PATH_LENGTH {
+        return Err(format!(
+            "Path too long: {} chars (max {})",
+            relative_path.len(),
+            MAX_FILE_PATH_LENGTH
+        ));
+    }
+
+    // Null byte check
+    if relative_path.contains('\0') {
+        return Err("Path contains null byte".to_string());
+    }
+
+    // Control character check
+    if relative_path.chars().any(|c| c.is_control()) {
+        return Err("Path contains control character".to_string());
+    }
+
+    // Absolute path check
+    if relative_path.starts_with('/') {
+        return Err("Absolute paths are not allowed".to_string());
+    }
+
+    // Build resolved path by normalizing components (handle ..)
+    let sandbox_root = std::path::PathBuf::from(SANDBOX_ROOT);
+    let mut resolved = sandbox_root.clone();
+
+    for component in std::path::Path::new(relative_path).components() {
+        match component {
+            std::path::Component::Normal(c) => {
+                // Per-component byte-length check (NAME_MAX = 255 bytes).
+                // ext4/xfs count UTF-8 bytes, not characters, so a filename
+                // of 100 CJK chars (300 bytes) would exceed the limit.
+                let name_bytes = c.as_encoded_bytes().len();
+                if name_bytes > MAX_FILE_NAME_BYTES {
+                    return Err(format!(
+                        "Filename component too long: {} bytes (max {})",
+                        name_bytes, MAX_FILE_NAME_BYTES
+                    ));
+                }
+                resolved.push(c);
+            }
+            std::path::Component::ParentDir => {
+                // Go up one level, but never above sandbox root
+                if !resolved.pop() || !resolved.starts_with(&sandbox_root) {
+                    return Err("Path traversal outside sandbox".to_string());
+                }
+            }
+            std::path::Component::CurDir => {} // Skip "."
+            _ => return Err("Invalid path component".to_string()),
+        }
+    }
+
+    // Final check: resolved path must be under sandbox root
+    if !resolved.starts_with(&sandbox_root) {
+        return Err("Path traversal outside sandbox".to_string());
+    }
+
+    Ok(resolved)
+}
+
+/// Handle read_file command: read from disk, stream as zstd-compressed chunks.
+async fn handle_read_file(
+    op_id: &str,
+    path: &str,
+    write_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate path
+    let resolved_path = match validate_file_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Invalid path '{}': {}", path, e),
+                "validation_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Reject sandbox root itself
+    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+        send_streaming_error(
+            write_tx,
+            "Cannot read a directory".to_string(),
+            "validation_error",
+            Some(op_id),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Canonicalize to follow symlinks and verify still under sandbox root
+    let canonical_path = match tokio::fs::canonicalize(&resolved_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("File not found or inaccessible '{}': {}", path, e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let sandbox_canonical = tokio::fs::canonicalize(SANDBOX_ROOT)
+        .await
+        .unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
+    if !canonical_path.starts_with(&sandbox_canonical) {
+        send_streaming_error(
+            write_tx,
+            format!("Path '{}' resolves outside sandbox", path),
+            "validation_error",
+            Some(op_id),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Check it's a regular file
+    let metadata = match tokio::fs::metadata(&canonical_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Cannot read '{}': {}", path, e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if metadata.is_dir() {
+        send_streaming_error(
+            write_tx,
+            format!("'{}' is a directory, not a file", path),
+            "validation_error",
+            Some(op_id),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Check size before reading
+    if metadata.len() as usize > MAX_FILE_SIZE_BYTES {
+        send_streaming_error(
+            write_tx,
+            format!(
+                "File too large: {} bytes (max {})",
+                metadata.len(),
+                MAX_FILE_SIZE_BYTES
+            ),
+            "validation_error",
+            Some(op_id),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Read file content (sync) -> stream as compressed chunks
+    let file_size = metadata.len();
+    let file = match std::fs::File::open(&canonical_path) {
+        Ok(f) => f,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Failed to read '{}': {}", path, e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut encoder = match zstd::stream::read::Encoder::new(file, FILE_TRANSFER_ZSTD_LEVEL) {
+        Ok(e) => e,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Compression init failed for '{}': {}", path, e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut buf = vec![0u8; FILE_TRANSFER_CHUNK_SIZE];
+    loop {
+        let n = match std::io::Read::read(&mut encoder, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                send_streaming_error(
+                    write_tx,
+                    format!("Compression error: {}", e),
+                    "io_error",
+                    Some(op_id),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let chunk_b64 = BASE64.encode(&buf[..n]);
+        let chunk_msg = FileChunkResponse {
+            msg_type: "file_chunk".to_string(),
+            op_id: op_id.to_string(),
+            data: chunk_b64,
+        };
+        let json = serde_json::to_string(&chunk_msg)?;
+        let mut response = json.into_bytes();
+        response.push(b'\n');
+        write_tx
+            .send(response)
+            .await
+            .map_err(|_| "Write queue closed")?;
+    }
+
+    // Send completion
+    let complete_msg = FileReadComplete {
+        msg_type: "file_read_complete".to_string(),
+        op_id: op_id.to_string(),
+        path: path.to_string(),
+        size: file_size,
+    };
+    let json = serde_json::to_string(&complete_msg)?;
+    let mut response = json.into_bytes();
+    response.push(b'\n');
+    write_tx
+        .send(response)
+        .await
+        .map_err(|_| "Write queue closed")?;
+
+    Ok(())
+}
+
+/// Handle list_files command: read directory entries.
+async fn handle_list_files(
+    path: &str,
+    write_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate path (empty = sandbox root)
+    let resolved_path = match validate_file_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Invalid path '{}': {}", path, e),
+                "validation_error",
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Read directory
+    let mut read_dir = match tokio::fs::read_dir(&resolved_path).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Cannot list '{}': {}", path, e),
+                "io_error",
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut entries = Vec::new();
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let metadata = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        entries.push(FileEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: metadata.is_dir(),
+            size: if metadata.is_dir() { 0 } else { metadata.len() },
+        });
+    }
+
+    // Sort entries by name for consistent ordering
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Send response
+    let response_msg = FileList {
+        msg_type: "file_list".to_string(),
+        path: path.to_string(),
+        entries,
+    };
+    let json = serde_json::to_string(&response_msg)?;
     let mut response = json.into_bytes();
     response.push(b'\n');
     write_tx
@@ -686,7 +1462,7 @@ async fn graceful_terminate_process_group(
     child: &mut tokio::process::Child,
     grace_period_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     // Get PID (= PGID when process_group(0) was used at spawn)
     let pid = match child.id() {
@@ -747,6 +1523,18 @@ async fn graceful_terminate_process_group(
     Ok(())
 }
 
+/// Execute code via persistent REPL with streaming output.
+///
+/// Flow:
+/// 1. Get or spawn REPL for this language (persists across calls)
+/// 2. Prepend env var setup code, then send via length-prefixed stdin protocol
+/// 3. Stream stdout chunks and buffer stderr lines looking for sentinel
+/// 4. On sentinel: drain remaining stdout, send completion with exit code
+/// 5. On REPL death (EOF): recover exit code via child.wait(), send completion
+/// 6. On timeout: kill REPL (respawned on next call), send timeout error
+///
+/// Sentinel detection uses `find()` (not `starts_with()`) to handle cases where
+/// user stderr without trailing newline gets concatenated with the sentinel line.
 async fn execute_code_streaming(
     language: &str,
     code: &str,
@@ -756,128 +1544,184 @@ async fn execute_code_streaming(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
     use tokio::io::AsyncReadExt;
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
 
     // Validate params
     if let Err(error_message) = validate_execute_params(language, code, timeout, env_vars) {
-        send_streaming_error(write_tx, error_message, "validation_error").await?;
+        send_streaming_error(write_tx, error_message, "validation_error", None).await?;
         return Ok(());
     }
 
     let start = Instant::now();
 
-    // Granular timing for diagnostics
-    let spawn_ms: Option<u64>;
-    let process_ms: Option<u64>;
-
-    let mut cmd = match language {
-        "python" => {
-            let mut c = Command::new("python3");
-            c.arg("-c").arg(code);
-            // Spawn in new process group for clean termination of all children
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
-            c
+    // Get or create persistent REPL for this language
+    let spawn_start = Instant::now();
+    let mut was_fresh_spawn = false;
+    let mut repl = {
+        let mut states = REPL_STATES.lock().await;
+        match states.remove(language) {
+            Some(mut existing) => {
+                // Check if REPL is still alive
+                match existing.child.try_wait() {
+                    Ok(Some(_)) => {
+                        eprintln!("REPL for {} died, spawning fresh", language);
+                        was_fresh_spawn = true;
+                        spawn_repl(language).await?
+                    }
+                    Ok(None) => existing, // Still alive
+                    Err(_) => {
+                        was_fresh_spawn = true;
+                        spawn_repl(language).await?
+                    }
+                }
+            }
+            None => {
+                was_fresh_spawn = true;
+                spawn_repl(language).await?
+            }
         }
-        "javascript" => {
-            let mut c = Command::new("bun");
-            c.arg("-e").arg(code);
-            // Spawn in new process group for clean termination of all children
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
-            c
-        }
-        "raw" => {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(code);
-            // Spawn in new process group for clean termination of all children
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
-            c
-        }
-        _ => unreachable!(),
+    };
+    let spawn_ms = if was_fresh_spawn {
+        Some(spawn_start.elapsed().as_millis() as u64)
+    } else {
+        Some(0)
     };
 
-    // Set environment variables
-    for (key, value) in env_vars {
-        cmd.env(key, value);
+    // Generate unique sentinel for this execution
+    // Nanosecond timestamp + monotonic counter: unique and long enough
+    // to avoid accidental collision with user stderr output
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let count = SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sentinel_id = format!("{nanos}_{count}");
+    let sentinel_prefix = format!("__SENTINEL_{}_", sentinel_id);
+
+    // Prepend env var setup to user code
+    let full_code = prepend_env_vars(language, code, env_vars);
+    let code_bytes = full_code.as_bytes();
+
+    // Write header + code to REPL stdin
+    let header = format!("{} {}\n", sentinel_id, code_bytes.len());
+    if let Err(e) = repl.stdin.write_all(header.as_bytes()).await {
+        eprintln!("REPL stdin write failed (header): {}", e);
+        let _ = repl.child.kill().await;
+        let _ = repl.child.wait().await;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to send code to REPL: {}", e),
+            "execution_error",
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(e) = repl.stdin.write_all(code_bytes).await {
+        eprintln!("REPL stdin write failed (code): {}", e);
+        let _ = repl.child.kill().await;
+        let _ = repl.child.wait().await;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to send code to REPL: {}", e),
+            "execution_error",
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(e) = repl.stdin.flush().await {
+        eprintln!("REPL stdin flush failed: {}", e);
+        let _ = repl.child.kill().await;
+        let _ = repl.child.wait().await;
+        send_streaming_error(
+            write_tx,
+            format!("Failed to send code to REPL: {}", e),
+            "execution_error",
+            None,
+        )
+        .await?;
+        return Ok(());
     }
 
-    // Spawn process with timing
-    let spawn_start = Instant::now();
-    let mut child = match cmd.spawn() {
-        Ok(c) => {
-            spawn_ms = Some(spawn_start.elapsed().as_millis() as u64);
-            c
-        }
-        Err(e) => {
-            // spawn_ms stays None on failure
-            send_streaming_error(
-                write_tx,
-                format!("Failed to execute {} code: {}", language, e),
-                "execution_error",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
     let process_start = Instant::now();
 
-    // Get stdout/stderr streams
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    // Stream output until sentinel detected, REPL dies, or timeout
+    let mut stdout_buffer = String::new();
+    let mut stderr_buffer = String::new();
+    let mut stderr_line_buf = String::new();
+    let mut stdout_bytes = [0u8; 8192];
+    let mut stderr_bytes = [0u8; 8192];
+    let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut sentinel_exit_code: Option<i32> = None;
 
-    // Incremental streaming with 50ms batching and 64KB max buffer (Jan 2026 best practice)
-    // - Prevents memory exhaustion on large outputs
-    // - Provides real-time feedback (50ms latency, not 1s)
-    // - Uses backpressure via bounded channel
-    let write_tx_clone = write_tx.clone();
-    let streaming_task = tokio::spawn(async move {
-        let mut stdout_buffer = String::new();
-        let mut stderr_buffer = String::new();
-        let mut stdout_bytes = [0u8; 8192]; // 8KB read chunks
-        let mut stderr_bytes = [0u8; 8192];
-        let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
-        let mut stdout_done = false;
-        let mut stderr_done = false;
+    let timeout_duration = if timeout > 0 {
+        Duration::from_secs(timeout)
+    } else {
+        Duration::from_secs(MAX_TIMEOUT_SECONDS)
+    };
 
+    let loop_result = tokio::time::timeout(timeout_duration, async {
         loop {
             tokio::select! {
                 // Flush timer (50ms) - send buffered data for real-time feel
                 _ = flush_timer.tick() => {
-                    let _ = flush_output_buffer(&write_tx_clone, &mut stdout_buffer, "stdout").await;
-                    let _ = flush_output_buffer(&write_tx_clone, &mut stderr_buffer, "stderr").await;
+                    let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
+                    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
                 }
 
                 // Read stdout
-                result = stdout.read(&mut stdout_bytes), if !stdout_done => {
+                result = repl.stdout.read(&mut stdout_bytes), if !stdout_done => {
                     match result {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
-                            // Use lossy conversion to never drop data (replaces invalid UTF-8 with �)
                             stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
-                            // Flush immediately if buffer exceeds 64KB (backpressure)
                             if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(&write_tx_clone, &mut stdout_buffer, "stdout").await;
+                                let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
                             }
                         }
                         Err(_) => stdout_done = true,
                     }
                 }
 
-                // Read stderr
-                result = stderr.read(&mut stderr_bytes), if !stderr_done => {
+                // Read stderr (with sentinel detection)
+                result = repl.stderr.read(&mut stderr_bytes), if !stderr_done => {
                     match result {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
-                            // Use lossy conversion to never drop data (replaces invalid UTF-8 with �)
-                            stderr_buffer.push_str(&String::from_utf8_lossy(&stderr_bytes[..n]));
-                            // Flush immediately if buffer exceeds 64KB (backpressure)
-                            if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(&write_tx_clone, &mut stderr_buffer, "stderr").await;
+                            let chunk = String::from_utf8_lossy(&stderr_bytes[..n]).into_owned();
+                            stderr_line_buf.push_str(&chunk);
+
+                            // Process complete lines looking for sentinel
+                            while let Some(nl) = stderr_line_buf.find('\n') {
+                                let line = stderr_line_buf[..nl].to_string();
+                                stderr_line_buf = stderr_line_buf[nl + 1..].to_string();
+
+                                // Search for sentinel anywhere in line (not just start)
+                                // User stderr without trailing \n can be concatenated with sentinel
+                                if let Some(sentinel_pos) = line.find(&sentinel_prefix) {
+                                    let sentinel_part = &line[sentinel_pos..];
+                                    if sentinel_part.ends_with("__") {
+                                        // Forward any user stderr before sentinel
+                                        if sentinel_pos > 0 {
+                                            stderr_buffer.push_str(&line[..sentinel_pos]);
+                                        }
+                                        // Parse exit code from __SENTINEL_{id}_{code}__
+                                        let code_str = &sentinel_part
+                                            [sentinel_prefix.len()..sentinel_part.len() - 2];
+                                        sentinel_exit_code =
+                                            Some(code_str.parse::<i32>().unwrap_or(-1));
+                                        continue;
+                                    }
+                                }
+                                // User stderr - buffer for streaming
+                                stderr_buffer.push_str(&line);
+                                stderr_buffer.push('\n');
+                                if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                                    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+                                }
                             }
                         }
                         Err(_) => stderr_done = true,
@@ -885,76 +1729,110 @@ async fn execute_code_streaming(
                 }
             }
 
-            // Exit when both streams are done
+            // Exit conditions
+            if sentinel_exit_code.is_some() {
+                // Sentinel detected - drain any remaining stdout (may still be in pipe)
+                loop {
+                    match tokio::time::timeout(
+                        Duration::from_millis(FLUSH_INTERVAL_MS),
+                        repl.stdout.read(&mut stdout_bytes),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Err(_) => break, // EOF or timeout - done draining
+                        Ok(Ok(n)) => {
+                            stdout_buffer
+                                .push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
+                        }
+                        Ok(Err(_)) => break,
+                    }
+                }
+                break;
+            }
             if stdout_done && stderr_done {
-                // Final flush of any remaining data
-                let _ = flush_output_buffer(&write_tx_clone, &mut stdout_buffer, "stdout").await;
-                let _ = flush_output_buffer(&write_tx_clone, &mut stderr_buffer, "stderr").await;
+                // REPL died (both streams EOF)
                 break;
             }
         }
-    });
+    })
+    .await;
 
-    // Wait for process with timeout
-    let wait_future = child.wait();
-    let wait_result = if timeout > 0 {
-        tokio::time::timeout(Duration::from_secs(timeout), wait_future).await
-    } else {
-        Ok(wait_future.await)
-    };
+    // Flush residual stderr_line_buf (user stderr without trailing newline)
+    if !stderr_line_buf.is_empty() {
+        stderr_buffer.push_str(&stderr_line_buf);
+    }
 
-    let status = match wait_result {
-        Ok(Ok(s)) => {
-            process_ms = Some(process_start.elapsed().as_millis() as u64);
-            s
+    // Final flush of any remaining data
+    let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
+    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let process_ms = Some(process_start.elapsed().as_millis() as u64);
+
+    match loop_result {
+        Ok(()) if sentinel_exit_code.is_some() => {
+            // Normal completion via sentinel - REPL stays alive for reuse
+            let exit_code = sentinel_exit_code.unwrap();
+
+            // Store REPL back for reuse
+            let mut states = REPL_STATES.lock().await;
+            states.insert(language.to_string(), repl);
+
+            let complete = ExecutionComplete {
+                msg_type: "complete".to_string(),
+                exit_code,
+                execution_time_ms: duration_ms,
+                spawn_ms,
+                process_ms,
+            };
+            let json = serde_json::to_string(&complete)?;
+            let mut response = json.into_bytes();
+            response.push(b'\n');
+            write_tx
+                .send(response)
+                .await
+                .map_err(|_| "Write queue closed")?;
         }
-        Ok(Err(e)) => {
-            // Graceful termination: SIGTERM → wait → SIGKILL
-            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
-            streaming_task.abort();
-            send_streaming_error(
-                write_tx,
-                format!("Process wait error: {}", e),
-                "execution_error",
-            )
-            .await?;
-            return Ok(());
+        Ok(()) => {
+            // REPL died (EOF on both streams) - recover exit code
+            let status = repl.child.wait().await;
+            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+
+            eprintln!("REPL for {} died with exit_code={}", language, exit_code);
+
+            let complete = ExecutionComplete {
+                msg_type: "complete".to_string(),
+                exit_code,
+                execution_time_ms: duration_ms,
+                spawn_ms,
+                process_ms,
+            };
+            let json = serde_json::to_string(&complete)?;
+            let mut response = json.into_bytes();
+            response.push(b'\n');
+            write_tx
+                .send(response)
+                .await
+                .map_err(|_| "Write queue closed")?;
         }
         Err(_) => {
-            // Timeout: Graceful termination: SIGTERM → wait → SIGKILL
-            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
-            streaming_task.abort();
+            // Timeout - kill REPL (will be respawned on next exec)
+            eprintln!(
+                "REPL for {} timed out after {}s, killing",
+                language, timeout
+            );
+            let _ =
+                graceful_terminate_process_group(&mut repl.child, TERM_GRACE_PERIOD_SECONDS).await;
+
             send_streaming_error(
                 write_tx,
                 format!("Execution timeout after {}s", timeout),
                 "timeout_error",
+                None,
             )
             .await?;
-            return Ok(());
         }
-    };
-
-    // Wait for streaming task to complete (captures remaining output after process exit)
-    let _ = streaming_task.await;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let exit_code = status.code().unwrap_or(-1);
-
-    // Send completion message
-    let complete = ExecutionComplete {
-        msg_type: "complete".to_string(),
-        exit_code,
-        execution_time_ms: duration_ms,
-        spawn_ms,
-        process_ms,
-    };
-    let json = serde_json::to_string(&complete)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
+    }
 
     Ok(())
 }
@@ -1123,6 +2001,9 @@ async fn handle_connection_nonblocking(
         }
     });
 
+    // Active streaming file write operations
+    let mut active_writes: HashMap<String, WriteFileState> = HashMap::new();
+
     // Main loop: read requests, queue responses
     let mut line = String::new();
     let result = loop {
@@ -1164,6 +2045,7 @@ async fn handle_connection_nonblocking(
                     bytes_read, MAX_REQUEST_SIZE_BYTES
                 ),
                 "request_error",
+                None,
             )
             .await;
             continue;
@@ -1222,12 +2104,250 @@ async fn handle_connection_nonblocking(
                     break Err("execute_code failed".into());
                 }
             }
+            Ok(GuestCommand::WriteFile {
+                op_id,
+                path,
+                make_executable,
+            }) => {
+                eprintln!(
+                    "Processing: write_file (op_id={}, path={}, executable={})",
+                    op_id, path, make_executable
+                );
+                // Validate path
+                let resolved_path = match validate_file_path(&path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Invalid path '{}': {}", path, e),
+                            "validation_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                // Reject sandbox root itself
+                if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        "Cannot write to sandbox root directory".to_string(),
+                        "validation_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
+                }
+                // Create parent directories (sync)
+                if let Some(parent) = resolved_path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!("Failed to create directories: {}", e),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
+                }
+                // Temp path: <dir>/.wr.<op_id>.tmp (40 chars max).
+                // Lives in the same directory for atomic rename (same filesystem).
+                // Uses a fixed-length name to avoid NAME_MAX overflow when the
+                // target filename is already near 255 bytes.
+                let tmp_path = resolved_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new(SANDBOX_ROOT))
+                    .join(format!(".wr.{}.tmp", op_id));
+                let file = match std::fs::File::create(&tmp_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Failed to create temp file: {}", e),
+                            "io_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let counting_writer = CountingWriter {
+                    inner: file,
+                    count: 0,
+                    limit: MAX_FILE_SIZE_BYTES,
+                };
+                let decoder = match zstd::stream::write::Decoder::new(counting_writer) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Decompression init failed: {}", e),
+                            "io_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                active_writes.insert(
+                    op_id.clone(),
+                    WriteFileState {
+                        decoder,
+                        tmp_path,
+                        final_path: resolved_path,
+                        make_executable,
+                        op_id,
+                        path_display: path,
+                        finished: false,
+                    },
+                );
+            }
+            Ok(GuestCommand::FileChunk { op_id, data }) => {
+                let state = match active_writes.get_mut(&op_id) {
+                    Some(s) => s,
+                    None => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("No active write for op_id '{}'", op_id),
+                            "protocol_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let decoded = match BASE64.decode(&data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let path_display = state.path_display.clone();
+                        active_writes.remove(&op_id);
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Invalid base64 in chunk for '{}': {}", path_display, e),
+                            "validation_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                if let Err(e) = std::io::Write::write_all(&mut state.decoder, &decoded) {
+                    let path_display = state.path_display.clone();
+                    active_writes.remove(&op_id);
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!("Write error for '{}': {}", path_display, e),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+            Ok(GuestCommand::FileEnd { op_id }) => {
+                let mut state = match active_writes.remove(&op_id) {
+                    Some(s) => s,
+                    None => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("No active write for op_id '{}'", op_id),
+                            "protocol_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                // Finalize zstd frame: flush remaining decompressed data
+                if let Err(e) = std::io::Write::flush(&mut state.decoder) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!(
+                            "Decompression finalize error for '{}': {}",
+                            state.path_display, e
+                        ),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    // state dropped here -> Drop cleans up tmp file
+                    continue;
+                }
+                let bytes_written = state.decoder.get_ref().count;
+                // Set permissions on temp file
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if state.make_executable { 0o755 } else { 0o644 };
+                    if let Err(e) = std::fs::set_permissions(
+                        &state.tmp_path,
+                        std::fs::Permissions::from_mode(mode),
+                    ) {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!(
+                                "Failed to set permissions for '{}': {}",
+                                state.path_display, e
+                            ),
+                            "io_error",
+                            Some(&op_id),
+                        )
+                        .await;
+                        // state dropped here -> Drop cleans up tmp file
+                        continue;
+                    }
+                }
+                // Atomic rename
+                if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!(
+                            "Failed to finalize write for '{}': {}",
+                            state.path_display, e
+                        ),
+                        "io_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    // state dropped here -> Drop cleans up tmp file
+                    continue;
+                }
+                state.finished = true;
+                // Send ack
+                let ack = FileWriteAck {
+                    msg_type: "file_write_ack".to_string(),
+                    op_id: state.op_id.clone(),
+                    path: state.path_display.clone(),
+                    bytes_written,
+                };
+                let json = serde_json::to_string(&ack).unwrap_or_default();
+                let mut response = json.into_bytes();
+                response.push(b'\n');
+                if write_tx.send(response).await.is_err() {
+                    break Err("write queue closed".into());
+                }
+            }
+            Ok(GuestCommand::ReadFile { op_id, path }) => {
+                eprintln!("Processing: read_file (op_id={}, path={})", op_id, path);
+                if handle_read_file(&op_id, &path, &write_tx).await.is_err() {
+                    break Err("read_file failed".into());
+                }
+            }
+            Ok(GuestCommand::ListFiles { path }) => {
+                eprintln!("Processing: list_files (path={})", path);
+                if handle_list_files(&path, &write_tx).await.is_err() {
+                    break Err("list_files failed".into());
+                }
+            }
             Err(e) => {
                 eprintln!("JSON parse error: {}", e);
                 let _ = send_streaming_error(
                     &write_tx,
                     format!("Invalid JSON: {}", e),
                     "request_error",
+                    None,
                 )
                 .await;
             }
@@ -1347,7 +2467,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Reference: https://github.com/fpco/pid1-rs
 async fn reap_zombies() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     // Create signal stream BEFORE any children are spawned to avoid race conditions
     let mut sigchld = match signal(SignalKind::child()) {
@@ -1386,11 +2506,13 @@ async fn reap_zombies() {
 /// which is unmounted after switch_root.
 fn setup_init_environment() {
     // Set PATH for child processes (uv, python3, bun, etc.)
-    std::env::set_var("PATH", "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    // SAFETY: called at startup before any threads are spawned
+    unsafe { std::env::set_var("PATH", "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") };
     eprintln!("Set PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 
     // Disable uv cache (ephemeral VMs)
-    std::env::set_var("UV_NO_CACHE", "1");
+    // SAFETY: called at startup before any threads are spawned
+    unsafe { std::env::set_var("UV_NO_CACHE", "1") };
     eprintln!("Set UV_NO_CACHE=1");
 
     // Wait for network interface (up to 1 second, 20ms intervals)
@@ -1430,12 +2552,12 @@ fn setup_init_environment() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-            if let Ok(status) = result {
-                if status.success() {
-                    eprintln!("gvproxy connectivity verified");
-                    gvproxy_ok = true;
-                    break;
-                }
+            if let Ok(status) = result
+                && status.success()
+            {
+                eprintln!("gvproxy connectivity verified");
+                gvproxy_ok = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
@@ -1467,4 +2589,339 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CMD_PORT_PATH, EVENT_PORT_PATH
     );
     listen_virtio_serial().await
+}
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // validate_file_path tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_file_path_basic() {
+        let result = validate_file_path("hello.txt");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/hello.txt")
+        );
+    }
+
+    #[test]
+    fn test_validate_file_path_nested() {
+        let result = validate_file_path("subdir/data.csv");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/subdir/data.csv")
+        );
+    }
+
+    #[test]
+    fn test_validate_file_path_deeply_nested() {
+        let result = validate_file_path("a/b/c/d/e.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_traversal_rejected() {
+        let result = validate_file_path("../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_file_path_mid_path_traversal() {
+        let result = validate_file_path("subdir/../../etc/shadow");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_file_path_absolute_rejected() {
+        let result = validate_file_path("/etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Absolute"));
+    }
+
+    #[test]
+    fn test_validate_file_path_empty_returns_sandbox_root() {
+        let result = validate_file_path("");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
+    }
+
+    #[test]
+    fn test_validate_file_path_null_byte_rejected() {
+        let result = validate_file_path("file\x00.txt");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("null byte"));
+    }
+
+    #[test]
+    fn test_validate_file_path_control_chars_rejected() {
+        let result = validate_file_path("file\x01name");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("control character"));
+    }
+
+    #[test]
+    fn test_validate_file_path_too_long() {
+        let long_path = "a".repeat(256);
+        let result = validate_file_path(&long_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too long"));
+    }
+
+    #[test]
+    fn test_validate_file_path_exactly_max_length() {
+        let path = "a".repeat(255);
+        let result = validate_file_path(&path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_dot_dot_normalization() {
+        // subdir/../file.txt should resolve to /home/user/file.txt (stays under root)
+        let result = validate_file_path("subdir/../file.txt");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/file.txt")
+        );
+    }
+
+    #[test]
+    fn test_validate_file_path_double_slash() {
+        let result = validate_file_path("dir//file.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_trailing_slash() {
+        let result = validate_file_path("subdir/");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_hidden_file() {
+        let result = validate_file_path(".hidden");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/home/user/.hidden")
+        );
+    }
+
+    #[test]
+    fn test_validate_file_path_unicode() {
+        let result = validate_file_path("日本語.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_dot_only() {
+        // "." should resolve to sandbox root
+        let result = validate_file_path(".");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), std::path::PathBuf::from("/home/user"));
+    }
+
+    // -------------------------------------------------------------------------
+    // GuestCommand deserialization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_deserialize_write_file() {
+        let json =
+            r#"{"action":"write_file","op_id":"abc123","path":"test.txt","make_executable":false}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WriteFile {
+                op_id,
+                path,
+                make_executable,
+            } => {
+                assert_eq!(op_id, "abc123");
+                assert_eq!(path, "test.txt");
+                assert!(!make_executable);
+            }
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_read_file() {
+        let json = r#"{"action":"read_file","op_id":"def456","path":"output.csv"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ReadFile { op_id, path } => {
+                assert_eq!(op_id, "def456");
+                assert_eq!(path, "output.csv");
+            }
+            _ => panic!("Expected ReadFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_files() {
+        let json = r#"{"action":"list_files","path":""}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ListFiles { path } => {
+                assert_eq!(path, "");
+            }
+            _ => panic!("Expected ListFiles"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_files_default_path() {
+        let json = r#"{"action":"list_files"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ListFiles { path } => {
+                assert_eq!(path, "");
+            }
+            _ => panic!("Expected ListFiles"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_write_file_executable() {
+        let json =
+            r#"{"action":"write_file","op_id":"xyz","path":"run.sh","make_executable":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WriteFile {
+                make_executable, ..
+            } => {
+                assert!(make_executable);
+            }
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_file_chunk() {
+        let json = r#"{"action":"file_chunk","op_id":"abc123","data":"SGVsbG8="}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::FileChunk { op_id, data } => {
+                assert_eq!(op_id, "abc123");
+                assert_eq!(data, "SGVsbG8=");
+            }
+            _ => panic!("Expected FileChunk"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_file_end() {
+        let json = r#"{"action":"file_end","op_id":"abc123"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::FileEnd { op_id } => {
+                assert_eq!(op_id, "abc123");
+            }
+            _ => panic!("Expected FileEnd"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Response serialization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_serialize_file_write_ack() {
+        let ack = FileWriteAck {
+            msg_type: "file_write_ack".to_string(),
+            op_id: "test_op".to_string(),
+            path: "test.txt".to_string(),
+            bytes_written: 42,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("\"type\":\"file_write_ack\""));
+        assert!(json.contains("\"op_id\":\"test_op\""));
+        assert!(json.contains("\"bytes_written\":42"));
+    }
+
+    #[test]
+    fn test_serialize_file_chunk_response() {
+        let chunk = FileChunkResponse {
+            msg_type: "file_chunk".to_string(),
+            op_id: "abc123".to_string(),
+            data: "SGVsbG8=".to_string(),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"type\":\"file_chunk\""));
+        assert!(json.contains("\"op_id\":\"abc123\""));
+        assert!(json.contains("\"data\":\"SGVsbG8=\""));
+    }
+
+    #[test]
+    fn test_serialize_file_read_complete() {
+        let msg = FileReadComplete {
+            msg_type: "file_read_complete".to_string(),
+            op_id: "def456".to_string(),
+            path: "data.csv".to_string(),
+            size: 1024,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"file_read_complete\""));
+        assert!(json.contains("\"op_id\":\"def456\""));
+        assert!(json.contains("\"size\":1024"));
+    }
+
+    #[test]
+    fn test_serialize_file_write_ack_with_op_id() {
+        let ack = FileWriteAck {
+            msg_type: "file_write_ack".to_string(),
+            op_id: "abc123".to_string(),
+            path: "test.txt".to_string(),
+            bytes_written: 42,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("\"type\":\"file_write_ack\""));
+        assert!(json.contains("\"op_id\":\"abc123\""));
+        assert!(json.contains("\"bytes_written\":42"));
+    }
+
+    #[test]
+    fn test_zstd_roundtrip() {
+        // Compress
+        let data = vec![42u8; FILE_TRANSFER_CHUNK_SIZE];
+        let compressed = zstd::stream::encode_all(&data[..], FILE_TRANSFER_ZSTD_LEVEL).unwrap();
+        // Decompress
+        let decompressed = zstd::stream::decode_all(&compressed[..]).unwrap();
+        assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn test_serialize_file_list() {
+        let list = FileList {
+            msg_type: "file_list".to_string(),
+            path: "".to_string(),
+            entries: vec![
+                FileEntry {
+                    name: "file.txt".to_string(),
+                    is_dir: false,
+                    size: 100,
+                },
+                FileEntry {
+                    name: "subdir".to_string(),
+                    is_dir: true,
+                    size: 0,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains("\"type\":\"file_list\""));
+        assert!(json.contains("\"file.txt\""));
+        assert!(json.contains("\"subdir\""));
+    }
 }

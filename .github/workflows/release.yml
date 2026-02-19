@@ -194,10 +194,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+
       - name: Build guest-agent
         uses: ./.github/actions/build-guest-agent
         with:
           arch: ${{ matrix.arch }}
+          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -214,10 +219,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+
       - name: Build tiny-init
         uses: ./.github/actions/build-tiny-init
         with:
           arch: ${{ matrix.arch }}
+          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

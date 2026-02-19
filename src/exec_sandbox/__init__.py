@@ -3,7 +3,7 @@
 A standalone Python library for executing untrusted code in isolated QEMU microVMs
 with 6-layer security architecture.
 
-Quick Start:
+Quick Start (single execution):
     ```python
     from exec_sandbox import Scheduler
 
@@ -13,6 +13,17 @@ Quick Start:
             language="python",
         )
         print(result.stdout)  # "hello\\n"
+    ```
+
+Session (stateful multi-step execution):
+    ```python
+    from exec_sandbox import Scheduler
+
+    async with Scheduler() as scheduler:
+        async with await scheduler.session(language="python") as session:
+            await session.exec("x = 42")
+            result = await session.exec("print(x)")
+            print(result.stdout)  # "42\\n"
     ```
 
 With Configuration:
@@ -50,14 +61,21 @@ For S3 snapshot caching:
 
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
+    AssetChecksumError,
+    AssetDownloadError,
+    AssetError,
+    AssetNotFoundError,
     BalloonTransientError,
     CommunicationError,
+    EnvVarValidationError,
     GuestAgentError,
     PackageNotAllowedError,
     PermanentError,
     SandboxDependencyError,
     SandboxError,
+    SessionClosedError,
     SnapshotError,
+    SocketAuthError,
     TransientError,
     VmBootError,
     VmBootTimeoutError,
@@ -72,14 +90,21 @@ from exec_sandbox.exceptions import (
     VmTimeoutError,
     VmTransientError,
 )
-from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, PortMapping, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.session import Session
 
 __all__ = [
+    "AssetChecksumError",
+    "AssetDownloadError",
+    "AssetError",
+    "AssetNotFoundError",
     "BalloonTransientError",
     "CommunicationError",
+    "EnvVarValidationError",
     "ExecutionResult",
     "ExposedPort",
+    "FileInfo",
     "GuestAgentError",
     "Language",
     "PackageNotAllowedError",
@@ -89,7 +114,10 @@ __all__ = [
     "SandboxError",
     "Scheduler",
     "SchedulerConfig",
+    "Session",
+    "SessionClosedError",
     "SnapshotError",
+    "SocketAuthError",
     "TimingBreakdown",
     "TransientError",
     "VmBootError",

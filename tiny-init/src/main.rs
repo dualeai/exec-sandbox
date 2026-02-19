@@ -187,10 +187,10 @@ fn wait_for_virtio_ports() -> bool {
     // Uses any() to stop at first entry (more efficient than count())
     // Fast exponential backoff: 1+2+4+8+16+32 = 63ms max (was 155ms)
     for delay_us in [1000, 2000, 4000, 8000, 16000, 32000] {
-        if let Ok(mut entries) = fs::read_dir("/sys/class/virtio-ports") {
-            if entries.any(|e| e.is_ok()) {
-                return true;
-            }
+        if let Ok(mut entries) = fs::read_dir("/sys/class/virtio-ports")
+            && entries.any(|e| e.is_ok())
+        {
+            return true;
         }
         thread::sleep(Duration::from_micros(delay_us));
     }
@@ -437,8 +437,11 @@ fn switch_root() -> ! {
     }
 
     // Set minimal environment for guest-agent
-    std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
-    std::env::set_var("HOME", "/root");
+    // SAFETY: called at startup before any threads are spawned
+    unsafe {
+        std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/bin");
+        std::env::set_var("HOME", "/root");
+    }
 
     // Ensure stdin is valid (open /dev/null if needed)
     let devnull = CString::new("/dev/null").unwrap();

@@ -12,7 +12,7 @@ Secure code execution in isolated lightweight VMs (QEMU microVMs). Python librar
 
 - **Hardware isolation** - Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
 - **Fast startup** - 400ms fresh start, 1-2ms with pre-started VMs (warm pool)
-- **Simple API** - Just `Scheduler` and `run()`, async-friendly; plus `sbx` CLI for quick testing
+- **Simple API** - `run()` for one-shot execution, `session()` for stateful multi-step workflows with file I/O; plus `sbx` CLI for quick testing
 - **Streaming output** - Real-time output as code runs
 - **Smart caching** - Local + S3 remote cache for VM snapshots
 - **Network control** - Disabled by default, optional domain allowlisting with defense-in-depth filtering (DNS + TLS SNI + DNS cross-validation to prevent spoofing)
@@ -101,6 +101,8 @@ sbx run -j 5 *.py
 | `--json` | | JSON output | false |
 | `--quiet` | `-q` | Suppress progress output | false |
 | `--no-validation` | | Skip package allowlist validation | false |
+| `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
+| `--download` | | Download file `GUEST:LOCAL` or `GUEST` (repeatable) | - |
 | `--concurrency` | `-j` | Max concurrent VMs for multi-input | 10 |
 
 ### Python API
@@ -117,6 +119,78 @@ async with Scheduler() as scheduler:
     )
     print(result.stdout)     # Hello, World!
     print(result.exit_code)  # 0
+```
+
+#### Sessions (Stateful Multi-Step)
+
+Sessions keep a VM alive across multiple `exec()` calls — variables, imports, and state persist.
+
+```python
+from exec_sandbox import Scheduler
+
+async with Scheduler() as scheduler:
+    async with await scheduler.session(language="python") as session:
+        await session.exec("import math")
+        await session.exec("x = math.pi * 2")
+        result = await session.exec("print(f'{x:.4f}')")
+        print(result.stdout)  # 6.2832
+        print(session.exec_count)  # 3
+```
+
+Sessions support all three languages:
+
+```python
+# JavaScript — variables and functions persist
+async with await scheduler.session(language="javascript") as session:
+    await session.exec("const greet = (name) => `Hello, ${name}!`")
+    result = await session.exec("console.log(greet('World'))")
+
+# Shell — env vars, cwd, and functions persist
+async with await scheduler.session(language="raw") as session:
+    await session.exec("cd /tmp && export MY_VAR=hello")
+    result = await session.exec("echo $MY_VAR from $(pwd)")
+```
+
+Sessions auto-close after idle timeout (default: 300s, configurable via `session_idle_timeout_seconds`).
+
+#### File I/O
+
+Sessions support reading, writing, and listing files inside the sandbox.
+
+```python
+from pathlib import Path
+from exec_sandbox import Scheduler
+
+async with Scheduler() as scheduler:
+    async with await scheduler.session(language="python") as session:
+        # Write a file into the sandbox
+        await session.write_file("input.csv", b"name,score\nAlice,95\nBob,87")
+
+        # Write from a local file
+        await session.write_file("model.pkl", Path("./local_model.pkl"))
+
+        # Execute code that reads input and writes output
+        await session.exec("data = open('input.csv').read().upper()")
+        await session.exec("open('output.csv', 'w').write(data)")
+
+        # Read a file back from the sandbox
+        content = await session.read_file("output.csv")
+
+        # List files in a directory
+        files = await session.list_files("")  # sandbox root
+        for f in files:
+            print(f"{f.name} {'dir' if f.is_dir else f'{f.size}B'}")
+```
+
+CLI file I/O uses sessions under the hood:
+
+```bash
+# Upload a local file, run code, download the result
+sbx run --upload ./local.csv:input.csv --download output.csv:./result.csv \
+  -c "open('output.csv','w').write(open('input.csv').read().upper())"
+
+# Download to ./output.csv (shorthand, no local path)
+sbx run --download output.csv -c "open('output.csv','w').write('data')"
 ```
 
 #### With Packages
@@ -197,7 +271,7 @@ from exec_sandbox import Scheduler, SchedulerConfig
 
 config = SchedulerConfig(
     max_concurrent_vms=20,       # Limit parallel executions
-    warm_pool_size=1,            # Pre-started VMs (warm pool), size = max_concurrent_vms × 25%
+    warm_pool_size=1,            # Pre-started VMs per language (0 disables)
     default_memory_mb=512,       # Per-VM memory
     default_timeout_seconds=60,  # Execution timeout
     s3_bucket="my-snapshots",    # Remote cache for package snapshots
@@ -287,13 +361,15 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_concurrent_vms` | 10 | Maximum parallel VMs |
-| `warm_pool_size` | 0 | Pre-started VMs (warm pool). Set >0 to enable. Size = `max_concurrent_vms × 25%` per language |
+| `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript). Set >0 to enable |
 | `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
+| `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
 | `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache |
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
+| `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
@@ -320,35 +396,47 @@ VMs include automatic memory optimization (no configuration required):
 | `timing.boot_ms` | int | VM boot time |
 | `timing.execute_ms` | int | Code execution |
 | `timing.total_ms` | int | End-to-end time |
+| `warm_pool_hit` | bool | Whether a pre-started VM was used |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
+
+## FileInfo
+
+Returned by `Session.list_files()`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | str | File or directory name |
+| `is_dir` | bool | True if entry is a directory |
+| `size` | int | File size in bytes (0 for directories) |
 
 ## Exceptions
 
 | Exception | Description |
 |-----------|-------------|
-| `SandboxError` | Base exception |
-| `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3 for S3) |
-| `VmError` | VM operation failed |
-| `VmTimeoutError` | Execution exceeded timeout |
-| `VmBootError` | VM failed to start |
-| `CommunicationError` | VM communication failed |
-| `SocketAuthError` | Socket peer authentication failed |
-| `GuestAgentError` | VM helper process returned error |
+| `SandboxError` | Base exception for all sandbox errors |
+| `TransientError` | Retryable errors — may succeed on retry |
+| `PermanentError` | Non-retryable errors |
+| `VmTimeoutError` | VM boot timed out |
+| `VmCapacityError` | VM pool at capacity |
+| `VmConfigError` | Invalid VM configuration |
+| `SessionClosedError` | Session already closed |
+| `CommunicationError` | Guest communication failed |
+| `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
-| `AssetError` | Asset download/verification error (base) |
-| `AssetDownloadError` | Asset download failed |
-| `AssetChecksumError` | Asset checksum verification failed |
-| `AssetNotFoundError` | Asset not found in registry/release |
+| `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
+| `AssetError` | Asset download/verification failed |
 
 ## Pitfalls
 
 ```python
-# VMs are never reused - state doesn't persist
+# run() creates a fresh VM each time - state doesn't persist across calls
 result1 = await scheduler.run("x = 42", language="python")
 result2 = await scheduler.run("print(x)", language="python")  # NameError!
-# Fix: single execution with all code
-await scheduler.run("x = 42; print(x)", language="python")
+# Fix: use sessions for multi-step stateful execution
+async with await scheduler.session(language="python") as session:
+    await session.exec("x = 42")
+    result = await session.exec("print(x)")  # Works! x persists
 
 # Pre-started VMs (warm pool) only work without packages
 config = SchedulerConfig(warm_pool_size=1)
@@ -389,6 +477,8 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 | Max packages | 50 |
 | Max env vars | 100 |
 | Max exposed ports | 10 |
+| Max file size (I/O) | 50MB |
+| Max file path length | 255 chars |
 | Execution timeout | 1-300s |
 | VM memory | 128-2048MB |
 | Max concurrent VMs | 1-100 |
@@ -407,7 +497,7 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 
 **Guarantees:**
 
-- VMs are never reused - fresh VM per `run()`, destroyed immediately after
+- Fresh VM per `run()`, destroyed immediately after. Sessions reuse the same VM across `exec()` calls (same isolation, persistent state)
 - Network disabled by default - requires explicit `allow_network=True`
 - Domain allowlisting with 3-layer outbound filtering — DNS resolution blocked for non-allowed domains, TLS SNI inspection on port 443, and DNS cross-validation to prevent SNI spoofing
 - Package validation - only top 10k Python/JavaScript packages allowed by default

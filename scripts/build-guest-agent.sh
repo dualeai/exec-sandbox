@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-RUST_VERSION="${RUST_VERSION:-1.83}"
+RUST_VERSION="${RUST_VERSION:?RUST_VERSION must be set (exported by root Makefile)}"
 
 # Buildx cache configuration (for CI)
 # Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
@@ -110,8 +110,8 @@ ARG RUST_TARGET
 ARG ARCH
 WORKDIR /workspace
 
-# Install wget for downloading cross-toolchain
-RUN apt-get update -qq && apt-get install -qq -y wget >/dev/null 2>&1
+# Install wget for downloading cross-toolchain, musl-tools for native musl builds (zstd-sys needs CC)
+RUN apt-get update -qq && apt-get install -qq -y wget musl-tools >/dev/null 2>&1
 
 # Download and setup cross-compiler if needed (cached layer)
 RUN --mount=type=cache,target=/tmp/toolchain-cache,sharing=locked \
@@ -148,6 +148,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         export PATH="/usr/local/aarch64-linux-musl-cross/bin:$PATH" && \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc && \
         export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc; \
+    else \
+        export CC=musl-gcc; \
     fi && \
     cd guest-agent && \
     cargo build --release --target ${RUST_TARGET} && \
