@@ -2591,6 +2591,15 @@ fn setup_init_environment() {
     unsafe { std::env::set_var("UV_NO_CACHE", "1") };
     eprintln!("Set UV_NO_CACHE=1");
 
+    // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
+    // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.
+    // Without lo, user code like http.createServer + fetch('http://localhost:...') fails
+    // with Bun's "FailedToOpenSocket: Was there a typo in the url or port?" error.
+    let _ = StdCommand::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
+    eprintln!("Loopback interface up");
+
     // Wait for network interface (up to 1 second, 20ms intervals)
     // virtio_net loaded by minimal-init.sh, eth0 appears shortly after
     for _ in 0..50 {
