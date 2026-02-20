@@ -479,6 +479,9 @@ class Scheduler:
         if self._vm_manager is None or self._settings is None:
             raise SandboxError("Scheduler resources not initialized")
 
+        # Ensure language is a Language enum (callers may pass raw strings)
+        language = Language(language)
+
         # Apply defaults
         memory = memory_mb or self.config.default_memory_mb
         packages = packages or []
@@ -515,8 +518,7 @@ class Scheduler:
         is_cold_boot = False
         needs_network: bool = allow_network or bool(resolved_ports)
         if self._warm_pool and not packages and not needs_network:
-            lang_enum = Language(language)
-            vm = await self._warm_pool.get_vm(lang_enum, packages)
+            vm = await self._warm_pool.get_vm(language, packages)
 
         # Cold boot if no warm VM available
         if vm is None:
@@ -583,7 +585,7 @@ class Scheduler:
         validator = await PackageValidator.create()
         validator.validate(packages, language)
 
-    async def _get_or_create_snapshot(self, language: str, packages: list[str], memory_mb: int) -> Path:
+    async def _get_or_create_snapshot(self, language: Language, packages: list[str], memory_mb: int) -> Path:
         """Get cached snapshot or create new one with packages.
 
         Checks L2 (local qcow2) and L3 (S3) caches before building.
@@ -603,7 +605,7 @@ class Scheduler:
             raise SandboxError("Packages requested but snapshot manager is not configured")
 
         snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
-            language=Language(language),
+            language=language,
             packages=packages,
             tenant_id="exec-sandbox",
             task_id=f"snapshot-{hash(tuple(sorted(packages)))}",
