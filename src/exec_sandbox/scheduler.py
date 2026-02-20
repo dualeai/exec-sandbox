@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Self
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import SandboxError
+from exec_sandbox.exceptions import SandboxError, VmConfigError
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.session import Session
@@ -483,14 +483,19 @@ class Scheduler:
         if not self._started:
             raise SandboxError("Scheduler not started. Use: async with Scheduler() as scheduler:")
 
+        # Validate memory before acquiring resources
+        memory = memory_mb or self.config.default_memory_mb
+        if memory < constants.MIN_MEMORY_MB:
+            raise VmConfigError(
+                f"memory_mb={memory} is below minimum ({constants.MIN_MEMORY_MB}MB). "
+                f"QEMU cannot boot a kernel with less than {constants.MIN_MEMORY_MB}MB of RAM."
+            )
+
         if self._vm_manager is None or self._settings is None:
             raise SandboxError("Scheduler resources not initialized")
 
         # Ensure language is a Language enum (callers may pass raw strings)
         language = Language(language)
-
-        # Apply defaults
-        memory = memory_mb or self.config.default_memory_mb
         packages = packages or []
 
         # Resolve port mappings (allocate ephemeral ports for those without explicit external)

@@ -253,7 +253,7 @@ class VmManager:
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
             backing_image: Base image for overlay (default: language base image)
-            memory_mb: Memory limit in MB (128-2048, default 512)
+            memory_mb: Memory limit in MB (minimum 128, default 256)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, write directly to this file (no overlay).
@@ -338,7 +338,7 @@ class VmManager:
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
             backing_image: Base image for overlay (default: language base image)
-            memory_mb: Memory limit in MB (128-2048, default 512)
+            memory_mb: Memory limit in MB (minimum 128, default 256)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, write directly to this file (no overlay).

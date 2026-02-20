@@ -14,9 +14,6 @@ DEFAULT_MEMORY_MB: Final[int] = 256
 MIN_MEMORY_MB: Final[int] = 128
 """Minimum guest VM memory in MB."""
 
-MAX_MEMORY_MB: Final[int] = 2048
-"""Maximum guest VM memory in MB."""
-
 TMPFS_SIZE_MB: Final[int] = 128
 """tmpfs /tmp size limit in MB (half of default VM memory)."""
 

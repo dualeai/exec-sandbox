@@ -110,6 +110,55 @@ class TestTimeoutValidation:
             await scheduler.run(code="print(1)", language=Language.PYTHON, timeout_seconds=301)
 
 
+class TestMemoryValidation:
+    """Tests for memory_mb validation in Scheduler._prepare_vm()."""
+
+    async def test_memory_below_minimum_rejected(self) -> None:
+        """memory_mb=1 raises VmConfigError before reaching QEMU."""
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(VmConfigError, match="below minimum"):
+            await scheduler.run(code="print(1)", language=Language.PYTHON, memory_mb=1)
+
+    async def test_memory_at_minimum_accepted(self) -> None:
+        """memory_mb=128 passes validation (may fail later without QEMU)."""
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        # Should NOT raise VmConfigError - it will fail later due to missing
+        # VM manager, but the memory validation itself should pass
+        with pytest.raises(Exception) as exc_info:
+            await scheduler.run(code="print(1)", language=Language.PYTHON, memory_mb=128)
+        assert not isinstance(exc_info.value, VmConfigError)
+
+    async def test_memory_127_rejected(self) -> None:
+        """memory_mb=127 (just below minimum) raises VmConfigError."""
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(VmConfigError, match="below minimum"):
+            await scheduler.run(code="print(1)", language=Language.PYTHON, memory_mb=127)
+
+    async def test_memory_large_value_accepted(self) -> None:
+        """Large memory_mb values pass validation (no upper bound)."""
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        # Should NOT raise VmConfigError - no upper bound on memory
+        with pytest.raises(Exception) as exc_info:
+            await scheduler.run(code="print(1)", language=Language.PYTHON, memory_mb=65536)
+        assert not isinstance(exc_info.value, VmConfigError)
+
+
 class TestPackageValidation:
     """Tests for package validation in Scheduler."""
 
