@@ -96,8 +96,14 @@ class PackageValidator:
             language: Programming language to validate for
 
         Raises:
-            PackageNotAllowedError: If package not in allow-list
+            PackageNotAllowedError: If package not in allow-list or language has no allow-list
         """
+        if language.value not in self._allow_lists:
+            raise PackageNotAllowedError(
+                f"Package validation not supported for '{language.value}' language. "
+                f"Supported: {', '.join(sorted(self._allow_lists))}."
+            )
+
         allow_list = self._allow_lists[language.value]
 
         for package_spec in packages:
