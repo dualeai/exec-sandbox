@@ -210,7 +210,7 @@ class Scheduler:
         self,
         code: str,
         *,
-        language: Language,
+        language: str | Language,
         packages: list[str] | None = None,
         timeout_seconds: int | None = None,
         memory_mb: int | None = None,
@@ -369,7 +369,7 @@ class Scheduler:
     async def session(
         self,
         *,
-        language: Language,
+        language: str | Language,
         packages: list[str] | None = None,
         memory_mb: int | None = None,
         allow_network: bool = False,
@@ -450,7 +450,7 @@ class Scheduler:
     async def _prepare_vm(
         self,
         *,
-        language: Language,
+        language: str | Language,
         packages: list[str] | None,
         memory_mb: int | None,
         allow_network: bool,
