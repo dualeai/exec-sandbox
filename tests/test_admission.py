@@ -1,12 +1,13 @@
 """Tests for ResourceAdmissionController.
 
-Tests the two admission gates (memory budget, CPU budget),
-blocking/signaling behavior, timeout, and graceful degradation.
+Tests the three admission gates (memory budget, CPU budget, available-memory floor),
+blocking/signaling behavior, timeout, cgroup-aware startup, and graceful degradation.
 """
 
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -36,6 +37,7 @@ def _make_controller(
     memory_overcommit: float = DEFAULT_MEMORY_OVERCOMMIT_RATIO,
     cpu_overcommit: float = DEFAULT_CPU_OVERCOMMIT_RATIO,
     reserve_ratio: float = DEFAULT_HOST_MEMORY_RESERVE_RATIO,
+    available_memory_floor_mb: int = 0,
 ) -> ResourceAdmissionController:
     """Create an admission controller with known host resources (no psutil)."""
     return ResourceAdmissionController(
@@ -44,6 +46,7 @@ def _make_controller(
         host_memory_reserve_ratio=reserve_ratio,
         host_memory_mb=host_memory_mb,
         host_cpu_count=host_cpu_count,
+        available_memory_floor_mb=available_memory_floor_mb,
     )
 
 
@@ -393,3 +396,171 @@ async def test_counters_snap_to_zero_when_empty() -> None:
     assert snap.allocated_vm_slots == 0
     assert snap.allocated_memory_mb == 0.0  # Exact zero, not approx
     assert snap.allocated_cpu == 0.0
+
+
+# ============================================================================
+# Cgroup-Aware Startup (L1)
+# ============================================================================
+
+
+async def test_cgroup_memory_limit_used_as_capacity() -> None:
+    """When cgroup memory limit detected, it becomes host_memory_mb."""
+    ctrl = ResourceAdmissionController(
+        memory_overcommit_ratio=1.0,
+        cpu_overcommit_ratio=1.0,
+        host_memory_reserve_ratio=0.1,
+    )
+
+    with (
+        patch("exec_sandbox.admission.detect_cgroup_memory_limit_mb", return_value=4096.0),
+        patch("exec_sandbox.admission.detect_cgroup_cpu_limit", return_value=2.0),
+    ):
+        await ctrl.start()
+
+    snap = ctrl.snapshot()
+    assert snap.host_memory_mb == pytest.approx(4096.0)
+    assert snap.host_cpu_count == pytest.approx(2.0)
+    assert snap.capacity_source == "cgroup"
+    # Budget = 4096 * 0.9 * 1.0 = 3686.4
+    assert snap.memory_budget_mb == pytest.approx(3686.4)
+
+
+async def test_cgroup_falls_through_to_psutil_when_unlimited() -> None:
+    """When cgroup returns None, psutil is used as fallback."""
+    ctrl = ResourceAdmissionController(
+        memory_overcommit_ratio=1.0,
+        cpu_overcommit_ratio=1.0,
+        host_memory_reserve_ratio=0.1,
+    )
+
+    mock_vmem = type("vmem", (), {"total": 8 * 1024 * 1024 * 1024})()  # 8GB
+    with (
+        patch("exec_sandbox.admission.detect_cgroup_memory_limit_mb", return_value=None),
+        patch("exec_sandbox.admission.detect_cgroup_cpu_limit", return_value=None),
+        patch("exec_sandbox.admission.psutil.virtual_memory", return_value=mock_vmem),
+        patch("exec_sandbox.admission.psutil.cpu_count", return_value=4),
+    ):
+        await ctrl.start()
+
+    snap = ctrl.snapshot()
+    assert snap.host_memory_mb == pytest.approx(8192.0)
+    assert snap.host_cpu_count == pytest.approx(4.0)
+    assert snap.capacity_source == "psutil"
+
+
+async def test_manual_override_beats_cgroup() -> None:
+    """Manual host_memory_mb/host_cpu_count bypass cgroup + psutil."""
+    ctrl = _make_controller(host_memory_mb=32_000.0, host_cpu_count=16.0)
+
+    snap = ctrl.snapshot()
+    assert snap.host_memory_mb == pytest.approx(32_000.0)
+    assert snap.host_cpu_count == pytest.approx(16.0)
+    assert snap.capacity_source == "manual"
+
+
+async def test_snapshot_includes_capacity_source() -> None:
+    """ResourceSnapshot reports which source was used for capacity detection."""
+    ctrl = _make_controller()
+    snap = ctrl.snapshot()
+    assert snap.capacity_source == "manual"
+
+
+# ============================================================================
+# Gate 3: Available-Memory Floor
+# ============================================================================
+
+
+async def test_floor_rejects_when_available_below_threshold() -> None:
+    """Gate 3 rejects when system available memory < floor."""
+    ctrl = _make_controller(available_memory_floor_mb=512)
+    # Simulate low available memory
+    ctrl._system_available_memory_mb = 256.0
+
+    with pytest.raises(VmCapacityError, match="Resource admission timeout"):
+        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+
+
+async def test_floor_allows_when_available_above_threshold() -> None:
+    """Gate 3 allows when system available memory >= floor."""
+    ctrl = _make_controller(available_memory_floor_mb=512)
+    ctrl._system_available_memory_mb = 1024.0
+
+    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    assert r.vm_id == "vm-1"
+    await ctrl.release(r)
+
+
+async def test_floor_zero_disables_gate3() -> None:
+    """Floor=0 disables Gate 3 (backward compat)."""
+    ctrl = _make_controller(available_memory_floor_mb=0)
+    # Even with very low available memory, Gate 3 is skipped
+    ctrl._system_available_memory_mb = 10.0
+
+    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    assert r.vm_id == "vm-1"
+    await ctrl.release(r)
+
+
+async def test_floor_none_available_allows_admission() -> None:
+    """When available memory hasn't been probed (None), Gate 3 allows."""
+    ctrl = _make_controller(available_memory_floor_mb=512)
+    assert ctrl._system_available_memory_mb is None
+
+    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    assert r.vm_id == "vm-1"
+    await ctrl.release(r)
+
+
+async def test_floor_recovery_wakes_waiters() -> None:
+    """When memory recovers above floor, blocked waiters are unblocked."""
+    ctrl = _make_controller(available_memory_floor_mb=512)
+    ctrl._system_available_memory_mb = 100.0  # Below floor
+
+    # Start blocked acquire
+    acquire_task = asyncio.create_task(ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=5.0))
+    await asyncio.sleep(0.1)
+    assert not acquire_task.done()
+
+    # Simulate memory recovery + notify
+    ctrl._system_available_memory_mb = 1024.0
+    async with ctrl._condition:
+        ctrl._condition.notify_all()
+
+    r = await asyncio.wait_for(acquire_task, timeout=5.0)
+    assert r.vm_id == "vm-1"
+    await ctrl.release(r)
+
+
+async def test_snapshot_includes_floor_fields() -> None:
+    """ResourceSnapshot includes Gate 3 fields."""
+    ctrl = _make_controller(available_memory_floor_mb=512)
+    ctrl._system_available_memory_mb = 2048.0
+
+    snap = ctrl.snapshot()
+    assert snap.available_memory_floor_mb == 512
+    assert snap.system_available_memory_mb == pytest.approx(2048.0)
+
+
+# ============================================================================
+# Stop
+# ============================================================================
+
+
+async def test_stop_cancels_probe_task() -> None:
+    """stop() cancels the background probe task."""
+    ctrl = _make_controller(available_memory_floor_mb=512)
+
+    # Simulate a running probe task
+    async def fake_probe() -> None:
+        await asyncio.sleep(3600)
+
+    ctrl._probe_task = asyncio.create_task(fake_probe())
+    await ctrl.stop()
+    assert ctrl._probe_task is None
+
+
+async def test_stop_is_idempotent() -> None:
+    """stop() is safe to call multiple times."""
+    ctrl = _make_controller()
+    await ctrl.stop()
+    await ctrl.stop()  # No error

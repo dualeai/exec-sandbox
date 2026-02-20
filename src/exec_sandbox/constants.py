@@ -327,3 +327,13 @@ RESOURCE_MONITOR_INTERVAL_SECONDS: Final[float] = 5.0
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for
 resources to become available, then raises VmCapacityError."""
+
+MIN_AVAILABLE_MEMORY_FLOOR_MB: Final[int] = 512
+"""Default available-memory floor in MB (Gate 3).
+When system available memory drops below this, new VMs are rejected.
+Equivalent to K8s eviction-threshold. Only used when
+available_memory_floor_mb > 0 in settings."""
+
+AVAILABLE_MEMORY_PROBE_INTERVAL_SECONDS: Final[float] = 5.0
+"""Interval between available-memory probes (seconds).
+Background task refreshes available memory from cgroup or psutil."""

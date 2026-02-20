@@ -158,6 +158,7 @@ class VmManager:
             host_memory_reserve_ratio=settings.host_memory_reserve_ratio,
             host_memory_mb=settings.host_memory_mb,
             host_cpu_count=settings.host_cpu_count,
+            available_memory_floor_mb=settings.available_memory_floor_mb,
         )
 
         # Overlay pool for fast VM boot (auto-manages base image discovery and pooling)
@@ -232,10 +233,11 @@ class VmManager:
         return dict(self._vms)
 
     async def stop(self) -> None:
-        """Stop VmManager and cleanup resources (overlay pool).
+        """Stop VmManager and cleanup resources (admission probe, overlay pool).
 
         Should be called when the VmManager is no longer needed.
         """
+        await self._admission.stop()
         await self._overlay_pool.stop()
 
     async def __aenter__(self) -> "VmManager":

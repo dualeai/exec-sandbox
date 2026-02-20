@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     host_memory_mb: float | None = None
     host_cpu_count: float | None = None
 
+    # Runtime available-memory floor (Gate 3)
+    # 0 = disabled (default, backward compat). Set >0 in production to reject
+    # new VMs when system available memory drops below this threshold.
+    available_memory_floor_mb: int = 0
+
     # Testing/Debug
     force_emulation: bool = False
     """Force software emulation instead of hardware virtualization (KVM/HVF).

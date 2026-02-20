@@ -25,7 +25,10 @@ from exec_sandbox.cgroup import (
     TCG_TB_CACHE_SIZE_MB,
     ULIMIT_CPU_TIME_SECONDS,
     ULIMIT_MEMORY_MULTIPLIER,
+    detect_cgroup_cpu_limit,
+    detect_cgroup_memory_limit_mb,
     is_cgroup_available,
+    read_container_available_memory_mb,
     wrap_with_ulimit,
 )
 from exec_sandbox.platform_utils import HostOS
@@ -1024,6 +1027,94 @@ class TestCgroupConstants:
 
         assert ERRNO_READ_ONLY_FILESYSTEM == errno.EROFS
         assert ERRNO_PERMISSION_DENIED == errno.EACCES
+
+
+# =============================================================================
+# detect_cgroup_memory_limit_mb - Tests
+# =============================================================================
+
+
+class TestDetectCgroupMemoryLimitMb:
+    """Test container cgroup memory limit detection."""
+
+    def test_v2_numeric_limit_returns_mb(self, tmp_path: Path):
+        """cgroup v2 numeric memory.max → returns MB."""
+        (tmp_path / "memory.max").write_text("4294967296")  # 4GB
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(4096.0)
+
+    def test_v2_max_string_returns_none(self, tmp_path: Path):
+        """cgroup v2 'max' (unlimited) → returns None."""
+        (tmp_path / "memory.max").write_text("max")
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path))
+        assert result is None
+
+    def test_v2_small_limit(self, tmp_path: Path):
+        """cgroup v2 small memory limit (1GB) returns correct MB."""
+        (tmp_path / "memory.max").write_text("1073741824")  # 1GB
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(1024.0)
+
+    def test_no_cgroup_returns_none(self, tmp_path: Path):
+        """No cgroup files → returns None (macOS, bare metal)."""
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path / "nonexistent"))
+        assert result is None
+
+
+class TestDetectCgroupCpuLimit:
+    """Test container cgroup CPU limit detection."""
+
+    def test_v2_quota_period_returns_cpus(self, tmp_path: Path):
+        """cgroup v2 cpu.max '200000 100000' → 2.0 CPUs."""
+        (tmp_path / "cpu.max").write_text("200000 100000")
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(2.0)
+
+    def test_v2_max_string_returns_none(self, tmp_path: Path):
+        """cgroup v2 'max 100000' (unlimited) → returns None."""
+        (tmp_path / "cpu.max").write_text("max 100000")
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path))
+        assert result is None
+
+    def test_v2_fractional_cpus(self, tmp_path: Path):
+        """cgroup v2 fractional CPU quota → correct float."""
+        (tmp_path / "cpu.max").write_text("50000 100000")  # 0.5 CPUs
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(0.5)
+
+    def test_no_cgroup_returns_none(self, tmp_path: Path):
+        """No cgroup files → returns None."""
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path / "nonexistent"))
+        assert result is None
+
+
+class TestReadContainerAvailableMemoryMb:
+    """Test container available memory reading."""
+
+    def test_v2_returns_available(self, tmp_path: Path):
+        """cgroup v2 memory.max - memory.current = available."""
+        (tmp_path / "memory.max").write_text("4294967296")  # 4GB
+        (tmp_path / "memory.current").write_text("1073741824")  # 1GB
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(3072.0)  # 3GB
+
+    def test_v2_unlimited_returns_none(self, tmp_path: Path):
+        """cgroup v2 'max' → returns None."""
+        (tmp_path / "memory.max").write_text("max")
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path))
+        assert result is None
+
+    def test_v2_current_exceeds_max_returns_zero(self, tmp_path: Path):
+        """cgroup v2 current > max → returns 0 (not negative)."""
+        (tmp_path / "memory.max").write_text("1073741824")  # 1GB
+        (tmp_path / "memory.current").write_text("2147483648")  # 2GB (over limit)
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path))
+        assert result == 0.0
+
+    def test_no_cgroup_returns_none(self, tmp_path: Path):
+        """No cgroup files → returns None."""
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path / "nonexistent"))
+        assert result is None
 
 
 # =============================================================================

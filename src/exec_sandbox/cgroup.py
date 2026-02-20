@@ -62,6 +62,157 @@ ERRNO_PERMISSION_DENIED: Final[int] = 13
 """errno for permission denied (EACCES)."""
 
 
+# cgroup v1 "unlimited" sentinel: values at or above this threshold are treated
+# as "no limit set".  The kernel uses PAGE_COUNTER_MAX which on 64-bit is
+# 2^63 / PAGE_SIZE ≈ 9.2e18 / 4096 ≈ 2.25e15.  Checking > 2^62 safely covers
+# both raw byte values (memory.limit_in_bytes) and page-counter representations.
+_CGROUP_V1_UNLIMITED_THRESHOLD: Final[int] = 2**62
+
+# =============================================================================
+# Container Cgroup Detection
+# =============================================================================
+
+
+def detect_cgroup_memory_limit_mb(
+    cgroup_v2_base: str | None = None,
+) -> float | None:
+    """Detect the container cgroup memory limit.
+
+    Priority: cgroup v2 ``memory.max`` → cgroup v1
+    ``memory.limit_in_bytes`` → None (fall through to psutil).
+
+    All reads are synchronous (tiny procfs files, no I/O).
+
+    Args:
+        cgroup_v2_base: Override base path for testing (default: ``/sys/fs/cgroup``).
+
+    Returns:
+        Memory limit in MB, or None if no cgroup limit is set.
+    """
+    base = cgroup_v2_base or CGROUP_V2_BASE_PATH
+
+    # --- cgroup v2 ---
+    v2_path = Path(base) / "memory.max"
+    try:
+        raw = v2_path.read_text().strip()
+        if raw != "max":
+            limit_bytes = int(raw)
+            limit_mb = limit_bytes / (1024 * 1024)
+            logger.info(
+                "Detected cgroup v2 memory limit",
+                extra={"limit_mb": round(limit_mb), "path": str(v2_path)},
+            )
+            return limit_mb
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # --- cgroup v1 ---
+    v1_path = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    try:
+        limit_bytes = int(v1_path.read_text().strip())
+        if limit_bytes < _CGROUP_V1_UNLIMITED_THRESHOLD:
+            limit_mb = limit_bytes / (1024 * 1024)
+            logger.info(
+                "Detected cgroup v1 memory limit",
+                extra={"limit_mb": round(limit_mb), "path": str(v1_path)},
+            )
+            return limit_mb
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    return None
+
+
+def detect_cgroup_cpu_limit(
+    cgroup_v2_base: str | None = None,
+) -> float | None:
+    """Detect the container cgroup CPU limit (in logical CPUs).
+
+    Priority: cgroup v2 ``cpu.max`` → cgroup v1
+    ``cpu.cfs_quota_us / cpu.cfs_period_us`` → None.
+
+    Args:
+        cgroup_v2_base: Override base path for testing.
+
+    Returns:
+        CPU limit as a float (e.g. 2.0 = 2 CPUs), or None if unlimited.
+    """
+    base = cgroup_v2_base or CGROUP_V2_BASE_PATH
+
+    # --- cgroup v2: "quota period" e.g. "200000 100000" ---
+    v2_path = Path(base) / "cpu.max"
+    try:
+        parts = v2_path.read_text().strip().split()
+        if len(parts) == 2 and parts[0] != "max":  # noqa: PLR2004
+            quota = int(parts[0])
+            period = int(parts[1])
+            if period > 0:
+                cpus = quota / period
+                logger.info(
+                    "Detected cgroup v2 CPU limit",
+                    extra={"cpus": round(cpus, 2), "path": str(v2_path)},
+                )
+                return cpus
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # --- cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us ---
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text().strip())
+        if quota == -1:
+            return None  # unlimited
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
+        if period > 0:
+            cpus = quota / period
+            logger.info(
+                "Detected cgroup v1 CPU limit",
+                extra={"cpus": round(cpus, 2)},
+            )
+            return cpus
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    return None
+
+
+def read_container_available_memory_mb(
+    cgroup_v2_base: str | None = None,
+) -> float | None:
+    """Read available memory inside a container (cgroup limit minus current usage).
+
+    Uses ``memory.max - memory.current`` (cgroup v2) or
+    ``memory.limit_in_bytes - memory.usage_in_bytes`` (cgroup v1).
+
+    Args:
+        cgroup_v2_base: Override base path for testing.
+
+    Returns:
+        Available memory in MB, or None if not in a cgroup.
+    """
+    base = cgroup_v2_base or CGROUP_V2_BASE_PATH
+
+    # --- cgroup v2 ---
+    try:
+        max_raw = Path(base, "memory.max").read_text().strip()
+        if max_raw != "max":
+            limit = int(max_raw)
+            current = int(Path(base, "memory.current").read_text().strip())
+            return max(0, limit - current) / (1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # --- cgroup v1 ---
+    try:
+        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text().strip())
+        if limit < _CGROUP_V1_UNLIMITED_THRESHOLD:
+            usage = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip())
+            return max(0, limit - usage) / (1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    return None
+
+
 # =============================================================================
 # Availability Check
 # =============================================================================

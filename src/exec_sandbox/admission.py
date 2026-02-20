@@ -1,11 +1,15 @@
 """Resource-aware admission controller for VM scheduling.
 
-Replaces the simple asyncio.Semaphore with two resource-based admission gates:
+Three admission gates (all must pass):
 1. Memory budget - host_total * (1 - reserve_ratio) * overcommit_ratio
 2. CPU budget - host_cpu_count * cpu_overcommit_ratio
+3. Available-memory floor - reject when system available memory < threshold
 
-Both gates must pass for a VM to be admitted. Uses asyncio.Condition
-for blocking/signaling when resources are insufficient.
+Gates 1-2 are budget-based (stable). Gate 3 is dynamic (probed every 5s).
+All gates block via asyncio.Condition, timing out with VmCapacityError.
+
+Capacity detection priority chain:
+  manual override > cgroup limit > psutil total
 
 Graceful degradation: if psutil probe fails, budgets are set to infinity
 (no admission control, equivalent to unlimited capacity).
@@ -14,16 +18,28 @@ Graceful degradation: if psutil probe fails, budgets are set to infinity
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, Literal
 from uuid import uuid4
 
+import psutil
+
 from exec_sandbox._logging import get_logger
-from exec_sandbox.cgroup import CGROUP_MEMORY_OVERHEAD_MB, TCG_TB_CACHE_SIZE_MB
+from exec_sandbox.cgroup import (
+    CGROUP_MEMORY_OVERHEAD_MB,
+    TCG_TB_CACHE_SIZE_MB,
+    detect_cgroup_cpu_limit,
+    detect_cgroup_memory_limit_mb,
+    read_container_available_memory_mb,
+)
+from exec_sandbox.constants import AVAILABLE_MEMORY_PROBE_INTERVAL_SECONDS
 from exec_sandbox.exceptions import VmCapacityError
 
 logger = get_logger(__name__)
+
+CapacitySource = Literal["manual", "cgroup", "psutil", "none", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +72,13 @@ class ResourceSnapshot:
     allocated_cpu: float = 0.0
     allocated_vm_slots: int = 0
 
+    # Capacity source (for observability)
+    capacity_source: CapacitySource = "psutil"
+
+    # Gate 3: available-memory floor
+    available_memory_floor_mb: int = 0
+    system_available_memory_mb: float | None = None
+
     # Computed availability
     available_memory_mb: float = field(init=False)
     available_cpu: float = field(init=False)
@@ -72,12 +95,13 @@ _UNLIMITED: Final[float] = float("inf")
 class ResourceAdmissionController:
     """Resource-aware admission controller replacing asyncio.Semaphore.
 
-    Two gates (both must pass):
+    Three gates (all must pass):
     1. Memory budget: host_total * (1 - reserve_ratio) * overcommit_ratio
     2. CPU budget: host_cpus * overcommit_ratio
+    3. Available-memory floor: system available memory >= threshold
 
-    If psutil is unavailable, both gates degrade to unlimited
-    (no admission control).
+    Gate 3 is disabled by default (available_memory_floor_mb=0).
+    If psutil is unavailable, gates 1-2 degrade to unlimited.
     """
 
     def __init__(
@@ -87,10 +111,12 @@ class ResourceAdmissionController:
         host_memory_reserve_ratio: float,
         host_memory_mb: float | None = None,
         host_cpu_count: float | None = None,
+        available_memory_floor_mb: int = 0,
     ) -> None:
         self._memory_overcommit_ratio = memory_overcommit_ratio
         self._cpu_overcommit_ratio = cpu_overcommit_ratio
         self._host_memory_reserve_ratio = host_memory_reserve_ratio
+        self._available_memory_floor_mb = available_memory_floor_mb
 
         # Set by start() or constructor override (for testing)
         self._host_memory_mb: float = host_memory_mb if host_memory_mb is not None else 0.0
@@ -100,67 +126,224 @@ class ResourceAdmissionController:
         self._memory_budget_mb: float = _UNLIMITED
         self._cpu_budget: float = _UNLIMITED
 
+        # Capacity source for observability
+        self._capacity_source: CapacitySource = "unknown"
+
         # Current allocations (protected by _condition's lock)
         self._allocated_memory_mb: float = 0.0
         self._allocated_cpu: float = 0.0
         self._allocated_vm_slots: int = 0
         self._reservations: dict[str, ResourceReservation] = {}
 
+        # Gate 3: available memory (updated by background probe)
+        # None = not yet probed or not available
+        self._system_available_memory_mb: float | None = None
+
         # Condition for blocking acquire / signaling release
         self._condition = asyncio.Condition()
         self._started = False
         self._start_lock = asyncio.Lock()
 
+        # Background probe task (Gate 3)
+        self._probe_task: asyncio.Task[None] | None = None
+
         # If host resources were provided at construction, compute budgets now
         if host_memory_mb is not None and host_cpu_count is not None:
+            self._capacity_source = "manual"
             self._compute_budgets()
             self._started = True
+            logger.warning(
+                "Host resources manually overridden, admission budgets may not reflect actual capacity",
+                extra={
+                    "host_memory_mb": host_memory_mb,
+                    "host_cpu_count": host_cpu_count,
+                    "memory_budget_mb": round(self._memory_budget_mb),
+                    "cpu_budget": round(self._cpu_budget, 1),
+                },
+            )
 
-    async def start(self) -> None:
-        """Probe host resources via psutil and compute budgets.
+    async def start(self) -> None:  # noqa: PLR0912
+        """Probe host resources and compute budgets.
+
+        Detection priority: cgroup limit > psutil total.
+        Manual overrides (host_memory_mb/host_cpu_count) skip this entirely.
 
         Safe to call multiple times (idempotent after first probe).
-        If psutil fails, degrades gracefully to unlimited budgets.
+        If all probes fail, degrades gracefully to unlimited budgets.
         Serialized via asyncio.Lock to prevent concurrent probe races.
         """
         async with self._start_lock:
             if self._started:
                 return
 
-            # Probe host resources
-            try:
-                import psutil  # noqa: PLC0415
+            # --- L1: Cgroup-aware capacity detection ---
+            cgroup_mem = detect_cgroup_memory_limit_mb()
+            cgroup_cpu = detect_cgroup_cpu_limit()
 
-                loop = asyncio.get_running_loop()
-                vmem = await loop.run_in_executor(None, psutil.virtual_memory)
-                cpu_count = await loop.run_in_executor(None, psutil.cpu_count)
-
-                self._host_memory_mb = vmem.total / (1024 * 1024)
-                self._host_cpu_count = float(cpu_count or 1)
-                self._compute_budgets()
-
-                reserve_mb = round(self._host_memory_mb * self._host_memory_reserve_ratio)
+            if cgroup_mem is not None:
+                self._host_memory_mb = cgroup_mem
+                self._capacity_source = "cgroup"
                 logger.info(
-                    "Host resources detected",
+                    "Using cgroup memory limit for admission budget",
+                    extra={"cgroup_memory_mb": round(cgroup_mem)},
+                )
+
+            if cgroup_cpu is not None:
+                self._host_cpu_count = cgroup_cpu
+                logger.info(
+                    "Using cgroup CPU limit for admission budget",
+                    extra={"cgroup_cpus": round(cgroup_cpu, 2)},
+                )
+
+            # --- Fallback to psutil for any missing dimension ---
+            need_psutil_mem = cgroup_mem is None
+            need_psutil_cpu = cgroup_cpu is None
+
+            if need_psutil_mem or need_psutil_cpu:
+                try:
+                    loop = asyncio.get_running_loop()
+
+                    if need_psutil_mem:
+                        vmem = await loop.run_in_executor(None, psutil.virtual_memory)
+                        self._host_memory_mb = vmem.total / (1024 * 1024)
+                        if self._capacity_source == "unknown":
+                            self._capacity_source = "psutil"
+
+                    if need_psutil_cpu:
+                        cpu_count = await loop.run_in_executor(None, psutil.cpu_count)
+                        self._host_cpu_count = float(cpu_count or 1)
+
+                    self._compute_budgets()
+
+                    reserve_mb = round(self._host_memory_mb * self._host_memory_reserve_ratio)
+                    logger.info(
+                        "Host resources detected",
+                        extra={
+                            "capacity_source": self._capacity_source,
+                            "host_memory_mb": round(self._host_memory_mb),
+                            "host_cpu_count": self._host_cpu_count,
+                            "host_memory_reserve_ratio": self._host_memory_reserve_ratio,
+                            "host_memory_reserve_mb": reserve_mb,
+                            "memory_budget_mb": round(self._memory_budget_mb),
+                            "cpu_budget": round(self._cpu_budget, 1),
+                            "memory_overcommit_ratio": self._memory_overcommit_ratio,
+                            "cpu_overcommit_ratio": self._cpu_overcommit_ratio,
+                        },
+                    )
+                except (OSError, AttributeError):
+                    if cgroup_mem is not None or cgroup_cpu is not None:
+                        # Partial cgroup detection - compute budgets with what we have
+                        if cgroup_mem is None:
+                            self._host_memory_mb = 0.0
+                        if cgroup_cpu is None:
+                            self._host_cpu_count = 1.0
+                        self._compute_budgets()
+                    else:
+                        logger.warning(
+                            "All resource probes failed, using unlimited budgets (no admission control)",
+                        )
+                        self._memory_budget_mb = _UNLIMITED
+                        self._cpu_budget = _UNLIMITED
+                        self._capacity_source = "none"
+            else:
+                # Both dimensions from cgroup
+                self._compute_budgets()
+                logger.info(
+                    "Host resources detected (all from cgroup)",
                     extra={
+                        "capacity_source": "cgroup",
                         "host_memory_mb": round(self._host_memory_mb),
                         "host_cpu_count": self._host_cpu_count,
-                        "host_memory_reserve_ratio": self._host_memory_reserve_ratio,
-                        "host_memory_reserve_mb": reserve_mb,
                         "memory_budget_mb": round(self._memory_budget_mb),
                         "cpu_budget": round(self._cpu_budget, 1),
-                        "memory_overcommit_ratio": self._memory_overcommit_ratio,
-                        "cpu_overcommit_ratio": self._cpu_overcommit_ratio,
                     },
                 )
-            except (ImportError, OSError, AttributeError):
-                logger.warning(
-                    "psutil probe failed, using unlimited memory/CPU budgets (no admission control)",
-                )
-                self._memory_budget_mb = _UNLIMITED
-                self._cpu_budget = _UNLIMITED
 
             self._started = True
+
+            # --- L3: Start background probe if floor is enabled ---
+            if self._available_memory_floor_mb > 0:
+                # Seed initial value synchronously so Gate 3 is active immediately
+                # (not deferred until first background tick)
+                self._system_available_memory_mb = await self._probe_available_memory()
+                self._probe_task = asyncio.create_task(self._probe_available_memory_loop())
+                logger.info(
+                    "Available-memory floor enabled (Gate 3)",
+                    extra={
+                        "floor_mb": self._available_memory_floor_mb,
+                        "probe_interval_seconds": AVAILABLE_MEMORY_PROBE_INTERVAL_SECONDS,
+                        "initial_available_mb": (
+                            round(self._system_available_memory_mb)
+                            if self._system_available_memory_mb is not None
+                            else None
+                        ),
+                    },
+                )
+
+    async def stop(self) -> None:
+        """Stop the background memory probe task.
+
+        Safe to call multiple times. No-op if probe was never started.
+        """
+        if self._probe_task is not None:
+            self._probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._probe_task
+            self._probe_task = None
+
+    async def _probe_available_memory(self) -> float | None:
+        """Probe system available memory (cgroup → psutil fallback).
+
+        Tries cgroup first (sync file reads, fast). Falls back to
+        psutil.virtual_memory via executor to avoid blocking the loop.
+
+        Returns:
+            Available memory in MB, or None if all probes fail.
+        """
+        avail = read_container_available_memory_mb()
+
+        if avail is None:
+            try:
+                loop = asyncio.get_running_loop()
+                vmem = await loop.run_in_executor(None, psutil.virtual_memory)
+                avail = vmem.available / (1024 * 1024)
+            except (OSError, AttributeError):
+                avail = None
+
+        if avail is None:
+            logger.warning(
+                "Failed to probe available memory (cgroup and psutil both failed), "
+                "Gate 3 floor enforcement is degraded",
+            )
+
+        return avail
+
+    async def _probe_available_memory_loop(self) -> None:
+        """Background loop that refreshes system available memory.
+
+        Runs every AVAILABLE_MEMORY_PROBE_INTERVAL_SECONDS.
+        When memory recovers above floor, wakes blocked waiters.
+        """
+        while True:
+            try:
+                avail = await self._probe_available_memory()
+
+                old_value = self._system_available_memory_mb
+                self._system_available_memory_mb = avail
+
+                # If memory recovered above floor, wake waiters
+                if (
+                    avail is not None
+                    and avail >= self._available_memory_floor_mb
+                    and (old_value is None or old_value < self._available_memory_floor_mb)
+                ):
+                    async with self._condition:
+                        self._condition.notify_all()
+
+            except (OSError, ValueError, AttributeError):
+                logger.debug("Available memory probe failed", exc_info=True)
+
+            await asyncio.sleep(AVAILABLE_MEMORY_PROBE_INTERVAL_SECONDS)
 
     def _compute_budgets(self) -> None:
         """Compute effective budgets from host resources and overcommit ratios.
@@ -182,7 +365,7 @@ class ResourceAdmissionController:
     ) -> ResourceReservation:
         """Acquire resources for a VM, blocking if insufficient.
 
-        Checks both gates under lock. Blocks on asyncio.Condition if
+        Checks all three gates under lock. Blocks on asyncio.Condition if
         insufficient resources. Raises VmCapacityError after timeout.
 
         Args:
@@ -236,6 +419,14 @@ class ResourceAdmissionController:
         except TimeoutError:
             mem_budget_str = "unlimited" if math.isinf(self._memory_budget_mb) else str(round(self._memory_budget_mb))
             cpu_budget_str = "unlimited" if math.isinf(self._cpu_budget) else str(round(self._cpu_budget, 1))
+            floor_info = ""
+            if self._available_memory_floor_mb > 0:
+                avail_str = (
+                    str(round(self._system_available_memory_mb))
+                    if self._system_available_memory_mb is not None
+                    else "unknown"
+                )
+                floor_info = f" Floor: {avail_str}/{self._available_memory_floor_mb}MB available."
             raise VmCapacityError(
                 f"Resource admission timeout after {timeout}s for VM {vm_id}. "
                 f"Requested: {round(total_memory_mb)}MB memory, {cpu_cores} CPU. "
@@ -243,7 +434,7 @@ class ResourceAdmissionController:
                 f"({round(self._allocated_memory_mb)}/{mem_budget_str} allocated), "
                 f"{cpu_budget_str} CPU "
                 f"({round(self._allocated_cpu, 1)}/{cpu_budget_str} allocated), "
-                f"{self._allocated_vm_slots} VM slots in use",
+                f"{self._allocated_vm_slots} VM slots in use.{floor_info}",
                 context={
                     "vm_id": vm_id,
                     "requested_memory_mb": round(total_memory_mb),
@@ -253,6 +444,12 @@ class ResourceAdmissionController:
                     "allocated_cpu": round(self._allocated_cpu, 1),
                     "cpu_budget": cpu_budget_str,
                     "vm_slots": self._allocated_vm_slots,
+                    "available_memory_floor_mb": self._available_memory_floor_mb,
+                    "system_available_memory_mb": (
+                        round(self._system_available_memory_mb)
+                        if self._system_available_memory_mb is not None
+                        else None
+                    ),
                 },
             ) from None
 
@@ -311,6 +508,9 @@ class ResourceAdmissionController:
             allocated_memory_mb=self._allocated_memory_mb,
             allocated_cpu=self._allocated_cpu,
             allocated_vm_slots=self._allocated_vm_slots,
+            capacity_source=self._capacity_source,
+            available_memory_floor_mb=self._available_memory_floor_mb,
+            system_available_memory_mb=self._system_available_memory_mb,
         )
 
     def effective_max_vms(
@@ -341,18 +541,26 @@ class ResourceAdmissionController:
         return min(max_by_memory, max_by_cpu)
 
     def _can_admit(self, memory_mb: float, cpu_cores: float) -> bool:
-        """Check if both admission gates pass.
+        """Check if all admission gates pass.
 
         Args:
             memory_mb: Total memory needed (guest + overhead)
             cpu_cores: CPU cores needed
 
         Returns:
-            True if both gates pass
+            True if all gates pass
         """
         # Gate 1: Memory budget
         if self._allocated_memory_mb + memory_mb > self._memory_budget_mb:
             return False
 
         # Gate 2: CPU budget
-        return self._allocated_cpu + cpu_cores <= self._cpu_budget
+        if self._allocated_cpu + cpu_cores > self._cpu_budget:
+            return False
+
+        # Gate 3: Available-memory floor (disabled when floor_mb == 0)
+        return not (
+            self._available_memory_floor_mb > 0
+            and self._system_available_memory_mb is not None
+            and self._system_available_memory_mb < self._available_memory_floor_mb
+        )
