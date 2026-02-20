@@ -47,6 +47,7 @@ from collections.abc import Callable  # noqa: TC003 - Used at runtime for on_std
 from pathlib import Path  # noqa: TC003 - Used at runtime
 from typing import TYPE_CHECKING, Self
 
+from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
@@ -283,8 +284,14 @@ class Scheduler:
             )
             ```
         """
-        # Apply defaults
-        timeout = timeout_seconds or self.config.default_timeout_seconds
+        # Validate and apply defaults
+        if timeout_seconds is not None and (
+            timeout_seconds < 1 or timeout_seconds > constants.MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"timeout_seconds must be between 1 and {constants.MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
+            )
+        timeout = timeout_seconds if timeout_seconds is not None else self.config.default_timeout_seconds
 
         vm, resolved_ports, is_cold_boot = await self._prepare_vm(
             language=language,

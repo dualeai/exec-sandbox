@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.constants import MAX_FILE_SIZE_BYTES
+from exec_sandbox.constants import MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.models import ExecutionResult, FileInfo, TimingBreakdown
 
@@ -182,7 +182,13 @@ class Session:
             exit_code=-1 and timeout message in stderr — they do NOT raise.
             Only VM-level failures (communication errors) raise exceptions.
         """
-        timeout = timeout_seconds or self._default_timeout_seconds
+        if timeout_seconds is not None and (
+            timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
+            )
+        timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
         async with self._guard():
             execute_start = asyncio.get_event_loop().time()

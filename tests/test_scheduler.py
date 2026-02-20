@@ -82,6 +82,34 @@ class TestSchedulerContextManager:
         assert "not started" in str(exc_info.value)
 
 
+class TestTimeoutValidation:
+    """Tests for timeout_seconds validation in Scheduler.run()."""
+
+    async def test_timeout_zero_rejected(self) -> None:
+        """timeout_seconds=0 raises ValueError."""
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+            await scheduler.run(code="print(1)", language=Language.PYTHON, timeout_seconds=0)
+
+    async def test_timeout_negative_rejected(self) -> None:
+        """Negative timeout_seconds raises ValueError."""
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+            await scheduler.run(code="print(1)", language=Language.PYTHON, timeout_seconds=-1)
+
+    async def test_timeout_exceeds_max_rejected(self) -> None:
+        """timeout_seconds > 300 raises ValueError."""
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+            await scheduler.run(code="print(1)", language=Language.PYTHON, timeout_seconds=301)
+
+
 class TestPackageValidation:
     """Tests for package validation in Scheduler."""
 
