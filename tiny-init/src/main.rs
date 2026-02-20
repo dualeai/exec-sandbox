@@ -552,7 +552,19 @@ fn main() {
     );
     mount("proc", "/proc", "proc", 0, "");
     mount("sysfs", "/sys", "sysfs", 0, "");
-    mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");
+    // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
+    // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
+    // pnpm (pnpm#9776), PyInstaller, and user temp executables.
+    // nr_inodes: fixed cap independent of VM memory (default is totalram_pages/2,
+    // which varies 13K–55K+ depending on memory_mb). 16K is sufficient — package
+    // managers use rootfs caches, not /tmp, for heavy file creation.
+    mount(
+        "tmpfs",
+        "/tmp",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+        "size=128M,nr_inodes=16384,mode=1777",
+    );
 
     // /dev/fd symlinks — not created by devtmpfs, must be done in userspace.
     // Required for bash process substitution <(), and /dev/std* for portability.
