@@ -239,12 +239,19 @@ _reduction.dump = _cloud_dump
 # flush their output and terminate without writing a premature sentinel.
 _repl_pid = _repl_os.getpid()
 
+# Redirect sys.stdin to /dev/null so user code that reads stdin (input(),
+# sys.stdin.read(), for line in sys.stdin, etc.) gets immediate EOF instead
+# of blocking on the protocol pipe. The REPL loop reads from _stdin_buf
+# (the original stdin buffer) for the length-prefixed command protocol.
+_stdin_buf = sys.stdin.buffer
+sys.stdin = open(_repl_os.devnull, "r")
+
 while True:
-    header = sys.stdin.buffer.readline()
+    header = _stdin_buf.readline()
     if not header:
         break
     sentinel_id, code_len = header.decode().strip().split(" ", 1)
-    code = sys.stdin.buffer.read(int(code_len)).decode()
+    code = _stdin_buf.read(int(code_len)).decode()
     exit_code = 0
     try:
         compiled = compile(code, "<exec>", "exec")
@@ -279,14 +286,43 @@ while True:
 /// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
 const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
+import { Readable } from 'node:stream';
 // Use 'ts' loader to accept both JavaScript and TypeScript syntax (TS is a
 // superset of JS). We avoid 'tsx' because Bun's TSX parser has open bugs with
 // generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
 // angle-bracket type assertions are ambiguous with JSX.
 const transpiler = new Bun.Transpiler({ loader: 'ts', replMode: true });
+// Create a null stdin (immediate EOF) so user code that reads process.stdin
+// or Bun.stdin gets EOF instead of blocking on the protocol pipe.
+const nullStdin = new Readable({ read() { this.push(null); } });
+nullStdin.fd = -1;
+nullStdin.isTTY = false;
+// Proxy intercepts stdin access on process, forwarding everything else.
+// set trap prevents user code from corrupting the real process object.
+const sandboxProcess = new Proxy(process, {
+    get(target, prop) {
+        if (prop === 'stdin') return nullStdin;
+        const val = target[prop];
+        return typeof val === 'function' ? val.bind(target) : val;
+    },
+    set(target, prop, value) {
+        if (prop === 'stdin') return true;
+        target[prop] = value;
+        return true;
+    }
+});
+// Also proxy Bun to intercept Bun.stdin — without this, user code could
+// bypass the process.stdin redirect via Bun.stdin.stream().
+const sandboxBun = new Proxy(Bun, {
+    get(target, prop) {
+        if (prop === 'stdin') return nullStdin;
+        const val = target[prop];
+        return typeof val === 'function' ? val.bind(target) : val;
+    }
+});
 const ctx = createContext({
-    Bun,
-    console, process, setTimeout, setInterval, clearTimeout, clearInterval,
+    Bun: sandboxBun,
+    console, process: sandboxProcess, setTimeout, setInterval, clearTimeout, clearInterval,
     Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
     AbortController, AbortSignal, Event, EventTarget,
     atob, btoa, structuredClone, queueMicrotask,
@@ -384,7 +420,7 @@ while (true) {
 /// `eval "$code"` maintains shell state (env vars, cwd, functions, aliases).
 const SHELL_REPL_WRAPPER: &str = r#"while read sentinel_id code_len; do
     code=$(head -c "$code_len")
-    eval "$code"
+    eval "$code" < /dev/null
     _ec=$?
     printf "__SENTINEL_%s_%d__\n" "$sentinel_id" "$_ec" >&2
 done
