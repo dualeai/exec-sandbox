@@ -81,8 +81,6 @@ sbx run 'print(1)' 'print(2)' script.py
 # Multiple inline codes
 sbx run -c 'print(1)' -c 'print(2)'
 
-# Limit concurrency
-sbx run -j 5 *.py
 ```
 
 **CLI Options:**
@@ -103,7 +101,6 @@ sbx run -j 5 *.py
 | `--no-validation` | | Skip package allowlist validation | false |
 | `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
 | `--download` | | Download file `GUEST:LOCAL` or `GUEST` (repeatable) | - |
-| `--concurrency` | `-j` | Max concurrent VMs for multi-input | 10 |
 
 ### Python API
 
@@ -270,7 +267,6 @@ async with Scheduler() as scheduler:
 from exec_sandbox import Scheduler, SchedulerConfig
 
 config = SchedulerConfig(
-    max_concurrent_vms=20,       # Limit parallel executions
     warm_pool_size=1,            # Pre-started VMs per language (0 disables)
     default_memory_mb=512,       # Per-VM memory
     default_timeout_seconds=60,  # Execution timeout
@@ -360,7 +356,6 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_concurrent_vms` | 10 | Maximum parallel VMs |
 | `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript). Set >0 to enable |
 | `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
@@ -451,8 +446,8 @@ packages=["pandas"]         # Cache miss every time
 on_stdout=lambda chunk: time.sleep(1)        # Blocks!
 on_stdout=lambda chunk: buffer.append(chunk)  # Fast
 
-# Memory overhead: pre-started VMs use (max_concurrent_vms × 25%) × 2 languages × 256MB
-# max_concurrent_vms=20 → 5 VMs/lang × 2 × 256MB = 2.5GB for warm pool alone
+# Memory overhead: pre-started VMs use warm_pool_size × 2 languages × 256MB
+# warm_pool_size=5 → 5 VMs/lang × 2 × 256MB = 2.5GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
 default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
@@ -486,9 +481,7 @@ Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda seri
 | Max file path length | 255 chars |
 | Execution timeout | 1-300s |
 | VM memory | 128MB minimum (no upper bound) |
-| Max concurrent VMs | 1+ (no upper bound) |
-
-> **Note:** The scheduler is not yet system-resources-aware. It does not check available host memory or CPU before launching VMs. Set `max_concurrent_vms` based on your host capacity (each VM uses ~256-512MB memory).
+| Max concurrent VMs | Resource-aware (auto-computed from host memory + CPU) |
 
 ## Security Architecture
 

@@ -559,6 +559,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-9-2",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -590,6 +591,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-8-x",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -621,6 +623,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-10",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -652,6 +655,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-unknown",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -682,6 +686,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-7",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -712,12 +717,52 @@ class TestNetdevReconnect:
                     vm_id="test-vm-no-network",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=False,
                 )
 
             # Should not have any netdev argument
             netdev_found = any(arg == "-netdev" for arg in cmd)
             assert not netdev_found, "netdev should not be present when network is disabled"
+        finally:
+            await workdir.cleanup()
+
+
+# ============================================================================
+# Tests - SMP / CPU cores
+# ============================================================================
+
+
+class TestSmpCpuCores:
+    """Verify -smp flag scales with cpu_cores parameter."""
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        probe_cache.reset("qemu_version")
+
+    @pytest.mark.parametrize("cpu_cores", [1, 2, 4])
+    async def test_smp_matches_cpu_cores(self, vm_settings, cpu_cores: int) -> None:
+        """-smp N matches the cpu_cores parameter."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create(f"test-smp-{cpu_cores}")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id=f"test-smp-{cpu_cores}",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=cpu_cores,
+                    allow_network=False,
+                )
+
+            # Find -smp value
+            smp_idx = cmd.index("-smp")
+            assert cmd[smp_idx + 1] == str(cpu_cores)
         finally:
             await workdir.cleanup()
 

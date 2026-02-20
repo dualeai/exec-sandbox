@@ -73,7 +73,7 @@ async def test_no_memory_leak_without_network(iterations: int, images_dir: Path)
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=_MAX_CONCURRENT,
+
     )
 
     async with Scheduler(config) as scheduler:
@@ -105,7 +105,7 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=_MAX_CONCURRENT,
+
         default_timeout_seconds=30,
     )
 
@@ -234,7 +234,7 @@ async def test_no_memory_leak_file_io(iterations: int, file_io_size_mb: int, ima
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=_MAX_CONCURRENT,
+
     )
 
     async with Scheduler(config) as scheduler:
@@ -280,7 +280,7 @@ async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_di
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     async with Scheduler(config) as scheduler:
@@ -328,7 +328,7 @@ async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path, tmp_path
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     tracker = PeakMemoryTracker()
@@ -363,7 +363,7 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=concurrent_vms,
+
         default_timeout_seconds=30 if allow_network else 10,
     )
 
@@ -416,7 +416,7 @@ async def test_peak_ram_read_file(file_io_size_mb: int, images_dir: Path, tmp_pa
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     dest = tmp_path / "peak_read_test.bin"
@@ -490,7 +490,7 @@ async def test_peak_ram_concurrent_file_io(
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=concurrent_sessions,
+
     )
 
     async def session_cycle(scheduler: Scheduler, idx: int) -> None:
@@ -548,7 +548,7 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Pat
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     async with Scheduler(config) as scheduler:
@@ -587,7 +587,7 @@ async def test_tracemalloc_peak_write_file_from_path(file_io_size_mb: int, image
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     async with Scheduler(config) as scheduler:
@@ -625,7 +625,7 @@ async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     async with Scheduler(config) as scheduler:
@@ -680,7 +680,7 @@ async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     tracker = PeakMemoryTracker()
@@ -730,7 +730,7 @@ async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_d
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
-        max_concurrent_vms=1,
+
     )
 
     # Measure bytes input peak

@@ -129,8 +129,6 @@ EXIT_TIMEOUT = 124  # Matches `timeout` command
 EXIT_SANDBOX_ERROR = 125
 
 # Concurrency limits
-DEFAULT_CONCURRENCY = 10
-MAX_CONCURRENCY = 100
 
 # File extension to language mapping
 EXTENSION_MAP: dict[str, str] = {
@@ -558,7 +556,6 @@ async def run_code(
         default_timeout_seconds=timeout,
         default_memory_mb=memory,
         enable_package_validation=not no_validation,
-        max_concurrent_vms=1,  # CLI runs single VM
     )
 
     # Streaming callbacks for non-JSON output
@@ -692,7 +689,6 @@ async def run_multiple(
     json_output: bool,
     quiet: bool,
     no_validation: bool,
-    concurrency: int,
 ) -> int:
     """Execute multiple sources concurrently and return max exit code.
 
@@ -708,7 +704,6 @@ async def run_multiple(
         json_output: Output as JSON
         quiet: Suppress progress output
         no_validation: Skip package validation
-        concurrency: Maximum concurrent VMs
 
     Returns:
         Maximum exit code from all sources (or EXIT_SANDBOX_ERROR on infrastructure failure)
@@ -717,7 +712,6 @@ async def run_multiple(
         default_timeout_seconds=timeout,
         default_memory_mb=memory,
         enable_package_validation=not no_validation,
-        max_concurrent_vms=min(len(sources), concurrency),
     )
 
     results: list[MultiSourceResult] = []
@@ -911,14 +905,6 @@ def cli(ctx: click.Context) -> None:
 @click.option("-q", "--quiet", is_flag=True, help="Suppress progress output")
 @click.option("--no-validation", is_flag=True, help="Skip package validation")
 @click.option(
-    "-j",
-    "--concurrency",
-    default=DEFAULT_CONCURRENCY,
-    type=click.IntRange(1, MAX_CONCURRENCY),
-    show_default=True,
-    help="Maximum concurrent VMs for multi-input",
-)
-@click.option(
     "--upload",
     "upload_files",
     multiple=True,
@@ -944,7 +930,6 @@ def run_command(
     json_output: bool,
     quiet: bool,
     no_validation: bool,
-    concurrency: int,
     upload_files: tuple[str, ...],
     download_files: tuple[str, ...],
 ) -> NoReturn:
@@ -957,11 +942,10 @@ def run_command(
       - File path:    sbx run script.py
       - Stdin:        echo 'print(1)' | sbx run -
 
-    Multiple sources run concurrently (use -j to limit concurrency):
+    Multiple sources run concurrently:
 
     \b
       sbx run 'print(1)' 'print(2)' script.py    # Run 3 sources
-      sbx run -j 5 *.py                          # Max 5 concurrent VMs
 
     Language is auto-detected from file extension (.py, .js, .sh)
     or defaults to Python. Use -l to override for all sources.
@@ -1063,7 +1047,6 @@ def run_command(
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
-                concurrency=concurrency,
             )
         )
 

@@ -7,7 +7,7 @@ Architecture:
 - VM lifecycle: VMs are NEVER reused. Each run() gets a fresh VM, destroyed after.
 - Warm pool: Pre-started VMs waiting for commands (faster than cold boot).
 - Snapshot cache: L2 (local disk cache) + L3 (S3) for package installation speedup.
-- Backpressure: max_concurrent_vms prevents OOM from unbounded VM creation.
+- Backpressure: resource-aware admission control prevents OOM from unbounded VM creation.
 
 Example:
     ```python
@@ -32,7 +32,6 @@ Example:
 
     # Production config with S3 cache
     config = SchedulerConfig(
-        max_concurrent_vms=20,
         s3_bucket="my-snapshots",
     )
     async with Scheduler(config) as scheduler:
@@ -58,6 +57,7 @@ from exec_sandbox.settings import Settings
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
+    from exec_sandbox.resource_monitor import ResourceMonitor
     from exec_sandbox.snapshot_manager import SnapshotManager
     from exec_sandbox.vm_manager import VmManager
     from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -102,6 +102,7 @@ class Scheduler:
         self._vm_manager: VmManager | None = None
         self._snapshot_manager: SnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
+        self._resource_monitor: ResourceMonitor | None = None
         self._started = False
 
     async def __aenter__(self) -> Self:
@@ -128,7 +129,6 @@ class Scheduler:
         logger.info(
             "Starting scheduler",
             extra={
-                "max_concurrent_vms": self.config.max_concurrent_vms,
                 "warm_pool_size": self.config.warm_pool_size,
                 "s3_enabled": self.config.s3_bucket is not None,
                 "auto_download_assets": self.config.auto_download_assets,
@@ -164,6 +164,16 @@ class Scheduler:
             self._warm_pool = WarmVMPool(self._vm_manager, self.config, self._snapshot_manager)
             await self._warm_pool.start()
 
+        # Start ResourceMonitor (always-on, core component for observability)
+        from exec_sandbox.resource_monitor import ResourceMonitor  # noqa: PLC0415
+
+        self._resource_monitor = ResourceMonitor(
+            vm_manager=self._vm_manager,
+            admission=self._vm_manager.admission,
+            interval_seconds=self.config.resource_monitor_interval_seconds,
+        )
+        await self._resource_monitor.start()
+
         self._started = True
         logger.info("Scheduler started successfully")
         return self
@@ -181,6 +191,13 @@ class Scheduler:
         Always completes cleanup, even on exceptions.
         """
         logger.info("Shutting down scheduler")
+
+        # Stop ResourceMonitor first
+        if self._resource_monitor:
+            try:
+                await self._resource_monitor.stop()
+            except (OSError, RuntimeError) as e:
+                logger.error("ResourceMonitor stop error", extra={"error": str(e)})
 
         # Stop WarmVMPool first (drains VMs)
         if self._warm_pool:
@@ -285,9 +302,7 @@ class Scheduler:
             ```
         """
         # Validate and apply defaults
-        if timeout_seconds is not None and (
-            timeout_seconds < 1 or timeout_seconds > constants.MAX_TIMEOUT_SECONDS
-        ):
+        if timeout_seconds is not None and (timeout_seconds < 1 or timeout_seconds > constants.MAX_TIMEOUT_SECONDS):
             raise ValueError(
                 f"timeout_seconds must be between 1 and {constants.MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
             )
@@ -575,11 +590,14 @@ class Scheduler:
         return Settings(
             base_images_dir=images_dir,
             kernel_path=kernel_path,
-            max_concurrent_vms=self.config.max_concurrent_vms,
             snapshot_cache_dir=self.config.snapshot_cache_dir,
             s3_bucket=self.config.s3_bucket,
             s3_region=self.config.s3_region,
             max_concurrent_s3_uploads=self.config.max_concurrent_s3_uploads,
+            memory_overcommit_ratio=self.config.memory_overcommit_ratio,
+            cpu_overcommit_ratio=self.config.cpu_overcommit_ratio,
+            host_memory_reserve_ratio=self.config.host_memory_reserve_ratio,
+            resource_monitor_interval_seconds=self.config.resource_monitor_interval_seconds,
         )
 
     async def _validate_packages(self, packages: list[str], language: Language) -> None:

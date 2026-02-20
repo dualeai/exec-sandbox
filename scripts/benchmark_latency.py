@@ -290,13 +290,11 @@ Examples:
     print(f"Network:      {'enabled' if args.network else 'disabled'}")
     print(f"Memory/VM:    {memory_mb} MB")
 
-    # Configure scheduler - need enough slots for concurrent requests + warm pool (per-language)
-    max_vms = max(args.n + total_warm_pool_vms, 12)
+    # Configure scheduler (admission controller auto-computes capacity from host resources)
     config = SchedulerConfig(
         images_dir=images_dir,
         auto_download_assets=False,
         warm_pool_size=args.pool,
-        max_concurrent_vms=max_vms,
         default_memory_mb=memory_mb,
     )
 

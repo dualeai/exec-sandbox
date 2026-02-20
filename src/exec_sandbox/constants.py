@@ -174,9 +174,6 @@ IO_URING_MIN_KERNEL_MINOR: Final[int] = 1
 # Warm VM Pool
 # ============================================================================
 
-WARM_POOL_SIZE_RATIO: Final[float] = 0.25
-"""Warm pool size as ratio of max_concurrent_vms (25% = 2-3 VMs for default=10)."""
-
 WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 """Max concurrent replenish boots as ratio of pool_size (50% = 2-3 concurrent for pool_size=5)."""
 
@@ -225,8 +222,14 @@ BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 # Overlay Pool
 # ============================================================================
 
+OVERLAY_POOL_FALLBACK_SIZE: Final[int] = 5
+"""Overlay pool size when host resources are unknown (psutil unavailable).
+
+Provides a reasonable default for pre-created overlays per base image
+when the admission controller cannot determine host capacity."""
+
 OVERLAY_POOL_SIZE_RATIO: Final[float] = 0.5
-"""Overlay pool size as ratio of max_concurrent_vms (50%).
+"""Overlay pool size as ratio of effective max VMs (50%).
 
 With 10 max VMs, pool will have 5 pre-created overlays per base image.
 Higher ratio = more pool hits, lower ratio = less disk usage.
@@ -290,3 +293,37 @@ On-wire size after base64+JSON is ~175KB per frame.
 
 FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
 """Zstd compression level for file transfers (1=fast, 22=max; 3=good balance)."""
+
+# ============================================================================
+# Resource Admission & Overcommit
+# ============================================================================
+
+DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 1.5
+"""Default memory overcommit ratio. Effective memory budget =
+host_total * (1 - host_reserve_ratio) * overcommit_ratio.
+AI agent workloads are bursty and mostly idle (avg memory 18-22%),
+making overcommit safe."""
+
+DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 4.0
+"""Default CPU overcommit ratio. Effective CPU budget =
+host_cpu_count * ratio. AI workloads average 11-17% CPU utilization."""
+
+DEFAULT_HOST_MEMORY_RESERVE_RATIO: Final[float] = 0.1
+"""Fraction of host memory reserved for OS and non-VM processes.
+Scales with host size:
+- 4GB host  → 400MB reserved  → 3.6GB for VMs
+- 16GB host → 1.6GB reserved  → 14.4GB for VMs
+- 64GB host → 6.4GB reserved  → 57.6GB for VMs"""
+
+DEFAULT_VM_CPU_CORES: Final[int] = 1
+"""CPU cores allocated per VM. Flows to three places:
+- QEMU -smp (guest-visible vCPU count)
+- cgroup cpu.max quota (host-side CPU time enforcement)
+- Admission controller budget (capacity planning)"""
+
+RESOURCE_MONITOR_INTERVAL_SECONDS: Final[float] = 5.0
+"""Interval between resource monitor ticks (seconds)."""
+
+RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
+"""Timeout for resource admission acquire (seconds). Blocks waiting for
+resources to become available, then raises VmCapacityError."""

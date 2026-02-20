@@ -4,7 +4,7 @@ Pre-boots VMs at service startup for default-image executions.
 Provides 200-400x faster execution start (1-2ms vs 400ms cold boot).
 
 Architecture:
-- Pool size: 25% of max_concurrent_vms (2-3 VMs per language)
+- Pool size: Configured via warm_pool_size (per language)
 - Languages: python, javascript
 - Lifecycle: Pre-boot → allocate → execute → destroy → replenish
 - Security: One-time use (no cross-tenant reuse)
@@ -12,7 +12,7 @@ Architecture:
 Performance:
 - Default image (packages=[]): 1-2ms allocation (vs 400ms cold boot)
 - Custom packages: Fallback to cold boot (no change)
-- Memory overhead: ~1GB for 4 VMs (256MB x 4, based on 25% of max_concurrent_vms=10)
+- Memory overhead: ~256MB per pre-booted VM
 
 L2 Disk Snapshots:
 - Uses L2 cache (local qcow2) for faster warm pool boots
@@ -119,14 +119,9 @@ class WarmVMPool:
         self.config = config
         self.snapshot_manager = snapshot_manager
 
-        # Calculate pool size: use explicit warm_pool_size if set, else 25% of max_concurrent_vms
-        if config.warm_pool_size > 0:
-            self.pool_size_per_language = config.warm_pool_size
-        else:
-            self.pool_size_per_language = max(
-                1,  # Minimum 1 VM per language
-                int(config.max_concurrent_vms * constants.WARM_POOL_SIZE_RATIO),
-            )
+        # Pool size is explicitly configured via warm_pool_size
+        # warm_pool_size=0 means warm pool disabled (caller should not create WarmVMPool)
+        self.pool_size_per_language = config.warm_pool_size
 
         # Pools: asyncio.Queue for thread-safe async access
         self.pools: dict[Language, asyncio.Queue[QemuVM]] = {

@@ -164,19 +164,21 @@ async def setup_cgroup(
     vm_id: str,
     tenant_id: str,
     memory_mb: int,
+    cpu_cores: int,
     use_tcg: bool = False,
 ) -> Path:
     """Set up cgroup v2 resource limits for a VM.
 
     Limits:
     - memory.max: guest_mb + overhead (+ TCG TB cache if software emulation)
-    - cpu.max: 100000 (1 vCPU)
+    - cpu.max: quota proportional to cpu_cores (e.g. 2 cores = 200000/100000)
     - pids.max: 100 (fork bomb prevention, also limits goroutines)
 
     Args:
         vm_id: Unique VM identifier
         tenant_id: Tenant identifier
         memory_mb: Guest VM memory in MB
+        cpu_cores: Number of CPU cores allocated (controls cpu.max quota)
         use_tcg: True if using TCG software emulation (needs extra memory for TB cache)
 
     Returns:
@@ -215,9 +217,11 @@ async def setup_cgroup(
         async with aiofiles.open(cgroup_path / "memory.max", "w") as f:
             await f.write(str(cgroup_memory_mb * 1024 * 1024))
 
-        # Set CPU limit (1 vCPU)
+        # Set CPU limit (quota proportional to cpu_cores, period=100000us)
+        # e.g. 1 core = "100000 100000", 2 cores = "200000 100000"
+        cpu_quota = 100_000 * cpu_cores
         async with aiofiles.open(cgroup_path / "cpu.max", "w") as f:
-            await f.write("100000 100000")
+            await f.write(f"{cpu_quota} 100000")
 
         # Set PID limit (fork bomb prevention)
         async with aiofiles.open(cgroup_path / "pids.max", "w") as f:
@@ -330,6 +334,54 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
         )
 
     return (cpu_time_ms, peak_memory_mb)
+
+
+async def read_cgroup_current(cgroup_path: Path | None) -> tuple[int | None, int | None]:
+    """Read live CPU usage and current memory from cgroup v2.
+
+    Unlike read_cgroup_stats() which reads memory.peak (post-execution),
+    this reads memory.current (live bytes) and cpu.stat usage_usec for
+    running VMs. Used by ResourceMonitor for observability.
+
+    Args:
+        cgroup_path: cgroup directory path
+
+    Returns:
+        Tuple of (cpu_time_ms, current_memory_mb)
+        Returns (None, None) if cgroup not available or read fails
+    """
+    if not cgroup_path or not await aiofiles.os.path.exists(cgroup_path):
+        return (None, None)
+
+    cpu_time_ms: int | None = None
+    current_memory_mb: int | None = None
+
+    try:
+        # Read cpu.stat for usage_usec (microseconds)
+        cpu_stat_file = cgroup_path / "cpu.stat"
+        if await aiofiles.os.path.exists(cpu_stat_file):
+            async with aiofiles.open(cpu_stat_file) as f:
+                cpu_stat = await f.read()
+            for line in cpu_stat.splitlines():
+                if line.startswith("usage_usec"):
+                    usage_usec = int(line.split()[1])
+                    cpu_time_ms = usage_usec // 1000
+                    break
+
+        # Read memory.current for live memory usage (bytes)
+        memory_current_file = cgroup_path / "memory.current"
+        if await aiofiles.os.path.exists(memory_current_file):
+            async with aiofiles.open(memory_current_file) as f:
+                current_bytes = int((await f.read()).strip())
+            current_memory_mb = current_bytes // (1024 * 1024)
+
+    except (OSError, ValueError) as e:
+        logger.debug(
+            f"Failed to read cgroup current stats: {e}",
+            extra={"cgroup_path": str(cgroup_path)},
+        )
+
+    return (cpu_time_ms, current_memory_mb)
 
 
 # =============================================================================

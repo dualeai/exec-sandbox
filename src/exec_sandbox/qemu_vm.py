@@ -35,6 +35,7 @@ from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 if TYPE_CHECKING:
+    from exec_sandbox.admission import ResourceReservation
     from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,8 @@ class QemuVM:
         self.timing = VmTiming()
         # Tracks if this VM owns a semaphore permit (prevents double-release in destroy)
         self.holds_semaphore_slot = False
+        # Resource reservation from admission controller (set by VmManager.create_vm)
+        self.resource_reservation: ResourceReservation | None = None
         # Port forwarding - set by VmManager after boot
         # Stores the resolved port mappings for result reporting
         self.exposed_ports: list[ExposedPort] = []

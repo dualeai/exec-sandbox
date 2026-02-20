@@ -26,17 +26,14 @@ class TestSchedulerInit:
         """Scheduler can be created with default config."""
         scheduler = Scheduler()
         assert scheduler.config is not None
-        assert scheduler.config.max_concurrent_vms == 10
 
     def test_init_custom_config(self) -> None:
         """Scheduler accepts custom config."""
         config = SchedulerConfig(
-            max_concurrent_vms=5,
             default_memory_mb=512,
             default_timeout_seconds=60,
         )
         scheduler = Scheduler(config)
-        assert scheduler.config.max_concurrent_vms == 5
         assert scheduler.config.default_memory_mb == 512
         assert scheduler.config.default_timeout_seconds == 60
 
@@ -196,7 +193,7 @@ class TestSchedulerConfig:
 
     def test_config_immutable(self) -> None:
         """Scheduler config is immutable."""
-        config = SchedulerConfig(max_concurrent_vms=5)
+        config = SchedulerConfig()
         scheduler = Scheduler(config)
 
         # Config should be the same object (frozen)

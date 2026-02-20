@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     """Runtime configuration from environment variables.
 
     All settings can be overridden via environment variables with EXEC_SANDBOX_ prefix.
-    Example: EXEC_SANDBOX_MAX_CONCURRENT_VMS=20
+    Example: EXEC_SANDBOX_FORCE_EMULATION=true
     """
 
     model_config = SettingsConfigDict(
@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     base_images_dir: Path = Path("/images")  # qcow2 base images
 
     # Execution
-    max_concurrent_vms: int = 10
     snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-snapshots")  # noqa: S108
 
     # Snapshot cache (2-tier: L2=local disk, L3=S3)
@@ -49,6 +48,17 @@ class Settings(BaseSettings):
 
     # Limits
     execution_timeout_max: int = constants.MAX_TIMEOUT_SECONDS
+
+    # Resource overcommit
+    memory_overcommit_ratio: float = constants.DEFAULT_MEMORY_OVERCOMMIT_RATIO
+    cpu_overcommit_ratio: float = constants.DEFAULT_CPU_OVERCOMMIT_RATIO
+    host_memory_reserve_ratio: float = constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO
+    resource_monitor_interval_seconds: float = constants.RESOURCE_MONITOR_INTERVAL_SECONDS
+
+    # Host resource overrides (None = auto-detect via psutil)
+    # Useful for testing or container deployments where psutil reports host resources
+    host_memory_mb: float | None = None
+    host_cpu_count: float | None = None
 
     # Testing/Debug
     force_emulation: bool = False
