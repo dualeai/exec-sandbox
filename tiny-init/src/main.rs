@@ -24,8 +24,11 @@ mod syscall_nr {
 }
 
 // Mount flags
-const MS_MOVE: libc::c_ulong = 0x2000;
+const MS_NOSUID: libc::c_ulong = 0x2;
+const MS_NODEV: libc::c_ulong = 0x4;
+const MS_NOEXEC: libc::c_ulong = 0x8;
 const MS_NOATIME: libc::c_ulong = 0x400;
+const MS_MOVE: libc::c_ulong = 0x2000;
 
 // Swap flags
 const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
@@ -521,9 +524,26 @@ fn switch_root() -> ! {
 fn main() {
     // Mount virtual filesystems
     mount("devtmpfs", "/dev", "devtmpfs", 0, "");
+
+    // Security: remove dangerous device nodes auto-created by devtmpfs.
+    // /dev/mem exposes raw physical memory, /dev/kmem kernel virtual memory,
+    // /dev/port raw I/O ports (x86). Even with CONFIG_STRICT_DEVMEM, the nodes
+    // exist and leak kernel config info. Removing them is defense-in-depth.
+    //
+    // Why not lockdown=confidentiality? Alpine's linux-virt APKBUILD strips
+    // modules (INSTALL_MOD_STRIP=1) which destroys the .PKCS7_message ELF
+    // section containing signatures. Lockdown enforces signature verification,
+    // so finit_module() returns EPERM for every module, preventing boot.
+    // See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=941827
+    for path in ["/dev/mem", "/dev/kmem", "/dev/port"] {
+        let _ = fs::remove_file(path);
+    }
+
     // Shared memory for POSIX semaphores (Python multiprocessing, etc.)
+    // nosuid|nodev|noexec: CIS Benchmark 1.1.15 hardening. Won't break
+    // multiprocessing — POSIX semaphores use shm_open()+mmap(), not execve().
     let _ = fs::create_dir("/dev/shm");
-    mount("tmpfs", "/dev/shm", "tmpfs", 0, "size=64M,mode=1777");
+    mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64M,mode=1777");
     mount("proc", "/proc", "proc", 0, "");
     mount("sysfs", "/sys", "sysfs", 0, "");
     mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");
