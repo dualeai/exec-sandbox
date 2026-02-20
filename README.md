@@ -435,12 +435,12 @@ async with await scheduler.session(language="python") as session:
 
 # Pre-started VMs (warm pool) only work without packages
 config = SchedulerConfig(warm_pool_size=1)
-await scheduler.run(code="...", packages=["pandas"])  # Bypasses warm pool, fresh start (400ms)
+await scheduler.run(code="...", packages=["pandas==2.2.0"])  # Bypasses warm pool, fresh start (400ms)
 await scheduler.run(code="...")                        # Uses warm pool (1-2ms)
 
-# Pin package versions for caching
-packages=["pandas==2.2.0"]  # Cacheable
-packages=["pandas"]         # Cache miss every time
+# Version specifiers are required (security + caching)
+packages=["pandas==2.2.0"]  # Valid, cacheable
+packages=["pandas"]         # PackageNotAllowedError! Must pin version
 
 # Streaming callbacks must be fast (blocks async execution)
 on_stdout=lambda chunk: time.sleep(1)        # Blocks!
