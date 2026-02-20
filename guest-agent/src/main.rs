@@ -367,7 +367,13 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         "python" => {
             let mut c = Command::new("python3");
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
+            // Package resolution for user-installed packages
+            // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONPATH
             c.env("PYTHONPATH", format!("{SANDBOX_ROOT}/site-packages"));
+            // Disable the 4300-digit limit for int<->str conversions (CVE-2020-10735).
+            // Safe here: execution timeout (300s) and output caps (1MB) already bound resource usage.
+            // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONINTMAXSTRDIGITS
+            c.env("PYTHONINTMAXSTRDIGITS", "0");
             c
         }
         "javascript" => {
