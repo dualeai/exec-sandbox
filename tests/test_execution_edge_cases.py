@@ -992,3 +992,171 @@ class TestRawEdgeCases:
 
         # Shell variable expansion
         assert result.exit_code == 0
+
+    # ---- Shebang handling (temp-file dispatch) ----
+
+    async def test_raw_shebang_awk(self, scheduler: Scheduler) -> None:
+        """AWK shebang executes via kernel binfmt_script."""
+        result = await scheduler.run(
+            code='#!/usr/bin/awk -f\nBEGIN { print "shebang_awk_ok" }',
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "shebang_awk_ok" in result.stdout
+
+    async def test_raw_shebang_sh(self, scheduler: Scheduler) -> None:
+        """Shell shebang via temp file."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho shebang_sh_ok",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "shebang_sh_ok" in result.stdout
+
+    async def test_raw_shebang_bash(self, scheduler: Scheduler) -> None:
+        """Bash shebang via temp file."""
+        result = await scheduler.run(
+            code="#!/bin/bash\necho shebang_bash_ok",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "shebang_bash_ok" in result.stdout
+
+    async def test_raw_shebang_sed(self, scheduler: Scheduler) -> None:
+        """Sed shebang processes input."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho hello | sed 's/hello/world/'",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "world" in result.stdout
+
+    async def test_raw_shebang_nonzero_exit(self, scheduler: Scheduler) -> None:
+        """Non-zero exit code propagates through temp-file wrapper."""
+        result = await scheduler.run(
+            code="#!/bin/sh\nexit 42",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 42
+
+    async def test_raw_shebang_stderr(self, scheduler: Scheduler) -> None:
+        """Stderr output from shebanged script."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho err_msg >&2",
+            language=Language.RAW,
+        )
+
+        assert "err_msg" in result.stderr
+
+    async def test_raw_shebang_env_vars(self, scheduler: Scheduler) -> None:
+        """Exported env vars are inherited by shebanged subprocess."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho $MY_VAR",
+            language=Language.RAW,
+            env_vars={"MY_VAR": "from_env"},
+        )
+
+        assert result.exit_code == 0
+        assert "from_env" in result.stdout
+
+    async def test_raw_shebang_empty_body(self, scheduler: Scheduler) -> None:
+        """Shebang with empty body is valid."""
+        result = await scheduler.run(
+            code="#!/bin/sh\n",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+
+    async def test_raw_shebang_special_chars(self, scheduler: Scheduler) -> None:
+        """Special characters are preserved (heredoc quoting prevents expansion)."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho 'quotes \"double\" $dollar `backtick`'",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "$dollar" in result.stdout
+        assert "`backtick`" in result.stdout
+
+    async def test_raw_shebang_sentinel_in_code(self, scheduler: Scheduler) -> None:
+        """Sentinel collision in code is handled."""
+        result = await scheduler.run(
+            code='#!/bin/sh\necho "_EXEC_SANDBOX_EOF_"',
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "_EXEC_SANDBOX_EOF_" in result.stdout
+
+    async def test_raw_shebang_nonexistent_interpreter(self, scheduler: Scheduler) -> None:
+        """Non-existent interpreter fails with non-zero exit."""
+        result = await scheduler.run(
+            code="#!/usr/bin/nonexistent_interp_xyz\necho hello",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code != 0
+
+    async def test_raw_shebang_no_newline(self, scheduler: Scheduler) -> None:
+        """Shebang with no trailing newline and no body."""
+        result = await scheduler.run(
+            code="#!/bin/sh",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+
+    async def test_raw_no_shebang_hash_comment(self, scheduler: Scheduler) -> None:
+        """Plain # comment is not treated as shebang."""
+        result = await scheduler.run(
+            code="# just a comment\necho hello",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_raw_shebang_with_leading_space(self, scheduler: Scheduler) -> None:
+        """Leading space means no shebang detection; eval path used."""
+        result = await scheduler.run(
+            code="  #!/bin/sh\necho hello",
+            language=Language.RAW,
+        )
+
+        # Leading space: bash treats #! as comment, echo runs normally
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_raw_shebang_multiline_output(self, scheduler: Scheduler) -> None:
+        """AWK shebang producing multiline output."""
+        result = await scheduler.run(
+            code="#!/usr/bin/awk -f\nBEGIN { for(i=1;i<=100;i++) print i }",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 100
+        assert lines[0].strip() == "1"
+        assert lines[99].strip() == "100"
+
+    async def test_raw_shebang_awk_multiline_program(self, scheduler: Scheduler) -> None:
+        """AWK shebang with BEGIN, pattern, and END blocks."""
+        # Use a shell wrapper to pipe input into the awk script, since
+        # a bare awk with an END block reads stdin (hangs without input).
+        result = await scheduler.run(
+            code='#!/bin/sh\nprintf "line1\\nline2\\n" | awk \'BEGIN{print "start"} /line/{print "matched:"$0} END{print "end"}\'',
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "start" in result.stdout
+        assert "matched:line1" in result.stdout
+        assert "matched:line2" in result.stdout
+        assert "end" in result.stdout
