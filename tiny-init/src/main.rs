@@ -308,6 +308,9 @@ fn setup_zram(kver: &str) {
 
     log_fmt!("[zram] swap enabled");
 
+    // Security: remove device node after swapon (kernel holds internal reference).
+    let _ = fs::remove_file("/dev/zram0");
+
     // VM tuning (these can fail silently - non-critical)
     let _ = fs::write("/proc/sys/vm/page-cluster", "0");
     let _ = fs::write("/proc/sys/vm/swappiness", "180");
@@ -638,6 +641,11 @@ fn main() {
             fallback_shell();
         }
     }
+
+    // Security: remove block device node after mount. The kernel references the
+    // device internally via bdevfs (indexed by major:minor), not the /dev path.
+    // Prevents raw disk reads that bypass filesystem permissions.
+    let _ = fs::remove_file("/dev/vda");
 
     // No existence check - execv will fail if guest-agent missing
     switch_root();

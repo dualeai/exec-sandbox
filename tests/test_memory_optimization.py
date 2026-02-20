@@ -45,8 +45,7 @@ class TestZramConfiguration:
             code="""
 import os
 
-# Check device exists in /dev and /sys
-assert os.path.exists('/dev/zram0'), 'zram0 device not found in /dev'
+# Check device exists in /sys (the /dev node is removed after swapon for security)
 assert os.path.exists('/sys/block/zram0'), 'zram0 not found in /sys/block'
 
 # Check it's in swaps with high priority

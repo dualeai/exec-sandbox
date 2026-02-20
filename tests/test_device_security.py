@@ -1,10 +1,11 @@
 """Tests for guest VM device-layer security hardening.
 
-Verifies that dangerous device nodes are removed, /dev/shm is mounted
-with restrictive flags, and /tmp has nosuid/nodev flags with an explicit
-inode cap (nr_inodes=16384). These are defense-in-depth measures that
-apply regardless of UID — even root (guest-agent) cannot access /dev/mem
-after these changes.
+Verifies that dangerous device nodes are removed, block device nodes
+(/dev/vda, /dev/zram0) are removed after use, /dev/shm is mounted with
+restrictive flags, and /tmp has nosuid/nodev flags with an explicit inode
+cap (nr_inodes=16384). These are defense-in-depth measures that apply
+regardless of UID — even root (guest-agent) cannot access /dev/mem or
+raw-read the root disk after these changes.
 
 Complements test_nonroot_repl.py (privilege escalation from UID 1000) with
 kernel/device-layer hardening that blocks access at the filesystem level.
@@ -505,3 +506,182 @@ with open('/home/user/still_works.txt') as f:
             r4 = await session.exec("print(f'MATH:{2 + 2}')", timeout_seconds=30)
             assert r4.exit_code == 0, f"stderr: {r4.stderr}"
             assert "MATH:4" in r4.stdout
+
+
+# =============================================================================
+# Block device hardening
+# =============================================================================
+class TestBlockDeviceHardening:
+    """Block device nodes (/dev/vda, /dev/zram0) are removed by tiny-init after use."""
+
+    # --- Normal cases: device nodes removed and filesystem still works ---
+
+    async def test_dev_vda_not_exists(self, scheduler: Scheduler) -> None:
+        """/dev/vda (root block device) must not exist after mount."""
+        result = await scheduler.run(
+            code="import os; print(os.path.exists('/dev/vda'))",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "False"
+
+    async def test_dev_zram0_not_exists(self, scheduler: Scheduler) -> None:
+        """/dev/zram0 must not exist after swapon."""
+        result = await scheduler.run(
+            code="import os; print(os.path.exists('/dev/zram0'))",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "False"
+
+    async def test_filesystem_still_works(self, scheduler: Scheduler) -> None:
+        """Read/write on the root filesystem works after /dev/vda removal."""
+        code = """\
+import os
+path = '/home/user/test_blkdev.txt'
+with open(path, 'w') as f:
+    f.write('block device node removed')
+with open(path) as f:
+    data = f.read()
+os.unlink(path)
+print(f'OK:{data}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "OK:block device node removed" in result.stdout
+
+    # --- Edge cases: alternative paths to block device are closed ---
+
+    async def test_dev_block_symlinks_broken(self, scheduler: Scheduler) -> None:
+        """/dev/block/MAJ:MIN symlinks point to removed nodes, so resolve fails."""
+        code = """\
+import os
+
+# Find block device symlinks in /dev/block/ (created by devtmpfs)
+dev_block = '/dev/block'
+if not os.path.isdir(dev_block):
+    print('NO_DEV_BLOCK_DIR')
+else:
+    broken = 0
+    for entry in os.listdir(dev_block):
+        link = os.path.join(dev_block, entry)
+        if os.path.islink(link):
+            target = os.readlink(link)
+            # Resolve relative to /dev/block/
+            resolved = os.path.normpath(os.path.join(dev_block, target))
+            if not os.path.exists(resolved):
+                broken += 1
+    print(f'BROKEN_LINKS:{broken}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        # Either the directory doesn't exist (fine) or all block symlinks are broken
+        out = result.stdout.strip()
+        assert "NO_DEV_BLOCK_DIR" in out or "BROKEN_LINKS:" in out
+        if "BROKEN_LINKS:" in out:
+            count = int(out.split("BROKEN_LINKS:")[1])
+            assert count > 0, "Expected at least one broken block device symlink"
+
+    async def test_dev_root_not_accessible(self, scheduler: Scheduler) -> None:
+        """/dev/root (sometimes auto-created by kernel) doesn't exist or is broken."""
+        code = """\
+import os
+exists = os.path.exists('/dev/root')
+if exists:
+    # If it exists, verify it's not a working block device
+    try:
+        f = open('/dev/root', 'rb')
+        f.close()
+        print('ACCESSIBLE')
+    except (PermissionError, OSError):
+        print('BLOCKED')
+else:
+    print('NOT_EXISTS')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.strip() in ("NOT_EXISTS", "BLOCKED")
+
+    async def test_proc_partitions_readable_but_no_data_access(self, scheduler: Scheduler) -> None:
+        """/proc/partitions shows vda metadata but the device node is gone."""
+        code = """\
+# /proc/partitions should still list vda (kernel metadata, not a device node)
+with open('/proc/partitions') as f:
+    content = f.read()
+has_vda = 'vda' in content
+print(f'PROC_HAS_VDA:{has_vda}')
+
+# But opening /dev/vda should fail
+try:
+    f = open('/dev/vda', 'rb')
+    f.close()
+    print('DEV_VDA_OPEN:success')
+except FileNotFoundError:
+    print('DEV_VDA_OPEN:not_found')
+except (PermissionError, OSError):
+    print('DEV_VDA_OPEN:blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "PROC_HAS_VDA:True" in result.stdout
+        assert "DEV_VDA_OPEN:not_found" in result.stdout
+
+    # --- Weird cases: attempts to recreate block device access ---
+
+    async def test_mknod_blocked(self, scheduler: Scheduler) -> None:
+        """mknod with block device type fails — UID 1000 lacks CAP_MKNOD."""
+        code = """\
+import os, stat
+try:
+    # Attempt to create a block device node (major 253 = virtblk)
+    os.mknod('/home/user/vda', 0o660 | stat.S_IFBLK, os.makedev(253, 0))
+    print('CREATED')
+except PermissionError:
+    print('BLOCKED:EPERM')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.strip().startswith("BLOCKED:")
+
+    async def test_dev_vda_open_fails(self, scheduler: Scheduler) -> None:
+        """open('/dev/vda') fails (defense-in-depth, same pattern as /dev/mem test)."""
+        code = """\
+try:
+    f = open('/dev/vda', 'rb')
+    f.close()
+    print("unexpected_success")
+except (FileNotFoundError, PermissionError, OSError):
+    print("blocked")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    # --- Out of bounds cases: no block device nodes remain anywhere in /dev ---
+
+    async def test_no_block_devices_in_dev(self, scheduler: Scheduler) -> None:
+        """No block device nodes exist anywhere under /dev."""
+        code = """\
+import os, stat
+
+block_devices = []
+for dirpath, dirnames, filenames in os.walk('/dev'):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        try:
+            s = os.lstat(path)
+            if stat.S_ISBLK(s.st_mode):
+                block_devices.append(path)
+        except OSError:
+            pass
+
+if block_devices:
+    print(f'FOUND:{",".join(block_devices)}')
+else:
+    print('NONE')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "NONE", f"Block device nodes found: {result.stdout.strip()}"
