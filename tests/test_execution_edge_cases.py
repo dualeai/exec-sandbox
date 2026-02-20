@@ -320,6 +320,28 @@ time.sleep(60)
 
         # Verify SIGTERM was sent (not SIGKILL)
         assert "RECEIVED_SIGTERM" in result.stdout
+        # Process caught SIGTERM and called sys.exit(42) — normal exit, not a signal kill
+        assert result.exit_code == 42
+
+    async def test_signal_kill_returns_128_plus_signal(self, scheduler: Scheduler) -> None:
+        """Process killed by uncaught signal returns 128+signal_number.
+
+        Normal case: SIGSEGV (signal 11) kills the REPL process.
+        The guest-agent should report exit_code=128+11=139 per Unix convention.
+        """
+        code = """
+import os
+import signal
+os.kill(os.getpid(), signal.SIGSEGV)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=10,
+        )
+
+        # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
+        assert result.exit_code == 139
 
     @skip_unless_hwaccel
     async def test_normal_exit_no_termination_needed(self, scheduler: Scheduler) -> None:
@@ -1371,7 +1393,8 @@ except Exception as e:
             language=Language.PYTHON,
             timeout_seconds=3,
         )
-        assert result.exit_code == -1
+        # SIGALRM (signal 14) kills the REPL process, exit_code = 128 + 14 = 142
+        assert result.exit_code == 142
 
     async def test_python_stdin_write_raises(self, scheduler: Scheduler) -> None:
         """Writing to stdin (opened read-only from /dev/null) raises."""
@@ -1409,8 +1432,8 @@ except Exception as e:
             language=Language.PYTHON,
             timeout_seconds=3,
         )
-        # Either blocks until timeout (fd 0 is protocol pipe) or permission denied
-        assert result.exit_code == -1 or "PERMISSION_ERROR" in result.stdout
+        # Either blocks until SIGALRM kills the REPL (128+14=142), or permission denied
+        assert result.exit_code == 142 or "PERMISSION_ERROR" in result.stdout
 
     async def test_python_fileinput_stdin_eof(self, scheduler: Scheduler) -> None:
         """fileinput.input('-') iterates zero times at EOF."""

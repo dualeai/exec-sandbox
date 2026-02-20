@@ -675,6 +675,19 @@ struct ExecutionComplete {
     process_ms: Option<u64>,
 }
 
+/// Extract exit code following Unix shell conventions.
+///
+/// - Normal exit: returns the exit code (0-255)
+/// - Signal kill: returns 128 + signal_number (e.g., SIGKILL → 137, SIGSEGV → 139)
+/// - Neither (impossible on Unix): returns 255 as "unknown error" fallback
+fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|sig| 128 + sig))
+        .unwrap_or(255)
+}
+
 #[derive(Debug, Serialize)]
 struct Pong {
     #[serde(rename = "type")]
@@ -1095,7 +1108,7 @@ async fn install_packages(
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let exit_code = status.code().unwrap_or(-1);
+    let exit_code = exit_code_from_status(status);
 
     // Sync filesystem to ensure package files are persisted
     // Critical for snapshots with cache=unsafe (QEMU may exit before lazy writeback)
@@ -1954,7 +1967,7 @@ async fn execute_code_streaming(
         Ok(()) => {
             // REPL died (EOF on both streams) - recover exit code
             let status = repl.child.wait().await;
-            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            let exit_code = status.map(exit_code_from_status).unwrap_or(-1);
 
             eprintln!("REPL for {} died with exit_code={}", language, exit_code);
 
