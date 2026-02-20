@@ -2591,6 +2591,22 @@ fn setup_init_environment() {
     unsafe { std::env::set_var("UV_NO_CACHE", "1") };
     eprintln!("Set UV_NO_CACHE=1");
 
+    // Harden system directories: CIS Benchmark 6.1.x compliance.
+    // Defense-in-depth against build-time ownership issues — macOS Docker
+    // export (VirtioFS) loses UID 0, so /etc may be writable by non-root.
+    // See: https://github.com/docker/for-mac/issues/6812
+    for dir in ["/etc", "/usr", "/var", "/sbin", "/bin"] {
+        let _ = StdCommand::new("chmod").args(["755", dir]).status();
+    }
+    // CIS 6.1.2-6.1.4: /etc/passwd, /etc/group = 644; /etc/shadow = 640
+    for file in ["/etc/passwd", "/etc/group", "/etc/resolv.conf"] {
+        let _ = StdCommand::new("chmod").args(["644", file]).status();
+    }
+    let _ = StdCommand::new("chmod")
+        .args(["640", "/etc/shadow"])
+        .status();
+    eprintln!("Hardened system directory permissions (CIS 6.1.x)");
+
     // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
     // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.
     // Without lo, user code like http.createServer + fetch('http://localhost:...') fails

@@ -635,10 +635,10 @@ with open("/nonexistent/path/to/file.txt") as f:
         assert "FileNotFoundError" in result.stderr or "No such file" in result.stderr
 
     async def test_permission_denied(self, scheduler: Scheduler) -> None:
-        """Write to read-only filesystem fails even as root.
+        """Write to read-only filesystem fails.
 
-        Note: VM runs as root, so traditional permission tests on /etc/shadow
-        won't work. Instead, test writing to /proc which is read-only.
+        Note: /proc is read-only regardless of UID, making it a reliable
+        target for testing write-permission errors.
         """
         code = """
 with open("/proc/version", "w") as f:

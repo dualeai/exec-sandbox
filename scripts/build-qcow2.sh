@@ -482,7 +482,16 @@ DOCKERFILE
         --platform "$host_platform" \
         "$guestfs_image" \
         bash -c "
+            # Fix ownership: macOS Docker export (VirtioFS) loses UID 0 on
+            # local output, so system files may be owned by the build user.
+            # Reset everything to root first, then set sandbox user's home.
+            # See: https://github.com/docker/for-mac/issues/6812
+            chown -R 0:0 /build/rootfs
             chown -R 1000:1000 /build/rootfs/home/user
+            # CIS Benchmark 6.1.x: harden /etc file permissions
+            chmod 755 /build/rootfs/etc
+            chmod 644 /build/rootfs/etc/passwd /build/rootfs/etc/group /build/rootfs/etc/resolv.conf
+            [ -f /build/rootfs/etc/shadow ] && chmod 640 /build/rootfs/etc/shadow
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
             qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
             rm -rf /build/rootfs /build/rootfs.raw
