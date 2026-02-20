@@ -182,12 +182,8 @@ class Session:
             exit_code=-1 and timeout message in stderr — they do NOT raise.
             Only VM-level failures (communication errors) raise exceptions.
         """
-        if timeout_seconds is not None and (
-            timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS
-        ):
-            raise ValueError(
-                f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
-            )
+        if timeout_seconds is not None and (timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS):
+            raise ValueError(f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}")
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
         async with self._guard():

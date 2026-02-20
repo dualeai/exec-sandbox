@@ -543,7 +543,13 @@ fn main() {
     // nosuid|nodev|noexec: CIS Benchmark 1.1.15 hardening. Won't break
     // multiprocessing — POSIX semaphores use shm_open()+mmap(), not execve().
     let _ = fs::create_dir("/dev/shm");
-    mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64M,mode=1777");
+    mount(
+        "tmpfs",
+        "/dev/shm",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV | MS_NOEXEC,
+        "size=64M,mode=1777",
+    );
     mount("proc", "/proc", "proc", 0, "");
     mount("sysfs", "/sys", "sysfs", 0, "");
     mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");

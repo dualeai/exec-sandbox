@@ -2072,9 +2072,7 @@ class TestExecuteEnvVarValidation:
             pytest.param({"K\n": "v"}, "control character", id="newline-name"),
         ],
     )
-    async def test_control_chars_raise_env_var_validation_error(
-        self, vm, env_vars: dict[str, str], match: str
-    ) -> None:
+    async def test_control_chars_raise_env_var_validation_error(self, vm, env_vars: dict[str, str], match: str) -> None:
         with pytest.raises(EnvVarValidationError, match=match) as exc_info:
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
         assert isinstance(exc_info.value, SandboxError)
@@ -2096,9 +2094,7 @@ class TestExecuteEnvVarValidation:
             ),
         ],
     )
-    async def test_limits_raise_env_var_validation_error(
-        self, vm, env_vars: dict[str, str], match: str
-    ) -> None:
+    async def test_limits_raise_env_var_validation_error(self, vm, env_vars: dict[str, str], match: str) -> None:
         with pytest.raises(EnvVarValidationError, match=match) as exc_info:
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
         assert isinstance(exc_info.value, SandboxError)
@@ -2119,9 +2115,7 @@ class TestExecuteEnvVarValidation:
             ),
         ],
     )
-    async def test_valid_env_vars_no_error(
-        self, vm, env_vars: dict[str, str]
-    ) -> None:
+    async def test_valid_env_vars_no_error(self, vm, env_vars: dict[str, str]) -> None:
         """Valid env vars pass validation (ExecuteCodeRequest succeeds).
 
         We expect some downstream error (VmTransientError from I/O) but
@@ -2144,8 +2138,6 @@ class TestExecuteEnvVarValidation:
             pytest.param({"K": "\n\r\x07"}, id="multiple-control-chars"),
         ],
     )
-    async def test_adversarial_values_raise_env_var_validation_error(
-        self, vm, env_vars: dict[str, str]
-    ) -> None:
+    async def test_adversarial_values_raise_env_var_validation_error(self, vm, env_vars: dict[str, str]) -> None:
         with pytest.raises(EnvVarValidationError):
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)

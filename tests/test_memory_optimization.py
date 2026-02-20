@@ -483,7 +483,6 @@ class TestConcurrentVMs:
         config = SchedulerConfig(
             default_memory_mb=256,
             default_timeout_seconds=90,
-
             images_dir=images_dir,
         )
 
@@ -528,7 +527,6 @@ print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
         config = SchedulerConfig(
             default_memory_mb=256,
             default_timeout_seconds=60,
-
             images_dir=images_dir,
         )
 

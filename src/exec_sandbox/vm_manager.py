@@ -476,7 +476,9 @@ class VmManager:
                 # Direct write mode - VM writes directly to target file (no overlay)
                 # Used for L2 snapshot creation where disk changes are written directly
                 workdir.use_qemu_vm_user = False  # target file owned by current user
-                cgroup_path = await cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg)
+                cgroup_path = await cgroup.setup_cgroup(
+                    vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg
+                )
             # Normal mode - create overlay backed by base image
             # This allows the backing image to remain read-only and shareable
             # Pool handles fast path (from pool) or slow path (on-demand) internally
@@ -1114,8 +1116,7 @@ class VmManager:
         )
         if effective_max < 0:
             logger.warning(
-                "Cannot compute overlay pool size from host resources (psutil probe failed), "
-                "using fallback",
+                "Cannot compute overlay pool size from host resources (psutil probe failed), using fallback",
                 extra={"fallback_pool_size": constants.OVERLAY_POOL_FALLBACK_SIZE},
             )
             return constants.OVERLAY_POOL_FALLBACK_SIZE
