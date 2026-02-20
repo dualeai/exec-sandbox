@@ -479,6 +479,9 @@ class Scheduler:
         if self._vm_manager is None or self._settings is None:
             raise SandboxError("Scheduler resources not initialized")
 
+        # Ensure language is a Language enum (callers may pass raw strings)
+        language = Language(language)
+
         # Apply defaults
         memory = memory_mb or self.config.default_memory_mb
         packages = packages or []
@@ -502,11 +505,11 @@ class Scheduler:
         # Only use snapshots when packages need to be installed - empty packages case
         # benefits from overlay pool pre-caching which requires using the original base image
         snapshot_path: Path | None = None
-        if self._snapshot_manager and packages:
+        if packages:
             snapshot_path = await self._get_or_create_snapshot(language, packages, memory)
             logger.info(
-                "Snapshot cache result",
-                extra={"snapshot_path": str(snapshot_path) if snapshot_path else None},
+                "Snapshot ready",
+                extra={"snapshot_path": str(snapshot_path)},
             )
 
         # Try warm pool first (instant allocation)
@@ -515,8 +518,7 @@ class Scheduler:
         is_cold_boot = False
         needs_network: bool = allow_network or bool(resolved_ports)
         if self._warm_pool and not packages and not needs_network:
-            lang_enum = Language(language)
-            vm = await self._warm_pool.get_vm(lang_enum, packages)
+            vm = await self._warm_pool.get_vm(language, packages)
 
         # Cold boot if no warm VM available
         if vm is None:
@@ -583,7 +585,7 @@ class Scheduler:
         validator = await PackageValidator.create()
         validator.validate(packages, language)
 
-    async def _get_or_create_snapshot(self, language: str, packages: list[str], memory_mb: int) -> Path | None:
+    async def _get_or_create_snapshot(self, language: Language, packages: list[str], memory_mb: int) -> Path:
         """Get cached snapshot or create new one with packages.
 
         Checks L2 (local qcow2) and L3 (S3) caches before building.
@@ -594,32 +596,27 @@ class Scheduler:
             memory_mb: VM memory in MB (included in cache key)
 
         Returns:
-            Path to snapshot qcow2, or None on error (graceful degradation).
+            Path to snapshot qcow2.
+
+        Raises:
+            SandboxError: Snapshot manager not configured or snapshot creation failed.
         """
         if not self._snapshot_manager:
-            return None
+            raise SandboxError("Packages requested but snapshot manager is not configured")
 
-        try:
-            snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
-                language=Language(language),
-                packages=packages,
-                tenant_id="exec-sandbox",
-                task_id=f"snapshot-{hash(tuple(sorted(packages)))}",
-                memory_mb=memory_mb,
-            )
-            logger.debug(
-                "Snapshot ready",
-                extra={
-                    "language": language,
-                    "packages": packages,
-                    "path": str(snapshot_path),
-                },
-            )
-            return snapshot_path
-        except (OSError, RuntimeError, TimeoutError, ConnectionError, SandboxError) as e:
-            # Graceful degradation: log error, continue without snapshot
-            logger.warning(
-                "Snapshot creation failed, continuing without cache",
-                extra={"language": language, "packages": packages, "error": str(e)},
-            )
-            return None
+        snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
+            language=language,
+            packages=packages,
+            tenant_id="exec-sandbox",
+            task_id=f"snapshot-{hash(tuple(sorted(packages)))}",
+            memory_mb=memory_mb,
+        )
+        logger.debug(
+            "Snapshot ready",
+            extra={
+                "language": language,
+                "packages": packages,
+                "path": str(snapshot_path),
+            },
+        )
+        return snapshot_path

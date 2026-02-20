@@ -989,6 +989,122 @@ class TestSchedulerWarmPoolTiming:
 # ============================================================================
 
 
+PACKAGE_INSTALL_TEST_CASES = [
+    # Python - pure Python packages
+    pytest.param(
+        Language.PYTHON,
+        ["requests==2.31.0"],
+        'import requests; print(f"requests={requests.__version__}")',
+        ["requests=2.31.0"],
+        id="python-requests",
+    ),
+    pytest.param(
+        Language.PYTHON,
+        ["requests==2.31.0", "flask==3.0.0", "httpx==0.27.0"],
+        """
+import requests
+import flask
+import httpx
+print(f"requests={requests.__version__}")
+print(f"flask={flask.__version__}")
+print(f"httpx={httpx.__version__}")
+""",
+        ["requests=2.31.0", "flask=3.0.0", "httpx=0.27.0"],
+        id="python-multi",
+    ),
+    # Python - C extension packages (native binaries, musllinux wheels)
+    pytest.param(
+        Language.PYTHON,
+        ["numpy==2.4.2"],
+        """
+import numpy as np
+a = np.array([[1, 2], [3, 4]])
+b = np.linalg.inv(a)
+det = np.linalg.det(a)
+print(f"numpy={np.__version__}")
+print(f"det={det:.1f}")
+print(f"inv_sum={b.sum():.1f}")
+""",
+        ["numpy=2.4.2", "det=-2.0", "inv_sum=0.0"],
+        id="python-numpy",
+    ),
+    pytest.param(
+        Language.PYTHON,
+        ["pandas==3.0.1"],
+        """
+import pandas as pd
+df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+filtered = df[df["a"] > 1]
+print(f"pandas={pd.__version__}")
+print(f"shape={filtered.shape}")
+print(f"mean={df['b'].mean():.1f}")
+""",
+        ["pandas=3.0.1", "shape=(2, 2)", "mean=5.0"],
+        id="python-pandas",
+    ),
+    pytest.param(
+        Language.PYTHON,
+        ["pillow==12.1.1"],
+        """
+from PIL import Image
+import PIL
+img = Image.new("RGB", (100, 50), color=(255, 0, 0))
+img = img.resize((50, 25))
+print(f"pillow={PIL.__version__}")
+print(f"size={img.size}")
+print(f"pixel={img.getpixel((0, 0))}")
+""",
+        ["pillow=12.1.1", "size=(50, 25)", "pixel=(255, 0, 0)"],
+        id="python-pillow",
+    ),
+    # JavaScript - pure JS packages
+    pytest.param(
+        Language.JAVASCRIPT,
+        ["lodash@4.17.21"],
+        """
+const _ = require("lodash");
+const arr = [3, 1, 4, 1, 5, 9];
+const sorted = _.sortBy(arr);
+const chunked = _.chunk(arr, 2);
+console.log("lodash=" + _.VERSION);
+console.log("sorted=" + JSON.stringify(sorted));
+console.log("chunks=" + chunked.length);
+""",
+        ["lodash=4.17.21", "sorted=[1,1,3,4,5,9]", "chunks=3"],
+        id="js-lodash",
+    ),
+    pytest.param(
+        Language.JAVASCRIPT,
+        ["lodash@4.17.21", "moment@2.30.1"],
+        """
+const _ = require("lodash");
+const moment = require("moment");
+const grouped = _.groupBy(["one", "two", "three"], "length");
+const date = moment("2024-01-15").format("MMMM D");
+console.log("lodash=" + _.VERSION);
+console.log("moment=" + moment.version);
+console.log("groups=" + Object.keys(grouped).length);
+console.log("date=" + date);
+""",
+        ["lodash=4.17.21", "moment=2.30.1", "groups=2", "date=January 15"],
+        id="js-multi",
+    ),
+    # JavaScript - native binary packages
+    pytest.param(
+        Language.JAVASCRIPT,
+        ["esbuild@0.25.4"],
+        """
+const esbuild = require("esbuild");
+const result = esbuild.transformSync("const x: number = 1", { loader: "ts" });
+console.log("esbuild=" + esbuild.version);
+console.log("output=" + result.code.trim());
+""",
+        ["esbuild=0.25.4", "output=const x = 1;"],
+        id="js-esbuild",
+    ),
+]
+
+
 class TestPackageInstallation:
     """Integration tests for package installation with real QEMU VMs.
 
@@ -999,70 +1115,26 @@ class TestPackageInstallation:
     - Snapshot corruption during package install
     """
 
-    async def test_python_package_install_and_import(self, scheduler: Scheduler) -> None:
-        """Python packages are installed and importable."""
-        result = await scheduler.run(
-            code='import requests; print(f"requests={requests.__version__}")',
-            language=Language.PYTHON,
-            packages=["requests==2.31.0"],
-            timeout_seconds=120,
-        )
-
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "requests=2.31.0" in result.stdout
-
-    async def test_python_multiple_packages(self, scheduler: Scheduler) -> None:
-        """Multiple Python packages are installed and importable."""
-        code = """
-import requests
-import flask
-import httpx
-print(f"requests={requests.__version__}")
-print(f"flask={flask.__version__}")
-print(f"httpx={httpx.__version__}")
-"""
+    @pytest.mark.parametrize("language,packages,code,expected_outputs", PACKAGE_INSTALL_TEST_CASES)
+    async def test_package_install_and_import(
+        self,
+        scheduler: Scheduler,
+        language: Language,
+        packages: list[str],
+        code: str,
+        expected_outputs: list[str],
+    ) -> None:
+        """Packages are installed and importable."""
         result = await scheduler.run(
             code=code,
-            language=Language.PYTHON,
-            packages=["requests==2.31.0", "flask==3.0.0", "httpx==0.27.0"],
+            language=language,
+            packages=packages,
             timeout_seconds=120,
         )
 
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "requests=2.31.0" in result.stdout
-        assert "flask=3.0.0" in result.stdout
-        assert "httpx=0.27.0" in result.stdout
-
-    async def test_javascript_package_install_and_import(self, scheduler: Scheduler) -> None:
-        """JavaScript packages are installed and importable."""
-        result = await scheduler.run(
-            code='const lodash = require("lodash"); console.log("lodash=" + lodash.VERSION)',
-            language=Language.JAVASCRIPT,
-            packages=["lodash@4.17.21"],
-            timeout_seconds=120,
-        )
-
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "lodash=4.17.21" in result.stdout
-
-    async def test_javascript_multiple_packages(self, scheduler: Scheduler) -> None:
-        """Multiple JavaScript packages are installed and importable."""
-        code = """
-const lodash = require("lodash");
-const moment = require("moment");
-console.log("lodash=" + lodash.VERSION);
-console.log("moment=" + moment.version);
-"""
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-            packages=["lodash@4.17.21", "moment@2.30.1"],
-            timeout_seconds=120,
-        )
-
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "lodash=4.17.21" in result.stdout
-        assert "moment=2.30.1" in result.stdout
+        for expected in expected_outputs:
+            assert expected in result.stdout
 
     async def test_python_snapshot_cache_hit(self, scheduler: Scheduler) -> None:
         """Second run with same packages uses cached snapshot."""

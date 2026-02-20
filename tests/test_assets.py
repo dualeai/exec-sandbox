@@ -16,6 +16,7 @@ import pytest
 from exec_sandbox.assets import (
     _find_asset,  # pyright: ignore[reportPrivateUsage]
     _find_images_dir,  # pyright: ignore[reportPrivateUsage]
+    _versioned_cache_dir,  # pyright: ignore[reportPrivateUsage]
     ensure_assets,
 )
 
@@ -57,7 +58,7 @@ class TestFindAsset:
 
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             result = await _find_asset("vmlinuz-x86_64")
             assert result == tmp_path / "vmlinuz-x86_64"
@@ -66,7 +67,7 @@ class TestFindAsset:
         """Returns None when asset doesn't exist anywhere."""
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             result = await _find_asset("nonexistent-file")
             assert result is None
@@ -119,7 +120,7 @@ class TestFindAsset:
 
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=cache_dir),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=cache_dir),
         ):
             result = await _find_asset("vmlinuz-x86_64")
             assert result == env_dir / "vmlinuz-x86_64"
@@ -140,7 +141,7 @@ class TestFindAsset:
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
             patch("exec_sandbox.assets.__file__", fake_file),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=cache_dir),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=cache_dir),
         ):
             result = await _find_asset("vmlinuz-x86_64")
             assert result == local_dir / "vmlinuz-x86_64"
@@ -151,7 +152,7 @@ class TestFindAsset:
 
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             result = await _find_asset("vmlinuz-x86_64")
             assert result == tmp_path / "vmlinuz-x86_64"
@@ -166,7 +167,7 @@ class TestFindAsset:
 
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": "   "}, clear=False),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             result = await _find_asset("vmlinuz-x86_64")
             # Should fall back to cache since env var is whitespace
@@ -179,7 +180,7 @@ class TestFindAsset:
 
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(nonexistent)}),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             result = await _find_asset("vmlinuz-x86_64")
             # Env var dir doesn't exist, so falls back to cache
@@ -230,7 +231,7 @@ class TestFindImagesDir:
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path / "cache"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "cache"),
         ):
             result = await _find_images_dir(override=nonexistent)
             assert result is None
@@ -266,7 +267,7 @@ class TestEnsureAssets:
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path / "cache"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "cache"),
         ):
             with pytest.raises(FileNotFoundError) as exc_info:
                 await ensure_assets(override=nonexistent, download=False)
@@ -346,6 +347,28 @@ class TestGetAssets:
 
         result = assets_module.get_assets()
         assert isinstance(result, AsyncPooch)
+
+
+class TestVersionedCacheDir:
+    """Tests for _versioned_cache_dir() helper."""
+
+    def test_appends_version_suffix(self) -> None:
+        """Cache dir includes version suffix by default."""
+        from exec_sandbox import __version__
+
+        with patch.dict(os.environ, {}, clear=False):
+            # Ensure EXEC_SANDBOX_CACHE_DIR is not set
+            os.environ.pop("EXEC_SANDBOX_CACHE_DIR", None)
+            result = _versioned_cache_dir()
+            assert result.name == f"v{__version__}"
+
+    def test_env_override_skips_version_suffix(self) -> None:
+        """EXEC_SANDBOX_CACHE_DIR skips version suffix."""
+        from pathlib import Path
+
+        with patch.dict(os.environ, {"EXEC_SANDBOX_CACHE_DIR": "/custom/cache"}):
+            result = _versioned_cache_dir()
+            assert result == Path("/custom/cache")
 
 
 class TestConcurrentDecompression:
@@ -473,7 +496,7 @@ class TestFetchKernel:
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path / "empty"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty"),
             patch("exec_sandbox.assets.ensure_registry_loaded", new_callable=AsyncMock) as mock_registry,
             patch("exec_sandbox.assets.get_assets") as mock_assets,
         ):
@@ -617,7 +640,7 @@ class TestFetchGvproxy:
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             result = await get_gvproxy_path()
             assert result is None
@@ -836,7 +859,7 @@ class TestErrorCases:
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path / "cache"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "cache"),
         ):
             with pytest.raises(FileNotFoundError) as exc_info:
                 await ensure_assets(override=nonexistent, download=False)
@@ -876,7 +899,7 @@ class TestPrefetchAllAssets:
             patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
             patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
             patch("exec_sandbox.assets.fetch_base_image") as mock_base,
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             mock_registry.return_value = None
             mock_kernel.return_value = tmp_path / "vmlinuz"
@@ -905,7 +928,7 @@ class TestPrefetchAllAssets:
             patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
             patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
             patch("exec_sandbox.assets.fetch_base_image") as mock_base,
-            patch("exec_sandbox.assets.get_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
         ):
             mock_registry.return_value = None
             mock_kernel.return_value = tmp_path / "vmlinuz"

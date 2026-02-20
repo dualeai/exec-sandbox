@@ -8,7 +8,7 @@ Path Resolution Priority:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. ./images/dist/ (local build directory)
-    4. ~/.cache/exec-sandbox/ (download cache)
+    4. ~/.cache/exec-sandbox/v{version}/ (download cache)
 """
 
 from __future__ import annotations
@@ -67,6 +67,15 @@ class PrefetchResult:
     cache_dir: Path | None = None
 
 
+def _versioned_cache_dir() -> Path:
+    """Get version-specific cache directory for downloaded assets."""
+    base = get_cache_dir("exec-sandbox")
+    # Don't add version suffix when user explicitly overrides cache dir
+    if os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
+        return base
+    return base / f"v{__version__}"
+
+
 def _get_asset_version() -> tuple[str, str]:
     """Get asset version from env var or package version.
 
@@ -88,7 +97,7 @@ def _create_assets_registry() -> AsyncPooch:
     """Create the assets registry singleton."""
     pooch_version, _ = _get_asset_version()
     return AsyncPooch(
-        path=get_cache_dir("exec-sandbox"),
+        path=_versioned_cache_dir(),
         base_url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/v{{version}}",
         version=pooch_version,
         env="EXEC_SANDBOX_CACHE_DIR",
@@ -241,7 +250,7 @@ async def get_gvproxy_path(override: Path | None = None) -> Path | None:
     1. Repo-relative path (gvproxy-wrapper/bin/ - for local development builds)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. Local build directory (./images/dist/)
-    4. Download cache directory (~/.cache/exec-sandbox/)
+    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
 
     Args:
         override: Explicit path to search first (from SchedulerConfig.images_dir).
@@ -407,7 +416,7 @@ def _get_search_paths(override: Path | None = None) -> list[Path]:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. Local build directory (./images/dist/ relative to package root)
-    4. Download cache directory (~/.cache/exec-sandbox/)
+    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
 
     Args:
         override: Explicit path from config (highest priority).
@@ -430,7 +439,7 @@ def _get_search_paths(override: Path | None = None) -> list[Path]:
     paths.append(local_images)
 
     # Priority 4: Download cache directory
-    paths.append(get_cache_dir("exec-sandbox"))
+    paths.append(_versioned_cache_dir())
 
     return paths
 
@@ -443,7 +452,7 @@ async def _find_images_dir(override: Path | None = None) -> Path | None:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. Local build directory (./images/dist/ relative to package root)
-    4. Download cache directory (~/.cache/exec-sandbox/)
+    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
 
     Args:
         override: Explicit path from config (highest priority).
@@ -465,7 +474,7 @@ async def _find_asset(fname: str, override: Path | None = None) -> Path | None:
     1. override (explicit from SchedulerConfig.images_dir)
     2. EXEC_SANDBOX_IMAGES_DIR env var
     3. Local build directory (./images/dist/ relative to package root)
-    4. Download cache directory (~/.cache/exec-sandbox/)
+    4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
 
     Also checks for decompressed versions (.zst removed).
 
@@ -554,5 +563,5 @@ async def prefetch_all_assets(
         arch=arch,
         downloaded=downloaded,
         errors=errors,
-        cache_dir=get_cache_dir("exec-sandbox") if len(errors) == 0 else None,
+        cache_dir=_versioned_cache_dir() if len(errors) == 0 else None,
     )

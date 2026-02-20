@@ -617,6 +617,30 @@ class TestSecurityCases:
 
 
 # =============================================================================
+# Language Type Handling Tests
+# =============================================================================
+
+
+class TestLanguageTypeHandling:
+    """Test that validate() handles Language enum correctly and rejects unsupported languages."""
+
+    async def test_raw_language_raises_clear_error(self, validator: PackageValidator) -> None:
+        """Language.RAW has no allow-list and should raise a descriptive error."""
+        with pytest.raises(PackageNotAllowedError) as exc_info:
+            validator.validate(["some-pkg==1.0.0"], language=Language.RAW)
+
+        assert "not supported" in str(exc_info.value)
+        assert "raw" in str(exc_info.value)
+        assert "python" in str(exc_info.value)
+        assert "javascript" in str(exc_info.value)
+
+    async def test_raw_language_single_package_raises(self, validator: PackageValidator) -> None:
+        """Language.RAW with a single valid-format package should raise on missing allow-list."""
+        with pytest.raises(PackageNotAllowedError):
+            validator.validate(["pkg==1.0"], language=Language.RAW)
+
+
+# =============================================================================
 # is_allowed() Method Tests
 # =============================================================================
 
