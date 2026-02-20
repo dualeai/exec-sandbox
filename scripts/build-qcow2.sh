@@ -473,6 +473,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 DOCKERFILE
 
     # Run virt-make-fs + qemu-img using cached image
+    # Note: cleanup inside Docker because files created by Docker (root) and chowned
+    # to UID 1000 cannot be deleted by the CI runner (UID 1001) on the host due to
+    # /tmp sticky bit. Removing inside the container (as root) avoids this.
     docker run --rm \
         -v "$tmp_dir:/build" \
         -v "$OUTPUT_DIR:/output" \
@@ -482,6 +485,7 @@ DOCKERFILE
             chown -R 1000:1000 /build/rootfs/home/user
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
             qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
+            rm -rf /build/rootfs /build/rootfs.raw
         "
 
     rm -rf "$tmp_dir"
