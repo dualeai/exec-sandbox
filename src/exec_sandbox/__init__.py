@@ -31,7 +31,6 @@ With Configuration:
     from exec_sandbox import Scheduler, SchedulerConfig
 
     config = SchedulerConfig(
-        max_concurrent_vms=5,
         s3_bucket="my-snapshots",  # Enable S3 cache
     )
     async with Scheduler(config) as scheduler:

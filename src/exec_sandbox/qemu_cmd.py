@@ -29,6 +29,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     vm_id: str,
     workdir: VmWorkingDirectory,
     memory_mb: int,
+    cpu_cores: int,
     allow_network: bool,
     expose_ports: list[ExposedPort] | None = None,
 ) -> list[str]:
@@ -40,6 +41,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         vm_id: Unique VM identifier
         workdir: VM working directory containing overlay and socket paths
         memory_mb: Guest VM memory in MB
+        cpu_cores: Number of vCPUs for the guest (maps to -smp)
         allow_network: Enable network access via gvproxy (outbound internet)
         expose_ports: List of ports to expose from guest to host.
             When set without allow_network, uses QEMU user-mode networking
@@ -325,7 +327,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-m",
             f"{memory_mb}M",
             "-smp",
-            "1",
+            str(cpu_cores),
             "-kernel",
             str(kernel_path),
             "-initrd",

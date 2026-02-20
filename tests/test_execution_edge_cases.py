@@ -757,6 +757,197 @@ Promise.reject(new Error("test rejection"));
 
 
 # =============================================================================
+# TypeScript Support (loader: 'ts' in Bun REPL wrapper)
+# =============================================================================
+class TestTypeScriptSupport:
+    """TypeScript syntax is accepted and transpiled by the Bun REPL wrapper."""
+
+    # --- Normal cases: core TS features ---
+
+    async def test_ts_type_annotation(self, scheduler: Scheduler) -> None:
+        """Basic type annotation on variable."""
+        result = await scheduler.run(
+            code="const x: number = 42; console.log(x);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "42" in result.stdout
+
+    async def test_ts_interface(self, scheduler: Scheduler) -> None:
+        """Interface definition and typed object."""
+        result = await scheduler.run(
+            code='interface User { name: string; age: number } const u: User = { name: "Alice", age: 30 }; console.log(u.name, u.age);',
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "Alice" in result.stdout
+        assert "30" in result.stdout
+
+    async def test_ts_generic_function(self, scheduler: Scheduler) -> None:
+        """Generic function with type parameter."""
+        result = await scheduler.run(
+            code="function identity<T>(x: T): T { return x; } console.log(identity(7));",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "7" in result.stdout
+
+    async def test_ts_enum(self, scheduler: Scheduler) -> None:
+        """TypeScript enum."""
+        result = await scheduler.run(
+            code="enum Color { Red, Green, Blue } console.log(Color.Green);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "1" in result.stdout
+
+    async def test_ts_type_alias(self, scheduler: Scheduler) -> None:
+        """Type alias."""
+        result = await scheduler.run(
+            code='type Pair = [number, string]; const p: Pair = [1, "hello"]; console.log(p[0], p[1]);',
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "1" in result.stdout
+        assert "hello" in result.stdout
+
+    async def test_ts_as_cast(self, scheduler: Scheduler) -> None:
+        """'as' type assertion."""
+        result = await scheduler.run(
+            code='const x: unknown = "hello"; console.log((x as string).length);',
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "5" in result.stdout
+
+    # --- Edge cases ---
+
+    async def test_ts_generic_arrow_function(self, scheduler: Scheduler) -> None:
+        """Generic arrow function (valid with 'ts' loader, ambiguous with 'tsx')."""
+        result = await scheduler.run(
+            code='const id = <T>(x: T): T => x; console.log(id("hi"));',
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "hi" in result.stdout
+
+    async def test_ts_optional_chaining_with_types(self, scheduler: Scheduler) -> None:
+        """Optional chaining with typed objects."""
+        result = await scheduler.run(
+            code='const o: { a?: { b?: number } } = {}; console.log(o?.a?.b ?? "none");',
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "none" in result.stdout
+
+    async def test_ts_type_only_constructs_stripped(self, scheduler: Scheduler) -> None:
+        """Type-only constructs are erased, no runtime footprint."""
+        result = await scheduler.run(
+            code="type Foo = { x: number }; const f: Foo = { x: 1 }; console.log(f.x);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "1" in result.stdout
+
+    async def test_ts_plain_js_still_works(self, scheduler: Scheduler) -> None:
+        """Plain JavaScript is unaffected by the 'ts' loader (regression guard)."""
+        result = await scheduler.run(
+            code="var arr = [1, 2, 3]; console.log(arr.length);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "3" in result.stdout
+
+    async def test_ts_top_level_await_with_types(self, scheduler: Scheduler) -> None:
+        """Top-level await combined with TypeScript annotations."""
+        result = await scheduler.run(
+            code="const r: number = await Promise.resolve(42); console.log(r);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "42" in result.stdout
+
+    async def test_ts_empty_object_type(self, scheduler: Scheduler) -> None:
+        """Empty object type annotation."""
+        result = await scheduler.run(
+            code="const x: {} = {}; console.log(typeof x);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "object" in result.stdout
+
+    # --- Weird / out-of-bounds cases ---
+
+    async def test_ts_deeply_nested_generics(self, scheduler: Scheduler) -> None:
+        """Deeply nested generic types."""
+        code = """
+const m: Map<string, Map<string, Array<[number, string]>>> = new Map();
+const inner = new Map<string, Array<[number, string]>>();
+inner.set("key", [[1, "a"], [2, "b"]]);
+m.set("outer", inner);
+console.log(m.get("outer")!.get("key")![0][1]);
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "a" in result.stdout
+
+    async def test_ts_mixed_js_and_ts(self, scheduler: Scheduler) -> None:
+        """Mixed untyped JS and typed TS in the same snippet."""
+        code = """
+var count = 0;
+function inc(): number { return ++count; }
+inc(); inc(); inc();
+const result: string = `count=${count}`;
+console.log(result);
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "count=3" in result.stdout
+
+    async def test_ts_types_are_erased_at_runtime(self, scheduler: Scheduler) -> None:
+        """Types are erased — no runtime type checking (by design)."""
+        # "number" annotation but assigned a string via `as any` — runs fine
+        result = await scheduler.run(
+            code='const x: number = "hello" as any; console.log(typeof x);',
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "string" in result.stdout
+
+    # --- Error cases ---
+
+    async def test_ts_invalid_syntax(self, scheduler: Scheduler) -> None:
+        """Invalid TypeScript syntax is rejected."""
+        result = await scheduler.run(
+            code="const x: = 42;",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code != 0
+
+
+# =============================================================================
 # RAW/Shell Edge Cases
 # =============================================================================
 class TestRawEdgeCases:

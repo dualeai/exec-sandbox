@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox.exceptions import VmError
+from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
@@ -559,6 +559,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-9-2",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -590,6 +591,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-8-x",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -621,6 +623,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-10",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -652,6 +655,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-unknown",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -682,6 +686,7 @@ class TestNetdevReconnect:
                     vm_id="test-vm-reconnect-7",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=True,
                 )
 
@@ -712,12 +717,52 @@ class TestNetdevReconnect:
                     vm_id="test-vm-no-network",
                     workdir=workdir,
                     memory_mb=256,
+                    cpu_cores=1,
                     allow_network=False,
                 )
 
             # Should not have any netdev argument
             netdev_found = any(arg == "-netdev" for arg in cmd)
             assert not netdev_found, "netdev should not be present when network is disabled"
+        finally:
+            await workdir.cleanup()
+
+
+# ============================================================================
+# Tests - SMP / CPU cores
+# ============================================================================
+
+
+class TestSmpCpuCores:
+    """Verify -smp flag scales with cpu_cores parameter."""
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        probe_cache.reset("qemu_version")
+
+    @pytest.mark.parametrize("cpu_cores", [1, 2, 4])
+    async def test_smp_matches_cpu_cores(self, vm_settings, cpu_cores: int) -> None:
+        """-smp N matches the cpu_cores parameter."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create(f"test-smp-{cpu_cores}")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id=f"test-smp-{cpu_cores}",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=cpu_cores,
+                    allow_network=False,
+                )
+
+            # Find -smp value
+            smp_idx = cmd.index("-smp")
+            assert cmd[smp_idx + 1] == str(cpu_cores)
         finally:
             await workdir.cleanup()
 
@@ -1988,3 +2033,119 @@ class TestExecuteStateRace:
 
             assert "VM destroyed during execution start" in str(exc_info.value)
             assert exc_info.value.context["current_state"] == "destroyed"
+
+
+# ============================================================================
+# Execute Env Var Validation Tests
+# ============================================================================
+
+
+class TestExecuteEnvVarValidation:
+    """Verify execute() wraps ValidationError as EnvVarValidationError.
+
+    Users catching SandboxError must catch invalid env vars. Without the
+    conversion, raw pydantic.ValidationError leaks through.
+    """
+
+    @pytest.fixture
+    def vm(self):
+        """Minimal QemuVM that passes the READY state check."""
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.READY
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-envvar"
+        vm.language = Language.PYTHON
+        return vm
+
+    # -- Control characters (core bug) ------------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars, match",
+        [
+            pytest.param({"K": "v\n"}, "control character", id="newline-value"),
+            pytest.param({"K": "v\x00"}, "control character", id="null-value"),
+            pytest.param({"K": "\x1b[31m"}, "control character", id="esc-value"),
+            pytest.param({"K": "v\r"}, "control character", id="cr-value"),
+            pytest.param({"K": "v\x07"}, "control character", id="bell-value"),
+            pytest.param({"K": "v\x7f"}, "control character", id="del-value"),
+            pytest.param({"K\x00": "v"}, "control character", id="null-name"),
+            pytest.param({"K\n": "v"}, "control character", id="newline-name"),
+        ],
+    )
+    async def test_control_chars_raise_env_var_validation_error(
+        self, vm, env_vars: dict[str, str], match: str
+    ) -> None:
+        with pytest.raises(EnvVarValidationError, match=match) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert isinstance(exc_info.value, SandboxError)
+        assert exc_info.value.__cause__ is not None
+        assert exc_info.value.context["vm_id"] == "test-vm-envvar"
+
+    # -- Size / count limits -----------------------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars, match",
+        [
+            pytest.param({"": "v"}, "length", id="empty-name"),
+            pytest.param({"A" * 257: "v"}, "length", id="name-too-long"),
+            pytest.param({"K": "x" * 4097}, "too large", id="value-too-long"),
+            pytest.param(
+                {f"V{i}": "v" for i in range(101)},
+                "(?i)too many",
+                id="too-many-vars",
+            ),
+        ],
+    )
+    async def test_limits_raise_env_var_validation_error(
+        self, vm, env_vars: dict[str, str], match: str
+    ) -> None:
+        with pytest.raises(EnvVarValidationError, match=match) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert isinstance(exc_info.value, SandboxError)
+        assert exc_info.value.__cause__ is not None
+
+    # -- Boundary values that must NOT raise --------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars",
+        [
+            pytest.param({"K": "v\t"}, id="tab-allowed"),
+            pytest.param({"K": "Hello 世界 🌍"}, id="utf8-allowed"),
+            pytest.param({"A" * 256: "v"}, id="name-at-limit"),
+            pytest.param({"K": "x" * 4096}, id="value-at-limit"),
+            pytest.param(
+                {f"V{i}": "v" for i in range(100)},
+                id="vars-at-limit",
+            ),
+        ],
+    )
+    async def test_valid_env_vars_no_error(
+        self, vm, env_vars: dict[str, str]
+    ) -> None:
+        """Valid env vars pass validation (ExecuteCodeRequest succeeds).
+
+        We expect some downstream error (VmTransientError from I/O) but
+        crucially NOT EnvVarValidationError.
+        """
+        with pytest.raises(Exception) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert not isinstance(exc_info.value, EnvVarValidationError)
+
+    # -- Weird / adversarial ------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars",
+        [
+            pytest.param({"K": "\n"}, id="value-only-newline"),
+            pytest.param({"K": "\x00"}, id="value-only-null"),
+            pytest.param({"K": "\nfoo"}, id="control-at-start"),
+            pytest.param({"K": "foo\n"}, id="control-at-end"),
+            pytest.param({"K": "fo\no"}, id="control-in-middle"),
+            pytest.param({"K": "\n\r\x07"}, id="multiple-control-chars"),
+        ],
+    )
+    async def test_adversarial_values_raise_env_var_validation_error(
+        self, vm, env_vars: dict[str, str]
+    ) -> None:
+        with pytest.raises(EnvVarValidationError):
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)

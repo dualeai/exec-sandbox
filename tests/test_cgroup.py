@@ -25,7 +25,10 @@ from exec_sandbox.cgroup import (
     TCG_TB_CACHE_SIZE_MB,
     ULIMIT_CPU_TIME_SECONDS,
     ULIMIT_MEMORY_MULTIPLIER,
+    detect_cgroup_cpu_limit,
+    detect_cgroup_memory_limit_mb,
     is_cgroup_available,
+    read_container_available_memory_mb,
     wrap_with_ulimit,
 )
 from exec_sandbox.platform_utils import HostOS
@@ -505,7 +508,7 @@ class TestSetupCgroup:
             mock_file.write = AsyncMock()
 
             with patch("aiofiles.open", return_value=mock_file):
-                result = await setup_cgroup("vm123", "tenant1", 256, use_tcg=False)
+                result = await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1, use_tcg=False)
 
                 assert result == Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/tenant1/vm123")
                 assert mock_makedirs.call_count == 2  # tenant + vm directories
@@ -526,11 +529,38 @@ class TestSetupCgroup:
             mock_file.write = AsyncMock(side_effect=capture_write)
 
             with patch("aiofiles.open", return_value=mock_file):
-                await setup_cgroup("vm123", "tenant1", 256, use_tcg=True)
+                await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1, use_tcg=True)
 
                 # Find memory.max value (in bytes)
                 expected_memory = (256 + CGROUP_MEMORY_OVERHEAD_MB + TCG_TB_CACHE_SIZE_MB) * 1024 * 1024
                 assert str(expected_memory) in written_values
+
+    @pytest.mark.parametrize(
+        ("cpu_cores", "expected_cpu_max"),
+        [
+            (1, "100000 100000"),
+            (2, "200000 100000"),
+            (4, "400000 100000"),
+        ],
+    )
+    async def test_setup_cpu_max_scales_with_cores(self, cpu_cores: int, expected_cpu_max: str):
+        """cpu.max quota scales proportionally with cpu_cores."""
+        from exec_sandbox.cgroup import setup_cgroup
+
+        written_values: list[str] = []
+
+        async def capture_write(value: str) -> None:
+            written_values.append(value)
+
+        with patch("aiofiles.os.makedirs", new_callable=AsyncMock):
+            mock_file = MagicMock()
+            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
+            mock_file.__aexit__ = AsyncMock(return_value=None)
+            mock_file.write = AsyncMock(side_effect=capture_write)
+
+            with patch("aiofiles.open", return_value=mock_file):
+                await setup_cgroup("vm123", "tenant1", 256, cpu_cores=cpu_cores)
+                assert expected_cpu_max in written_values
 
     # --- Error cases ---
     async def test_setup_read_only_filesystem_returns_fallback(self):
@@ -541,7 +571,7 @@ class TestSetupCgroup:
         error.errno = ERRNO_READ_ONLY_FILESYSTEM
 
         with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
-            result = await setup_cgroup("vm123", "tenant1", 256)
+            result = await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1)
 
             assert result == Path("/tmp/cgroup-vm123")
 
@@ -553,7 +583,7 @@ class TestSetupCgroup:
         error.errno = ERRNO_PERMISSION_DENIED
 
         with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
-            result = await setup_cgroup("vm123", "tenant1", 256)
+            result = await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1)
 
             assert result == Path("/tmp/cgroup-vm123")
 
@@ -567,7 +597,7 @@ class TestSetupCgroup:
 
         with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
             with pytest.raises(VmError, match="Failed to setup cgroup"):
-                await setup_cgroup("vm123", "tenant1", 256)
+                await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1)
 
 
 # =============================================================================
@@ -1000,6 +1030,94 @@ class TestCgroupConstants:
 
 
 # =============================================================================
+# detect_cgroup_memory_limit_mb - Tests
+# =============================================================================
+
+
+class TestDetectCgroupMemoryLimitMb:
+    """Test container cgroup memory limit detection."""
+
+    def test_v2_numeric_limit_returns_mb(self, tmp_path: Path):
+        """cgroup v2 numeric memory.max → returns MB."""
+        (tmp_path / "memory.max").write_text("4294967296")  # 4GB
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(4096.0)
+
+    def test_v2_max_string_returns_none(self, tmp_path: Path):
+        """cgroup v2 'max' (unlimited) → returns None."""
+        (tmp_path / "memory.max").write_text("max")
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path))
+        assert result is None
+
+    def test_v2_small_limit(self, tmp_path: Path):
+        """cgroup v2 small memory limit (1GB) returns correct MB."""
+        (tmp_path / "memory.max").write_text("1073741824")  # 1GB
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(1024.0)
+
+    def test_no_cgroup_returns_none(self, tmp_path: Path):
+        """No cgroup files → returns None (macOS, bare metal)."""
+        result = detect_cgroup_memory_limit_mb(cgroup_v2_base=str(tmp_path / "nonexistent"))
+        assert result is None
+
+
+class TestDetectCgroupCpuLimit:
+    """Test container cgroup CPU limit detection."""
+
+    def test_v2_quota_period_returns_cpus(self, tmp_path: Path):
+        """cgroup v2 cpu.max '200000 100000' → 2.0 CPUs."""
+        (tmp_path / "cpu.max").write_text("200000 100000")
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(2.0)
+
+    def test_v2_max_string_returns_none(self, tmp_path: Path):
+        """cgroup v2 'max 100000' (unlimited) → returns None."""
+        (tmp_path / "cpu.max").write_text("max 100000")
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path))
+        assert result is None
+
+    def test_v2_fractional_cpus(self, tmp_path: Path):
+        """cgroup v2 fractional CPU quota → correct float."""
+        (tmp_path / "cpu.max").write_text("50000 100000")  # 0.5 CPUs
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(0.5)
+
+    def test_no_cgroup_returns_none(self, tmp_path: Path):
+        """No cgroup files → returns None."""
+        result = detect_cgroup_cpu_limit(cgroup_v2_base=str(tmp_path / "nonexistent"))
+        assert result is None
+
+
+class TestReadContainerAvailableMemoryMb:
+    """Test container available memory reading."""
+
+    def test_v2_returns_available(self, tmp_path: Path):
+        """cgroup v2 memory.max - memory.current = available."""
+        (tmp_path / "memory.max").write_text("4294967296")  # 4GB
+        (tmp_path / "memory.current").write_text("1073741824")  # 1GB
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path))
+        assert result == pytest.approx(3072.0)  # 3GB
+
+    def test_v2_unlimited_returns_none(self, tmp_path: Path):
+        """cgroup v2 'max' → returns None."""
+        (tmp_path / "memory.max").write_text("max")
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path))
+        assert result is None
+
+    def test_v2_current_exceeds_max_returns_zero(self, tmp_path: Path):
+        """cgroup v2 current > max → returns 0 (not negative)."""
+        (tmp_path / "memory.max").write_text("1073741824")  # 1GB
+        (tmp_path / "memory.current").write_text("2147483648")  # 2GB (over limit)
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path))
+        assert result == 0.0
+
+    def test_no_cgroup_returns_none(self, tmp_path: Path):
+        """No cgroup files → returns None."""
+        result = read_container_available_memory_mb(cgroup_v2_base=str(tmp_path / "nonexistent"))
+        assert result is None
+
+
+# =============================================================================
 # Integration Tests (Real cgroups, Linux-only, requires sudo)
 # =============================================================================
 
@@ -1033,6 +1151,7 @@ class TestCgroupIntegration:
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
             memory_mb=256,
+            cpu_cores=1,
             use_tcg=False,
         )
 
@@ -1068,6 +1187,7 @@ class TestCgroupIntegration:
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
             memory_mb=256,
+            cpu_cores=1,
         )
 
         # Start a real process (sleep)
@@ -1111,6 +1231,7 @@ class TestCgroupIntegration:
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
             memory_mb=256,
+            cpu_cores=1,
         )
 
         # Start a process that does some work
@@ -1157,6 +1278,7 @@ class TestCgroupIntegration:
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
             memory_mb=256,
+            cpu_cores=1,
         )
 
         assert cgroup_path.exists(), "Cgroup should exist after setup"
@@ -1178,6 +1300,7 @@ class TestCgroupIntegration:
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
             memory_mb=256,
+            cpu_cores=1,
         )
 
         # Override pids.max to a very low value for testing

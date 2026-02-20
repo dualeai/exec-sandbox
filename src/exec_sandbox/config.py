@@ -13,7 +13,6 @@ Example:
 
     # Custom configuration
     config = SchedulerConfig(
-        max_concurrent_vms=5,
         default_memory_mb=512,
         s3_bucket="my-snapshots",
     )
@@ -28,20 +27,20 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from exec_sandbox import constants
+
 
 class SchedulerConfig(BaseModel):
     """Configuration for Scheduler.
 
     All fields have sensible defaults for local development.
-    Production deployments should tune max_concurrent_vms based on host resources.
+    Production deployments should tune resource overcommit ratios based on host resources.
 
     Attributes:
-        max_concurrent_vms: Maximum number of VMs that can run concurrently.
-            Each VM uses ~256-512MB memory. Default: 10.
         warm_pool_size: Number of pre-booted VMs per language (python, javascript).
             0 disables warm pool. Default: 0 (cold boot only).
         default_memory_mb: Default guest VM memory in MB. Can be overridden per-run.
-            Range: 128-2048. Default: 256.
+            Minimum: 128. No upper bound (limited by host resources). Default: 256.
         default_timeout_seconds: Default execution timeout in seconds.
             Can be overridden per-run. Range: 1-300. Default: 30.
         images_dir: Directory containing base VM images (qcow2, kernels).
@@ -68,11 +67,6 @@ class SchedulerConfig(BaseModel):
     )
 
     # VM pool
-    max_concurrent_vms: int = Field(
-        default=10,
-        ge=1,
-        description="Maximum concurrent VMs (each uses ~256-512MB memory)",
-    )
     warm_pool_size: int = Field(
         default=0,
         ge=0,
@@ -126,6 +120,32 @@ class SchedulerConfig(BaseModel):
         ge=1,
         le=16,
         description="Max concurrent background S3 uploads",
+    )
+
+    # Resource overcommit
+    memory_overcommit_ratio: float = Field(
+        default=constants.DEFAULT_MEMORY_OVERCOMMIT_RATIO,
+        ge=1.0,
+        le=10.0,
+        description="Memory overcommit ratio. Effective budget = host_total * (1 - reserve_ratio) * ratio",
+    )
+    cpu_overcommit_ratio: float = Field(
+        default=constants.DEFAULT_CPU_OVERCOMMIT_RATIO,
+        ge=1.0,
+        le=20.0,
+        description="CPU overcommit ratio. Effective budget = host_cpus * ratio",
+    )
+    host_memory_reserve_ratio: float = Field(
+        default=constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO,
+        ge=0.01,
+        le=0.5,
+        description="Fraction of host memory reserved for OS (e.g. 0.1 = 10%)",
+    )
+    resource_monitor_interval_seconds: float = Field(
+        default=constants.RESOURCE_MONITOR_INTERVAL_SECONDS,
+        ge=1.0,
+        le=60.0,
+        description="Interval between resource monitor ticks (seconds)",
     )
 
     # Features

@@ -25,6 +25,7 @@ OUTPUT_DIR="$REPO_ROOT/images/dist"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.2}"
 PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-build-standalone
 UV_VERSION="${UV_VERSION:-0.9.24}"  # From astral-sh/uv
+CLOUDPICKLE_VERSION="${CLOUDPICKLE_VERSION:-3.1.2}"  # From https://github.com/cloudpipe/cloudpickle/releases
 BUN_VERSION="${BUN_VERSION:-1.3.5}"
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
 
@@ -128,6 +129,7 @@ compute_qcow2_hash() {
                 echo "python=$PYTHON_VERSION"
                 echo "python_build=$PYTHON_BUILD_DATE"
                 echo "uv=$UV_VERSION"
+                echo "cloudpickle=$CLOUDPICKLE_VERSION"
                 echo "pkgs=$PYTHON_PKGS"
                 ;;
             node)
@@ -301,6 +303,22 @@ create_python_rootfs() {
     # Note: install_only_stripped doesn't include pip - use 'uv pip' instead
     ln -sf /opt/python/bin/python3 "$rootfs_dir/usr/local/bin/python3"
     ln -sf /opt/python/bin/python3 "$rootfs_dir/usr/local/bin/python"
+
+    # Pre-install cloudpickle for multiprocessing support in REPL
+    # cloudpickle serializes functions defined in exec() (lambdas, closures, dynamic functions)
+    # by extracting only referenced globals via bytecode analysis — the industry standard
+    # approach used by PySpark, Ray, Dask, and joblib/loky.
+    # Uses Docker because uv/python in rootfs are Linux binaries (can't run on macOS host).
+    # See: https://github.com/cloudpipe/cloudpickle
+    mkdir -p "$rootfs_dir/home/user/site-packages"
+    docker run --rm \
+        -v "$rootfs_dir:/rootfs" \
+        --platform "$docker_platform" \
+        "alpine:${ALPINE_VERSION}" \
+        /rootfs/usr/local/bin/uv pip install \
+            --python /rootfs/opt/python/bin/python3 \
+            --target /rootfs/home/user/site-packages \
+            "cloudpickle==$CLOUDPICKLE_VERSION"
 }
 
 # Create rootfs with Node/bun runtime using Docker
@@ -403,6 +421,14 @@ build_qcow2() {
     mkdir -p "$rootfs_dir/tmp" "$rootfs_dir/home/user"
     chmod 1777 "$rootfs_dir/tmp"
 
+    # Create sandbox user (UID 1000) for REPL execution
+    # Guest-agent runs as root (PID 1), but REPL subprocess drops to this user.
+    # This blocks mount(2), ptrace, module loading, etc. without needing seccomp.
+    # Note: passwd/group are text files (no permission issues on macOS), but chown
+    # to UID 1000 requires root — so it's done inside Docker below.
+    echo "user:x:1000:1000:sandbox:/home/user:/sbin/nologin" >> "$rootfs_dir/etc/passwd"
+    echo "user:x:1000:" >> "$rootfs_dir/etc/group"
+
     # Create qcow2 using Docker (virt-make-fs requires Linux)
     echo "  Creating qcow2..."
     mkdir -p "$OUTPUT_DIR"
@@ -453,6 +479,7 @@ DOCKERFILE
         --platform "$host_platform" \
         "$guestfs_image" \
         bash -c "
+            chown -R 1000:1000 /build/rootfs/home/user
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
             qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
         "

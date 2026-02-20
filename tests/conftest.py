@@ -134,7 +134,6 @@ def vm_settings(images_dir: Path):
     return Settings(
         base_images_dir=images_dir,
         kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-        max_concurrent_vms=4,
     )
 
 
@@ -157,7 +156,6 @@ def emulation_settings(images_dir: Path):
     return Settings(
         base_images_dir=images_dir,
         kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-        max_concurrent_vms=4,
         force_emulation=True,
     )
 
@@ -184,7 +182,6 @@ def unit_test_settings():
     return Settings(
         base_images_dir=Path("/nonexistent"),
         kernel_path=Path("/nonexistent"),
-        max_concurrent_vms=4,
     )
 
 
@@ -217,7 +214,6 @@ def make_vm_settings(images_dir: Path):
         defaults: dict[str, Any] = {
             "base_images_dir": images_dir,
             "kernel_path": images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-            "max_concurrent_vms": 4,
         }
         defaults.update(overrides)
         return Settings(**defaults)

@@ -94,7 +94,7 @@ class OverlayPool:
     Base images are auto-discovered from images_path matching pattern *-base-*.qcow2.
 
     Usage:
-        async with OverlayPool(max_concurrent_vms=10, images_path=base_images_dir) as pool:
+        async with OverlayPool(pool_size=5, images_path=base_images_dir) as pool:
             # Always returns an overlay - fast if from pool, slow if created on-demand
             pool_hit = await pool.acquire(base_image, target_path)
             # pool_hit indicates if it was from pool (for metrics), but overlay is ready
@@ -102,7 +102,7 @@ class OverlayPool:
 
     def __init__(
         self,
-        max_concurrent_vms: int,
+        pool_size: int = 0,
         *,
         images_path: Path | None = None,
         pool_dir: Path | None = None,
@@ -110,12 +110,12 @@ class OverlayPool:
         """Initialize overlay pool.
 
         Args:
-            max_concurrent_vms: Maximum concurrent VMs (pool size derived as 50% of this)
+            pool_size: Number of pre-created overlays per base image (0 = on-demand only)
             images_path: Directory containing base images (for auto-discovery)
             pool_dir: Optional pool directory (default: tempdir/exec-sandbox-overlay-pool)
         """
         self._pool_dir = pool_dir or Path(tempfile.gettempdir()) / "exec-sandbox-overlay-pool"
-        self._pool_size = int(max_concurrent_vms * constants.OVERLAY_POOL_SIZE_RATIO)
+        self._pool_size = pool_size
         self._images_path = images_path
         self._pools: dict[str, asyncio.Queue[Path]] = {}  # base_image_path -> queue
         self._replenish_tasks: set[asyncio.Task[None]] = set()
@@ -130,6 +130,13 @@ class OverlayPool:
     def pool_size(self) -> int:
         """Get configured pool size per base image."""
         return self._pool_size
+
+    @pool_size.setter
+    def pool_size(self, value: int) -> None:
+        """Set pool size. Must be called before start()."""
+        if self._started:
+            raise RuntimeError("Cannot change pool_size after start()")
+        self._pool_size = value
 
     @property
     def daemon_enabled(self) -> bool:

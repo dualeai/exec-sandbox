@@ -1,6 +1,6 @@
 # exec-sandbox
 
-Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 7-layer security isolation.
+Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 8-layer security isolation.
 
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
@@ -81,8 +81,6 @@ sbx run 'print(1)' 'print(2)' script.py
 # Multiple inline codes
 sbx run -c 'print(1)' -c 'print(2)'
 
-# Limit concurrency
-sbx run -j 5 *.py
 ```
 
 **CLI Options:**
@@ -103,7 +101,6 @@ sbx run -j 5 *.py
 | `--no-validation` | | Skip package allowlist validation | false |
 | `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
 | `--download` | | Download file `GUEST:LOCAL` or `GUEST` (repeatable) | - |
-| `--concurrency` | `-j` | Max concurrent VMs for multi-input | 10 |
 
 ### Python API
 
@@ -140,12 +137,12 @@ async with Scheduler() as scheduler:
 Sessions support all three languages:
 
 ```python
-# JavaScript — variables and functions persist
+# JavaScript/TypeScript — variables and functions persist
 async with await scheduler.session(language="javascript") as session:
-    await session.exec("const greet = (name) => `Hello, ${name}!`")
+    await session.exec("const greet = (name: string): string => `Hello, ${name}!`")
     result = await session.exec("console.log(greet('World'))")
 
-# Shell — env vars, cwd, and functions persist
+# Shell (Bash) — env vars, cwd, and functions persist
 async with await scheduler.session(language="raw") as session:
     await session.exec("cd /tmp && export MY_VAR=hello")
     result = await session.exec("echo $MY_VAR from $(pwd)")
@@ -174,7 +171,7 @@ async with Scheduler() as scheduler:
         await session.exec("open('output.csv', 'w').write(data)")
 
         # Read a file back from the sandbox
-        content = await session.read_file("output.csv")
+        await session.read_file("output.csv", destination=Path("./output.csv"))
 
         # List files in a directory
         files = await session.list_files("")  # sandbox root
@@ -270,7 +267,6 @@ async with Scheduler() as scheduler:
 from exec_sandbox import Scheduler, SchedulerConfig
 
 config = SchedulerConfig(
-    max_concurrent_vms=20,       # Limit parallel executions
     warm_pool_size=1,            # Pre-started VMs per language (0 disables)
     default_memory_mb=512,       # Per-VM memory
     default_timeout_seconds=60,  # Execution timeout
@@ -360,7 +356,6 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_concurrent_vms` | 10 | Maximum parallel VMs |
 | `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript). Set >0 to enable |
 | `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
@@ -440,19 +435,19 @@ async with await scheduler.session(language="python") as session:
 
 # Pre-started VMs (warm pool) only work without packages
 config = SchedulerConfig(warm_pool_size=1)
-await scheduler.run(code="...", packages=["pandas"])  # Bypasses warm pool, fresh start (400ms)
+await scheduler.run(code="...", packages=["pandas==2.2.0"])  # Bypasses warm pool, fresh start (400ms)
 await scheduler.run(code="...")                        # Uses warm pool (1-2ms)
 
-# Pin package versions for caching
-packages=["pandas==2.2.0"]  # Cacheable
-packages=["pandas"]         # Cache miss every time
+# Version specifiers are required (security + caching)
+packages=["pandas==2.2.0"]  # Valid, cacheable
+packages=["pandas"]         # PackageNotAllowedError! Must pin version
 
 # Streaming callbacks must be fast (blocks async execution)
 on_stdout=lambda chunk: time.sleep(1)        # Blocks!
 on_stdout=lambda chunk: buffer.append(chunk)  # Fast
 
-# Memory overhead: pre-started VMs use (max_concurrent_vms × 25%) × 2 languages × 256MB
-# max_concurrent_vms=20 → 5 VMs/lang × 2 × 256MB = 2.5GB for warm pool alone
+# Memory overhead: pre-started VMs use warm_pool_size × 2 languages × 256MB
+# warm_pool_size=5 → 5 VMs/lang × 2 × 256MB = 2.5GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
 default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
@@ -465,6 +460,11 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 # Port forwarding binds to localhost only
 expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 # If you need external access, use a reverse proxy on the host
+
+# multiprocessing.Pool works, but single vCPU means no CPU-bound speedup
+from multiprocessing import Pool
+Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda serialization)
+# For CPU-bound parallelism, use multiple VMs via scheduler.run() concurrently instead
 ```
 
 ## Limits
@@ -480,8 +480,8 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 | Max file size (I/O) | 50MB |
 | Max file path length | 255 chars |
 | Execution timeout | 1-300s |
-| VM memory | 128-2048MB |
-| Max concurrent VMs | 1-100 |
+| VM memory | 128MB minimum (no upper bound) |
+| Max concurrent VMs | Resource-aware (auto-computed from host memory + CPU) |
 
 ## Security Architecture
 
@@ -489,11 +489,12 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 |-------|------------|------------|
 | 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
 | 2 | Unprivileged QEMU | No root privileges, minimal exposure |
-| 3 | System call filtering (seccomp) | Blocks unauthorized OS calls |
-| 4 | Resource limits (cgroups v2) | Memory, CPU, process limits |
-| 5 | Process isolation (namespaces) | Separate process, network, filesystem views |
-| 6 | Security policies (AppArmor/SELinux) | When available |
-| 7 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
+| 3 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
+| 4 | System call filtering (seccomp) | Blocks unauthorized OS calls |
+| 5 | Resource limits (cgroups v2) | Memory, CPU, process limits |
+| 6 | Process isolation (namespaces) | Separate process, network, filesystem views |
+| 7 | Security policies (AppArmor/SELinux) | When available |
+| 8 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
 
 **Guarantees:**
 
@@ -552,7 +553,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 |-------|---------|-----------------|------|-------------|
 | `python-3.14-base` | Python 3.14 | uv | ~140MB | Full Python environment with C extension support |
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
-| `raw-base` | None | None | ~15MB | Shell scripts and custom runtimes |
+| `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
 All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and include common tools for AI agent workflows.
 
@@ -575,10 +576,12 @@ All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and in
 | Python | 3.14 | [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (musl) |
 | uv | 0.9+ | 10-100x faster than pip ([docs](https://docs.astral.sh/uv/)) |
 | gcc, musl-dev | Alpine | For C extensions (numpy, pandas, etc.) |
+| cloudpickle | 3.1 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
 
 **Usage notes:**
 - Use `uv pip install` instead of `pip install` (pip not included)
 - Python 3.14 includes t-strings, deferred annotations, free-threading support
+- `multiprocessing.Pool` works out of the box — cloudpickle handles serialization of REPL-defined functions, lambdas, and closures. Single vCPU means no CPU-bound speedup, but I/O-bound parallelism and `Pool`-based APIs work correctly
 
 ### JavaScript Image
 
@@ -595,7 +598,7 @@ All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and in
 ### Raw Image
 
 Minimal Alpine Linux with common tools only. Use for:
-- Shell script execution (`language="raw"`)
+- Shell script execution (`language="raw"`) — runs under **GNU Bash**, full bash syntax supported
 - Custom runtime installation
 - Lightweight workloads
 

@@ -1656,48 +1656,6 @@ class TestCliMultiInput:
             assert result.exit_code == 0
             assert mock_scheduler.run.call_count == 2
 
-    def test_concurrency_flag(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Uses -j flag to limit concurrency."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.return_value = mock_result
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
-
-            result = runner.invoke(run_command, ["-j", "5", "print(1)", "print(2)"])
-
-            assert result.exit_code == 0
-            # Check that config was created with limited concurrency
-            config = scheduler_cls.call_args[0][0]
-            assert config.max_concurrent_vms <= 5
-
-    def test_concurrency_default(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Uses default concurrency."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.return_value = mock_result
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
-
-            result = runner.invoke(run_command, ["print(1)", "print(2)"])
-
-            assert result.exit_code == 0
-            config = scheduler_cls.call_args[0][0]
-            # min(2 sources, DEFAULT_CONCURRENCY)
-            assert config.max_concurrent_vms == 2
-
-    def test_concurrency_bounds(self, runner: CliRunner) -> None:
-        """Concurrency is bounded between 1 and MAX_CONCURRENCY."""
-        # Test invalid low value
-        result = runner.invoke(run_command, ["-j", "0", "print(1)"])
-        assert result.exit_code == EXIT_CLI_ERROR
-
-        # Test invalid high value
-        result = runner.invoke(run_command, ["-j", "200", "print(1)"])
-        assert result.exit_code == EXIT_CLI_ERROR
-
     def test_json_output_multi(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """JSON output for multiple sources is an array."""
         import json
@@ -1736,9 +1694,6 @@ class TestCliMultiInput:
             result = runner.invoke(run_command, ["print('hello')"])
 
             assert result.exit_code == 0
-            # Single source: config should have max_concurrent_vms=1
-            config = scheduler_cls.call_args[0][0]
-            assert config.max_concurrent_vms == 1
 
 
 class TestCliMultiInputLanguageDetection:

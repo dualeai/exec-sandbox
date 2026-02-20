@@ -82,6 +82,47 @@ def _make_session(
 
 
 # ============================================================================
+# exec() — timeout_seconds validation
+# ============================================================================
+
+
+class TestExecTimeoutValidation:
+    """Tests for timeout_seconds validation in Session.exec()."""
+
+    async def test_timeout_zero_rejected(self) -> None:
+        """timeout_seconds=0 raises ValueError."""
+        session, _, _ = _make_session()
+        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+            await session.exec("print(1)", timeout_seconds=0)
+
+    async def test_timeout_negative_rejected(self) -> None:
+        """Negative timeout_seconds raises ValueError."""
+        session, _, _ = _make_session()
+        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+            await session.exec("print(1)", timeout_seconds=-1)
+
+    async def test_timeout_exceeds_max_rejected(self) -> None:
+        """timeout_seconds > 300 raises ValueError."""
+        session, _, _ = _make_session()
+        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+            await session.exec("print(1)", timeout_seconds=301)
+
+    async def test_timeout_none_uses_default(self) -> None:
+        """timeout_seconds=None uses the default from constructor."""
+        session, mock_vm, _ = _make_session(default_timeout_seconds=42)
+        await session.exec("print(1)")
+        mock_vm.execute.assert_called_once()
+        assert mock_vm.execute.call_args.kwargs["timeout_seconds"] == 42
+
+    async def test_timeout_explicit_value_used(self) -> None:
+        """Explicit timeout_seconds is passed through."""
+        session, mock_vm, _ = _make_session(default_timeout_seconds=42)
+        await session.exec("print(1)", timeout_seconds=10)
+        mock_vm.execute.assert_called_once()
+        assert mock_vm.execute.call_args.kwargs["timeout_seconds"] == 10
+
+
+# ============================================================================
 # _guard() — Normal cases
 # ============================================================================
 

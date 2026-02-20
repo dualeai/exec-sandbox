@@ -22,7 +22,6 @@ class TestSchedulerConfigValidation:
     def test_defaults(self) -> None:
         """SchedulerConfig has sensible defaults."""
         config = SchedulerConfig()
-        assert config.max_concurrent_vms == 10
         assert config.warm_pool_size == 0
         assert config.default_memory_mb == 256
         assert config.default_timeout_seconds == 30
@@ -32,20 +31,6 @@ class TestSchedulerConfigValidation:
         assert config.s3_region == "us-east-1"
         assert config.s3_prefix == "snapshots/"
         assert config.enable_package_validation is True
-
-    def test_max_concurrent_vms_range(self) -> None:
-        """max_concurrent_vms must be >= 1."""
-        # Valid: min
-        config = SchedulerConfig(max_concurrent_vms=1)
-        assert config.max_concurrent_vms == 1
-
-        # Valid: large value (no upper bound)
-        config = SchedulerConfig(max_concurrent_vms=1000)
-        assert config.max_concurrent_vms == 1000
-
-        # Invalid: 0
-        with pytest.raises(ValidationError):
-            SchedulerConfig(max_concurrent_vms=0)
 
     def test_warm_pool_size_range(self) -> None:
         """warm_pool_size must be >= 0."""
@@ -92,12 +77,6 @@ class TestSchedulerConfigValidation:
         # Invalid: > 300
         with pytest.raises(ValidationError):
             SchedulerConfig(default_timeout_seconds=301)
-
-    def test_immutable(self) -> None:
-        """SchedulerConfig is frozen (immutable)."""
-        config = SchedulerConfig()
-        with pytest.raises(ValidationError):
-            config.max_concurrent_vms = 20  # type: ignore[misc]
 
     def test_extra_fields_forbidden(self) -> None:
         """SchedulerConfig rejects unknown fields."""

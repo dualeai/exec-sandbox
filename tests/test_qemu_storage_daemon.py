@@ -248,7 +248,7 @@ class TestOverlayPoolWithDaemon:
         vm_manager = VmManager(vm_settings)
         base_image = vm_manager.get_base_image("python")
 
-        pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
+        pool = OverlayPool(pool_size=2, pool_dir=tmp_path / "pool")
         await pool.start([base_image])
 
         try:
@@ -271,7 +271,7 @@ class TestOverlayPoolWithDaemon:
         vm_manager = VmManager(vm_settings)
         base_image = vm_manager.get_base_image("python")
 
-        pool = OverlayPool(max_concurrent_vms=4, pool_dir=tmp_path / "pool")
+        pool = OverlayPool(pool_size=2, pool_dir=tmp_path / "pool")
         await pool.start([base_image])
 
         assert pool.daemon_enabled is True

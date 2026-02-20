@@ -39,6 +39,7 @@ from tenacity import (
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.exceptions import (
     VmBootTimeoutError,
     VmConfigError,
@@ -151,11 +152,19 @@ class VmManager:
 
         self._vms: dict[str, QemuVM] = {}  # vm_id -> VM object
         self._vms_lock = asyncio.Lock()  # Protect registry access
-        self._semaphore = asyncio.Semaphore(settings.max_concurrent_vms)  # Backpressure
+        self._admission = ResourceAdmissionController(
+            memory_overcommit_ratio=settings.memory_overcommit_ratio,
+            cpu_overcommit_ratio=settings.cpu_overcommit_ratio,
+            host_memory_reserve_ratio=settings.host_memory_reserve_ratio,
+            host_memory_mb=settings.host_memory_mb,
+            host_cpu_count=settings.host_cpu_count,
+            available_memory_floor_mb=settings.available_memory_floor_mb,
+        )
 
         # Overlay pool for fast VM boot (auto-manages base image discovery and pooling)
+        # pool_size=0 initially; computed from admission budget in start()
         self._overlay_pool = OverlayPool(
-            max_concurrent_vms=settings.max_concurrent_vms,
+            pool_size=0,
             images_path=settings.base_images_dir,
         )
 
@@ -170,6 +179,12 @@ class VmManager:
         """
         if self._initialized:
             return
+
+        # Probe host resources for admission control (psutil)
+        await self._admission.start()
+
+        # Compute overlay pool size from admission budget (after probing host resources)
+        self._overlay_pool.pool_size = self._compute_overlay_pool_size()
 
         # Run all async probes concurrently (they cache their results at module level)
         # This prevents cache stampede when multiple VMs start concurrently
@@ -195,7 +210,7 @@ class VmManager:
         logger.info(
             "VM registry initialized",
             extra={
-                "max_concurrent_vms": self.settings.max_concurrent_vms,
+                "overlay_pool_size": self._overlay_pool.pool_size,
                 "accel_type": accel_type.value,
                 "io_uring_available": io_uring_available,
                 "unshare_available": unshare_available,
@@ -203,6 +218,11 @@ class VmManager:
                 "note": "All system probes pre-warmed (stampede prevention)",
             },
         )
+
+    @property
+    def admission(self) -> ResourceAdmissionController:
+        """Access the resource admission controller (for ResourceMonitor)."""
+        return self._admission
 
     def get_active_vms(self) -> dict[str, QemuVM]:
         """Get snapshot of active VMs (for debugging/metrics).
@@ -213,10 +233,11 @@ class VmManager:
         return dict(self._vms)
 
     async def stop(self) -> None:
-        """Stop VmManager and cleanup resources (overlay pool).
+        """Stop VmManager and cleanup resources (admission probe, overlay pool).
 
         Should be called when the VmManager is no longer needed.
         """
+        await self._admission.stop()
         await self._overlay_pool.stop()
 
     async def __aenter__(self) -> "VmManager":
@@ -253,7 +274,7 @@ class VmManager:
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
             backing_image: Base image for overlay (default: language base image)
-            memory_mb: Memory limit in MB (128-2048, default 512)
+            memory_mb: Memory limit in MB (minimum 128, default 256)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, write directly to this file (no overlay).
@@ -272,8 +293,18 @@ class VmManager:
         """
         from exec_sandbox.exceptions import VmTransientError  # noqa: PLC0415
 
-        # Acquire semaphore manually - hold until VM is destroyed (lifecycle-bound)
-        await self._semaphore.acquire()
+        # Detect acceleration type to calculate accurate memory overhead
+        accel_type = await self._detect_accel_type()
+        use_tcg = accel_type == AccelType.TCG
+
+        # Acquire resource reservation - blocks if insufficient resources
+        reservation = await self._admission.acquire(
+            vm_id=f"{tenant_id}-{task_id}",
+            memory_mb=memory_mb,
+            cpu_cores=constants.DEFAULT_VM_CPU_CORES,
+            timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
+            use_tcg=use_tcg,
+        )
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.VM_BOOT_MAX_RETRIES),
@@ -302,13 +333,15 @@ class VmManager:
                     vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
                     # Mark VM as holding semaphore slot (released in destroy_vm)
                     vm.holds_semaphore_slot = True
+                    # Store resource reservation on VM for release in destroy_vm
+                    vm.resource_reservation = reservation
                     return vm
 
             # Unreachable: AsyncRetrying either returns or raises
             raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
         except BaseException:
-            # Release semaphore on failure - VM was not created successfully
-            self._semaphore.release()
+            # Release reservation on failure - VM was not created successfully
+            await self._admission.release(reservation)
             raise
 
     async def _create_vm_impl(  # noqa: PLR0912, PLR0915
@@ -338,7 +371,7 @@ class VmManager:
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
             backing_image: Base image for overlay (default: language base image)
-            memory_mb: Memory limit in MB (128-2048, default 512)
+            memory_mb: Memory limit in MB (minimum 128, default 256)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, write directly to this file (no overlay).
@@ -443,7 +476,7 @@ class VmManager:
                 # Direct write mode - VM writes directly to target file (no overlay)
                 # Used for L2 snapshot creation where disk changes are written directly
                 workdir.use_qemu_vm_user = False  # target file owned by current user
-                cgroup_path = await cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg)
+                cgroup_path = await cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg)
             # Normal mode - create overlay backed by base image
             # This allows the backing image to remain read-only and shareable
             # Pool handles fast path (from pool) or slow path (on-demand) internally
@@ -457,7 +490,7 @@ class VmManager:
                 # Apply permissions in parallel with cgroup setup
                 perm_result, cgroup_result = await asyncio.gather(
                     self._apply_overlay_permissions(base_image, workdir.overlay_image),
-                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, use_tcg),
+                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg),
                     return_exceptions=True,
                 )
                 if isinstance(perm_result, BaseException):
@@ -479,6 +512,7 @@ class VmManager:
                 vm_id,
                 workdir,
                 memory_mb,
+                constants.DEFAULT_VM_CPU_CORES,
                 allow_network,
                 expose_ports=expose_ports,
             )
@@ -1001,10 +1035,12 @@ class VmManager:
             # ALWAYS remove from registry, even on failure
             async with self._vms_lock:
                 self._vms.pop(vm.vm_id, None)
-            # Release semaphore slot only if this VM held one (prevents double-release)
+            # Release resource reservation only if this VM held one (prevents double-release)
             if vm.holds_semaphore_slot:
                 vm.holds_semaphore_slot = False
-                self._semaphore.release()
+                if vm.resource_reservation is not None:
+                    await self._admission.release(vm.resource_reservation)
+                    vm.resource_reservation = None
 
     async def _capture_qemu_output(self, process: ProcessWrapper) -> tuple[str, str]:
         """Capture stdout/stderr from QEMU process.
@@ -1062,6 +1098,33 @@ class VmManager:
 
         # Return first match (sorted for determinism)
         return sorted(matches)[0]
+
+    def _compute_overlay_pool_size(self) -> int:
+        """Compute overlay pool size from admission controller budget.
+
+        Derives the effective max VMs from host resources (memory + CPU),
+        then applies OVERLAY_POOL_SIZE_RATIO to determine pool size.
+
+        Returns:
+            Pool size per base image
+        """
+        effective_max = self._admission.effective_max_vms(
+            guest_memory_mb=constants.DEFAULT_MEMORY_MB,
+            cpu_per_vm=constants.DEFAULT_VM_CPU_CORES,
+        )
+        if effective_max < 0:
+            logger.warning(
+                "Cannot compute overlay pool size from host resources (psutil probe failed), "
+                "using fallback",
+                extra={"fallback_pool_size": constants.OVERLAY_POOL_FALLBACK_SIZE},
+            )
+            return constants.OVERLAY_POOL_FALLBACK_SIZE
+        pool_size = max(0, int(effective_max * constants.OVERLAY_POOL_SIZE_RATIO))
+        logger.info(
+            "Overlay pool size computed from admission budget",
+            extra={"effective_max_vms": effective_max, "pool_size": pool_size},
+        )
+        return pool_size
 
     async def _detect_accel_type(self) -> AccelType:
         """Detect which QEMU accelerator to use.

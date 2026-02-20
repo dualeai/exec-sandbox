@@ -97,6 +97,23 @@ class TestSessionNormal:
             assert result.exit_code == 0
             assert "hi bob" in result.stdout
 
+    async def test_ts_typed_variable_persistence(self, scheduler: Scheduler) -> None:
+        """TypeScript typed variables persist across exec calls."""
+        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+            await session.exec("let x: number = 10;")
+            result = await session.exec("console.log(x + 1);")
+            assert result.exit_code == 0
+            assert "11" in result.stdout
+
+    async def test_ts_interface_reuse_across_execs(self, scheduler: Scheduler) -> None:
+        """TypeScript interface defined in one exec is usable in the next."""
+        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+            await session.exec("interface Item { name: string; qty: number }")
+            await session.exec("function describe(i: Item): string { return `${i.name}:${i.qty}`; }")
+            result = await session.exec('console.log(describe({ name: "apple", qty: 3 }));')
+            assert result.exit_code == 0
+            assert "apple:3" in result.stdout
+
     async def test_shell_env_var_persistence(self, scheduler: Scheduler) -> None:
         """Shell environment variables persist across exec calls."""
         async with await scheduler.session(language=Language.RAW) as session:
@@ -332,6 +349,54 @@ class TestSessionWeirdCases:
             result = await session.exec("echo ok")
             assert result.exit_code == 0
             assert "ok" in result.stdout
+
+    async def test_shell_bash_array(self, scheduler: Scheduler) -> None:
+        """Bash indexed arrays work (fails under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec('arr=(one two three); echo "${arr[1]}"')
+            assert result.exit_code == 0
+            assert "two" in result.stdout
+
+    async def test_shell_bash_associative_array(self, scheduler: Scheduler) -> None:
+        """Bash associative arrays work (fails under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec(
+                'declare -A map; map[key]="value"; echo "${map[key]}"'
+            )
+            assert result.exit_code == 0
+            assert "value" in result.stdout
+
+    async def test_shell_bash_trap(self, scheduler: Scheduler) -> None:
+        """Bash EXIT trap fires (silent failure under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec(
+                "(trap 'echo TRAP_FIRED' EXIT; echo body)"
+            )
+            assert result.exit_code == 0
+            assert "TRAP_FIRED" in result.stdout
+
+    async def test_shell_bash_process_substitution(self, scheduler: Scheduler) -> None:
+        """Bash process substitution works (syntax error under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec("cat <(echo hello)")
+            assert result.exit_code == 0
+            assert "hello" in result.stdout
+
+    async def test_shell_bash_regex(self, scheduler: Scheduler) -> None:
+        """Bash [[ =~ ]] regex matching works (syntax error under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec(
+                '[[ "2025-01-15" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && echo MATCH'
+            )
+            assert result.exit_code == 0
+            assert "MATCH" in result.stdout
+
+    async def test_shell_bash_here_string(self, scheduler: Scheduler) -> None:
+        """Bash here-strings work (syntax error under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec('read -r word <<< "hello world"; echo "$word"')
+            assert result.exit_code == 0
+            assert "hello" in result.stdout
 
     async def test_stderr_no_trailing_newline(self, scheduler: Scheduler) -> None:
         """Stderr without trailing newline doesn't prevent sentinel detection.

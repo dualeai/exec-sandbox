@@ -24,35 +24,15 @@ from .conftest import skip_unless_hwaccel
 class TestWarmVMPoolConfig:
     """Tests for WarmVMPool configuration."""
 
-    def test_pool_size_calculation(self) -> None:
-        """Pool size is 25% of max_concurrent_vms when warm_pool_size=0."""
-        # The calculation: max(1, int(max_concurrent_vms * 0.25))
-
-        # max_concurrent_vms=10 → pool_size=2
-        expected = max(1, int(10 * constants.WARM_POOL_SIZE_RATIO))
-        assert expected == 2
-
-        # max_concurrent_vms=100 → pool_size=25
-        expected = max(1, int(100 * constants.WARM_POOL_SIZE_RATIO))
-        assert expected == 25
-
-        # max_concurrent_vms=1 → pool_size=1 (minimum)
-        expected = max(1, int(1 * constants.WARM_POOL_SIZE_RATIO))
-        assert expected == 1
-
-    def test_explicit_warm_pool_size_overrides_ratio(self, unit_test_vm_manager) -> None:
-        """When warm_pool_size > 0, it overrides the 25% ratio calculation."""
+    def test_explicit_warm_pool_size(self, unit_test_vm_manager) -> None:
+        """When warm_pool_size > 0, it directly sets pool size."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        # With warm_pool_size=5 and max_concurrent_vms=100,
-        # pool should be 5, not 25 (100 * 0.25)
-        config = SchedulerConfig(warm_pool_size=5, max_concurrent_vms=100)
+        config = SchedulerConfig(warm_pool_size=5)
         pool = WarmVMPool(unit_test_vm_manager, config)
         assert pool.pool_size_per_language == 5
 
-        # With warm_pool_size=50 and max_concurrent_vms=10,
-        # pool should be 50, not 2 (10 * 0.25)
-        config = SchedulerConfig(warm_pool_size=50, max_concurrent_vms=200)
+        config = SchedulerConfig(warm_pool_size=50)
         pool = WarmVMPool(unit_test_vm_manager, config)
         assert pool.pool_size_per_language == 50
 
@@ -90,7 +70,7 @@ class TestDrainPoolForCheck:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         # Create pool with minimal config (no VMs booted)
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Pool is empty (no startup called)
@@ -106,7 +86,7 @@ class TestDrainPoolForCheck:
         """Drain only removes up to pool_size items."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Manually add items to test drain logic
@@ -131,7 +111,7 @@ class TestDrainPoolForCheck:
         """Drain handles request for more items than queue contains."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         test_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
@@ -154,7 +134,7 @@ class TestDrainPoolForCheck:
         """Drain exactly the number of items in queue (boundary)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         test_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=10)
@@ -186,7 +166,7 @@ class TestHealthCheckPoolUnit:
         """Health check on empty pool returns immediately without error."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Pool is empty (no startup called)
@@ -213,7 +193,7 @@ class TestWarmVMPoolIntegration:
         """Pool starts and stops cleanly."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -231,7 +211,7 @@ class TestWarmVMPoolIntegration:
         """Get VM from warm pool."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -253,7 +233,7 @@ class TestWarmVMPoolIntegration:
         """Get VM with packages returns None (not eligible for warm pool)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -280,7 +260,7 @@ class TestHealthcheckIntegration:
         """_check_vm_health returns True for healthy VM."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -303,7 +283,7 @@ class TestHealthcheckIntegration:
         """_health_check_pool keeps healthy VMs in pool."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -333,7 +313,7 @@ class TestHealthcheckIntegration:
         """VMs drained for health check are restored to pool."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -373,7 +353,7 @@ class TestHealthcheckIntegration:
         """Health check loop exits cleanly when stop is signaled."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -402,7 +382,7 @@ class TestHealthcheckIntegration:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -460,7 +440,7 @@ class TestHealthcheckIntegration:
             allowed_domains=None,
         )
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         try:
@@ -515,7 +495,7 @@ class TestHealthcheckIntegration:
             allowed_domains=None,
         )
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
         python_pool = pool.pools[Language.PYTHON]
 
@@ -564,7 +544,7 @@ class TestHealthcheckIntegration:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -631,7 +611,7 @@ class TestHealthcheckIntegration:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -670,7 +650,7 @@ class TestHealthcheckIntegration:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -703,7 +683,7 @@ class TestHealthcheckIntegration:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
 
         await pool.start()
@@ -750,7 +730,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Tracking variables
@@ -805,7 +785,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)  # pool_size = 1
+        config = SchedulerConfig(warm_pool_size=1)  # pool_size = 1
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         boot_count = 0
@@ -833,7 +813,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         py_started = asyncio.Event()
@@ -869,7 +849,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         call_count = 0
@@ -904,7 +884,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         boot_started = asyncio.Event()
@@ -939,7 +919,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4, warm_pool_size=1)
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         created_vm = AsyncMock()
@@ -983,7 +963,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)  # pool_size = 1
+        config = SchedulerConfig(warm_pool_size=1)  # pool_size = 1
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         # Pool starts empty
@@ -1009,8 +989,8 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        # max_concurrent_vms=20 → pool_size = max(1, int(20 * 0.25)) = 5
-        config = SchedulerConfig(max_concurrent_vms=20)
+        # warm_pool_size=5
+        config = SchedulerConfig(warm_pool_size=5)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         assert pool.pool_size_per_language == 5
@@ -1040,8 +1020,8 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        # max_concurrent_vms=1 → pool_size = max(1, int(1 * 0.25)) = max(1, 0) = 1
-        config = SchedulerConfig(max_concurrent_vms=1)
+        # warm_pool_size=1
+        config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         assert pool.pool_size_per_language == 1
@@ -1075,9 +1055,9 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        # max_concurrent_vms=8 → pool_size = max(1, int(8 * 0.25)) = 2
+        # warm_pool_size=2
         # replenish_max_concurrent = max(1, int(2 * 0.5)) = 1
-        config = SchedulerConfig(max_concurrent_vms=8)
+        config = SchedulerConfig(warm_pool_size=2)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         assert pool.pool_size_per_language == 2
@@ -1130,9 +1110,9 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        # max_concurrent_vms=20 → pool_size = max(1, int(20 * 0.25)) = 5
+        # warm_pool_size=5
         # replenish_max_concurrent = max(1, int(5 * 0.5)) = 2
-        config = SchedulerConfig(max_concurrent_vms=20)
+        config = SchedulerConfig(warm_pool_size=5)
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         assert pool.pool_size_per_language == 5
@@ -1192,7 +1172,7 @@ class TestReplenishRaceCondition:
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
-        config = SchedulerConfig(max_concurrent_vms=4)  # pool_size = 1
+        config = SchedulerConfig(warm_pool_size=1)  # pool_size = 1
         pool = WarmVMPool(unit_test_vm_manager, config)
 
         boot_count = 0

@@ -176,9 +176,63 @@ static BLOCKED_ENV_VARS: &[&str] = &[
 /// Uses sys.stdin.buffer (binary mode) to read exact byte counts.
 /// Text-mode sys.stdin.read(n) reads n *characters*, which differs from n bytes
 /// for multi-byte UTF-8 (e.g., "café" = 5 chars but 6 bytes), causing deadlocks.
-const PYTHON_REPL_WRAPPER: &str = r#"import sys, traceback
+const PYTHON_REPL_WRAPPER: &str = r#"import sys
+import traceback
+
 sys.argv = ['-c']
-ns = {"__name__": "__main__", "__builtins__": __builtins__}
+
+# Use __main__.__dict__ as exec namespace so functions have correct __globals__.
+# This lets pickle serialize exec()'d functions by qualified name, and cloudpickle
+# recognize __main__.__dict__ for minimal globals extraction.
+import __main__
+
+ns = __main__.__dict__
+ns["__builtins__"] = __builtins__
+
+# Force fork start method — Python 3.14 defaults to forkserver, which hangs in the
+# single-process VM environment. fork is safe here (single-threaded, Linux).
+import multiprocessing
+multiprocessing.set_start_method("fork")
+
+# Patch multiprocessing to use cloudpickle for serialization.
+# cloudpickle extracts only referenced globals via bytecode analysis (never the entire
+# __globals__ dict), so it handles exec()'d functions, lambdas, and closures safely.
+# This is the industry standard approach (PySpark, Ray, Dask, joblib/loky).
+# See: https://github.com/cloudpipe/cloudpickle
+import cloudpickle
+import copyreg
+import io
+import multiprocessing.reduction as _reduction
+
+
+class _CloudForkingPickler(cloudpickle.Pickler):
+    _extra_reducers = {}
+    _copyreg_dispatch_table = copyreg.dispatch_table
+
+    def __init__(self, *args, **kwds):
+        super().__init__(*args, **kwds)
+        self.dispatch_table = self._copyreg_dispatch_table.copy()
+        self.dispatch_table.update(self._extra_reducers)
+
+    @classmethod
+    def register(cls, type, reduce):
+        cls._extra_reducers[type] = reduce
+
+    @classmethod
+    def dumps(cls, obj, protocol=None):
+        buf = io.BytesIO()
+        cls(buf, protocol).dump(obj)
+        return buf.getbuffer()
+
+    loads = staticmethod(cloudpickle.loads)
+
+
+def _cloud_dump(obj, file, protocol=None):
+    _CloudForkingPickler(file, protocol).dump(obj)
+
+_reduction.ForkingPickler = _CloudForkingPickler
+_reduction.dump = _cloud_dump
+
 while True:
     header = sys.stdin.buffer.readline()
     if not header:
@@ -210,7 +264,11 @@ while True:
 /// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
 const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
-const transpiler = new Bun.Transpiler({ loader: 'js', replMode: true });
+// Use 'ts' loader to accept both JavaScript and TypeScript syntax (TS is a
+// superset of JS). We avoid 'tsx' because Bun's TSX parser has open bugs with
+// generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
+// angle-bracket type assertions are ambiguous with JSX.
+const transpiler = new Bun.Transpiler({ loader: 'ts', replMode: true });
 const ctx = createContext({
     Bun,
     console, process, setTimeout, setInterval, clearTimeout, clearInterval,
@@ -356,6 +414,7 @@ async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Er
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally:
 ///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages
 ///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules
+///   - Raw: GNU Bash (not busybox ash) for arrays, traps, [[ ]], etc.
 async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
     write_repl_wrapper(language).await?;
 
@@ -363,7 +422,13 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         "python" => {
             let mut c = Command::new("python3");
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
+            // Package resolution for user-installed packages
+            // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONPATH
             c.env("PYTHONPATH", format!("{SANDBOX_ROOT}/site-packages"));
+            // Disable the 4300-digit limit for int<->str conversions (CVE-2020-10735).
+            // Safe here: execution timeout (300s) and output caps (1MB) already bound resource usage.
+            // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONINTMAXSTRDIGITS
+            c.env("PYTHONINTMAXSTRDIGITS", "0");
             c
         }
         "javascript" => {
@@ -372,7 +437,13 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             c
         }
         "raw" => {
-            let mut c = Command::new("sh");
+            // Use bash instead of /bin/sh (busybox ash on Alpine). Ash silently
+            // breaks common shell patterns: arrays, process substitution, [[ ]],
+            // here-strings, traps. Bash is installed in all VM images (COMMON_PKGS).
+            // --norc/--noprofile: skip startup files (defense-in-depth; BASH_ENV
+            // and PROMPT_COMMAND are already in the env var blocklist).
+            let mut c = Command::new("bash");
+            c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
             c
         }
@@ -383,7 +454,12 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .current_dir(SANDBOX_ROOT)
-        .process_group(0);
+        .process_group(0)
+        // Drop to non-root: guest-agent stays root (PID 1, needs it for
+        // package install, file I/O, module loading), but the REPL subprocess
+        // runs as UID 1000. This blocks mount(2), ptrace, raw sockets, etc.
+        .uid(1000)
+        .gid(1000);
 
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().unwrap();
