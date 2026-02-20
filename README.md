@@ -174,7 +174,7 @@ async with Scheduler() as scheduler:
         await session.exec("open('output.csv', 'w').write(data)")
 
         # Read a file back from the sandbox
-        content = await session.read_file("output.csv")
+        await session.read_file("output.csv", destination=Path("./output.csv"))
 
         # List files in a directory
         files = await session.list_files("")  # sandbox root
