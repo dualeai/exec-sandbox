@@ -383,7 +383,7 @@ VMs include automatic memory optimization (no configuration required):
 |-------|------|-------------|
 | `stdout` | str | Captured output (max 1MB) |
 | `stderr` | str | Captured errors (max 100KB) |
-| `exit_code` | int | Process exit code (0 = success) |
+| `exit_code` | int | Process exit code (0 = success, 128+N = killed by signal N) |
 | `execution_time_ms` | int | Duration reported by VM |
 | `external_cpu_time_ms` | int | CPU time measured by host |
 | `external_memory_peak_mb` | int | Peak memory measured by host |
@@ -393,6 +393,21 @@ VMs include automatic memory optimization (no configuration required):
 | `timing.total_ms` | int | End-to-end time |
 | `warm_pool_hit` | bool | Whether a pre-started VM was used |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
+
+Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = internal error (could not retrieve status), other non-zero = program error.
+
+```python
+result = await scheduler.run(code="...", language="python")
+
+if result.exit_code == 0:
+    pass  # Success
+elif result.exit_code > 128:
+    signal_num = result.exit_code - 128  # e.g., 9 for SIGKILL
+elif result.exit_code == -1:
+    pass  # Internal error (see result.stderr)
+else:
+    pass  # Program exited with error
+```
 
 ## FileInfo
 

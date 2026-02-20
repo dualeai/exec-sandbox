@@ -320,6 +320,28 @@ time.sleep(60)
 
         # Verify SIGTERM was sent (not SIGKILL)
         assert "RECEIVED_SIGTERM" in result.stdout
+        # Process caught SIGTERM and called sys.exit(42) — normal exit, not a signal kill
+        assert result.exit_code == 42
+
+    async def test_signal_kill_returns_128_plus_signal(self, scheduler: Scheduler) -> None:
+        """Process killed by uncaught signal returns 128+signal_number.
+
+        Normal case: SIGSEGV (signal 11) kills the REPL process.
+        The guest-agent should report exit_code=128+11=139 per Unix convention.
+        """
+        code = """
+import os
+import signal
+os.kill(os.getpid(), signal.SIGSEGV)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=10,
+        )
+
+        # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
+        assert result.exit_code == 139
 
     @skip_unless_hwaccel
     async def test_normal_exit_no_termination_needed(self, scheduler: Scheduler) -> None:
@@ -635,10 +657,10 @@ with open("/nonexistent/path/to/file.txt") as f:
         assert "FileNotFoundError" in result.stderr or "No such file" in result.stderr
 
     async def test_permission_denied(self, scheduler: Scheduler) -> None:
-        """Write to read-only filesystem fails even as root.
+        """Write to read-only filesystem fails.
 
-        Note: VM runs as root, so traditional permission tests on /etc/shadow
-        won't work. Instead, test writing to /proc which is read-only.
+        Note: /proc is read-only regardless of UID, making it a reliable
+        target for testing write-permission errors.
         """
         code = """
 with open("/proc/version", "w") as f:
@@ -992,3 +1014,436 @@ class TestRawEdgeCases:
 
         # Shell variable expansion
         assert result.exit_code == 0
+
+    # ---- Shebang handling (temp-file dispatch) ----
+
+    async def test_raw_shebang_awk(self, scheduler: Scheduler) -> None:
+        """AWK shebang executes via kernel binfmt_script."""
+        result = await scheduler.run(
+            code='#!/usr/bin/awk -f\nBEGIN { print "shebang_awk_ok" }',
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "shebang_awk_ok" in result.stdout
+
+    async def test_raw_shebang_sh(self, scheduler: Scheduler) -> None:
+        """Shell shebang via temp file."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho shebang_sh_ok",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "shebang_sh_ok" in result.stdout
+
+    async def test_raw_shebang_bash(self, scheduler: Scheduler) -> None:
+        """Bash shebang via temp file."""
+        result = await scheduler.run(
+            code="#!/bin/bash\necho shebang_bash_ok",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "shebang_bash_ok" in result.stdout
+
+    async def test_raw_shebang_sed(self, scheduler: Scheduler) -> None:
+        """Sed shebang processes input."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho hello | sed 's/hello/world/'",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "world" in result.stdout
+
+    async def test_raw_shebang_nonzero_exit(self, scheduler: Scheduler) -> None:
+        """Non-zero exit code propagates through temp-file wrapper."""
+        result = await scheduler.run(
+            code="#!/bin/sh\nexit 42",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 42
+
+    async def test_raw_shebang_stderr(self, scheduler: Scheduler) -> None:
+        """Stderr output from shebanged script."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho err_msg >&2",
+            language=Language.RAW,
+        )
+
+        assert "err_msg" in result.stderr
+
+    async def test_raw_shebang_env_vars(self, scheduler: Scheduler) -> None:
+        """Exported env vars are inherited by shebanged subprocess."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho $MY_VAR",
+            language=Language.RAW,
+            env_vars={"MY_VAR": "from_env"},
+        )
+
+        assert result.exit_code == 0
+        assert "from_env" in result.stdout
+
+    async def test_raw_shebang_empty_body(self, scheduler: Scheduler) -> None:
+        """Shebang with empty body is valid."""
+        result = await scheduler.run(
+            code="#!/bin/sh\n",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+
+    async def test_raw_shebang_special_chars(self, scheduler: Scheduler) -> None:
+        """Special characters are preserved (heredoc quoting prevents expansion)."""
+        result = await scheduler.run(
+            code="#!/bin/sh\necho 'quotes \"double\" $dollar `backtick`'",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "$dollar" in result.stdout
+        assert "`backtick`" in result.stdout
+
+    async def test_raw_shebang_sentinel_in_code(self, scheduler: Scheduler) -> None:
+        """Sentinel collision in code is handled."""
+        result = await scheduler.run(
+            code='#!/bin/sh\necho "_EXEC_SANDBOX_EOF_"',
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "_EXEC_SANDBOX_EOF_" in result.stdout
+
+    async def test_raw_shebang_nonexistent_interpreter(self, scheduler: Scheduler) -> None:
+        """Non-existent interpreter fails with non-zero exit."""
+        result = await scheduler.run(
+            code="#!/usr/bin/nonexistent_interp_xyz\necho hello",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code != 0
+
+    async def test_raw_shebang_no_newline(self, scheduler: Scheduler) -> None:
+        """Shebang with no trailing newline and no body."""
+        result = await scheduler.run(
+            code="#!/bin/sh",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+
+    async def test_raw_no_shebang_hash_comment(self, scheduler: Scheduler) -> None:
+        """Plain # comment is not treated as shebang."""
+        result = await scheduler.run(
+            code="# just a comment\necho hello",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_raw_shebang_with_leading_space(self, scheduler: Scheduler) -> None:
+        """Leading space means no shebang detection; eval path used."""
+        result = await scheduler.run(
+            code="  #!/bin/sh\necho hello",
+            language=Language.RAW,
+        )
+
+        # Leading space: bash treats #! as comment, echo runs normally
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_raw_shebang_multiline_output(self, scheduler: Scheduler) -> None:
+        """AWK shebang producing multiline output."""
+        result = await scheduler.run(
+            code="#!/usr/bin/awk -f\nBEGIN { for(i=1;i<=100;i++) print i }",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 100
+        assert lines[0].strip() == "1"
+        assert lines[99].strip() == "100"
+
+    async def test_raw_shebang_awk_multiline_program(self, scheduler: Scheduler) -> None:
+        """AWK shebang with BEGIN, pattern, and END blocks."""
+        # Use a shell wrapper to pipe input into the awk script, since
+        # a bare awk with an END block reads stdin (hangs without input).
+        result = await scheduler.run(
+            code='#!/bin/sh\nprintf "line1\\nline2\\n" | awk \'BEGIN{print "start"} /line/{print "matched:"$0} END{print "end"}\'',
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "start" in result.stdout
+        assert "matched:line1" in result.stdout
+        assert "matched:line2" in result.stdout
+        assert "end" in result.stdout
+
+
+# =============================================================================
+# Stdin EOF: user code reading stdin gets immediate EOF (not a hang)
+# =============================================================================
+
+
+class TestStdinEofNormal:
+    """Common stdin-reading patterns return EOF immediately instead of hanging."""
+
+    async def test_python_input_eof(self, scheduler: Scheduler) -> None:
+        """input() raises EOFError when stdin is /dev/null."""
+        code = """\
+try:
+    input("prompt> ")
+except EOFError:
+    print("CAUGHT_EOF")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "CAUGHT_EOF" in result.stdout
+
+    async def test_python_stdin_read_empty(self, scheduler: Scheduler) -> None:
+        """sys.stdin.read() returns empty string at EOF."""
+        code = """\
+import sys
+data = sys.stdin.read()
+print(repr(data))
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "''" in result.stdout
+
+    async def test_python_stdin_iteration_empty(self, scheduler: Scheduler) -> None:
+        """for line in sys.stdin iterates zero times at EOF."""
+        code = """\
+import sys
+count = 0
+for line in sys.stdin:
+    count += 1
+print(f"COUNT={count}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "COUNT=0" in result.stdout
+
+    async def test_shell_read_eof(self, scheduler: Scheduler) -> None:
+        """Shell read returns failure at EOF, allowing fallback."""
+        result = await scheduler.run(
+            code='read var || echo "NO_INPUT"',
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "NO_INPUT" in result.stdout
+
+    async def test_js_stdin_read_null(self, scheduler: Scheduler) -> None:
+        """process.stdin.read() returns null at EOF."""
+        code = """\
+const d = process.stdin.read();
+console.log(String(d));
+"""
+        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        assert result.exit_code == 0
+        assert "null" in result.stdout
+
+
+class TestStdinEofEdge:
+    """Boundary conditions and sequential stdin interactions."""
+
+    async def test_python_input_catch_continue(self, scheduler: Scheduler) -> None:
+        """Code catches EOFError from input() and continues execution."""
+        code = """\
+try:
+    input()
+except EOFError:
+    print("CAUGHT")
+print("CONTINUED")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "CAUGHT" in result.stdout
+        assert "CONTINUED" in result.stdout
+
+    async def test_python_stdin_read_twice(self, scheduler: Scheduler) -> None:
+        """sys.stdin.read() called twice both return empty string (idempotent EOF)."""
+        code = """\
+import sys
+a = sys.stdin.read()
+b = sys.stdin.read()
+print(f"A={repr(a)} B={repr(b)}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "A=''" in result.stdout
+        assert "B=''" in result.stdout
+
+    async def test_python_stdin_buffer_read(self, scheduler: Scheduler) -> None:
+        """sys.stdin.buffer.read() returns b'' (real file, not StringIO)."""
+        code = """\
+import sys
+data = sys.stdin.buffer.read()
+print(repr(data))
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "b''" in result.stdout
+
+    async def test_python_stdin_readline_empty(self, scheduler: Scheduler) -> None:
+        """sys.stdin.readline() returns '' at EOF (not EOFError)."""
+        code = """\
+import sys
+line = sys.stdin.readline()
+print(repr(line))
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "''" in result.stdout
+
+    async def test_session_reuse_after_stdin_read(self, scheduler: Scheduler) -> None:
+        """REPL protocol channel is unaffected after user code reads stdin."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            r1 = await session.exec("import sys; sys.stdin.read()")
+            assert r1.exit_code == 0
+
+            r2 = await session.exec('print("STILL_WORKS")')
+            assert r2.exit_code == 0
+            assert "STILL_WORKS" in r2.stdout
+
+
+class TestStdinEofWeird:
+    """Valid but unusual stdin patterns."""
+
+    async def test_python_stdin_fileno_valid(self, scheduler: Scheduler) -> None:
+        """sys.stdin.fileno() returns a valid int (real file object, not StringIO)."""
+        code = """\
+import sys
+fd = sys.stdin.fileno()
+print(f"FD={fd}")
+print(f"TYPE={type(fd).__name__}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "TYPE=int" in result.stdout
+
+    async def test_python_stdin_isatty_false(self, scheduler: Scheduler) -> None:
+        """sys.stdin.isatty() returns False (/dev/null is not a TTY)."""
+        code = """\
+import sys
+print(f"ISATTY={sys.stdin.isatty()}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "ISATTY=False" in result.stdout
+
+    async def test_python_json_load_stdin(self, scheduler: Scheduler) -> None:
+        """json.load(sys.stdin) raises JSONDecodeError on empty input (not hang)."""
+        code = """\
+import json, sys
+try:
+    json.load(sys.stdin)
+except json.JSONDecodeError:
+    print("JSON_DECODE_ERROR")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "JSON_DECODE_ERROR" in result.stdout
+
+    async def test_python_select_stdin_readable(self, scheduler: Scheduler) -> None:
+        """/dev/null reports as readable via select (immediate EOF)."""
+        code = """\
+import select, sys
+r, _, _ = select.select([sys.stdin], [], [], 0)
+print(f"READABLE={len(r) > 0}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "READABLE=True" in result.stdout
+
+    async def test_shell_wc_stdin_zero(self, scheduler: Scheduler) -> None:
+        """wc -l with no file arg reads stdin (/dev/null), reports 0 lines."""
+        result = await scheduler.run(
+            code="wc -l",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "0" in result.stdout
+
+
+class TestStdinEofOutOfBounds:
+    """Adversarial and limitation-probing stdin patterns."""
+
+    async def test_python_os_read_fd0_blocks(self, scheduler: Scheduler) -> None:
+        """os.read(0, ...) blocks because fd 0 is the protocol pipe, not /dev/null.
+
+        Known limitation: only sys.stdin is redirected; OS-level fd 0 remains
+        connected to the protocol pipe for the REPL command channel.
+        """
+        code = """\
+import os, signal
+signal.alarm(2)
+try:
+    os.read(0, 1024)
+    print("READ_RETURNED")
+except Exception as e:
+    print(f"ERROR={type(e).__name__}")
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=3,
+        )
+        # SIGALRM (signal 14) kills the REPL process, exit_code = 128 + 14 = 142
+        assert result.exit_code == 142
+
+    async def test_python_stdin_write_raises(self, scheduler: Scheduler) -> None:
+        """Writing to stdin (opened read-only from /dev/null) raises."""
+        code = """\
+import sys
+try:
+    sys.stdin.write("x")
+except Exception as e:
+    print(f"ERROR={type(e).__name__}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "UnsupportedOperation" in result.stdout
+
+    async def test_python_open_dev_stdin_blocks_or_denied(self, scheduler: Scheduler) -> None:
+        """/dev/stdin reopens fd 0 (protocol pipe) or is denied by sandbox.
+
+        Known limitation: /dev/stdin is a symlink to /proc/self/fd/0. If
+        accessible, it reopens the protocol pipe and blocks. If /proc/self/fd
+        is restricted, open() raises PermissionError.
+        """
+        code = """\
+import signal
+signal.alarm(2)
+try:
+    data = open("/dev/stdin").read()
+    print(f"DATA={repr(data)}")
+except PermissionError:
+    print("PERMISSION_ERROR")
+except Exception as e:
+    print(f"ERROR={type(e).__name__}")
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=3,
+        )
+        # Either blocks until SIGALRM kills the REPL (128+14=142), or permission denied
+        assert result.exit_code == 142 or "PERMISSION_ERROR" in result.stdout
+
+    async def test_python_fileinput_stdin_eof(self, scheduler: Scheduler) -> None:
+        """fileinput.input('-') iterates zero times at EOF."""
+        code = """\
+import fileinput
+count = 0
+for line in fileinput.input("-"):
+    count += 1
+print(f"COUNT={count}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "COUNT=0" in result.stdout

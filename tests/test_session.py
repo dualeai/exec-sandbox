@@ -360,18 +360,14 @@ class TestSessionWeirdCases:
     async def test_shell_bash_associative_array(self, scheduler: Scheduler) -> None:
         """Bash associative arrays work (fails under busybox ash)."""
         async with await scheduler.session(language=Language.RAW) as session:
-            result = await session.exec(
-                'declare -A map; map[key]="value"; echo "${map[key]}"'
-            )
+            result = await session.exec('declare -A map; map[key]="value"; echo "${map[key]}"')
             assert result.exit_code == 0
             assert "value" in result.stdout
 
     async def test_shell_bash_trap(self, scheduler: Scheduler) -> None:
         """Bash EXIT trap fires (silent failure under busybox ash)."""
         async with await scheduler.session(language=Language.RAW) as session:
-            result = await session.exec(
-                "(trap 'echo TRAP_FIRED' EXIT; echo body)"
-            )
+            result = await session.exec("(trap 'echo TRAP_FIRED' EXIT; echo body)")
             assert result.exit_code == 0
             assert "TRAP_FIRED" in result.stdout
 
@@ -385,9 +381,7 @@ class TestSessionWeirdCases:
     async def test_shell_bash_regex(self, scheduler: Scheduler) -> None:
         """Bash [[ =~ ]] regex matching works (syntax error under busybox ash)."""
         async with await scheduler.session(language=Language.RAW) as session:
-            result = await session.exec(
-                '[[ "2025-01-15" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && echo MATCH'
-            )
+            result = await session.exec('[[ "2025-01-15" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && echo MATCH')
             assert result.exit_code == 0
             assert "MATCH" in result.stdout
 

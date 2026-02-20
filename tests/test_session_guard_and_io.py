@@ -31,7 +31,7 @@ from exec_sandbox.guest_agent_protocol import (
     WriteFileRequest,
 )
 from exec_sandbox.guest_channel import FileOpDispatcher, UnixSocketChannel
-from exec_sandbox.models import ExecutionResult, FileInfo, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 from exec_sandbox.session import Session
 
 # ============================================================================
@@ -68,6 +68,7 @@ def _make_session(
     mock_vm.write_file = AsyncMock()
     mock_vm.read_file = AsyncMock(return_value=None)
     mock_vm.list_files = AsyncMock(return_value=[FileInfo(name="a.txt", is_dir=False, size=10)])
+    mock_vm.exposed_ports = []
 
     mock_vm_manager = AsyncMock()
     mock_vm_manager.destroy_vm = AsyncMock()
@@ -1238,3 +1239,31 @@ class TestFileOpDispatcherRouting:
         assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
+
+
+# ============================================================================
+# exposed_ports property — delegates to VM
+# ============================================================================
+
+
+class TestExposedPorts:
+    """Tests for Session.exposed_ports property."""
+
+    async def test_exposed_ports_delegates_to_vm(self) -> None:
+        """exposed_ports returns the VM's exposed_ports list."""
+        session, mock_vm, _ = _make_session()
+        mock_vm.exposed_ports = [ExposedPort(internal=8080, external=3000)]
+        assert session.exposed_ports == [ExposedPort(internal=8080, external=3000)]
+
+    async def test_exposed_ports_empty_when_no_ports(self) -> None:
+        """exposed_ports returns empty list when VM has no exposed ports."""
+        session, mock_vm, _ = _make_session()
+        mock_vm.exposed_ports = []
+        assert session.exposed_ports == []
+
+    async def test_exposed_ports_accessible_after_close(self) -> None:
+        """exposed_ports is still accessible after session is closed."""
+        session, mock_vm, _ = _make_session()
+        mock_vm.exposed_ports = [ExposedPort(internal=8080, external=3000)]
+        await session.close()
+        assert session.exposed_ports == [ExposedPort(internal=8080, external=3000)]

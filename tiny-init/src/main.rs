@@ -308,6 +308,9 @@ fn setup_zram(kver: &str) {
 
     log_fmt!("[zram] swap enabled");
 
+    // Security: remove device node after swapon (kernel holds internal reference).
+    let _ = fs::remove_file("/dev/zram0");
+
     // VM tuning (these can fail silently - non-critical)
     let _ = fs::write("/proc/sys/vm/page-cluster", "0");
     let _ = fs::write("/proc/sys/vm/swappiness", "180");
@@ -543,10 +546,28 @@ fn main() {
     // nosuid|nodev|noexec: CIS Benchmark 1.1.15 hardening. Won't break
     // multiprocessing — POSIX semaphores use shm_open()+mmap(), not execve().
     let _ = fs::create_dir("/dev/shm");
-    mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64M,mode=1777");
+    mount(
+        "tmpfs",
+        "/dev/shm",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV | MS_NOEXEC,
+        "size=64M,mode=1777",
+    );
     mount("proc", "/proc", "proc", 0, "");
     mount("sysfs", "/sys", "sysfs", 0, "");
-    mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");
+    // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
+    // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
+    // pnpm (pnpm#9776), PyInstaller, and user temp executables.
+    // nr_inodes: fixed cap independent of VM memory (default is totalram_pages/2,
+    // which varies 13K–55K+ depending on memory_mb). 16K is sufficient — package
+    // managers use rootfs caches, not /tmp, for heavy file creation.
+    mount(
+        "tmpfs",
+        "/tmp",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+        "size=128M,nr_inodes=16384,mode=1777",
+    );
 
     // /dev/fd symlinks — not created by devtmpfs, must be done in userspace.
     // Required for bash process substitution <(), and /dev/std* for portability.
@@ -620,6 +641,11 @@ fn main() {
             fallback_shell();
         }
     }
+
+    // Security: remove block device node after mount. The kernel references the
+    // device internally via bdevfs (indexed by major:minor), not the /dev path.
+    // Prevents raw disk reads that bypass filesystem permissions.
+    let _ = fs::remove_file("/dev/vda");
 
     // No existence check - execv will fail if guest-agent missing
     switch_root();

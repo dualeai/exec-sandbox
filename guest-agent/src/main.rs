@@ -176,7 +176,8 @@ static BLOCKED_ENV_VARS: &[&str] = &[
 /// Uses sys.stdin.buffer (binary mode) to read exact byte counts.
 /// Text-mode sys.stdin.read(n) reads n *characters*, which differs from n bytes
 /// for multi-byte UTF-8 (e.g., "café" = 5 chars but 6 bytes), causing deadlocks.
-const PYTHON_REPL_WRAPPER: &str = r#"import sys
+const PYTHON_REPL_WRAPPER: &str = r#"import os as _repl_os
+import sys
 import traceback
 
 sys.argv = ['-c']
@@ -233,21 +234,42 @@ def _cloud_dump(obj, file, protocol=None):
 _reduction.ForkingPickler = _CloudForkingPickler
 _reduction.dump = _cloud_dump
 
+# PID guard: forked children inherit the REPL wrapper. Record parent PID so
+# children that escape user code (via sys.exit(), exception, or fall-through)
+# flush their output and terminate without writing a premature sentinel.
+_repl_pid = _repl_os.getpid()
+
+# Redirect sys.stdin to /dev/null so user code that reads stdin (input(),
+# sys.stdin.read(), for line in sys.stdin, etc.) gets immediate EOF instead
+# of blocking on the protocol pipe. The REPL loop reads from _stdin_buf
+# (the original stdin buffer) for the length-prefixed command protocol.
+_stdin_buf = sys.stdin.buffer
+sys.stdin = open(_repl_os.devnull, "r")
+
 while True:
-    header = sys.stdin.buffer.readline()
+    header = _stdin_buf.readline()
     if not header:
         break
     sentinel_id, code_len = header.decode().strip().split(" ", 1)
-    code = sys.stdin.buffer.read(int(code_len)).decode()
+    code = _stdin_buf.read(int(code_len)).decode()
     exit_code = 0
     try:
         compiled = compile(code, "<exec>", "exec")
         exec(compiled, ns)
     except SystemExit as e:
-        exit_code = e.code if isinstance(e.code, int) else 1
+        exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except BaseException:
         traceback.print_exc()
         exit_code = 1
+    # PID guard: if we're a forked child, flush output and terminate immediately
+    # without writing a sentinel. Only the original REPL parent writes sentinels.
+    if _repl_os.getpid() != _repl_pid:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        _repl_os._exit(exit_code)
     sys.stdout.flush()
     sys.stderr.flush()
     sys.stderr.write(f"__SENTINEL_{sentinel_id}_{exit_code}__\n")
@@ -264,14 +286,43 @@ while True:
 /// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
 const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
+import { Readable } from 'node:stream';
 // Use 'ts' loader to accept both JavaScript and TypeScript syntax (TS is a
 // superset of JS). We avoid 'tsx' because Bun's TSX parser has open bugs with
 // generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
 // angle-bracket type assertions are ambiguous with JSX.
 const transpiler = new Bun.Transpiler({ loader: 'ts', replMode: true });
+// Create a null stdin (immediate EOF) so user code that reads process.stdin
+// or Bun.stdin gets EOF instead of blocking on the protocol pipe.
+const nullStdin = new Readable({ read() { this.push(null); } });
+nullStdin.fd = -1;
+nullStdin.isTTY = false;
+// Proxy intercepts stdin access on process, forwarding everything else.
+// set trap prevents user code from corrupting the real process object.
+const sandboxProcess = new Proxy(process, {
+    get(target, prop) {
+        if (prop === 'stdin') return nullStdin;
+        const val = target[prop];
+        return typeof val === 'function' ? val.bind(target) : val;
+    },
+    set(target, prop, value) {
+        if (prop === 'stdin') return true;
+        target[prop] = value;
+        return true;
+    }
+});
+// Also proxy Bun to intercept Bun.stdin — without this, user code could
+// bypass the process.stdin redirect via Bun.stdin.stream().
+const sandboxBun = new Proxy(Bun, {
+    get(target, prop) {
+        if (prop === 'stdin') return nullStdin;
+        const val = target[prop];
+        return typeof val === 'function' ? val.bind(target) : val;
+    }
+});
 const ctx = createContext({
-    Bun,
-    console, process, setTimeout, setInterval, clearTimeout, clearInterval,
+    Bun: sandboxBun,
+    console, process: sandboxProcess, setTimeout, setInterval, clearTimeout, clearInterval,
     Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
     AbortController, AbortSignal, Event, EventTarget,
     atob, btoa, structuredClone, queueMicrotask,
@@ -369,7 +420,7 @@ while (true) {
 /// `eval "$code"` maintains shell state (env vars, cwd, functions, aliases).
 const SHELL_REPL_WRAPPER: &str = r#"while read sentinel_id code_len; do
     code=$(head -c "$code_len")
-    eval "$code"
+    eval "$code" < /dev/null
     _ec=$?
     printf "__SENTINEL_%s_%d__\n" "$sentinel_id" "$_ec" >&2
 done
@@ -477,51 +528,82 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
 }
 
 /// Build code prefix that sets environment variables for the given language.
+///
+/// For RAW mode with shebang lines (`#!`), the user code is written to a temp
+/// file so the kernel's `binfmt_script` handles interpreter dispatch. Without
+/// this, `eval` treats `#!` as a comment and tries to parse the remaining lines
+/// as bash — failing for non-shell interpreters (awk, perl, ruby, etc.).
 fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, String>) -> String {
-    if env_vars.is_empty() {
-        return code.to_string();
-    }
-
     let mut full_code = String::new();
 
-    match language {
-        "python" => {
-            full_code.push_str("import os as __os__\n");
-            for (key, value) in env_vars {
-                // Escape backslashes and single quotes for Python string literal
-                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
-                let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
-                full_code.push_str(&format!(
-                    "__os__.environ['{escaped_key}']='{escaped_val}'\n"
-                ));
-            }
-            full_code.push_str("del __os__\n");
-        }
-        "javascript" => {
-            for (key, value) in env_vars {
-                let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
-                let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
-                full_code.push_str(&format!("process.env['{escaped_key}']='{escaped_val}';\n"));
-            }
-        }
-        "raw" => {
-            for (key, value) in env_vars {
-                // Shell export syntax requires unquoted identifier keys.
-                // Skip keys that aren't valid POSIX identifiers to avoid broken syntax.
-                if !key
-                    .bytes()
-                    .next()
-                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-                    || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
-                    eprintln!("Skipping invalid shell env var key: {:?}", key);
-                    continue;
+    if !env_vars.is_empty() {
+        match language {
+            "python" => {
+                full_code.push_str("import os as __os__\n");
+                for (key, value) in env_vars {
+                    // Escape backslashes and single quotes for Python string literal
+                    let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                    let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+                    full_code.push_str(&format!(
+                        "__os__.environ['{escaped_key}']='{escaped_val}'\n"
+                    ));
                 }
-                let escaped_val = value.replace('\'', "'\"'\"'");
-                full_code.push_str(&format!("export {key}='{escaped_val}'\n"));
+                full_code.push_str("del __os__\n");
             }
+            "javascript" => {
+                for (key, value) in env_vars {
+                    let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
+                    let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
+                    full_code.push_str(&format!("process.env['{escaped_key}']='{escaped_val}';\n"));
+                }
+            }
+            "raw" => {
+                for (key, value) in env_vars {
+                    // Shell export syntax requires unquoted identifier keys.
+                    // Skip keys that aren't valid POSIX identifiers to avoid broken syntax.
+                    if !key
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        eprintln!("Skipping invalid shell env var key: {:?}", key);
+                        continue;
+                    }
+                    let escaped_val = value.replace('\'', "'\"'\"'");
+                    full_code.push_str(&format!("export {key}='{escaped_val}'\n"));
+                }
+            }
+            _ => {}
         }
-        _ => {}
+    }
+
+    // RAW mode shebang: write to temp file for kernel-level interpretation.
+    // eval treats #! as a comment, then tries to parse remaining lines as
+    // shell syntax — fails for non-shell interpreters (awk, perl, ruby, etc.).
+    if language == "raw" && code.starts_with("#!") {
+        // Pick a heredoc sentinel not present in the code
+        let mut sentinel = String::from("_EXEC_SANDBOX_EOF_");
+        while code.contains(&sentinel) {
+            sentinel.push('X');
+        }
+        // IMPORTANT: Each `\<newline><spaces>` in the Rust string literal
+        // strips the newline AND all leading whitespace on the continuation
+        // line. The resulting shell lines have NO leading indentation. This
+        // is required: the heredoc closing sentinel must appear at column 0.
+        // Do not reformat alignment without verifying generated output.
+        full_code.push_str(&format!(
+            "_sf=$(mktemp /tmp/exec_XXXXXX) || {{ printf 'exec-sandbox: mktemp failed\\n' >&2; exit 126; }}\n\
+             cat > \"$_sf\" <<'{sentinel}'\n\
+             {code}\n\
+             {sentinel}\n\
+             chmod +x \"$_sf\"\n\
+             \"$_sf\"\n\
+             _sec=$?\n\
+             rm -f \"$_sf\"\n\
+             ( exit $_sec )\n"
+        ));
+        return full_code;
     }
 
     full_code.push_str(code);
@@ -591,6 +673,19 @@ struct ExecutionComplete {
     spawn_ms: Option<u64>,
     /// Time from spawn completion to child.wait() returning (actual process runtime)
     process_ms: Option<u64>,
+}
+
+/// Extract exit code following Unix shell conventions.
+///
+/// - Normal exit: returns the exit code (0-255)
+/// - Signal kill: returns 128 + signal_number (e.g., SIGKILL → 137, SIGSEGV → 139)
+/// - Neither (impossible on Unix): returns 255 as "unknown error" fallback
+fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|sig| 128 + sig))
+        .unwrap_or(255)
 }
 
 #[derive(Debug, Serialize)]
@@ -1013,7 +1108,7 @@ async fn install_packages(
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let exit_code = status.code().unwrap_or(-1);
+    let exit_code = exit_code_from_status(status);
 
     // Sync filesystem to ensure package files are persisted
     // Critical for snapshots with cache=unsafe (QEMU may exit before lazy writeback)
@@ -1872,7 +1967,7 @@ async fn execute_code_streaming(
         Ok(()) => {
             // REPL died (EOF on both streams) - recover exit code
             let status = repl.child.wait().await;
-            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            let exit_code = status.map(exit_code_from_status).unwrap_or(-1);
 
             eprintln!("REPL for {} died with exit_code={}", language, exit_code);
 
@@ -2591,6 +2686,31 @@ fn setup_init_environment() {
     unsafe { std::env::set_var("UV_NO_CACHE", "1") };
     eprintln!("Set UV_NO_CACHE=1");
 
+    // Harden system directories: CIS Benchmark 6.1.x compliance.
+    // Defense-in-depth against build-time ownership issues — macOS Docker
+    // export (VirtioFS) loses UID 0, so /etc may be writable by non-root.
+    // See: https://github.com/docker/for-mac/issues/6812
+    for dir in ["/etc", "/usr", "/var", "/sbin", "/bin"] {
+        let _ = StdCommand::new("chmod").args(["755", dir]).status();
+    }
+    // CIS 6.1.2-6.1.4: /etc/passwd, /etc/group = 644; /etc/shadow = 640
+    for file in ["/etc/passwd", "/etc/group", "/etc/resolv.conf"] {
+        let _ = StdCommand::new("chmod").args(["644", file]).status();
+    }
+    let _ = StdCommand::new("chmod")
+        .args(["640", "/etc/shadow"])
+        .status();
+    eprintln!("Hardened system directory permissions (CIS 6.1.x)");
+
+    // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
+    // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.
+    // Without lo, user code like http.createServer + fetch('http://localhost:...') fails
+    // with Bun's "FailedToOpenSocket: Was there a typo in the url or port?" error.
+    let _ = StdCommand::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status();
+    eprintln!("Loopback interface up");
+
     // Wait for network interface (up to 1 second, 20ms intervals)
     // virtio_net loaded by minimal-init.sh, eth0 appears shortly after
     for _ in 0..50 {
@@ -2999,5 +3119,130 @@ mod tests {
         assert!(json.contains("\"type\":\"file_list\""));
         assert!(json.contains("\"file.txt\""));
         assert!(json.contains("\"subdir\""));
+    }
+
+    // -------------------------------------------------------------------------
+    // prepend_env_vars shebang tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_prepend_shebang_wraps_tempfile() {
+        let code = "#!/usr/bin/awk -f\nBEGIN{print}";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        assert!(result.contains("mktemp"), "should use mktemp");
+        assert!(result.contains("cat >"), "should write via cat heredoc");
+        assert!(result.contains("chmod +x"), "should make executable");
+        assert!(result.contains("#!/usr/bin/awk -f\nBEGIN{print}"));
+    }
+
+    #[test]
+    fn test_prepend_shebang_with_env_vars() {
+        let code = "#!/bin/sh\necho $FOO";
+        let env = HashMap::from([("FOO".to_string(), "bar".to_string())]);
+        let result = prepend_env_vars("raw", code, &env);
+        // Env export comes before the tempfile block
+        let export_pos = result.find("export FOO='bar'").unwrap();
+        let mktemp_pos = result.find("mktemp").unwrap();
+        assert!(
+            export_pos < mktemp_pos,
+            "export should precede mktemp block"
+        );
+    }
+
+    #[test]
+    fn test_prepend_shebang_empty_env() {
+        let code = "#!/bin/sh\necho hi";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        // Even with empty env, shebang should still be wrapped
+        assert!(result.contains("mktemp"));
+        assert!(result.contains("chmod +x"));
+    }
+
+    #[test]
+    fn test_prepend_no_shebang_passthrough() {
+        let code = "echo hello";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        assert_eq!(result, "echo hello");
+    }
+
+    #[test]
+    fn test_prepend_no_shebang_with_env() {
+        let code = "echo $X";
+        let env = HashMap::from([("X".to_string(), "1".to_string())]);
+        let result = prepend_env_vars("raw", code, &env);
+        assert!(result.contains("export X='1'"));
+        assert!(result.contains("echo $X"));
+        assert!(!result.contains("mktemp"), "no shebang = no wrapping");
+    }
+
+    #[test]
+    fn test_prepend_shebang_sentinel_collision() {
+        let code = "#!/bin/sh\necho _EXEC_SANDBOX_EOF_";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        // The sentinel must not be the base string since it appears in code
+        assert!(result.contains("_EXEC_SANDBOX_EOF_X"));
+    }
+
+    #[test]
+    fn test_prepend_shebang_sentinel_double_collision() {
+        let code = "#!/bin/sh\necho _EXEC_SANDBOX_EOF_ _EXEC_SANDBOX_EOF_X";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        assert!(result.contains("_EXEC_SANDBOX_EOF_XX"));
+    }
+
+    #[test]
+    fn test_prepend_shebang_non_raw_ignored() {
+        let code = "#!/usr/bin/awk -f\nBEGIN{print}";
+        let env = HashMap::new();
+        let result = prepend_env_vars("python", code, &env);
+        assert_eq!(result, code, "non-raw languages should not wrap shebangs");
+    }
+
+    #[test]
+    fn test_prepend_shebang_quoted_heredoc() {
+        let code = "#!/bin/sh\necho $VAR `cmd`";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        // Heredoc sentinel must be single-quoted to prevent shell expansion
+        assert!(
+            result.contains("<<'_EXEC_SANDBOX_EOF_'"),
+            "heredoc delimiter should be single-quoted, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_prepend_shebang_no_leading_whitespace() {
+        // The Rust `\<newline>` string continuation strips indentation.
+        // Every generated shell line must start at column 0 — especially the
+        // heredoc closing sentinel which the shell matches at line start.
+        let code = "#!/bin/sh\necho hi";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        for (i, line) in result.lines().enumerate() {
+            assert!(
+                !line.starts_with(' ') && !line.starts_with('\t'),
+                "line {} has leading whitespace: {:?}",
+                i,
+                line,
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepend_shebang_mktemp_guard() {
+        let code = "#!/bin/sh\necho hi";
+        let env = HashMap::new();
+        let result = prepend_env_vars("raw", code, &env);
+        assert!(
+            result.contains("|| {") && result.contains("exit 126"),
+            "mktemp should have an error guard, got: {}",
+            result,
+        );
     }
 }

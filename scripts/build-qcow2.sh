@@ -473,15 +473,28 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 DOCKERFILE
 
     # Run virt-make-fs + qemu-img using cached image
+    # Note: cleanup inside Docker because files created by Docker (root) and chowned
+    # to UID 1000 cannot be deleted by the CI runner (UID 1001) on the host due to
+    # /tmp sticky bit. Removing inside the container (as root) avoids this.
     docker run --rm \
         -v "$tmp_dir:/build" \
         -v "$OUTPUT_DIR:/output" \
         --platform "$host_platform" \
         "$guestfs_image" \
         bash -c "
+            # Fix ownership: macOS Docker export (VirtioFS) loses UID 0 on
+            # local output, so system files may be owned by the build user.
+            # Reset everything to root first, then set sandbox user's home.
+            # See: https://github.com/docker/for-mac/issues/6812
+            chown -R 0:0 /build/rootfs
             chown -R 1000:1000 /build/rootfs/home/user
+            # CIS Benchmark 6.1.x: harden /etc file permissions
+            chmod 755 /build/rootfs/etc
+            chmod 644 /build/rootfs/etc/passwd /build/rootfs/etc/group /build/rootfs/etc/resolv.conf
+            [ -f /build/rootfs/etc/shadow ] && chmod 640 /build/rootfs/etc/shadow
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
             qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
+            rm -rf /build/rootfs /build/rootfs.raw
         "
 
     rm -rf "$tmp_dir"

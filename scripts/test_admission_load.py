@@ -53,11 +53,13 @@ async def main() -> None:
 
     async with Scheduler(config) as scheduler:
         # Print admission snapshot
-        snap = scheduler._vm_manager.admission.snapshot()
+        snap = scheduler._vm_manager.admission.snapshot()  # type: ignore[reportPrivateUsage, union-attr]  # diagnostic script
         print(f"Host: {snap.host_memory_mb:.0f}MB RAM, {snap.host_cpu_count:.1f} CPUs (source: {snap.capacity_source})")
         print(f"Budget: {snap.memory_budget_mb:.0f}MB memory, {snap.cpu_budget:.1f} CPU cores")
         if snap.available_memory_floor_mb > 0:
-            avail = f"{snap.system_available_memory_mb:.0f}MB" if snap.system_available_memory_mb is not None else "unknown"
+            avail = (
+                f"{snap.system_available_memory_mb:.0f}MB" if snap.system_available_memory_mb is not None else "unknown"
+            )
             print(f"Floor: {snap.available_memory_floor_mb}MB (current available: {avail})")
         print()
 
@@ -86,7 +88,7 @@ async def main() -> None:
         # Progress tracking
         while not all(t.done() for t in tasks):
             done = sum(1 for t in tasks if t.done())
-            snap = scheduler._vm_manager.admission.snapshot()
+            snap = scheduler._vm_manager.admission.snapshot()  # type: ignore[reportPrivateUsage, union-attr]  # diagnostic script
             print(
                 f"\r  Progress: {done}/{TOTAL_VMS} done | "
                 f"Active VMs: {snap.allocated_vm_slots} | "
@@ -102,7 +104,7 @@ async def main() -> None:
         elapsed = time.perf_counter() - start
 
     print(f"\r{'':80}")  # Clear progress line
-    print(f"Results:")
+    print("Results:")
     print(f"  Succeeded: {succeeded}/{TOTAL_VMS}")
     print(f"  Failed:    {failed}/{TOTAL_VMS}")
     print(f"  Total:     {elapsed:.1f}s")

@@ -161,7 +161,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/**/*.py" = [
+    "BLE001",   # blind except (acceptable in load-test scripts)
     "PLC0415",  # import outside top-level (fine for scripts)
+    "PLR2004",  # magic values (fine for scripts)
+    "SLF001",   # private member access (needed for diagnostic scripts)
     "T201",     # print statements (expected in CLI scripts)
 ]
 "tests/**/*.py" = [

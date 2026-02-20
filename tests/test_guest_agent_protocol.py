@@ -387,6 +387,12 @@ class TestExecutionCompleteMessage:
         msg = ExecutionCompleteMessage(exit_code=-9, execution_time_ms=100)
         assert msg.exit_code == -9
 
+    def test_signal_exit_code_convention(self) -> None:
+        """ExecutionCompleteMessage accepts 128+signal exit codes (Unix convention)."""
+        # SIGKILL (9) → 128 + 9 = 137
+        msg = ExecutionCompleteMessage(exit_code=137, execution_time_ms=100)
+        assert msg.exit_code == 137
+
     def test_with_timing_fields(self) -> None:
         """ExecutionCompleteMessage with optional timing fields."""
         msg = ExecutionCompleteMessage(
