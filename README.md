@@ -465,6 +465,11 @@ allow_network=True, allowed_domains=["api.example.com"]  # Controlled
 # Port forwarding binds to localhost only
 expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 # If you need external access, use a reverse proxy on the host
+
+# multiprocessing.Pool works, but single vCPU means no CPU-bound speedup
+from multiprocessing import Pool
+Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda serialization)
+# For CPU-bound parallelism, use multiple VMs via scheduler.run() concurrently instead
 ```
 
 ## Limits
@@ -577,10 +582,12 @@ All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and in
 | Python | 3.14 | [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (musl) |
 | uv | 0.9+ | 10-100x faster than pip ([docs](https://docs.astral.sh/uv/)) |
 | gcc, musl-dev | Alpine | For C extensions (numpy, pandas, etc.) |
+| cloudpickle | 3.1 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
 
 **Usage notes:**
 - Use `uv pip install` instead of `pip install` (pip not included)
 - Python 3.14 includes t-strings, deferred annotations, free-threading support
+- `multiprocessing.Pool` works out of the box — cloudpickle handles serialization of REPL-defined functions, lambdas, and closures. Single vCPU means no CPU-bound speedup, but I/O-bound parallelism and `Pool`-based APIs work correctly
 
 ### JavaScript Image
 

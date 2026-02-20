@@ -176,9 +176,63 @@ static BLOCKED_ENV_VARS: &[&str] = &[
 /// Uses sys.stdin.buffer (binary mode) to read exact byte counts.
 /// Text-mode sys.stdin.read(n) reads n *characters*, which differs from n bytes
 /// for multi-byte UTF-8 (e.g., "café" = 5 chars but 6 bytes), causing deadlocks.
-const PYTHON_REPL_WRAPPER: &str = r#"import sys, traceback
+const PYTHON_REPL_WRAPPER: &str = r#"import sys
+import traceback
+
 sys.argv = ['-c']
-ns = {"__name__": "__main__", "__builtins__": __builtins__}
+
+# Use __main__.__dict__ as exec namespace so functions have correct __globals__.
+# This lets pickle serialize exec()'d functions by qualified name, and cloudpickle
+# recognize __main__.__dict__ for minimal globals extraction.
+import __main__
+
+ns = __main__.__dict__
+ns["__builtins__"] = __builtins__
+
+# Force fork start method — Python 3.14 defaults to forkserver, which hangs in the
+# single-process VM environment. fork is safe here (single-threaded, Linux).
+import multiprocessing
+multiprocessing.set_start_method("fork")
+
+# Patch multiprocessing to use cloudpickle for serialization.
+# cloudpickle extracts only referenced globals via bytecode analysis (never the entire
+# __globals__ dict), so it handles exec()'d functions, lambdas, and closures safely.
+# This is the industry standard approach (PySpark, Ray, Dask, joblib/loky).
+# See: https://github.com/cloudpipe/cloudpickle
+import cloudpickle
+import copyreg
+import io
+import multiprocessing.reduction as _reduction
+
+
+class _CloudForkingPickler(cloudpickle.Pickler):
+    _extra_reducers = {}
+    _copyreg_dispatch_table = copyreg.dispatch_table
+
+    def __init__(self, *args, **kwds):
+        super().__init__(*args, **kwds)
+        self.dispatch_table = self._copyreg_dispatch_table.copy()
+        self.dispatch_table.update(self._extra_reducers)
+
+    @classmethod
+    def register(cls, type, reduce):
+        cls._extra_reducers[type] = reduce
+
+    @classmethod
+    def dumps(cls, obj, protocol=None):
+        buf = io.BytesIO()
+        cls(buf, protocol).dump(obj)
+        return buf.getbuffer()
+
+    loads = staticmethod(cloudpickle.loads)
+
+
+def _cloud_dump(obj, file, protocol=None):
+    _CloudForkingPickler(file, protocol).dump(obj)
+
+_reduction.ForkingPickler = _CloudForkingPickler
+_reduction.dump = _cloud_dump
+
 while True:
     header = sys.stdin.buffer.readline()
     if not header:

@@ -25,6 +25,7 @@ OUTPUT_DIR="$REPO_ROOT/images/dist"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.2}"
 PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-build-standalone
 UV_VERSION="${UV_VERSION:-0.9.24}"  # From astral-sh/uv
+CLOUDPICKLE_VERSION="${CLOUDPICKLE_VERSION:-3.1.2}"  # From https://github.com/cloudpipe/cloudpickle/releases
 BUN_VERSION="${BUN_VERSION:-1.3.5}"
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
 
@@ -128,6 +129,7 @@ compute_qcow2_hash() {
                 echo "python=$PYTHON_VERSION"
                 echo "python_build=$PYTHON_BUILD_DATE"
                 echo "uv=$UV_VERSION"
+                echo "cloudpickle=$CLOUDPICKLE_VERSION"
                 echo "pkgs=$PYTHON_PKGS"
                 ;;
             node)
@@ -301,6 +303,22 @@ create_python_rootfs() {
     # Note: install_only_stripped doesn't include pip - use 'uv pip' instead
     ln -sf /opt/python/bin/python3 "$rootfs_dir/usr/local/bin/python3"
     ln -sf /opt/python/bin/python3 "$rootfs_dir/usr/local/bin/python"
+
+    # Pre-install cloudpickle for multiprocessing support in REPL
+    # cloudpickle serializes functions defined in exec() (lambdas, closures, dynamic functions)
+    # by extracting only referenced globals via bytecode analysis — the industry standard
+    # approach used by PySpark, Ray, Dask, and joblib/loky.
+    # Uses Docker because uv/python in rootfs are Linux binaries (can't run on macOS host).
+    # See: https://github.com/cloudpipe/cloudpickle
+    mkdir -p "$rootfs_dir/home/user/site-packages"
+    docker run --rm \
+        -v "$rootfs_dir:/rootfs" \
+        --platform "$docker_platform" \
+        "alpine:${ALPINE_VERSION}" \
+        /rootfs/usr/local/bin/uv pip install \
+            --python /rootfs/opt/python/bin/python3 \
+            --target /rootfs/home/user/site-packages \
+            "cloudpickle==$CLOUDPICKLE_VERSION"
 }
 
 # Create rootfs with Node/bun runtime using Docker

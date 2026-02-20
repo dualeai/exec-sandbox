@@ -521,6 +521,9 @@ fn switch_root() -> ! {
 fn main() {
     // Mount virtual filesystems
     mount("devtmpfs", "/dev", "devtmpfs", 0, "");
+    // Shared memory for POSIX semaphores (Python multiprocessing, etc.)
+    let _ = fs::create_dir("/dev/shm");
+    mount("tmpfs", "/dev/shm", "tmpfs", 0, "size=64M,mode=1777");
     mount("proc", "/proc", "proc", 0, "");
     mount("sysfs", "/sys", "sysfs", 0, "");
     mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");
