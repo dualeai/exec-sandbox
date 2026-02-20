@@ -669,3 +669,119 @@ finally:
         assert len(result.exposed_ports) == 1
         port = result.exposed_ports[0]
         assert port.url == f"http://127.0.0.1:{port.external}"
+
+
+# =============================================================================
+# Integration Tests - Session.exposed_ports property
+# =============================================================================
+
+
+class TestSessionExposedPorts:
+    """Integration tests for Session.exposed_ports property."""
+
+    # ------------------------------------------------------------------
+    # Normal (happy path)
+    # ------------------------------------------------------------------
+
+    async def test_session_single_port(self, scheduler: Scheduler) -> None:
+        """Session with one exposed port has correct exposed_ports."""
+        async with await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[PortMapping(internal=8080)],
+        ) as session:
+            assert len(session.exposed_ports) == 1
+            assert session.exposed_ports[0].internal == 8080
+            assert session.exposed_ports[0].external >= 1024
+            assert session.exposed_ports[0].host == "127.0.0.1"
+
+    async def test_session_multiple_ports(self, scheduler: Scheduler) -> None:
+        """Session with multiple exposed ports has all entries with unique externals."""
+        async with await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[
+                PortMapping(internal=8080),
+                PortMapping(internal=8081),
+                PortMapping(internal=9000),
+            ],
+        ) as session:
+            assert len(session.exposed_ports) == 3
+            internals = {p.internal for p in session.exposed_ports}
+            assert internals == {8080, 8081, 9000}
+            externals = [p.external for p in session.exposed_ports]
+            assert len(set(externals)) == 3
+
+    async def test_session_explicit_external_port(self, scheduler: Scheduler) -> None:
+        """Session with explicit external port preserves it."""
+        external_port = allocate_ephemeral_port()
+        async with await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[PortMapping(internal=8080, external=external_port)],
+        ) as session:
+            assert len(session.exposed_ports) == 1
+            assert session.exposed_ports[0].internal == 8080
+            assert session.exposed_ports[0].external == external_port
+
+    async def test_session_ports_available_before_exec(self, scheduler: Scheduler) -> None:
+        """Exposed ports are populated immediately, before any exec() call."""
+        async with await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[PortMapping(internal=8080)],
+        ) as session:
+            # Check before any exec()
+            assert len(session.exposed_ports) == 1
+            assert session.exposed_ports[0].internal == 8080
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    async def test_session_no_ports_returns_empty(self, scheduler: Scheduler) -> None:
+        """Session without expose_ports has empty exposed_ports."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            assert session.exposed_ports == []
+
+    async def test_session_ports_stable_across_execs(self, scheduler: Scheduler) -> None:
+        """Exposed ports remain the same across multiple exec() calls."""
+        async with await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[PortMapping(internal=8080)],
+        ) as session:
+            ports_before = session.exposed_ports
+            await session.exec("x = 1")
+            await session.exec("x = 2")
+            await session.exec("x = 3")
+            assert session.exposed_ports == ports_before
+
+    # ------------------------------------------------------------------
+    # Weird cases
+    # ------------------------------------------------------------------
+
+    async def test_session_ports_with_network(self, scheduler: Scheduler) -> None:
+        """Session with expose_ports and allow_network=True (Mode 2) has correct ports."""
+        async with await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[PortMapping(internal=8080)],
+            allow_network=True,
+            allowed_domains=["example.com"],
+        ) as session:
+            assert len(session.exposed_ports) == 1
+            assert session.exposed_ports[0].internal == 8080
+            assert session.exposed_ports[0].external >= 1024
+
+    # ------------------------------------------------------------------
+    # Out of bounds
+    # ------------------------------------------------------------------
+
+    async def test_session_ports_after_close(self, scheduler: Scheduler) -> None:
+        """Exposed ports are still readable after session is closed."""
+        session = await scheduler.session(
+            language=Language.PYTHON,
+            expose_ports=[PortMapping(internal=8080)],
+        )
+        try:
+            ports_before_close = session.exposed_ports
+            assert len(ports_before_close) == 1
+            await session.close()
+            assert session.exposed_ports == ports_before_close
+        finally:
+            await session.close()  # idempotent — safe if already closed

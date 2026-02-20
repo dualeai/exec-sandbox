@@ -35,7 +35,7 @@ from typing import IO, TYPE_CHECKING, Self
 from exec_sandbox._logging import get_logger
 from exec_sandbox.constants import MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
 from exec_sandbox.exceptions import SessionClosedError
-from exec_sandbox.models import ExecutionResult, FileInfo, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -58,6 +58,7 @@ class Session:
         closed: Whether the session has been closed.
         vm_id: ID of the underlying VM.
         exec_count: Number of successful exec() calls.
+        exposed_ports: Resolved port mappings (internal→external) for this session's VM.
     """
 
     def __init__(
@@ -95,6 +96,11 @@ class Session:
     def exec_count(self) -> int:
         """Number of successful exec() calls."""
         return self._exec_count
+
+    @property
+    def exposed_ports(self) -> list[ExposedPort]:
+        """Resolved port mappings (internal→external) for this session's VM."""
+        return self._vm.exposed_ports
 
     # -------------------------------------------------------------------------
     # Internal helpers
