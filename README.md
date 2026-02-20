@@ -1,6 +1,6 @@
 # exec-sandbox
 
-Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 7-layer security isolation.
+Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 8-layer security isolation.
 
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
@@ -496,11 +496,12 @@ Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda seri
 |-------|------------|------------|
 | 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
 | 2 | Unprivileged QEMU | No root privileges, minimal exposure |
-| 3 | System call filtering (seccomp) | Blocks unauthorized OS calls |
-| 4 | Resource limits (cgroups v2) | Memory, CPU, process limits |
-| 5 | Process isolation (namespaces) | Separate process, network, filesystem views |
-| 6 | Security policies (AppArmor/SELinux) | When available |
-| 7 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
+| 3 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
+| 4 | System call filtering (seccomp) | Blocks unauthorized OS calls |
+| 5 | Resource limits (cgroups v2) | Memory, CPU, process limits |
+| 6 | Process isolation (namespaces) | Separate process, network, filesystem views |
+| 7 | Security policies (AppArmor/SELinux) | When available |
+| 8 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
 
 **Guarantees:**
 

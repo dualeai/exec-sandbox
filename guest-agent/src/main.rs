@@ -454,7 +454,12 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .current_dir(SANDBOX_ROOT)
-        .process_group(0);
+        .process_group(0)
+        // Drop to non-root: guest-agent stays root (PID 1, needs it for
+        // package install, file I/O, module loading), but the REPL subprocess
+        // runs as UID 1000. This blocks mount(2), ptrace, raw sockets, etc.
+        .uid(1000)
+        .gid(1000);
 
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().unwrap();
