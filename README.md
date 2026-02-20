@@ -481,7 +481,9 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 | Max file path length | 255 chars |
 | Execution timeout | 1-300s |
 | VM memory | 128-2048MB |
-| Max concurrent VMs | 1-100 |
+| Max concurrent VMs | 1+ (no upper bound) |
+
+> **Note:** The scheduler is not yet system-resources-aware. It does not check available host memory or CPU before launching VMs. Set `max_concurrent_vms` based on your host capacity (each VM uses ~256-512MB memory).
 
 ## Security Architecture
 
