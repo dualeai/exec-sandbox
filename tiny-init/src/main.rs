@@ -528,6 +528,15 @@ fn main() {
     mount("sysfs", "/sys", "sysfs", 0, "");
     mount("tmpfs", "/tmp", "tmpfs", 0, "size=128M");
 
+    // /dev/fd symlinks — not created by devtmpfs, must be done in userspace.
+    // Required for bash process substitution <(), and /dev/std* for portability.
+    // See: https://gitlab.alpinelinux.org/alpine/aports/-/issues/1465
+    let _ = fs::remove_dir_all("/dev/fd"); // guard: devtmpfs may create it as a dir
+    let _ = symlink("/proc/self/fd", "/dev/fd");
+    let _ = symlink("/proc/self/fd/0", "/dev/stdin");
+    let _ = symlink("/proc/self/fd/1", "/dev/stdout");
+    let _ = symlink("/proc/self/fd/2", "/dev/stderr");
+
     // Redirect stdout/stderr early (so errors are visible)
     redirect_to_console();
 

@@ -350,6 +350,54 @@ class TestSessionWeirdCases:
             assert result.exit_code == 0
             assert "ok" in result.stdout
 
+    async def test_shell_bash_array(self, scheduler: Scheduler) -> None:
+        """Bash indexed arrays work (fails under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec('arr=(one two three); echo "${arr[1]}"')
+            assert result.exit_code == 0
+            assert "two" in result.stdout
+
+    async def test_shell_bash_associative_array(self, scheduler: Scheduler) -> None:
+        """Bash associative arrays work (fails under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec(
+                'declare -A map; map[key]="value"; echo "${map[key]}"'
+            )
+            assert result.exit_code == 0
+            assert "value" in result.stdout
+
+    async def test_shell_bash_trap(self, scheduler: Scheduler) -> None:
+        """Bash EXIT trap fires (silent failure under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec(
+                "(trap 'echo TRAP_FIRED' EXIT; echo body)"
+            )
+            assert result.exit_code == 0
+            assert "TRAP_FIRED" in result.stdout
+
+    async def test_shell_bash_process_substitution(self, scheduler: Scheduler) -> None:
+        """Bash process substitution works (syntax error under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec("cat <(echo hello)")
+            assert result.exit_code == 0
+            assert "hello" in result.stdout
+
+    async def test_shell_bash_regex(self, scheduler: Scheduler) -> None:
+        """Bash [[ =~ ]] regex matching works (syntax error under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec(
+                '[[ "2025-01-15" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && echo MATCH'
+            )
+            assert result.exit_code == 0
+            assert "MATCH" in result.stdout
+
+    async def test_shell_bash_here_string(self, scheduler: Scheduler) -> None:
+        """Bash here-strings work (syntax error under busybox ash)."""
+        async with await scheduler.session(language=Language.RAW) as session:
+            result = await session.exec('read -r word <<< "hello world"; echo "$word"')
+            assert result.exit_code == 0
+            assert "hello" in result.stdout
+
     async def test_stderr_no_trailing_newline(self, scheduler: Scheduler) -> None:
         """Stderr without trailing newline doesn't prevent sentinel detection.
 

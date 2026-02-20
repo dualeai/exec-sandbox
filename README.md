@@ -145,7 +145,7 @@ async with await scheduler.session(language="javascript") as session:
     await session.exec("const greet = (name: string): string => `Hello, ${name}!`")
     result = await session.exec("console.log(greet('World'))")
 
-# Shell — env vars, cwd, and functions persist
+# Shell (Bash) — env vars, cwd, and functions persist
 async with await scheduler.session(language="raw") as session:
     await session.exec("cd /tmp && export MY_VAR=hello")
     result = await session.exec("echo $MY_VAR from $(pwd)")
@@ -559,7 +559,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 |-------|---------|-----------------|------|-------------|
 | `python-3.14-base` | Python 3.14 | uv | ~140MB | Full Python environment with C extension support |
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
-| `raw-base` | None | None | ~15MB | Shell scripts and custom runtimes |
+| `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
 All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and include common tools for AI agent workflows.
 
@@ -604,7 +604,7 @@ All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and in
 ### Raw Image
 
 Minimal Alpine Linux with common tools only. Use for:
-- Shell script execution (`language="raw"`)
+- Shell script execution (`language="raw"`) — runs under **GNU Bash**, full bash syntax supported
 - Custom runtime installation
 - Lightweight workloads
 

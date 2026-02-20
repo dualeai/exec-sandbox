@@ -414,6 +414,7 @@ async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Er
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally:
 ///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages
 ///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules
+///   - Raw: GNU Bash (not busybox ash) for arrays, traps, [[ ]], etc.
 async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
     write_repl_wrapper(language).await?;
 
@@ -436,7 +437,13 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             c
         }
         "raw" => {
-            let mut c = Command::new("sh");
+            // Use bash instead of /bin/sh (busybox ash on Alpine). Ash silently
+            // breaks common shell patterns: arrays, process substitution, [[ ]],
+            // here-strings, traps. Bash is installed in all VM images (COMMON_PKGS).
+            // --norc/--noprofile: skip startup files (defense-in-depth; BASH_ENV
+            // and PROMPT_COMMAND are already in the env var blocklist).
+            let mut c = Command::new("bash");
+            c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
             c
         }
