@@ -15,7 +15,7 @@ from typing import IO, TYPE_CHECKING, TextIO
 from uuid import uuid4
 
 from exec_sandbox import cgroup, constants
-from exec_sandbox.exceptions import VmBootTimeoutError, VmPermanentError, VmTransientError
+from exec_sandbox.exceptions import EnvVarValidationError, VmBootTimeoutError, VmPermanentError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     FileChunkResponseMessage,
@@ -328,6 +328,7 @@ class QemuVM:
             ExecutionResult with stdout, stderr, exit code, and resource usage
 
         Raises:
+            EnvVarValidationError: Invalid env vars (control chars, size limits)
             VmPermanentError: VM not in READY state or communication failed
             VmBootTimeoutError: Execution exceeded timeout_seconds
         """
@@ -370,12 +371,20 @@ class QemuVM:
             )
 
         # Prepare execution request
-        request = ExecuteCodeRequest(
-            language=self.language,
-            code=code,
-            timeout=timeout_seconds,
-            env_vars=env_vars or {},
-        )
+        try:
+            request = ExecuteCodeRequest(
+                language=self.language,
+                code=code,
+                timeout=timeout_seconds,
+                env_vars=env_vars or {},
+            )
+        except Exception as e:
+            # Convert Pydantic ValidationError to domain exception so callers
+            # catching SandboxError will handle invalid env vars properly.
+            raise EnvVarValidationError(
+                str(e),
+                context={"vm_id": self.vm_id},
+            ) from e
 
         try:
             # Re-check state before expensive I/O operations

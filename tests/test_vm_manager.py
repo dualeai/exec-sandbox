@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox.exceptions import VmError
+from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
@@ -1988,3 +1988,119 @@ class TestExecuteStateRace:
 
             assert "VM destroyed during execution start" in str(exc_info.value)
             assert exc_info.value.context["current_state"] == "destroyed"
+
+
+# ============================================================================
+# Execute Env Var Validation Tests
+# ============================================================================
+
+
+class TestExecuteEnvVarValidation:
+    """Verify execute() wraps ValidationError as EnvVarValidationError.
+
+    Users catching SandboxError must catch invalid env vars. Without the
+    conversion, raw pydantic.ValidationError leaks through.
+    """
+
+    @pytest.fixture
+    def vm(self):
+        """Minimal QemuVM that passes the READY state check."""
+        vm = object.__new__(QemuVM)
+        vm._state = VmState.READY
+        vm._state_lock = asyncio.Lock()
+        vm.vm_id = "test-vm-envvar"
+        vm.language = Language.PYTHON
+        return vm
+
+    # -- Control characters (core bug) ------------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars, match",
+        [
+            pytest.param({"K": "v\n"}, "control character", id="newline-value"),
+            pytest.param({"K": "v\x00"}, "control character", id="null-value"),
+            pytest.param({"K": "\x1b[31m"}, "control character", id="esc-value"),
+            pytest.param({"K": "v\r"}, "control character", id="cr-value"),
+            pytest.param({"K": "v\x07"}, "control character", id="bell-value"),
+            pytest.param({"K": "v\x7f"}, "control character", id="del-value"),
+            pytest.param({"K\x00": "v"}, "control character", id="null-name"),
+            pytest.param({"K\n": "v"}, "control character", id="newline-name"),
+        ],
+    )
+    async def test_control_chars_raise_env_var_validation_error(
+        self, vm, env_vars: dict[str, str], match: str
+    ) -> None:
+        with pytest.raises(EnvVarValidationError, match=match) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert isinstance(exc_info.value, SandboxError)
+        assert exc_info.value.__cause__ is not None
+        assert exc_info.value.context["vm_id"] == "test-vm-envvar"
+
+    # -- Size / count limits -----------------------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars, match",
+        [
+            pytest.param({"": "v"}, "length", id="empty-name"),
+            pytest.param({"A" * 257: "v"}, "length", id="name-too-long"),
+            pytest.param({"K": "x" * 4097}, "too large", id="value-too-long"),
+            pytest.param(
+                {f"V{i}": "v" for i in range(101)},
+                "(?i)too many",
+                id="too-many-vars",
+            ),
+        ],
+    )
+    async def test_limits_raise_env_var_validation_error(
+        self, vm, env_vars: dict[str, str], match: str
+    ) -> None:
+        with pytest.raises(EnvVarValidationError, match=match) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert isinstance(exc_info.value, SandboxError)
+        assert exc_info.value.__cause__ is not None
+
+    # -- Boundary values that must NOT raise --------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars",
+        [
+            pytest.param({"K": "v\t"}, id="tab-allowed"),
+            pytest.param({"K": "Hello 世界 🌍"}, id="utf8-allowed"),
+            pytest.param({"A" * 256: "v"}, id="name-at-limit"),
+            pytest.param({"K": "x" * 4096}, id="value-at-limit"),
+            pytest.param(
+                {f"V{i}": "v" for i in range(100)},
+                id="vars-at-limit",
+            ),
+        ],
+    )
+    async def test_valid_env_vars_no_error(
+        self, vm, env_vars: dict[str, str]
+    ) -> None:
+        """Valid env vars pass validation (ExecuteCodeRequest succeeds).
+
+        We expect some downstream error (VmTransientError from I/O) but
+        crucially NOT EnvVarValidationError.
+        """
+        with pytest.raises(Exception) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert not isinstance(exc_info.value, EnvVarValidationError)
+
+    # -- Weird / adversarial ------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "env_vars",
+        [
+            pytest.param({"K": "\n"}, id="value-only-newline"),
+            pytest.param({"K": "\x00"}, id="value-only-null"),
+            pytest.param({"K": "\nfoo"}, id="control-at-start"),
+            pytest.param({"K": "foo\n"}, id="control-at-end"),
+            pytest.param({"K": "fo\no"}, id="control-in-middle"),
+            pytest.param({"K": "\n\r\x07"}, id="multiple-control-chars"),
+        ],
+    )
+    async def test_adversarial_values_raise_env_var_validation_error(
+        self, vm, env_vars: dict[str, str]
+    ) -> None:
+        with pytest.raises(EnvVarValidationError):
+            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
