@@ -210,7 +210,11 @@ while True:
 /// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
 const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
-const transpiler = new Bun.Transpiler({ loader: 'js', replMode: true });
+// Use 'ts' loader to accept both JavaScript and TypeScript syntax (TS is a
+// superset of JS). We avoid 'tsx' because Bun's TSX parser has open bugs with
+// generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
+// angle-bracket type assertions are ambiguous with JSX.
+const transpiler = new Bun.Transpiler({ loader: 'ts', replMode: true });
 const ctx = createContext({
     Bun,
     console, process, setTimeout, setInterval, clearTimeout, clearInterval,

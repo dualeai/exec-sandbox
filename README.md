@@ -140,9 +140,9 @@ async with Scheduler() as scheduler:
 Sessions support all three languages:
 
 ```python
-# JavaScript — variables and functions persist
+# JavaScript/TypeScript — variables and functions persist
 async with await scheduler.session(language="javascript") as session:
-    await session.exec("const greet = (name) => `Hello, ${name}!`")
+    await session.exec("const greet = (name: string): string => `Hello, ${name}!`")
     result = await session.exec("console.log(greet('World'))")
 
 # Shell — env vars, cwd, and functions persist

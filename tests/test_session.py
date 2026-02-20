@@ -97,6 +97,23 @@ class TestSessionNormal:
             assert result.exit_code == 0
             assert "hi bob" in result.stdout
 
+    async def test_ts_typed_variable_persistence(self, scheduler: Scheduler) -> None:
+        """TypeScript typed variables persist across exec calls."""
+        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+            await session.exec("let x: number = 10;")
+            result = await session.exec("console.log(x + 1);")
+            assert result.exit_code == 0
+            assert "11" in result.stdout
+
+    async def test_ts_interface_reuse_across_execs(self, scheduler: Scheduler) -> None:
+        """TypeScript interface defined in one exec is usable in the next."""
+        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+            await session.exec("interface Item { name: string; qty: number }")
+            await session.exec("function describe(i: Item): string { return `${i.name}:${i.qty}`; }")
+            result = await session.exec('console.log(describe({ name: "apple", qty: 3 }));')
+            assert result.exit_code == 0
+            assert "apple:3" in result.stdout
+
     async def test_shell_env_var_persistence(self, scheduler: Scheduler) -> None:
         """Shell environment variables persist across exec calls."""
         async with await scheduler.session(language=Language.RAW) as session:
