@@ -339,19 +339,13 @@ class TestSessionWeirdCases:
         """subprocess.Popen child survives across exec() calls (VM persists)."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Exec 1: spawn a long-lived subprocess, capture its PID
-            result = await session.exec(
-                "import subprocess\n"
-                "p = subprocess.Popen(['sleep', '60'])\n"
-                "print(p.pid)"
-            )
+            result = await session.exec("import subprocess\np = subprocess.Popen(['sleep', '60'])\nprint(p.pid)")
             assert result.exit_code == 0
             pid = result.stdout.strip()
             assert pid.isdigit()
 
             # Exec 2: verify the subprocess is still alive via /proc
-            result = await session.exec(
-                f"import os; print(os.path.exists('/proc/{pid}/stat'))"
-            )
+            result = await session.exec(f"import os; print(os.path.exists('/proc/{pid}/stat'))")
             assert result.exit_code == 0
             assert "True" in result.stdout
 
@@ -567,6 +561,50 @@ class TestSessionOutOfBounds:
             assert result.exit_code == 0
         finally:
             await session.close()
+
+    @skip_unless_hwaccel
+    async def test_sigkill_preserves_session(self, scheduler: Scheduler) -> None:
+        """SIGKILL (same signal OOM killer sends) doesn't destroy session."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.exec("x = 42")
+            # SIGKILL mirrors what the OOM killer does
+            result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+            assert result.exit_code == 137  # 128 + 9 (SIGKILL)
+            # Session alive, state reset (x is gone)
+            result = await session.exec("try:\n    print(x)\nexcept NameError:\n    print('state_reset')")
+            assert result.exit_code == 0
+            assert "state_reset" in result.stdout
+
+    @skip_unless_hwaccel
+    async def test_oom_preserves_session(self, scheduler: Scheduler) -> None:
+        """Actual OOM-killed code doesn't destroy session — REPL respawns."""
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+            # Allocate and write to memory in a loop. Writing forces page faults,
+            # which commits physical memory and triggers the kernel OOM killer.
+            # Plain mmap() without writes only reserves address space (overcommit_memory=0).
+            result = await session.exec(
+                "data = []\nwhile True:\n    data.append(b'x' * 10_000_000)",
+                timeout_seconds=30,
+            )
+            # OOM: SIGKILL (137), or MemoryError (non-zero), or timeout (-1) as safety net
+            assert result.exit_code != 0
+            # Session still alive — REPL respawned
+            result = await session.exec('print("alive")')
+            assert result.exit_code == 0
+            assert "alive" in result.stdout
+
+    @skip_unless_hwaccel
+    async def test_repeated_repl_death_preserves_session(self, scheduler: Scheduler) -> None:
+        """Session survives multiple consecutive REPL deaths."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            for i in range(3):
+                # Kill REPL
+                result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+                assert result.exit_code == 137
+                # Verify session is still usable with fresh state
+                result = await session.exec(f'print("cycle_{i}")')
+                assert result.exit_code == 0
+                assert f"cycle_{i}" in result.stdout
 
     @skip_unless_hwaccel
     async def test_exec_timeout_preserves_session(self, scheduler: Scheduler) -> None:
