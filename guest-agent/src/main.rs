@@ -493,7 +493,7 @@ async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Er
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally:
-///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages
+///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages + /usr/lib/python3/site-packages
 ///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules
 ///   - Raw: GNU Bash (not busybox ash) for arrays, traps, [[ ]], etc.
 async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
@@ -503,18 +503,30 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         "python" => {
             let mut c = Command::new("python3");
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
-            // Package resolution for user-installed packages
+            // Package resolution: session-time installs (tmpfs) then system installs (ext4 snapshot)
             // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONPATH
-            c.env("PYTHONPATH", format!("{SANDBOX_ROOT}/site-packages"));
+            c.env(
+                "PYTHONPATH",
+                format!("{SANDBOX_ROOT}/site-packages:/usr/lib/python3/site-packages"),
+            );
             // Disable the 4300-digit limit for int<->str conversions (CVE-2020-10735).
             // Safe here: execution timeout (300s) and output caps (1MB) already bound resource usage.
             // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONINTMAXSTRDIGITS
             c.env("PYTHONINTMAXSTRDIGITS", "0");
+            // Prevent Python from prepending script directory or CWD to sys.path,
+            // blocking stdlib shadowing attacks (CVE-2024-48990, CVE-2025-68668).
+            // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONSAFEPATH
+            c.env("PYTHONSAFEPATH", "1");
             c
         }
         "javascript" => {
             let mut c = Command::new("bun");
             c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
+            // Package resolution: session-time (tmpfs) then system (ext4 snapshot)
+            c.env(
+                "NODE_PATH",
+                format!("{SANDBOX_ROOT}/node_modules:/usr/local/lib/node_modules"),
+            );
             c
         }
         "raw" => {
@@ -894,12 +906,13 @@ async fn send_streaming_error(
 
 // Note: flush_buffers() removed - replaced with spawned task pattern (Nov 2025)
 
-/// Install packages into SANDBOX_ROOT for the given language.
+/// Install packages to system paths for snapshot persistence.
 ///
-/// Packages are installed locally (not system-wide) so they persist in snapshots
-/// and are resolved by the REPL via standard language mechanisms:
-///   - Python: `uv pip install --target {SANDBOX_ROOT}/site-packages` + `PYTHONPATH`
-///   - JavaScript: `bun add` in SANDBOX_ROOT + Node `node_modules/` resolution
+/// Packages are installed to system directories on the ext4 rootfs (not /home/user
+/// tmpfs) so they survive snapshot capture. The rootfs must be mounted read-write
+/// (init.rw=1) during snapshot creation.
+///   - Python: `uv pip install --target /usr/lib/python3/site-packages`
+///   - JavaScript: `bun add` in /usr/local/lib (NODE_PATH resolution)
 async fn install_packages(
     language: &str,
     packages: &[String],
@@ -1045,12 +1058,14 @@ async fn install_packages(
             let mut c = Command::new("uv");
             c.arg("pip")
                 .arg("install")
+                .arg("--python")
+                .arg("/opt/python/bin/python3")
                 .arg("--target")
-                .arg(format!("{SANDBOX_ROOT}/site-packages"));
+                .arg("/usr/lib/python3/site-packages");
             for pkg in packages {
                 c.arg(pkg);
             }
-            c.current_dir(SANDBOX_ROOT);
+            c.current_dir("/usr/lib/python3");
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
@@ -1063,9 +1078,8 @@ async fn install_packages(
             for pkg in packages {
                 c.arg(pkg);
             }
-            // Install to SANDBOX_ROOT where the REPL script lives, so bun
-            // resolves node_modules/ via standard Node resolution
-            c.current_dir(SANDBOX_ROOT);
+            // Install to system path for snapshot persistence (NODE_PATH resolution)
+            c.current_dir("/usr/local/lib");
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
@@ -2765,6 +2779,10 @@ fn chmod_paths(mode: &str, paths: &[&str]) {
 /// remain visible and writable. The non-recursive remount only applies read-only
 /// to the top mount, not to children.
 ///
+/// Note: MS_NODEV is intentionally excluded — this function is used for /dev
+/// (devtmpfs), where MS_NODEV would block all device file access including
+/// virtio-serial ports needed for guest-agent communication.
+///
 /// Returns `true` on success. Logs warnings on failure (non-fatal).
 fn mount_readonly(path: &std::ffi::CStr) -> bool {
     unsafe {
@@ -2807,9 +2825,9 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
     }
 }
 
-/// Handles userspace-only initialization after minimal-init.sh:
-/// - minimal-init.sh: kernel modules, zram, mounts (has access to initramfs modules)
-/// - guest-agent: PATH, env vars, network IP config (userspace only)
+/// Handles userspace-only initialization after tiny-init:
+/// - tiny-init: kernel modules, zram, devtmpfs, read-only rootfs mount (initramfs)
+/// - guest-agent: PATH, env vars, /home/user tmpfs, network IP config (userspace only)
 ///
 /// Note: modprobe/insmod won't work here - kernel modules are only in initramfs
 /// which is unmounted after switch_root.
@@ -2825,8 +2843,9 @@ fn setup_init_environment() {
     eprintln!("Set UV_NO_CACHE=1");
 
     // Harden system directories: CIS Benchmark 6.1.x compliance.
-    // Defense-in-depth against build-time ownership issues — macOS Docker
-    // export (VirtioFS) loses UID 0, so /etc may be writable by non-root.
+    // No-op on read-only rootfs (build-time permissions are authoritative).
+    // Retained as defense-in-depth against the macOS Docker VirtioFS ownership
+    // bug where export loses UID 0.
     // See: https://github.com/docker/for-mac/issues/6812
     chmod_paths("755", &["/etc", "/usr", "/var", "/sbin", "/bin"]);
     // CIS 6.1.2-6.1.4: /etc/passwd, /etc/group = 644; /etc/shadow = 640
@@ -2842,9 +2861,48 @@ fn setup_init_environment() {
     chmod_paths("640", &["/etc/shadow"]);
     eprintln!("Hardened system directory permissions (CIS 6.1.x)");
 
-    // Read-only bind remount of /usr with nosuid (CIS: nodev,ro for /usr).
-    // Protects guest-agent binary and all system binaries from modification.
-    // Must happen AFTER chmod 755 /usr above since that writes to /usr metadata.
+    // Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
+    // /home/user on rootfs is empty (cloudpickle moved to /usr/lib/python3/site-packages).
+    // No explicit size — defaults to half-of-RAM, auto-adapts to memory_mb.
+    // No noexec — uv/bun install executables into site-packages/node_modules.
+    // No nr_inodes cap — package managers create thousands of files.
+    // noswap prevents data leaking to zram swap (kernel 6.4+).
+    let home_ret = unsafe {
+        let source = std::ffi::CString::new("tmpfs").unwrap();
+        let target = std::ffi::CString::new("/home/user").unwrap();
+        let fstype = std::ffi::CString::new("tmpfs").unwrap();
+        let data = std::ffi::CString::new("mode=0755,uid=1000,gid=1000,noswap").unwrap();
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if home_ret == 0 {
+        eprintln!("Mounted tmpfs on /home/user (nosuid,nodev)");
+    } else {
+        eprintln!(
+            "Warning: tmpfs mount on /home/user failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Read-only bind remounts of /usr, /bin, /sbin (CIS hardening).
+    // Skipped when init.rw=1 is set (snapshot creation): package install writes
+    // to /usr/lib/python3/site-packages and /usr/local/lib/node_modules.
+    let rw_mode = std::fs::read_to_string("/proc/cmdline")
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .any(|p| p == "init.rw=1");
+
+    if rw_mode {
+        eprintln!("init.rw=1: skipping /usr, /bin, /sbin read-only remounts");
+    } else {
+        // Read-only bind remount of /usr with nosuid (CIS: nodev,ro for /usr).
+        // Defense-in-depth: rootfs is already ro from tiny-init, this adds a
+        // nosuid bind-mount layer on /usr specifically.
     // Does NOT include noexec — system binaries in /usr/bin must remain executable.
     if mount_readonly(c"/usr") {
         eprintln!("Mounted /usr read-only with nosuid");
@@ -2852,8 +2910,8 @@ fn setup_init_environment() {
 
     // Read-only bind remount of /etc/hosts (prevents host alias injection).
     // musl checks /etc/hosts before DNS — injection would affect all name
-    // resolution. EROFS is stronger than chmod 644 alone (blocks even root).
-    // Must happen AFTER chmod 644 above since that writes file metadata.
+    // resolution. Defense-in-depth: rootfs is already ro from tiny-init,
+    // this adds a nosuid bind-mount layer on /etc/hosts specifically.
     if mount_readonly(c"/etc/hosts") {
         eprintln!("Mounted /etc/hosts read-only");
     }
@@ -2861,8 +2919,8 @@ fn setup_init_environment() {
     // Read-only bind remount of /etc/resolv.conf (prevents DNS hijack).
     // Guest DNS must use gvproxy gateway (192.168.127.1); modifying resolv.conf
     // to point at external DNS (e.g. 8.8.8.8) would bypass filtering intent.
-    // EROFS is stronger than chmod 644 alone (blocks even root).
-    // Must happen AFTER chmod 644 above since that writes file metadata.
+    // Defense-in-depth: rootfs is already ro from tiny-init,
+    // this adds a nosuid bind-mount layer on /etc/resolv.conf specifically.
     if mount_readonly(c"/etc/resolv.conf") {
         eprintln!("Mounted /etc/resolv.conf read-only");
     }
@@ -2914,7 +2972,7 @@ fn setup_init_environment() {
     eprintln!("Loopback interface up");
 
     // Wait for network interface (up to 1 second, 20ms intervals)
-    // virtio_net loaded by minimal-init.sh, eth0 appears shortly after
+    // virtio_net loaded by tiny-init, eth0 appears shortly after
     for _ in 0..50 {
         if std::path::Path::new("/sys/class/net/eth0").exists() {
             break;

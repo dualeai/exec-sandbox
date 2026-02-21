@@ -332,16 +332,18 @@ create_python_rootfs() {
     # cloudpickle serializes functions defined in exec() (lambdas, closures, dynamic functions)
     # by extracting only referenced globals via bytecode analysis — the industry standard
     # approach used by PySpark, Ray, Dask, and joblib/loky.
+    # Installed to /usr/lib/python3/site-packages (not /home/user/) because /home/user
+    # is a tmpfs mount at runtime (writable scratch space on read-only rootfs).
     # Uses Docker because uv/python in rootfs are Linux binaries (can't run on macOS host).
     # See: https://github.com/cloudpipe/cloudpickle
-    mkdir -p "$rootfs_dir/home/user/site-packages"
+    mkdir -p "$rootfs_dir/usr/lib/python3/site-packages"
     docker run --rm \
         -v "$rootfs_dir:/rootfs" \
         --platform "$docker_platform" \
         "alpine:${ALPINE_VERSION}" \
         /rootfs/usr/local/bin/uv pip install \
             --python /rootfs/opt/python/bin/python3 \
-            --target /rootfs/home/user/site-packages \
+            --target /rootfs/usr/lib/python3/site-packages \
             "cloudpickle==$CLOUDPICKLE_VERSION"
 }
 

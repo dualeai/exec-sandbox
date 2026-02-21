@@ -61,13 +61,16 @@ except (PermissionError, OSError):
         assert "blocked" in result.stdout
 
     async def test_append_passwd(self, scheduler: Scheduler) -> None:
-        """Append to /etc/passwd fails (UID 0 user injection)."""
+        """Append to /etc/passwd fails (UID 0 user injection).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 try:
     with open('/etc/passwd', 'a') as f:
         f.write('evil:x:0:0:evil:/root:/bin/sh\\n')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -170,9 +173,9 @@ except (PermissionError, OSError):
     async def test_hardlink_etc_passwd_write(self, scheduler: Scheduler) -> None:
         """Write through hard link to /etc/passwd is blocked.
 
-        Hard link creation may succeed (user can read /etc/passwd and write
-        to /home/user), but the file's 644 root:root permissions still
-        prevent UID 1000 from writing through the link.
+        Hard link creation always fails (EXDEV: /home/user is tmpfs, /etc is
+        rootfs — different filesystems). Fallback tests /etc/passwd directly.
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
         """
         code = """\
 import os
@@ -187,7 +190,7 @@ try:
     with open(target, 'a') as f:
         f.write('evil:x:0:0:evil:/root:/bin/sh\\n')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -195,13 +198,16 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_mkdir_in_etc(self, scheduler: Scheduler) -> None:
-        """mkdir inside /etc is blocked (directory creation requires dir write)."""
+        """mkdir inside /etc is blocked (directory creation requires dir write).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 import os
 try:
     os.mkdir('/etc/evil.d')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -209,13 +215,16 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_delete_file_from_etc(self, scheduler: Scheduler) -> None:
-        """rm /etc/resolv.conf fails (deletion requires write on parent dir)."""
+        """rm /etc/resolv.conf fails (deletion requires write on parent dir).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 import os
 try:
     os.unlink('/etc/resolv.conf')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -223,7 +232,10 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_rename_into_etc(self, scheduler: Scheduler) -> None:
-        """mv from /home/user into /etc fails (cross-dir rename needs target dir write)."""
+        """mv from /home/user into /etc fails (cross-dir rename needs target dir write).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 import os
 with open('/home/user/evil.conf', 'w') as f:
@@ -231,7 +243,7 @@ with open('/home/user/evil.conf', 'w') as f:
 try:
     os.rename('/home/user/evil.conf', '/etc/evil.conf')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -301,13 +313,16 @@ class TestEtcWeirdCases:
     """Unconventional modification attempts that should still fail."""
 
     async def test_chmod_etc_then_write(self, scheduler: Scheduler) -> None:
-        """chmod 777 /etc fails (requires CAP_FOWNER or ownership), so write still blocked."""
+        """chmod 777 /etc fails (requires CAP_FOWNER or ownership), so write still blocked.
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 import os
 try:
     os.chmod('/etc', 0o777)
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -315,7 +330,10 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_shutil_copy_into_etc(self, scheduler: Scheduler) -> None:
-        """shutil.copy into /etc fails (creates new file in /etc)."""
+        """shutil.copy into /etc fails (creates new file in /etc).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 import shutil
 with open('/home/user/src.txt', 'w') as f:
@@ -323,7 +341,7 @@ with open('/home/user/src.txt', 'w') as f:
 try:
     shutil.copy('/home/user/src.txt', '/etc/evil.txt')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -426,13 +444,16 @@ else:
         assert "blocked" in result.stdout
 
     async def test_chown_etc_to_user(self, scheduler: Scheduler) -> None:
-        """chown /etc to UID 1000 requires CAP_CHOWN -- blocked."""
+        """chown /etc to UID 1000 requires CAP_CHOWN -- blocked.
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 import os
 try:
     os.chown('/etc', 1000, 1000)
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)

@@ -1,10 +1,13 @@
 """Integration tests for streaming file transfers under memory pressure and concurrency.
 
 Validates that the zstd-compressed chunked file transfer protocol:
-1. Handles large files (30-50 MB) in low-memory VMs without OOM
+1. Handles large files (30-150 MB) in VMs without OOM
 2. Supports concurrent parallel file transfers via asyncio.gather
 3. Keeps guest memory usage low during transfers (streaming, not buffering)
 4. Handles interleaved success/failure correctly (dispatcher multiplexing)
+
+Note: /home/user is tmpfs (50% of guest RAM). Files written there consume guest
+RAM directly, so tests use 512 MB VMs for large files (tmpfs cap = 256 MB).
 
 All tests require real VMs via the scheduler fixture.
 """
@@ -39,18 +42,18 @@ class TestStreamingLargeFiles:
     """Prove streaming works for files that would OOM with the old buffered approach."""
 
     async def test_write_read_30mb_in_128mb_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write 30 MB to a 128 MB VM and read it back with SHA256 verification.
+        """Write 30 MB and read it back with SHA256 verification.
 
-        With the old base64 approach, 30 MB would require ~110 MB of guest RAM
-        just for decode + content, leaving nothing for the OS in 128 MB.
-        Streaming only needs ~128 KB decompression buffer.
+        /home/user is tmpfs (50% of RAM), so file writes consume guest RAM.
+        Uses 512 MB VM (256 MB tmpfs cap) to avoid ENOSPC.
+        Streaming only needs ~128 KB decompression buffer in the guest.
         """
         size = 30 * 1024 * 1024
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_30mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("large_30mb.bin", content)
             await session.read_file("large_30mb.bin", destination=dest)
 
@@ -62,18 +65,17 @@ class TestStreamingLargeFiles:
         )
 
     async def test_write_read_file_larger_than_vm_memory(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write a 150 MB file to a 128 MB VM — file is larger than total RAM.
+        """Write a 150 MB file — larger than what fits in default tmpfs.
 
-        The file is 17% larger than the VM's entire memory.  With the old
-        buffered approach this would be impossible (~550 MB peak for base64).
-        Streaming only needs ~64 KB decompression buffer in the guest.
+        /home/user tmpfs is 50% of RAM. Uses 512 MB VM (256 MB tmpfs) so the
+        150 MB file fits. Streaming only needs ~64 KB decompression buffer.
         """
         size = 150 * 1024 * 1024
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_150mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("large_150mb.bin", content)
             await session.read_file("large_150mb.bin", destination=dest)
 
@@ -194,7 +196,7 @@ class TestStreamingMemoryEfficiency:
         size = 30 * 1024 * 1024
         content = os.urandom(size)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("mem_test_30mb.bin", content)
 
             # Read /proc/meminfo to check available memory
@@ -233,7 +235,7 @@ class TestStreamingMemoryEfficiency:
         """
         size = 20 * 1024 * 1024
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             for i in range(3):
                 content = os.urandom(size)
                 expected_hash = hashlib.sha256(content).hexdigest()
@@ -284,7 +286,7 @@ class TestStreamingMemoryEfficiency:
             print(f'pid={pid}')
         """)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             # Start background memory monitor
             start_result = await session.exec(monitor_code)
             assert start_result.exit_code == 0, f"Monitor start failed: {start_result.stderr}"
@@ -337,7 +339,7 @@ class TestStreamingMemoryEfficiency:
         content = os.urandom(size)
         dest = tmp_path / "read_mem_test_30mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("read_mem_test_30mb.bin", content)
             await session.read_file("read_mem_test_30mb.bin", destination=dest)
 
@@ -398,7 +400,7 @@ class TestStreamingMemoryEfficiency:
             print(f'pid={pid}')
         """)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             # First write the file to read back
             await session.write_file("peak_read_30mb.bin", content)
 

@@ -1,6 +1,6 @@
 //! Minimal init for QEMU microVMs
 //!
-//! Pure Rust port of images/minimal-init.sh - no busybox dependency.
+//! Handles kernel modules, zram, devtmpfs, read-only rootfs mount, and switch_root.
 
 use std::ffi::CString;
 use std::fs;
@@ -27,6 +27,7 @@ mod syscall_nr {
 const MS_NOSUID: libc::c_ulong = 0x2;
 const MS_NODEV: libc::c_ulong = 0x4;
 const MS_NOEXEC: libc::c_ulong = 0x8;
+const MS_RDONLY: libc::c_ulong = 0x1;
 const MS_NOATIME: libc::c_ulong = 0x400;
 const MS_MOVE: libc::c_ulong = 0x2000;
 
@@ -570,7 +571,7 @@ fn main() {
         "/dev/shm",
         "tmpfs",
         MS_NOSUID | MS_NODEV | MS_NOEXEC,
-        "size=64M,mode=1777",
+        "size=64M,mode=1777,noswap",
     );
     // hidepid=2: hide /proc/[pid] entries for processes not owned by the
     // querying user. Prevents UID 1000 from reading /proc/1/maps (memory layout
@@ -602,7 +603,7 @@ fn main() {
         "/tmp",
         "tmpfs",
         MS_NOSUID | MS_NODEV,
-        "size=128M,nr_inodes=16384,mode=1777",
+        "size=128M,nr_inodes=16384,mode=1777,noswap",
     );
 
     // /dev/fd symlinks — not created by devtmpfs, must be done in userspace.
@@ -669,10 +670,18 @@ fn main() {
     // Create virtio-ports symlinks
     setup_virtio_ports();
 
-    // Mount root filesystem: mount -t ext4 -o rw,noatime /dev/vda /mnt
-    if mount("/dev/vda", "/mnt", "ext4", MS_NOATIME, "") != 0 {
+    // Mount root filesystem.
+    // Default: read-only (ro,noatime,nosuid,nodev) — matches AWS Lambda rootfs flags.
+    // init.rw=1: read-write — used for snapshot creation (package install to ext4).
+    let need_rw = cmdline_has("init.rw=1");
+    let mount_flags = if need_rw {
+        MS_NOATIME | MS_NOSUID | MS_NODEV
+    } else {
+        MS_RDONLY | MS_NOATIME | MS_NOSUID | MS_NODEV
+    };
+    if mount("/dev/vda", "/mnt", "ext4", mount_flags, "") != 0 {
         // Fallback: try without specifying fstype
-        if mount("/dev/vda", "/mnt", "", MS_NOATIME, "") != 0 {
+        if mount("/dev/vda", "/mnt", "", mount_flags, "") != 0 {
             error("mount /dev/vda failed");
             fallback_shell();
         }

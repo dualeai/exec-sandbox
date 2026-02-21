@@ -517,6 +517,7 @@ class VmManager:
                 constants.DEFAULT_VM_CPU_CORES,
                 allow_network,
                 expose_ports=expose_ports,
+                direct_write=direct_write_target is not None,
             )
 
             # Step 6: Create dual-port Unix socket communication channel for guest agent
