@@ -40,10 +40,11 @@ _DEFAULT_MEMORY_MB = SchedulerConfig().default_memory_mb
 # Kernel reserves memory for its own data structures (page tables, slab caches,
 # reserved memory regions).  On a minimal Alpine Linux VM this overhead is
 # typically 20-40 MB, so /proc/meminfo MemTotal < QEMU -m value.
-# We cap the allowance at 25% for small VMs (128 MB) so a severe regression
-# (e.g., QEMU allocating half the requested memory) does not pass silently.
+# Kernel 6.18 on microvm with virtio_balloon + zram modules loaded shows
+# ~38 MB overhead on 128 MB VMs. We cap at 30% for small VMs so a severe
+# regression (e.g., QEMU allocating half the requested memory) does not pass.
 _KERNEL_OVERHEAD_MB = 50
-_MAX_KERNEL_OVERHEAD_RATIO = 0.25
+_MAX_KERNEL_OVERHEAD_RATIO = 0.30
 
 
 def _memory_lower_bound_mb(configured_mb: int) -> float:
@@ -706,13 +707,26 @@ print(f'CWD:{cwd}')
         assert len(cwd) > 0
 
     async def test_process_environ(self, scheduler: Scheduler) -> None:
-        """Process.environ() returns env vars dict."""
+        """Process.environ() returns env vars dict.
+
+        Note: psutil reads /proc/<pid>/environ which requires dumpable=1.
+        Our REPL wrapper sets PR_SET_DUMPABLE=0 (CVE-2022-30594 mitigation),
+        so psutil.Process().environ() raises AccessDenied. We use os.environ
+        as a fallback to verify environment propagation, then confirm psutil
+        correctly raises AccessDenied as expected under our hardening.
+        """
         code = """\
-import psutil
-proc = psutil.Process()
-env = proc.environ()
+import os, psutil
+# os.environ works regardless of dumpable flag
+env = dict(os.environ)
 print(f'HAS_PATH:{"PATH" in env}')
 print(f'ENV_COUNT:{len(env)}')
+# Verify psutil raises AccessDenied due to PR_SET_DUMPABLE=0
+try:
+    psutil.Process().environ()
+    print('PSUTIL_DUMPABLE:allowed')
+except psutil.AccessDenied:
+    print('PSUTIL_DUMPABLE:blocked')
 """
         result = await scheduler.run(
             code=code,
@@ -721,8 +735,16 @@ print(f'ENV_COUNT:{len(env)}')
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "HAS_PATH:True" in result.stdout
-        env_count = int(result.stdout.split("ENV_COUNT:")[1].strip())
-        assert env_count >= 1
+        # Parse ENV_COUNT from the line (not the whole output)
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("ENV_COUNT:"):
+                env_count = int(line.split(":")[1])
+                assert env_count >= 1
+                break
+        else:
+            pytest.fail("ENV_COUNT not found in output")
+        # PR_SET_DUMPABLE=0 must block psutil's /proc/PID/environ read
+        assert "PSUTIL_DUMPABLE:blocked" in result.stdout
 
     async def test_process_open_files(self, scheduler: Scheduler) -> None:
         """Process.open_files() lists open file descriptors."""
