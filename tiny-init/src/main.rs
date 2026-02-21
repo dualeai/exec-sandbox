@@ -388,14 +388,14 @@ fn remove_device_node(path: &str) {
     }
     // Fallback: chmod 000 blocks UID 1000 access (CAP_DAC_OVERRIDE can bypass,
     // but user code runs as UID 1000). Effective on devtmpfs.
-    if let Ok(cpath) = CString::new(path) {
-        if unsafe { libc::chmod(cpath.as_ptr(), 0) } == 0 {
-            log_fmt!(
-                "[init] WARNING: could not remove {}, chmod 000 applied",
-                path
-            );
-            return;
-        }
+    if let Ok(cpath) = CString::new(path)
+        && unsafe { libc::chmod(cpath.as_ptr(), 0) } == 0
+    {
+        log_fmt!(
+            "[init] WARNING: could not remove {}, chmod 000 applied",
+            path
+        );
+        return;
     }
     log_fmt!("[init] WARNING: could not remove or chmod {}", path);
 }
