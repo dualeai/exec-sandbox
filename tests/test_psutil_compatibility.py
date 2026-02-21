@@ -31,7 +31,7 @@ from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
-PSUTIL_PACKAGES = ["psutil"]
+PSUTIL_PACKAGES = ["psutil==7.2.1"]
 
 # The default memory allocated to each VM by the scheduler (QEMU -m flag).
 # We use this to cross-validate psutil.virtual_memory().total inside the guest.
