@@ -2744,18 +2744,25 @@ fn chmod_paths(mode: &str, paths: &[&str]) {
 /// Bind-mount a path onto itself and remount read-only with nosuid.
 ///
 /// Two-step process required by Linux VFS:
-///   1. `mount --bind <path> <path>` — creates a bind mount
-///   2. `mount -o remount,ro,nosuid,bind <path>` — makes it read-only
+///   1. `mount --rbind <path> <path>` — recursive bind preserving child mounts
+///   2. `mount -o remount,ro,nosuid,bind <path>` — makes top mount read-only
+///
+/// The recursive bind (MS_REC) ensures child mounts (e.g., /dev/shm inside /dev)
+/// remain visible and writable. The non-recursive remount only applies read-only
+/// to the top mount, not to children.
 ///
 /// Returns `true` on success. Logs warnings on failure (non-fatal).
 fn mount_readonly(path: &std::ffi::CStr) -> bool {
     unsafe {
-        // Step 1: bind mount onto itself
+        // Step 1: recursive bind mount onto itself.
+        // MS_REC preserves child mounts (e.g., /dev/shm tmpfs inside /dev).
+        // Without MS_REC, bind-mounting /dev hides /dev/shm, breaking
+        // POSIX semaphores (multiprocessing, etc.).
         let ret = libc::mount(
             path.as_ptr(),
             path.as_ptr(),
             std::ptr::null(),
-            libc::MS_BIND,
+            libc::MS_BIND | libc::MS_REC,
             std::ptr::null(),
         );
         if ret != 0 {
@@ -2844,6 +2851,17 @@ fn setup_init_environment() {
     // Must happen AFTER chmod 644 above since that writes file metadata.
     if mount_readonly(c"/etc/resolv.conf") {
         eprintln!("Mounted /etc/resolv.conf read-only");
+    }
+
+    // Read-only bind remount of /dev (defense-in-depth against device node creation).
+    // Prevents mknod(2) with EROFS even if CAP_MKNOD were somehow available.
+    // Does NOT break device I/O: VFS skips write-access counting for special files
+    // (char/block devices go through device driver, not filesystem).
+    // Does NOT affect /dev/shm: recursive bind (MS_REC) preserves the child tmpfs
+    // mount, and the non-recursive remount-ro only applies to the top devtmpfs.
+    // See: CVE-2020-2023 (Kata mknod+debugfs attack chain)
+    if mount_readonly(c"/dev") {
+        eprintln!("Mounted /dev read-only with nosuid");
     }
 
     // Read-only bind remount of /proc/sys (prevents sysctl modification).

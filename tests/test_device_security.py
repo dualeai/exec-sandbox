@@ -1,7 +1,8 @@
 """Tests for guest VM device-layer security hardening.
 
 Verifies that dangerous device nodes are removed, block device nodes
-(/dev/vda, /dev/zram0) are removed after use, /dev/shm is mounted with
+(/dev/vda, /dev/zram0) are removed after use, /dev is bind-remounted
+read-only (preventing mknod with EROFS), /dev/shm is mounted with
 restrictive flags, /tmp has nosuid/nodev flags with an explicit inode
 cap (nr_inodes=16384), and /proc/sys is read-only. These are defense-in-depth
 measures that apply regardless of UID — even root (guest-agent) cannot
@@ -553,34 +554,14 @@ print(f'OK:{data}')
     # --- Edge cases: alternative paths to block device are closed ---
 
     async def test_dev_block_symlinks_broken(self, scheduler: Scheduler) -> None:
-        """/dev/block/MAJ:MIN symlinks point to removed nodes, so resolve fails."""
+        """/dev/block/ directory is removed by tiny-init (eliminates symlink access path)."""
         code = """\
 import os
-
-# Find block device symlinks in /dev/block/ (created by devtmpfs)
-dev_block = '/dev/block'
-if not os.path.isdir(dev_block):
-    print('NO_DEV_BLOCK_DIR')
-else:
-    broken = 0
-    for entry in os.listdir(dev_block):
-        link = os.path.join(dev_block, entry)
-        if os.path.islink(link):
-            target = os.readlink(link)
-            # Resolve relative to /dev/block/
-            resolved = os.path.normpath(os.path.join(dev_block, target))
-            if not os.path.exists(resolved):
-                broken += 1
-    print(f'BROKEN_LINKS:{broken}')
+print(f'EXISTS:{os.path.exists("/dev/block")}')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
-        # Either the directory doesn't exist (fine) or all block symlinks are broken
-        out = result.stdout.strip()
-        assert "NO_DEV_BLOCK_DIR" in out or "BROKEN_LINKS:" in out
-        if "BROKEN_LINKS:" in out:
-            count = int(out.split("BROKEN_LINKS:")[1])
-            assert count > 0, "Expected at least one broken block device symlink"
+        assert "EXISTS:False" in result.stdout
 
     async def test_dev_root_not_accessible(self, scheduler: Scheduler) -> None:
         """/dev/root (sometimes auto-created by kernel) doesn't exist or is broken."""
@@ -1066,3 +1047,360 @@ else:
             language=Language.RAW,
         )
         assert "EXIT:0" not in result.stdout, f"Expected secondary procfs mount to fail.\nstdout: {result.stdout}"
+
+
+# =============================================================================
+# /dev read-only hardening
+# =============================================================================
+class TestDevReadonlyHardening:
+    """/dev is bind-mounted read-only to prevent device node creation.
+
+    Blocks the CVE-2020-2023 (Kata Containers) attack chain:
+    discover major:minor from /proc/partitions -> mknod -> debugfs -w /dev/vda.
+    Even if CAP_MKNOD were somehow available, mknod(2) returns EROFS on a
+    read-only filesystem. Does NOT break device I/O: VFS skips write-access
+    counting for special files (char/block devices go through device driver).
+    Does NOT affect /dev/shm (separate tmpfs mount, preserved by recursive bind).
+    """
+
+    # --- Normal: standard write attempts fail ---
+
+    async def test_dev_vda_write_fails(self, scheduler: Scheduler) -> None:
+        """open('/dev/vda', 'wb') fails — node removed + /dev read-only."""
+        code = """\
+try:
+    f = open('/dev/vda', 'wb')
+    f.close()
+    print('unexpected_success')
+except (FileNotFoundError, PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_dev_vda_readwrite_os_open(self, scheduler: Scheduler) -> None:
+        """os.open('/dev/vda', O_RDWR) fails (different syscall flags than Python open)."""
+        code = """\
+import os
+try:
+    fd = os.open('/dev/vda', os.O_RDWR)
+    os.close(fd)
+    print('unexpected_success')
+except (FileNotFoundError, PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_dev_mounted_readonly(self, scheduler: Scheduler) -> None:
+        """/dev is mounted read-only; mknod returns EROFS."""
+        code = """\
+import os, stat
+
+# Verify /dev is mounted read-only.
+# /proc/mounts may have multiple entries for /dev (original + bind mount).
+# Check the LAST entry which reflects the bind-remount.
+with open('/proc/mounts') as f:
+    dev_ro = False
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/dev':
+            opts = parts[3].split(',')
+            dev_ro = 'ro' in opts
+print(f'DEV_RO:{dev_ro}')
+
+# Attempt mknod — should get EROFS (errno 30)
+try:
+    os.mknod('/dev/test_blk', 0o660 | stat.S_IFBLK, os.makedev(253, 0))
+    print('MKNOD:success')
+except OSError as e:
+    print(f'MKNOD:errno_{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "DEV_RO:True" in result.stdout
+        # EROFS (30) or EPERM (1) — both acceptable, EROFS preferred
+        assert "MKNOD:errno_" in result.stdout
+        assert "MKNOD:success" not in result.stdout
+
+    # --- Normal: mmap attacks blocked (requires open() first) ---
+
+    async def test_dev_vda_mmap_blocked(self, scheduler: Scheduler) -> None:
+        """open('/dev/vda', 'rb') + mmap fails — node removed."""
+        code = """\
+import mmap
+try:
+    f = open('/dev/vda', 'rb')
+    m = mmap.mmap(f.fileno(), 4096)
+    m.close()
+    f.close()
+    print('unexpected_success')
+except (FileNotFoundError, PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_dev_mem_mmap_blocked(self, scheduler: Scheduler) -> None:
+        """open('/dev/mem', 'rb') + mmap fails — node removed."""
+        code = """\
+import mmap
+try:
+    f = open('/dev/mem', 'rb')
+    m = mmap.mmap(f.fileno(), 4096)
+    m.close()
+    f.close()
+    print('unexpected_success')
+except (FileNotFoundError, PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_dev_vda_mmap_write_blocked(self, scheduler: Scheduler) -> None:
+        """open('/dev/vda', 'r+b') + writable mmap fails — node removed."""
+        code = """\
+import mmap
+try:
+    f = open('/dev/vda', 'r+b')
+    m = mmap.mmap(f.fileno(), 4096, mmap.MAP_SHARED, mmap.PROT_WRITE)
+    m.close()
+    f.close()
+    print('unexpected_success')
+except (FileNotFoundError, PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    # --- Edge: alternative access paths closed ---
+
+    async def test_proc_self_root_traversal_blocked(self, scheduler: Scheduler) -> None:
+        """/proc/self/root/dev/vda fails (WithSecure Labs traversal vector)."""
+        code = """\
+try:
+    f = open('/proc/self/root/dev/vda', 'rb')
+    f.close()
+    print('unexpected_success')
+except (FileNotFoundError, PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_mknod_tmp_nodev(self, scheduler: Scheduler) -> None:
+        """mknod in /tmp fails — nodev mount flag blocks block device creation."""
+        code = """\
+import os, stat
+try:
+    os.mknod('/tmp/fake_blk', 0o660 | stat.S_IFBLK, os.makedev(253, 0))
+    print('CREATED')
+except PermissionError:
+    print('BLOCKED:EPERM')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:")
+
+    async def test_open_by_handle_at_blocked(self, scheduler: Scheduler) -> None:
+        """open_by_handle_at syscall fails without CAP_DAC_READ_SEARCH (Shocker exploit)."""
+        code = """\
+import ctypes, ctypes.util, errno, struct
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# open_by_handle_at requires CAP_DAC_READ_SEARCH (the "Shocker" exploit)
+# We don't even need a valid handle — the capability check happens first
+# Construct a minimal file_handle struct (8 bytes header + 0 bytes handle)
+handle_bytes = struct.pack('II', 0, 0)  # handle_bytes=0, handle_type=0
+handle_buf = ctypes.create_string_buffer(handle_bytes)
+
+# SYS_open_by_handle_at = 304 on x86_64, 265 on aarch64
+import platform
+if platform.machine() == 'x86_64':
+    SYS_open_by_handle_at = 304
+else:
+    SYS_open_by_handle_at = 265
+
+ret = libc.syscall(SYS_open_by_handle_at, 3, handle_buf, 0)
+err = ctypes.get_errno()
+if ret == -1 and err == errno.EPERM:
+    print('BLOCKED:EPERM')
+elif ret == -1:
+    print(f'BLOCKED:errno_{err}')
+else:
+    print('unexpected_success')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "BLOCKED:" in result.stdout
+        assert "unexpected_success" not in result.stdout
+
+    # --- Weird: creative bypass attempts ---
+
+    async def test_mknod_raw_syscall_blocked(self, scheduler: Scheduler) -> None:
+        """ctypes SYS_mknod proves kernel-level deny (Kata CVE-2020-2023 chain)."""
+        code = """\
+import ctypes, ctypes.util, errno, os, stat, platform
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+
+# SYS_mknodat = 259 on x86_64, 33 on aarch64
+if platform.machine() == 'x86_64':
+    SYS_mknodat = 259
+else:
+    SYS_mknodat = 33
+
+# AT_FDCWD = -100
+AT_FDCWD = -100
+path = b'/dev/test_mknod'
+mode = stat.S_IFBLK | 0o660
+dev = os.makedev(253, 0)
+
+ret = libc.syscall(SYS_mknodat, AT_FDCWD, path, mode, dev)
+err = ctypes.get_errno()
+if ret == -1:
+    if err == errno.EROFS:
+        print('BLOCKED:EROFS')
+    elif err == errno.EPERM:
+        print('BLOCKED:EPERM')
+    else:
+        print(f'BLOCKED:errno_{err}')
+else:
+    print('unexpected_success')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "BLOCKED:" in result.stdout
+        assert "unexpected_success" not in result.stdout
+
+    async def test_debugfs_not_available(self, scheduler: Scheduler) -> None:
+        """debugfs binary doesn't exist in minimal Alpine rootfs."""
+        code = """\
+import shutil
+print(f'DEBUGFS:{shutil.which("debugfs") is not None}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "DEBUGFS:False" in result.stdout
+
+    async def test_sysfs_block_no_data_path(self, scheduler: Scheduler) -> None:
+        """/sys/dev/block/ exposes metadata only, no writable raw IO interface."""
+        code = """\
+import os
+
+# Find any block device entries in sysfs
+sysfs_block = '/sys/dev/block'
+if not os.path.isdir(sysfs_block):
+    print('NO_SYSFS_BLOCK')
+else:
+    dangerous_files = []
+    for entry in os.listdir(sysfs_block):
+        dev_path = os.path.join(sysfs_block, entry)
+        if os.path.islink(dev_path):
+            resolved = os.path.realpath(dev_path)
+            for name in ['data', 'raw']:
+                check = os.path.join(resolved, name)
+                if os.path.exists(check):
+                    dangerous_files.append(check)
+    if dangerous_files:
+        print(f'DANGEROUS:{",".join(dangerous_files)}')
+    else:
+        print('SAFE')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        out = result.stdout.strip()
+        assert out in ("NO_SYSFS_BLOCK", "SAFE"), f"Dangerous sysfs paths found: {out}"
+
+    async def test_uevent_helper_not_writable(self, scheduler: Scheduler) -> None:
+        """/sys/kernel/uevent_helper not writable by UID 1000."""
+        code = """\
+import os
+
+path = '/sys/kernel/uevent_helper'
+if not os.path.exists(path):
+    print('NOT_EXISTS')
+else:
+    try:
+        with open(path, 'w') as f:
+            f.write('/tmp/pwned')
+        print('WRITTEN')
+    except (PermissionError, OSError) as e:
+        print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "WRITTEN" not in result.stdout
+
+    # --- Out of bounds: comprehensive/adversarial ---
+
+    async def test_no_block_devices_outside_dev(self, scheduler: Scheduler) -> None:
+        """No block device nodes in /tmp or /home (catches smuggled nodes)."""
+        code = """\
+import os, stat
+
+block_devices = []
+for search_dir in ['/tmp', '/home']:
+    if not os.path.isdir(search_dir):
+        continue
+    for dirpath, dirnames, filenames in os.walk(search_dir):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                s = os.lstat(path)
+                if stat.S_ISBLK(s.st_mode):
+                    block_devices.append(path)
+            except OSError:
+                pass
+
+if block_devices:
+    print(f'FOUND:{",".join(block_devices)}')
+else:
+    print('NONE')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "NONE", f"Block devices outside /dev: {result.stdout}"
+
+    async def test_effective_caps_no_mknod(self, scheduler: Scheduler) -> None:
+        """CAP_MKNOD (bit 27) and CAP_DAC_READ_SEARCH (bit 2) are both clear."""
+        code = """\
+with open('/proc/self/status') as f:
+    for line in f:
+        if line.startswith('CapEff:'):
+            cap_eff = int(line.split(':')[1].strip(), 16)
+            cap_mknod = bool(cap_eff & (1 << 27))
+            cap_dac_read_search = bool(cap_eff & (1 << 2))
+            print(f'CAP_MKNOD:{cap_mknod}')
+            print(f'CAP_DAC_READ_SEARCH:{cap_dac_read_search}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "CAP_MKNOD:False" in result.stdout
+        assert "CAP_DAC_READ_SEARCH:False" in result.stdout
+
+    async def test_sysrq_trigger_not_writable(self, scheduler: Scheduler) -> None:
+        """/proc/sysrq-trigger not writable by UID 1000."""
+        code = """\
+try:
+    with open('/proc/sysrq-trigger', 'w') as f:
+        f.write('h')
+    print('WRITTEN')
+except (PermissionError, OSError) as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected sysrq-trigger write to be blocked.\nstdout: {result.stdout}"
+        )

@@ -309,7 +309,7 @@ fn setup_zram(kver: &str) {
     log_fmt!("[zram] swap enabled");
 
     // Security: remove device node after swapon (kernel holds internal reference).
-    let _ = fs::remove_file("/dev/zram0");
+    remove_device_node("/dev/zram0");
 
     // VM tuning (these can fail silently - non-critical)
     let _ = fs::write("/proc/sys/vm/page-cluster", "0");
@@ -379,6 +379,25 @@ fn redirect_to_console() {
 
 fn error(msg: &str) {
     log_fmt!("[init] ERROR: {}", msg);
+}
+
+fn remove_device_node(path: &str) {
+    // Try to remove the device node entirely
+    if fs::remove_file(path).is_ok() {
+        return;
+    }
+    // Fallback: chmod 000 blocks UID 1000 access (CAP_DAC_OVERRIDE can bypass,
+    // but user code runs as UID 1000). Effective on devtmpfs.
+    if let Ok(cpath) = CString::new(path) {
+        if unsafe { libc::chmod(cpath.as_ptr(), 0) } == 0 {
+            log_fmt!(
+                "[init] WARNING: could not remove {}, chmod 000 applied",
+                path
+            );
+            return;
+        }
+    }
+    log_fmt!("[init] WARNING: could not remove or chmod {}", path);
 }
 
 fn fallback_shell() -> ! {
@@ -539,7 +558,7 @@ fn main() {
     // so finit_module() returns EPERM for every module, preventing boot.
     // See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=941827
     for path in ["/dev/mem", "/dev/kmem", "/dev/port"] {
-        let _ = fs::remove_file(path);
+        remove_device_node(path);
     }
 
     // Shared memory for POSIX semaphores (Python multiprocessing, etc.)
@@ -645,7 +664,11 @@ fn main() {
     // Security: remove block device node after mount. The kernel references the
     // device internally via bdevfs (indexed by major:minor), not the /dev path.
     // Prevents raw disk reads that bypass filesystem permissions.
-    let _ = fs::remove_file("/dev/vda");
+    remove_device_node("/dev/vda");
+
+    // Security: remove /dev/block/ directory (devtmpfs-created symlinks like 253:0 -> ../vda).
+    // Eliminates alternative path to block device nodes.
+    let _ = fs::remove_dir_all("/dev/block");
 
     // Security: harden kernel attack surface via sysctl.
     // These settings disable kernel subsystems that have been repeatedly exploited
