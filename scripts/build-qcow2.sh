@@ -111,11 +111,11 @@ DOCKERFILE
 # Cache helpers - content-addressable build caching via .hash sidecar files
 # =============================================================================
 
-# Compute hash for qcow2 inputs
-compute_qcow2_hash() {
+# Compute rootfs hash — everything EXCEPT guest-agent binary.
+# Used to detect when only guest-agent changed (guestfish patch fast-path).
+compute_rootfs_hash() {
     local variant=$1
     local target_arch=$2
-    local guest_agent=$3
 
     (
         # Version info
@@ -141,15 +141,24 @@ compute_qcow2_hash() {
                 ;;
         esac
 
-        # Guest agent binary hash (includes init logic)
-        sha256sum "$guest_agent" 2>/dev/null | cut -d' ' -f1 || echo "no-agent"
-
         # Build script itself (invalidate cache when build logic changes)
         cat "$SCRIPT_DIR/build-qcow2.sh" 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }
 
-# Check if output is up-to-date (hash matches)
+# Compute full hash — rootfs + guest-agent binary.
+# A full hash hit means nothing changed at all.
+compute_qcow2_hash() {
+    local rootfs_hash=$1
+    local guest_agent=$2
+
+    (
+        echo "rootfs=$rootfs_hash"
+        sha256sum "$guest_agent" 2>/dev/null | cut -d' ' -f1 || echo "no-agent"
+    ) | sha256sum | cut -d' ' -f1
+}
+
+# Check if output is up-to-date (line 1 of .hash matches)
 cache_hit() {
     local output_file=$1
     local current_hash=$2
@@ -157,18 +166,33 @@ cache_hit() {
 
     if [ -f "$output_file" ] && [ -f "$hash_file" ]; then
         local cached_hash
-        cached_hash=$(cat "$hash_file" 2>/dev/null || echo "")
+        cached_hash=$(head -1 "$hash_file" 2>/dev/null || echo "")
         [ "$cached_hash" = "$current_hash" ]
     else
         return 1
     fi
 }
 
+# Read rootfs hash from line 2 of .hash file (empty string if absent)
+read_rootfs_hash() {
+    local output_file=$1
+    local hash_file="${output_file}.hash"
+    sed -n '2p' "$hash_file" 2>/dev/null || echo ""
+}
+
 # Save hash after successful build
+# Usage: save_hash <output_file> <full_hash> [rootfs_hash]
 save_hash() {
     local output_file=$1
     local hash=$2
-    echo "$hash" > "${output_file}.hash"
+    local rootfs_hash="${3:-}"
+    local hash_file="${output_file}.hash"
+
+    if [ -n "$rootfs_hash" ]; then
+        printf '%s\n%s\n' "$hash" "$rootfs_hash" > "$hash_file"
+    else
+        echo "$hash" > "$hash_file"
+    fi
 }
 
 # =============================================================================
@@ -363,6 +387,74 @@ create_raw_rootfs() {
     create_alpine_rootfs "$rootfs_dir" "$docker_platform" $RAW_PKGS
 }
 
+# Build or reuse the guestfs Docker image (shared by full rebuild and patch paths)
+# Sets GUESTFS_IMAGE and HOST_PLATFORM variables for callers
+ensure_guestfs_image() {
+    GUESTFS_IMAGE="exec-sandbox-guestfs:latest"
+    # Handle both macOS (arm64) and Linux (aarch64)
+    local host_arch
+    case "$(uname -m)" in
+        arm64|aarch64) host_arch="arm64" ;;
+        *) host_arch="amd64" ;;
+    esac
+    HOST_PLATFORM="linux/${host_arch}"
+
+    # Scope includes host arch to avoid cache collisions in multi-arch CI
+    local cache_scope="guestfs-${host_arch}"
+    local cache_args=()
+    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
+    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
+
+    DOCKER_BUILDKIT=1 docker buildx build \
+        --platform "$HOST_PLATFORM" \
+        --load \
+        --tag "$GUESTFS_IMAGE" \
+        "${cache_args[@]+"${cache_args[@]}"}" \
+        --quiet \
+        -f - . <<'DOCKERFILE'
+# syntax=docker/dockerfile:1.4
+FROM debian:sid-slim
+# Use BuildKit cache mount for apt (persists across builds)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache && \
+    apt-get update -qq && \
+    apt-get install -y -qq guestfs-tools qemu-utils >/dev/null 2>&1
+DOCKERFILE
+}
+
+# Patch guest-agent binary in an existing qcow2 image using guestfish.
+# Much faster than a full rebuild (~41s vs ~3:52 for python).
+patch_guest_agent() {
+    local qcow2_img=$1
+    local guest_agent=$2
+
+    echo "  Patching guest-agent in $qcow2_img..."
+    ensure_guestfs_image
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    cp "$guest_agent" "$tmp_dir/guest-agent"
+
+    # Replace binary in-place using guestfish.
+    # /dev/sda: libguestfs presents the first disk as SCSI (Debian's default backend).
+    # This matches our qcow2 images which have a single ext4 filesystem on the whole device
+    # (created by virt-make-fs --type=ext4 without a partition table).
+    docker run --rm \
+        -v "$tmp_dir:/patch" \
+        -v "$(dirname "$qcow2_img"):/output" \
+        --platform "$HOST_PLATFORM" \
+        "$GUESTFS_IMAGE" \
+        guestfish --rw -a "/output/$(basename "$qcow2_img")" run \
+            : mount /dev/sda / \
+            : upload /patch/guest-agent /usr/local/bin/guest-agent \
+            : chmod 0555 /usr/local/bin/guest-agent \
+            : sync
+
+    rm -rf "$tmp_dir"
+}
+
 build_qcow2() {
     local variant=$1
     local target_arch=$2
@@ -382,16 +474,41 @@ build_qcow2() {
     local guest_agent
     guest_agent=$(find_guest_agent "$target_arch")
 
-    # Check cache
     local qcow2_img="$OUTPUT_DIR/$output_name.qcow2"
-    local current_hash
-    current_hash=$(compute_qcow2_hash "$variant" "$target_arch" "$guest_agent")
 
+    # Three-way cache decision:
+    #   1. Full hash match → skip (nothing changed)
+    #   2. Rootfs hash match + qcow2 exists → guestfish patch (only guest-agent changed)
+    #   3. Rootfs hash miss → full rebuild (packages/versions changed)
+    local rootfs_hash current_hash
+    rootfs_hash=$(compute_rootfs_hash "$variant" "$target_arch")
+    current_hash=$(compute_qcow2_hash "$rootfs_hash" "$guest_agent")
+
+    # Case 1: full hash hit — nothing changed
     if cache_hit "$qcow2_img" "$current_hash"; then
         echo "qcow2 up-to-date: $output_name (cache hit)"
         return 0
     fi
 
+    # Case 2: rootfs hash hit + valid image exists — only guest-agent changed, patch it
+    local cached_rootfs_hash
+    cached_rootfs_hash=$(read_rootfs_hash "$qcow2_img")
+    if [ -f "$qcow2_img" ] && [ -n "$cached_rootfs_hash" ] && [ "$cached_rootfs_hash" = "$rootfs_hash" ]; then
+        # Validate qcow2 header before patching (guards against truncated images from interrupted builds)
+        if qemu-img check "$qcow2_img" >/dev/null 2>&1; then
+            echo "Patching $output_name (guest-agent changed, rootfs unchanged)..."
+            echo "  Using guest-agent: $guest_agent"
+            patch_guest_agent "$qcow2_img" "$guest_agent"
+            save_hash "$qcow2_img" "$current_hash" "$rootfs_hash"
+            echo "Patched: $qcow2_img"
+            return 0
+        else
+            echo "WARNING: $output_name qcow2 is corrupt, falling through to full rebuild" >&2
+            rm -f "$qcow2_img" "${qcow2_img}.hash"
+        fi
+    fi
+
+    # Case 3: rootfs hash miss — full rebuild
     echo "Building $output_name..."
     echo "  Using guest-agent: $guest_agent"
 
@@ -432,45 +549,13 @@ build_qcow2() {
     # Create qcow2 using Docker (virt-make-fs requires Linux)
     echo "  Creating qcow2..."
     mkdir -p "$OUTPUT_DIR"
-    local qcow2_img="$OUTPUT_DIR/$output_name.qcow2"
 
     local rootfs_size
     rootfs_size=$(du -sm "$rootfs_dir" | cut -f1)
     local img_size=$((rootfs_size + 100))
 
     # Build guestfs image with BuildKit cache (caches apt-get install across builds)
-    local guestfs_image="exec-sandbox-guestfs:latest"
-    # Handle both macOS (arm64) and Linux (aarch64)
-    local host_arch
-    case "$(uname -m)" in
-        arm64|aarch64) host_arch="arm64" ;;
-        *) host_arch="amd64" ;;
-    esac
-    local host_platform="linux/${host_arch}"
-
-    # Scope includes host arch to avoid cache collisions in multi-arch CI
-    local cache_scope="guestfs-${host_arch}"
-    local cache_args=()
-    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
-    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
-
-    DOCKER_BUILDKIT=1 docker buildx build \
-        --platform "$host_platform" \
-        --load \
-        --tag "$guestfs_image" \
-        "${cache_args[@]+"${cache_args[@]}"}" \
-        --quiet \
-        -f - . <<'DOCKERFILE'
-# syntax=docker/dockerfile:1.4
-FROM debian:sid-slim
-# Use BuildKit cache mount for apt (persists across builds)
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    rm -f /etc/apt/apt.conf.d/docker-clean && \
-    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache && \
-    apt-get update -qq && \
-    apt-get install -y -qq guestfs-tools qemu-utils >/dev/null 2>&1
-DOCKERFILE
+    ensure_guestfs_image
 
     # Run virt-make-fs + qemu-img using cached image
     # Note: cleanup inside Docker because files created by Docker (root) and chowned
@@ -479,8 +564,8 @@ DOCKERFILE
     docker run --rm \
         -v "$tmp_dir:/build" \
         -v "$OUTPUT_DIR:/output" \
-        --platform "$host_platform" \
-        "$guestfs_image" \
+        --platform "$HOST_PLATFORM" \
+        "$GUESTFS_IMAGE" \
         bash -c "
             # Fix ownership: macOS Docker export (VirtioFS) loses UID 0 on
             # local output, so system files may be owned by the build user.
@@ -498,7 +583,8 @@ DOCKERFILE
         "
 
     rm -rf "$tmp_dir"
-    save_hash "$qcow2_img" "$current_hash"
+    # Save full hash (line 1) + rootfs hash (line 2) for future patch fast-path
+    save_hash "$qcow2_img" "$current_hash" "$rootfs_hash"
     echo "Built: $qcow2_img"
 }
 
@@ -509,6 +595,9 @@ main() {
     check_deps
 
     if [ "$target" = "all" ]; then
+        # Pre-build guestfs image once before forking (avoids 3 redundant concurrent builds)
+        ensure_guestfs_image
+
         # Build all variants in parallel
         build_qcow2 "python" "$arch" &
         local pid_python=$!
