@@ -188,7 +188,7 @@ class TestNonRootPrivilegeBlocked:
     async def test_python_mount_blocked(self, scheduler: Scheduler) -> None:
         """Python ctypes mount(2) fails with EPERM for non-root."""
         code = """\
-import ctypes, errno
+import ctypes
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 ret = libc.mount(b"none", b"/mnt", b"tmpfs", 0, None)
 print(f"ret={ret} errno={ctypes.get_errno()}")
@@ -205,6 +205,34 @@ print(f"ret={ret} errno={ctypes.get_errno()}")
             language=Language.RAW,
         )
         assert "exit=1" in result.stdout or "ermission" in result.stdout
+
+    async def test_usr_readonly_mount(self, scheduler: Scheduler) -> None:
+        """Writing to /usr returns EROFS (read-only filesystem), not just EACCES."""
+        code = """\
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+# O_WRONLY | O_CREAT = 0x41
+fd = libc.open(b"/usr/local/bin/evil", 0x41, 0o644)
+err = ctypes.get_errno()
+print(f"fd={fd} errno={err}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        # EROFS = 30 (read-only filesystem)
+        assert "errno=30" in result.stdout
+
+    async def test_no_new_privs_set(self, scheduler: Scheduler) -> None:
+        """REPL subprocess has no_new_privs set (blocks SUID escalation)."""
+        code = """\
+with open("/proc/self/status") as f:
+    for line in f:
+        if line.startswith("NoNewPrivs:"):
+            print(line.strip())
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NoNewPrivs:\t1" in result.stdout
 
     async def test_kill_pid1_blocked(self, scheduler: Scheduler) -> None:
         """Non-root cannot signal PID 1 (guest-agent)."""
@@ -271,7 +299,7 @@ except PermissionError:
     async def test_kernel_module_load_blocked(self, scheduler: Scheduler) -> None:
         """Loading kernel modules requires CAP_SYS_MODULE — blocked for non-root."""
         code = """\
-import ctypes, errno
+import ctypes
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 # init_module syscall (175 on x86_64, 105 on aarch64)
 import platform

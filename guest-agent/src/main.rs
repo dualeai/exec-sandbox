@@ -512,6 +512,24 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         .uid(1000)
         .gid(1000);
 
+    // Defense-in-depth: harden the REPL child process before exec.
+    // SAFETY: pre_exec runs in the forked child before exec. Both prctl calls
+    // are async-signal-safe and work at any privilege level.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Block privilege escalation via execve (SUID/SGID binaries, file capabilities).
+            // Inherited by all children including fork().
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Prevent ptrace attach and core dumps from other processes at same UID.
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -2701,6 +2719,47 @@ fn setup_init_environment() {
         .args(["640", "/etc/shadow"])
         .status();
     eprintln!("Hardened system directory permissions (CIS 6.1.x)");
+
+    // Read-only bind remount of /usr with nosuid (CIS: nodev,ro for /usr).
+    // Protects guest-agent binary and all system binaries from modification.
+    // Must happen AFTER chmod 755 /usr above since that writes to /usr metadata.
+    // Does NOT include noexec — system binaries in /usr/bin must remain executable.
+    // SAFETY: CStr pointers are compiler-verified null-terminated, flags are
+    // kernel-defined constants, and return values are checked.
+    unsafe {
+        let usr = c"/usr";
+        // Step 1: bind mount /usr onto itself
+        let ret = libc::mount(
+            usr.as_ptr(),
+            usr.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        );
+        if ret != 0 {
+            eprintln!(
+                "Warning: bind mount /usr failed: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            // Step 2: remount read-only with nosuid
+            let ret = libc::mount(
+                std::ptr::null(),
+                usr.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID,
+                std::ptr::null(),
+            );
+            if ret != 0 {
+                eprintln!(
+                    "Warning: RO remount /usr failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                eprintln!("Mounted /usr read-only with nosuid");
+            }
+        }
+    }
 
     // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
     // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.

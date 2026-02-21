@@ -410,7 +410,7 @@ build_qcow2() {
     # Copy guest-agent
     mkdir -p "$rootfs_dir/usr/local/bin"
     cp "$guest_agent" "$rootfs_dir/usr/local/bin/guest-agent"
-    chmod 755 "$rootfs_dir/usr/local/bin/guest-agent"
+    chmod 555 "$rootfs_dir/usr/local/bin/guest-agent"
 
     # Configure DNS (gvproxy gateway) - duplicate for Alpine musl quirk
     # Note: init-wrapper.sh and network-init.start removed - logic moved to guest-agent
