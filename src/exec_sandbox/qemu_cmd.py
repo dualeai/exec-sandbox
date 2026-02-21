@@ -342,10 +342,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # - panic=-1: Immediate reboot on panic (boot timeout handles loops)
             # - i8042.nokbd: Skip keyboard port check (no PS/2 in VM)
             # - tsc=reliable: Trust TSC clocksource (x86_64 only, kvmclock stable)
+            # - rootflags=noatime: hint only; tiny-init mounts rootfs with
+            #   MS_RDONLY|MS_NOATIME|MS_NOSUID|MS_NODEV (read-only rootfs)
             # See: https://github.com/firecracker-microvm/firecracker
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce"
             # init.net=1: load network modules when networking is needed
             # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
             # init.balloon=1: load balloon module (always, needed for warm pool)

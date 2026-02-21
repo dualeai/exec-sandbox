@@ -170,9 +170,8 @@ except (PermissionError, OSError):
     async def test_hardlink_etc_passwd_write(self, scheduler: Scheduler) -> None:
         """Write through hard link to /etc/passwd is blocked.
 
-        Hard link creation may succeed (user can read /etc/passwd and write
-        to /home/user), but the file's 644 root:root permissions still
-        prevent UID 1000 from writing through the link.
+        Hard link creation always fails (EXDEV: /home/user is tmpfs, /etc is
+        rootfs — different filesystems). Fallback tests /etc/passwd directly.
         """
         code = """\
 import os

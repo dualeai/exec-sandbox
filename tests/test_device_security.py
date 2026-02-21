@@ -490,7 +490,7 @@ except OSError:
             assert r2.exit_code == 0, f"stderr: {r2.stderr}"
             assert "CORRECTLY_BLOCKED" in r2.stdout
 
-            # Step 3: Verify rootfs (/home/user) still works
+            # Step 3: Verify /home/user (tmpfs) still works
             r3 = await session.exec(
                 """\
 with open('/home/user/still_works.txt', 'w') as f:
@@ -848,11 +848,17 @@ print(f'SWAPPINESS:{val}')
 
     async def test_shell_redirect_write_blocked(self, scheduler: Scheduler) -> None:
         """Shell redirect to /proc/sys is blocked too."""
-        result = await scheduler.run(
-            code="echo 0 > /proc/sys/kernel/randomize_va_space 2>&1; echo EXIT:$?",
-            language=Language.RAW,
-        )
-        # Shell may return non-zero exit code — we only care that the write failed
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["sh", "-c", "echo 0 > /proc/sys/kernel/randomize_va_space 2>&1; echo EXIT:$?"],
+    capture_output=True, text=True, timeout=5,
+)
+print(r.stdout)
+print(r.stderr, end='')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
         out = result.stdout + result.stderr
         assert "EXIT:0" not in result.stdout or "Read-only" in out or "Permission denied" in out
 
@@ -1016,36 +1022,61 @@ else:
 
     async def test_remount_rw_blocked(self, scheduler: Scheduler) -> None:
         """mount -o remount,rw /proc/sys requires CAP_SYS_ADMIN."""
-        result = await scheduler.run(
-            code="mount -o remount,rw /proc/sys 2>&1; echo EXIT:$?",
-            language=Language.RAW,
-        )
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "-o", "remount,rw", "/proc/sys"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, (
             f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
         )
 
     async def test_bind_mount_shadow_blocked(self, scheduler: Scheduler) -> None:
         """Bind tmpfs over /proc/sys requires CAP_SYS_ADMIN."""
-        result = await scheduler.run(
-            code="mount -t tmpfs none /proc/sys 2>&1; echo EXIT:$?",
-            language=Language.RAW,
-        )
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "-t", "tmpfs", "none", "/proc/sys"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected tmpfs shadow mount to fail.\nstdout: {result.stdout}"
 
     async def test_umount_proc_sys_blocked(self, scheduler: Scheduler) -> None:
         """umount /proc/sys requires CAP_SYS_ADMIN."""
-        result = await scheduler.run(
-            code="umount /proc/sys 2>&1; echo EXIT:$?",
-            language=Language.RAW,
-        )
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["umount", "/proc/sys"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected umount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
 
     async def test_mount_second_proc_blocked(self, scheduler: Scheduler) -> None:
         """Mount new procfs at /tmp/proc requires CAP_SYS_ADMIN."""
-        result = await scheduler.run(
-            code="mkdir -p /tmp/proc && mount -t proc proc /tmp/proc 2>&1; echo EXIT:$?",
-            language=Language.RAW,
-        )
+        code = """\
+import subprocess, os
+os.makedirs("/tmp/proc", exist_ok=True)
+r = subprocess.run(
+    ["mount", "-t", "proc", "proc", "/tmp/proc"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected secondary procfs mount to fail.\nstdout: {result.stdout}"
 
     async def test_sysrq_disabled(self, scheduler: Scheduler) -> None:
@@ -1420,3 +1451,265 @@ except OSError as e:
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected sysrq-trigger write to be blocked.\nstdout: {result.stdout}"
         )
+
+
+# =============================================================================
+# Root filesystem read-only hardening
+# =============================================================================
+class TestRootFsReadonly:
+    """Root filesystem is mounted read-only with nosuid and nodev flags.
+
+    Matches AWS Lambda rootfs flags (ro,nosuid,nodev,noatime). The rootfs
+    never enters rw state — tiny-init mounts it with MS_RDONLY from boot.
+    Prevents writing to /etc/passwd, /sbin, planting SUID binaries, or
+    remounting rw to DoS subsequent code.
+    """
+
+    ROOT_MOUNT_LINE = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/':
+            print(line.strip())
+            break
+"""
+
+    async def test_root_has_ro_flag(self, scheduler: Scheduler) -> None:
+        """Root filesystem has ro mount flag."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/':
+            opts = parts[3].split(',')
+            print(f'RO:{"ro" in opts}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "RO:True" in result.stdout, f"Expected / to be mounted read-only.\nstdout: {result.stdout}"
+
+    async def test_root_has_nosuid_flag(self, scheduler: Scheduler) -> None:
+        """Root filesystem has nosuid mount flag."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/':
+            opts = parts[3].split(',')
+            print(f'NOSUID:{"nosuid" in opts}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NOSUID:True" in result.stdout, f"Expected / to have nosuid.\nstdout: {result.stdout}"
+
+    async def test_root_has_nodev_flag(self, scheduler: Scheduler) -> None:
+        """Root filesystem has nodev mount flag."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/':
+            opts = parts[3].split(',')
+            print(f'NODEV:{"nodev" in opts}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NODEV:True" in result.stdout, f"Expected / to have nodev.\nstdout: {result.stdout}"
+
+    async def test_write_to_var_fails(self, scheduler: Scheduler) -> None:
+        """Writing to /var fails with EROFS on read-only rootfs."""
+        code = """\
+try:
+    with open('/var/test_file', 'w') as f:
+        f.write('test')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), f"Expected write to /var to fail.\nstdout: {result.stdout}"
+
+    async def test_create_file_in_sbin_fails(self, scheduler: Scheduler) -> None:
+        """Writing to /sbin fails with EROFS on read-only rootfs."""
+        code = """\
+try:
+    with open('/sbin/test_file', 'w') as f:
+        f.write('test')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), f"Expected write to /sbin to fail.\nstdout: {result.stdout}"
+
+    async def test_remount_rw_root_fails(self, scheduler: Scheduler) -> None:
+        """mount -o remount,rw / requires CAP_SYS_ADMIN — fails as UID 1000."""
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "-o", "remount,rw", "/"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "EXIT:0" not in result.stdout, f"Expected remount rw / to fail.\nstdout: {result.stdout}"
+
+    async def test_home_user_still_writable(self, scheduler: Scheduler) -> None:
+        """/home/user is writable (tmpfs overlay on read-only rootfs)."""
+        code = """\
+import os
+path = '/home/user/test_rw.txt'
+with open(path, 'w') as f:
+    f.write('writable')
+with open(path) as f:
+    data = f.read()
+os.unlink(path)
+print(f'OK:{data}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "OK:writable" in result.stdout
+
+    async def test_tmp_still_writable(self, scheduler: Scheduler) -> None:
+        """/tmp is writable (separate tmpfs mount)."""
+        code = """\
+import os
+path = '/tmp/test_rw.txt'
+with open(path, 'w') as f:
+    f.write('writable')
+with open(path) as f:
+    data = f.read()
+os.unlink(path)
+print(f'OK:{data}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "OK:writable" in result.stdout
+
+    async def test_dev_shm_still_writable(self, scheduler: Scheduler) -> None:
+        """/dev/shm is writable (separate tmpfs mount)."""
+        code = """\
+import os
+path = '/dev/shm/test_rw.txt'
+with open(path, 'w') as f:
+    f.write('writable')
+with open(path) as f:
+    data = f.read()
+os.unlink(path)
+print(f'OK:{data}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "OK:writable" in result.stdout
+
+
+# =============================================================================
+# /home/user tmpfs mount hardening
+# =============================================================================
+class TestHomeUserTmpfs:
+    """/home/user is mounted as tmpfs with nosuid and nodev flags.
+
+    Zero-copy scratch space: /home/user on rootfs is empty (cloudpickle
+    installed to /usr/lib/python3/site-packages), so the tmpfs mount
+    overlays an empty directory. This provides writable user space without
+    compromising the read-only rootfs.
+    """
+
+    HOME_MOUNT_LINE = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        if ' /home/user ' in line:
+            print(line.strip())
+            break
+"""
+
+    async def test_is_tmpfs(self, scheduler: Scheduler) -> None:
+        """/home/user filesystem type is tmpfs."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/home/user':
+            print(f'FSTYPE:{parts[2]}')
+            break
+    else:
+        print('MOUNT_NOT_FOUND')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "FSTYPE:tmpfs" in result.stdout, f"Expected /home/user to be tmpfs.\nstdout: {result.stdout}"
+
+    async def test_nosuid_flag(self, scheduler: Scheduler) -> None:
+        """/home/user has nosuid mount flag."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/home/user':
+            opts = parts[3].split(',')
+            print(f'NOSUID:{"nosuid" in opts}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NOSUID:True" in result.stdout
+
+    async def test_nodev_flag(self, scheduler: Scheduler) -> None:
+        """/home/user has nodev mount flag."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/home/user':
+            opts = parts[3].split(',')
+            print(f'NODEV:{"nodev" in opts}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NODEV:True" in result.stdout
+
+    async def test_no_noexec_flag(self, scheduler: Scheduler) -> None:
+        """/home/user does NOT have noexec (uv/bun install executables)."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/home/user':
+            opts = parts[3].split(',')
+            print(f'NOEXEC_PRESENT:{"noexec" in opts}')
+            break
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NOEXEC_PRESENT:False" in result.stdout
+
+    async def test_cloudpickle_importable(self, scheduler: Scheduler) -> None:
+        """cloudpickle is importable (loaded from /usr/lib/python3/site-packages)."""
+        code = """\
+import cloudpickle
+print(f'VERSION:{cloudpickle.__version__}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "VERSION:" in result.stdout
+
+    async def test_owned_by_uid_1000(self, scheduler: Scheduler) -> None:
+        """/home/user is owned by UID 1000 (sandbox user)."""
+        code = """\
+import os
+s = os.stat('/home/user')
+print(f'UID:{s.st_uid}')
+print(f'GID:{s.st_gid}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "UID:1000" in result.stdout
+        assert "GID:1000" in result.stdout
