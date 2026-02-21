@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import termios
@@ -282,6 +283,9 @@ def parse_upload_spec(spec: str) -> tuple[str, str]:
             f"Empty local path in: '{spec}'. Use LOCAL:GUEST format.",
             param_hint="'--upload'",
         )
+    # Expand ~ since shell can't do it inside colon-separated args
+    # Uses os.path.expanduser (not Path.expanduser) to avoid normalizing ./relative paths
+    local = os.path.expanduser(local)  # noqa: PTH111
     if not Path(local).exists():
         raise click.BadParameter(
             f"Local file not found: '{local}'.",
@@ -319,6 +323,14 @@ def parse_download_spec(spec: str) -> tuple[str, str]:
     if not local:
         raise click.BadParameter(
             f"Empty local path in: '{spec}'. Use GUEST:LOCAL format (e.g. output.csv:./out.csv).",
+            param_hint="'--download'",
+        )
+    # Expand ~ since shell can't do it inside colon-separated args
+    # Uses os.path.expanduser (not Path.expanduser) to avoid normalizing ./relative paths
+    local = os.path.expanduser(local)  # noqa: PTH111
+    if Path(local).is_dir():
+        raise click.BadParameter(
+            f"Local path is a directory, not a file: '{local}'. Specify a full file path (e.g. ~/results/output.csv).",
             param_hint="'--download'",
         )
     return (guest, local)

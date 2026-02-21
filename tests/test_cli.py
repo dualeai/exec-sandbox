@@ -1121,6 +1121,32 @@ class TestParseUploadSpec:
         local_path, _ = parse_upload_spec(f"{local_file}:config")
         assert local_path == str(local_file)
 
+    # --- Tilde expansion ---
+
+    def test_tilde_expanded_in_local_path(self, tmp_path: Path) -> None:
+        """Expands ~ to home directory in local path."""
+        local_file = tmp_path / "data.csv"
+        local_file.write_text("content")
+        with patch("os.path.expanduser", return_value=str(local_file)):
+            local_path, guest_path = parse_upload_spec("~/data.csv:data.csv")
+        assert local_path == str(local_file)
+        assert guest_path == "data.csv"
+
+    def test_tilde_prefix_user_expanded(self, tmp_path: Path) -> None:
+        """Expands ~user to that user's home directory."""
+        local_file = tmp_path / "data.csv"
+        local_file.write_text("content")
+        with patch("os.path.expanduser", return_value=str(local_file)):
+            local_path, _ = parse_upload_spec("~someone/data.csv:data.csv")
+        assert local_path == str(local_file)
+
+    def test_no_tilde_unchanged(self, tmp_path: Path) -> None:
+        """Paths without ~ are unchanged by expanduser."""
+        local_file = tmp_path / "data.csv"
+        local_file.write_text("content")
+        local_path, _ = parse_upload_spec(f"{local_file}:data.csv")
+        assert local_path == str(local_file)
+
     # --- Error cases ---
 
     def test_missing_colon(self) -> None:
@@ -1268,6 +1294,33 @@ class TestParseDownloadSpec:
         assert guest_path == "subdir/"
         assert local_path == "subdir"
 
+    # --- Tilde expansion ---
+
+    def test_tilde_expanded_in_local_path(self) -> None:
+        """Expands ~ to home directory in local path."""
+        guest_path, local_path = parse_download_spec("output.csv:~/result.csv")
+        assert guest_path == "output.csv"
+        assert "~" not in local_path
+        assert local_path.endswith("/result.csv")
+
+    def test_tilde_prefix_user_expanded(self) -> None:
+        """Expands ~user to that user's home directory (or leaves unchanged if user unknown)."""
+        import os
+
+        expected = os.path.expanduser("~someone/result.csv")  # noqa: PTH111
+        _, local_path = parse_download_spec("output.csv:~someone/result.csv")
+        assert local_path == expected
+
+    def test_no_tilde_unchanged(self) -> None:
+        """Paths without ~ are unchanged by expanduser."""
+        _, local_path = parse_download_spec("output.csv:./result.csv")
+        assert local_path == "./result.csv"
+
+    def test_shorthand_no_tilde(self) -> None:
+        """Shorthand (no colon) paths without ~ are unchanged."""
+        _, local_path = parse_download_spec("output.csv")
+        assert local_path == "output.csv"
+
     # --- Boundary cases ---
 
     def test_root_path_shorthand(self) -> None:
@@ -1283,12 +1336,6 @@ class TestParseDownloadSpec:
 
         with pytest.raises(click.BadParameter, match="Empty local path"):
             parse_download_spec(".")
-
-    def test_dotdot_shorthand(self) -> None:
-        """Guest path '..' — basename is '..', returned as-is (guest agent validates)."""
-        guest_path, local_path = parse_download_spec("..")
-        assert guest_path == ".."
-        assert local_path == ".."
 
     # --- Error cases ---
 
@@ -1326,6 +1373,34 @@ class TestParseDownloadSpec:
 
         with pytest.raises(click.BadParameter, match="Empty guest path"):
             parse_download_spec("::")
+
+    def test_dotdot_shorthand(self) -> None:
+        """Guest path '..' — basename is '..', rejected because '..' is a directory."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="directory"):
+            parse_download_spec("..")
+
+    def test_tilde_alone_as_local_rejected(self) -> None:
+        """Bare ~ as local path (full format) is rejected as directory."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="directory"):
+            parse_download_spec("output.csv:~")
+
+    def test_tilde_alone_shorthand_rejected(self) -> None:
+        """Shorthand ~ is rejected as directory."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="directory"):
+            parse_download_spec("~")
+
+    def test_existing_directory_as_local_rejected(self, tmp_path: Path) -> None:
+        """Existing directory as local path is rejected."""
+        import click
+
+        with pytest.raises(click.BadParameter, match="directory"):
+            parse_download_spec(f"output.csv:{tmp_path}")
 
 
 class TestCliFileIoIntegration:
