@@ -572,7 +572,13 @@ fn main() {
         MS_NOSUID | MS_NODEV | MS_NOEXEC,
         "size=64M,mode=1777",
     );
-    mount("proc", "/proc", "proc", 0, "");
+    // hidepid=2: hide /proc/[pid] entries for processes not owned by the
+    // querying user. Prevents UID 1000 from reading /proc/1/maps (memory layout
+    // leak). /proc/self is always exempted by the kernel. System-wide files
+    // (/proc/meminfo, /proc/cpuinfo, /proc/net/*) are unaffected.
+    // MS_MOVE in switch_root() preserves this option (superblock not modified).
+    // Available since Linux 3.3; see proc(5).
+    mount("proc", "/proc", "proc", 0, "hidepid=2");
     mount("sysfs", "/sys", "sysfs", 0, "");
     // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
     // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
