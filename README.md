@@ -437,6 +437,20 @@ Returned by `Session.list_files()`.
 | `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
 | `AssetError` | Asset download/verification failed |
 
+## Session Resilience
+
+Sessions survive user code failures. Only VM-level communication errors close a session.
+
+| Failure | Exit Code | Session | State | Next `exec()` |
+|---------|-----------|---------|-------|----------------|
+| Exception (ValueError, etc.) | 1 | Alive | Preserved | Works, state intact |
+| `sys.exit(n)` | n | Alive | Preserved | Works, state intact |
+| Syntax error | 1 | Alive | Preserved | Works, state intact |
+| `os._exit(n)` | n | Alive | **Reset** | Works, fresh REPL |
+| Signal (SIGKILL, OOM kill) | 128 + signal | Alive | **Reset** | Works, fresh REPL |
+| Timeout | -1 | Alive | **Reset** | Works, fresh REPL |
+| VM communication failure | N/A | **Closed** | Lost | `SessionClosedError` |
+
 ## Pitfalls
 
 ```python
