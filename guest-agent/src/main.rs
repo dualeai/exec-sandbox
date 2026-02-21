@@ -2801,6 +2801,19 @@ fn setup_init_environment() {
         eprintln!("Mounted /etc/resolv.conf read-only");
     }
 
+    // Read-only bind remount of /proc/sys (prevents sysctl modification).
+    // Blocks the most dangerous attack vectors:
+    // - core_pattern pipe-to-binary (arbitrary root code execution on crash)
+    // - modprobe path hijack (root code execution on unknown binary format)
+    // - randomize_va_space=0 (disables ASLR system-wide)
+    // - ip_forward (network pivoting), hostname, panic, panic_on_oom (DoS)
+    // All sysctl tuning (page-cluster, swappiness, etc.) is done by tiny-init
+    // during setup_zram() before switch_root, so no writes needed here.
+    // See: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (runc /proc/sys escapes)
+    if mount_readonly(c"/proc/sys") {
+        eprintln!("Mounted /proc/sys read-only");
+    }
+
     // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
     // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.
     // Without lo, user code like http.createServer + fetch('http://localhost:...') fails

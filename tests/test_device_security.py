@@ -2,10 +2,10 @@
 
 Verifies that dangerous device nodes are removed, block device nodes
 (/dev/vda, /dev/zram0) are removed after use, /dev/shm is mounted with
-restrictive flags, and /tmp has nosuid/nodev flags with an explicit inode
-cap (nr_inodes=16384). These are defense-in-depth measures that apply
-regardless of UID — even root (guest-agent) cannot access /dev/mem or
-raw-read the root disk after these changes.
+restrictive flags, /tmp has nosuid/nodev flags with an explicit inode
+cap (nr_inodes=16384), and /proc/sys is read-only. These are defense-in-depth
+measures that apply regardless of UID — even root (guest-agent) cannot
+access /dev/mem or raw-read the root disk after these changes.
 
 Complements test_nonroot_repl.py (privilege escalation from UID 1000) with
 kernel/device-layer hardening that blocks access at the filesystem level.
@@ -685,3 +685,384 @@ else:
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "NONE", f"Block device nodes found: {result.stdout.strip()}"
+
+
+# =============================================================================
+# /proc/sys read-only hardening
+# =============================================================================
+class TestProcSysHardening:
+    """/proc/sys is bind-mounted read-only to prevent sysctl modification.
+
+    Blocks the most dangerous privilege escalation vectors:
+    - core_pattern pipe-to-binary (arbitrary root code execution on crash)
+    - modprobe path hijack (root code execution on unknown binary format)
+    - randomize_va_space=0 (disables ASLR system-wide)
+    - ip_forward (network pivoting), hostname, panic, panic_on_oom (DoS)
+
+    All sysctl tuning is done by tiny-init during setup_zram() before
+    switch_root, so no writes to /proc/sys are needed at runtime.
+
+    See: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (runc /proc/sys escapes)
+    """
+
+    # --- Normal: direct writes to dangerous sysctl paths ---
+
+    async def test_proc_sys_mount_is_readonly(self, scheduler: Scheduler) -> None:
+        """/proc/sys has ro flag in /proc/mounts."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/proc/sys':
+            opts = parts[3].split(',')
+            print(f'RO:{"ro" in opts}')
+            break
+    else:
+        print('MOUNT_NOT_FOUND')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "RO:True" in result.stdout, f"Expected /proc/sys to be mounted read-only.\nstdout: {result.stdout}"
+
+    async def test_write_core_pattern_blocked(self, scheduler: Scheduler) -> None:
+        """Critical: pipe-to-binary root execution via core_pattern cannot be set."""
+        code = """\
+try:
+    with open('/proc/sys/kernel/core_pattern', 'w') as f:
+        f.write('|/tmp/pwned')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to core_pattern to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_write_modprobe_blocked(self, scheduler: Scheduler) -> None:
+        """Critical: module autoloader path cannot be hijacked."""
+        code = """\
+try:
+    with open('/proc/sys/kernel/modprobe', 'w') as f:
+        f.write('/tmp/pwned')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to modprobe to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_write_randomize_va_space_blocked(self, scheduler: Scheduler) -> None:
+        """ASLR cannot be disabled via randomize_va_space."""
+        code = """\
+try:
+    with open('/proc/sys/kernel/randomize_va_space', 'w') as f:
+        f.write('0')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to randomize_va_space to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_write_ip_forward_blocked(self, scheduler: Scheduler) -> None:
+        """IP forwarding cannot be enabled (prevents network pivoting)."""
+        code = """\
+try:
+    with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
+        f.write('1')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to ip_forward to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_write_hostname_blocked(self, scheduler: Scheduler) -> None:
+        """Hostname sysctl cannot be changed."""
+        code = """\
+try:
+    with open('/proc/sys/kernel/hostname', 'w') as f:
+        f.write('pwned')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to hostname to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_write_overcommit_memory_blocked(self, scheduler: Scheduler) -> None:
+        """OOM policy cannot be changed via overcommit_memory."""
+        code = """\
+try:
+    with open('/proc/sys/vm/overcommit_memory', 'w') as f:
+        f.write('1')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to overcommit_memory to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_write_panic_blocked(self, scheduler: Scheduler) -> None:
+        """Panic behavior cannot be changed."""
+        code = """\
+try:
+    with open('/proc/sys/kernel/panic', 'w') as f:
+        f.write('1')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), f"Expected write to panic to be blocked.\nstdout: {result.stdout}"
+
+    async def test_write_panic_on_oom_blocked(self, scheduler: Scheduler) -> None:
+        """Kernel panic on OOM cannot be enabled."""
+        code = """\
+try:
+    with open('/proc/sys/vm/panic_on_oom', 'w') as f:
+        f.write('1')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected write to panic_on_oom to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_read_sysctl_still_works(self, scheduler: Scheduler) -> None:
+        """Reading sysctl values still works (read-only, not hidden)."""
+        code = """\
+with open('/proc/sys/vm/swappiness') as f:
+    val = f.read().strip()
+print(f'SWAPPINESS:{val}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "SWAPPINESS:" in result.stdout
+        val = int(result.stdout.split("SWAPPINESS:")[1].strip())
+        assert 0 <= val <= 200  # valid swappiness range
+
+    # --- Edge: indirect write vectors ---
+
+    async def test_shell_redirect_write_blocked(self, scheduler: Scheduler) -> None:
+        """Shell redirect to /proc/sys is blocked too."""
+        result = await scheduler.run(
+            code="echo 0 > /proc/sys/kernel/randomize_va_space 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        # Shell may return non-zero exit code — we only care that the write failed
+        out = result.stdout + result.stderr
+        assert "EXIT:0" not in result.stdout or "Read-only" in out or "Permission denied" in out
+
+    async def test_open_modes_all_blocked(self, scheduler: Scheduler) -> None:
+        """O_WRONLY, O_RDWR, and O_WRONLY|O_APPEND are all rejected on /proc/sys files."""
+        code = """\
+import os
+
+path = '/proc/sys/kernel/hostname'
+results = []
+for mode_name, mode_flag in [('O_WRONLY', os.O_WRONLY), ('O_RDWR', os.O_RDWR), ('O_APPEND', os.O_WRONLY | os.O_APPEND)]:
+    try:
+        fd = os.open(path, mode_flag)
+        os.close(fd)
+        results.append(f'{mode_name}:OPEN')
+    except OSError as e:
+        results.append(f'{mode_name}:BLOCKED:{e.errno}')
+for r in results:
+    print(r)
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "O_WRONLY:BLOCKED:" in result.stdout
+        assert "O_RDWR:BLOCKED:" in result.stdout
+        assert "O_APPEND:BLOCKED:" in result.stdout
+
+    async def test_nested_path_write_blocked(self, scheduler: Scheduler) -> None:
+        """Read-only applies recursively to deeply nested sysctl paths."""
+        code = """\
+import os
+
+# Try a deeply nested path under /proc/sys
+nested_paths = [
+    '/proc/sys/net/ipv4/conf/all/accept_redirects',
+    '/proc/sys/net/ipv4/conf/all/send_redirects',
+    '/proc/sys/net/core/somaxconn',
+]
+for path in nested_paths:
+    if os.path.exists(path):
+        try:
+            with open(path, 'w') as f:
+                f.write('0')
+            print(f'{path}:WRITTEN')
+        except OSError as e:
+            print(f'{path}:BLOCKED:{e.errno}')
+        break
+else:
+    print('NO_NESTED_PATH_FOUND')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "BLOCKED:" in result.stdout, f"Expected nested sysctl write to be blocked.\nstdout: {result.stdout}"
+
+    async def test_symlink_write_through_blocked(self, scheduler: Scheduler) -> None:
+        """Symlink pointing to /proc/sys path — write through symlink is blocked."""
+        code = """\
+import os
+
+os.symlink('/proc/sys/kernel/hostname', '/tmp/sys_link')
+try:
+    with open('/tmp/sys_link', 'w') as f:
+        f.write('pwned')
+    print('WRITTEN')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+finally:
+    os.unlink('/tmp/sys_link')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected symlink write-through to be blocked.\nstdout: {result.stdout}"
+        )
+
+    # --- Weird: unconventional bypass attempts ---
+
+    async def test_proc_self_fd_reopen_blocked(self, scheduler: Scheduler) -> None:
+        """Open O_RDONLY, reopen via /proc/self/fd/{fd} O_WRONLY — still blocked."""
+        code = """\
+import os
+
+fd_ro = os.open('/proc/sys/kernel/hostname', os.O_RDONLY)
+try:
+    fd_rw = os.open(f'/proc/self/fd/{fd_ro}', os.O_WRONLY)
+    os.close(fd_rw)
+    print('REOPENED')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+finally:
+    os.close(fd_ro)
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected /proc/self/fd reopen to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_ctypes_direct_syscall_blocked(self, scheduler: Scheduler) -> None:
+        """libc.open(path, O_WRONLY) — kernel enforcement, not Python."""
+        code = """\
+import ctypes, os, errno
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+fd = libc.open(b"/proc/sys/kernel/core_pattern", os.O_WRONLY)
+err = ctypes.get_errno()
+if fd == -1:
+    if err == errno.EROFS:
+        print("BLOCKED:erofs")
+    elif err == errno.EACCES:
+        print("BLOCKED:eacces")
+    else:
+        print(f"BLOCKED:errno_{err}")
+else:
+    os.close(fd)
+    print("OPENED")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), f"Expected ctypes open to be blocked.\nstdout: {result.stdout}"
+
+    async def test_truncate_sysctl_blocked(self, scheduler: Scheduler) -> None:
+        """os.truncate() on a sysctl file is blocked at VFS layer."""
+        code = """\
+import os
+
+try:
+    os.truncate('/proc/sys/kernel/hostname', 0)
+    print('TRUNCATED')
+except OSError as e:
+    print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), f"Expected truncate to be blocked.\nstdout: {result.stdout}"
+
+    async def test_binfmt_misc_register_blocked(self, scheduler: Scheduler) -> None:
+        """Cannot register custom binary format interpreters via binfmt_misc."""
+        code = """\
+import os
+
+# binfmt_misc register path (may or may not exist in minimal VM)
+register_path = '/proc/sys/fs/binfmt_misc/register'
+if not os.path.exists(register_path):
+    # binfmt_misc not mounted — also safe
+    print('BLOCKED:not_mounted')
+else:
+    try:
+        with open(register_path, 'w') as f:
+            f.write(':test:M::MZ::/tmp/handler:')
+        print('REGISTERED')
+    except OSError as e:
+        print(f'BLOCKED:{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected binfmt_misc register to be blocked.\nstdout: {result.stdout}"
+        )
+
+    # --- Out of bounds: privilege escalation to remount ---
+
+    async def test_remount_rw_blocked(self, scheduler: Scheduler) -> None:
+        """mount -o remount,rw /proc/sys requires CAP_SYS_ADMIN."""
+        result = await scheduler.run(
+            code="mount -o remount,rw /proc/sys 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        assert "EXIT:0" not in result.stdout, (
+            f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
+        )
+
+    async def test_bind_mount_shadow_blocked(self, scheduler: Scheduler) -> None:
+        """Bind tmpfs over /proc/sys requires CAP_SYS_ADMIN."""
+        result = await scheduler.run(
+            code="mount -t tmpfs none /proc/sys 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        assert "EXIT:0" not in result.stdout, f"Expected tmpfs shadow mount to fail.\nstdout: {result.stdout}"
+
+    async def test_umount_proc_sys_blocked(self, scheduler: Scheduler) -> None:
+        """umount /proc/sys requires CAP_SYS_ADMIN."""
+        result = await scheduler.run(
+            code="umount /proc/sys 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        assert "EXIT:0" not in result.stdout, f"Expected umount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
+
+    async def test_mount_second_proc_blocked(self, scheduler: Scheduler) -> None:
+        """Mount new procfs at /tmp/proc requires CAP_SYS_ADMIN."""
+        result = await scheduler.run(
+            code="mkdir -p /tmp/proc && mount -t proc proc /tmp/proc 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        assert "EXIT:0" not in result.stdout, f"Expected secondary procfs mount to fail.\nstdout: {result.stdout}"
