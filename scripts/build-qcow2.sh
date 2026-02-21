@@ -490,7 +490,7 @@ DOCKERFILE
             chown -R 1000:1000 /build/rootfs/home/user
             # CIS Benchmark 6.1.x: harden /etc file permissions
             chmod 755 /build/rootfs/etc
-            chmod 644 /build/rootfs/etc/passwd /build/rootfs/etc/group /build/rootfs/etc/resolv.conf
+            chmod 644 /build/rootfs/etc/passwd /build/rootfs/etc/group /build/rootfs/etc/resolv.conf /build/rootfs/etc/hosts
             [ -f /build/rootfs/etc/shadow ] && chmod 640 /build/rootfs/etc/shadow
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
             qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2

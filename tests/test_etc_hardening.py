@@ -41,13 +41,16 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_append_hosts(self, scheduler: Scheduler) -> None:
-        """Append to /etc/hosts fails (host alias injection)."""
+        """Append to /etc/hosts fails (host alias injection).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 try:
     with open('/etc/hosts', 'a') as f:
         f.write('0.0.0.0 evil.example.com\\n')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -96,7 +99,40 @@ except PermissionError:
             code='echo "0.0.0.0 evil" >> /etc/hosts 2>&1; echo exit=$?',
             language=Language.RAW,
         )
-        assert "exit=1" in result.stdout or "ermission" in result.stdout
+        assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
+
+    async def test_truncate_hosts(self, scheduler: Scheduler) -> None:
+        """Truncate /etc/hosts fails (O_WRONLY|O_TRUNC path).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
+        code = """\
+try:
+    with open('/etc/hosts', 'w') as f:
+        f.write('')
+    print('unexpected_success')
+except (PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_tee_append_hosts(self, scheduler: Scheduler) -> None:
+        """tee -a /etc/hosts fails (GTFOBins tee write vector)."""
+        result = await scheduler.run(
+            code="echo '0.0.0.0 evil' | tee -a /etc/hosts 2>&1; echo exit=$?",
+            language=Language.RAW,
+        )
+        assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
+
+    async def test_dd_overwrite_hosts(self, scheduler: Scheduler) -> None:
+        """dd of=/etc/hosts fails (GTFOBins dd write vector)."""
+        result = await scheduler.run(
+            code="echo '0.0.0.0 evil' | dd of=/etc/hosts 2>&1; echo exit=$?",
+            language=Language.RAW,
+        )
+        assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
 
 
 # =============================================================================
@@ -195,6 +231,61 @@ except PermissionError:
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
+    async def test_symlink_write_through_hosts(self, scheduler: Scheduler) -> None:
+        """Write through symlink from sandbox -> /etc/hosts is blocked.
+
+        RO bind remount follows symlink target, so EROFS is enforced.
+        """
+        code = """\
+import os
+os.symlink('/etc/hosts', '/home/user/link_hosts')
+try:
+    with open('/home/user/link_hosts', 'a') as f:
+        f.write('0.0.0.0 evil.example.com\\n')
+    print('unexpected_success')
+except (PermissionError, OSError):
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_cp_overwrite_hosts(self, scheduler: Scheduler) -> None:
+        """cp overwrite /etc/hosts fails (GTFOBins cp vector).
+
+        cp to existing file uses O_WRONLY|O_TRUNC — tests file-level write perms.
+        """
+        result = await scheduler.run(
+            code="echo '0.0.0.0 evil' > /tmp/evil_hosts && cp /tmp/evil_hosts /etc/hosts 2>&1; echo exit=$?",
+            language=Language.RAW,
+        )
+        assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
+
+    async def test_hosts_injection_no_resolution(self, scheduler: Scheduler) -> None:
+        """Semantic test: injected host alias does not resolve.
+
+        musl checks /etc/hosts before DNS — verifies injection attempt
+        fails and the injected name produces socket.gaierror.
+        """
+        code = """\
+import socket
+# Attempt injection (should fail with EROFS or PermissionError)
+try:
+    with open('/etc/hosts', 'a') as f:
+        f.write('127.0.0.1 evil.sandbox.test\\n')
+except (PermissionError, OSError):
+    pass
+# Verify the name does NOT resolve
+try:
+    socket.getaddrinfo('evil.sandbox.test', 80)
+    print('unexpected_resolution')
+except socket.gaierror:
+    print('blocked')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
 
 # =============================================================================
 # Weird: Indirect modification attempts
@@ -260,6 +351,43 @@ else:
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
+    async def test_sed_inplace_hosts(self, scheduler: Scheduler) -> None:
+        """sed -i on /etc/hosts fails (creates temp + rename in /etc)."""
+        result = await scheduler.run(
+            code="sed -i 's/localhost/evil/' /etc/hosts 2>&1; echo exit=$?",
+            language=Language.RAW,
+        )
+        assert (
+            "exit=1" in result.stdout
+            or "exit=2" in result.stdout
+            or "ermission" in result.stdout
+            or "Read-only" in result.stdout
+        )
+
+    async def test_ctypes_open_wronly_hosts(self, scheduler: Scheduler) -> None:
+        """Direct open(2) via ctypes with O_WRONLY on /etc/hosts fails.
+
+        Bypasses Python abstraction — verifies kernel enforces RO bind remount
+        at the syscall level. Asserts EROFS (errno=30) specifically.
+        """
+        code = """\
+import ctypes, os, errno
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+fd = libc.open(b"/etc/hosts", os.O_WRONLY)
+err = ctypes.get_errno()
+if fd == -1:
+    if err == errno.EROFS:
+        print(f"blocked erofs errno={err}")
+    else:
+        print(f"blocked errno={err}")
+else:
+    os.close(fd)
+    print("unexpected_success")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
 
 # =============================================================================
 # Out of bounds: Privilege escalation required, should fail hard
@@ -315,6 +443,44 @@ except (PermissionError, OSError):
     print('blocked')
 finally:
     os.close(fd)
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_proc_fd_write_bypass_hosts(self, scheduler: Scheduler) -> None:
+        """/proc/self/fd trick on /etc/hosts: open read-only, write via fd path.
+
+        Kernel checks permissions on original open(), not the fd path.
+        """
+        code = """\
+import os
+fd = os.open('/etc/hosts', os.O_RDONLY)
+try:
+    with open(f'/proc/self/fd/{fd}', 'w') as f:
+        f.write('0.0.0.0 evil.example.com\\n')
+    print('unexpected_success')
+except (PermissionError, OSError):
+    print('blocked')
+finally:
+    os.close(fd)
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_bind_mount_over_hosts(self, scheduler: Scheduler) -> None:
+        """Bind mount over /etc/hosts requires CAP_SYS_ADMIN -- blocked."""
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "--bind", "/tmp/evil_hosts", "/etc/hosts"],
+    capture_output=True, text=True
+)
+if r.returncode != 0:
+    print("blocked")
+else:
+    print("unexpected_success")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0

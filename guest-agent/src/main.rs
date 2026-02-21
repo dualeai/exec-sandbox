@@ -2685,8 +2685,62 @@ async fn reap_zombies() {
     }
 }
 
-/// Setup environment when running as PID 1 (init).
+// ---------------------------------------------------------------------------
+// Init-time hardening helpers (PID 1 only)
+// ---------------------------------------------------------------------------
+
+/// Set file mode on multiple paths (non-fatal, logs nothing on failure).
+fn chmod_paths(mode: &str, paths: &[&str]) {
+    for path in paths {
+        let _ = StdCommand::new("chmod").args([mode, path]).status();
+    }
+}
+
+/// Bind-mount a path onto itself and remount read-only with nosuid.
 ///
+/// Two-step process required by Linux VFS:
+///   1. `mount --bind <path> <path>` — creates a bind mount
+///   2. `mount -o remount,ro,nosuid,bind <path>` — makes it read-only
+///
+/// Returns `true` on success. Logs warnings on failure (non-fatal).
+fn mount_readonly(path: &std::ffi::CStr) -> bool {
+    unsafe {
+        // Step 1: bind mount onto itself
+        let ret = libc::mount(
+            path.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        );
+        if ret != 0 {
+            eprintln!(
+                "Warning: bind mount {} failed: {}",
+                path.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        // Step 2: remount read-only with nosuid
+        let ret = libc::mount(
+            std::ptr::null(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID,
+            std::ptr::null(),
+        );
+        if ret != 0 {
+            eprintln!(
+                "Warning: RO remount {} failed: {}",
+                path.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        true
+    }
+}
+
 /// Handles userspace-only initialization after minimal-init.sh:
 /// - minimal-init.sh: kernel modules, zram, mounts (has access to initramfs modules)
 /// - guest-agent: PATH, env vars, network IP config (userspace only)
@@ -2708,57 +2762,34 @@ fn setup_init_environment() {
     // Defense-in-depth against build-time ownership issues — macOS Docker
     // export (VirtioFS) loses UID 0, so /etc may be writable by non-root.
     // See: https://github.com/docker/for-mac/issues/6812
-    for dir in ["/etc", "/usr", "/var", "/sbin", "/bin"] {
-        let _ = StdCommand::new("chmod").args(["755", dir]).status();
-    }
+    chmod_paths("755", &["/etc", "/usr", "/var", "/sbin", "/bin"]);
     // CIS 6.1.2-6.1.4: /etc/passwd, /etc/group = 644; /etc/shadow = 640
-    for file in ["/etc/passwd", "/etc/group", "/etc/resolv.conf"] {
-        let _ = StdCommand::new("chmod").args(["644", file]).status();
-    }
-    let _ = StdCommand::new("chmod")
-        .args(["640", "/etc/shadow"])
-        .status();
+    chmod_paths(
+        "644",
+        &[
+            "/etc/passwd",
+            "/etc/group",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+        ],
+    );
+    chmod_paths("640", &["/etc/shadow"]);
     eprintln!("Hardened system directory permissions (CIS 6.1.x)");
 
     // Read-only bind remount of /usr with nosuid (CIS: nodev,ro for /usr).
     // Protects guest-agent binary and all system binaries from modification.
     // Must happen AFTER chmod 755 /usr above since that writes to /usr metadata.
     // Does NOT include noexec — system binaries in /usr/bin must remain executable.
-    // SAFETY: CStr pointers are compiler-verified null-terminated, flags are
-    // kernel-defined constants, and return values are checked.
-    unsafe {
-        let usr = c"/usr";
-        // Step 1: bind mount /usr onto itself
-        let ret = libc::mount(
-            usr.as_ptr(),
-            usr.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND,
-            std::ptr::null(),
-        );
-        if ret != 0 {
-            eprintln!(
-                "Warning: bind mount /usr failed: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            // Step 2: remount read-only with nosuid
-            let ret = libc::mount(
-                std::ptr::null(),
-                usr.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID,
-                std::ptr::null(),
-            );
-            if ret != 0 {
-                eprintln!(
-                    "Warning: RO remount /usr failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            } else {
-                eprintln!("Mounted /usr read-only with nosuid");
-            }
-        }
+    if mount_readonly(c"/usr") {
+        eprintln!("Mounted /usr read-only with nosuid");
+    }
+
+    // Read-only bind remount of /etc/hosts (prevents host alias injection).
+    // musl checks /etc/hosts before DNS — injection would affect all name
+    // resolution. EROFS is stronger than chmod 644 alone (blocks even root).
+    // Must happen AFTER chmod 644 above since that writes file metadata.
+    if mount_readonly(c"/etc/hosts") {
+        eprintln!("Mounted /etc/hosts read-only");
     }
 
     // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
