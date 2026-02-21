@@ -27,13 +27,16 @@ class TestEtcWriteBlocked:
     """Direct writes to /etc files and directory are blocked for UID 1000."""
 
     async def test_append_resolv_conf(self, scheduler: Scheduler) -> None:
-        """Append to /etc/resolv.conf fails (DNS hijack vector)."""
+        """Append to /etc/resolv.conf fails (DNS hijack vector).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 try:
     with open('/etc/resolv.conf', 'a') as f:
         f.write('nameserver 1.2.3.4\\n')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -72,13 +75,16 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_truncate_resolv_conf(self, scheduler: Scheduler) -> None:
-        """Truncate /etc/resolv.conf fails (DNS denial-of-service)."""
+        """Truncate /etc/resolv.conf fails (DNS denial-of-service).
+
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
+        """
         code = """\
 try:
     with open('/etc/resolv.conf', 'w') as f:
         f.write('')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -145,6 +151,7 @@ class TestEtcEdgeCases:
         """Write through symlink from sandbox -> /etc/resolv.conf is blocked.
 
         Symlink created in writable /home/user, but kernel checks target perms.
+        With RO bind remount, raises OSError (EROFS) instead of PermissionError.
         """
         code = """\
 import os
@@ -153,7 +160,7 @@ try:
     with open('/home/user/link_resolv', 'a') as f:
         f.write('nameserver 1.2.3.4\\n')
     print('unexpected_success')
-except PermissionError:
+except (PermissionError, OSError):
     print('blocked')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
@@ -329,7 +336,12 @@ except PermissionError:
             code="sed -i 's/nameserver.*/nameserver 1.2.3.4/' /etc/resolv.conf 2>&1; echo exit=$?",
             language=Language.RAW,
         )
-        assert "exit=1" in result.stdout or "exit=2" in result.stdout or "ermission" in result.stdout
+        assert (
+            "exit=1" in result.stdout
+            or "exit=2" in result.stdout
+            or "ermission" in result.stdout
+            or "Read-only" in result.stdout
+        )
 
     async def test_ctypes_open_wronly(self, scheduler: Scheduler) -> None:
         """Direct open(2) via ctypes with O_WRONLY on /etc/resolv.conf fails.

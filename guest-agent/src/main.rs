@@ -2792,6 +2792,15 @@ fn setup_init_environment() {
         eprintln!("Mounted /etc/hosts read-only");
     }
 
+    // Read-only bind remount of /etc/resolv.conf (prevents DNS hijack).
+    // Guest DNS must use gvproxy gateway (192.168.127.1); modifying resolv.conf
+    // to point at external DNS (e.g. 8.8.8.8) would bypass filtering intent.
+    // EROFS is stronger than chmod 644 alone (blocks even root).
+    // Must happen AFTER chmod 644 above since that writes file metadata.
+    if mount_readonly(c"/etc/resolv.conf") {
+        eprintln!("Mounted /etc/resolv.conf read-only");
+    }
+
     // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
     // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.
     // Without lo, user code like http.createServer + fetch('http://localhost:...') fails
