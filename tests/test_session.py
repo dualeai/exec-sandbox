@@ -16,7 +16,7 @@ import pytest
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_hwaccel
+from tests.conftest import skip_on_python_312_subprocess_bug, skip_unless_hwaccel
 
 
 # =============================================================================
@@ -331,6 +331,76 @@ class TestSessionWeirdCases:
                 "t = threading.Thread(target=bg, daemon=True)\n"
                 "t.start()"
             )
+            result = await session.exec('print("ok")')
+            assert result.exit_code == 0
+            assert "ok" in result.stdout
+
+    async def test_subprocess_popen_survives_across_execs(self, scheduler: Scheduler) -> None:
+        """subprocess.Popen child survives across exec() calls (VM persists)."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            # Exec 1: spawn a long-lived subprocess, capture its PID
+            result = await session.exec(
+                "import subprocess\n"
+                "p = subprocess.Popen(['sleep', '60'])\n"
+                "print(p.pid)"
+            )
+            assert result.exit_code == 0
+            pid = result.stdout.strip()
+            assert pid.isdigit()
+
+            # Exec 2: verify the subprocess is still alive via /proc
+            result = await session.exec(
+                f"import os; print(os.path.exists('/proc/{pid}/stat'))"
+            )
+            assert result.exit_code == 0
+            assert "True" in result.stdout
+
+            # Exec 3: session still works normally
+            result = await session.exec('print("ok")')
+            assert result.exit_code == 0
+            assert "ok" in result.stdout
+
+    @skip_on_python_312_subprocess_bug
+    async def test_daemon_double_fork_survives_across_execs(self, scheduler: Scheduler) -> None:
+        """Double-fork daemon survives across exec() calls, reparented to PID 1."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            # Exec 1: classic double-fork + setsid to create a daemon
+            result = await session.exec(
+                "import os, time\n"
+                "pid = os.fork()\n"
+                "if pid == 0:\n"
+                "    os.setsid()\n"
+                "    pid2 = os.fork()\n"
+                "    if pid2 == 0:\n"
+                "        with open('/tmp/daemon.pid', 'w') as f:\n"
+                "            f.write(str(os.getpid()))\n"
+                "        time.sleep(60)\n"
+                "        os._exit(0)\n"
+                "    else:\n"
+                "        os._exit(0)\n"
+                "else:\n"
+                "    os.waitpid(pid, 0)\n"
+                "    time.sleep(0.5)\n"
+                "    print('spawned')"
+            )
+            assert result.exit_code == 0
+            assert "spawned" in result.stdout
+
+            # Exec 2: verify daemon is alive and reparented to PID 1
+            result = await session.exec(
+                "with open('/tmp/daemon.pid') as f:\n"
+                "    daemon_pid = f.read().strip()\n"
+                "with open(f'/proc/{daemon_pid}/stat') as f:\n"
+                "    stat = f.read()\n"
+                "# Parse ppid from after last ')' — comm field can contain spaces\n"
+                "ppid = stat[stat.rfind(')') + 2:].split()[1]\n"
+                "print(f'alive ppid={ppid}')"
+            )
+            assert result.exit_code == 0
+            assert "alive" in result.stdout
+            assert "ppid=1" in result.stdout
+
+            # Exec 3: session still works normally
             result = await session.exec('print("ok")')
             assert result.exit_code == 0
             assert "ok" in result.stdout
