@@ -179,6 +179,12 @@ static BLOCKED_ENV_VARS: &[&str] = &[
 const PYTHON_REPL_WRAPPER: &str = r#"import os as _repl_os
 import sys
 import traceback
+import ctypes as _repl_ctypes
+
+# Security: set PR_SET_DUMPABLE=0 to prevent ptrace from other UID 1000 processes.
+# Must be done here (after exec) because begin_new_exec() always resets dumpable
+# to 1, regardless of credential state. Blocks CVE-2022-30594 style attacks.
+_repl_ctypes.CDLL("libc.so.6", use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE=0
 
 sys.argv = ['-c']
 
@@ -285,7 +291,17 @@ while True:
 /// Awaits the returned value if thenable (handles fire-and-forget async calls like `main()`).
 /// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
-const JS_REPL_WRAPPER: &str = r#"import { createContext, runInContext } from 'node:vm';
+const JS_REPL_WRAPPER: &str = r#"// Security: set PR_SET_DUMPABLE=0 to prevent ptrace from other UID 1000 processes.
+// Must be done here (after exec) because begin_new_exec() always resets dumpable
+// to 1, regardless of credential state. Blocks CVE-2022-30594 style attacks.
+import { dlopen, FFIType } from 'bun:ffi';
+try {
+    const _libc = dlopen('libc.so.6', { prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 } });
+    _libc.symbols.prctl(4, 0, 0, 0, 0);  // PR_SET_DUMPABLE=0
+    _libc.close();
+} catch (_) {}
+
+import { createContext, runInContext } from 'node:vm';
 import { Readable } from 'node:stream';
 // Use 'ts' loader to accept both JavaScript and TypeScript syntax (TS is a
 // superset of JS). We avoid 'tsx' because Bun's TSX parser has open bugs with
@@ -493,6 +509,9 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             // here-strings, traps. Bash is installed in all VM images (COMMON_PKGS).
             // --norc/--noprofile: skip startup files (defense-in-depth; BASH_ENV
             // and PROMPT_COMMAND are already in the env var blocklist).
+            //
+            // NOTE: Shell REPL has dumpable=1 (cannot set prctl from bash after
+            // exec). Python and JS wrappers set dumpable=0 in their wrapper code.
             let mut c = Command::new("bash");
             c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
@@ -505,24 +524,50 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .current_dir(SANDBOX_ROOT)
-        .process_group(0)
-        // Drop to non-root: guest-agent stays root (PID 1, needs it for
-        // package install, file I/O, module loading), but the REPL subprocess
-        // runs as UID 1000. This blocks mount(2), ptrace, raw sockets, etc.
-        .uid(1000)
-        .gid(1000);
+        .process_group(0);
+    // NOTE: .uid()/.gid() intentionally NOT used — see pre_exec below.
 
     // Defense-in-depth: harden the REPL child process before exec.
-    // SAFETY: pre_exec runs in the forked child before exec. Both prctl calls
-    // are async-signal-safe and work at any privilege level.
+    //
+    // We handle uid/gid/prctl ALL in our pre_exec to control ordering.
+    // Rust's Command applies .uid()/.gid() in its own pre_exec which runs
+    // AFTER ours. The UID change from root to 1000 resets PR_SET_DUMPABLE
+    // (Linux kernel behavior: commit_creds() resets dumpable on credential
+    // change). By doing uid/gid changes ourselves, we can set DUMPABLE=0
+    // AFTER the change, protecting the fork→exec window.
+    //
+    // IMPORTANT: begin_new_exec() in the kernel ALWAYS resets dumpable to
+    // SUID_DUMP_USER (1) during execve(), regardless of credentials. So step 4
+    // only protects the brief window between fork() and execve(). The REPL
+    // wrappers (Python/JS) re-apply PR_SET_DUMPABLE=0 after exec() to get
+    // persistent protection. Shell REPL cannot do this (bash can't call prctl).
+    //
+    // Order matters:
+    //   1. no_new_privs — blocks SUID/SGID escalation for all future exec()
+    //   2. setgid(1000) — must come before setuid to avoid losing permission
+    //   3. setuid(1000) — drop to non-root (resets dumpable via commit_creds)
+    //   4. dumpable=0 — defense-in-depth for fork→exec window only
+    //
+    // SAFETY: pre_exec runs in the forked child before exec. All syscalls
+    // used (prctl, setgid, setuid) are async-signal-safe.
     unsafe {
         cmd.pre_exec(|| {
-            // Block privilege escalation via execve (SUID/SGID binaries, file capabilities).
-            // Inherited by all children including fork().
+            // 1. Block privilege escalation via execve (SUID/SGID, file capabilities).
+            //    Inherited by all children and subprocesses.
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Prevent ptrace attach and core dumps from other processes at same UID.
+            // 2-3. Drop to non-root UID 1000. This blocks mount(2), ptrace,
+            //      raw sockets, and kernel module loading without seccomp.
+            if libc::setgid(1000) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(1000) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // 4. Prevent ptrace attach and core dumps from other UID 1000 processes.
+            //    Must be AFTER setuid — UID change resets dumpable to 1.
+            //    CVE-2022-30594: ptrace + PTRACE_O_SUSPEND_SECCOMP bypass.
             if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }

@@ -647,6 +647,71 @@ fn main() {
     // Prevents raw disk reads that bypass filesystem permissions.
     let _ = fs::remove_file("/dev/vda");
 
+    // Security: harden kernel attack surface via sysctl.
+    // These settings disable kernel subsystems that have been repeatedly exploited
+    // for privilege escalation and sandbox escape. Each write may fail silently
+    // if the sysctl doesn't exist (older kernel), which is acceptable.
+    //
+    // eBPF: CVE-2020-8835, CVE-2021-3490, CVE-2021-31440, CVE-2023-2163
+    // Value 2 = disabled for all (even CAP_SYS_ADMIN requires BPF token)
+    let _ = fs::write("/proc/sys/kernel/unprivileged_bpf_disabled", "2");
+    //
+    // io_uring: CVE-2023-2598, CVE-2024-0582
+    // Value 2 = disabled for all users (requires kernel >= 6.6, introduced in 6.6-rc1)
+    let _ = fs::write("/proc/sys/kernel/io_uring_disabled", "2");
+    //
+    // User namespaces: CVE-2022-0185, CVE-2023-0386
+    // Value 0 = no unprivileged user namespaces (prevents gaining CAP_SYS_ADMIN)
+    // unprivileged_userns_clone is Debian/Ubuntu-specific
+    let _ = fs::write("/proc/sys/kernel/unprivileged_userns_clone", "0");
+    // user.max_user_namespaces is the portable alternative (works on Alpine)
+    let _ = fs::write("/proc/sys/user/max_user_namespaces", "0");
+    //
+    // Kernel address exposure: aids exploitation of CVE-2023-3269 (StackRot) etc.
+    // Value 2 = restrict to CAP_SYSLOG (even root can't read without capability)
+    let _ = fs::write("/proc/sys/kernel/kptr_restrict", "2");
+    //
+    // dmesg: kernel log may leak addresses, module info, hardware details
+    // Value 1 = restrict to CAP_SYSLOG
+    let _ = fs::write("/proc/sys/kernel/dmesg_restrict", "1");
+    //
+    // Perf events: can be used for side-channel attacks and kernel exploitation
+    // Value 3 = disabled for all (even CAP_PERFMON)
+    let _ = fs::write("/proc/sys/kernel/perf_event_paranoid", "3");
+    //
+    // BPF JIT hardening: prevents JIT spraying attacks (CVE-2024-56615)
+    // Value 2 = JIT hardening for all users (blinding constants in BPF JIT)
+    let _ = fs::write("/proc/sys/net/core/bpf_jit_harden", "2");
+    //
+    // userfaultfd: used in kernel race condition exploits to pause execution
+    // at precise points during memory operations (UAF, double-free, TOCTOU).
+    // Value 0 = restrict to CAP_SYS_PTRACE holders only.
+    let _ = fs::write("/proc/sys/vm/unprivileged_userfaultfd", "0");
+    //
+    // YAMA ptrace_scope: restricts ptrace regardless of dumpable flag.
+    // Value 2 = only CAP_SYS_PTRACE can ptrace (admin-only).
+    // This is the primary ptrace defense — dumpable=0 is defense-in-depth
+    // but exec() always resets dumpable to 1 (see begin_new_exec in fs/exec.c).
+    // CVE-2022-30594: PTRACE_O_SUSPEND_SECCOMP bypass via ptrace.
+    let _ = fs::write("/proc/sys/kernel/yama/ptrace_scope", "2");
+    //
+    // Filesystem link protections: prevent symlink/hardlink attacks in
+    // world-writable directories (defense-in-depth for /tmp).
+    let _ = fs::write("/proc/sys/fs/protected_symlinks", "1");
+    let _ = fs::write("/proc/sys/fs/protected_hardlinks", "1");
+    let _ = fs::write("/proc/sys/fs/protected_fifos", "2");
+    let _ = fs::write("/proc/sys/fs/protected_regular", "2");
+    //
+    // suid_dumpable: controls core dump behavior for setuid processes.
+    // Value 0 = no core dumps for processes that crossed privilege boundary.
+    // Note: does NOT prevent same-UID exec from setting dumpable=1.
+    let _ = fs::write("/proc/sys/fs/suid_dumpable", "0");
+    //
+    // Disable kernel module loading. MUST be last sysctl — once set to 1,
+    // modules can never be loaded again (irreversible). All modules (virtio,
+    // ext4, zram, etc.) are loaded above before this point.
+    let _ = fs::write("/proc/sys/kernel/modules_disabled", "1");
+
     // No existence check - execv will fail if guest-agent missing
     switch_root();
 }
