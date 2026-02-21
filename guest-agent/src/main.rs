@@ -291,6 +291,9 @@ while True:
 /// Awaits the returned value if thenable (handles fire-and-forget async calls like `main()`).
 /// Catches unhandled promise rejections via process.on('unhandledRejection').
 /// Provides Bun's native `require` for CommonJS package imports (resolves global packages).
+/// Provides `__import()` to the VM context — a host-scope wrapper for dynamic `import()`.
+/// Bun's replMode transpiler rewrites `import()` → `__import()` automatically; a regex
+/// fallback also catches any cases the transpiler misses.
 const JS_REPL_WRAPPER: &str = r#"// Security: set PR_SET_DUMPABLE=0 to prevent ptrace from other UID 1000 processes.
 // Must be done here (after exec) because begin_new_exec() always resets dumpable
 // to 1, regardless of credential state. Blocks CVE-2022-30594 style attacks.
@@ -308,6 +311,11 @@ import { Readable } from 'node:stream';
 // generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
 // angle-bracket type assertions are ambiguous with JSX.
 const transpiler = new Bun.Transpiler({ loader: 'ts', replMode: true });
+// Host-scope dynamic import wrapper. The VM's runInContext cannot use the
+// native import() keyword (it's a language feature, not a function). This
+// arrow function captures the host ESM module's import() capability, and
+// is exposed to the VM context so transpiled code can call __import() instead.
+const __import = (specifier) => import(specifier);
 // Create a null stdin (immediate EOF) so user code that reads process.stdin
 // or Bun.stdin gets EOF instead of blocking on the protocol pipe.
 const nullStdin = new Readable({ read() { this.push(null); } });
@@ -344,6 +352,7 @@ const ctx = createContext({
     atob, btoa, structuredClone, queueMicrotask,
     crypto,
     require,
+    __import,
     module: { exports: {} },
     exports: {},
     __filename: '<exec>', __dirname: '/tmp',
@@ -402,8 +411,13 @@ while (true) {
         // - Captures last expression as { value: (expr) }
         // - Converts const/let to var for re-declaration across invocations
         const transformed = transpiler.transformSync(code);
-        if (transformed.length > 0) {
-            let val = runInContext(transformed, ctx, { filename: '<exec>' });
+        // Defensive fallback: rewrite any import() the transpiler didn't
+        // catch. Bun's replMode already rewrites import() → __import(),
+        // so this regex normally never matches.
+        // \b prevents false positives on identifiers like "reimport(".
+        const patched = transformed.replace(/\bimport\s*\(/g, '__import(');
+        if (patched.length > 0) {
+            let val = runInContext(patched, ctx, { filename: '<exec>' });
             // replMode wraps in async IIFE only when code has top-level await;
             // otherwise runInContext returns { value: expr } directly.
             if (val && typeof val.then === 'function') {
