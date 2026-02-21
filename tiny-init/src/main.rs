@@ -747,6 +747,14 @@ fn main() {
     // Note: does NOT prevent same-UID exec from setting dumpable=1.
     let _ = fs::write("/proc/sys/fs/suid_dumpable", "0");
     //
+    // SysRq: disable keyboard-triggered Magic SysRq functions.
+    // NOTE: This does NOT protect /proc/sysrq-trigger — the kernel's
+    // write_sysrq_trigger() bypasses the sysrq_enabled bitmask (check_mask=false
+    // in drivers/tty/sysrq.c). The procfs trigger is blocked by a read-only
+    // bind-mount in guest-agent instead. This only disables Alt+SysRq+key combos.
+    // Value 0 = all keyboard SysRq functions disabled.
+    let _ = fs::write("/proc/sys/kernel/sysrq", "0");
+    //
     // Disable kernel module loading. MUST be last sysctl — once set to 1,
     // modules can never be loaded again (irreversible). All modules (virtio,
     // ext4, zram, etc.) are loaded above before this point.

@@ -2891,6 +2891,19 @@ fn setup_init_environment() {
         eprintln!("Mounted /proc/sys read-only");
     }
 
+    // Read-only bind remount of /proc/sysrq-trigger (DoS prevention).
+    // /proc/sysrq-trigger is outside /proc/sys (not covered by the remount above).
+    // Writing 'c' = kernel crash, 'b' = reboot — denial of service against the VM.
+    // IMPORTANT: kernel.sysrq=0 does NOT protect this file — the kernel's
+    // write_sysrq_trigger() in drivers/tty/sysrq.c passes check_mask=false to
+    // __handle_sysrq(), bypassing the sysrq_enabled bitmask entirely. Only
+    // filesystem-level blocking (EROFS via bind-mount) is effective.
+    // File permissions (S_IWUSR) block UID 1000, but this also blocks root.
+    // See: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (runc procfs redirects)
+    if mount_readonly(c"/proc/sysrq-trigger") {
+        eprintln!("Mounted /proc/sysrq-trigger read-only");
+    }
+
     // Bring up loopback interface (required for localhost/127.0.0.1 connectivity).
     // In microvm guests with custom init, lo starts DOWN — no systemd/OpenRC to activate it.
     // Without lo, user code like http.createServer + fetch('http://localhost:...') fails
