@@ -35,7 +35,7 @@ install-sys:
 install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
-	$(MAKE) --directory guest-agent install
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory gvproxy-wrapper install
 
@@ -49,7 +49,7 @@ install-deps:
 upgrade:
 	uv lock --upgrade --refresh
 	$(MAKE) build-catalogs
-	$(MAKE) --directory guest-agent upgrade
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) upgrade
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) upgrade
 	$(MAKE) --directory gvproxy-wrapper upgrade
 
@@ -80,7 +80,7 @@ test-static:
 	uv run pyright .
 	uv run -m vulture src/ scripts/ --min-confidence 80
 	shellcheck scripts/*.sh cicd/*.sh
-	$(MAKE) --directory guest-agent test-static
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-static
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
@@ -95,7 +95,7 @@ test-sudo:
 # Unit tests only (fast)
 test-unit:
 	uv run pytest tests/ -v -n auto -m "unit"
-	$(MAKE) --directory guest-agent test-unit
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
 
@@ -110,7 +110,7 @@ test-slow:
 lint:
 	uv run ruff format .
 	uv run ruff check --fix .
-	$(MAKE) --directory guest-agent lint
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) lint
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) lint
 	$(MAKE) --directory gvproxy-wrapper lint
 
@@ -194,7 +194,7 @@ bench-pool-flamegraph:
 # ============================================================================
 
 build:
-	$(MAKE) --directory guest-agent build
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) build
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) build
 	$(MAKE) --directory gvproxy-wrapper build
 
@@ -203,7 +203,7 @@ build:
 # ============================================================================
 
 clean:
-	$(MAKE) --directory guest-agent clean
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) clean
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) clean
 	$(MAKE) --directory gvproxy-wrapper clean
 	rm -rf .pytest_cache .coverage htmlcov

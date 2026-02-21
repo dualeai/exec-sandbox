@@ -52,14 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: rustfmt, clippy
-          cache-workspaces: guest-agent
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+        working-directory: .
 
       - name: Static checks
-        run: make test-static
+        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-static
 
   static-rust-tiny-init:
     name: Static / Rust (tiny-init)
@@ -260,13 +259,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.1
 
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-workspaces: guest-agent
+      - name: Get Rust version
+        id: rust
+        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+        working-directory: .
 
       - name: Unit tests
-        run: make test-unit
+        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-unit
 
   test-go:
     name: Test / Go
