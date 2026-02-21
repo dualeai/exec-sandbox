@@ -1048,6 +1048,17 @@ else:
         )
         assert "EXIT:0" not in result.stdout, f"Expected secondary procfs mount to fail.\nstdout: {result.stdout}"
 
+    async def test_sysrq_disabled(self, scheduler: Scheduler) -> None:
+        """kernel.sysrq must be 0 (keyboard SysRq disabled, locked by RO mount)."""
+        code = """\
+with open('/proc/sys/kernel/sysrq') as f:
+    val = f.read().strip()
+print(f'SYSRQ:{val}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "SYSRQ:0" in result.stdout, f"Expected kernel.sysrq=0 but got: {result.stdout}"
+
 
 # =============================================================================
 # /dev read-only hardening
@@ -1390,13 +1401,18 @@ with open('/proc/self/status') as f:
         assert "CAP_DAC_READ_SEARCH:False" in result.stdout
 
     async def test_sysrq_trigger_not_writable(self, scheduler: Scheduler) -> None:
-        """/proc/sysrq-trigger not writable by UID 1000."""
+        """/proc/sysrq-trigger bind-mounted read-only (EROFS).
+
+        Writing 'c' = kernel crash, 'b' = reboot (DoS). kernel.sysrq=0 does NOT
+        protect this file — write_sysrq_trigger() bypasses the sysrq_enabled bitmask.
+        See: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881.
+        """
         code = """\
 try:
     with open('/proc/sysrq-trigger', 'w') as f:
         f.write('h')
     print('WRITTEN')
-except (PermissionError, OSError) as e:
+except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
