@@ -480,6 +480,13 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 from multiprocessing import Pool
 Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda serialization)
 # For CPU-bound parallelism, use multiple VMs via scheduler.run() concurrently instead
+
+# Background processes survive across session exec() calls — state accumulates
+async with await scheduler.session(language="python") as session:
+    await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
+    await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
+    # Both sleep processes are still running! VM PID limit (100) prevents unbounded growth
+    # All processes are cleaned up when session.close() destroys the VM
 ```
 
 ## Limits
