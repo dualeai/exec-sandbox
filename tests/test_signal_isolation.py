@@ -541,7 +541,9 @@ try:
     entries = os.listdir('/proc/1/fd')
     print(f"unexpected_success:{len(entries)} fds")
 except PermissionError:
-    print("blocked")
+    print("blocked:EPERM")
+except FileNotFoundError:
+    print("blocked:ENOENT")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
@@ -555,7 +557,9 @@ try:
         data = f.read()
     print(f"unexpected_success:{len(data)} bytes")
 except PermissionError:
-    print("blocked")
+    print("blocked:EPERM")
+except FileNotFoundError:
+    print("blocked:ENOENT")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
@@ -594,7 +598,9 @@ try:
         data = f.read()
     print(f"unexpected_success:{len(data)} bytes")
 except PermissionError:
-    print("blocked")
+    print("blocked:EPERM")
+except FileNotFoundError:
+    print("blocked:ENOENT")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
@@ -608,7 +614,9 @@ try:
         f.write('1000')
     print("unexpected_success")
 except PermissionError:
-    print("blocked")
+    print("blocked:EPERM")
+except FileNotFoundError:
+    print("blocked:ENOENT")
 except OSError as e:
     print(f"blocked:errno={e.errno}")
 """

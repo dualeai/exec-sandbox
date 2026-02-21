@@ -664,7 +664,8 @@ print(f'ITER_COUNT:{len(procs)}')
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         pid_count = int(result.stdout.split("PID_COUNT:")[1].split("\n")[0])
         assert pid_count >= 1
-        assert "HAS_PID_1:True" in result.stdout
+        # PID 1 hidden by hidepid=2 (root-owned, invisible to UID 1000)
+        assert "HAS_PID_1:False" in result.stdout
         iter_count = int(result.stdout.split("ITER_COUNT:")[1].strip())
         assert iter_count >= 1
 
@@ -942,7 +943,8 @@ print(f'BOGUS_PID:{psutil.pid_exists(999999)}')
             packages=PSUTIL_PACKAGES,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "PID1_EXISTS:True" in result.stdout
+        # PID 1 hidden by hidepid=2 (root-owned, invisible to UID 1000)
+        assert "PID1_EXISTS:False" in result.stdout
         assert "BOGUS_PID:False" in result.stdout
 
 
@@ -1106,7 +1108,7 @@ for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info', 'cpu_
         pass
 
 print(f'PROC_COUNT:{len(procs)}')
-# PID 1 (init/tiny-init) should be visible
+# PID 1 hidden by hidepid=2 (root-owned, invisible to UID 1000)
 pid1_found = any(p['pid'] == 1 for p in procs)
 print(f'PID1_FOUND:{pid1_found}')
 """
@@ -1118,7 +1120,7 @@ print(f'PID1_FOUND:{pid1_found}')
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("PROC_COUNT:")[1].split("\n")[0])
         assert count >= 1
-        assert "PID1_FOUND:True" in result.stdout
+        assert "PID1_FOUND:False" in result.stdout
 
     @pytest.mark.parametrize(
         "code,check",

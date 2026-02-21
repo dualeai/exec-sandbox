@@ -689,6 +689,80 @@ except FileNotFoundError:
         assert result.exit_code == 0
         assert "BLOCKED" in result.stdout or "NOT_FOUND" in result.stdout
 
+    async def test_proc_hidepid_mount_option(self, scheduler: Scheduler) -> None:
+        """Proc must be mounted with hidepid=2 to hide other users' processes.
+
+        hidepid=2 makes /proc/[pid] directories invisible for PIDs not owned
+        by the querying user. This is the standard container/sandbox hardening
+        approach used by Docker, Kubernetes, and systemd (ProtectProc=invisible).
+        Available since Linux 3.3; see proc(5).
+        """
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == '/proc' and parts[2] == 'proc':
+            options = parts[3] if len(parts) > 3 else ''
+            # hidepid=2 or hidepid=invisible (kernel 5.8+ alias)
+            if 'hidepid=2' in options or 'hidepid=invisible' in options:
+                print('HIDEPID:enabled')
+            else:
+                print(f'HIDEPID:missing options={options}')
+            break
+    else:
+        print('HIDEPID:no_proc_mount')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "HIDEPID:enabled" in result.stdout, f"stdout: {result.stdout}"
+
+    async def test_proc_pid1_directory_invisible(self, scheduler: Scheduler) -> None:
+        """/proc/1 must be invisible to UID 1000 with hidepid=2.
+
+        This is stronger than permission-denied — the directory does not exist
+        at the VFS level, preventing any information leakage about PID 1.
+        """
+        code = """\
+import os
+exists = os.path.exists('/proc/1')
+print(f'EXISTS:{exists}')
+try:
+    os.listdir('/proc/1')
+    print('LISTDIR:success')
+except FileNotFoundError:
+    print('LISTDIR:ENOENT')
+except PermissionError:
+    print('LISTDIR:EPERM')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "EXISTS:False" in result.stdout
+        assert "LISTDIR:ENOENT" in result.stdout
+
+    async def test_proc_self_still_accessible(self, scheduler: Scheduler) -> None:
+        """/proc/self and /proc/{pid} must remain readable for the current process.
+
+        Regression canary: hidepid=2 must not break process self-introspection.
+        The kernel always exempts /proc/self and /proc/[own-pid] from hidepid.
+        """
+        code = """\
+import os
+# /proc/self/status is always accessible
+with open('/proc/self/status') as f:
+    status = f.read()
+print(f'SELF_STATUS:{"Name:" in status}')
+
+# /proc/{own_pid}/status is also accessible
+pid = os.getpid()
+with open(f'/proc/{pid}/status') as f:
+    status = f.read()
+print(f'OWN_PID_STATUS:{"Name:" in status}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "SELF_STATUS:True" in result.stdout
+        assert "OWN_PID_STATUS:True" in result.stdout
+
 
 # =============================================================================
 # Out of bounds: Direct kernel exploitation primitives
