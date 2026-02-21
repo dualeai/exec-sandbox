@@ -62,9 +62,15 @@ build-catalogs:
 # Image Building
 # ============================================================================
 
+IMAGE_ARCH ?= $$(uname -m)
+IMAGE_VARIANT ?= all
+
+# Build QEMU images. Native arch by default, use IMAGE_ARCH=all for cross-arch.
+# Usage: make build-images [IMAGE_ARCH=all|x86_64|aarch64] [IMAGE_VARIANT=python|node|raw|all]
+# Note: arm64 is normalized to aarch64 in the recipe to match script expectations.
 build-images:
-	@echo "🔨 Building QEMU base images..."
-	RUST_VERSION=$(rust_version) ./scripts/build-images.sh
+	@echo "🔨 Building QEMU images (arch=$(IMAGE_ARCH), variant=$(IMAGE_VARIANT))..."
+	RUST_VERSION=$(rust_version) ./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
 
 # ============================================================================
 # Testing

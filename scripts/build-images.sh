@@ -13,6 +13,7 @@
 #   ./scripts/build-images.sh              # Build for all architectures
 #   ./scripts/build-images.sh x86_64       # Build for specific arch
 #   ./scripts/build-images.sh aarch64      # Build for specific arch
+#   ./scripts/build-images.sh aarch64 python  # Build specific variant for arch
 
 set -euo pipefail
 
@@ -30,8 +31,9 @@ detect_arch() {
 
 build_for_arch() {
     local arch=$1
+    local variant="${2:-all}"
 
-    echo "=== Building for $arch ==="
+    echo "=== Building for $arch (variant: $variant) ==="
 
     # Step 1: Build guest-agent and tiny-init in parallel
     echo "[$arch] Building guest-agent + tiny-init..."
@@ -49,11 +51,12 @@ build_for_arch() {
 
     # Step 3: Build qcow2 images (parallelized inside build-qcow2.sh)
     echo "[$arch] Building qcow2 images..."
-    "$SCRIPT_DIR/build-qcow2.sh" all "$arch"
+    "$SCRIPT_DIR/build-qcow2.sh" "$variant" "$arch"
 }
 
 main() {
     local target="${1:-all}"
+    local variant="${2:-all}"
 
     # Check Docker is available
     if ! command -v docker >/dev/null 2>&1; then
@@ -67,9 +70,9 @@ main() {
 
     if [ "$target" = "all" ]; then
         # Build both architectures in parallel
-        build_for_arch "x86_64" &
+        build_for_arch "x86_64" "$variant" &
         local pid_x86=$!
-        build_for_arch "aarch64" &
+        build_for_arch "aarch64" "$variant" &
         local pid_arm=$!
 
         # Wait for both to complete
@@ -82,7 +85,7 @@ main() {
             exit 1
         fi
     else
-        build_for_arch "$target"
+        build_for_arch "$target" "$variant"
     fi
 
     echo ""

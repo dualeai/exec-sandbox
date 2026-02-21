@@ -145,7 +145,9 @@ extract_for_arch() {
     if [ "$need_initramfs" = true ]; then
         # Build custom minimal initramfs (2MB vs 9MB Alpine stock)
         # This includes only essential modules: virtio_blk, ext4 + dependencies
-        "$SCRIPT_DIR/build-initramfs.sh" "$target_arch" "$OUTPUT_DIR"
+        local kernel_ver
+        kernel_ver=$(get_kernel_version "$target_arch")
+        "$SCRIPT_DIR/build-initramfs.sh" "$target_arch" "$OUTPUT_DIR" "$kernel_ver"
         save_hash "$initramfs_file" "$initramfs_hash"
     fi
 
