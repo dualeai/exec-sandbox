@@ -331,6 +331,31 @@ print(f"ret={ret} errno={err}")
             f"Expected cgroup mount to fail with EPERM(1), ENOENT(2), or ENODEV(19), got errno={errno_val}"
         )
 
+    async def test_cgroupfs_not_mounted(self, scheduler: Scheduler) -> None:
+        """cgroupfs is intentionally not mounted inside the VM.
+
+        Resource limits are enforced host-side on the QEMU process via
+        cgroup v2. Not mounting cgroupfs eliminates escape vectors:
+        CVE-2022-0492 (release_agent), CVE-2024-21626 (Leaky Vessels).
+        """
+        code = """\
+import os
+path = '/sys/fs/cgroup'
+if not os.path.isdir(path):
+    print("NO_DIR")
+else:
+    entries = os.listdir(path)
+    if not entries:
+        print("EMPTY")
+    else:
+        for e in entries:
+            print(f"FOUND:{e}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        stdout = result.stdout.strip()
+        assert stdout in {"NO_DIR", "EMPTY"}, f"cgroupfs should not be mounted inside VM. Found: {stdout}"
+
     async def test_cgroup_release_agent_not_writable(self, scheduler: Scheduler) -> None:
         """No writable cgroup release_agent files exist.
 

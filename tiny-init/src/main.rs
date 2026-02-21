@@ -580,6 +580,17 @@ fn main() {
     // Available since Linux 3.3; see proc(5).
     mount("proc", "/proc", "proc", 0, "hidepid=2");
     mount("sysfs", "/sys", "sysfs", 0, "");
+    // Security: cgroupfs is intentionally NOT mounted.
+    // Resource limits (memory, CPU, PIDs) are enforced on the host via cgroup v2
+    // on the QEMU process (see src/exec_sandbox/cgroup.py). The guest runs a
+    // single process (guest-agent), so internal cgroup subdivision is unnecessary.
+    //
+    // Not mounting cgroupfs eliminates cgroup-based escape vectors:
+    // - CVE-2022-0492: write release_agent for root code execution
+    // - CVE-2024-21626: leaked fd to /sys/fs/cgroup enables host filesystem access
+    // /proc/cgroups will show registered subsystems (compiled-in), but they are
+    // inert without a mounted cgroupfs (see cgroups(7)).
+
     // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
     // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
     // pnpm (pnpm#9776), PyInstaller, and user temp executables.
