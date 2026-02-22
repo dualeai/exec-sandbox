@@ -5,6 +5,7 @@ Validates that the zstd-compressed chunked file transfer protocol:
 2. Supports concurrent parallel file transfers via asyncio.gather
 3. Keeps guest memory usage low during transfers (streaming, not buffering)
 4. Handles interleaved success/failure correctly (dispatcher multiplexing)
+5. Measures upload/download throughput (write_file/read_file MiB/s)
 
 Note: /home/user is tmpfs (50% of guest RAM). Files written there consume guest
 RAM directly, so tests use 512 MB VMs for large files (tmpfs cap = 256 MB).
@@ -16,6 +17,7 @@ import asyncio
 import hashlib
 import os
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -626,3 +628,60 @@ class TestInterleavedSuccessFailure:
             # At least the 3 pre-existing files should be visible
             for i in range(3):
                 assert f"file_{i}.txt" in file_names, f"file_{i}.txt missing from list"
+
+
+# =============================================================================
+# TestFileTransferThroughput - Upload/download MiB/s benchmarks
+# =============================================================================
+
+
+@skip_unless_hwaccel
+class TestFileTransferThroughput:
+    """Benchmark upload (write_file) and download (read_file) throughput.
+
+    Run with -s to see throughput output:
+        uv run pytest tests/test_file_io_streaming.py::TestFileTransferThroughput -v -s -n 0
+    """
+
+    @pytest.mark.parametrize("size_mib", [10, 50])
+    async def test_upload_throughput(self, scheduler: Scheduler, size_mib: int) -> None:
+        """Measure host->guest write_file throughput in MiB/s."""
+        size = size_mib * 1024 * 1024
+        content = os.urandom(size)
+        expected_hash = hashlib.sha256(content).hexdigest()
+
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=256) as session:
+            start = time.perf_counter()
+            await session.write_file("bench.bin", content)
+            elapsed = time.perf_counter() - start
+
+            throughput = size_mib / elapsed
+            # Verify integrity
+            result = await session.exec(
+                "import hashlib; print(hashlib.sha256(open('bench.bin','rb').read()).hexdigest())"
+            )
+            assert result.exit_code == 0, f"Hash check failed: {result.stderr}"
+            assert result.stdout.strip() == expected_hash, "Upload data corrupted"
+
+        print(f"\n  UPLOAD {size_mib} MiB: {elapsed:.1f}s, {throughput:.1f} MiB/s")  # noqa: T201
+
+    @pytest.mark.parametrize("size_mib", [10, 50])
+    async def test_download_throughput(self, scheduler: Scheduler, tmp_path: Path, size_mib: int) -> None:
+        """Measure guest->host read_file throughput in MiB/s."""
+        size = size_mib * 1024 * 1024
+        expected_content = bytes(range(256)) * (size // 256)
+        expected_hash = hashlib.sha256(expected_content).hexdigest()
+        dest = tmp_path / "bench_dl.bin"
+
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=256) as session:
+            # Generate deterministic file in guest
+            await session.exec(f"open('bench.bin','wb').write(bytes(range(256)) * {size // 256})")
+            start = time.perf_counter()
+            await session.read_file("bench.bin", destination=dest)
+            elapsed = time.perf_counter() - start
+
+        throughput = size_mib / elapsed
+        assert dest.stat().st_size == size, "Download size mismatch"
+        actual_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
+        assert actual_hash == expected_hash, "Download data corrupted"
+        print(f"\n  DOWNLOAD {size_mib} MiB: {elapsed:.1f}s, {throughput:.1f} MiB/s")  # noqa: T201

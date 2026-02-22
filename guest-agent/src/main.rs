@@ -17,10 +17,12 @@
 //! - /dev/virtio-ports/org.dualeai.cmd (host → guest, read-only)
 //! - /dev/virtio-ports/org.dualeai.event (guest → host, write-only)
 
+mod types;
+use types::*;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::Command as StdCommand;
@@ -43,7 +45,13 @@ const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 // Connection limits
 const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max single request JSON (streaming chunks are ~90KB each)
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
-const WRITE_QUEUE_SIZE: usize = 100; // Bounded channel size for write queue (prevents deadlocks)
+// Bounded channel size for the guest→host write queue.
+// Larger values let the guest buffer more outbound messages before backpressure
+// stalls producers (e.g. file-read chunk generation), improving throughput
+// for bursty workloads. The cost is memory: each slot holds a JSON-encoded
+// message (~175 KB worst case for file chunks), so 128 slots ≈ 22 MB max.
+// Must stay bounded to prevent unbounded memory growth on slow drains.
+const WRITE_QUEUE_SIZE: usize = 128;
 const READ_TIMEOUT_MS: u64 = 12000; // Timeout for idle reads - detects hung connections
 // 12s > 10s health check interval to avoid spurious reconnects
 
@@ -456,14 +464,6 @@ const SHELL_REPL_WRAPPER: &str = r#"while read sentinel_id code_len; do
 done
 "#;
 
-/// State for a persistent REPL process.
-struct ReplState {
-    child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
-    stderr: tokio::process::ChildStderr,
-}
-
 /// Module-level REPL storage. Persists across 12s guest agent reconnect cycles
 /// (guest agent process stays alive, just reconnects serial port).
 /// Monotonic counter for sentinel IDs. Combined with nanosecond timestamp
@@ -699,71 +699,6 @@ fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, Strin
     full_code
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action")]
-enum GuestCommand {
-    #[serde(rename = "ping")]
-    Ping,
-
-    #[serde(rename = "install_packages")]
-    InstallPackages {
-        language: String,
-        packages: Vec<String>,
-    },
-
-    #[serde(rename = "exec")]
-    ExecuteCode {
-        language: String,
-        code: String,
-        #[serde(default)]
-        timeout: u64,
-        #[serde(default)]
-        env_vars: HashMap<String, String>,
-    },
-
-    #[serde(rename = "write_file")]
-    WriteFile {
-        op_id: String,
-        path: String,
-        #[serde(default)]
-        make_executable: bool,
-    },
-
-    #[serde(rename = "read_file")]
-    ReadFile { op_id: String, path: String },
-
-    #[serde(rename = "file_chunk")]
-    FileChunk { op_id: String, data: String },
-
-    #[serde(rename = "file_end")]
-    FileEnd { op_id: String },
-
-    #[serde(rename = "list_files")]
-    ListFiles {
-        #[serde(default)]
-        path: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct OutputChunk {
-    #[serde(rename = "type")]
-    chunk_type: String, // "stdout" or "stderr"
-    chunk: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ExecutionComplete {
-    #[serde(rename = "type")]
-    msg_type: String, // "complete"
-    exit_code: i32,
-    execution_time_ms: u64,
-    /// Time for cmd.spawn() to return (fork/exec overhead)
-    spawn_ms: Option<u64>,
-    /// Time from spawn completion to child.wait() returning (actual process runtime)
-    process_ms: Option<u64>,
-}
-
 /// Extract exit code following Unix shell conventions.
 ///
 /// - Normal exit: returns the exit code (0-255)
@@ -775,107 +710,6 @@ fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
         .code()
         .or_else(|| status.signal().map(|sig| 128 + sig))
         .unwrap_or(255)
-}
-
-#[derive(Debug, Serialize)]
-struct Pong {
-    #[serde(rename = "type")]
-    msg_type: String, // "pong"
-    version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct StreamingError {
-    #[serde(rename = "type")]
-    msg_type: String, // "error"
-    message: String,
-    error_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    op_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct FileWriteAck {
-    #[serde(rename = "type")]
-    msg_type: String, // "file_write_ack"
-    op_id: String,
-    path: String,
-    bytes_written: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct FileChunkResponse {
-    #[serde(rename = "type")]
-    msg_type: String, // "file_chunk"
-    op_id: String,
-    data: String,
-}
-
-#[derive(Debug, Serialize)]
-struct FileReadComplete {
-    #[serde(rename = "type")]
-    msg_type: String, // "file_read_complete"
-    op_id: String,
-    path: String,
-    size: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct FileEntry {
-    name: String,
-    is_dir: bool,
-    size: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct FileList {
-    #[serde(rename = "type")]
-    msg_type: String, // "file_list"
-    path: String,
-    entries: Vec<FileEntry>,
-}
-
-/// Wrapper that counts bytes written and enforces a size limit.
-struct CountingWriter<W> {
-    inner: W,
-    count: usize,
-    limit: usize,
-}
-
-impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.count + buf.len() > self.limit {
-            return Err(std::io::Error::other("file size limit exceeded"));
-        }
-        let n = self.inner.write(buf)?;
-        self.count += n;
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// State for an in-progress streaming file write operation.
-struct WriteFileState {
-    decoder: zstd::stream::write::Decoder<'static, CountingWriter<std::fs::File>>,
-    tmp_path: std::path::PathBuf,
-    final_path: std::path::PathBuf,
-    make_executable: bool,
-    op_id: String,
-    path_display: String, // relative path for error messages
-    finished: bool,
-}
-
-impl Drop for WriteFileState {
-    fn drop(&mut self) {
-        // Clean up temp file if write was not completed (error/disconnect)
-        if !self.finished {
-            let _ = std::fs::remove_file(&self.tmp_path);
-        }
-    }
 }
 
 // Helper to send streaming error via queue
@@ -1488,6 +1322,7 @@ async fn handle_read_file(
                 return Ok(());
             }
         };
+        // TODO: Binary framing would eliminate this base64 encode overhead (~33% wire bloat)
         let chunk_b64 = BASE64.encode(&buf[..n]);
         let chunk_msg = FileChunkResponse {
             msg_type: "file_chunk".to_string(),
@@ -2108,6 +1943,7 @@ async fn execute_code_streaming(
 /// guest agent can detect and recover from stale connections.
 struct NonBlockingFile {
     async_fd: AsyncFd<std::fs::File>,
+    leftover: Vec<u8>, // bytes read past the last newline
 }
 
 impl NonBlockingFile {
@@ -2118,7 +1954,10 @@ impl NonBlockingFile {
         let file = OpenOptions::new().read(true).open(path)?;
         Self::set_nonblocking(file.as_raw_fd())?;
         let async_fd = AsyncFd::new(file)?;
-        Ok(Self { async_fd })
+        Ok(Self {
+            async_fd,
+            leftover: Vec::new(),
+        })
     }
 
     /// Set O_NONBLOCK on a file descriptor using fcntl.
@@ -2169,28 +2008,52 @@ impl NonBlockingFile {
         Ok(!host_disconnected)
     }
 
-    /// Read a line with proper async timeout support.
+    /// Read a line with proper async timeout support and buffered I/O.
     ///
     /// Unlike tokio::fs::File::read which uses spawn_blocking (and thus
     /// can't be interrupted by timeout when stuck in kernel), this method
     /// uses AsyncFd::readable() which properly integrates with tokio's
     /// event loop and can be cancelled by timeout.
-    async fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
+    ///
+    /// Reads up to 16KB per syscall instead of 1 byte, reducing syscalls
+    /// from ~175,000 to ~11 per chunk message (~16,000x reduction).
+    /// Bytes past the newline are stored in `leftover` for the next call.
+    async fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
         let mut total_bytes = 0;
-        let mut byte_buf = [0u8; 1];
         // Accumulate raw bytes for proper UTF-8 decoding
         // (pushing bytes directly as chars corrupts multi-byte UTF-8 sequences)
         let mut bytes = Vec::new();
+
+        // First drain leftover from previous read
+        if !self.leftover.is_empty() {
+            if let Some(pos) = self.leftover.iter().position(|&b| b == b'\n') {
+                // Found newline in leftover — return up to and including it
+                let line_len = pos + 1;
+                buf.push_str(&String::from_utf8_lossy(&self.leftover[..line_len]));
+                self.leftover.drain(..line_len);
+                return Ok(line_len);
+            }
+            // No newline in leftover — consume all of it and keep reading
+            total_bytes += self.leftover.len();
+            bytes.append(&mut self.leftover);
+        }
+
+        let mut read_buf = [0u8; 16384]; // 16KB read buffer
 
         loop {
             // Wait for the fd to be readable (epoll-based, properly cancellable)
             let mut guard = self.async_fd.readable().await?;
 
-            // Try to read one byte (non-blocking)
+            // Try to read up to 16KB (non-blocking)
             match guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
-                let result =
-                    unsafe { libc::read(fd, byte_buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                let result = unsafe {
+                    libc::read(
+                        fd,
+                        read_buf.as_mut_ptr() as *mut libc::c_void,
+                        read_buf.len(),
+                    )
+                };
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -2203,14 +2066,21 @@ impl NonBlockingFile {
                     return Ok(total_bytes);
                 }
                 Ok(Ok(n)) => {
-                    total_bytes += n;
-                    let byte = byte_buf[0];
-                    bytes.push(byte);
-                    if byte == b'\n' {
-                        // End of line - convert accumulated bytes to UTF-8
+                    let chunk = &read_buf[..n];
+                    if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                        // Found newline — take up to and including it
+                        bytes.extend_from_slice(&chunk[..=pos]);
+                        total_bytes += pos + 1;
+                        // Store remaining bytes after newline for next call
+                        if pos + 1 < n {
+                            self.leftover.extend_from_slice(&chunk[pos + 1..]);
+                        }
                         buf.push_str(&String::from_utf8_lossy(&bytes));
                         return Ok(total_bytes);
                     }
+                    // No newline — accumulate and keep reading
+                    total_bytes += n;
+                    bytes.extend_from_slice(chunk);
                 }
                 Ok(Err(e)) => {
                     return Err(e);
@@ -2225,14 +2095,14 @@ impl NonBlockingFile {
 }
 
 async fn run_with_ports(
-    cmd_file: NonBlockingFile,
+    mut cmd_file: NonBlockingFile,
     event_file: tokio::fs::File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Use the non-blocking file directly for reads
     // Event file can stay as tokio::fs::File since writes don't block
 
     // Run the connection handler with non-blocking cmd reader
-    handle_connection_nonblocking(&cmd_file, event_file).await
+    handle_connection_nonblocking(&mut cmd_file, event_file).await
 }
 
 /// Handle connection with non-blocking command reader.
@@ -2240,7 +2110,7 @@ async fn run_with_ports(
 /// Uses NonBlockingFile for the command port, enabling proper timeout
 /// detection on hung/stale connections.
 async fn handle_connection_nonblocking(
-    cmd_reader: &NonBlockingFile,
+    cmd_reader: &mut NonBlockingFile,
     event_file: tokio::fs::File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let writer = BufWriter::new(event_file);
@@ -2248,23 +2118,32 @@ async fn handle_connection_nonblocking(
     // Create bounded channel for write queue to prevent deadlocks
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE_SIZE);
 
-    // Spawn write task
+    // Spawn write task — batches up to 16 writes before flushing to reduce
+    // syscalls. Flushes immediately when the channel is empty to keep
+    // latency-sensitive single messages (pong, ack) responsive.
     let write_handle = tokio::spawn(async move {
         let mut writer = writer;
+        let mut pending = 0u32;
         while let Some(data) = write_rx.recv().await {
             if let Err(e) = writer.write_all(&data).await {
                 eprintln!("Write error: {}", e);
                 break;
             }
-            if let Err(e) = writer.flush().await {
-                eprintln!("Flush error: {}", e);
-                break;
+            pending += 1;
+            if pending >= 16 || write_rx.is_empty() {
+                if let Err(e) = writer.flush().await {
+                    eprintln!("Flush error: {}", e);
+                    break;
+                }
+                pending = 0;
             }
         }
+        // Final flush for any remaining data
+        let _ = writer.flush().await;
     });
 
-    // Active streaming file write operations
-    let mut active_writes: HashMap<String, WriteFileState> = HashMap::new();
+    // Active streaming file write operations (pipelined via spawn_blocking)
+    let mut active_writes: HashMap<String, ActiveWriteHandle> = HashMap::new();
 
     // Main loop: read requests, queue responses
     let mut line = String::new();
@@ -2453,41 +2332,144 @@ async fn handle_connection_nonblocking(
                         continue;
                     }
                 };
+
+                // Pipeline: spawn a blocking task for decompression + disk I/O.
+                // The main loop sends decoded chunks through the channel while
+                // the blocking task decompresses and writes to disk in parallel.
+                let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(16);
+                let write_state = WriteFileState {
+                    decoder,
+                    tmp_path,
+                    final_path: resolved_path,
+                    make_executable,
+                    op_id: op_id.clone(),
+                    path_display: path.clone(),
+                    finished: false,
+                };
+
+                let task = tokio::task::spawn_blocking(move || {
+                    let mut state = write_state;
+                    let mut chunk_rx = chunk_rx;
+                    // blocking_recv() is safe here — we're on the blocking thread pool.
+                    // Empty vec = "finalize" sentinel from FileEnd handler.
+                    // None (channel closed) without sentinel = abort (error/disconnect).
+                    let mut finalize = false;
+                    while let Some(decoded) = chunk_rx.blocking_recv() {
+                        if decoded.is_empty() {
+                            finalize = true;
+                            break;
+                        }
+                        if let Err(e) = std::io::Write::write_all(&mut state.decoder, &decoded) {
+                            // state dropped on return → Drop cleans up tmp file
+                            return Err(WriteError {
+                                message: format!("Write error for '{}': {}", state.path_display, e),
+                                error_type: "io_error".to_string(),
+                                path_display: state.path_display.clone(),
+                                op_id: state.op_id.clone(),
+                            });
+                        }
+                    }
+                    if !finalize {
+                        // Channel closed without sentinel — abort (sender dropped
+                        // due to decode error, disconnect, etc.). Don't set
+                        // finished=true so Drop cleans up the tmp file.
+                        return Err(WriteError {
+                            message: format!(
+                                "Write aborted for '{}': channel closed without finalize",
+                                state.path_display
+                            ),
+                            error_type: "io_error".to_string(),
+                            path_display: state.path_display.clone(),
+                            op_id: state.op_id.clone(),
+                        });
+                    }
+                    // Sentinel received — all chunks delivered, finalize
+                    if let Err(e) = std::io::Write::flush(&mut state.decoder) {
+                        return Err(WriteError {
+                            message: format!(
+                                "Decompression finalize error for '{}': {}",
+                                state.path_display, e
+                            ),
+                            error_type: "io_error".to_string(),
+                            path_display: state.path_display.clone(),
+                            op_id: state.op_id.clone(),
+                        });
+                    }
+                    let bytes_written = state.decoder.get_ref().count;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = if state.make_executable { 0o755 } else { 0o644 };
+                        if let Err(e) = std::fs::set_permissions(
+                            &state.tmp_path,
+                            std::fs::Permissions::from_mode(mode),
+                        ) {
+                            return Err(WriteError {
+                                message: format!(
+                                    "Failed to set permissions for '{}': {}",
+                                    state.path_display, e
+                                ),
+                                error_type: "io_error".to_string(),
+                                path_display: state.path_display.clone(),
+                                op_id: state.op_id.clone(),
+                            });
+                        }
+                    }
+                    if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
+                        return Err(WriteError {
+                            message: format!(
+                                "Failed to finalize write for '{}': {}",
+                                state.path_display, e
+                            ),
+                            error_type: "io_error".to_string(),
+                            path_display: state.path_display.clone(),
+                            op_id: state.op_id.clone(),
+                        });
+                    }
+                    state.finished = true;
+                    Ok(WriteResult {
+                        bytes_written,
+                        path_display: state.path_display.clone(),
+                        op_id: state.op_id.clone(),
+                    })
+                });
+
                 active_writes.insert(
                     op_id.clone(),
-                    WriteFileState {
-                        decoder,
-                        tmp_path,
-                        final_path: resolved_path,
-                        make_executable,
-                        op_id,
+                    ActiveWriteHandle {
+                        chunk_tx,
+                        task,
                         path_display: path,
-                        finished: false,
+                        op_id,
                     },
                 );
             }
             Ok(GuestCommand::FileChunk { op_id, data }) => {
-                let state = match active_writes.get_mut(&op_id) {
-                    Some(s) => s,
-                    None => {
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!("No active write for op_id '{}'", op_id),
-                            "protocol_error",
-                            Some(&op_id),
-                        )
-                        .await;
-                        continue;
-                    }
-                };
+                if !active_writes.contains_key(&op_id) {
+                    let _ = send_streaming_error(
+                        &write_tx,
+                        format!("No active write for op_id '{}'", op_id),
+                        "protocol_error",
+                        Some(&op_id),
+                    )
+                    .await;
+                    continue;
+                }
+                // TODO: Binary framing would eliminate this base64 decode overhead (~33% wire bloat)
                 let decoded = match BASE64.decode(&data) {
                     Ok(d) => d,
                     Err(e) => {
-                        let path_display = state.path_display.clone();
-                        active_writes.remove(&op_id);
+                        // Remove handle and drop chunk_tx — the blocking task
+                        // will see channel close without sentinel and abort,
+                        // cleaning up the tmp file via Drop.
+                        let handle = active_writes.remove(&op_id).unwrap();
+                        drop(handle.chunk_tx);
                         let _ = send_streaming_error(
                             &write_tx,
-                            format!("Invalid base64 in chunk for '{}': {}", path_display, e),
+                            format!(
+                                "Invalid base64 in chunk for '{}': {}",
+                                handle.path_display, e
+                            ),
                             "validation_error",
                             Some(&op_id),
                         )
@@ -2495,22 +2477,69 @@ async fn handle_connection_nonblocking(
                         continue;
                     }
                 };
-                if let Err(e) = std::io::Write::write_all(&mut state.decoder, &decoded) {
-                    let path_display = state.path_display.clone();
-                    active_writes.remove(&op_id);
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        format!("Write error for '{}': {}", path_display, e),
-                        "io_error",
-                        Some(&op_id),
-                    )
-                    .await;
+                // Non-blocking send to the pipeline worker. If the channel is full
+                // (16 items), this awaits briefly, providing natural backpressure.
+                // We use get() here — the borrow is released before any mutation.
+                let send_failed = {
+                    let handle = active_writes.get(&op_id).unwrap();
+                    handle.chunk_tx.send(decoded).await.is_err()
+                };
+                if send_failed {
+                    // Worker task exited with an error — remove handle and
+                    // await the task to surface the actual error message.
+                    let handle = active_writes.remove(&op_id).unwrap();
+                    drop(handle.chunk_tx);
+                    match handle.task.await {
+                        Ok(Err(write_err)) => {
+                            eprintln!(
+                                "Write pipeline error for '{}' (op_id={}): {}",
+                                write_err.path_display, write_err.op_id, write_err.message
+                            );
+                            let _ = send_streaming_error(
+                                &write_tx,
+                                write_err.message,
+                                &write_err.error_type,
+                                Some(&write_err.op_id),
+                            )
+                            .await;
+                        }
+                        Ok(Ok(_)) => {
+                            // Task succeeded but channel closed — shouldn't happen
+                            let _ = send_streaming_error(
+                                &write_tx,
+                                format!(
+                                    "Write pipeline unexpectedly closed for '{}'",
+                                    handle.path_display
+                                ),
+                                "io_error",
+                                Some(&op_id),
+                            )
+                            .await;
+                        }
+                        Err(join_err) => {
+                            let _ = send_streaming_error(
+                                &write_tx,
+                                format!(
+                                    "Internal error writing '{}': {}",
+                                    handle.path_display, join_err
+                                ),
+                                "io_error",
+                                Some(&handle.op_id),
+                            )
+                            .await;
+                        }
+                    }
                     continue;
                 }
             }
             Ok(GuestCommand::FileEnd { op_id }) => {
-                let mut state = match active_writes.remove(&op_id) {
-                    Some(s) => s,
+                let ActiveWriteHandle {
+                    chunk_tx,
+                    task,
+                    path_display,
+                    op_id: handle_op_id,
+                } = match active_writes.remove(&op_id) {
+                    Some(h) => h,
                     None => {
                         let _ = send_streaming_error(
                             &write_tx,
@@ -2522,73 +2551,48 @@ async fn handle_connection_nonblocking(
                         continue;
                     }
                 };
-                // Finalize zstd frame: flush remaining decompressed data
-                if let Err(e) = std::io::Write::flush(&mut state.decoder) {
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        format!(
-                            "Decompression finalize error for '{}': {}",
-                            state.path_display, e
-                        ),
-                        "io_error",
-                        Some(&op_id),
-                    )
-                    .await;
-                    // state dropped here -> Drop cleans up tmp file
-                    continue;
-                }
-                let bytes_written = state.decoder.get_ref().count;
-                // Set permissions on temp file
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = if state.make_executable { 0o755 } else { 0o644 };
-                    if let Err(e) = std::fs::set_permissions(
-                        &state.tmp_path,
-                        std::fs::Permissions::from_mode(mode),
-                    ) {
+                // Send empty vec as "finalize" sentinel, then drop sender.
+                // The blocking task distinguishes this from channel-close-on-error.
+                let _ = chunk_tx.send(vec![]).await;
+                drop(chunk_tx);
+                // Await the blocking task result
+                match task.await {
+                    Ok(Ok(result)) => {
+                        let ack = FileWriteAck {
+                            msg_type: "file_write_ack".to_string(),
+                            op_id: result.op_id,
+                            path: result.path_display,
+                            bytes_written: result.bytes_written,
+                        };
+                        let json = serde_json::to_string(&ack).unwrap_or_default();
+                        let mut response = json.into_bytes();
+                        response.push(b'\n');
+                        if write_tx.send(response).await.is_err() {
+                            break Err("write queue closed".into());
+                        }
+                    }
+                    Ok(Err(write_err)) => {
+                        eprintln!(
+                            "Write pipeline error for '{}' (op_id={}): {}",
+                            write_err.path_display, write_err.op_id, write_err.message
+                        );
                         let _ = send_streaming_error(
                             &write_tx,
-                            format!(
-                                "Failed to set permissions for '{}': {}",
-                                state.path_display, e
-                            ),
-                            "io_error",
-                            Some(&op_id),
+                            write_err.message,
+                            &write_err.error_type,
+                            Some(&write_err.op_id),
                         )
                         .await;
-                        // state dropped here -> Drop cleans up tmp file
-                        continue;
                     }
-                }
-                // Atomic rename
-                if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        format!(
-                            "Failed to finalize write for '{}': {}",
-                            state.path_display, e
-                        ),
-                        "io_error",
-                        Some(&op_id),
-                    )
-                    .await;
-                    // state dropped here -> Drop cleans up tmp file
-                    continue;
-                }
-                state.finished = true;
-                // Send ack
-                let ack = FileWriteAck {
-                    msg_type: "file_write_ack".to_string(),
-                    op_id: state.op_id.clone(),
-                    path: state.path_display.clone(),
-                    bytes_written,
-                };
-                let json = serde_json::to_string(&ack).unwrap_or_default();
-                let mut response = json.into_bytes();
-                response.push(b'\n');
-                if write_tx.send(response).await.is_err() {
-                    break Err("write queue closed".into());
+                    Err(join_err) => {
+                        let _ = send_streaming_error(
+                            &write_tx,
+                            format!("Internal error writing '{}': {}", path_display, join_err),
+                            "io_error",
+                            Some(&handle_op_id),
+                        )
+                        .await;
+                    }
                 }
             }
             Ok(GuestCommand::ReadFile { op_id, path }) => {

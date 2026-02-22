@@ -181,22 +181,25 @@ class PeakMemoryTracker:
 # File sizes (MB) shared across all file I/O memory tests
 _FILE_IO_SIZES_MB = [1, 5, 10]
 
-# --- Streaming pipeline overhead thresholds (all O(chunk_size), NOT O(file_size)) ---
-# With bounded write queue (maxsize=4) and bounded op_queues (maxsize=4),
-# in-flight data is ~4 chunks x ~200KB = ~800KB.  Constants include GC jitter.
+# --- Streaming pipeline overhead thresholds ---
 #
-# Pipeline overhead for tracemalloc tests (Python allocations only, no C/zstd).
-# Read path is heavier than write (~3.6 MB) due to Pydantic model parsing,
-# StreamReader internal buffer, and zstd decompressor state.
-_FILE_IO_TRACEMALLOC_OVERHEAD_MB = 5
-# Tracemalloc overhead for bytes-input write (BytesIO copy tracked, pipeline ~500KB).
-_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 1
+# Write path: look-ahead pipelining fills the bounded write queue (maxsize=64)
+# before backpressure kicks in.  Queue capacity: 64 x ~175KB ≈ 11MB.
+# Memory is O(queue_capacity), bounded but higher than the read path.
+_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = 13
+# Tracemalloc overhead for bytes-input write: BytesIO copy is tracked at ~file_size,
+# plus ~2MB from in-flight queue frames and compressor state.
+_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 2
+# Read path: op_queue (maxsize=4) x ~200KB + StreamReader + Pydantic parsing.
+# Still O(chunk_size), much lower than write pipeline.
+_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 5
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache, etc).
 _FILE_IO_RSS_OVERHEAD_MB = 10
 # Streaming chunk pipeline headroom for RSS tests (~500KB real, padded for jitter).
 _FILE_IO_RSS_STREAMING_OVERHEAD_MB = 2
-# Intra-session leak ceiling: fixed overhead from GC fragmentation over 50 cycles.
-_FILE_IO_INTRA_SESSION_LEAK_MB = 15
+# Intra-session leak ceiling: fixed overhead from GC fragmentation + larger
+# write pipeline buffers over 50 cycles.
+_FILE_IO_INTRA_SESSION_LEAK_MB = 20
 
 
 @pytest.fixture(params=_FILE_IO_SIZES_MB, ids=[f"{s}MB" for s in _FILE_IO_SIZES_MB])
@@ -533,7 +536,7 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Pat
 
     content (os.urandom) is allocated BEFORE tracemalloc.start(), so NOT tracked.
     Tracked: BytesIO(content) copy in _resolve_content (~1x file_size) + chunk
-    pipeline per 128 KB (~500 KB transient).  Threshold: file_size + 1 MB.
+    pipeline (in-flight queue frames + compressor state).  Threshold: file_size + 2 MB.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
@@ -567,9 +570,9 @@ async def test_tracemalloc_peak_write_file_from_path(file_io_size_mb: int, image
     """Measure Python-level allocation peak during write_file with Path input.
 
     Path input: _resolve_content opens a file handle, no full-content copy.
-    Write queue (maxsize=4) bounds in-flight chunks to ~800KB.
-    Threshold: 3 MB flat (pipeline + GC/allocator jitter).
-    Must NOT scale with file size — proves streaming is O(chunk_size).
+    Write queue (maxsize=64) with look-ahead pipelining can hold up to
+    ~11MB of in-flight compressed+encoded frames.  Memory is O(queue_capacity),
+    bounded but not O(chunk_size).
     """
     size_bytes = file_io_size_mb * 1024 * 1024
     src = tmp_path / "tracemalloc_src.bin"
@@ -591,10 +594,10 @@ async def test_tracemalloc_peak_write_file_from_path(file_io_size_mb: int, image
 
     peak_mb = peak_bytes / 1024 / 1024
 
-    assert peak_mb < _FILE_IO_TRACEMALLOC_OVERHEAD_MB, (
+    assert peak_mb < _FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB, (
         f"tracemalloc peak too high for write_file (Path): {peak_mb:.1f}MB "
-        f"(flat threshold: {_FILE_IO_TRACEMALLOC_OVERHEAD_MB}MB — "
-        f"streaming is O(chunk_size), not O(file_size))"
+        f"(threshold: {_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB}MB — "
+        f"write queue capacity bounds in-flight data)"
     )
 
 
@@ -632,9 +635,9 @@ async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path
 
     peak_mb = peak_bytes / 1024 / 1024
 
-    assert peak_mb < _FILE_IO_TRACEMALLOC_OVERHEAD_MB, (
+    assert peak_mb < _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB, (
         f"tracemalloc peak too high for read_file: {peak_mb:.1f}MB "
-        f"(flat threshold: {_FILE_IO_TRACEMALLOC_OVERHEAD_MB}MB — "
+        f"(flat threshold: {_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB}MB — "
         f"streaming is O(chunk_size), not O(file_size))"
     )
 
@@ -704,12 +707,10 @@ async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_
 async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
     """Compare tracemalloc peaks for bytes vs Path write_file inputs.
 
-    Both paths share the same bounded chunk pipeline (maxsize=4 write queue).
-    CPython BytesIO shares the input buffer (no copy for read-only use),
-    so both paths show similar pipeline overhead.
-
-    Assert both peaks stay below _FILE_IO_TRACEMALLOC_OVERHEAD_MB regardless
-    of file size — proves streaming is O(chunk_size), not O(file_size).
+    Both paths share the same bounded chunk pipeline (write queue maxsize=64).
+    Bytes input: BytesIO copy (~file_size) + in-flight queue frames.
+    Path input: file handle (no copy) + in-flight queue frames.
+    Both bounded by write queue capacity (~11MB).
     """
     size_bytes = comparison_size_mb * 1024 * 1024
     src = tmp_path / "compare_src.bin"
@@ -745,11 +746,12 @@ async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_d
     bytes_peak_mb = bytes_peak / 1024 / 1024
     path_peak_mb = path_peak / 1024 / 1024
 
-    assert bytes_peak_mb < _FILE_IO_TRACEMALLOC_OVERHEAD_MB, (
-        f"bytes input peak ({bytes_peak_mb:.1f}MB) should be < {_FILE_IO_TRACEMALLOC_OVERHEAD_MB}MB — "
-        f"streaming is O(chunk_size), not O(file_size)"
+    bytes_threshold_mb = comparison_size_mb + _FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB
+    assert bytes_peak_mb < bytes_threshold_mb, (
+        f"bytes input peak ({bytes_peak_mb:.1f}MB) should be < {bytes_threshold_mb}MB — "
+        f"BytesIO copy ({comparison_size_mb}MB) + {_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB}MB pipeline overhead"
     )
-    assert path_peak_mb < _FILE_IO_TRACEMALLOC_OVERHEAD_MB, (
-        f"Path input peak ({path_peak_mb:.1f}MB) should be < {_FILE_IO_TRACEMALLOC_OVERHEAD_MB}MB — "
-        f"streaming is O(chunk_size), not O(file_size)"
+    assert path_peak_mb < _FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB, (
+        f"Path input peak ({path_peak_mb:.1f}MB) should be < {_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB}MB — "
+        f"bounded by write queue capacity"
     )
