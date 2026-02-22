@@ -747,3 +747,96 @@ class TestWorkingDirectory:
         )
         assert result.exit_code == 0
         assert "/home/user" in result.stdout
+
+
+# =============================================================================
+# TestLazyCloudpickle - Deferred cloudpickle import
+# =============================================================================
+@skip_unless_hwaccel
+class TestLazyCloudpickle:
+    """Tests for lazy cloudpickle import in REPL.
+
+    Change 2: cloudpickle is deferred until multiprocessing.Process.start().
+    """
+
+    async def test_simple_code_works(self, scheduler: Scheduler) -> None:
+        """Simple print works without triggering cloudpickle."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_multiprocessing_process_works(self, scheduler: Scheduler) -> None:
+        """multiprocessing.Process.start() triggers lazy cloudpickle patch."""
+        code = """
+import multiprocessing
+import os
+
+def worker():
+    print(f"worker pid={os.getpid()}")
+
+p = multiprocessing.Process(target=worker)
+p.start()
+p.join(timeout=10)
+print(f"exit_code={p.exitcode}")
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "exit_code=0" in result.stdout
+
+    async def test_multiprocessing_pool_works(self, scheduler: Scheduler) -> None:
+        """multiprocessing.Pool internally calls Process.start() — triggers patch."""
+        code = """
+import multiprocessing
+
+def square(x):
+    return x * x
+
+with multiprocessing.Pool(2) as pool:
+    results = pool.map(square, [1, 2, 3, 4])
+print(results)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "[1, 4, 9, 16]" in result.stdout
+
+    async def test_cloudpickle_not_imported_without_multiprocessing(self, scheduler: Scheduler) -> None:
+        """Verify cloudpickle is NOT imported for simple scripts."""
+        code = """
+import sys
+print('cloudpickle' in sys.modules)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "False" in result.stdout
+
+    async def test_cloudpickle_imported_after_process_start(self, scheduler: Scheduler) -> None:
+        """Verify cloudpickle IS imported after Process.start()."""
+        code = """
+import multiprocessing, sys, os
+
+def noop():
+    pass
+
+p = multiprocessing.Process(target=noop)
+p.start()
+p.join(timeout=10)
+print('cloudpickle' in sys.modules)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "True" in result.stdout

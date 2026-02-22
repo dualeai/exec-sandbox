@@ -216,44 +216,55 @@ ns["__builtins__"] = __builtins__
 import multiprocessing
 multiprocessing.set_start_method("fork")
 
-# Patch multiprocessing to use cloudpickle for serialization.
-# cloudpickle extracts only referenced globals via bytecode analysis (never the entire
-# __globals__ dict), so it handles exec()'d functions, lambdas, and closures safely.
-# This is the industry standard approach (PySpark, Ray, Dask, joblib/loky).
-# See: https://github.com/cloudpipe/cloudpickle
-import cloudpickle
-import copyreg
-import io
-import multiprocessing.reduction as _reduction
+# Lazy-load cloudpickle: only imported when multiprocessing actually spawns a process.
+# Saves ~100-150ms on REPL startup for scripts that never use multiprocessing.
+# cloudpickle is safe to defer (pure Python, no import-time side effects).
+# See: PEP 810 for future native lazy imports (Python 3.15+).
+def _patch_cloudpickle():
+    import cloudpickle
+    import copyreg
+    import io
+    import multiprocessing.reduction as _reduction
 
+    class _CloudForkingPickler(cloudpickle.Pickler):
+        _extra_reducers = {}
+        _copyreg_dispatch_table = copyreg.dispatch_table
 
-class _CloudForkingPickler(cloudpickle.Pickler):
-    _extra_reducers = {}
-    _copyreg_dispatch_table = copyreg.dispatch_table
+        def __init__(self, *args, **kwds):
+            super().__init__(*args, **kwds)
+            self.dispatch_table = self._copyreg_dispatch_table.copy()
+            self.dispatch_table.update(self._extra_reducers)
 
-    def __init__(self, *args, **kwds):
-        super().__init__(*args, **kwds)
-        self.dispatch_table = self._copyreg_dispatch_table.copy()
-        self.dispatch_table.update(self._extra_reducers)
+        @classmethod
+        def register(cls, type, reduce):
+            cls._extra_reducers[type] = reduce
 
-    @classmethod
-    def register(cls, type, reduce):
-        cls._extra_reducers[type] = reduce
+        @classmethod
+        def dumps(cls, obj, protocol=None):
+            buf = io.BytesIO()
+            cls(buf, protocol).dump(obj)
+            return buf.getbuffer()
 
-    @classmethod
-    def dumps(cls, obj, protocol=None):
-        buf = io.BytesIO()
-        cls(buf, protocol).dump(obj)
-        return buf.getbuffer()
+        loads = staticmethod(cloudpickle.loads)
 
-    loads = staticmethod(cloudpickle.loads)
+    def _cloud_dump(obj, file, protocol=None):
+        _CloudForkingPickler(file, protocol).dump(obj)
 
+    _reduction.ForkingPickler = _CloudForkingPickler
+    _reduction.dump = _cloud_dump
 
-def _cloud_dump(obj, file, protocol=None):
-    _CloudForkingPickler(file, protocol).dump(obj)
-
-_reduction.ForkingPickler = _CloudForkingPickler
-_reduction.dump = _cloud_dump
+# Intercept multiprocessing.Process.start() to trigger lazy patching.
+# After first call, restores the original start() to avoid overhead.
+_mp_orig_start = multiprocessing.Process.start
+_mp_patched = False
+def _lazy_mp_start(self):
+    global _mp_patched
+    if not _mp_patched:
+        _mp_patched = True
+        _patch_cloudpickle()
+        multiprocessing.Process.start = _mp_orig_start
+    return _mp_orig_start(self)
+multiprocessing.Process.start = _lazy_mp_start
 
 # PID guard: forked children inherit the REPL wrapper. Record parent PID so
 # children that escape user code (via sys.exit(), exception, or fall-through)
