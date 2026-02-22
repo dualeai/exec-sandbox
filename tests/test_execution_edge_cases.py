@@ -156,6 +156,36 @@ for i in range(100):
         assert "err0" in result.stderr
         assert "err99" in result.stderr
 
+    async def test_bom_prefix_stripped_python(self, scheduler: Scheduler) -> None:
+        """UTF-8 BOM (U+FEFF) before Python code is stripped, execution succeeds."""
+        result = await scheduler.run(
+            code="\ufeffprint('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_bom_prefix_stripped_javascript(self, scheduler: Scheduler) -> None:
+        """UTF-8 BOM (U+FEFF) before JavaScript code is stripped, execution succeeds."""
+        result = await scheduler.run(
+            code="\ufeffconsole.log('hello')",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_bom_prefix_stripped_raw(self, scheduler: Scheduler) -> None:
+        """UTF-8 BOM (U+FEFF) before shell code is stripped, execution succeeds."""
+        result = await scheduler.run(
+            code="\ufeffecho hello",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
 
 # =============================================================================
 # Weird Cases: Unusual behavior that should be handled gracefully

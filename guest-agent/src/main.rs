@@ -692,6 +692,11 @@ async fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error:
 /// this, `eval` treats `#!` as a comment and tries to parse the remaining lines
 /// as bash — failing for non-shell interpreters (awk, perl, ruby, etc.).
 fn prepend_env_vars(language: Language, code: &str, env_vars: &HashMap<String, String>) -> String {
+    // Strip UTF-8 BOM (U+FEFF) — editors and copy-paste can silently prepend it,
+    // causing interpreters to fail with unhelpful errors (e.g. Python SyntaxError,
+    // bash "$'\357\273\277': command not found").
+    let code = code.strip_prefix('\u{FEFF}').unwrap_or(code);
+
     let mut full_code = String::new();
 
     if !env_vars.is_empty() {
@@ -3718,5 +3723,46 @@ mod tests {
             "mktemp should have an error guard, got: {}",
             result,
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // prepend_env_vars BOM stripping tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_prepend_strips_bom_python() {
+        let code = "\u{FEFF}print('hello')";
+        let env = HashMap::new();
+        let result = prepend_env_vars(Language::Python, code, &env);
+        assert_eq!(result, "print('hello')");
+    }
+
+    #[test]
+    fn test_prepend_strips_bom_raw() {
+        let code = "\u{FEFF}echo hello";
+        let env = HashMap::new();
+        let result = prepend_env_vars(Language::Raw, code, &env);
+        assert_eq!(result, "echo hello");
+    }
+
+    #[test]
+    fn test_prepend_strips_bom_shebang() {
+        let code = "\u{FEFF}#!/bin/sh\necho hello";
+        let env = HashMap::new();
+        let result = prepend_env_vars(Language::Raw, code, &env);
+        // After BOM stripping, shebang is detected → tempfile path
+        assert!(
+            result.contains("mktemp"),
+            "shebang should be detected after BOM stripping, got: {}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_prepend_no_bom_unchanged() {
+        let code = "print('hello')";
+        let env = HashMap::new();
+        let result = prepend_env_vars(Language::Python, code, &env);
+        assert_eq!(result, "print('hello')");
     }
 }
