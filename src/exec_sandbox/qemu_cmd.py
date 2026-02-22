@@ -298,13 +298,25 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # ARM64 virt machine has PL011 UART (ttyAMA0) - reliable at early boot
         # Note: hvc0 doesn't work for console because virtio-serial isn't ready
         # when kernel tries to open /dev/console, causing init to crash
-        console_params = "console=ttyAMA0 loglevel=7"
+        # loglevel=1 (KERN_ALERT): suppress kernel printk below ALERT during boot.
+        # DEBUG (7) emits hundreds of messages, each requiring MMIO writes through
+        # PL011 UART. Panics still print (console_flush_on_panic). tiny-init
+        # messages are unaffected (direct libc::write to fd 2, not printk).
+        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+        console_params = "console=ttyAMA0 loglevel=1"
     elif use_virtio_console:
         # x86 non-legacy mode: ISA serial disabled, use virtio-console
-        console_params = "console=hvc0 loglevel=7"
+        # loglevel=1: suppress kernel printk noise. Each message triggers a
+        # virtqueue notification (MMIO doorbell + vCPU exit) on virtio-console.
+        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+        console_params = "console=hvc0 loglevel=1"
     else:
         # x86 legacy mode or TCG: ISA serial available at T=0, reliable boot
-        console_params = "console=ttyS0 loglevel=7"
+        # loglevel=1: suppress kernel printk noise. ISA serial (ttyS0) transmits
+        # byte-by-byte through I/O port 0x3F8 -- extremely expensive under TCG
+        # software emulation. Biggest win for TCG boot latency.
+        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+        console_params = "console=ttyS0 loglevel=1"
 
     qemu_args.extend(
         [
@@ -346,10 +358,16 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # - tsc=reliable: Trust TSC clocksource (x86_64 only, kvmclock stable)
             # - rootflags=noatime: hint only; tiny-init mounts rootfs with
             #   MS_RDONLY|MS_NOATIME|MS_NOSUID|MS_NODEV (read-only rootfs)
+            # - numa_balancing=0: Disable NUMA page migration scanner (single-vCPU
+            #   guest has one NUMA node; scanner wastes cycles on TLB shootdowns)
+            #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html
+            # - page_alloc.shuffle=0: Disable page allocator free-list shuffling.
+            #   Only useful for KASLR effectiveness, already disabled via nokaslr.
+            #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
             # See: https://github.com/firecracker-microvm/firecracker
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
             # init.net=1: load network modules when networking is needed
             # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
             # init.balloon=1: load balloon module (always, needed for warm pool)
