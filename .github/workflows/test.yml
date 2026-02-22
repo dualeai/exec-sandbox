@@ -244,6 +244,7 @@ jobs:
         with:
           name: vm-images-${{ matrix.arch }}
           path: |
+            images/dist/vmlinux-${{ matrix.image_arch }}
             images/dist/vmlinuz-${{ matrix.image_arch }}
             images/dist/vmlinuz-${{ matrix.image_arch }}.hash
             images/dist/initramfs-${{ matrix.image_arch }}

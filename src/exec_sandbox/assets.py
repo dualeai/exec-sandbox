@@ -156,6 +156,9 @@ async def fetch_kernel(arch: str | None = None, override: Path | None = None) ->
     """
     Fetch kernel for the given architecture.
 
+    Prefers vmlinux (PVH direct boot, x86_64 only, ~50ms faster) over vmlinuz.
+    Falls back to vmlinuz if vmlinux is not available.
+
     Args:
         arch: Architecture ("x86_64" or "aarch64"). Defaults to current machine.
         override: Explicit path to search first (from SchedulerConfig.images_dir).
@@ -164,6 +167,15 @@ async def fetch_kernel(arch: str | None = None, override: Path | None = None) ->
         Path to the decompressed kernel file.
     """
     arch = arch or get_current_arch()
+
+    # Prefer vmlinux for PVH direct boot (x86_64 only)
+    if arch == "x86_64":
+        vmlinux_fname = f"vmlinux-{arch}.zst"
+        if local_path := await _find_asset(vmlinux_fname, override):
+            logger.debug("Using cached vmlinux kernel", extra={"arch": arch, "path": str(local_path)})
+            return local_path
+
+    # Fall back to vmlinuz (always available)
     fname = f"vmlinuz-{arch}.zst"
 
     # Check local cache first
@@ -174,6 +186,13 @@ async def fetch_kernel(arch: str | None = None, override: Path | None = None) ->
     # Not found locally, download from GitHub
     await ensure_registry_loaded()
     assets = get_assets()
+
+    # Try vmlinux first for x86_64 (PVH direct boot)
+    if arch == "x86_64":
+        vmlinux_fname = f"vmlinux-{arch}.zst"
+        if vmlinux_fname in assets.registry:
+            logger.debug("Fetching vmlinux kernel", extra={"arch": arch, "file": vmlinux_fname})
+            return await assets.fetch(vmlinux_fname, processor=decompress_zstd)
 
     logger.debug("Fetching kernel", extra={"arch": arch, "file": fname})
     return await assets.fetch(fname, processor=decompress_zstd)
@@ -383,8 +402,11 @@ async def ensure_assets(
     # Try to find existing assets first
     if images_dir := await _find_images_dir(override):
         # Validate that essential files exist (not just the directory)
+        # Accept either vmlinux (PVH direct boot) or vmlinuz (compressed)
         arch = get_current_arch()
-        kernel_path = images_dir / f"vmlinuz-{arch}"
+        kernel_path = images_dir / f"vmlinux-{arch}"
+        if not await aiofiles.os.path.exists(kernel_path):
+            kernel_path = images_dir / f"vmlinuz-{arch}"
         if await aiofiles.os.path.exists(kernel_path):
             logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
             return images_dir

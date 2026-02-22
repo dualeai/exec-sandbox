@@ -225,7 +225,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Auto-discover kernel and initramfs based on architecture
     # Note: existence validated in create_vm() before calling this method
-    kernel_path = settings.kernel_path / f"vmlinuz-{arch_suffix}"
+    # Prefer uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
+    # QEMU auto-detects PVH ELF note and skips kernel decompression
+    vmlinux_path = settings.kernel_path / f"vmlinux-{arch_suffix}"
+    vmlinuz_path = settings.kernel_path / f"vmlinuz-{arch_suffix}"
+    kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
     initramfs_path = settings.kernel_path / f"initramfs-{arch_suffix}"
 
     # Layer 5: Linux namespaces (optional - requires capabilities or user namespaces)

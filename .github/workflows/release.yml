@@ -276,6 +276,7 @@ jobs:
         with:
           name: vm-images-${{ matrix.arch }}
           path: |
+            images/dist/vmlinux-${{ matrix.arch }}
             images/dist/vmlinuz-${{ matrix.arch }}
             images/dist/initramfs-${{ matrix.arch }}
             images/dist/*-${{ matrix.arch }}.qcow2
@@ -329,7 +330,7 @@ jobs:
 
           # Compress large files
           cd release
-          for f in *.qcow2 vmlinuz-* initramfs-*; do
+          for f in *.qcow2 vmlinux-* vmlinuz-* initramfs-*; do
             zstd -19 --rm "$f"
           done
 

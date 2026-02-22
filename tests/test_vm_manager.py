@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmError
+from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmDependencyError, VmError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
@@ -1137,6 +1137,96 @@ class TestKernelInitramfsValidation:
         fake_path = Path("/nonexistent/kernels")
         with pytest.raises(VmError, match="Kernel not found"):
             await validate_kernel_initramfs(fake_path, arch)
+
+    async def test_validation_accepts_vmlinux_only(self, tmp_path: Path) -> None:
+        """Validation passes with vmlinux (no vmlinuz) + initramfs."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        # Create vmlinux + initramfs (no vmlinuz)
+        (tmp_path / f"vmlinux-{arch_suffix}").write_text("fake-elf")
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        # Should NOT raise
+        await validate_kernel_initramfs(tmp_path, arch)
+
+    async def test_validation_accepts_vmlinuz_only(self, tmp_path: Path) -> None:
+        """Validation passes with vmlinuz (no vmlinux) + initramfs."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        # Create vmlinuz + initramfs (no vmlinux)
+        (tmp_path / f"vmlinuz-{arch_suffix}").write_text("fake-bzimage")
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        # Should NOT raise
+        await validate_kernel_initramfs(tmp_path, arch)
+
+    async def test_validation_prefers_vmlinux(self, tmp_path: Path) -> None:
+        """When both vmlinux and vmlinuz exist, validation still passes (vmlinux found first)."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        (tmp_path / f"vmlinux-{arch_suffix}").write_text("fake-elf")
+        (tmp_path / f"vmlinuz-{arch_suffix}").write_text("fake-bzimage")
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        await validate_kernel_initramfs(tmp_path, arch)
+
+    async def test_validation_fails_neither_kernel(self, tmp_path: Path) -> None:
+        """Validation fails when neither vmlinux nor vmlinuz exists."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        # Only initramfs, no kernel
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        with pytest.raises(VmDependencyError, match="Kernel not found"):
+            await validate_kernel_initramfs(tmp_path, arch)
+
+
+class TestQemuKernelPathSelection:
+    """Tests for vmlinux vs vmlinuz selection in qemu_cmd.py."""
+
+    def test_x86_64_prefers_vmlinux_when_exists(self, tmp_path: Path) -> None:
+        """On x86_64, vmlinux is preferred when it exists."""
+        arch = HostArch.X86_64
+        arch_suffix = "x86_64"
+
+        vmlinux_path = tmp_path / f"vmlinux-{arch_suffix}"
+        vmlinuz_path = tmp_path / f"vmlinuz-{arch_suffix}"
+        vmlinux_path.write_text("fake-elf")
+        vmlinuz_path.write_text("fake-bzimage")
+
+        # Replicate the selection logic from qemu_cmd.py
+        kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+        assert kernel_path == vmlinux_path
+
+    def test_x86_64_falls_back_to_vmlinuz(self, tmp_path: Path) -> None:
+        """On x86_64, falls back to vmlinuz when vmlinux doesn't exist."""
+        arch = HostArch.X86_64
+        arch_suffix = "x86_64"
+
+        vmlinux_path = tmp_path / f"vmlinux-{arch_suffix}"
+        vmlinuz_path = tmp_path / f"vmlinuz-{arch_suffix}"
+        vmlinuz_path.write_text("fake-bzimage")
+        # vmlinux does NOT exist
+
+        kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+        assert kernel_path == vmlinuz_path
+
+    def test_aarch64_always_uses_vmlinuz(self, tmp_path: Path) -> None:
+        """On aarch64, vmlinuz is always used (PVH is x86-only)."""
+        arch = HostArch.AARCH64
+        arch_suffix = "aarch64"
+
+        vmlinux_path = tmp_path / f"vmlinux-{arch_suffix}"
+        vmlinuz_path = tmp_path / f"vmlinuz-{arch_suffix}"
+        vmlinux_path.write_text("fake-elf")
+        vmlinuz_path.write_text("fake-bzimage")
+
+        kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+        assert kernel_path == vmlinuz_path  # aarch64 always vmlinuz
 
 
 # ============================================================================

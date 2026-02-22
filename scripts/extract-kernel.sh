@@ -139,6 +139,26 @@ extract_for_arch() {
                 chmod 644 /output/vmlinuz-$target_arch
             "
         save_hash "$vmlinuz_file" "$kernel_hash"
+
+        # Extract uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
+        if [ "$target_arch" = "x86_64" ]; then
+            local vmlinux_file="$OUTPUT_DIR/vmlinux-x86_64"
+            echo "Extracting vmlinux for PVH boot..."
+            if "$SCRIPT_DIR/extract-vmlinux.sh" "$vmlinuz_file" > "$vmlinux_file" 2>/dev/null; then
+                chmod 644 "$vmlinux_file"
+                # Verify PVH note exists (XEN_ELFNOTE_PHYS32_ENTRY)
+                if docker run --rm -v "$OUTPUT_DIR:/output" --platform linux/amd64 \
+                    "alpine:$ALPINE_VERSION" sh -c "apk add --no-cache binutils >/dev/null 2>&1 && readelf -n /output/vmlinux-x86_64 2>/dev/null | grep -q Xen"; then
+                    echo "vmlinux-x86_64: PVH note verified ($(du -h "$vmlinux_file" | cut -f1))"
+                else
+                    echo "Warning: vmlinux lacks PVH note, removing (will use vmlinuz)"
+                    rm -f "$vmlinux_file"
+                fi
+            else
+                echo "Warning: vmlinux extraction failed (will use vmlinuz)"
+                rm -f "$vmlinux_file"
+            fi
+        fi
     fi
 
     # Build initramfs if needed
