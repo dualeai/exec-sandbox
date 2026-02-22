@@ -497,16 +497,17 @@ static REPL_STATES: Lazy<TokioMutex<HashMap<String, ReplState>>> =
 /// Write REPL wrapper script to SANDBOX_ROOT for the given language.
 /// All languages use SANDBOX_ROOT so package managers (bun, pip) resolve
 /// dependencies installed in the same directory.
-async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_repl_wrapper(language: Language) -> Result<(), Box<dyn std::error::Error>> {
     match language {
-        "python" => {
+        Language::Python => {
             tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER).await?
         }
-        "javascript" => {
+        Language::Javascript => {
             tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER).await?
         }
-        "raw" => tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?,
-        _ => return Err(format!("Unknown language for REPL: {}", language).into()),
+        Language::Raw => {
+            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?
+        }
     }
     Ok(())
 }
@@ -517,11 +518,11 @@ async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Er
 ///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages + {PYTHON_SITE_PACKAGES}
 ///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules + {NODE_MODULES_SYSTEM}
 ///   - Raw: GNU Bash (not busybox ash) for arrays, traps, [[ ]], etc.
-async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
+async fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error::Error>> {
     write_repl_wrapper(language).await?;
 
     let mut cmd = match language {
-        "python" => {
+        Language::Python => {
             let mut c = Command::new("python3");
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
             // Package resolution: session-time installs (tmpfs) then system installs (ext4 snapshot)
@@ -540,7 +541,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             c.env("PYTHONSAFEPATH", "1");
             c
         }
-        "javascript" => {
+        Language::Javascript => {
             let mut c = Command::new("bun");
             c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
             // Package resolution: session-time (tmpfs) then system (ext4 snapshot)
@@ -550,7 +551,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             );
             c
         }
-        "raw" => {
+        Language::Raw => {
             // Use bash instead of /bin/sh (busybox ash on Alpine). Ash silently
             // breaks common shell patterns: arrays, process substitution, [[ ]],
             // here-strings, traps. Bash is installed in all VM images (COMMON_PKGS).
@@ -564,7 +565,6 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
             c
         }
-        _ => return Err(format!("Unknown language for REPL: {}", language).into()),
     };
 
     cmd.stdin(std::process::Stdio::piped())
@@ -627,7 +627,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    eprintln!("Spawned REPL for language={}", language);
+    eprintln!("Spawned REPL for language={}", language.as_str());
 
     Ok(ReplState {
         child,
@@ -643,12 +643,12 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
 /// file so the kernel's `binfmt_script` handles interpreter dispatch. Without
 /// this, `eval` treats `#!` as a comment and tries to parse the remaining lines
 /// as bash — failing for non-shell interpreters (awk, perl, ruby, etc.).
-fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, String>) -> String {
+fn prepend_env_vars(language: Language, code: &str, env_vars: &HashMap<String, String>) -> String {
     let mut full_code = String::new();
 
     if !env_vars.is_empty() {
         match language {
-            "python" => {
+            Language::Python => {
                 full_code.push_str("import os as __os__\n");
                 for (key, value) in env_vars {
                     // Escape backslashes and single quotes for Python string literal
@@ -660,14 +660,14 @@ fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, Strin
                 }
                 full_code.push_str("del __os__\n");
             }
-            "javascript" => {
+            Language::Javascript => {
                 for (key, value) in env_vars {
                     let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
                     let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
                     full_code.push_str(&format!("process.env['{escaped_key}']='{escaped_val}';\n"));
                 }
             }
-            "raw" => {
+            Language::Raw => {
                 for (key, value) in env_vars {
                     // Shell export syntax requires unquoted identifier keys.
                     // Skip keys that aren't valid POSIX identifiers to avoid broken syntax.
@@ -684,14 +684,13 @@ fn prepend_env_vars(language: &str, code: &str, env_vars: &HashMap<String, Strin
                     full_code.push_str(&format!("export {key}='{escaped_val}'\n"));
                 }
             }
-            _ => {}
         }
     }
 
     // RAW mode shebang: write to temp file for kernel-level interpretation.
     // eval treats #! as a comment, then tries to parse remaining lines as
     // shell syntax — fails for non-shell interpreters (awk, perl, ruby, etc.).
-    if language == "raw" && code.starts_with("#!") {
+    if language == Language::Raw && code.starts_with("#!") {
         // Pick a heredoc sentinel not present in the code
         let mut sentinel = String::from("_EXEC_SANDBOX_EOF_");
         while code.contains(&sentinel) {
@@ -733,6 +732,20 @@ fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(255)
 }
 
+/// Serialize a GuestResponse to JSON + newline and queue it for sending.
+async fn send_response(
+    write_tx: &mpsc::Sender<Vec<u8>>,
+    msg: &GuestResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = serde_json::to_vec(msg)?;
+    bytes.push(b'\n');
+    write_tx
+        .send(bytes)
+        .await
+        .map_err(|_| "Write queue closed")?;
+    Ok(())
+}
+
 // Helper to send streaming error via queue
 async fn send_streaming_error(
     write_tx: &mpsc::Sender<Vec<u8>>,
@@ -740,23 +753,16 @@ async fn send_streaming_error(
     error_type: &str,
     op_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let error = StreamingError {
-        msg_type: "error".to_string(),
-        message,
-        error_type: error_type.to_string(),
-        op_id: op_id.map(|s| s.to_string()),
-        version: Some(VERSION.to_string()),
-    };
-    let json = serde_json::to_string(&error)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-
-    // Queue write (blocks if queue full - backpressure)
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
-    Ok(())
+    send_response(
+        write_tx,
+        &GuestResponse::Error {
+            message,
+            error_type: error_type.to_string(),
+            op_id: op_id.map(|s| s.to_string()),
+            version: Some(VERSION),
+        },
+    )
+    .await
 }
 
 // Note: flush_buffers() removed - replaced with spawned task pattern (Nov 2025)
@@ -769,24 +775,25 @@ async fn send_streaming_error(
 ///   - Python: `uv pip install --target {PYTHON_SITE_PACKAGES}`
 ///   - JavaScript: `bun add` in /usr/local/lib ({NODE_MODULES_SYSTEM} resolution)
 async fn install_packages(
-    language: &str,
+    language: Language,
     packages: &[String],
     write_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
     use tokio::time::Duration;
 
-    // Validation: check language is supported
-    if language != "python" && language != "javascript" {
+    // Validation: check language supports package installation
+    if language == Language::Raw {
         send_streaming_error(
             write_tx,
             format!(
                 "Unsupported language '{}' for package installation (supported: python, javascript)",
-                language
+                language.as_str()
             ),
             "validation_error",
             None,
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -909,7 +916,7 @@ async fn install_packages(
     let start = Instant::now();
 
     let mut cmd = match language {
-        "python" => {
+        Language::Python => {
             let mut c = Command::new("uv");
             c.arg("pip")
                 .arg("install")
@@ -927,7 +934,7 @@ async fn install_packages(
             c.stderr(std::process::Stdio::piped());
             c
         }
-        "javascript" => {
+        Language::Javascript => {
             let mut c = Command::new("bun");
             c.arg("add");
             for pkg in packages {
@@ -942,7 +949,7 @@ async fn install_packages(
             c.stderr(std::process::Stdio::piped());
             c
         }
-        _ => unreachable!(), // Already validated above
+        Language::Raw => unreachable!(), // Already validated above
     };
 
     // Spawn process
@@ -951,7 +958,11 @@ async fn install_packages(
         Err(e) => {
             send_streaming_error(
                 write_tx,
-                format!("Failed to execute package manager for {}: {}", language, e),
+                format!(
+                    "Failed to execute package manager for {}: {}",
+                    language.as_str(),
+                    e
+                ),
                 "execution_error",
                 None,
             )
@@ -1066,48 +1077,36 @@ async fn install_packages(
 
     // Stream all captured output (batched for efficiency)
     if !stdout_lines.is_empty() {
-        let chunk = OutputChunk {
-            chunk_type: "stdout".to_string(),
-            chunk: stdout_lines.join("\n") + "\n",
-        };
-        let json = serde_json::to_string(&chunk)?;
-        let mut response = json.into_bytes();
-        response.push(b'\n');
-        write_tx
-            .send(response)
-            .await
-            .map_err(|_| "Write queue closed")?;
+        send_response(
+            write_tx,
+            &GuestResponse::Stdout {
+                chunk: stdout_lines.join("\n") + "\n",
+            },
+        )
+        .await?;
     }
 
     if !stderr_lines.is_empty() {
-        let chunk = OutputChunk {
-            chunk_type: "stderr".to_string(),
-            chunk: stderr_lines.join("\n") + "\n",
-        };
-        let json = serde_json::to_string(&chunk)?;
-        let mut response = json.into_bytes();
-        response.push(b'\n');
-        write_tx
-            .send(response)
-            .await
-            .map_err(|_| "Write queue closed")?;
+        send_response(
+            write_tx,
+            &GuestResponse::Stderr {
+                chunk: stderr_lines.join("\n") + "\n",
+            },
+        )
+        .await?;
     }
 
     // Send completion message (no granular timing for install_packages)
-    let complete = ExecutionComplete {
-        msg_type: "complete".to_string(),
-        exit_code,
-        execution_time_ms: duration_ms,
-        spawn_ms: None,
-        process_ms: None,
-    };
-    let json = serde_json::to_string(&complete)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
+    send_response(
+        write_tx,
+        &GuestResponse::Complete {
+            exit_code,
+            execution_time_ms: duration_ms,
+            spawn_ms: None,
+            process_ms: None,
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -1346,34 +1345,26 @@ async fn handle_read_file(
         };
         // TODO: Binary framing would eliminate this base64 encode overhead (~33% wire bloat)
         let chunk_b64 = BASE64.encode(&buf[..n]);
-        let chunk_msg = FileChunkResponse {
-            msg_type: "file_chunk".to_string(),
-            op_id: op_id.to_string(),
-            data: chunk_b64,
-        };
-        let json = serde_json::to_string(&chunk_msg)?;
-        let mut response = json.into_bytes();
-        response.push(b'\n');
-        write_tx
-            .send(response)
-            .await
-            .map_err(|_| "Write queue closed")?;
+        send_response(
+            write_tx,
+            &GuestResponse::FileChunk {
+                op_id: op_id.to_string(),
+                data: chunk_b64,
+            },
+        )
+        .await?;
     }
 
     // Send completion
-    let complete_msg = FileReadComplete {
-        msg_type: "file_read_complete".to_string(),
-        op_id: op_id.to_string(),
-        path: path.to_string(),
-        size: file_size,
-    };
-    let json = serde_json::to_string(&complete_msg)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
+    send_response(
+        write_tx,
+        &GuestResponse::FileReadComplete {
+            op_id: op_id.to_string(),
+            path: path.to_string(),
+            size: file_size,
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -1430,37 +1421,199 @@ async fn handle_list_files(
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Send response
-    let response_msg = FileList {
-        msg_type: "file_list".to_string(),
-        path: path.to_string(),
-        entries,
-    };
-    let json = serde_json::to_string(&response_msg)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
-
-    Ok(())
+    send_response(
+        write_tx,
+        &GuestResponse::FileList {
+            path: path.to_string(),
+            entries,
+        },
+    )
+    .await
 }
 
-// Validation helper for execute_code_streaming
+/// Set up a pipelined file write operation.
+///
+/// Validates the path, creates parent directories, opens a temp file with
+/// zstd decompression, and spawns a blocking task for the I/O pipeline.
+/// Returns `Some(ActiveWriteHandle)` on success, or `None` if an error was
+/// already sent to the host.
+async fn handle_write_file(
+    op_id: &str,
+    path: &str,
+    make_executable: bool,
+    write_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<Option<ActiveWriteHandle>, Box<dyn std::error::Error>> {
+    // Validate path
+    let resolved_path = match validate_file_path(path) {
+        Ok(p) => p,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Invalid path '{}': {}", path, e),
+                "validation_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+    // Reject sandbox root itself
+    if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
+        send_streaming_error(
+            write_tx,
+            "Cannot write to sandbox root directory".to_string(),
+            "validation_error",
+            Some(op_id),
+        )
+        .await?;
+        return Ok(None);
+    }
+    // Create parent directories (sync)
+    if let Some(parent) = resolved_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        send_streaming_error(
+            write_tx,
+            format!("Failed to create directories: {}", e),
+            "io_error",
+            Some(op_id),
+        )
+        .await?;
+        return Ok(None);
+    }
+    // Temp path: <dir>/.wr.<op_id>.tmp (40 chars max).
+    // Lives in the same directory for atomic rename (same filesystem).
+    // Uses a fixed-length name to avoid NAME_MAX overflow when the
+    // target filename is already near 255 bytes.
+    let tmp_path = resolved_path
+        .parent()
+        .unwrap_or(std::path::Path::new(SANDBOX_ROOT))
+        .join(format!(".wr.{}.tmp", op_id));
+    let file = match std::fs::File::create(&tmp_path) {
+        Ok(f) => f,
+        Err(e) => {
+            send_streaming_error(
+                write_tx,
+                format!("Failed to create temp file: {}", e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+    let counting_writer = CountingWriter {
+        inner: file,
+        count: 0,
+        limit: MAX_FILE_SIZE_BYTES,
+    };
+    let decoder = match zstd::stream::write::Decoder::new(counting_writer) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            send_streaming_error(
+                write_tx,
+                format!("Decompression init failed: {}", e),
+                "io_error",
+                Some(op_id),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+
+    // Pipeline: spawn a blocking task for decompression + disk I/O.
+    // The main loop sends decoded chunks through the channel while
+    // the blocking task decompresses and writes to disk in parallel.
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(16);
+    let write_state = WriteFileState {
+        decoder,
+        tmp_path,
+        final_path: resolved_path,
+        make_executable,
+        op_id: op_id.to_string(),
+        path_display: path.to_string(),
+        finished: false,
+    };
+
+    let task = tokio::task::spawn_blocking(move || {
+        let mut state = write_state;
+        let mut chunk_rx = chunk_rx;
+        // blocking_recv() is safe here — we're on the blocking thread pool.
+        // Empty vec = "finalize" sentinel from FileEnd handler.
+        // None (channel closed) without sentinel = abort (error/disconnect).
+        let mut finalize = false;
+        while let Some(decoded) = chunk_rx.blocking_recv() {
+            if decoded.is_empty() {
+                finalize = true;
+                break;
+            }
+            if let Err(e) = std::io::Write::write_all(&mut state.decoder, &decoded) {
+                // state dropped on return → Drop cleans up tmp file
+                return Err(state.io_error(format!("write: {e}")));
+            }
+        }
+        if !finalize {
+            // Channel closed without sentinel — abort (sender dropped
+            // due to decode error, disconnect, etc.). Don't set
+            // finished=true so Drop cleans up the tmp file.
+            return Err(state.io_error("channel closed without finalize"));
+        }
+        // Sentinel received — all chunks delivered, finalize
+        if let Err(e) = std::io::Write::flush(&mut state.decoder) {
+            return Err(state.io_error(format!("decompression finalize: {e}")));
+        }
+        let bytes_written = state.decoder.get_ref().count;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if state.make_executable { 0o755 } else { 0o644 };
+            if let Err(e) =
+                std::fs::set_permissions(&state.tmp_path, std::fs::Permissions::from_mode(mode))
+            {
+                return Err(state.io_error(format!("set_permissions: {e}")));
+            }
+            // Chown to sandbox user so the REPL process can
+            // read and modify the file.
+            let ret = unsafe {
+                libc::chown(
+                    std::ffi::CString::new(state.tmp_path.as_os_str().as_encoded_bytes())
+                        .unwrap()
+                        .as_ptr(),
+                    SANDBOX_UID,
+                    SANDBOX_GID,
+                )
+            };
+            if ret != 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(state.io_error(format!("chown: {e}")));
+            }
+        }
+        if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
+            return Err(state.io_error(format!("rename: {e}")));
+        }
+        state.finished = true;
+        Ok(WriteResult {
+            bytes_written,
+            path_display: state.path_display.clone(),
+            op_id: state.op_id.clone(),
+        })
+    });
+
+    Ok(Some(ActiveWriteHandle {
+        chunk_tx,
+        task,
+        path_display: path.to_string(),
+        op_id: op_id.to_string(),
+    }))
+}
+
+// Validation helper for execute_code_streaming (language already validated via Language::parse)
 fn validate_execute_params(
-    language: &str,
     code: &str,
     timeout: u64,
     env_vars: &HashMap<String, String>,
 ) -> Result<(), String> {
-    // Check language
-    if language != "python" && language != "javascript" && language != "raw" {
-        return Err(format!(
-            "Unsupported language '{}' (supported: python, javascript, raw)",
-            language
-        ));
-    }
-
     // Check code not empty
     if code.trim().is_empty() {
         return Err("Code cannot be empty".to_string());
@@ -1549,7 +1702,7 @@ fn validate_execute_params(
     Ok(())
 }
 
-/// Helper to flush a buffer as an OutputChunk message
+/// Helper to flush a buffer as a Stdout/Stderr response message
 async fn flush_output_buffer(
     write_tx: &mpsc::Sender<Vec<u8>>,
     buffer: &mut String,
@@ -1559,18 +1712,12 @@ async fn flush_output_buffer(
         return Ok(());
     }
 
-    let chunk = OutputChunk {
-        chunk_type: chunk_type.to_string(),
-        chunk: std::mem::take(buffer),
+    let data = std::mem::take(buffer);
+    let msg = match chunk_type {
+        "stderr" => GuestResponse::Stderr { chunk: data },
+        _ => GuestResponse::Stdout { chunk: data },
     };
-    let json = serde_json::to_string(&chunk)?;
-    let mut response = json.into_bytes();
-    response.push(b'\n');
-    write_tx
-        .send(response)
-        .await
-        .map_err(|_| "Write queue closed")?;
-    Ok(())
+    send_response(write_tx, &msg).await
 }
 
 /// Gracefully terminate a process group: SIGTERM → wait → SIGKILL
@@ -1661,7 +1808,7 @@ async fn graceful_terminate_process_group(
 /// Sentinel detection uses `find()` (not `starts_with()`) to handle cases where
 /// user stderr without trailing newline gets concatenated with the sentinel line.
 async fn execute_code_streaming(
-    language: &str,
+    language_str: &str,
     code: &str,
     timeout: u64,
     env_vars: &HashMap<String, String>,
@@ -1671,8 +1818,26 @@ async fn execute_code_streaming(
     use tokio::io::AsyncReadExt;
     use tokio::time::{Duration, interval};
 
-    // Validate params
-    if let Err(error_message) = validate_execute_params(language, code, timeout, env_vars) {
+    // Parse language
+    let language = match Language::parse(language_str) {
+        Some(l) => l,
+        None => {
+            send_streaming_error(
+                write_tx,
+                format!(
+                    "Unsupported language '{}' (supported: python, javascript, raw)",
+                    language_str
+                ),
+                "validation_error",
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Validate params (language already validated above)
+    if let Err(error_message) = validate_execute_params(code, timeout, env_vars) {
         send_streaming_error(write_tx, error_message, "validation_error", None).await?;
         return Ok(());
     }
@@ -1684,12 +1849,12 @@ async fn execute_code_streaming(
     let mut was_fresh_spawn = false;
     let mut repl = {
         let mut states = REPL_STATES.lock().await;
-        match states.remove(language) {
+        match states.remove(language.as_str()) {
             Some(mut existing) => {
                 // Check if REPL is still alive
                 match existing.child.try_wait() {
                     Ok(Some(_)) => {
-                        eprintln!("REPL for {} died, spawning fresh", language);
+                        eprintln!("REPL for {} died, spawning fresh", language.as_str());
                         was_fresh_spawn = true;
                         spawn_repl(language).await?
                     }
@@ -1727,36 +1892,16 @@ async fn execute_code_streaming(
     let full_code = prepend_env_vars(language, code, env_vars);
     let code_bytes = full_code.as_bytes();
 
-    // Write header + code to REPL stdin
+    // Write header + code to REPL stdin (header\ncode, then flush)
     let header = format!("{} {}\n", sentinel_id, code_bytes.len());
-    if let Err(e) = repl.stdin.write_all(header.as_bytes()).await {
-        eprintln!("REPL stdin write failed (header): {}", e);
-        let _ = repl.child.kill().await;
-        let _ = repl.child.wait().await;
-        send_streaming_error(
-            write_tx,
-            format!("Failed to send code to REPL: {}", e),
-            "execution_error",
-            None,
-        )
-        .await?;
-        return Ok(());
+    let write_result = async {
+        repl.stdin.write_all(header.as_bytes()).await?;
+        repl.stdin.write_all(code_bytes).await?;
+        repl.stdin.flush().await
     }
-    if let Err(e) = repl.stdin.write_all(code_bytes).await {
-        eprintln!("REPL stdin write failed (code): {}", e);
-        let _ = repl.child.kill().await;
-        let _ = repl.child.wait().await;
-        send_streaming_error(
-            write_tx,
-            format!("Failed to send code to REPL: {}", e),
-            "execution_error",
-            None,
-        )
-        .await?;
-        return Ok(());
-    }
-    if let Err(e) = repl.stdin.flush().await {
-        eprintln!("REPL stdin flush failed: {}", e);
+    .await;
+    if let Err(e) = write_result {
+        eprintln!("REPL stdin write failed: {}", e);
         let _ = repl.child.kill().await;
         let _ = repl.child.wait().await;
         send_streaming_error(
@@ -1898,53 +2043,49 @@ async fn execute_code_streaming(
         Ok(()) if sentinel_exit_code.is_some() => {
             // Normal completion via sentinel - REPL stays alive for reuse
             let exit_code = sentinel_exit_code.unwrap();
-
-            // Store REPL back for reuse
-            let mut states = REPL_STATES.lock().await;
-            states.insert(language.to_string(), repl);
-
-            let complete = ExecutionComplete {
-                msg_type: "complete".to_string(),
-                exit_code,
-                execution_time_ms: duration_ms,
-                spawn_ms,
-                process_ms,
-            };
-            let json = serde_json::to_string(&complete)?;
-            let mut response = json.into_bytes();
-            response.push(b'\n');
-            write_tx
-                .send(response)
+            REPL_STATES
+                .lock()
                 .await
-                .map_err(|_| "Write queue closed")?;
+                .insert(language.as_str().to_string(), repl);
+
+            send_response(
+                write_tx,
+                &GuestResponse::Complete {
+                    exit_code,
+                    execution_time_ms: duration_ms,
+                    spawn_ms,
+                    process_ms,
+                },
+            )
+            .await?;
         }
         Ok(()) => {
             // REPL died (EOF on both streams) - recover exit code
             let status = repl.child.wait().await;
             let exit_code = status.map(exit_code_from_status).unwrap_or(-1);
+            eprintln!(
+                "REPL for {} died with exit_code={}",
+                language.as_str(),
+                exit_code
+            );
 
-            eprintln!("REPL for {} died with exit_code={}", language, exit_code);
-
-            let complete = ExecutionComplete {
-                msg_type: "complete".to_string(),
-                exit_code,
-                execution_time_ms: duration_ms,
-                spawn_ms,
-                process_ms,
-            };
-            let json = serde_json::to_string(&complete)?;
-            let mut response = json.into_bytes();
-            response.push(b'\n');
-            write_tx
-                .send(response)
-                .await
-                .map_err(|_| "Write queue closed")?;
+            send_response(
+                write_tx,
+                &GuestResponse::Complete {
+                    exit_code,
+                    execution_time_ms: duration_ms,
+                    spawn_ms,
+                    process_ms,
+                },
+            )
+            .await?;
         }
         Err(_) => {
             // Timeout - kill REPL (will be respawned on next exec)
             eprintln!(
                 "REPL for {} timed out after {}s, killing",
-                language, timeout
+                language.as_str(),
+                timeout
             );
             let _ =
                 graceful_terminate_process_group(&mut repl.child, TERM_GRACE_PERIOD_SECONDS).await;
@@ -2227,47 +2368,68 @@ async fn handle_connection_nonblocking(
         match serde_json::from_str::<GuestCommand>(&line) {
             Ok(GuestCommand::Ping) => {
                 eprintln!("Processing: ping");
-                let pong = Pong {
-                    msg_type: "pong".to_string(),
-                    version: VERSION.to_string(),
-                };
-                let response_json = serde_json::to_string(&pong)?;
-                let mut response = response_json.into_bytes();
-                response.push(b'\n');
-
-                if write_tx.send(response).await.is_err() {
-                    eprintln!("Write queue closed");
+                if send_response(&write_tx, &GuestResponse::Pong { version: VERSION })
+                    .await
+                    .is_err()
+                {
                     break Err("write queue closed".into());
                 }
             }
             Ok(GuestCommand::WarmRepl { language }) => {
                 eprintln!("Processing: warm_repl (language={})", language);
-                match spawn_repl(&language).await {
+                let lang = match Language::parse(&language) {
+                    Some(l) => l,
+                    None => {
+                        if send_response(
+                            &write_tx,
+                            &GuestResponse::WarmReplAck {
+                                language,
+                                status: "error".to_string(),
+                                message: Some(
+                                    "Unsupported language (supported: python, javascript, raw)"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break Err("write queue closed".into());
+                        }
+                        continue;
+                    }
+                };
+                match spawn_repl(lang).await {
                     Ok(repl) => {
                         REPL_STATES.lock().await.insert(language.clone(), repl);
                         eprintln!("REPL pre-warmed for {}", language);
-                        let ack = serde_json::json!({
-                            "type": "warm_repl_ack",
-                            "language": language,
-                            "status": "ok"
-                        });
-                        let mut response = serde_json::to_vec(&ack)?;
-                        response.push(b'\n');
-                        if write_tx.send(response).await.is_err() {
+                        if send_response(
+                            &write_tx,
+                            &GuestResponse::WarmReplAck {
+                                language,
+                                status: "ok".to_string(),
+                                message: None,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
                             break Err("write queue closed".into());
                         }
                     }
                     Err(e) => {
                         eprintln!("Warning: eager REPL spawn failed: {}", e);
-                        let ack = serde_json::json!({
-                            "type": "warm_repl_ack",
-                            "language": language,
-                            "status": "error",
-                            "message": e.to_string()
-                        });
-                        let mut response = serde_json::to_vec(&ack)?;
-                        response.push(b'\n');
-                        if write_tx.send(response).await.is_err() {
+                        if send_response(
+                            &write_tx,
+                            &GuestResponse::WarmReplAck {
+                                language,
+                                status: "error".to_string(),
+                                message: Some(e.to_string()),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
                             break Err("write queue closed".into());
                         }
                     }
@@ -2279,10 +2441,27 @@ async fn handle_connection_nonblocking(
                     language,
                     packages.len()
                 );
-                if install_packages(&language, &packages, &write_tx)
-                    .await
-                    .is_err()
-                {
+                let lang = match Language::parse(&language) {
+                    Some(l) => l,
+                    None => {
+                        if send_streaming_error(
+                            &write_tx,
+                            format!(
+                                "Unsupported language '{}' for package installation (supported: python, javascript)",
+                                language
+                            ),
+                            "validation_error",
+                            None,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break Err("write queue closed".into());
+                        }
+                        continue;
+                    }
+                };
+                if install_packages(lang, &packages, &write_tx).await.is_err() {
                     break Err("install_packages failed".into());
                 }
             }
@@ -2315,220 +2494,15 @@ async fn handle_connection_nonblocking(
                     "Processing: write_file (op_id={}, path={}, executable={})",
                     op_id, path, make_executable
                 );
-                // Validate path
-                let resolved_path = match validate_file_path(&path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!("Invalid path '{}': {}", path, e),
-                            "validation_error",
-                            Some(&op_id),
-                        )
-                        .await;
-                        continue;
+                match handle_write_file(&op_id, &path, make_executable, &write_tx).await {
+                    Ok(Some(handle)) => {
+                        active_writes.insert(op_id, handle);
                     }
-                };
-                // Reject sandbox root itself
-                if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        "Cannot write to sandbox root directory".to_string(),
-                        "validation_error",
-                        Some(&op_id),
-                    )
-                    .await;
-                    continue;
+                    Ok(None) => {} // error already sent to host
+                    Err(e) => {
+                        break Err(e);
+                    }
                 }
-                // Create parent directories (sync)
-                if let Some(parent) = resolved_path.parent()
-                    && let Err(e) = std::fs::create_dir_all(parent)
-                {
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        format!("Failed to create directories: {}", e),
-                        "io_error",
-                        Some(&op_id),
-                    )
-                    .await;
-                    continue;
-                }
-                // Temp path: <dir>/.wr.<op_id>.tmp (40 chars max).
-                // Lives in the same directory for atomic rename (same filesystem).
-                // Uses a fixed-length name to avoid NAME_MAX overflow when the
-                // target filename is already near 255 bytes.
-                let tmp_path = resolved_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new(SANDBOX_ROOT))
-                    .join(format!(".wr.{}.tmp", op_id));
-                let file = match std::fs::File::create(&tmp_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!("Failed to create temp file: {}", e),
-                            "io_error",
-                            Some(&op_id),
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-                let counting_writer = CountingWriter {
-                    inner: file,
-                    count: 0,
-                    limit: MAX_FILE_SIZE_BYTES,
-                };
-                let decoder = match zstd::stream::write::Decoder::new(counting_writer) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!("Decompression init failed: {}", e),
-                            "io_error",
-                            Some(&op_id),
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-
-                // Pipeline: spawn a blocking task for decompression + disk I/O.
-                // The main loop sends decoded chunks through the channel while
-                // the blocking task decompresses and writes to disk in parallel.
-                let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(16);
-                let write_state = WriteFileState {
-                    decoder,
-                    tmp_path,
-                    final_path: resolved_path,
-                    make_executable,
-                    op_id: op_id.clone(),
-                    path_display: path.clone(),
-                    finished: false,
-                };
-
-                let task = tokio::task::spawn_blocking(move || {
-                    let mut state = write_state;
-                    let mut chunk_rx = chunk_rx;
-                    // blocking_recv() is safe here — we're on the blocking thread pool.
-                    // Empty vec = "finalize" sentinel from FileEnd handler.
-                    // None (channel closed) without sentinel = abort (error/disconnect).
-                    let mut finalize = false;
-                    while let Some(decoded) = chunk_rx.blocking_recv() {
-                        if decoded.is_empty() {
-                            finalize = true;
-                            break;
-                        }
-                        if let Err(e) = std::io::Write::write_all(&mut state.decoder, &decoded) {
-                            // state dropped on return → Drop cleans up tmp file
-                            return Err(WriteError {
-                                message: format!("Write error for '{}': {}", state.path_display, e),
-                                error_type: "io_error".to_string(),
-                                path_display: state.path_display.clone(),
-                                op_id: state.op_id.clone(),
-                            });
-                        }
-                    }
-                    if !finalize {
-                        // Channel closed without sentinel — abort (sender dropped
-                        // due to decode error, disconnect, etc.). Don't set
-                        // finished=true so Drop cleans up the tmp file.
-                        return Err(WriteError {
-                            message: format!(
-                                "Write aborted for '{}': channel closed without finalize",
-                                state.path_display
-                            ),
-                            error_type: "io_error".to_string(),
-                            path_display: state.path_display.clone(),
-                            op_id: state.op_id.clone(),
-                        });
-                    }
-                    // Sentinel received — all chunks delivered, finalize
-                    if let Err(e) = std::io::Write::flush(&mut state.decoder) {
-                        return Err(WriteError {
-                            message: format!(
-                                "Decompression finalize error for '{}': {}",
-                                state.path_display, e
-                            ),
-                            error_type: "io_error".to_string(),
-                            path_display: state.path_display.clone(),
-                            op_id: state.op_id.clone(),
-                        });
-                    }
-                    let bytes_written = state.decoder.get_ref().count;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = if state.make_executable { 0o755 } else { 0o644 };
-                        if let Err(e) = std::fs::set_permissions(
-                            &state.tmp_path,
-                            std::fs::Permissions::from_mode(mode),
-                        ) {
-                            return Err(WriteError {
-                                message: format!(
-                                    "Failed to set permissions for '{}': {}",
-                                    state.path_display, e
-                                ),
-                                error_type: "io_error".to_string(),
-                                path_display: state.path_display.clone(),
-                                op_id: state.op_id.clone(),
-                            });
-                        }
-                        // Chown to sandbox user so the REPL process can
-                        // read and modify the file.
-                        let ret = unsafe {
-                            libc::chown(
-                                std::ffi::CString::new(
-                                    state.tmp_path.as_os_str().as_encoded_bytes(),
-                                )
-                                .unwrap()
-                                .as_ptr(),
-                                SANDBOX_UID,
-                                SANDBOX_GID,
-                            )
-                        };
-                        if ret != 0 {
-                            let e = std::io::Error::last_os_error();
-                            return Err(WriteError {
-                                message: format!(
-                                    "Failed to chown for '{}': {}",
-                                    state.path_display, e
-                                ),
-                                error_type: "io_error".to_string(),
-                                path_display: state.path_display.clone(),
-                                op_id: state.op_id.clone(),
-                            });
-                        }
-                    }
-                    if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
-                        return Err(WriteError {
-                            message: format!(
-                                "Failed to finalize write for '{}': {}",
-                                state.path_display, e
-                            ),
-                            error_type: "io_error".to_string(),
-                            path_display: state.path_display.clone(),
-                            op_id: state.op_id.clone(),
-                        });
-                    }
-                    state.finished = true;
-                    Ok(WriteResult {
-                        bytes_written,
-                        path_display: state.path_display.clone(),
-                        op_id: state.op_id.clone(),
-                    })
-                });
-
-                active_writes.insert(
-                    op_id.clone(),
-                    ActiveWriteHandle {
-                        chunk_tx,
-                        task,
-                        path_display: path,
-                        op_id,
-                    },
-                );
             }
             Ok(GuestCommand::FileChunk { op_id, data }) => {
                 if !active_writes.contains_key(&op_id) {
@@ -2644,16 +2618,17 @@ async fn handle_connection_nonblocking(
                 // Await the blocking task result
                 match task.await {
                     Ok(Ok(result)) => {
-                        let ack = FileWriteAck {
-                            msg_type: "file_write_ack".to_string(),
-                            op_id: result.op_id,
-                            path: result.path_display,
-                            bytes_written: result.bytes_written,
-                        };
-                        let json = serde_json::to_string(&ack).unwrap_or_default();
-                        let mut response = json.into_bytes();
-                        response.push(b'\n');
-                        if write_tx.send(response).await.is_err() {
+                        if send_response(
+                            &write_tx,
+                            &GuestResponse::FileWriteAck {
+                                op_id: result.op_id,
+                                path: result.path_display,
+                                bytes_written: result.bytes_written,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
                             break Err("write queue closed".into());
                         }
                     }
@@ -3477,8 +3452,7 @@ mod tests {
 
     #[test]
     fn test_serialize_file_write_ack() {
-        let ack = FileWriteAck {
-            msg_type: "file_write_ack".to_string(),
+        let ack = GuestResponse::FileWriteAck {
             op_id: "test_op".to_string(),
             path: "test.txt".to_string(),
             bytes_written: 42,
@@ -3491,8 +3465,7 @@ mod tests {
 
     #[test]
     fn test_serialize_file_chunk_response() {
-        let chunk = FileChunkResponse {
-            msg_type: "file_chunk".to_string(),
+        let chunk = GuestResponse::FileChunk {
             op_id: "abc123".to_string(),
             data: "SGVsbG8=".to_string(),
         };
@@ -3504,8 +3477,7 @@ mod tests {
 
     #[test]
     fn test_serialize_file_read_complete() {
-        let msg = FileReadComplete {
-            msg_type: "file_read_complete".to_string(),
+        let msg = GuestResponse::FileReadComplete {
             op_id: "def456".to_string(),
             path: "data.csv".to_string(),
             size: 1024,
@@ -3514,20 +3486,6 @@ mod tests {
         assert!(json.contains("\"type\":\"file_read_complete\""));
         assert!(json.contains("\"op_id\":\"def456\""));
         assert!(json.contains("\"size\":1024"));
-    }
-
-    #[test]
-    fn test_serialize_file_write_ack_with_op_id() {
-        let ack = FileWriteAck {
-            msg_type: "file_write_ack".to_string(),
-            op_id: "abc123".to_string(),
-            path: "test.txt".to_string(),
-            bytes_written: 42,
-        };
-        let json = serde_json::to_string(&ack).unwrap();
-        assert!(json.contains("\"type\":\"file_write_ack\""));
-        assert!(json.contains("\"op_id\":\"abc123\""));
-        assert!(json.contains("\"bytes_written\":42"));
     }
 
     #[test]
@@ -3542,8 +3500,7 @@ mod tests {
 
     #[test]
     fn test_serialize_file_list() {
-        let list = FileList {
-            msg_type: "file_list".to_string(),
+        let list = GuestResponse::FileList {
             path: "".to_string(),
             entries: vec![
                 FileEntry {
@@ -3572,7 +3529,7 @@ mod tests {
     fn test_prepend_shebang_wraps_tempfile() {
         let code = "#!/usr/bin/awk -f\nBEGIN{print}";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         assert!(result.contains("mktemp"), "should use mktemp");
         assert!(result.contains("cat >"), "should write via cat heredoc");
         assert!(result.contains("chmod +x"), "should make executable");
@@ -3583,7 +3540,7 @@ mod tests {
     fn test_prepend_shebang_with_env_vars() {
         let code = "#!/bin/sh\necho $FOO";
         let env = HashMap::from([("FOO".to_string(), "bar".to_string())]);
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         // Env export comes before the tempfile block
         let export_pos = result.find("export FOO='bar'").unwrap();
         let mktemp_pos = result.find("mktemp").unwrap();
@@ -3597,7 +3554,7 @@ mod tests {
     fn test_prepend_shebang_empty_env() {
         let code = "#!/bin/sh\necho hi";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         // Even with empty env, shebang should still be wrapped
         assert!(result.contains("mktemp"));
         assert!(result.contains("chmod +x"));
@@ -3607,7 +3564,7 @@ mod tests {
     fn test_prepend_no_shebang_passthrough() {
         let code = "echo hello";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         assert_eq!(result, "echo hello");
     }
 
@@ -3615,7 +3572,7 @@ mod tests {
     fn test_prepend_no_shebang_with_env() {
         let code = "echo $X";
         let env = HashMap::from([("X".to_string(), "1".to_string())]);
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         assert!(result.contains("export X='1'"));
         assert!(result.contains("echo $X"));
         assert!(!result.contains("mktemp"), "no shebang = no wrapping");
@@ -3625,7 +3582,7 @@ mod tests {
     fn test_prepend_shebang_sentinel_collision() {
         let code = "#!/bin/sh\necho _EXEC_SANDBOX_EOF_";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         // The sentinel must not be the base string since it appears in code
         assert!(result.contains("_EXEC_SANDBOX_EOF_X"));
     }
@@ -3634,7 +3591,7 @@ mod tests {
     fn test_prepend_shebang_sentinel_double_collision() {
         let code = "#!/bin/sh\necho _EXEC_SANDBOX_EOF_ _EXEC_SANDBOX_EOF_X";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         assert!(result.contains("_EXEC_SANDBOX_EOF_XX"));
     }
 
@@ -3642,7 +3599,7 @@ mod tests {
     fn test_prepend_shebang_non_raw_ignored() {
         let code = "#!/usr/bin/awk -f\nBEGIN{print}";
         let env = HashMap::new();
-        let result = prepend_env_vars("python", code, &env);
+        let result = prepend_env_vars(Language::Python, code, &env);
         assert_eq!(result, code, "non-raw languages should not wrap shebangs");
     }
 
@@ -3650,7 +3607,7 @@ mod tests {
     fn test_prepend_shebang_quoted_heredoc() {
         let code = "#!/bin/sh\necho $VAR `cmd`";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         // Heredoc sentinel must be single-quoted to prevent shell expansion
         assert!(
             result.contains("<<'_EXEC_SANDBOX_EOF_'"),
@@ -3666,7 +3623,7 @@ mod tests {
         // heredoc closing sentinel which the shell matches at line start.
         let code = "#!/bin/sh\necho hi";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         for (i, line) in result.lines().enumerate() {
             assert!(
                 !line.starts_with(' ') && !line.starts_with('\t'),
@@ -3684,7 +3641,7 @@ mod tests {
     #[test]
     fn test_validate_execute_params_null_byte_in_code() {
         let env = HashMap::new();
-        let result = validate_execute_params("python", "print('hi')\0print('bye')", 30, &env);
+        let result = validate_execute_params("print('hi')\0print('bye')", 30, &env);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("null bytes"));
     }
@@ -3692,14 +3649,14 @@ mod tests {
     #[test]
     fn test_validate_execute_params_only_null_byte() {
         let env = HashMap::new();
-        let result = validate_execute_params("python", "\0", 30, &env);
+        let result = validate_execute_params("\0", 30, &env);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_execute_params_valid_code_no_null() {
         let env = HashMap::new();
-        let result = validate_execute_params("python", "print('hello')", 30, &env);
+        let result = validate_execute_params("print('hello')", 30, &env);
         assert!(result.is_ok());
     }
 
@@ -3707,7 +3664,7 @@ mod tests {
     fn test_prepend_shebang_mktemp_guard() {
         let code = "#!/bin/sh\necho hi";
         let env = HashMap::new();
-        let result = prepend_env_vars("raw", code, &env);
+        let result = prepend_env_vars(Language::Raw, code, &env);
         assert!(
             result.contains("|| {") && result.contains("exit 126"),
             "mktemp should have an error guard, got: {}",

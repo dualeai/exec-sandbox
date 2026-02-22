@@ -64,68 +64,73 @@ pub enum GuestCommand {
 // Outbound messages (guest → host, serialized to JSON)
 // ============================================================================
 
+/// All guest → host messages as a single tagged enum.
+///
+/// `#[serde(tag = "type")]` produces `{"type": "<variant>", ...}` — identical
+/// wire format to the previous per-struct approach. The Python host discriminates
+/// on `"type"` via Pydantic tagged union (`guest_agent_protocol.py`).
 #[derive(Debug, Serialize)]
-pub struct OutputChunk {
-    #[serde(rename = "type")]
-    pub chunk_type: String, // "stdout" or "stderr"
-    pub chunk: String,
-}
+#[serde(tag = "type")]
+pub enum GuestResponse {
+    #[serde(rename = "stdout")]
+    Stdout { chunk: String },
 
-#[derive(Debug, Serialize)]
-pub struct ExecutionComplete {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "complete"
-    pub exit_code: i32,
-    pub execution_time_ms: u64,
-    /// Time for cmd.spawn() to return (fork/exec overhead)
-    pub spawn_ms: Option<u64>,
-    /// Time from spawn completion to child.wait() returning (actual process runtime)
-    pub process_ms: Option<u64>,
-}
+    #[serde(rename = "stderr")]
+    Stderr { chunk: String },
 
-#[derive(Debug, Serialize)]
-pub struct Pong {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "pong"
-    pub version: String,
-}
+    #[serde(rename = "complete")]
+    Complete {
+        exit_code: i32,
+        execution_time_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spawn_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        process_ms: Option<u64>,
+    },
 
-#[derive(Debug, Serialize)]
-pub struct StreamingError {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "error"
-    pub message: String,
-    pub error_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub op_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-}
+    #[serde(rename = "pong")]
+    Pong { version: &'static str },
 
-#[derive(Debug, Serialize)]
-pub struct FileWriteAck {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "file_write_ack"
-    pub op_id: String,
-    pub path: String,
-    pub bytes_written: usize,
-}
+    #[serde(rename = "error")]
+    Error {
+        message: String,
+        error_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        op_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<&'static str>,
+    },
 
-#[derive(Debug, Serialize)]
-pub struct FileChunkResponse {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "file_chunk"
-    pub op_id: String,
-    pub data: String,
-}
+    #[serde(rename = "file_write_ack")]
+    FileWriteAck {
+        op_id: String,
+        path: String,
+        bytes_written: usize,
+    },
 
-#[derive(Debug, Serialize)]
-pub struct FileReadComplete {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "file_read_complete"
-    pub op_id: String,
-    pub path: String,
-    pub size: u64,
+    #[serde(rename = "file_chunk")]
+    FileChunk { op_id: String, data: String },
+
+    #[serde(rename = "file_read_complete")]
+    FileReadComplete {
+        op_id: String,
+        path: String,
+        size: u64,
+    },
+
+    #[serde(rename = "file_list")]
+    FileList {
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+
+    #[serde(rename = "warm_repl_ack")]
+    WarmReplAck {
+        language: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -133,14 +138,6 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct FileList {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "file_list"
-    pub path: String,
-    pub entries: Vec<FileEntry>,
 }
 
 // ============================================================================
@@ -180,6 +177,18 @@ pub struct WriteFileState {
     pub finished: bool,
 }
 
+impl WriteFileState {
+    /// Build a `WriteError` for this write operation with `error_type = "io_error"`.
+    pub fn io_error(&self, message: impl std::fmt::Display) -> WriteError {
+        WriteError {
+            message: format!("I/O error for '{}': {}", self.path_display, message),
+            error_type: "io_error".to_string(),
+            path_display: self.path_display.clone(),
+            op_id: self.op_id.clone(),
+        }
+    }
+}
+
 impl Drop for WriteFileState {
     fn drop(&mut self) {
         // Clean up temp file if write was not completed (error/disconnect)
@@ -213,6 +222,42 @@ pub struct WriteError {
     pub error_type: String,
     pub path_display: String,
     pub op_id: String,
+}
+
+// ============================================================================
+// Language dispatch
+// ============================================================================
+
+/// Supported execution languages.
+///
+/// `GuestCommand` keeps `language: String` so unknown languages (e.g. `"cobol"`)
+/// still deserialize — validation happens at the handler level via `Language::parse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Python,
+    Javascript,
+    Raw,
+}
+
+impl Language {
+    /// Parse a language string. Returns `None` for unsupported languages.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "python" => Some(Self::Python),
+            "javascript" => Some(Self::Javascript),
+            "raw" => Some(Self::Raw),
+            _ => None,
+        }
+    }
+
+    /// Wire-format string (matches `GuestCommand.language` values).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Javascript => "javascript",
+            Self::Raw => "raw",
+        }
+    }
 }
 
 // ============================================================================
