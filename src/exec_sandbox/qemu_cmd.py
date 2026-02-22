@@ -354,7 +354,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # Boot params: console varies by machine type, minimal kernel logging
             # =============================================================
             # Boot Parameter Optimizations (validated Jan 2025):
-            # - nokaslr: Skip KASLR (safe for ephemeral isolated VMs)
             # - noresume: Skip hibernate resume check (VMs don't hibernate)
             # - swiotlb=noforce: Disable software I/O TLB (virtio uses direct DMA)
             # - panic=-1: Immediate reboot on panic (boot timeout handles loops)
@@ -366,12 +365,18 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #   guest has one NUMA node; scanner wastes cycles on TLB shootdowns)
             #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html
             # - page_alloc.shuffle=0: Disable page allocator free-list shuffling.
-            #   Only useful for KASLR effectiveness, already disabled via nokaslr.
+            #   Reduces allocator overhead with no security downside (KASLR uses
+            #   boot-time randomization, not ongoing free-list shuffling).
             #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+            # - mitigations: Left at kernel default (mitigations=auto) to match
+            #   AWS Lambda/Firecracker security posture. Enables speculative
+            #   execution mitigations relevant to the actual CPU (Spectre, MDS, etc.).
+            #   Ref: https://docs.kernel.org/admin-guide/hw-vuln/spectre.html
+            #   Ref: CVE-2025-40300 (VMSCAPE Spectre-BTI guest-to-host via KVM)
             # See: https://github.com/firecracker-microvm/firecracker
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
             # init.net=1: load network modules when networking is needed
             # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
             # init.balloon=1: load balloon module (always, needed for warm pool)
