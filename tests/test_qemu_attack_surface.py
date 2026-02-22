@@ -388,7 +388,7 @@ for dev in glob.glob('/dev/*'):
     safe = {'null', 'zero', 'full', 'random', 'urandom', 'tty',
             'console', 'ptmx', 'pts', 'shm', 'mqueue', 'fd',
             'stdin', 'stdout', 'stderr', 'kmsg', 'cpu_dma_latency',
-            'virtio-ports'}
+            'virtio-ports', 'iommu'}
     if basename not in safe and not basename.startswith(('tty', 'vcs', 'vcsa', 'hvc', 'vport', 'rtc')):
         try:
             st = os.stat(dev)

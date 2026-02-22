@@ -261,10 +261,15 @@ jobs:
           name: tiny-init-${{ matrix.arch }}
           path: images/dist/
 
+      - name: Get Alpine version
+        id: alpine
+        run: echo "version=$(make --silent alpine-version)" >> "$GITHUB_OUTPUT"
+
       - name: Build VM images
         uses: ./.github/actions/build-vm-images
         with:
           arch: ${{ matrix.arch }}
+          alpine-version: ${{ steps.alpine.outputs.version }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

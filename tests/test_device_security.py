@@ -4,9 +4,11 @@ Verifies that dangerous device nodes are removed, block device nodes
 (/dev/vda, /dev/zram0) are removed after use, /dev is bind-remounted
 read-only (preventing mknod with EROFS), /dev/shm is mounted with
 restrictive flags, /tmp has nosuid/nodev flags with an explicit inode
-cap (nr_inodes=16384), and /proc/sys is read-only. These are defense-in-depth
-measures that apply regardless of UID — even root (guest-agent) cannot
-access /dev/mem or raw-read the root disk after these changes.
+cap (nr_inodes=16384), /proc/sys is read-only, and /bin + /sbin are
+bind-mounted read-only with nosuid (blocking path hijack attacks).
+These are defense-in-depth measures that apply regardless of UID — even
+root (guest-agent) cannot access /dev/mem or raw-read the root disk
+after these changes.
 
 Complements test_nonroot_repl.py (privilege escalation from UID 1000) with
 kernel/device-layer hardening that blocks access at the filesystem level.
@@ -1864,3 +1866,282 @@ print(f'GID:{s.st_gid}')
         assert result.exit_code == 0
         assert "UID:1000" in result.stdout
         assert "GID:1000" in result.stdout
+
+
+# =============================================================================
+# /bin and /sbin read-only hardening
+# =============================================================================
+class TestSystemBinaryHardening:
+    """/bin and /sbin are bind-mounted read-only with nosuid.
+
+    Blocks path hijack attacks where user code (UID 1000) replaces /bin/sh
+    (a busybox symlink) with an arbitrary script, hijacking subsequent shebang
+    (#!/bin/sh) execution within the same session. Primary protection is the
+    RO rootfs from tiny-init; the bind-mount adds nosuid as defense-in-depth.
+
+    Alpine 3.23+ uses usrmerge (/bin -> /usr/bin, /sbin -> /usr/sbin); mount(2)
+    resolves symlinks, so the bind-mount targets the resolved /usr/bin directory.
+
+    See: Microsoft Copilot Enterprise path hijack (Eye Security, April 2025).
+    """
+
+    # --- Normal: verify read-only mount flags ---
+
+    async def test_bin_mounted_readonly(self, scheduler: Scheduler) -> None:
+        """/bin has 'ro' flag in /proc/mounts."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/bin':
+            opts = parts[3].split(',')
+            print(f'RO:{"ro" in opts}')
+            break
+    else:
+        # usrmerge: /bin -> /usr/bin, check /usr instead
+        for line in open('/proc/mounts'):
+            parts = line.split()
+            if len(parts) >= 4 and parts[1] == '/usr':
+                opts = parts[3].split(',')
+                print(f'RO:{"ro" in opts}')
+                break
+        else:
+            print('NOT_FOUND')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "RO:True" in result.stdout, f"Expected /bin to be read-only.\nstdout: {result.stdout}"
+
+    async def test_sbin_mounted_readonly(self, scheduler: Scheduler) -> None:
+        """/sbin has 'ro' flag in /proc/mounts."""
+        code = """\
+with open('/proc/mounts') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] == '/sbin':
+            opts = parts[3].split(',')
+            print(f'RO:{"ro" in opts}')
+            break
+    else:
+        # usrmerge: /sbin -> /usr/sbin, check /usr instead
+        for line in open('/proc/mounts'):
+            parts = line.split()
+            if len(parts) >= 4 and parts[1] == '/usr':
+                opts = parts[3].split(',')
+                print(f'RO:{"ro" in opts}')
+                break
+        else:
+            print('NOT_FOUND')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "RO:True" in result.stdout, f"Expected /sbin to be read-only.\nstdout: {result.stdout}"
+
+    # --- Normal: write attempts blocked ---
+
+    async def test_cannot_replace_bin_sh(self, scheduler: Scheduler) -> None:
+        """os.unlink('/bin/sh') is blocked with EROFS."""
+        code = """\
+import os, errno
+try:
+    os.unlink('/bin/sh')
+    print('REMOVED')
+except OSError as e:
+    if e.errno == errno.EROFS:
+        print('BLOCKED:erofs')
+    elif e.errno == errno.EACCES:
+        print('BLOCKED:eacces')
+    else:
+        print(f'BLOCKED:errno_{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), f"Expected unlink /bin/sh to be blocked.\nstdout: {result.stdout}"
+
+    async def test_cannot_overwrite_busybox(self, scheduler: Scheduler) -> None:
+        """open('/bin/busybox', 'wb') is blocked."""
+        code = """\
+import errno
+try:
+    f = open('/bin/busybox', 'wb')
+    f.close()
+    print('OPENED')
+except OSError as e:
+    if e.errno == errno.EROFS:
+        print('BLOCKED:erofs')
+    elif e.errno == errno.EACCES:
+        print('BLOCKED:eacces')
+    else:
+        print(f'BLOCKED:errno_{e.errno}')
+except FileNotFoundError:
+    # usrmerge: busybox may be at /usr/bin/busybox
+    print('BLOCKED:not_found')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected busybox overwrite to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_cannot_create_file_in_bin(self, scheduler: Scheduler) -> None:
+        """File creation in /bin is blocked."""
+        code = """\
+import errno
+try:
+    with open('/bin/evil', 'w') as f:
+        f.write('#!/bin/sh\\necho pwned')
+    print('CREATED')
+except OSError as e:
+    if e.errno == errno.EROFS:
+        print('BLOCKED:erofs')
+    elif e.errno == errno.EACCES:
+        print('BLOCKED:eacces')
+    else:
+        print(f'BLOCKED:errno_{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected file creation in /bin to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_cannot_create_file_in_sbin(self, scheduler: Scheduler) -> None:
+        """File creation in /sbin is blocked."""
+        code = """\
+import errno
+try:
+    with open('/sbin/evil', 'w') as f:
+        f.write('#!/bin/sh\\necho pwned')
+    print('CREATED')
+except OSError as e:
+    if e.errno == errno.EROFS:
+        print('BLOCKED:erofs')
+    elif e.errno == errno.EACCES:
+        print('BLOCKED:eacces')
+    else:
+        print(f'BLOCKED:errno_{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected file creation in /sbin to be blocked.\nstdout: {result.stdout}"
+        )
+
+    async def test_cannot_create_symlink_in_bin(self, scheduler: Scheduler) -> None:
+        """Symlink creation in /bin is blocked."""
+        code = """\
+import os, errno
+try:
+    os.symlink('/tmp/evil', '/bin/evil_link')
+    print('CREATED')
+except OSError as e:
+    if e.errno == errno.EROFS:
+        print('BLOCKED:erofs')
+    elif e.errno == errno.EACCES:
+        print('BLOCKED:eacces')
+    else:
+        print(f'BLOCKED:errno_{e.errno}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.startswith("BLOCKED:"), (
+            f"Expected symlink creation in /bin to be blocked.\nstdout: {result.stdout}"
+        )
+
+    # --- Edge: the specific attack vector ---
+
+    async def test_bin_sh_replacement_attack_blocked(self, scheduler: Scheduler) -> None:
+        """rm /bin/sh via RAW language fails (the specific attack vector)."""
+        result = await scheduler.run(
+            code="rm /bin/sh 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        assert result.exit_code in {0, 1}
+        assert "EXIT:0" not in result.stdout, f"Expected rm /bin/sh to fail.\nstdout: {result.stdout}"
+
+    # --- Normal: system binaries still functional ---
+
+    async def test_bin_sh_still_executable(self, scheduler: Scheduler) -> None:
+        """/bin/sh -c 'echo OK' still works (read-only does not imply noexec)."""
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["/bin/sh", "-c", "echo OK"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f'OUTPUT:{r.stdout.strip()}')
+print(f'EXIT:{r.returncode}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "OUTPUT:OK" in result.stdout
+        assert "EXIT:0" in result.stdout
+
+    async def test_busybox_applets_still_work(self, scheduler: Scheduler) -> None:
+        """Busybox applets (ls, cat) still work from /bin."""
+        code = """\
+import subprocess
+
+# Test ls
+r = subprocess.run(["ls", "/tmp"], capture_output=True, text=True, timeout=5)
+print(f'LS_EXIT:{r.returncode}')
+
+# Test cat
+r = subprocess.run(
+    ["cat", "/etc/hostname"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f'CAT_EXIT:{r.returncode}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "LS_EXIT:0" in result.stdout
+        assert "CAT_EXIT:0" in result.stdout
+
+    # --- Weird: mount bypass attempts ---
+
+    async def test_remount_bin_rw_blocked(self, scheduler: Scheduler) -> None:
+        """mount -o remount,rw /bin requires CAP_SYS_ADMIN."""
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "-o", "remount,rw", "/bin"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "EXIT:0" not in result.stdout, (
+            f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
+        )
+
+    async def test_remount_sbin_rw_blocked(self, scheduler: Scheduler) -> None:
+        """mount -o remount,rw /sbin requires CAP_SYS_ADMIN."""
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "-o", "remount,rw", "/sbin"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "EXIT:0" not in result.stdout, (
+            f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
+        )
+
+    async def test_bind_mount_shadow_bin_blocked(self, scheduler: Scheduler) -> None:
+        """Bind tmpfs over /bin requires CAP_SYS_ADMIN."""
+        code = """\
+import subprocess
+r = subprocess.run(
+    ["mount", "-t", "tmpfs", "none", "/bin"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f"EXIT:{r.returncode}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "EXIT:0" not in result.stdout, f"Expected tmpfs shadow mount to fail.\nstdout: {result.stdout}"

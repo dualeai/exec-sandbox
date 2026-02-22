@@ -612,7 +612,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
 | `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
-All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and include common tools for AI agent workflows.
+All images are based on **Alpine Linux 3.23** (Linux 6.18 LTS, musl libc) and include common tools for AI agent workflows.
 
 ### Common Tools (all images)
 

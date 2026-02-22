@@ -38,7 +38,7 @@ case "$ARCH" in
         ;;
 esac
 
-ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
+ALPINE_VERSION="${ALPINE_VERSION:?ALPINE_VERSION must be set (exported by root Makefile)}"
 
 echo "Building minimal initramfs for $ARCH_NAME..."
 
@@ -113,9 +113,8 @@ extract_modules_from_docker() {
             kernel/fs/ext4/ext4.ko.gz \
             kernel/fs/jbd2/jbd2.ko.gz \
             kernel/fs/mbcache.ko.gz \
-            kernel/lib/crc16.ko.gz \
-            kernel/lib/libcrc32c.ko.gz \
-            kernel/crypto/crc32c_generic.ko.gz \
+            kernel/lib/crc/crc16.ko.gz \
+            kernel/crypto/crc32c-cryptoapi.ko.gz \
             kernel/drivers/block/zram/zram.ko.gz \
             kernel/lib/lz4/lz4_compress.ko.gz \
             kernel/crypto/lz4.ko.gz

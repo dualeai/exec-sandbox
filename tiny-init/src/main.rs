@@ -287,8 +287,8 @@ fn setup_zram(kver: &str) {
         header[4086..4096].copy_from_slice(b"SWAPSPACE2");
         // version = 1 (write as u32)
         header[1024..1028].copy_from_slice(&1u32.to_le_bytes());
-        // last_page
-        let pages = (zram_size / 4096) as u32;
+        // last_page (0-indexed: total_pages - 1, since page 0 is the header)
+        let pages = (zram_size / 4096).saturating_sub(1) as u32;
         header[1028..1032].copy_from_slice(&pages.to_le_bytes());
         f.write_all(&header)
     })();
@@ -320,6 +320,14 @@ fn setup_zram(kver: &str) {
         (mem_kb * 4 / 100).to_string(),
     );
     let _ = fs::write("/proc/sys/vm/overcommit_memory", "0");
+
+    // Kernel 6.15+: proactive defragmentation mode.
+    // Mode 1 = the page allocator groups allocations by mobility type more
+    // aggressively, preserving contiguous free regions for large folios.
+    // Critical for 128-256MB VMs where fragmentation quickly exhausts
+    // contiguous memory and degrades tmpfs/ext4 large folio performance.
+    // Ref: https://kernelnewbies.org/Linux_6.15 (vm.defrag_mode)
+    let _ = fs::write("/proc/sys/vm/defrag_mode", "1");
 
     log_fmt!("[zram] setup complete");
 }
@@ -656,9 +664,9 @@ fn main() {
     }
 
     // Filesystem modules (always needed)
-    load_module(&format!("{}/lib/crc16.ko", m), false);
-    load_module(&format!("{}/crypto/crc32c_generic.ko", m), false);
-    load_module(&format!("{}/lib/libcrc32c.ko", m), false);
+    // Alpine 3.23 / kernel 6.18 paths
+    load_module(&format!("{}/lib/crc/crc16.ko", m), false);
+    load_module(&format!("{}/crypto/crc32c-cryptoapi.ko", m), false);
     load_module(&format!("{}/fs/mbcache.ko", m), false);
     load_module(&format!("{}/fs/jbd2/jbd2.ko", m), false);
     load_module(&format!("{}/fs/ext4/ext4.ko", m), false);

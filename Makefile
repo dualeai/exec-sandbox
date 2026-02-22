@@ -2,6 +2,7 @@
 name ?= exec_sandbox
 python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires-python)
 rust_version ?= 1.93
+alpine_version ?= 3.23
 
 # Versions
 version_full ?= $(shell $(MAKE) --silent version-full)
@@ -24,6 +25,9 @@ version-pypi:
 
 rust-version:
 	@echo $(rust_version)
+
+alpine-version:
+	@echo $(alpine_version)
 
 # ============================================================================
 # Installation
@@ -70,7 +74,7 @@ IMAGE_VARIANT ?= all
 # Note: arm64 is normalized to aarch64 in the recipe to match script expectations.
 build-images:
 	@echo "🔨 Building QEMU images (arch=$(IMAGE_ARCH), variant=$(IMAGE_VARIANT))..."
-	RUST_VERSION=$(rust_version) ./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
+	RUST_VERSION=$(rust_version) ALPINE_VERSION=$(alpine_version) ./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
 
 # ============================================================================
 # Testing

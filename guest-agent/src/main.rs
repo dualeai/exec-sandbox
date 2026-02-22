@@ -89,7 +89,9 @@ const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB max buffer before forced
 const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024; // 500 MiB max file size (must match Python MAX_FILE_SIZE_BYTES)
 const MAX_FILE_PATH_LENGTH: usize = 4096; // POSIX PATH_MAX (full relative path)
 const MAX_FILE_NAME_BYTES: usize = 255; // POSIX NAME_MAX (single component, in bytes)
-const SANDBOX_ROOT: &str = "/home/user"; // Sandbox root directory
+const SANDBOX_ROOT: &str = "/home/user"; // Sandbox root directory (tmpfs, session-scoped)
+const PYTHON_SITE_PACKAGES: &str = "/usr/lib/python3/site-packages"; // ext4, snapshot-persisted
+const NODE_MODULES_SYSTEM: &str = "/usr/local/lib/node_modules"; // ext4, snapshot-persisted
 
 // File transfer streaming
 // 128KB balances fewer frames (halves syscalls, JSON parses, base64 en/decodes vs 64KB)
@@ -501,8 +503,8 @@ async fn write_repl_wrapper(language: &str) -> Result<(), Box<dyn std::error::Er
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally:
-///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages + /usr/lib/python3/site-packages
-///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules
+///   - Python: PYTHONPATH includes {SANDBOX_ROOT}/site-packages + {PYTHON_SITE_PACKAGES}
+///   - JavaScript: Node resolution finds {SANDBOX_ROOT}/node_modules + {NODE_MODULES_SYSTEM}
 ///   - Raw: GNU Bash (not busybox ash) for arrays, traps, [[ ]], etc.
 async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Error>> {
     write_repl_wrapper(language).await?;
@@ -515,7 +517,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             // See: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONPATH
             c.env(
                 "PYTHONPATH",
-                format!("{SANDBOX_ROOT}/site-packages:/usr/lib/python3/site-packages"),
+                format!("{SANDBOX_ROOT}/site-packages:{PYTHON_SITE_PACKAGES}"),
             );
             // Disable the 4300-digit limit for int<->str conversions (CVE-2020-10735).
             // Safe here: execution timeout (300s) and output caps (1MB) already bound resource usage.
@@ -533,7 +535,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             // Package resolution: session-time (tmpfs) then system (ext4 snapshot)
             c.env(
                 "NODE_PATH",
-                format!("{SANDBOX_ROOT}/node_modules:/usr/local/lib/node_modules"),
+                format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
             c
         }
@@ -753,8 +755,8 @@ async fn send_streaming_error(
 /// Packages are installed to system directories on the ext4 rootfs (not /home/user
 /// tmpfs) so they survive snapshot capture. The rootfs must be mounted read-write
 /// (init.rw=1) during snapshot creation.
-///   - Python: `uv pip install --target /usr/lib/python3/site-packages`
-///   - JavaScript: `bun add` in /usr/local/lib (NODE_PATH resolution)
+///   - Python: `uv pip install --target {PYTHON_SITE_PACKAGES}`
+///   - JavaScript: `bun add` in /usr/local/lib ({NODE_MODULES_SYSTEM} resolution)
 async fn install_packages(
     language: &str,
     packages: &[String],
@@ -903,11 +905,11 @@ async fn install_packages(
                 .arg("--python")
                 .arg("/opt/python/bin/python3")
                 .arg("--target")
-                .arg("/usr/lib/python3/site-packages");
+                .arg(PYTHON_SITE_PACKAGES);
             for pkg in packages {
                 c.arg(pkg);
             }
-            c.current_dir("/usr/lib/python3");
+            c.current_dir(PYTHON_SITE_PACKAGES);
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
             c.stdout(std::process::Stdio::piped());
@@ -920,7 +922,8 @@ async fn install_packages(
             for pkg in packages {
                 c.arg(pkg);
             }
-            // Install to system path for snapshot persistence (NODE_PATH resolution)
+            // Install to system path for snapshot persistence (NODE_PATH resolution).
+            // Parent of NODE_MODULES_SYSTEM — bun creates node_modules/ here.
             c.current_dir("/usr/local/lib");
             // Spawn in new process group for clean termination of all children
             c.process_group(0);
@@ -2899,7 +2902,7 @@ fn setup_init_environment() {
     eprintln!("Hardened system directory permissions (CIS 6.1.x)");
 
     // Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
-    // /home/user on rootfs is empty (cloudpickle moved to /usr/lib/python3/site-packages).
+    // /home/user on rootfs is empty (cloudpickle moved to PYTHON_SITE_PACKAGES).
     //
     // Why tmpfs over alternatives:
     //   - ramfs: no size cap, so runaway writes OOM the VM silently (no ENOSPC back-pressure)
@@ -2944,7 +2947,7 @@ fn setup_init_environment() {
 
     // Read-only bind remounts of /usr, /bin, /sbin (CIS hardening).
     // Skipped when init.rw=1 is set (snapshot creation): package install writes
-    // to /usr/lib/python3/site-packages and /usr/local/lib/node_modules.
+    // to PYTHON_SITE_PACKAGES and NODE_MODULES_SYSTEM.
     let rw_mode = std::fs::read_to_string("/proc/cmdline")
         .unwrap_or_default()
         .split_ascii_whitespace()
@@ -2956,9 +2959,25 @@ fn setup_init_environment() {
         // Read-only bind remount of /usr with nosuid (CIS: nodev,ro for /usr).
         // Defense-in-depth: rootfs is already ro from tiny-init, this adds a
         // nosuid bind-mount layer on /usr specifically.
-    // Does NOT include noexec — system binaries in /usr/bin must remain executable.
-    if mount_readonly(c"/usr") {
-        eprintln!("Mounted /usr read-only with nosuid");
+        // Does NOT include noexec — system binaries in /usr/bin must remain executable.
+        if mount_readonly(c"/usr") {
+            eprintln!("Mounted /usr read-only with nosuid");
+        }
+
+        // Read-only bind remount of /bin with nosuid (defense-in-depth).
+        // Alpine 3.23+: /bin is a symlink to /usr/bin (usrmerge); mount(2) resolves
+        // symlinks, so this bind-mounts the already-RO /usr/bin (harmless no-op).
+        // Primary protection is the RO rootfs from tiny-init; this adds nosuid layer.
+        if mount_readonly(c"/bin") {
+            eprintln!("Mounted /bin read-only with nosuid");
+        }
+
+        // Read-only bind remount of /sbin with nosuid (defense-in-depth).
+        // Alpine /sbin has networking (ip, iptables), filesystem (mkfs, fdisk),
+        // and service tools (rc-service). Same usrmerge compatibility as /bin.
+        if mount_readonly(c"/sbin") {
+            eprintln!("Mounted /sbin read-only with nosuid");
+        }
     }
 
     // Read-only bind remount of /etc/hosts (prevents host alias injection).
