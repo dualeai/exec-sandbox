@@ -652,6 +652,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
+    # Orphan protection: kill QEMU if parent process dies (QEMU 10.2+)
+    # Uses PR_SET_PDEATHSIG on Linux, kqueue on macOS/FreeBSD
+    qemu_version = await probe_qemu_version()
+    if qemu_version is not None and qemu_version >= (10, 2, 0):
+        qemu_args.extend(["-run-with", "exit-with-parent=on"])
+
     # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
     # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
     if workdir.use_qemu_vm_user:

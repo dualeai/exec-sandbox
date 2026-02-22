@@ -729,6 +729,91 @@ class TestNetdevReconnect:
 
 
 # ============================================================================
+# Unit Tests - Run-With Exit-With-Parent
+# ============================================================================
+
+
+class TestRunWithExitParent:
+    """Tests for -run-with exit-with-parent=on based on QEMU version.
+
+    QEMU 10.2+ supports exit-with-parent=on, which kills the QEMU process
+    when its parent dies (PR_SET_PDEATHSIG on Linux, kqueue on macOS).
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        probe_cache.reset("qemu_version")
+
+    async def test_run_with_exit_parent_for_qemu_10_2(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 10.2+ gets -run-with exit-with-parent=on."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-2")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-exit-parent-10-2",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+
+            idx = cmd.index("-run-with")
+            assert cmd[idx + 1] == "exit-with-parent=on"
+        finally:
+            await workdir.cleanup()
+
+    async def test_no_run_with_exit_parent_for_qemu_10_1(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 10.1 does not support exit-with-parent."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-1")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 1, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-exit-parent-10-1",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+
+            assert "-run-with" not in cmd
+        finally:
+            await workdir.cleanup()
+
+    async def test_no_run_with_exit_parent_when_version_unknown(self, vm_settings, tmp_path: Path) -> None:
+        """No exit-with-parent when QEMU version cannot be detected."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-unknown")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=None):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-exit-parent-unknown",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+
+            assert "-run-with" not in cmd
+        finally:
+            await workdir.cleanup()
+
+
+# ============================================================================
 # Tests - SMP / CPU cores
 # ============================================================================
 
