@@ -377,6 +377,27 @@ VMs include automatic memory optimization (no configuration required):
 - **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
 - **Memory reclamation (virtio-balloon)** - 70-90% smaller snapshots
 
+### Memory Architecture
+
+Guest RAM is a fixed budget shared between the kernel, userspace processes, and tmpfs mounts. tmpfs is demand-allocated — writing 10 MB of files consumes ~10 MB of the VM's memory budget.
+
+```
+Guest RAM (default 256 MB)
+├── Kernel + slab caches     (~20 MB fixed)
+├── Userspace (code execution) (variable)
+├── tmpfs mounts (on demand)
+│   ├── /home/user           50% of RAM (no fixed cap) — user files, packages
+│   ├── /tmp                 128 MB cap — pip/uv wheel builds, temp files
+│   └── /dev/shm              64 MB cap — POSIX shared memory
+└── zram compressed swap     (~25% effective bonus)
+```
+
+| Mount | Size | Purpose |
+|---|---|---|
+| `/home/user` | 50% of RAM | Writable home dir — installed packages, user scripts, data files |
+| `/tmp` | 128 MB | Scratch space for package managers (wheel builds), temp files |
+| `/dev/shm` | 64 MB | POSIX shared memory segments (Python multiprocessing semaphores) |
+
 ## Execution Result
 
 | Field | Type | Description |

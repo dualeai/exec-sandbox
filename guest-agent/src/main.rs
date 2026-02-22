@@ -2897,6 +2897,19 @@ fn setup_init_environment() {
 
     // Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
     // /home/user on rootfs is empty (cloudpickle moved to /usr/lib/python3/site-packages).
+    //
+    // Why tmpfs over alternatives:
+    //   - ramfs: no size cap, so runaway writes OOM the VM silently (no ENOSPC back-pressure)
+    //   - virtio-blk: virtio exit overhead per I/O, requires host-side image create/attach/cleanup,
+    //     and data persists on host disk (undesirable for ephemeral sandboxes)
+    //   - virtiofs: requires virtiofsd daemon per VM, adds host attack surface; works on microvm
+    //     via vhost-user-fs-device (MMIO) but unnecessary for scratch that doesn't need host access
+    //   - overlayfs: /home/user is empty on rootfs, overlay over empty dir = just tmpfs with extra
+    //     indirection (and overlayfs requires a writable upperdir, which is itself tmpfs)
+    //
+    // Memory accounting: pages allocated on demand from guest RAM (not host disk).
+    // Default size = 50% of guest RAM; counts toward the QEMU process cgroup memory limit on host.
+    //
     // No explicit size — defaults to half-of-RAM, auto-adapts to memory_mb.
     // No noexec — uv/bun install executables into site-packages/node_modules.
     // No nr_inodes cap — package managers create thousands of files.

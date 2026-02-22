@@ -565,6 +565,10 @@ fn main() {
     // Shared memory for POSIX semaphores (Python multiprocessing, etc.)
     // nosuid|nodev|noexec: CIS Benchmark 1.1.15 hardening. Won't break
     // multiprocessing — POSIX semaphores use shm_open()+mmap(), not execve().
+    // Why 64MB: sufficient for POSIX semaphores and small shared memory segments.
+    // Python multiprocessing default segment is ~1MB; larger allocations (numpy
+    // shared arrays, torch tensors) need more but are out of scope for lightweight
+    // sandboxes. 64MB is 25% of default 256MB guest RAM — a generous ceiling.
     let _ = fs::create_dir("/dev/shm");
     mount(
         "tmpfs",
@@ -595,9 +599,12 @@ fn main() {
     // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
     // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
     // pnpm (pnpm#9776), PyInstaller, and user temp executables.
-    // nr_inodes: fixed cap independent of VM memory (default is totalram_pages/2,
-    // which varies 13K–55K+ depending on memory_mb). 16K is sufficient — package
-    // managers use rootfs caches, not /tmp, for heavy file creation.
+    // Why 128MB: half of default 256MB guest RAM. Balances scratch space for
+    // pip/uv wheel builds (which unpack into /tmp) vs leaving RAM for user code.
+    // nr_inodes=16384: fixed cap independent of VM memory (default is
+    // totalram_pages/2, which varies 13K–55K+ depending on memory_mb). 16K
+    // covers typical `pip install` (measured ~2K-5K files for large packages
+    // like pandas).
     mount(
         "tmpfs",
         "/tmp",
