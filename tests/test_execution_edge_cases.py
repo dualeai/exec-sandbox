@@ -180,6 +180,15 @@ sys.stdout.buffer.flush()
         assert result.exit_code == 0
         assert "before" in result.stdout or "after" in result.stdout
 
+    async def test_null_bytes_in_code_rejected(self, scheduler: Scheduler) -> None:
+        """Code containing null bytes is rejected with clear error before reaching runtime."""
+        result = await scheduler.run(
+            code="print('hello')\x00print('world')",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == -1
+        assert "null bytes" in result.stderr.lower()
+
     async def test_binary_data_in_output(self, scheduler: Scheduler) -> None:
         """Code outputting binary data."""
         code = """

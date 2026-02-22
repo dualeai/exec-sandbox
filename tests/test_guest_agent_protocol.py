@@ -137,6 +137,72 @@ class TestExecuteCodeRequest:
         assert data["env_vars"] == {"KEY": "value"}
 
 
+class TestCodeNullByteValidation:
+    """Tests for null byte rejection in code field."""
+
+    # --- Normal cases ---
+    def test_null_byte_in_middle_rejected(self) -> None:
+        """Null byte between valid statements is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            ExecuteCodeRequest(language=Language.PYTHON, code="print('hi')\x00print('bye')")
+        assert "null bytes" in str(exc_info.value).lower()
+
+    def test_single_null_byte_rejected(self) -> None:
+        """Lone null byte is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="\x00")
+
+    # --- Edge cases ---
+    def test_null_byte_at_start_rejected(self) -> None:
+        """Null byte at start of code is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="\x00print('hi')")
+
+    def test_null_byte_at_end_rejected(self) -> None:
+        """Null byte at end of code is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="print('hi')\x00")
+
+    def test_all_null_bytes_rejected(self) -> None:
+        """Code that is entirely null bytes is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="\x00\x00\x00")
+
+    def test_escaped_null_repr_accepted(self) -> None:
+        r"""Code containing literal '\\x00' string (no actual null byte) is accepted."""
+        req = ExecuteCodeRequest(language=Language.PYTHON, code=r"x = 'hello\x00world'")
+        assert req.code == r"x = 'hello\x00world'"
+
+    # --- Weird cases ---
+    def test_null_byte_in_comment_rejected(self) -> None:
+        """Null byte inside a comment is still rejected (can't safely parse)."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="# comment\x00\nprint(1)")
+
+    def test_null_byte_between_multibyte_utf8_rejected(self) -> None:
+        """Null byte between multi-byte UTF-8 chars is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="print('\u4e16\x00\u754c')")
+
+    def test_null_byte_after_newline_rejected(self) -> None:
+        """Null byte on its own line between valid code is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="x = 1\n\x00\ny = 2")
+
+    # --- Out of bounds ---
+    def test_null_byte_at_end_of_large_code_rejected(self) -> None:
+        """Near max-length code with null byte at very end is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="x" * 999_999 + "\x00")
+
+    # --- All languages ---
+    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
+    def test_null_byte_rejected_all_languages(self, language: Language) -> None:
+        """Null bytes rejected regardless of language."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=language, code="echo hi\x00")
+
+
 class TestEnvVarValidation:
     """Tests for environment variable validation."""
 

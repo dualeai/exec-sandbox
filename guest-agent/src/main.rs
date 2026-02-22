@@ -1455,6 +1455,12 @@ fn validate_execute_params(
         return Err("Code cannot be empty".to_string());
     }
 
+    // Reject null bytes: shell $() silently truncates at \0, Python compile()
+    // rejects them, and JS engine behavior is undefined.
+    if code.contains('\0') {
+        return Err("Code cannot contain null bytes".to_string());
+    }
+
     // Check code size
     if code.len() > MAX_CODE_SIZE_BYTES {
         return Err(format!(
@@ -3564,6 +3570,32 @@ mod tests {
                 line,
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // validate_execute_params tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_execute_params_null_byte_in_code() {
+        let env = HashMap::new();
+        let result = validate_execute_params("python", "print('hi')\0print('bye')", 30, &env);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("null bytes"));
+    }
+
+    #[test]
+    fn test_validate_execute_params_only_null_byte() {
+        let env = HashMap::new();
+        let result = validate_execute_params("python", "\0", 30, &env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_execute_params_valid_code_no_null() {
+        let env = HashMap::new();
+        let result = validate_execute_params("python", "print('hello')", 30, &env);
+        assert!(result.is_ok());
     }
 
     #[test]

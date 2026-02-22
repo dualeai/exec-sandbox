@@ -50,6 +50,15 @@ class ExecuteCodeRequest(GuestAgentRequest):
     action: Literal["exec"] = Field(default="exec")  # type: ignore[assignment]
     language: Language = Field(description="Programming language for execution")
     code: str = Field(max_length=1_000_000, description="Code to execute (max 1MB)")
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        """Reject null bytes in code (causes silent failures in runtimes)."""
+        if "\x00" in v:
+            raise ValueError("Code cannot contain null bytes")
+        return v
+
     timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
     env_vars: dict[str, str] = Field(
         default_factory=dict,
