@@ -2145,3 +2145,117 @@ print(f"EXIT:{r.returncode}")
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected tmpfs shadow mount to fail.\nstdout: {result.stdout}"
+
+
+# =============================================================================
+# Thread/fork bomb mitigation (RLIMIT_NPROC + kernel.threads-max)
+# =============================================================================
+class TestThreadBombMitigation:
+    """RLIMIT_NPROC and kernel.threads-max cap thread/fork bombs.
+
+    Defense-in-depth: RLIMIT_NPROC=1024 (per-UID, set via prlimit64 from the
+    guest-agent after REPL spawn) is the primary defense. kernel.threads-max=1200
+    (system-wide, set in tiny-init) is the secondary defense.
+    """
+
+    # --- Normal: verify limits are applied ---
+
+    async def test_rlimit_nproc_is_set(self, scheduler: Scheduler) -> None:
+        """RLIMIT_NPROC soft and hard limits are both 1024."""
+        code = """\
+import resource
+soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+print(f'NPROC_SOFT:{soft}')
+print(f'NPROC_HARD:{hard}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "NPROC_SOFT:1024" in result.stdout
+        assert "NPROC_HARD:1024" in result.stdout
+
+    async def test_threadpool_executor_still_works(self, scheduler: Scheduler) -> None:
+        """ThreadPoolExecutor(max_workers=4) works within the limit."""
+        code = """\
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    results = list(pool.map(lambda x: x**2, range(100)))
+print(f'RESULT:{len(results)}:{results[-1]}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "RESULT:100:9801" in result.stdout
+
+    # --- Edge: thread bomb is capped ---
+
+    async def test_thread_bomb_capped(self, scheduler: Scheduler) -> None:
+        """Thread bomb hits RLIMIT_NPROC well below the old ~1,659 ceiling."""
+        code = """\
+import threading
+import time
+
+threads = []
+try:
+    while True:
+        t = threading.Thread(target=lambda: time.sleep(60), daemon=True)
+        t.start()
+        threads.append(t)
+except RuntimeError:
+    pass
+
+print(f'THREAD_COUNT:{len(threads)}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        assert result.exit_code == 0
+        count_line = [line for line in result.stdout.splitlines() if line.startswith("THREAD_COUNT:")]
+        assert count_line, f"Expected THREAD_COUNT in output.\nstdout: {result.stdout}"
+        count = int(count_line[0].split(":")[1])
+        assert count <= 1100, f"Thread bomb created {count} threads, expected <= 1100 with RLIMIT_NPROC=1024"
+
+    # --- Out of bounds: cannot escalate limits ---
+
+    async def test_cannot_raise_nproc_limit(self, scheduler: Scheduler) -> None:
+        """User code cannot raise RLIMIT_NPROC above the hard limit."""
+        code = """\
+import resource
+try:
+    resource.setrlimit(resource.RLIMIT_NPROC, (9999, 9999))
+    print('RAISED:True')
+except (ValueError, PermissionError, OSError) as e:
+    print(f'RAISED:False:{type(e).__name__}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "RAISED:False" in result.stdout
+
+    async def test_fork_bomb_hits_nproc(self, scheduler: Scheduler) -> None:
+        """Fork bomb hits RLIMIT_NPROC, count is <= 1024."""
+        code = """\
+import os
+
+count = 0
+try:
+    while True:
+        pid = os.fork()
+        if pid == 0:
+            # Child: exit immediately (becomes zombie until reaped)
+            os._exit(0)
+        count += 1
+except OSError:
+    pass
+
+# Reap all zombies
+while True:
+    try:
+        os.waitpid(-1, 0)
+    except ChildProcessError:
+        break
+
+print(f'FORK_COUNT:{count}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        assert result.exit_code == 0
+        count_line = [line for line in result.stdout.splitlines() if line.startswith("FORK_COUNT:")]
+        assert count_line, f"Expected FORK_COUNT in output.\nstdout: {result.stdout}"
+        count = int(count_line[0].split(":")[1])
+        assert count <= 1024, f"Fork bomb created {count} children, expected <= 1024 with RLIMIT_NPROC=1024"

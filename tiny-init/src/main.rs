@@ -788,6 +788,15 @@ fn main() {
     // Value 0 = all keyboard SysRq functions disabled.
     let _ = fs::write("/proc/sys/kernel/sysrq", "0");
     //
+    // Thread bomb mitigation: limit total system-wide threads.
+    // Default is memory-proportional (~1,659 on a 512MB VM, computed as
+    // mempages / (8 * THREAD_SIZE / PAGE_SIZE) in kernel/fork.c:fork_init).
+    // Value 1200 leaves headroom for ~150 kernel threads (kthreadd, kworker,
+    // ksoftirqd, etc.) while capping user-space thread bombs. RLIMIT_NPROC=1024
+    // per-UID is the primary defense; this is defense-in-depth.
+    // See: https://docs.kernel.org/admin-guide/sysctl/kernel.html
+    let _ = fs::write("/proc/sys/kernel/threads-max", "1200");
+    //
     // Disable kernel module loading. MUST be last sysctl — once set to 1,
     // modules can never be loaded again (irreversible). All modules (virtio,
     // ext4, zram, etc.) are loaded above before this point.

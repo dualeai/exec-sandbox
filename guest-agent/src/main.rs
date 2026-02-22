@@ -594,9 +594,11 @@ async fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error:
     //   2. setgid(SANDBOX_GID) — must come before setuid to avoid losing permission
     //   3. setuid(SANDBOX_UID) — drop to non-root (resets dumpable via commit_creds)
     //   4. dumpable=0 — defense-in-depth for fork→exec window only
+    //   5. RLIMIT_NPROC=1024 — after spawn(), via prlimit64 from parent (root)
     //
     // SAFETY: pre_exec runs in the forked child before exec. All syscalls
-    // used (prctl, setgid, setuid) are async-signal-safe.
+    // used (prctl, setgid, setuid) are async-signal-safe. Step 5 runs in the
+    // parent after spawn — not subject to async-signal-safety constraints.
     unsafe {
         cmd.pre_exec(|| {
             // 1. Block privilege escalation via execve (SUID/SGID, file capabilities).
@@ -623,6 +625,52 @@ async fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error:
     }
 
     let mut child = cmd.spawn()?;
+
+    // 5. Limit processes+threads for the REPL child (thread/fork bomb prevention).
+    //    RLIMIT_NPROC counts all tasks (processes + threads via clone()) for the
+    //    real UID. The kernel checks this in copy_process() and returns EAGAIN when
+    //    exceeded. Python surfaces this as:
+    //      RuntimeError: can't start new thread (threading)
+    //      OSError: [Errno 11] Resource temporarily unavailable (os.fork)
+    //    Called from the guest-agent (root) via prlimit64 on the child PID, NOT in
+    //    pre_exec — musl libc's setrlimit is not async-signal-safe (it may use
+    //    __synccall internally), which can deadlock in the post-fork/pre-exec window.
+    //    Root (CAP_SYS_RESOURCE) can set rlimits on any process.
+    //    Value 1024 matches AWS Lambda's 1,024 processes+threads combined limit.
+    //    Both soft and hard set to 1024 — user code cannot raise it.
+    //    See: https://man7.org/linux/man-pages/man2/prlimit.2.html
+    {
+        let nproc_limit = libc::rlimit {
+            rlim_cur: 1024,
+            rlim_max: 1024,
+        };
+        let pid = match child.id() {
+            Some(id) => id as libc::pid_t,
+            None => {
+                eprintln!("WARNING: REPL child exited before prlimit64(RLIMIT_NPROC)");
+                0 // skip prlimit64 — child already gone
+            }
+        };
+        if pid > 0 {
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_prlimit64,
+                    pid,
+                    libc::RLIMIT_NPROC,
+                    &nproc_limit as *const libc::rlimit,
+                    std::ptr::null_mut::<libc::rlimit>(),
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "WARNING: prlimit64(RLIMIT_NPROC) failed for pid {}: {}",
+                    pid, err
+                );
+            }
+        }
+    }
+
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
