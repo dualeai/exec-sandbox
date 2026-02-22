@@ -1,12 +1,12 @@
 """Pre-created qcow2 overlay pool for instant VM boot.
 
 The overlay pool eliminates 30-430ms disk I/O from VM boot critical path by
-pre-creating qcow2 overlay files. Acquisition is <1ms (atomic rename) vs
+pre-creating qcow2 overlay files. Acquisition is <1ms (atomic rename, or copy+unlink cross-filesystem) vs
 30-430ms (qemu-img create under contention).
 
 Architecture:
 - Separate pool per base image (python/javascript)
-- Pool directory under tempfile.gettempdir() for same-filesystem atomic rename
+- Pool directory under tempfile.gettempdir() for fast file move
 - Background replenishment maintains pool size after allocations
 - Graceful fallback to on-demand creation when pool is exhausted
 - Uses qemu-storage-daemon for fast overlay creation (~4ms vs ~39ms)
@@ -86,7 +86,7 @@ class OverlayPool:
     """Pre-created qcow2 overlay pool for instant VM boot.
 
     The pool maintains pre-created overlay files for each base image, enabling
-    <1ms allocation via atomic file rename instead of 30-430ms qemu-img create.
+    <1ms allocation via file move instead of 30-430ms qemu-img create.
 
     All overlay creation is centralized here - callers just request an overlay
     and the pool handles fast path (from pool) or slow path (on-demand) internally.
@@ -310,9 +310,9 @@ class OverlayPool:
         # Try fast path: get pre-created overlay from pool
         try:
             overlay_path = pool.get_nowait()
-            # Atomic move to target (same filesystem = rename, instant)
+            # Move to target (same filesystem = atomic rename, cross-filesystem = copy+unlink)
             try:
-                await aiofiles.os.rename(overlay_path, target_path)
+                await asyncio.to_thread(shutil.move, overlay_path, target_path)
                 logger.debug(
                     "Overlay acquired from pool",
                     extra={"base_image": key, "target": str(target_path)},
@@ -321,13 +321,18 @@ class OverlayPool:
             except OSError as e:
                 # Move failed (cross-filesystem or other error)
                 logger.warning(
-                    "Failed to move pooled overlay, falling back to on-demand",
-                    extra={"source": str(overlay_path), "target": str(target_path), "error": str(e)},
+                    "Failed to move pooled overlay, falling back to on-demand: %s",
+                    e,
+                    extra={"source": str(overlay_path), "target": str(target_path)},
                 )
                 # Clean up the orphaned overlay file
                 with contextlib.suppress(OSError):
                     if overlay_path.exists():
                         overlay_path.unlink()
+                # Clean up partial target that cross-FS copy may have created
+                with contextlib.suppress(OSError):
+                    if target_path.exists():
+                        target_path.unlink()
                 # Fall through to slow path
         except asyncio.QueueEmpty:
             logger.debug(
