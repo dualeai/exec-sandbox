@@ -254,6 +254,15 @@ fn setup_zram(kver: &str) {
         return;
     }
 
+    // Kernel 6.16+: algorithm-specific tuning via sysfs.
+    // LZ4 "level" is an acceleration parameter (lower = better compression,
+    // higher = faster). Level 1 = max compression ratio, best for 128-256MB
+    // VMs where every byte of zram matters. CPU cost is negligible vs. the
+    // memory savings on small VMs.
+    // Must be set AFTER comp_algorithm but BEFORE disksize.
+    // Ref: https://docs.kernel.org/admin-guide/blockdev/zram.html
+    let _ = fs::write("/sys/block/zram0/algorithm_params", "level=1");
+
     // MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
     let mem_kb: u64 = fs::read_to_string("/proc/meminfo")
         .ok()

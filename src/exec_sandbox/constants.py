@@ -199,14 +199,14 @@ WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
 # Balloon Memory Management (for warm pool memory efficiency)
 # ============================================================================
 
-BALLOON_INFLATE_TARGET_MB: Final[int] = 96
+BALLOON_INFLATE_TARGET_MB: Final[int] = 128
 """Target guest memory in MB when inflating balloon for idle warm pool VMs.
 Inflating the balloon reduces guest memory, allowing host to reclaim.
 
-Note: 64MB was too aggressive - Alpine Linux idles at ~50MB, leaving only ~14MB
-headroom for guest agent operations. Under memory pressure, the guest becomes
-unresponsive and health checks timeout. 96MB provides ~46MB headroom while still
-achieving 62% memory reduction (96MB vs 256MB default)."""
+History: 64MB caused unresponsive guests (only ~14MB headroom). 96MB still
+caused freezes on kernel 6.18 where ~38MB overhead + guest-agent + Python
+leaves <20MB free under pressure. 128MB provides reliable headroom (~50MB
+free after overhead) while still achieving 50% memory reduction vs 256MB."""
 
 BALLOON_TOLERANCE_MB: Final[int] = 40
 """Tolerance in MB for balloon target polling. Allows early exit when balloon is

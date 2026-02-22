@@ -19,9 +19,9 @@ L2 Disk Snapshots:
 - snapshot_manager: Optional for L2 cache (graceful degradation to cold boot if None)
 
 Memory Optimization (Balloon):
-- Idle pool VMs have balloon inflated (guest has ~64MB free)
+- Idle pool VMs have balloon inflated (guest has BALLOON_INFLATE_TARGET_MB)
 - Before execution, balloon deflates (guest gets full memory back)
-- Reduces idle memory from ~1GB to ~256MB for 4 VMs (75% reduction)
+- Reduces idle memory by 50% per VM (128MB idle vs 256MB active)
 
 Example:
     ```python
@@ -522,8 +522,8 @@ class WarmVMPool:
 
         This eliminates up to 5s of polling overhead on slow systems (nested
         virtualization) where balloon operations are degraded. Most code doesn't
-        need the full 256MB immediately - the 64MB idle memory is sufficient
-        for runtime startup, and additional memory becomes available within ~1s.
+        need the full 256MB immediately - the idle memory (BALLOON_INFLATE_TARGET_MB)
+        is sufficient for runtime startup, and full memory becomes available within ~1s.
 
         Graceful degradation: logs warning and continues if balloon fails.
 
