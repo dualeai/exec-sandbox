@@ -104,7 +104,7 @@ test-sudo:
 
 # Unit tests only (fast)
 test-unit:
-	uv run pytest tests/ -v -n auto -m "unit"
+	$(MAKE) test-func
 	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
