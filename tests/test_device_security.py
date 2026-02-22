@@ -669,6 +669,157 @@ else:
 
 
 # =============================================================================
+# Loop device + filesystem creation blocked
+# =============================================================================
+class TestLoopDeviceBlocked:
+    """Loop device infrastructure is absent — no module, no device nodes, no tools.
+
+    Loop devices are a proven attack vector: CVE-2025-8067 (udisks loop device
+    LPE, CVSS 8.5), CVE-2025-6019 (SUID shell via loop-mounted XFS without
+    nosuid), and multiple ext4/btrfs/xfs kernel bugs triggered by mounting
+    crafted filesystem images (CVE-2025-38220, CVE-2025-38222, CVE-2024-39472).
+
+    5 independent layers block loop device + mkfs operations:
+    1. No loop.ko in initramfs (module list: virtio, ext4, zram only)
+    2. modules_disabled=1 (irreversible sysctl set by tiny-init)
+    3. No /dev/loop* nodes (kernel never creates them without loop module)
+    4. /dev is read-only (mknod returns EROFS)
+    5. No CAP_MKNOD (UID 1000, verified in TestDevReadonlyHardening)
+    """
+
+    # --- Normal: verify loop infrastructure absent ---
+
+    async def test_no_loop_devices_exist(self, scheduler: Scheduler) -> None:
+        """No /dev/loop* nodes exist anywhere under /dev."""
+        code = """\
+import os
+
+loop_devices = []
+for dirpath, dirnames, filenames in os.walk('/dev'):
+    for name in filenames:
+        if name.startswith('loop'):
+            path = os.path.join(dirpath, name)
+            loop_devices.append(path)
+
+if loop_devices:
+    print(f'FOUND:{",".join(loop_devices)}')
+else:
+    print('NONE')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "NONE", f"Loop device nodes found: {result.stdout.strip()}"
+
+    async def test_loop_module_not_loaded(self, scheduler: Scheduler) -> None:
+        """loop kernel module is not loaded."""
+        code = """\
+with open('/proc/modules') as f:
+    modules = [line.split()[0] for line in f]
+print(f'LOOP_LOADED:{"loop" in modules}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "LOOP_LOADED:False" in result.stdout
+
+    async def test_dev_loop_control_not_exists(self, scheduler: Scheduler) -> None:
+        """/dev/loop-control (dynamic loop allocation, Linux 3.1+) does not exist."""
+        result = await scheduler.run(
+            code="import os; print(os.path.exists('/dev/loop-control'))",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "False"
+
+    # --- Edge: tools that need loop devices fail gracefully ---
+
+    async def test_losetup_associate_fails(self, scheduler: Scheduler) -> None:
+        """losetup cannot associate a file with a loop device — no /dev/loop* nodes."""
+        code = """\
+import subprocess
+
+# Create a small file to use as backing store
+subprocess.run(
+    ["dd", "if=/dev/zero", "of=/tmp/lo.img", "bs=1k", "count=64"],
+    capture_output=True, timeout=5,
+)
+
+# Try to associate it with a loop device
+r = subprocess.run(
+    ["losetup", "/dev/loop0", "/tmp/lo.img"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f'LOSETUP_RC:{r.returncode}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        assert result.exit_code == 0
+        assert "LOSETUP_RC:0" not in result.stdout, f"Expected losetup associate to fail.\nstdout: {result.stdout}"
+
+    async def test_mkfs_ext4_not_available(self, scheduler: Scheduler) -> None:
+        """mkfs.ext4 is not installed (e2fsprogs not in image package list)."""
+        code = """\
+import shutil
+print(f'MKFS_EXT4:{shutil.which("mkfs.ext4") is not None}')
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "MKFS_EXT4:False" in result.stdout
+
+    # --- Out of bounds: full attack chains blocked ---
+
+    async def test_loop_module_load_blocked(self, scheduler: Scheduler) -> None:
+        """modprobe loop fails — modules_disabled=1 is irreversible."""
+        result = await scheduler.run(
+            code="modprobe loop 2>&1; echo EXIT:$?",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "EXIT:0" not in result.stdout, (
+            f"Expected modprobe loop to fail with modules_disabled=1.\nstdout: {result.stdout}"
+        )
+
+    async def test_file_backed_loop_mount_blocked(self, scheduler: Scheduler) -> None:
+        """Full CVE-2025-6019 attack chain: create file, losetup, mount — every step fails."""
+        code = """\
+import subprocess
+
+results = []
+
+# Step 1: Create a 1MB file (should succeed — /tmp is writable)
+r = subprocess.run(
+    ["dd", "if=/dev/zero", "of=/tmp/fake.img", "bs=1M", "count=1"],
+    capture_output=True, text=True, timeout=10,
+)
+results.append(f'DD_EXIT:{r.returncode}')
+
+# Step 2: Try losetup (should fail — no loop devices)
+r = subprocess.run(
+    ["losetup", "-f", "/tmp/fake.img"],
+    capture_output=True, text=True, timeout=5,
+)
+results.append(f'LOSETUP_EXIT:{r.returncode}')
+
+# Step 3: Try direct mount (should fail — no CAP_SYS_ADMIN)
+r = subprocess.run(
+    ["mount", "-o", "loop", "/tmp/fake.img", "/mnt"],
+    capture_output=True, text=True, timeout=5,
+)
+results.append(f'MOUNT_EXIT:{r.returncode}')
+
+for line in results:
+    print(line)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            timeout_seconds=30,
+        )
+        assert result.exit_code == 0
+        # dd may succeed (just creates a regular file), but losetup and mount must fail
+        assert "LOSETUP_EXIT:0" not in result.stdout, f"Expected losetup to fail.\nstdout: {result.stdout}"
+        assert "MOUNT_EXIT:0" not in result.stdout, f"Expected mount to fail.\nstdout: {result.stdout}"
+
+
+# =============================================================================
 # /proc/sys read-only hardening
 # =============================================================================
 class TestProcSysHardening:
