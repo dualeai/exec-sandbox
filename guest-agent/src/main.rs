@@ -2101,6 +2101,7 @@ async fn execute_code_streaming(
 /// guest agent can detect and recover from stale connections.
 struct NonBlockingFile {
     async_fd: AsyncFd<std::fs::File>,
+    leftover: Vec<u8>, // bytes read past the last newline
 }
 
 impl NonBlockingFile {
@@ -2111,7 +2112,10 @@ impl NonBlockingFile {
         let file = OpenOptions::new().read(true).open(path)?;
         Self::set_nonblocking(file.as_raw_fd())?;
         let async_fd = AsyncFd::new(file)?;
-        Ok(Self { async_fd })
+        Ok(Self {
+            async_fd,
+            leftover: Vec::new(),
+        })
     }
 
     /// Set O_NONBLOCK on a file descriptor using fcntl.
@@ -2162,28 +2166,52 @@ impl NonBlockingFile {
         Ok(!host_disconnected)
     }
 
-    /// Read a line with proper async timeout support.
+    /// Read a line with proper async timeout support and buffered I/O.
     ///
     /// Unlike tokio::fs::File::read which uses spawn_blocking (and thus
     /// can't be interrupted by timeout when stuck in kernel), this method
     /// uses AsyncFd::readable() which properly integrates with tokio's
     /// event loop and can be cancelled by timeout.
-    async fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
+    ///
+    /// Reads up to 16KB per syscall instead of 1 byte, reducing syscalls
+    /// from ~175,000 to ~11 per chunk message (~16,000x reduction).
+    /// Bytes past the newline are stored in `leftover` for the next call.
+    async fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
         let mut total_bytes = 0;
-        let mut byte_buf = [0u8; 1];
         // Accumulate raw bytes for proper UTF-8 decoding
         // (pushing bytes directly as chars corrupts multi-byte UTF-8 sequences)
         let mut bytes = Vec::new();
+
+        // First drain leftover from previous read
+        if !self.leftover.is_empty() {
+            if let Some(pos) = self.leftover.iter().position(|&b| b == b'\n') {
+                // Found newline in leftover — return up to and including it
+                let line_len = pos + 1;
+                buf.push_str(&String::from_utf8_lossy(&self.leftover[..line_len]));
+                self.leftover.drain(..line_len);
+                return Ok(line_len);
+            }
+            // No newline in leftover — consume all of it and keep reading
+            total_bytes += self.leftover.len();
+            bytes.append(&mut self.leftover);
+        }
+
+        let mut read_buf = [0u8; 16384]; // 16KB read buffer
 
         loop {
             // Wait for the fd to be readable (epoll-based, properly cancellable)
             let mut guard = self.async_fd.readable().await?;
 
-            // Try to read one byte (non-blocking)
+            // Try to read up to 16KB (non-blocking)
             match guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
-                let result =
-                    unsafe { libc::read(fd, byte_buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                let result = unsafe {
+                    libc::read(
+                        fd,
+                        read_buf.as_mut_ptr() as *mut libc::c_void,
+                        read_buf.len(),
+                    )
+                };
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {
@@ -2196,14 +2224,21 @@ impl NonBlockingFile {
                     return Ok(total_bytes);
                 }
                 Ok(Ok(n)) => {
-                    total_bytes += n;
-                    let byte = byte_buf[0];
-                    bytes.push(byte);
-                    if byte == b'\n' {
-                        // End of line - convert accumulated bytes to UTF-8
+                    let chunk = &read_buf[..n];
+                    if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                        // Found newline — take up to and including it
+                        bytes.extend_from_slice(&chunk[..=pos]);
+                        total_bytes += pos + 1;
+                        // Store remaining bytes after newline for next call
+                        if pos + 1 < n {
+                            self.leftover.extend_from_slice(&chunk[pos + 1..]);
+                        }
                         buf.push_str(&String::from_utf8_lossy(&bytes));
                         return Ok(total_bytes);
                     }
+                    // No newline — accumulate and keep reading
+                    total_bytes += n;
+                    bytes.extend_from_slice(chunk);
                 }
                 Ok(Err(e)) => {
                     return Err(e);
@@ -2218,14 +2253,14 @@ impl NonBlockingFile {
 }
 
 async fn run_with_ports(
-    cmd_file: NonBlockingFile,
+    mut cmd_file: NonBlockingFile,
     event_file: tokio::fs::File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Use the non-blocking file directly for reads
     // Event file can stay as tokio::fs::File since writes don't block
 
     // Run the connection handler with non-blocking cmd reader
-    handle_connection_nonblocking(&cmd_file, event_file).await
+    handle_connection_nonblocking(&mut cmd_file, event_file).await
 }
 
 /// Handle connection with non-blocking command reader.
@@ -2233,7 +2268,7 @@ async fn run_with_ports(
 /// Uses NonBlockingFile for the command port, enabling proper timeout
 /// detection on hung/stale connections.
 async fn handle_connection_nonblocking(
-    cmd_reader: &NonBlockingFile,
+    cmd_reader: &mut NonBlockingFile,
     event_file: tokio::fs::File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let writer = BufWriter::new(event_file);
@@ -2241,19 +2276,28 @@ async fn handle_connection_nonblocking(
     // Create bounded channel for write queue to prevent deadlocks
     let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE_SIZE);
 
-    // Spawn write task
+    // Spawn write task — batches up to 16 writes before flushing to reduce
+    // syscalls. Flushes immediately when the channel is empty to keep
+    // latency-sensitive single messages (pong, ack) responsive.
     let write_handle = tokio::spawn(async move {
         let mut writer = writer;
+        let mut pending = 0u32;
         while let Some(data) = write_rx.recv().await {
             if let Err(e) = writer.write_all(&data).await {
                 eprintln!("Write error: {}", e);
                 break;
             }
-            if let Err(e) = writer.flush().await {
-                eprintln!("Flush error: {}", e);
-                break;
+            pending += 1;
+            if pending >= 16 || write_rx.is_empty() {
+                if let Err(e) = writer.flush().await {
+                    eprintln!("Flush error: {}", e);
+                    break;
+                }
+                pending = 0;
             }
         }
+        // Final flush for any remaining data
+        let _ = writer.flush().await;
     });
 
     // Active streaming file write operations

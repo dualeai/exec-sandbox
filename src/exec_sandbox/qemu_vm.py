@@ -552,7 +552,7 @@ class QemuVM:
     # File I/O
     # -------------------------------------------------------------------------
 
-    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:
+    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:  # noqa: PLR0915
         """Write a file to the sandbox via streaming zstd-compressed chunks.
 
         Protocol:
@@ -607,29 +607,38 @@ class QemuVM:
             chunk_size = constants.FILE_TRANSFER_CHUNK_SIZE
             compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
             loop = asyncio.get_running_loop()
+
+            def _encode_frame(compressed: bytes) -> bytes:
+                chunk_b64 = base64.b64encode(compressed).decode("ascii")
+                return json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
+
+            def _compress_and_encode(data: bytes) -> bytes | None:
+                compressed = compressor.compress(data)
+                if not compressed:
+                    return None
+                return _encode_frame(compressed)
+
             try:
                 while True:
-                    # Offload to thread pool: content may be a SpooledTemporaryFile
-                    # that has spilled to disk, blocking the event loop.
+                    # Offload disk read to thread pool (content may be a
+                    # SpooledTemporaryFile that has spilled to disk).
                     input_chunk = await loop.run_in_executor(None, content.read, chunk_size)
                     if not input_chunk:
                         break
-                    compressed = compressor.compress(input_chunk)
-                    if compressed:
-                        chunk_b64 = base64.b64encode(compressed).decode("ascii")
-                        chunk_frame = (
-                            json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
-                        )
+                    # Offload compress + encode to thread pool to keep
+                    # the event loop free for processing write worker drains.
+                    chunk_frame = await loop.run_in_executor(None, _compress_and_encode, input_chunk)
+                    if chunk_frame:
                         await self.channel.enqueue_raw(chunk_frame)
 
                 # Flush remaining compressed data from the compressor
-                remaining = compressor.flush()
-                if remaining:
-                    chunk_b64 = base64.b64encode(remaining).decode("ascii")
-                    chunk_frame = (
-                        json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
-                    )
-                    await self.channel.enqueue_raw(chunk_frame)
+                def _flush_and_encode() -> bytes | None:
+                    remaining = compressor.flush()
+                    return _encode_frame(remaining) if remaining else None
+
+                flush_frame = await loop.run_in_executor(None, _flush_and_encode)
+                if flush_frame:
+                    await self.channel.enqueue_raw(flush_frame)
             finally:
                 # Always send file_end so the guest agent exits its chunk loop.
                 # Suppress errors: channel may already be broken.
