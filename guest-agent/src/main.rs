@@ -2229,6 +2229,39 @@ async fn handle_connection_nonblocking(
                     break Err("write queue closed".into());
                 }
             }
+            Ok(GuestCommand::WarmRepl { language }) => {
+                eprintln!("Processing: warm_repl (language={})", language);
+                match spawn_repl(&language).await {
+                    Ok(repl) => {
+                        REPL_STATES.lock().await.insert(language.clone(), repl);
+                        eprintln!("REPL pre-warmed for {}", language);
+                        let ack = serde_json::json!({
+                            "type": "warm_repl_ack",
+                            "language": language,
+                            "status": "ok"
+                        });
+                        let mut response = serde_json::to_vec(&ack)?;
+                        response.push(b'\n');
+                        if write_tx.send(response).await.is_err() {
+                            break Err("write queue closed".into());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: eager REPL spawn failed: {}", e);
+                        let ack = serde_json::json!({
+                            "type": "warm_repl_ack",
+                            "language": language,
+                            "status": "error",
+                            "message": e.to_string()
+                        });
+                        let mut response = serde_json::to_vec(&ack)?;
+                        response.push(b'\n');
+                        if write_tx.send(response).await.is_err() {
+                            break Err("write queue closed".into());
+                        }
+                    }
+                }
+            }
             Ok(GuestCommand::InstallPackages { language, packages }) => {
                 eprintln!(
                     "Processing: install_packages (language={}, count={})",
@@ -3364,6 +3397,67 @@ mod tests {
             }
             _ => panic!("Expected FileEnd"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // WarmRepl deserialization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_deserialize_warm_repl() {
+        let json = r#"{"action":"warm_repl","language":"python"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WarmRepl { language } => {
+                assert_eq!(language, "python");
+            }
+            _ => panic!("Expected WarmRepl"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl_javascript() {
+        let json = r#"{"action":"warm_repl","language":"javascript"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WarmRepl { language } => {
+                assert_eq!(language, "javascript");
+            }
+            _ => panic!("Expected WarmRepl"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl_unknown_language() {
+        // Guest accepts any string — validation is at host side
+        let json = r#"{"action":"warm_repl","language":"cobol"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WarmRepl { language } => {
+                assert_eq!(language, "cobol");
+            }
+            _ => panic!("Expected WarmRepl"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl_empty_language() {
+        let json = r#"{"action":"warm_repl","language":""}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WarmRepl { language } => {
+                assert_eq!(language, "");
+            }
+            _ => panic!("Expected WarmRepl"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl_missing_language() {
+        // Missing required field should fail
+        let json = r#"{"action":"warm_repl"}"#;
+        let result = serde_json::from_str::<GuestCommand>(json);
+        assert!(result.is_err());
     }
 
     // -------------------------------------------------------------------------

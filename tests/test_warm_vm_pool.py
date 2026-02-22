@@ -62,6 +62,107 @@ class TestLanguageEnum:
 # ============================================================================
 
 
+class TestWarmReplUnit:
+    """Unit tests for _warm_repl - mocked channel, no QEMU."""
+
+    async def test_warm_repl_ok(self, unit_test_vm_manager) -> None:
+        """_warm_repl succeeds when guest returns ok ack."""
+        from exec_sandbox.guest_agent_protocol import WarmReplAckMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        vm = AsyncMock()
+        vm.vm_id = "test-vm"
+        vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="python", status="ok"))
+
+        # Should complete without error
+        await pool._warm_repl(vm, Language.PYTHON)
+        vm.channel.send_request.assert_called_once()
+
+    async def test_warm_repl_error_response_non_fatal(self, unit_test_vm_manager) -> None:
+        """_warm_repl logs warning but doesn't raise on error response."""
+        from exec_sandbox.guest_agent_protocol import WarmReplAckMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        vm = AsyncMock()
+        vm.vm_id = "test-vm"
+        vm.channel.send_request = AsyncMock(
+            return_value=WarmReplAckMessage(language="python", status="error", message="spawn failed")
+        )
+
+        # Should NOT raise
+        await pool._warm_repl(vm, Language.PYTHON)
+
+    async def test_warm_repl_timeout_non_fatal(self, unit_test_vm_manager) -> None:
+        """_warm_repl swallows timeout exceptions (graceful degradation)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        vm = AsyncMock()
+        vm.vm_id = "test-vm"
+        vm.channel.send_request = AsyncMock(side_effect=TimeoutError("timed out"))
+
+        # Should NOT raise
+        await pool._warm_repl(vm, Language.PYTHON)
+
+    async def test_warm_repl_connection_error_non_fatal(self, unit_test_vm_manager) -> None:
+        """_warm_repl swallows connection errors (graceful degradation)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        vm = AsyncMock()
+        vm.vm_id = "test-vm"
+        vm.channel.send_request = AsyncMock(side_effect=ConnectionError("broken pipe"))
+
+        # Should NOT raise
+        await pool._warm_repl(vm, Language.PYTHON)
+
+    async def test_warm_repl_unexpected_response_type(self, unit_test_vm_manager) -> None:
+        """_warm_repl handles unexpected response type (logs warning, doesn't crash)."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        vm = AsyncMock()
+        vm.vm_id = "test-vm"
+        # Return a PongMessage instead of WarmReplAckMessage
+        vm.channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
+
+        # Should NOT raise — logs warning about non-ok response
+        await pool._warm_repl(vm, Language.PYTHON)
+
+    async def test_warm_repl_passes_correct_language(self, unit_test_vm_manager) -> None:
+        """_warm_repl sends the correct language in request."""
+        from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+
+        vm = AsyncMock()
+        vm.vm_id = "test-vm"
+        vm.channel.send_request = AsyncMock(return_value=WarmReplAckMessage(language="javascript", status="ok"))
+
+        await pool._warm_repl(vm, Language.JAVASCRIPT)
+
+        # Verify the request sent had language=javascript
+        call_args = vm.channel.send_request.call_args
+        request = call_args[0][0]
+        assert isinstance(request, WarmReplRequest)
+        assert request.language == Language.JAVASCRIPT
+
+
 class TestDrainPoolForCheck:
     """Tests for _drain_pool_for_check - pure queue draining logic."""
 
@@ -226,6 +327,30 @@ class TestWarmVMPoolIntegration:
             # Destroy VM after use
             await vm_manager.destroy_vm(vm)
 
+        finally:
+            await pool.stop()
+
+    async def test_warm_pool_vm_has_prewarmed_repl(self, vm_manager) -> None:
+        """VM from warm pool has pre-warmed REPL (fast first execution)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None
+
+            # First execution should be fast — REPL was pre-warmed
+            result = await vm.execute(
+                code="print('warm')",
+                timeout_seconds=30,
+            )
+            assert result.exit_code == 0
+            assert "warm" in result.stdout
+
+            await vm_manager.destroy_vm(vm)
         finally:
             await pool.stop()
 

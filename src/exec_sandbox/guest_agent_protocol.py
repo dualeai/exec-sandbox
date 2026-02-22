@@ -35,6 +35,16 @@ class PingRequest(GuestAgentRequest):
     action: Literal["ping"] = Field(default="ping")  # type: ignore[assignment]
 
 
+class WarmReplRequest(GuestAgentRequest):
+    """Pre-warm REPL for faster first execution.
+
+    Response: WarmReplAckMessage.
+    """
+
+    action: Literal["warm_repl"] = Field(default="warm_repl")  # type: ignore[assignment]
+    language: Language = Field(description="Language REPL to pre-warm")
+
+
 class ExecuteCodeRequest(GuestAgentRequest):
     """Execute code in guest VM.
 
@@ -276,6 +286,15 @@ class PongMessage(BaseModel):
     version: str = Field(description="Guest agent version")
 
 
+class WarmReplAckMessage(BaseModel):
+    """Acknowledgement for REPL pre-warming."""
+
+    type: Literal["warm_repl_ack"] = "warm_repl_ack"
+    language: str
+    status: str  # "ok" or "error"
+    message: str | None = None
+
+
 # ============================================================================
 # File I/O Response Models (Streaming Chunked Protocol)
 # ============================================================================
@@ -335,6 +354,7 @@ StreamingMessage = Annotated[
     OutputChunkMessage
     | ExecutionCompleteMessage
     | PongMessage
+    | WarmReplAckMessage
     | StreamingErrorMessage
     | FileWriteAckMessage
     | FileChunkResponseMessage

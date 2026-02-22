@@ -55,6 +55,9 @@ pub enum GuestCommand {
         #[serde(default)]
         path: String,
     },
+
+    #[serde(rename = "warm_repl")]
+    WarmRepl { language: String },
 }
 
 // ============================================================================

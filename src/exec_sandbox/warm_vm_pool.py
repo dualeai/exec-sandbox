@@ -362,6 +362,9 @@ class WarmVMPool:
             # Inflate balloon to reduce idle memory footprint
             await self._inflate_balloon(vm)
 
+            # Pre-warm REPL while VM is idle (hides ~800ms Python startup)
+            await self._warm_repl(vm, language)
+
             await self.pools[language].put(vm)
             logger.info(
                 "Warm VM ready",
@@ -544,6 +547,28 @@ class WarmVMPool:
                 "Balloon deflation failed (VM may be memory-constrained)",
                 extra={"vm_id": vm.vm_id, "error": str(e)},
             )
+
+    async def _warm_repl(self, vm: QemuVM, language: Language) -> None:
+        """Pre-warm REPL in guest VM for faster first execution.
+
+        Fire-and-forget: failure is non-fatal (lazy spawn on first request).
+        """
+        from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
+            WarmReplAckMessage,
+            WarmReplRequest,
+        )
+
+        try:
+            response = await vm.channel.send_request(
+                WarmReplRequest(language=language),
+                timeout=15,  # REPL startup can take ~1s
+            )
+            if isinstance(response, WarmReplAckMessage) and response.status == "ok":
+                logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
+            else:
+                logger.warning("REPL pre-warm returned non-ok", extra={"vm_id": vm.vm_id, "response": str(response)})
+        except Exception as e:  # noqa: BLE001 - Graceful degradation: any failure falls back to lazy spawn
+            logger.warning("REPL pre-warm failed", extra={"vm_id": vm.vm_id, "error": str(e)})
 
     async def _health_check_loop(self) -> None:
         """Background health check for warm VMs.
