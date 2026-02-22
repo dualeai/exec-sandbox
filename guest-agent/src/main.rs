@@ -42,6 +42,11 @@ const MAX_CODE_SIZE_BYTES: usize = 1_000_000; // 1MB max code size
 const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install output
 const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 
+// Sandbox user identity — all code execution runs as this non-root user.
+// Matches the "user" account created in the VM image (see build-qcow2.sh).
+const SANDBOX_UID: u32 = 1000;
+const SANDBOX_GID: u32 = 1000;
+
 // Connection limits
 const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max single request JSON (streaming chunks are ~90KB each)
 const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
@@ -557,7 +562,7 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
     //
     // We handle uid/gid/prctl ALL in our pre_exec to control ordering.
     // Rust's Command applies .uid()/.gid() in its own pre_exec which runs
-    // AFTER ours. The UID change from root to 1000 resets PR_SET_DUMPABLE
+    // AFTER ours. The UID change from root to SANDBOX_UID resets PR_SET_DUMPABLE
     // (Linux kernel behavior: commit_creds() resets dumpable on credential
     // change). By doing uid/gid changes ourselves, we can set DUMPABLE=0
     // AFTER the change, protecting the fork→exec window.
@@ -570,8 +575,8 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
     //
     // Order matters:
     //   1. no_new_privs — blocks SUID/SGID escalation for all future exec()
-    //   2. setgid(1000) — must come before setuid to avoid losing permission
-    //   3. setuid(1000) — drop to non-root (resets dumpable via commit_creds)
+    //   2. setgid(SANDBOX_GID) — must come before setuid to avoid losing permission
+    //   3. setuid(SANDBOX_UID) — drop to non-root (resets dumpable via commit_creds)
     //   4. dumpable=0 — defense-in-depth for fork→exec window only
     //
     // SAFETY: pre_exec runs in the forked child before exec. All syscalls
@@ -583,15 +588,15 @@ async fn spawn_repl(language: &str) -> Result<ReplState, Box<dyn std::error::Err
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // 2-3. Drop to non-root UID 1000. This blocks mount(2), ptrace,
+            // 2-3. Drop to non-root sandbox user. This blocks mount(2), ptrace,
             //      raw sockets, and kernel module loading without seccomp.
-            if libc::setgid(1000) != 0 {
+            if libc::setgid(SANDBOX_GID) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::setuid(1000) != 0 {
+            if libc::setuid(SANDBOX_UID) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // 4. Prevent ptrace attach and core dumps from other UID 1000 processes.
+            // 4. Prevent ptrace attach and core dumps from other sandbox user processes.
             //    Must be AFTER setuid — UID change resets dumpable to 1.
             //    CVE-2022-30594: ptrace + PTRACE_O_SUSPEND_SECCOMP bypass.
             if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
@@ -2414,6 +2419,31 @@ async fn handle_connection_nonblocking(
                                 op_id: state.op_id.clone(),
                             });
                         }
+                        // Chown to sandbox user so the REPL process can
+                        // read and modify the file.
+                        let ret = unsafe {
+                            libc::chown(
+                                std::ffi::CString::new(
+                                    state.tmp_path.as_os_str().as_encoded_bytes(),
+                                )
+                                .unwrap()
+                                .as_ptr(),
+                                SANDBOX_UID,
+                                SANDBOX_GID,
+                            )
+                        };
+                        if ret != 0 {
+                            let e = std::io::Error::last_os_error();
+                            return Err(WriteError {
+                                message: format!(
+                                    "Failed to chown for '{}': {}",
+                                    state.path_display, e
+                                ),
+                                error_type: "io_error".to_string(),
+                                path_display: state.path_display.clone(),
+                                op_id: state.op_id.clone(),
+                            });
+                        }
                     }
                     if let Err(e) = std::fs::rename(&state.tmp_path, &state.final_path) {
                         return Err(WriteError {
@@ -2875,7 +2905,10 @@ fn setup_init_environment() {
         let source = std::ffi::CString::new("tmpfs").unwrap();
         let target = std::ffi::CString::new("/home/user").unwrap();
         let fstype = std::ffi::CString::new("tmpfs").unwrap();
-        let data = std::ffi::CString::new("mode=0755,uid=1000,gid=1000,noswap").unwrap();
+        let data = std::ffi::CString::new(format!(
+            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},noswap"
+        ))
+        .unwrap();
         libc::mount(
             source.as_ptr(),
             target.as_ptr(),
@@ -2960,7 +2993,7 @@ fn setup_init_environment() {
     // write_sysrq_trigger() in drivers/tty/sysrq.c passes check_mask=false to
     // __handle_sysrq(), bypassing the sysrq_enabled bitmask entirely. Only
     // filesystem-level blocking (EROFS via bind-mount) is effective.
-    // File permissions (S_IWUSR) block UID 1000, but this also blocks root.
+    // File permissions (S_IWUSR) block the sandbox user, but this also blocks root.
     // See: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (runc procfs redirects)
     if mount_readonly(c"/proc/sysrq-trigger") {
         eprintln!("Mounted /proc/sysrq-trigger read-only");
