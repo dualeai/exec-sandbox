@@ -6,6 +6,17 @@
 #   2. kernel + initramfs (from Alpine, needs tiny-init)
 #   3. qcow2 disk images (python, node, raw variants)
 #
+# Artifact dependency graph:
+#
+#   tiny-init src → tiny-init binary → initramfs (QEMU -initrd, NOT inside qcow2)
+#   guest-agent src → guest-agent binary → embedded in qcow2 (guestfish-patchable)
+#   rootfs packages (Alpine, Python, Node) → qcow2 (full rebuild only)
+#
+# Caching: each artifact has a .hash sidecar file (content-addressable input key,
+# NOT an output checksum). When inputs match, the build step is skipped.
+# The qcow2 build has a 3-way cache: full hit → skip, rootfs hit → guestfish
+# patch (guest-agent only), miss → full rebuild.
+#
 # All build commands run inside Linux containers with the repo mounted.
 # This ensures consistent builds across macOS and Linux hosts.
 #
