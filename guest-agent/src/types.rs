@@ -1,11 +1,10 @@
-//! Type definitions for the guest agent protocol.
+//! Wire protocol type definitions for the guest agent.
 //!
-//! All structs for wire protocol messages (serde), internal state, and
-//! pipeline handles live here to keep main.rs focused on logic.
+//! All structs for inbound commands (host → guest) and outbound messages
+//! (guest → host). Internal state types live in their owning modules.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 
 // ============================================================================
 // Inbound commands (host → guest, deserialized from JSON)
@@ -13,7 +12,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
-pub enum GuestCommand {
+pub(crate) enum GuestCommand {
     #[serde(rename = "ping")]
     Ping,
 
@@ -64,14 +63,9 @@ pub enum GuestCommand {
 // Outbound messages (guest → host, serialized to JSON)
 // ============================================================================
 
-/// All guest → host messages as a single tagged enum.
-///
-/// `#[serde(tag = "type")]` produces `{"type": "<variant>", ...}` — identical
-/// wire format to the previous per-struct approach. The Python host discriminates
-/// on `"type"` via Pydantic tagged union (`guest_agent_protocol.py`).
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
-pub enum GuestResponse {
+pub(crate) enum GuestResponse {
     #[serde(rename = "stdout")]
     Stdout { chunk: String },
 
@@ -134,94 +128,10 @@ pub enum GuestResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct FileEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-}
-
-// ============================================================================
-// File I/O internals
-// ============================================================================
-
-/// Wrapper that counts bytes written and enforces a size limit.
-pub struct CountingWriter<W> {
-    pub inner: W,
-    pub count: usize,
-    pub limit: usize,
-}
-
-impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.count + buf.len() > self.limit {
-            return Err(std::io::Error::other("file size limit exceeded"));
-        }
-        let n = self.inner.write(buf)?;
-        self.count += n;
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// State for an in-progress streaming file write operation.
-/// Moved into a `spawn_blocking` task for pipelined decompression + disk I/O.
-pub struct WriteFileState {
-    pub decoder: zstd::stream::write::Decoder<'static, CountingWriter<std::fs::File>>,
-    pub tmp_path: std::path::PathBuf,
-    pub final_path: std::path::PathBuf,
-    pub make_executable: bool,
-    pub op_id: String,
-    pub path_display: String, // relative path for error messages
-    pub finished: bool,
-}
-
-impl WriteFileState {
-    /// Build a `WriteError` for this write operation with `error_type = "io_error"`.
-    pub fn io_error(&self, message: impl std::fmt::Display) -> WriteError {
-        WriteError {
-            message: format!("I/O error for '{}': {}", self.path_display, message),
-            error_type: "io_error".to_string(),
-            path_display: self.path_display.clone(),
-            op_id: self.op_id.clone(),
-        }
-    }
-}
-
-impl Drop for WriteFileState {
-    fn drop(&mut self) {
-        // Clean up temp file if write was not completed (error/disconnect)
-        if !self.finished {
-            let _ = std::fs::remove_file(&self.tmp_path);
-        }
-    }
-}
-
-/// Handle for an in-progress pipelined file write.
-/// Decouples chunk reception (main loop) from decompression+disk I/O (blocking thread pool).
-pub struct ActiveWriteHandle {
-    /// Send decoded (but not yet decompressed) chunks to the blocking worker.
-    pub chunk_tx: mpsc::Sender<Vec<u8>>,
-    /// Join handle for the blocking worker task.
-    pub task: tokio::task::JoinHandle<Result<WriteResult, WriteError>>,
-    /// For error messages when chunk_tx.send() fails.
-    pub path_display: String,
-    /// Correlates interleaved write operations on the orchestrator side.
-    pub op_id: String,
-}
-
-pub struct WriteResult {
-    pub bytes_written: usize,
-    pub path_display: String,
-    pub op_id: String,
-}
-
-pub struct WriteError {
-    pub message: String,
-    pub error_type: String,
-    pub path_display: String,
-    pub op_id: String,
+pub(crate) struct FileEntry {
+    pub(crate) name: String,
+    pub(crate) is_dir: bool,
+    pub(crate) size: u64,
 }
 
 // ============================================================================
@@ -229,19 +139,15 @@ pub struct WriteError {
 // ============================================================================
 
 /// Supported execution languages.
-///
-/// `GuestCommand` keeps `language: String` so unknown languages (e.g. `"cobol"`)
-/// still deserialize — validation happens at the handler level via `Language::parse`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Language {
     Python,
     Javascript,
     Raw,
 }
 
 impl Language {
-    /// Parse a language string. Returns `None` for unsupported languages.
-    pub fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "python" => Some(Self::Python),
             "javascript" => Some(Self::Javascript),
@@ -250,8 +156,7 @@ impl Language {
         }
     }
 
-    /// Wire-format string (matches `GuestCommand.language` values).
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Python => "python",
             Self::Javascript => "javascript",
@@ -261,13 +166,229 @@ impl Language {
 }
 
 // ============================================================================
-// REPL state
+// Tests
 // ============================================================================
 
-/// State for a persistent REPL process.
-pub struct ReplState {
-    pub child: tokio::process::Child,
-    pub stdin: tokio::process::ChildStdin,
-    pub stdout: tokio::process::ChildStdout,
-    pub stderr: tokio::process::ChildStderr,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Language::parse
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_language_parse_python() {
+        assert_eq!(Language::parse("python"), Some(Language::Python));
+    }
+
+    #[test]
+    fn test_language_parse_javascript() {
+        assert_eq!(Language::parse("javascript"), Some(Language::Javascript));
+    }
+
+    #[test]
+    fn test_language_parse_raw() {
+        assert_eq!(Language::parse("raw"), Some(Language::Raw));
+    }
+
+    #[test]
+    fn test_language_parse_uppercase_none() {
+        assert_eq!(Language::parse("PYTHON"), None);
+    }
+
+    #[test]
+    fn test_language_parse_empty_none() {
+        assert_eq!(Language::parse(""), None);
+    }
+
+    #[test]
+    fn test_language_parse_unknown_none() {
+        assert_eq!(Language::parse("cobol"), None);
+    }
+
+    #[test]
+    fn test_language_roundtrip() {
+        for lang in [Language::Python, Language::Javascript, Language::Raw] {
+            assert_eq!(Language::parse(lang.as_str()), Some(lang));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // GuestCommand deserialization
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_deserialize_write_file() {
+        let json =
+            r#"{"action":"write_file","op_id":"abc123","path":"test.txt","make_executable":false}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WriteFile {
+                op_id,
+                path,
+                make_executable,
+            } => {
+                assert_eq!(op_id, "abc123");
+                assert_eq!(path, "test.txt");
+                assert!(!make_executable);
+            }
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_read_file() {
+        let json = r#"{"action":"read_file","op_id":"def456","path":"output.csv"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ReadFile { op_id, path } => {
+                assert_eq!(op_id, "def456");
+                assert_eq!(path, "output.csv");
+            }
+            _ => panic!("Expected ReadFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_files() {
+        let json = r#"{"action":"list_files","path":""}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ListFiles { path } => assert_eq!(path, ""),
+            _ => panic!("Expected ListFiles"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_list_files_default_path() {
+        let json = r#"{"action":"list_files"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::ListFiles { path } => assert_eq!(path, ""),
+            _ => panic!("Expected ListFiles"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_write_file_executable() {
+        let json =
+            r#"{"action":"write_file","op_id":"xyz","path":"run.sh","make_executable":true}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WriteFile {
+                make_executable, ..
+            } => assert!(make_executable),
+            _ => panic!("Expected WriteFile"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_file_chunk() {
+        let json = r#"{"action":"file_chunk","op_id":"abc123","data":"SGVsbG8="}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::FileChunk { op_id, data } => {
+                assert_eq!(op_id, "abc123");
+                assert_eq!(data, "SGVsbG8=");
+            }
+            _ => panic!("Expected FileChunk"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_file_end() {
+        let json = r#"{"action":"file_end","op_id":"abc123"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::FileEnd { op_id } => assert_eq!(op_id, "abc123"),
+            _ => panic!("Expected FileEnd"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl() {
+        let json = r#"{"action":"warm_repl","language":"python"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WarmRepl { language } => assert_eq!(language, "python"),
+            _ => panic!("Expected WarmRepl"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl_unknown_language() {
+        let json = r#"{"action":"warm_repl","language":"cobol"}"#;
+        let cmd: GuestCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            GuestCommand::WarmRepl { language } => assert_eq!(language, "cobol"),
+            _ => panic!("Expected WarmRepl"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_warm_repl_missing_language() {
+        let json = r#"{"action":"warm_repl"}"#;
+        assert!(serde_json::from_str::<GuestCommand>(json).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Response serialization
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_serialize_file_write_ack() {
+        let ack = GuestResponse::FileWriteAck {
+            op_id: "test_op".to_string(),
+            path: "test.txt".to_string(),
+            bytes_written: 42,
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("\"type\":\"file_write_ack\""));
+        assert!(json.contains("\"bytes_written\":42"));
+    }
+
+    #[test]
+    fn test_serialize_file_chunk_response() {
+        let chunk = GuestResponse::FileChunk {
+            op_id: "abc123".to_string(),
+            data: "SGVsbG8=".to_string(),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"type\":\"file_chunk\""));
+    }
+
+    #[test]
+    fn test_serialize_file_read_complete() {
+        let msg = GuestResponse::FileReadComplete {
+            op_id: "def456".to_string(),
+            path: "data.csv".to_string(),
+            size: 1024,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"file_read_complete\""));
+        assert!(json.contains("\"size\":1024"));
+    }
+
+    #[test]
+    fn test_serialize_file_list() {
+        let list = GuestResponse::FileList {
+            path: "".to_string(),
+            entries: vec![
+                FileEntry {
+                    name: "file.txt".to_string(),
+                    is_dir: false,
+                    size: 100,
+                },
+                FileEntry {
+                    name: "subdir".to_string(),
+                    is_dir: true,
+                    size: 0,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains("\"type\":\"file_list\""));
+        assert!(json.contains("\"file.txt\""));
+    }
 }
