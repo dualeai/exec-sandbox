@@ -69,6 +69,19 @@ pub(crate) async fn spawn_repl(
                 format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
             c.env("BUN_JSC_useFTLJIT", "0");
+            // Minimize background thread CPU when idle. Without these, JSC's
+            // concurrent GC/JIT threads and Bun's GC timer cause ~20-25% CPU
+            // even when the main thread is blocked in libc.read().
+            // See: oven-sh/bun#27365, oven-sh/bun#21081
+            c.env("BUN_GC_TIMER_DISABLE", "1"); // Disable Bun's 1s GC repeating timer
+            c.env("BUN_JSC_useConcurrentGC", "false"); // No background GC marker threads
+            c.env("BUN_JSC_useConcurrentJIT", "false"); // No background JIT compilation
+            // Reduce idle RSS. Tighter growth factor limits heap expansion;
+            // earlier critical threshold triggers GC sooner; mimalloc purge
+            // returns freed pages to the OS immediately (important for balloon).
+            c.env("BUN_JSC_miniVMHeapGrowthFactor", "1.05"); // 5% growth (default 1.20)
+            c.env("BUN_JSC_criticalGCMemoryThreshold", "0.50"); // Aggressive GC at 50% of RAM
+            c.env("MIMALLOC_PURGE_DELAY", "0"); // Immediate page release to OS
             c
         }
         Language::Raw => {
