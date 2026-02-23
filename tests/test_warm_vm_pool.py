@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from exec_sandbox import constants
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 
@@ -36,11 +35,13 @@ class TestWarmVMPoolConfig:
         pool = WarmVMPool(unit_test_vm_manager, config)
         assert pool.pool_size_per_language == 50
 
-    def test_warm_pool_languages(self) -> None:
-        """Warm pool supports python and javascript."""
-        assert Language.PYTHON in constants.WARM_POOL_LANGUAGES
-        assert Language.JAVASCRIPT in constants.WARM_POOL_LANGUAGES
-        assert len(constants.WARM_POOL_LANGUAGES) == 2
+    def test_warm_pool_has_all_languages(self, unit_test_vm_manager) -> None:
+        """Warm pool creates a pool for every Language."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(unit_test_vm_manager, config)
+        assert set(pool.pools.keys()) == set(Language)
 
 
 class TestLanguageEnum:
@@ -307,6 +308,7 @@ class TestWarmVMPoolIntegration:
         # Pools should be empty
         assert pool.pools[Language.PYTHON].qsize() == 0
         assert pool.pools[Language.JAVASCRIPT].qsize() == 0
+        assert pool.pools[Language.RAW].qsize() == 0
 
     async def test_get_vm_from_pool(self, vm_manager) -> None:
         """Get VM from warm pool."""

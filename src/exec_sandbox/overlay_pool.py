@@ -163,7 +163,7 @@ class OverlayPool:
     async def start(self, base_images: list[Path] | None = None) -> None:
         """Start the overlay pool and pre-create overlays for base images.
 
-        If base_images is None, auto-discovers from images_path using WARM_POOL_LANGUAGES.
+        If base_images is None, auto-discovers from images_path.
 
         The daemon is always started (needed for on-demand overlay creation in acquire()),
         but pre-creation and replenishment are only enabled when pool_size > 0.

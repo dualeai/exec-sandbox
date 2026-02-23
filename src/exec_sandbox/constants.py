@@ -2,8 +2,6 @@
 
 from typing import Final
 
-from exec_sandbox.models import Language
-
 # ============================================================================
 # VM Memory and Resource Defaults
 # ============================================================================
@@ -183,9 +181,6 @@ IO_URING_MIN_KERNEL_MINOR: Final[int] = 1
 
 WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 """Max concurrent replenish boots as ratio of pool_size (50% = 2-3 concurrent for pool_size=5)."""
-
-WARM_POOL_LANGUAGES: Final[tuple[Language, ...]] = (Language.PYTHON, Language.JAVASCRIPT)
-"""Languages eligible for warm VM pool."""
 
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""

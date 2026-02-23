@@ -5,7 +5,7 @@ Provides 200-400x faster execution start (1-2ms vs 400ms cold boot).
 
 Architecture:
 - Pool size: Configured via warm_pool_size (per language)
-- Languages: python, javascript
+- Languages: all (python, javascript, raw)
 - Lifecycle: Pre-boot → allocate → execute → destroy → replenish
 - Security: One-time use (no cross-tenant reuse)
 
@@ -125,7 +125,7 @@ class WarmVMPool:
 
         # Pools: asyncio.Queue for thread-safe async access
         self.pools: dict[Language, asyncio.Queue[QemuVM]] = {
-            lang: asyncio.Queue(maxsize=self.pool_size_per_language) for lang in constants.WARM_POOL_LANGUAGES
+            lang: asyncio.Queue(maxsize=self.pool_size_per_language) for lang in Language
         }
 
         # Track background replenish tasks (prevent GC)
@@ -139,7 +139,7 @@ class WarmVMPool:
             int(self.pool_size_per_language * constants.WARM_POOL_REPLENISH_CONCURRENCY_RATIO),
         )
         self._replenish_semaphores: dict[Language, asyncio.Semaphore] = {
-            lang: asyncio.Semaphore(self._replenish_max_concurrent) for lang in constants.WARM_POOL_LANGUAGES
+            lang: asyncio.Semaphore(self._replenish_max_concurrent) for lang in Language
         }
 
         # Health check task
@@ -150,8 +150,8 @@ class WarmVMPool:
             "Warm VM pool initialized",
             extra={
                 "pool_size_per_language": self.pool_size_per_language,
-                "languages": [lang.value for lang in constants.WARM_POOL_LANGUAGES],
-                "total_vms": self.pool_size_per_language * len(constants.WARM_POOL_LANGUAGES),
+                "languages": [lang.value for lang in Language],
+                "total_vms": self.pool_size_per_language * len(Language),
             },
         )
 
@@ -166,14 +166,14 @@ class WarmVMPool:
         """
         logger.info(
             "Starting warm VM pool",
-            extra={"total_vms": self.pool_size_per_language * len(constants.WARM_POOL_LANGUAGES)},
+            extra={"total_vms": self.pool_size_per_language * len(Language)},
         )
 
         boot_start = asyncio.get_event_loop().time()
 
         # Build list of all VMs to boot (parallel execution)
         boot_coroutines: list[Coroutine[Any, Any, None]] = []
-        for language in constants.WARM_POOL_LANGUAGES:
+        for language in Language:
             logger.info(f"Pre-booting {self.pool_size_per_language} {language.value} VMs (parallel)")
             boot_coroutines.extend(self._boot_and_add_vm(language, index=i) for i in range(self.pool_size_per_language))
 
@@ -198,8 +198,7 @@ class WarmVMPool:
             "Warm VM pool startup complete",
             extra={
                 "boot_duration_s": f"{boot_duration:.2f}",
-                "python_vms": self.pools[Language.PYTHON].qsize(),
-                "javascript_vms": self.pools[Language.JAVASCRIPT].qsize(),
+                **{f"{lang.value}_vms": self.pools[lang].qsize() for lang in Language},
             },
         )
 
@@ -363,6 +362,8 @@ class WarmVMPool:
             # Must run BEFORE balloon inflate: Bun (42MB RSS) swap-thrashes
             # when starting at 128MB. After startup, Bun idles at ~42MB RSS
             # which fits comfortably in the ballooned 128MB target.
+            # RAW (bash ~5MB RSS) has no such constraint but benefits from
+            # the same ordering for consistency.
             await self._warm_repl(vm, language)
 
             # Inflate balloon to reduce idle memory footprint
