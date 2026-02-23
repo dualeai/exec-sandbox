@@ -12,7 +12,14 @@ DEFAULT_MEMORY_MB: Final[int] = 256
 """Default guest VM memory allocation in MB (reduced from 512MB for cost optimization)."""
 
 MIN_MEMORY_MB: Final[int] = 128
-"""Minimum guest VM memory in MB."""
+"""Minimum guest VM memory in MB.
+
+NOTE: JavaScript (Bun) requires significantly more memory than Python.
+Bun RSS ~42MB vs CPython ~19MB. At 128MB VMs (~40MB free RAM), Bun
+swap-thrashes via zram causing 40s+ latency for trivial operations.
+Recommended minimums: Python 128MB, JavaScript 160MB+, ideal 192MB+.
+The --smol flag in guest-agent mitigates this but doesn't eliminate it.
+"""
 
 TMPFS_SIZE_MB: Final[int] = 128
 """tmpfs /tmp size limit in MB (half of default VM memory)."""

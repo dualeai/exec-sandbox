@@ -543,12 +543,20 @@ async fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error:
         }
         Language::Javascript => {
             let mut c = Command::new("bun");
+            // --smol: configure JSC to use smaller heap that grows slower.
+            // Reduces heap from ~343MB to ~54MB at ~2x CPU cost — always
+            // worthwhile in 128-256MB sandbox VMs.
+            c.arg("--smol");
             c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
             // Package resolution: session-time (tmpfs) then system (ext4 snapshot)
             c.env(
                 "NODE_PATH",
                 format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
+            // Disable FTL (most expensive JIT tier). FTL requires 100k+
+            // iterations to trigger — never reached by sandbox code snippets.
+            // Saves JIT code buffer memory.
+            c.env("BUN_JSC_useFTLJIT", "0");
             c
         }
         Language::Raw => {

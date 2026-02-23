@@ -359,11 +359,14 @@ class WarmVMPool:
         try:
             vm = await self._boot_warm_vm(language, index)
 
+            # Pre-warm REPL at full memory (hides ~800ms Python startup).
+            # Must run BEFORE balloon inflate: Bun (42MB RSS) swap-thrashes
+            # when starting at 128MB. After startup, Bun idles at ~42MB RSS
+            # which fits comfortably in the ballooned 128MB target.
+            await self._warm_repl(vm, language)
+
             # Inflate balloon to reduce idle memory footprint
             await self._inflate_balloon(vm)
-
-            # Pre-warm REPL while VM is idle (hides ~800ms Python startup)
-            await self._warm_repl(vm, language)
 
             await self.pools[language].put(vm)
             logger.info(
