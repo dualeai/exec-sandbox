@@ -1,13 +1,13 @@
 """Tests for kernel attack surface reduction inside the guest VM.
 
-Validates that dangerous kernel subsystems — historically responsible for
-privilege escalation and container/sandbox escapes — are restricted or
-disabled for the REPL user (UID 1000).
+Validates kernel attack surface configuration inside the guest VM:
+subsystems that are restricted/disabled for the REPL user (UID 1000),
+and subsystems intentionally left available (VM isolation is the boundary).
 
 CVE references per subsystem:
 - eBPF verifier: CVE-2020-8835, CVE-2021-3490, CVE-2021-31440, CVE-2023-2163,
   CVE-2024-56615 (DEVMAP integer overflow)
-- io_uring: CVE-2023-2598, CVE-2024-0582
+- io_uring: enabled (VM isolation is the security boundary)
 - nf_tables: CVE-2024-1086, CVE-2023-32233, CVE-2023-35001, CVE-2021-22555,
   CVE-2024-53141 (ipset OOB access)
 - AF_PACKET: CVE-2020-14386
@@ -117,22 +117,20 @@ except PermissionError:
 
 
 # =============================================================================
-# Normal: io_uring is restricted (CVE-2023-2598, CVE-2024-0582)
+# Normal: io_uring is available (VM isolation is the security boundary)
 # =============================================================================
-class TestIoUringRestricted:
-    """io_uring has had serial use-after-free bugs leading to privesc.
+class TestIoUringAvailable:
+    """io_uring is intentionally enabled for I/O performance.
 
-    Mitigations: io_uring_setup() should fail for UID 1000 via sysctl
-    io_uring_disabled or kernel config.
+    The VM isolation boundary (QEMU + KVM/HVF) is the primary security
+    layer — an io_uring exploit grants at most root inside an ephemeral VM.
     """
 
-    async def test_io_uring_setup_blocked(self, scheduler: Scheduler) -> None:
-        """io_uring_setup() syscall must be blocked for UID 1000.
+    async def test_io_uring_setup_succeeds(self, scheduler: Scheduler) -> None:
+        """io_uring_setup() should succeed for UID 1000.
 
-        CVE-2024-0582: io_uring use-after-free enabling privilege escalation
-        via "Dirty Pagetable" technique.
-
-        Hardened via sysctl kernel.io_uring_disabled=2 set in tiny-init.
+        Validates that io_uring is not disabled via sysctl, allowing
+        workloads to benefit from async I/O performance.
         """
         code = """\
 import ctypes
@@ -151,10 +149,42 @@ print(f"ret={ret} errno={err}")
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        # EPERM=1 means disabled via sysctl, ENOSYS=38 means not compiled in
+        ret_val = int(stdout.split("ret=")[1].split()[0])
         errno_val = int(stdout.rsplit("errno=", 1)[1])
-        assert errno_val in {1, 38}, (
-            f"io_uring_setup should be blocked (EPERM or ENOSYS), got errno={errno_val}. stdout: {stdout}"
+        # Valid fd (>= 0) means io_uring works; ENOSYS means kernel lacks io_uring (acceptable)
+        assert ret_val >= 0 or errno_val == 38, (
+            f"io_uring_setup should succeed or return ENOSYS(38), got ret={ret_val} errno={errno_val}. stdout: {stdout}"
+        )
+
+    async def test_io_uring_rejects_invalid_params_not_eperm(self, scheduler: Scheduler) -> None:
+        """io_uring_setup(0, &params) should return EINVAL, not EPERM.
+
+        Calling with zero entries is invalid. If io_uring is enabled, the
+        kernel reaches parameter validation (EINVAL=22). If disabled via
+        sysctl, it would return EPERM(1) instead.
+        """
+        code = """\
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+# io_uring_setup: 425 on both x86_64 and aarch64
+nr = 425
+# struct io_uring_params (120 bytes of zeros)
+params = (ctypes.c_char * 120)()
+# entries=0 is invalid
+ret = libc.syscall(nr, 0, ctypes.byref(params))
+err = ctypes.get_errno()
+print(f"ret={ret} errno={err}")
+"""
+        result = await scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        stdout = result.stdout.strip()
+        errno_val = int(stdout.rsplit("errno=", 1)[1])
+        # EINVAL=22 proves kernel reaches parameter validation (io_uring enabled)
+        # ENOSYS=38 means kernel lacks io_uring (acceptable)
+        # EPERM=1 would mean io_uring is still disabled via sysctl (unexpected)
+        assert errno_val in {22, 38}, (
+            f"Expected EINVAL(22) or ENOSYS(38), got errno={errno_val}. "
+            f"EPERM(1) would indicate io_uring is still disabled. stdout: {stdout}"
         )
 
 

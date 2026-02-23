@@ -729,10 +729,6 @@ fn main() {
     // Value 2 = disabled for all (even CAP_SYS_ADMIN requires BPF token)
     let _ = fs::write("/proc/sys/kernel/unprivileged_bpf_disabled", "2");
     //
-    // io_uring: CVE-2023-2598, CVE-2024-0582
-    // Value 2 = disabled for all users (requires kernel >= 6.6, introduced in 6.6-rc1)
-    let _ = fs::write("/proc/sys/kernel/io_uring_disabled", "2");
-    //
     // User namespaces: CVE-2022-0185, CVE-2023-0386
     // Value 0 = no unprivileged user namespaces (prevents gaining CAP_SYS_ADMIN)
     // unprivileged_userns_clone is Debian/Ubuntu-specific
