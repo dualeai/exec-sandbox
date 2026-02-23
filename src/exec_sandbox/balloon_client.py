@@ -305,11 +305,19 @@ class BalloonClient:
                                     extra={"actual_mb": actual_mb, "target_mb": target_mb},
                                 )
                 except RetryError:
-                    # Log warning but don't fail - balloon may still be inflating
                     actual_mb = await self.query(timeout=1.0)
                     logger.warning(
                         "Balloon did not reach target within retry limit",
                         extra={"actual_mb": actual_mb, "target_mb": target_mb},
+                    )
+                    # Reset balloon target to original memory so the guest
+                    # kernel's balloon driver stops retrying page reclaim.
+                    # Without this, failed inflation causes ~20% sustained
+                    # QEMU vCPU overhead from continuous VMExits.
+                    await self.set_target(current_mb, timeout=timeout)
+                    logger.info(
+                        "Balloon target reset after failed inflation",
+                        extra={"reset_to_mb": current_mb},
                     )
 
             logger.info(

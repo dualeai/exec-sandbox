@@ -30,6 +30,7 @@ from operator import attrgetter
 from pathlib import Path
 
 from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig
+from exec_sandbox.constants import DEFAULT_MEMORY_MB
 from exec_sandbox.models import Language
 
 # ============================================================================
@@ -40,12 +41,6 @@ CODE_MAP: dict[Language, str] = {
     Language.PYTHON: "print('ok')",
     Language.JAVASCRIPT: "console.log('ok')",
     Language.RAW: "echo ok",
-}
-
-MEMORY_MB_BY_LANG: dict[Language, int] = {
-    Language.PYTHON: 128,
-    Language.JAVASCRIPT: 192,
-    Language.RAW: 128,
 }
 
 ALL_LANGUAGES: list[Language] = [Language.PYTHON, Language.JAVASCRIPT, Language.RAW]
@@ -374,7 +369,7 @@ async def run_benchmarks(
             scheduler,
             lang,
             n,
-            memory_mb=MEMORY_MB_BY_LANG[lang],
+            memory_mb=None,  # Use scheduler default
             allow_network=network,
         )
 
@@ -444,16 +439,12 @@ async def main() -> None:
     else:
         print("Warm pool:    disabled")
     print(f"Network:      {'enabled' if args.network else 'disabled'}")
-    for lang in args.langs:
-        print(f"Memory/VM:    {MEMORY_MB_BY_LANG[lang]} MB ({LANG_DISPLAY[lang]})")
+    print(f"Memory/VM:    {DEFAULT_MEMORY_MB} MB")
 
-    # Configure scheduler — use the highest per-language memory as default
-    # (individual benchmarks override via memory_mb parameter)
     config = SchedulerConfig(
         images_dir=images_dir,
         auto_download_assets=False,
         warm_pool_size=args.pool,
-        default_memory_mb=max(MEMORY_MB_BY_LANG[lang] for lang in args.langs),
     )
 
     async with Scheduler(config) as scheduler:
