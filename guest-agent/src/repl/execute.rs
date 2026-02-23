@@ -192,7 +192,7 @@ pub(crate) async fn execute_code_streaming(
                 // Drain remaining stdout
                 loop {
                     match tokio::time::timeout(
-                        Duration::from_millis(FLUSH_INTERVAL_MS),
+                        Duration::from_millis(DRAIN_TIMEOUT_MS),
                         repl.stdout.read(&mut stdout_bytes),
                     )
                     .await

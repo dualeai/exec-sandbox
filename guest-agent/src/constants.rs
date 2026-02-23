@@ -46,6 +46,7 @@ pub(crate) const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300;
 
 // Streaming configuration
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
+pub(crate) const DRAIN_TIMEOUT_MS: u64 = 5;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
 
 // File I/O limits

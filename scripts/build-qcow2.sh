@@ -41,7 +41,7 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file iputils"
 
 # Python: add build tools for C extensions (numpy, pandas, etc.)
-PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev"
+PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev jemalloc"
 
 # Node: bun needs libgcc/libstdc++
 NODE_PKGS="$COMMON_PKGS libgcc libstdc++"
@@ -345,6 +345,24 @@ create_python_rootfs() {
             --python /rootfs/opt/python/bin/python3 \
             --target /rootfs/usr/lib/python3/site-packages \
             "cloudpickle==$CLOUDPICKLE_VERSION"
+
+    # Verify jemalloc is installed at the expected path (LD_PRELOAD in guest-agent)
+    if [ ! -f "$rootfs_dir/usr/lib/libjemalloc.so.2" ]; then
+        echo "ERROR: jemalloc library not found at /usr/lib/libjemalloc.so.2" >&2
+        echo "  Check Alpine $ALPINE_VERSION jemalloc package contents" >&2
+        exit 1
+    fi
+
+    echo "  Pre-compiling .pyc files..."
+    docker run --rm \
+        -v "$rootfs_dir:/rootfs" \
+        --platform "$docker_platform" \
+        "alpine:${ALPINE_VERSION}" \
+        /rootfs/opt/python/bin/python3 -m compileall \
+            --invalidation-mode unchecked-hash \
+            -q \
+            /rootfs/opt/python/lib/ \
+            /rootfs/usr/lib/python3/site-packages/
 }
 
 # Create rootfs with Node/bun runtime using Docker
