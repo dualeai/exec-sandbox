@@ -7,6 +7,8 @@ Test philosophy:
 """
 
 import asyncio
+import errno
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -168,11 +170,12 @@ class TestOverlayPoolPureLogic:
 class TestOverlayPoolErrorHandling:
     """Tests for error handling - mocks needed to simulate failures."""
 
-    async def test_rename_failure_falls_back_to_ondemand(self, tmp_path: Path) -> None:
-        """Failed rename (cross-filesystem) cleans up and creates on-demand.
+    @pytest.fixture
+    def mock_pool(self, tmp_path: Path) -> types.SimpleNamespace:
+        """Create an OverlayPool with a fake overlay file, mocked daemon, and manual internal state.
 
-        Note: Uses internal state setup because triggering real rename failure
-        requires cross-filesystem setup which is environment-dependent.
+        Returns SimpleNamespace with: pool, pool_dir, base_image, overlay, mock_daemon.
+        Each test puts overlays into the queue as needed.
         """
         from exec_sandbox.overlay_pool import OverlayPool
         from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
@@ -181,26 +184,171 @@ class TestOverlayPoolErrorHandling:
         pool_dir.mkdir(parents=True)
         pool = OverlayPool(pool_size=1, pool_dir=pool_dir)
 
-        # Setup: create a file in the pool queue and mock daemon
         base_image = Path("/fake/base.qcow2")
-        pool._pools[str(base_image)] = asyncio.Queue(maxsize=1)
+        pool._pools[str(base_image.resolve())] = asyncio.Queue(maxsize=5)
         overlay = pool_dir / "test.qcow2"
-        overlay.write_text("content")
-        await pool._pools[str(base_image)].put(overlay)
+        overlay.write_text("overlay-content")
         pool._started = True
 
-        # Mock daemon for on-demand creation
         mock_daemon = AsyncMock(spec=QemuStorageDaemon)
         pool._daemon = mock_daemon
 
-        # Test: rename fails, should cleanup and fall back to on-demand via daemon
-        with patch("aiofiles.os.rename", side_effect=OSError("Cross-device link")):
-            result = await pool.acquire(base_image, tmp_path / "target.qcow2")
+        return types.SimpleNamespace(
+            pool=pool,
+            pool_dir=pool_dir,
+            base_image=base_image,
+            overlay=overlay,
+            mock_daemon=mock_daemon,
+        )
+
+    async def test_move_failure_falls_back_to_ondemand(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """Failed move (e.g. cross-filesystem) cleans up and creates on-demand."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        with patch("shutil.move", side_effect=OSError("Cross-device link")):
+            result = await mp.pool.acquire(mp.base_image, tmp_path / "target.qcow2")
 
         assert result is False  # Not from pool (created on-demand)
-        assert not overlay.exists()  # Orphaned overlay cleaned up
-        mock_daemon.create_overlay.assert_called_once()  # Fell back to daemon
-        await pool.stop()
+        assert not mp.overlay.exists()  # Orphaned overlay cleaned up
+        mp.mock_daemon.create_overlay.assert_called_once()  # Fell back to daemon
+        await mp.pool.stop()
+
+    async def test_move_succeeds_same_filesystem(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """Real move: file at target, source gone, daemon not called."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        target = tmp_path / "target.qcow2"
+        result = await mp.pool.acquire(mp.base_image, target)
+
+        assert result is True
+        assert target.exists()
+        assert target.read_text() == "overlay-content"
+        assert not mp.overlay.exists()
+        mp.mock_daemon.create_overlay.assert_not_called()
+        await mp.pool.stop()
+
+    async def test_source_vanishes_before_move(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """Source deleted before move -> FileNotFoundError -> on-demand fallback."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        # Delete source before acquire can move it
+        mp.overlay.unlink()
+
+        target = tmp_path / "target.qcow2"
+        result = await mp.pool.acquire(mp.base_image, target)
+
+        assert result is False
+        assert not target.exists()  # shutil.move failed before creating target
+        mp.mock_daemon.create_overlay.assert_called_once()
+        await mp.pool.stop()
+
+    async def test_target_parent_missing(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """Target dir missing -> move fails -> on-demand fallback."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        target = tmp_path / "nonexistent" / "target.qcow2"
+        result = await mp.pool.acquire(mp.base_image, target)
+
+        assert result is False
+        assert not mp.overlay.exists()  # orphan cleanup should have run
+        mp.mock_daemon.create_overlay.assert_called_once()
+        await mp.pool.stop()
+
+    async def test_target_permission_denied(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """PermissionError(EACCES) -> on-demand fallback."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        with patch("shutil.move", side_effect=PermissionError(errno.EACCES, "Permission denied")):
+            result = await mp.pool.acquire(mp.base_image, tmp_path / "target.qcow2")
+
+        assert result is False
+        mp.mock_daemon.create_overlay.assert_called_once()
+        await mp.pool.stop()
+
+    async def test_zero_byte_overlay_moves(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """0-byte file moves fine (pool doesn't validate content)."""
+        mp = mock_pool
+        mp.overlay.write_bytes(b"")
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        target = tmp_path / "target.qcow2"
+        result = await mp.pool.acquire(mp.base_image, target)
+
+        assert result is True
+        assert target.exists()
+        assert target.stat().st_size == 0
+        mp.mock_daemon.create_overlay.assert_not_called()
+        await mp.pool.stop()
+
+    async def test_orphan_cleanup_failure_suppressed(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """Move EIO + unlink EIO -> suppress(OSError) handles both."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        with (
+            patch("shutil.move", side_effect=OSError(errno.EIO, "I/O error")),
+            patch("os.unlink", side_effect=OSError(errno.EIO, "I/O error")),
+        ):
+            result = await mp.pool.acquire(mp.base_image, tmp_path / "target.qcow2")
+
+        assert result is False
+        mp.mock_daemon.create_overlay.assert_called_once()
+        await mp.pool.stop()
+
+    async def test_first_move_fails_queue_retains_rest(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """1st fails -> on-demand; 2nd acquire gets next overlay from queue."""
+        mp = mock_pool
+        overlay2 = mp.pool_dir / "test2.qcow2"
+        overlay2.write_text("overlay2-content")
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+        await mp.pool._pools[str(mp.base_image.resolve())].put(overlay2)
+
+        # First acquire: move fails
+        with patch("shutil.move", side_effect=OSError("disk error")):
+            result1 = await mp.pool.acquire(mp.base_image, tmp_path / "t1.qcow2")
+        assert result1 is False
+        mp.mock_daemon.create_overlay.assert_called_once()
+
+        # Second acquire: succeeds from queue (real move)
+        target2 = tmp_path / "t2.qcow2"
+        result2 = await mp.pool.acquire(mp.base_image, target2)
+        assert result2 is True
+        assert target2.read_text() == "overlay2-content"
+        await mp.pool.stop()
+
+    async def test_non_oserror_propagates(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """RuntimeError from move propagates (not caught by except OSError)."""
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+
+        with (
+            patch("shutil.move", side_effect=RuntimeError("unexpected")),
+            pytest.raises(RuntimeError, match="unexpected"),
+        ):
+            await mp.pool.acquire(mp.base_image, tmp_path / "target.qcow2")
+
+        await mp.pool.stop()
+
+    async def test_daemon_also_fails_after_move(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
+        """Move + daemon both fail -> QemuStorageDaemonError propagates."""
+        from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
+
+        mp = mock_pool
+        await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
+        mp.mock_daemon.create_overlay.side_effect = QemuStorageDaemonError("daemon down")
+
+        with (
+            patch("shutil.move", side_effect=OSError("move failed")),
+            pytest.raises(QemuStorageDaemonError, match="daemon down"),
+        ):
+            await mp.pool.acquire(mp.base_image, tmp_path / "target.qcow2")
+
+        await mp.pool.stop()
 
     async def test_stop_handles_rmtree_failure(self, tmp_path: Path) -> None:
         """stop() completes even if directory cleanup fails."""

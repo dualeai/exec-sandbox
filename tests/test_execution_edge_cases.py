@@ -156,6 +156,36 @@ for i in range(100):
         assert "err0" in result.stderr
         assert "err99" in result.stderr
 
+    async def test_bom_prefix_stripped_python(self, scheduler: Scheduler) -> None:
+        """UTF-8 BOM (U+FEFF) before Python code is stripped, execution succeeds."""
+        result = await scheduler.run(
+            code="\ufeffprint('hello')",
+            language=Language.PYTHON,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_bom_prefix_stripped_javascript(self, scheduler: Scheduler) -> None:
+        """UTF-8 BOM (U+FEFF) before JavaScript code is stripped, execution succeeds."""
+        result = await scheduler.run(
+            code="\ufeffconsole.log('hello')",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_bom_prefix_stripped_raw(self, scheduler: Scheduler) -> None:
+        """UTF-8 BOM (U+FEFF) before shell code is stripped, execution succeeds."""
+        result = await scheduler.run(
+            code="\ufeffecho hello",
+            language=Language.RAW,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
 
 # =============================================================================
 # Weird Cases: Unusual behavior that should be handled gracefully
@@ -179,6 +209,15 @@ sys.stdout.buffer.flush()
         # Should handle null bytes without crashing
         assert result.exit_code == 0
         assert "before" in result.stdout or "after" in result.stdout
+
+    async def test_null_bytes_in_code_rejected(self, scheduler: Scheduler) -> None:
+        """Code containing null bytes is rejected with clear error before reaching runtime."""
+        result = await scheduler.run(
+            code="print('hello')\x00print('world')",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == -1
+        assert "null bytes" in result.stderr.lower()
 
     async def test_binary_data_in_output(self, scheduler: Scheduler) -> None:
         """Code outputting binary data."""
@@ -776,6 +815,177 @@ Promise.reject(new Error("test rejection"));
         # Should handle rejection gracefully
         # Exit code depends on Bun's behavior
         assert result.exit_code != 0 or "rejection" in result.stderr.lower()
+
+
+# =============================================================================
+# JavaScript Dynamic Import (ESM import() via __import wrapper)
+# =============================================================================
+class TestJavaScriptDynamicImport:
+    """ESM dynamic import() in the JavaScript/Bun VM context."""
+
+    # --- Normal cases ---
+
+    async def test_dynamic_import_builtin(self, scheduler: Scheduler) -> None:
+        """Dynamic import of a built-in module."""
+        result = await scheduler.run(
+            code="const path = await import('path'); console.log(path.join('a','b'));",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "a/b" in result.stdout
+
+    async def test_dynamic_import_destructured(self, scheduler: Scheduler) -> None:
+        """Destructured dynamic import."""
+        result = await scheduler.run(
+            code="const { join } = await import('path'); console.log(join('a','b'));",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "a/b" in result.stdout
+
+    async def test_dynamic_import_multiple_modules(self, scheduler: Scheduler) -> None:
+        """Sequential dynamic imports of multiple modules."""
+        code = """\
+const path = await import('path');
+const url = await import('url');
+console.log(path.join('a','b'));
+console.log(typeof url.parse);
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "a/b" in result.stdout
+        assert "function" in result.stdout
+
+    async def test_dynamic_import_inside_function(self, scheduler: Scheduler) -> None:
+        """Dynamic import inside an async function."""
+        code = """\
+async function f() {
+    const m = await import('crypto');
+    return m.randomUUID();
+}
+console.log(await f());
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        # UUID format: 8-4-4-4-12 hex chars = 36 chars total
+        assert len(result.stdout.strip()) == 36
+
+    # --- Edge cases ---
+
+    async def test_dynamic_import_computed_specifier(self, scheduler: Scheduler) -> None:
+        """Dynamic import with a computed (variable) specifier."""
+        result = await scheduler.run(
+            code="const mod = 'path'; const p = await import(mod); console.log(typeof p.join);",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "function" in result.stdout
+
+    async def test_dynamic_import_promise_all(self, scheduler: Scheduler) -> None:
+        """Parallel dynamic imports via Promise.all."""
+        code = """\
+const [p, u] = await Promise.all([import('path'), import('url')]);
+console.log(typeof p.join, typeof u.parse);
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout.strip().count("function") == 2
+
+    async def test_dynamic_import_coexists_with_require(self, scheduler: Scheduler) -> None:
+        """Dynamic import and require resolve the same module."""
+        code = """\
+const imported = await import('path');
+const required = require('path');
+console.log(imported.join === required.join);
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "true" in result.stdout
+
+    async def test_dynamic_import_session_persistence(self, scheduler: Scheduler) -> None:
+        """Imported module persists across session exec() calls."""
+        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+            r1 = await session.exec("var path = await import('path');")
+            assert r1.exit_code == 0
+
+            r2 = await session.exec("console.log(path.join('a','b'));")
+            assert r2.exit_code == 0
+            assert "a/b" in r2.stdout
+
+    # --- Weird cases ---
+
+    async def test_dynamic_import_string_literal_harmless(self, scheduler: Scheduler) -> None:
+        """String containing 'import()' doesn't break a real import."""
+        code = """\
+const s = "import()";
+const path = await import('path');
+console.log(path.join('a','b'));
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "a/b" in result.stdout
+
+    async def test_reimport_function_not_mangled(self, scheduler: Scheduler) -> None:
+        """User function named 'reimport' is not confused with import()."""
+        code = """\
+function reimport(x) { return x; }
+console.log(reimport(42));
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code == 0
+        assert "42" in result.stdout
+
+    # --- Error cases ---
+
+    async def test_dynamic_import_nonexistent_module(self, scheduler: Scheduler) -> None:
+        """Dynamic import of non-existent module fails."""
+        result = await scheduler.run(
+            code="await import('nonexistent_xyz_module');",
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code != 0
+
+    async def test_dynamic_import_fire_and_forget_error(self, scheduler: Scheduler) -> None:
+        """Unhandled dynamic import rejection is caught by unhandledRejection handler."""
+        code = """\
+import('nonexistent_xyz');
+await new Promise(r => setTimeout(r, 200));
+console.log("after");
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.JAVASCRIPT,
+        )
+
+        assert result.exit_code != 0
 
 
 # =============================================================================

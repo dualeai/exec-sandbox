@@ -228,8 +228,8 @@ class UnixSocketChannel:
 
     Queueing:
     - Decoupled read/write paths prevent deadlocks
-    - Bounded queue (4 items, ~800KB) provides backpressure for O(chunk_size) memory
-    - Background worker handles QEMU throttling
+    - Bounded queue (32 items, ~5.5MB) provides backpressure for O(chunk_size) memory
+    - Background worker batches writes before drain for throughput
     - Fail-fast (5s) if queue full
     """
 
@@ -243,7 +243,13 @@ class UnixSocketChannel:
         self.expected_uid = expected_uid
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=4)
+        # Bounded write queue for host→guest messages. Larger values let the
+        # host pipeline more chunks before backpressure stalls producers
+        # (e.g. file upload read+compress), improving throughput. Memory cost:
+        # 64 slots x ~175 KB per file chunk ≈ 11 MB max in-flight. Must stay
+        # bounded to prevent unbounded growth on slow guest drains. Paired with
+        # the guest-side WRITE_QUEUE_SIZE (128) to keep both ends balanced.
+        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
         self._write_task: asyncio.Task[None] | None = None
         self._shutdown_event: asyncio.Event = asyncio.Event()
 
@@ -273,22 +279,34 @@ class UnixSocketChannel:
         self._write_task = asyncio.create_task(self._write_worker())
 
     async def _write_worker(self) -> None:
-        """Background worker drains write queue with backpressure handling.
+        """Background worker drains write queue with batched drain for throughput.
 
         Decouples writing from reading to prevent deadlocks when virtio-serial
-        buffers are full (128 descriptors per port).
+        buffers are full (128 descriptors per port). Batches up to 16 writes
+        before a single drain() call to amortize backpressure overhead.
         """
         while not self._shutdown_event.is_set():
             try:
                 # Wait for data or shutdown (1s timeout prevents hang)
                 data = await asyncio.wait_for(self._write_queue.get(), timeout=1.0)
 
-                # Write data and wait for buffer space (handles QEMU throttling)
                 if self._writer:
                     self._writer.write(data)
-                    await self._writer.drain()
-
                 self._write_queue.task_done()
+
+                # Greedily batch up to 15 more queued items before draining
+                for _ in range(15):
+                    try:
+                        data = self._write_queue.get_nowait()
+                        if self._writer:
+                            self._writer.write(data)
+                        self._write_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Single drain for the whole batch
+                if self._writer:
+                    await self._writer.drain()
 
             except TimeoutError:
                 continue  # Check shutdown flag

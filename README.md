@@ -377,6 +377,27 @@ VMs include automatic memory optimization (no configuration required):
 - **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
 - **Memory reclamation (virtio-balloon)** - 70-90% smaller snapshots
 
+### Memory Architecture
+
+Guest RAM is a fixed budget shared between the kernel, userspace processes, and tmpfs mounts. tmpfs is demand-allocated — writing 10 MB of files consumes ~10 MB of the VM's memory budget.
+
+```
+Guest RAM (default 256 MB)
+├── Kernel + slab caches     (~20 MB fixed)
+├── Userspace (code execution) (variable)
+├── tmpfs mounts (on demand)
+│   ├── /home/user           50% of RAM (no fixed cap) — user files, packages
+│   ├── /tmp                 128 MB cap — pip/uv wheel builds, temp files
+│   └── /dev/shm              64 MB cap — POSIX shared memory
+└── zram compressed swap     (~25% effective bonus)
+```
+
+| Mount | Size | Purpose |
+|---|---|---|
+| `/home/user` | 50% of RAM | Writable home dir — installed packages, user scripts, data files |
+| `/tmp` | 128 MB | Scratch space for package managers (wheel builds), temp files |
+| `/dev/shm` | 64 MB | POSIX shared memory segments (Python multiprocessing semaphores) |
+
 ## Execution Result
 
 | Field | Type | Description |
@@ -437,6 +458,20 @@ Returned by `Session.list_files()`.
 | `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
 | `AssetError` | Asset download/verification failed |
 
+## Session Resilience
+
+Sessions survive user code failures. Only VM-level communication errors close a session.
+
+| Failure | Exit Code | Session | State | Next `exec()` |
+|---------|-----------|---------|-------|----------------|
+| Exception (ValueError, etc.) | 1 | Alive | Preserved | Works, state intact |
+| `sys.exit(n)` | n | Alive | Preserved | Works, state intact |
+| Syntax error | 1 | Alive | Preserved | Works, state intact |
+| `os._exit(n)` | n | Alive | **Reset** | Works, fresh REPL |
+| Signal (SIGKILL, OOM kill) | 128 + signal | Alive | **Reset** | Works, fresh REPL |
+| Timeout | -1 | Alive | **Reset** | Works, fresh REPL |
+| VM communication failure | N/A | **Closed** | Lost | `SessionClosedError` |
+
 ## Pitfalls
 
 ```python
@@ -480,6 +515,13 @@ expose_ports=[8080]  # Binds to 127.0.0.1, not 0.0.0.0
 from multiprocessing import Pool
 Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda serialization)
 # For CPU-bound parallelism, use multiple VMs via scheduler.run() concurrently instead
+
+# Background processes survive across session exec() calls — state accumulates
+async with await scheduler.session(language="python") as session:
+    await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
+    await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
+    # Both sleep processes are still running! VM PID limit (100) prevents unbounded growth
+    # All processes are cleaned up when session.close() destroys the VM
 ```
 
 ## Limits
@@ -570,7 +612,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
 | `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
-All images are based on **Alpine Linux 3.21** (Linux 6.12 LTS, musl libc) and include common tools for AI agent workflows.
+All images are based on **Alpine Linux 3.23** (Linux 6.18 LTS, musl libc) and include common tools for AI agent workflows.
 
 ### Common Tools (all images)
 

@@ -6,6 +6,17 @@
 #   2. kernel + initramfs (from Alpine, needs tiny-init)
 #   3. qcow2 disk images (python, node, raw variants)
 #
+# Artifact dependency graph:
+#
+#   tiny-init src → tiny-init binary → initramfs (QEMU -initrd, NOT inside qcow2)
+#   guest-agent src → guest-agent binary → embedded in qcow2 (guestfish-patchable)
+#   rootfs packages (Alpine, Python, Node) → qcow2 (full rebuild only)
+#
+# Caching: each artifact has a .hash sidecar file (content-addressable input key,
+# NOT an output checksum). When inputs match, the build step is skipped.
+# The qcow2 build has a 3-way cache: full hit → skip, rootfs hit → guestfish
+# patch (guest-agent only), miss → full rebuild.
+#
 # All build commands run inside Linux containers with the repo mounted.
 # This ensures consistent builds across macOS and Linux hosts.
 #
@@ -13,6 +24,7 @@
 #   ./scripts/build-images.sh              # Build for all architectures
 #   ./scripts/build-images.sh x86_64       # Build for specific arch
 #   ./scripts/build-images.sh aarch64      # Build for specific arch
+#   ./scripts/build-images.sh aarch64 python  # Build specific variant for arch
 
 set -euo pipefail
 
@@ -30,8 +42,9 @@ detect_arch() {
 
 build_for_arch() {
     local arch=$1
+    local variant="${2:-all}"
 
-    echo "=== Building for $arch ==="
+    echo "=== Building for $arch (variant: $variant) ==="
 
     # Step 1: Build guest-agent and tiny-init in parallel
     echo "[$arch] Building guest-agent + tiny-init..."
@@ -49,11 +62,12 @@ build_for_arch() {
 
     # Step 3: Build qcow2 images (parallelized inside build-qcow2.sh)
     echo "[$arch] Building qcow2 images..."
-    "$SCRIPT_DIR/build-qcow2.sh" all "$arch"
+    "$SCRIPT_DIR/build-qcow2.sh" "$variant" "$arch"
 }
 
 main() {
     local target="${1:-all}"
+    local variant="${2:-all}"
 
     # Check Docker is available
     if ! command -v docker >/dev/null 2>&1; then
@@ -67,9 +81,9 @@ main() {
 
     if [ "$target" = "all" ]; then
         # Build both architectures in parallel
-        build_for_arch "x86_64" &
+        build_for_arch "x86_64" "$variant" &
         local pid_x86=$!
-        build_for_arch "aarch64" &
+        build_for_arch "aarch64" "$variant" &
         local pid_arm=$!
 
         # Wait for both to complete
@@ -82,7 +96,7 @@ main() {
             exit 1
         fi
     else
-        build_for_arch "$target"
+        build_for_arch "$target" "$variant"
     fi
 
     echo ""

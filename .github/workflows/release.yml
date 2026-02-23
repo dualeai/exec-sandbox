@@ -261,16 +261,22 @@ jobs:
           name: tiny-init-${{ matrix.arch }}
           path: images/dist/
 
+      - name: Get Alpine version
+        id: alpine
+        run: echo "version=$(make --silent alpine-version)" >> "$GITHUB_OUTPUT"
+
       - name: Build VM images
         uses: ./.github/actions/build-vm-images
         with:
           arch: ${{ matrix.arch }}
+          alpine-version: ${{ steps.alpine.outputs.version }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vm-images-${{ matrix.arch }}
           path: |
+            images/dist/vmlinux-${{ matrix.arch }}
             images/dist/vmlinuz-${{ matrix.arch }}
             images/dist/initramfs-${{ matrix.arch }}
             images/dist/*-${{ matrix.arch }}.qcow2
@@ -324,7 +330,7 @@ jobs:
 
           # Compress large files
           cd release
-          for f in *.qcow2 vmlinuz-* initramfs-*; do
+          for f in *.qcow2 vmlinux-* vmlinuz-* initramfs-*; do
             zstd -19 --rm "$f"
           done
 

@@ -2,8 +2,6 @@
 
 from typing import Final
 
-from exec_sandbox.models import Language
-
 # ============================================================================
 # VM Memory and Resource Defaults
 # ============================================================================
@@ -12,7 +10,14 @@ DEFAULT_MEMORY_MB: Final[int] = 256
 """Default guest VM memory allocation in MB (reduced from 512MB for cost optimization)."""
 
 MIN_MEMORY_MB: Final[int] = 128
-"""Minimum guest VM memory in MB."""
+"""Minimum guest VM memory in MB.
+
+NOTE: JavaScript (Bun) requires significantly more memory than Python.
+Bun RSS ~42MB vs CPython ~19MB. At 128MB VMs (~40MB free RAM), Bun
+swap-thrashes via zram causing 40s+ latency for trivial operations.
+Recommended minimums: Python 128MB, JavaScript 160MB+, ideal 192MB+.
+The --smol flag in guest-agent mitigates this but doesn't eliminate it.
+"""
 
 TMPFS_SIZE_MB: Final[int] = 128
 """tmpfs /tmp size limit in MB (half of default VM memory)."""
@@ -177,9 +182,6 @@ IO_URING_MIN_KERNEL_MINOR: Final[int] = 1
 WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 """Max concurrent replenish boots as ratio of pool_size (50% = 2-3 concurrent for pool_size=5)."""
 
-WARM_POOL_LANGUAGES: Final[tuple[Language, ...]] = (Language.PYTHON, Language.JAVASCRIPT)
-"""Languages eligible for warm VM pool."""
-
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
 
@@ -199,14 +201,14 @@ WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
 # Balloon Memory Management (for warm pool memory efficiency)
 # ============================================================================
 
-BALLOON_INFLATE_TARGET_MB: Final[int] = 96
+BALLOON_INFLATE_TARGET_MB: Final[int] = 128
 """Target guest memory in MB when inflating balloon for idle warm pool VMs.
 Inflating the balloon reduces guest memory, allowing host to reclaim.
 
-Note: 64MB was too aggressive - Alpine Linux idles at ~50MB, leaving only ~14MB
-headroom for guest agent operations. Under memory pressure, the guest becomes
-unresponsive and health checks timeout. 96MB provides ~46MB headroom while still
-achieving 62% memory reduction (96MB vs 256MB default)."""
+History: 64MB caused unresponsive guests (only ~14MB headroom). 96MB still
+caused freezes on kernel 6.18 where ~38MB overhead + guest-agent + Python
+leaves <20MB free under pressure. 128MB provides reliable headroom (~50MB
+free after overhead) while still achieving 50% memory reduction vs 256MB."""
 
 BALLOON_TOLERANCE_MB: Final[int] = 40
 """Tolerance in MB for balloon target polling. Allows early exit when balloon is

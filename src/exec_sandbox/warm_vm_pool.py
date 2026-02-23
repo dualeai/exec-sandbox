@@ -5,7 +5,7 @@ Provides 200-400x faster execution start (1-2ms vs 400ms cold boot).
 
 Architecture:
 - Pool size: Configured via warm_pool_size (per language)
-- Languages: python, javascript
+- Languages: all (python, javascript, raw)
 - Lifecycle: Pre-boot → allocate → execute → destroy → replenish
 - Security: One-time use (no cross-tenant reuse)
 
@@ -19,9 +19,9 @@ L2 Disk Snapshots:
 - snapshot_manager: Optional for L2 cache (graceful degradation to cold boot if None)
 
 Memory Optimization (Balloon):
-- Idle pool VMs have balloon inflated (guest has ~64MB free)
+- Idle pool VMs have balloon inflated (guest has BALLOON_INFLATE_TARGET_MB)
 - Before execution, balloon deflates (guest gets full memory back)
-- Reduces idle memory from ~1GB to ~256MB for 4 VMs (75% reduction)
+- Reduces idle memory by 50% per VM (128MB idle vs 256MB active)
 
 Example:
     ```python
@@ -125,7 +125,7 @@ class WarmVMPool:
 
         # Pools: asyncio.Queue for thread-safe async access
         self.pools: dict[Language, asyncio.Queue[QemuVM]] = {
-            lang: asyncio.Queue(maxsize=self.pool_size_per_language) for lang in constants.WARM_POOL_LANGUAGES
+            lang: asyncio.Queue(maxsize=self.pool_size_per_language) for lang in Language
         }
 
         # Track background replenish tasks (prevent GC)
@@ -139,7 +139,7 @@ class WarmVMPool:
             int(self.pool_size_per_language * constants.WARM_POOL_REPLENISH_CONCURRENCY_RATIO),
         )
         self._replenish_semaphores: dict[Language, asyncio.Semaphore] = {
-            lang: asyncio.Semaphore(self._replenish_max_concurrent) for lang in constants.WARM_POOL_LANGUAGES
+            lang: asyncio.Semaphore(self._replenish_max_concurrent) for lang in Language
         }
 
         # Health check task
@@ -150,8 +150,8 @@ class WarmVMPool:
             "Warm VM pool initialized",
             extra={
                 "pool_size_per_language": self.pool_size_per_language,
-                "languages": [lang.value for lang in constants.WARM_POOL_LANGUAGES],
-                "total_vms": self.pool_size_per_language * len(constants.WARM_POOL_LANGUAGES),
+                "languages": [lang.value for lang in Language],
+                "total_vms": self.pool_size_per_language * len(Language),
             },
         )
 
@@ -166,14 +166,14 @@ class WarmVMPool:
         """
         logger.info(
             "Starting warm VM pool",
-            extra={"total_vms": self.pool_size_per_language * len(constants.WARM_POOL_LANGUAGES)},
+            extra={"total_vms": self.pool_size_per_language * len(Language)},
         )
 
         boot_start = asyncio.get_event_loop().time()
 
         # Build list of all VMs to boot (parallel execution)
         boot_coroutines: list[Coroutine[Any, Any, None]] = []
-        for language in constants.WARM_POOL_LANGUAGES:
+        for language in Language:
             logger.info(f"Pre-booting {self.pool_size_per_language} {language.value} VMs (parallel)")
             boot_coroutines.extend(self._boot_and_add_vm(language, index=i) for i in range(self.pool_size_per_language))
 
@@ -198,8 +198,7 @@ class WarmVMPool:
             "Warm VM pool startup complete",
             extra={
                 "boot_duration_s": f"{boot_duration:.2f}",
-                "python_vms": self.pools[Language.PYTHON].qsize(),
-                "javascript_vms": self.pools[Language.JAVASCRIPT].qsize(),
+                **{f"{lang.value}_vms": self.pools[lang].qsize() for lang in Language},
             },
         )
 
@@ -358,6 +357,14 @@ class WarmVMPool:
         vm: QemuVM | None = None
         try:
             vm = await self._boot_warm_vm(language, index)
+
+            # Pre-warm REPL at full memory (hides ~800ms Python startup).
+            # Must run BEFORE balloon inflate: Bun (42MB RSS) swap-thrashes
+            # when starting at 128MB. After startup, Bun idles at ~42MB RSS
+            # which fits comfortably in the ballooned 128MB target.
+            # RAW (bash ~5MB RSS) has no such constraint but benefits from
+            # the same ordering for consistency.
+            await self._warm_repl(vm, language)
 
             # Inflate balloon to reduce idle memory footprint
             await self._inflate_balloon(vm)
@@ -522,8 +529,8 @@ class WarmVMPool:
 
         This eliminates up to 5s of polling overhead on slow systems (nested
         virtualization) where balloon operations are degraded. Most code doesn't
-        need the full 256MB immediately - the 64MB idle memory is sufficient
-        for runtime startup, and additional memory becomes available within ~1s.
+        need the full 256MB immediately - the idle memory (BALLOON_INFLATE_TARGET_MB)
+        is sufficient for runtime startup, and full memory becomes available within ~1s.
 
         Graceful degradation: logs warning and continues if balloon fails.
 
@@ -544,6 +551,28 @@ class WarmVMPool:
                 "Balloon deflation failed (VM may be memory-constrained)",
                 extra={"vm_id": vm.vm_id, "error": str(e)},
             )
+
+    async def _warm_repl(self, vm: QemuVM, language: Language) -> None:
+        """Pre-warm REPL in guest VM for faster first execution.
+
+        Fire-and-forget: failure is non-fatal (lazy spawn on first request).
+        """
+        from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
+            WarmReplAckMessage,
+            WarmReplRequest,
+        )
+
+        try:
+            response = await vm.channel.send_request(
+                WarmReplRequest(language=language),
+                timeout=15,  # REPL startup can take ~1s
+            )
+            if isinstance(response, WarmReplAckMessage) and response.status == "ok":
+                logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
+            else:
+                logger.warning("REPL pre-warm returned non-ok", extra={"vm_id": vm.vm_id, "response": str(response)})
+        except Exception as e:  # noqa: BLE001 - Graceful degradation: any failure falls back to lazy spawn
+            logger.warning("REPL pre-warm failed", extra={"vm_id": vm.vm_id, "error": str(e)})
 
     async def _health_check_loop(self) -> None:
         """Background health check for warm VMs.

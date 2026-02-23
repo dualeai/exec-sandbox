@@ -32,6 +32,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     cpu_cores: int,
     allow_network: bool,
     expose_ports: list[ExposedPort] | None = None,
+    direct_write: bool = False,
 ) -> list[str]:
     """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -47,6 +48,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             When set without allow_network, uses QEMU user-mode networking
             with hostfwd (Mode 1). When set with allow_network, port
             forwarding is handled by gvproxy API (Mode 2).
+        direct_write: Mount rootfs read-write (for snapshot creation).
 
     Returns:
         QEMU command as list of strings
@@ -223,7 +225,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Auto-discover kernel and initramfs based on architecture
     # Note: existence validated in create_vm() before calling this method
-    kernel_path = settings.kernel_path / f"vmlinuz-{arch_suffix}"
+    # Prefer uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
+    # QEMU auto-detects PVH ELF note and skips kernel decompression
+    vmlinux_path = settings.kernel_path / f"vmlinux-{arch_suffix}"
+    vmlinuz_path = settings.kernel_path / f"vmlinuz-{arch_suffix}"
+    kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
     initramfs_path = settings.kernel_path / f"initramfs-{arch_suffix}"
 
     # Layer 5: Linux namespaces (optional - requires capabilities or user namespaces)
@@ -296,13 +302,25 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # ARM64 virt machine has PL011 UART (ttyAMA0) - reliable at early boot
         # Note: hvc0 doesn't work for console because virtio-serial isn't ready
         # when kernel tries to open /dev/console, causing init to crash
-        console_params = "console=ttyAMA0 loglevel=7"
+        # loglevel=1 (KERN_ALERT): suppress kernel printk below ALERT during boot.
+        # DEBUG (7) emits hundreds of messages, each requiring MMIO writes through
+        # PL011 UART. Panics still print (console_flush_on_panic). tiny-init
+        # messages are unaffected (direct libc::write to fd 2, not printk).
+        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+        console_params = "console=ttyAMA0 loglevel=1"
     elif use_virtio_console:
         # x86 non-legacy mode: ISA serial disabled, use virtio-console
-        console_params = "console=hvc0 loglevel=7"
+        # loglevel=1: suppress kernel printk noise. Each message triggers a
+        # virtqueue notification (MMIO doorbell + vCPU exit) on virtio-console.
+        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+        console_params = "console=hvc0 loglevel=1"
     else:
         # x86 legacy mode or TCG: ISA serial available at T=0, reliable boot
-        console_params = "console=ttyS0 loglevel=7"
+        # loglevel=1: suppress kernel printk noise. ISA serial (ttyS0) transmits
+        # byte-by-byte through I/O port 0x3F8 -- extremely expensive under TCG
+        # software emulation. Biggest win for TCG boot latency.
+        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+        console_params = "console=ttyS0 loglevel=1"
 
     qemu_args.extend(
         [
@@ -336,20 +354,34 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # Boot params: console varies by machine type, minimal kernel logging
             # =============================================================
             # Boot Parameter Optimizations (validated Jan 2025):
-            # - nokaslr: Skip KASLR (safe for ephemeral isolated VMs)
             # - noresume: Skip hibernate resume check (VMs don't hibernate)
             # - swiotlb=noforce: Disable software I/O TLB (virtio uses direct DMA)
             # - panic=-1: Immediate reboot on panic (boot timeout handles loops)
             # - i8042.nokbd: Skip keyboard port check (no PS/2 in VM)
             # - tsc=reliable: Trust TSC clocksource (x86_64 only, kvmclock stable)
+            # - rootflags=noatime: hint only; tiny-init mounts rootfs with
+            #   MS_RDONLY|MS_NOATIME|MS_NOSUID|MS_NODEV (read-only rootfs)
+            # - numa_balancing=0: Disable NUMA page migration scanner (single-vCPU
+            #   guest has one NUMA node; scanner wastes cycles on TLB shootdowns)
+            #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html
+            # - page_alloc.shuffle=0: Disable page allocator free-list shuffling.
+            #   Reduces allocator overhead with no security downside (KASLR uses
+            #   boot-time randomization, not ongoing free-list shuffling).
+            #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+            # - mitigations: Left at kernel default (mitigations=auto) to match
+            #   AWS Lambda/Firecracker security posture. Enables speculative
+            #   execution mitigations relevant to the actual CPU (Spectre, MDS, etc.).
+            #   Ref: https://docs.kernel.org/admin-guide/hw-vuln/spectre.html
+            #   Ref: CVE-2025-40300 (VMSCAPE Spectre-BTI guest-to-host via KVM)
             # See: https://github.com/firecracker-microvm/firecracker
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=rw,noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect mitigations=off nokaslr noresume swiotlb=noforce"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
             # init.net=1: load network modules when networking is needed
             # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
             # init.balloon=1: load balloon module (always, needed for warm pool)
             + (" init.net=1" if (allow_network or expose_ports) else "")
+            + (" init.rw=1" if direct_write else "")
             + " init.balloon=1"
             # tsc=reliable only for x86_64 (TSC is x86-specific, ARM uses CNTVCT_EL0)
             + (" tsc=reliable" if arch == HostArch.X86_64 else ""),
@@ -619,6 +651,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"unix:{workdir.qmp_socket},server=on,wait=off",
         ]
     )
+
+    # Orphan protection: kill QEMU if parent process dies (QEMU 10.2+)
+    # Uses PR_SET_PDEATHSIG on Linux, kqueue on macOS/FreeBSD
+    qemu_version = await probe_qemu_version()
+    if qemu_version is not None and qemu_version >= (10, 2, 0):
+        qemu_args.extend(["-run-with", "exit-with-parent=on"])
 
     # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
     # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation

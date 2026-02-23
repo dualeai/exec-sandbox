@@ -11,9 +11,9 @@ Architecture:
 
 Usage:
     async with BalloonClient(qmp_socket_path, expected_uid) as client:
-        await client.deflate(target_mb=64)  # Reduce guest memory to 64MB
+        await client.inflate(target_mb=128)  # Reduce guest memory to 128MB
         # ... VM waits in pool ...
-        await client.inflate(target_mb=256)  # Restore memory before execution
+        await client.deflate(target_mb=256)  # Restore memory before execution
 """
 
 from __future__ import annotations
@@ -171,11 +171,19 @@ class BalloonClient:
         self._writer.write(json.dumps(cmd).encode() + b"\n")
         await self._writer.drain()
 
-        response = await asyncio.wait_for(
-            self._reader.readline(),
-            timeout=timeout,
-        )
-        return json.loads(response)
+        # QMP can send asynchronous events (e.g., BALLOON_CHANGE) at any time.
+        # We must skip over events and only return command responses ("return"
+        # or "error" key).  Without this, events desynchronize the request/
+        # response stream and corrupt subsequent commands.
+        # Global timeout covers the entire read loop, not per-readline.
+        async with asyncio.timeout(timeout):
+            for _ in range(16):
+                response = await self._reader.readline()
+                data: dict[str, Any] = json.loads(response)
+                if "event" not in data:
+                    return data
+                logger.debug("QMP event (skipped)", extra={"event": data.get("event")})
+        raise BalloonError("Too many QMP events without command response")
 
     async def query(self, timeout: float = 5.0) -> int | None:
         """Query current balloon memory.

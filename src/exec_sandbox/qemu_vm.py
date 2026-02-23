@@ -552,7 +552,7 @@ class QemuVM:
     # File I/O
     # -------------------------------------------------------------------------
 
-    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:
+    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:  # noqa: PLR0915
         """Write a file to the sandbox via streaming zstd-compressed chunks.
 
         Protocol:
@@ -607,29 +607,45 @@ class QemuVM:
             chunk_size = constants.FILE_TRANSFER_CHUNK_SIZE
             compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
             loop = asyncio.get_running_loop()
+
+            def _encode_frame(compressed: bytes) -> bytes:
+                # TODO: Binary framing would eliminate this base64 encode overhead (~33% wire bloat)
+                chunk_b64 = base64.b64encode(compressed).decode("ascii")
+                return json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
+
+            # Combine read + compress into a single executor call to reduce
+            # thread pool round-trips and enable look-ahead pipelining.
+            def _read_and_compress(reader: IO[bytes]) -> bytes | None:
+                raw = reader.read(chunk_size)
+                if not raw:
+                    return None  # EOF
+                compressed = compressor.compress(raw)
+                if not compressed:
+                    return b""  # compressor buffered, no output yet
+                return _encode_frame(compressed)
+
             try:
+                # Look-ahead pipelining: start reading+compressing chunk N+1
+                # in the thread pool while enqueueing chunk N on the event loop.
+                prev_future = loop.run_in_executor(None, _read_and_compress, content)
                 while True:
-                    # Offload to thread pool: content may be a SpooledTemporaryFile
-                    # that has spilled to disk, blocking the event loop.
-                    input_chunk = await loop.run_in_executor(None, content.read, chunk_size)
-                    if not input_chunk:
-                        break
-                    compressed = compressor.compress(input_chunk)
-                    if compressed:
-                        chunk_b64 = base64.b64encode(compressed).decode("ascii")
-                        chunk_frame = (
-                            json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
-                        )
-                        await self.channel.enqueue_raw(chunk_frame)
+                    prev_frame = await prev_future
+                    if prev_frame is None:
+                        break  # EOF
+                    # Start next read+compress while we enqueue the current frame
+                    next_future = loop.run_in_executor(None, _read_and_compress, content)
+                    if prev_frame:  # non-empty (not just compressor buffering)
+                        await self.channel.enqueue_raw(prev_frame)
+                    prev_future = next_future
 
                 # Flush remaining compressed data from the compressor
-                remaining = compressor.flush()
-                if remaining:
-                    chunk_b64 = base64.b64encode(remaining).decode("ascii")
-                    chunk_frame = (
-                        json.dumps({"action": "file_chunk", "op_id": op_id, "data": chunk_b64}).encode() + b"\n"
-                    )
-                    await self.channel.enqueue_raw(chunk_frame)
+                def _flush_and_encode() -> bytes | None:
+                    remaining = compressor.flush()
+                    return _encode_frame(remaining) if remaining else None
+
+                flush_frame = await loop.run_in_executor(None, _flush_and_encode)
+                if flush_frame:
+                    await self.channel.enqueue_raw(flush_frame)
             finally:
                 # Always send file_end so the guest agent exits its chunk loop.
                 # Suppress errors: channel may already be broken.
@@ -718,6 +734,7 @@ class QemuVM:
                     msg = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
 
                     if isinstance(msg, FileChunkResponseMessage):
+                        # TODO: Binary framing would eliminate this base64 decode overhead (~33% wire bloat)
                         compressed_chunk = base64.b64decode(msg.data)
                         decompressed = decompressor.decompress(compressed_chunk)
                         await loop.run_in_executor(None, sink.write, decompressed)

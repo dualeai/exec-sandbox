@@ -16,7 +16,7 @@ import pytest
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_hwaccel
+from tests.conftest import skip_on_python_312_subprocess_bug, skip_unless_hwaccel
 
 
 # =============================================================================
@@ -335,6 +335,70 @@ class TestSessionWeirdCases:
             assert result.exit_code == 0
             assert "ok" in result.stdout
 
+    async def test_subprocess_popen_survives_across_execs(self, scheduler: Scheduler) -> None:
+        """subprocess.Popen child survives across exec() calls (VM persists)."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            # Exec 1: spawn a long-lived subprocess, capture its PID
+            result = await session.exec("import subprocess\np = subprocess.Popen(['sleep', '60'])\nprint(p.pid)")
+            assert result.exit_code == 0
+            pid = result.stdout.strip()
+            assert pid.isdigit()
+
+            # Exec 2: verify the subprocess is still alive via /proc
+            result = await session.exec(f"import os; print(os.path.exists('/proc/{pid}/stat'))")
+            assert result.exit_code == 0
+            assert "True" in result.stdout
+
+            # Exec 3: session still works normally
+            result = await session.exec('print("ok")')
+            assert result.exit_code == 0
+            assert "ok" in result.stdout
+
+    @skip_on_python_312_subprocess_bug
+    async def test_daemon_double_fork_survives_across_execs(self, scheduler: Scheduler) -> None:
+        """Double-fork daemon survives across exec() calls, reparented to PID 1."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            # Exec 1: classic double-fork + setsid to create a daemon
+            result = await session.exec(
+                "import os, time\n"
+                "pid = os.fork()\n"
+                "if pid == 0:\n"
+                "    os.setsid()\n"
+                "    pid2 = os.fork()\n"
+                "    if pid2 == 0:\n"
+                "        with open('/tmp/daemon.pid', 'w') as f:\n"
+                "            f.write(str(os.getpid()))\n"
+                "        time.sleep(60)\n"
+                "        os._exit(0)\n"
+                "    else:\n"
+                "        os._exit(0)\n"
+                "else:\n"
+                "    os.waitpid(pid, 0)\n"
+                "    time.sleep(0.5)\n"
+                "    print('spawned')"
+            )
+            assert result.exit_code == 0
+            assert "spawned" in result.stdout
+
+            # Exec 2: verify daemon is alive and reparented to PID 1
+            result = await session.exec(
+                "with open('/tmp/daemon.pid') as f:\n"
+                "    daemon_pid = f.read().strip()\n"
+                "with open(f'/proc/{daemon_pid}/stat') as f:\n"
+                "    stat = f.read()\n"
+                "# Parse ppid from after last ')' — comm field can contain spaces\n"
+                "ppid = stat[stat.rfind(')') + 2:].split()[1]\n"
+                "print(f'alive ppid={ppid}')"
+            )
+            assert result.exit_code == 0
+            assert "alive" in result.stdout
+            assert "ppid=1" in result.stdout
+
+            # Exec 3: session still works normally
+            result = await session.exec('print("ok")')
+            assert result.exit_code == 0
+            assert "ok" in result.stdout
+
     async def test_shell_pipe_in_session(self, scheduler: Scheduler) -> None:
         """Shell pipes work in session."""
         async with await scheduler.session(language=Language.RAW) as session:
@@ -499,6 +563,50 @@ class TestSessionOutOfBounds:
             await session.close()
 
     @skip_unless_hwaccel
+    async def test_sigkill_preserves_session(self, scheduler: Scheduler) -> None:
+        """SIGKILL (same signal OOM killer sends) doesn't destroy session."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.exec("x = 42")
+            # SIGKILL mirrors what the OOM killer does
+            result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+            assert result.exit_code == 137  # 128 + 9 (SIGKILL)
+            # Session alive, state reset (x is gone)
+            result = await session.exec("try:\n    print(x)\nexcept NameError:\n    print('state_reset')")
+            assert result.exit_code == 0
+            assert "state_reset" in result.stdout
+
+    @skip_unless_hwaccel
+    async def test_oom_preserves_session(self, scheduler: Scheduler) -> None:
+        """Actual OOM-killed code doesn't destroy session — REPL respawns."""
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+            # Allocate and write to memory in a loop. Writing forces page faults,
+            # which commits physical memory and triggers the kernel OOM killer.
+            # Plain mmap() without writes only reserves address space (overcommit_memory=0).
+            result = await session.exec(
+                "data = []\nwhile True:\n    data.append(b'x' * 10_000_000)",
+                timeout_seconds=30,
+            )
+            # OOM: SIGKILL (137), or MemoryError (non-zero), or timeout (-1) as safety net
+            assert result.exit_code != 0
+            # Session still alive — REPL respawned
+            result = await session.exec('print("alive")')
+            assert result.exit_code == 0
+            assert "alive" in result.stdout
+
+    @skip_unless_hwaccel
+    async def test_repeated_repl_death_preserves_session(self, scheduler: Scheduler) -> None:
+        """Session survives multiple consecutive REPL deaths."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            for i in range(3):
+                # Kill REPL
+                result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+                assert result.exit_code == 137
+                # Verify session is still usable with fresh state
+                result = await session.exec(f'print("cycle_{i}")')
+                assert result.exit_code == 0
+                assert f"cycle_{i}" in result.stdout
+
+    @skip_unless_hwaccel
     async def test_exec_timeout_preserves_session(self, scheduler: Scheduler) -> None:
         """Execution timeout returns error result but session stays alive."""
         async with await scheduler.session(language=Language.PYTHON) as session:
@@ -639,3 +747,96 @@ class TestWorkingDirectory:
         )
         assert result.exit_code == 0
         assert "/home/user" in result.stdout
+
+
+# =============================================================================
+# TestLazyCloudpickle - Deferred cloudpickle import
+# =============================================================================
+@skip_unless_hwaccel
+class TestLazyCloudpickle:
+    """Tests for lazy cloudpickle import in REPL.
+
+    Change 2: cloudpickle is deferred until multiprocessing.Process.start().
+    """
+
+    async def test_simple_code_works(self, scheduler: Scheduler) -> None:
+        """Simple print works without triggering cloudpickle."""
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+    async def test_multiprocessing_process_works(self, scheduler: Scheduler) -> None:
+        """multiprocessing.Process.start() triggers lazy cloudpickle patch."""
+        code = """
+import multiprocessing
+import os
+
+def worker():
+    print(f"worker pid={os.getpid()}")
+
+p = multiprocessing.Process(target=worker)
+p.start()
+p.join(timeout=10)
+print(f"exit_code={p.exitcode}")
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "exit_code=0" in result.stdout
+
+    async def test_multiprocessing_pool_works(self, scheduler: Scheduler) -> None:
+        """multiprocessing.Pool internally calls Process.start() — triggers patch."""
+        code = """
+import multiprocessing
+
+def square(x):
+    return x * x
+
+with multiprocessing.Pool(2) as pool:
+    results = pool.map(square, [1, 2, 3, 4])
+print(results)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "[1, 4, 9, 16]" in result.stdout
+
+    async def test_cloudpickle_not_imported_without_multiprocessing(self, scheduler: Scheduler) -> None:
+        """Verify cloudpickle is NOT imported for simple scripts."""
+        code = """
+import sys
+print('cloudpickle' in sys.modules)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "False" in result.stdout
+
+    async def test_cloudpickle_imported_after_process_start(self, scheduler: Scheduler) -> None:
+        """Verify cloudpickle IS imported after Process.start()."""
+        code = """
+import multiprocessing, sys, os
+
+def noop():
+    pass
+
+p = multiprocessing.Process(target=noop)
+p.start()
+p.join(timeout=10)
+print('cloudpickle' in sys.modules)
+"""
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert "True" in result.stdout

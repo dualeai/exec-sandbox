@@ -35,6 +35,16 @@ class PingRequest(GuestAgentRequest):
     action: Literal["ping"] = Field(default="ping")  # type: ignore[assignment]
 
 
+class WarmReplRequest(GuestAgentRequest):
+    """Pre-warm REPL for faster first execution.
+
+    Response: WarmReplAckMessage.
+    """
+
+    action: Literal["warm_repl"] = Field(default="warm_repl")  # type: ignore[assignment]
+    language: Language = Field(description="Language REPL to pre-warm")
+
+
 class ExecuteCodeRequest(GuestAgentRequest):
     """Execute code in guest VM.
 
@@ -50,6 +60,15 @@ class ExecuteCodeRequest(GuestAgentRequest):
     action: Literal["exec"] = Field(default="exec")  # type: ignore[assignment]
     language: Language = Field(description="Programming language for execution")
     code: str = Field(max_length=1_000_000, description="Code to execute (max 1MB)")
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        """Reject null bytes in code (causes silent failures in runtimes)."""
+        if "\x00" in v:
+            raise ValueError("Code cannot contain null bytes")
+        return v
+
     timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
     env_vars: dict[str, str] = Field(
         default_factory=dict,
@@ -267,6 +286,15 @@ class PongMessage(BaseModel):
     version: str = Field(description="Guest agent version")
 
 
+class WarmReplAckMessage(BaseModel):
+    """Acknowledgement for REPL pre-warming."""
+
+    type: Literal["warm_repl_ack"] = "warm_repl_ack"
+    language: str
+    status: str  # "ok" or "error"
+    message: str | None = None
+
+
 # ============================================================================
 # File I/O Response Models (Streaming Chunked Protocol)
 # ============================================================================
@@ -326,6 +354,7 @@ StreamingMessage = Annotated[
     OutputChunkMessage
     | ExecutionCompleteMessage
     | PongMessage
+    | WarmReplAckMessage
     | StreamingErrorMessage
     | FileWriteAckMessage
     | FileChunkResponseMessage

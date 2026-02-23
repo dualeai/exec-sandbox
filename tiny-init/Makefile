@@ -4,7 +4,8 @@ ifndef RUST_VERSION
 $(error RUST_VERSION is not set - invoke from root Makefile)
 endif
 RUST_IMAGE := rust:$(RUST_VERSION)-slim
-DOCKER_RUN := docker run --rm -v $(CURDIR):/workspace -w /workspace $(RUST_IMAGE)
+CARGO_VOLUME := tiny-init-cargo-$(RUST_VERSION)
+DOCKER_RUN := docker run --rm -v $(CURDIR):/workspace -v $(CARGO_VOLUME):/usr/local/cargo/registry -w /workspace $(RUST_IMAGE)
 
 install:
 	$(DOCKER_RUN) cargo fetch

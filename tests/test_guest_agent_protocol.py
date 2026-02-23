@@ -28,6 +28,8 @@ from exec_sandbox.guest_agent_protocol import (
     ReadFileRequest,
     StreamingErrorMessage,
     StreamingMessage,
+    WarmReplAckMessage,
+    WarmReplRequest,
     WriteFileRequest,
 )
 from exec_sandbox.models import FileInfo, Language
@@ -56,6 +58,66 @@ class TestPingRequest:
         req = PingRequest()
         json_str = req.model_dump_json()
         assert json_str == '{"action":"ping"}'
+
+
+class TestWarmReplRequest:
+    """Tests for WarmReplRequest model."""
+
+    def test_default_action(self) -> None:
+        req = WarmReplRequest(language=Language.PYTHON)
+        assert req.action == "warm_repl"
+
+    def test_serialize_python(self) -> None:
+        req = WarmReplRequest(language=Language.PYTHON)
+        data = req.model_dump()
+        assert data == {"action": "warm_repl", "language": "python"}
+
+    def test_serialize_javascript(self) -> None:
+        req = WarmReplRequest(language=Language.JAVASCRIPT)
+        data = req.model_dump()
+        assert data["language"] == "javascript"
+
+    def test_serialize_to_json(self) -> None:
+        req = WarmReplRequest(language=Language.PYTHON)
+        json_str = req.model_dump_json()
+        assert '"action":"warm_repl"' in json_str
+        assert '"language":"python"' in json_str
+
+    def test_invalid_language_rejected(self) -> None:
+        """Non-Language enum value is rejected by Pydantic."""
+        with pytest.raises(ValidationError):
+            WarmReplRequest(language="cobol")  # type: ignore[arg-type]
+
+
+class TestWarmReplAckMessage:
+    """Tests for WarmReplAckMessage model."""
+
+    def test_ok_response(self) -> None:
+        ack = WarmReplAckMessage(language="python", status="ok")
+        assert ack.type == "warm_repl_ack"
+        assert ack.language == "python"
+        assert ack.status == "ok"
+        assert ack.message is None
+
+    def test_error_response(self) -> None:
+        ack = WarmReplAckMessage(language="python", status="error", message="spawn failed")
+        assert ack.status == "error"
+        assert ack.message == "spawn failed"
+
+    def test_from_dict(self) -> None:
+        data = {"type": "warm_repl_ack", "language": "python", "status": "ok"}
+        ack = WarmReplAckMessage.model_validate(data)
+        assert ack.status == "ok"
+
+    def test_from_json(self) -> None:
+        json_str = '{"type": "warm_repl_ack", "language": "javascript", "status": "ok"}'
+        ack = WarmReplAckMessage.model_validate_json(json_str)
+        assert ack.language == "javascript"
+
+    def test_wrong_type_rejected(self) -> None:
+        """Wrong type literal is rejected."""
+        with pytest.raises(ValidationError):
+            WarmReplAckMessage(type="pong", language="python", status="ok")  # type: ignore[arg-type]
 
 
 class TestExecuteCodeRequest:
@@ -135,6 +197,72 @@ class TestExecuteCodeRequest:
         assert data["code"] == "print(1)"
         assert data["timeout"] == 30
         assert data["env_vars"] == {"KEY": "value"}
+
+
+class TestCodeNullByteValidation:
+    """Tests for null byte rejection in code field."""
+
+    # --- Normal cases ---
+    def test_null_byte_in_middle_rejected(self) -> None:
+        """Null byte between valid statements is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            ExecuteCodeRequest(language=Language.PYTHON, code="print('hi')\x00print('bye')")
+        assert "null bytes" in str(exc_info.value).lower()
+
+    def test_single_null_byte_rejected(self) -> None:
+        """Lone null byte is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="\x00")
+
+    # --- Edge cases ---
+    def test_null_byte_at_start_rejected(self) -> None:
+        """Null byte at start of code is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="\x00print('hi')")
+
+    def test_null_byte_at_end_rejected(self) -> None:
+        """Null byte at end of code is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="print('hi')\x00")
+
+    def test_all_null_bytes_rejected(self) -> None:
+        """Code that is entirely null bytes is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="\x00\x00\x00")
+
+    def test_escaped_null_repr_accepted(self) -> None:
+        r"""Code containing literal '\\x00' string (no actual null byte) is accepted."""
+        req = ExecuteCodeRequest(language=Language.PYTHON, code=r"x = 'hello\x00world'")
+        assert req.code == r"x = 'hello\x00world'"
+
+    # --- Weird cases ---
+    def test_null_byte_in_comment_rejected(self) -> None:
+        """Null byte inside a comment is still rejected (can't safely parse)."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="# comment\x00\nprint(1)")
+
+    def test_null_byte_between_multibyte_utf8_rejected(self) -> None:
+        """Null byte between multi-byte UTF-8 chars is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="print('\u4e16\x00\u754c')")
+
+    def test_null_byte_after_newline_rejected(self) -> None:
+        """Null byte on its own line between valid code is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="x = 1\n\x00\ny = 2")
+
+    # --- Out of bounds ---
+    def test_null_byte_at_end_of_large_code_rejected(self) -> None:
+        """Near max-length code with null byte at very end is rejected."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=Language.PYTHON, code="x" * 999_999 + "\x00")
+
+    # --- All languages ---
+    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
+    def test_null_byte_rejected_all_languages(self, language: Language) -> None:
+        """Null bytes rejected regardless of language."""
+        with pytest.raises(ValidationError):
+            ExecuteCodeRequest(language=language, code="echo hi\x00")
 
 
 class TestEnvVarValidation:
@@ -551,6 +679,37 @@ class TestStreamingMessage:
         msg = adapter.validate_python(data)
         assert isinstance(msg, PongMessage)
         assert msg.version == "1.0.0"
+
+    def test_parse_warm_repl_ack(self) -> None:
+        """Parse WarmReplAckMessage from dict."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        data = {"type": "warm_repl_ack", "language": "python", "status": "ok"}
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, WarmReplAckMessage)
+        assert msg.language == "python"
+        assert msg.status == "ok"
+
+    def test_parse_warm_repl_ack_error(self) -> None:
+        """Parse WarmReplAckMessage with error status."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        data = {"type": "warm_repl_ack", "language": "python", "status": "error", "message": "spawn failed"}
+        msg = adapter.validate_python(data)
+        assert isinstance(msg, WarmReplAckMessage)
+        assert msg.status == "error"
+        assert msg.message == "spawn failed"
+
+    def test_parse_warm_repl_ack_from_json(self) -> None:
+        """Parse WarmReplAckMessage from JSON bytes (wire format)."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+        json_str = '{"type":"warm_repl_ack","language":"python","status":"ok"}'
+        msg = adapter.validate_json(json_str)
+        assert isinstance(msg, WarmReplAckMessage)
 
     def test_parse_error(self) -> None:
         """Parse StreamingErrorMessage from dict."""

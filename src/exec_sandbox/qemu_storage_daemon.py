@@ -1,7 +1,9 @@
 """QEMU Storage Daemon for fast overlay creation.
 
-Manages a persistent qemu-storage-daemon process that creates qcow2 overlays
-via QMP commands instead of spawning qemu-img processes.
+Uses qemu-storage-daemon (QSD) instead of forking qemu-img processes, as
+recommended by the QEMU project for storage operations outside a VM:
+- https://www.qemu.org/docs/master/tools/qemu-storage-daemon.html
+- https://lwn.net/Articles/911281/ (LWN: "Accessing QEMU storage features without a VM")
 
 This eliminates ~70ms fork/exec overhead per overlay creation, achieving
 ~4-5ms per overlay via QMP commands vs ~39ms via qemu-img subprocess.
@@ -9,8 +11,14 @@ This eliminates ~70ms fork/exec overhead per overlay creation, achieving
 Architecture:
 - Single persistent daemon process per OverlayPool
 - QMP socket: /tmp/qsd-{pid}-{random}.sock
-- Handles blockdev-create commands for overlay creation
-- Auto-cleanup on shutdown
+- Event-driven job completion: JOB_STATUS_CHANGE events are stashed by
+  _execute() and consumed by _wait_for_job(), eliminating polling storms.
+  Fallback polling at 50ms interval as safety net.
+- Orphan reaper: On startup, scans /tmp for stale QSD sockets from dead
+  parent processes and kills the owning daemons. Handles crashes, OOM kills,
+  and kill -9 that bypass normal cleanup.
+- Process registry: Daemon PID is registered with process_registry so
+  force_kill_all() (2nd Ctrl+C) reaches QSD processes.
 
 Usage:
     async with QemuStorageDaemon() as daemon:
@@ -23,16 +31,21 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import secrets
+import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self, cast
 
+import psutil
+
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import VmOverlayError as QemuStorageDaemonError
 from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.process_registry import register_process, unregister_process
 
 logger = get_logger(__name__)
 
@@ -41,9 +54,23 @@ logger = get_logger(__name__)
 class QmpJob:
     """QMP job status from query-jobs response."""
 
-    id: str
+    job_id: str
     status: str
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QmpEvent:
+    """Parsed QMP event (e.g. JOB_STATUS_CHANGE).
+
+    Only the fields relevant to job completion tracking are extracted.
+    Unknown/malformed events parse to empty strings, allowing safe
+    matching without KeyError.
+    """
+
+    event: str
+    job_id: str
+    status: str
 
 
 class QemuStorageDaemon:
@@ -61,6 +88,7 @@ class QemuStorageDaemon:
     """
 
     __slots__ = (
+        "_event_buffer",
         "_lock",
         "_process",
         "_reader",
@@ -79,6 +107,7 @@ class QemuStorageDaemon:
         self._started = False
         self._lock = asyncio.Lock()  # Serialize QMP commands
         self._virtual_size_cache: dict[str, int] = {}  # Cache base image sizes
+        self._event_buffer: list[QmpEvent] = []  # Events stashed by _execute(), consumed by _wait_for_job()
 
     @property
     def started(self) -> bool:
@@ -96,11 +125,16 @@ class QemuStorageDaemon:
         if self._started:
             return
 
-        # Generate unique socket path
-        # Use system temp for socket to avoid Unix socket path length limit (104-108 chars)
-        # The socket_dir is used for the daemon's working context, but socket goes in /tmp
-        socket_dir = Path(tempfile.gettempdir())
-        self._socket_path = socket_dir / f"qsd-{os.getpid()}-{secrets.token_hex(8)}.sock"
+        # Clean up orphaned daemons from previous crashes (non-critical)
+        try:
+            count = await asyncio.to_thread(self._reap_stale_daemons)
+            if count:
+                logger.info("Reaped stale QSD daemons", extra={"count": count})
+        except (OSError, psutil.Error):
+            logger.debug("Orphan reaper failed (non-critical)", exc_info=True)
+
+        # Use /tmp for socket to avoid Unix socket path length limit (104-108 chars)
+        self._socket_path = Path(tempfile.gettempdir()) / f"qsd-{os.getpid()}-{secrets.token_hex(8)}.sock"
 
         # Start daemon process
         cmd = [
@@ -120,6 +154,7 @@ class QemuStorageDaemon:
                     start_new_session=True,
                 )
             )
+            register_process(self._process)
 
             # Wait for socket and connect
             await self._wait_for_socket()
@@ -133,31 +168,41 @@ class QemuStorageDaemon:
 
         except Exception as e:
             # Cleanup on failure
+            unregister_process(self._process)
             await self._cleanup_process()
             raise QemuStorageDaemonError(f"Failed to start daemon: {e}") from e
 
     async def stop(self) -> None:
         """Stop daemon gracefully.
 
-        Idempotent: Does nothing if not started.
+        Idempotent: Clears event buffer and returns if not started.
+        Cancellation-safe: _started is set False before any await.
         """
         if not self._started:
+            self._event_buffer.clear()
             return
+
+        # Set early so idempotency guard works even if we're cancelled mid-cleanup
+        self._started = False
 
         # Send quit command (ignore errors - daemon may already be dead)
         with contextlib.suppress(Exception):
             await self._execute("quit")
 
-        # Close connection
-        await self._cleanup_connection()
-        await self._cleanup_process()
+        # Unregister before _cleanup_process() sets self._process = None
+        unregister_process(self._process)
 
-        # Cleanup socket
-        if self._socket_path and self._socket_path.exists():
-            with contextlib.suppress(OSError):
-                self._socket_path.unlink()
+        try:
+            # Close connection
+            await self._cleanup_connection()
+            await self._cleanup_process()
+        finally:
+            # Cleanup socket and buffer even if cancelled
+            if self._socket_path and self._socket_path.exists():
+                with contextlib.suppress(OSError):
+                    self._socket_path.unlink()
+            self._event_buffer.clear()
 
-        self._started = False
         logger.info("QEMU storage daemon stopped")
 
     async def create_overlay(
@@ -262,8 +307,9 @@ class QemuStorageDaemon:
         Raises:
             QemuStorageDaemonError: If socket doesn't appear within timeout
         """
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
             if self._socket_path and self._socket_path.exists():
                 return
             # Check if process died
@@ -334,14 +380,19 @@ class QemuStorageDaemon:
 
             # QMP sends async events alongside responses. Read lines until we
             # get an actual response (has "return" or "error" key), skip events.
-            deadline = asyncio.get_event_loop().time() + timeout
-            while asyncio.get_event_loop().time() < deadline:
-                remaining = deadline - asyncio.get_event_loop().time()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while loop.time() < deadline:
+                remaining = deadline - loop.time()
                 response = await asyncio.wait_for(self._reader.readline(), timeout=max(0.1, remaining))
                 result = json.loads(response)
 
-                # Events have "event" key, skip them
+                # Stash concluded events for _wait_for_job; discard
+                # intermediate states (created, running, waiting, pending, null)
                 if "event" in result:
+                    parsed = self._parse_event(result)
+                    if parsed.status == "concluded":
+                        self._event_buffer.append(parsed)
                     continue
 
                 if "error" in result:
@@ -406,20 +457,74 @@ class QemuStorageDaemon:
         self._virtual_size_cache[cache_key] = size
         return size
 
-    def _parse_job(self, data: dict[str, Any]) -> QmpJob:
+    @staticmethod
+    def _parse_job(data: dict[str, Any]) -> QmpJob:
         """Parse raw QMP job dict into QmpJob dataclass."""
         return QmpJob(
-            id=data.get("id", ""),
+            job_id=data.get("id", ""),
             status=data.get("status", ""),
             error=data.get("error"),
         )
+
+    @staticmethod
+    def _parse_event(raw: dict[str, Any]) -> QmpEvent:
+        """Parse raw QMP event dict into QmpEvent dataclass.
+
+        Handles malformed events gracefully — missing keys or non-dict data
+        default to empty strings, so matching always works without errors.
+        """
+        data_raw = raw.get("data")
+        data = cast("dict[str, Any]", data_raw) if isinstance(data_raw, dict) else {}
+        return QmpEvent(
+            event=raw.get("event", ""),
+            job_id=data.get("id", ""),
+            status=data.get("status", ""),
+        )
+
+    def _consume_event(self, job_id: str, status: str) -> QmpEvent | None:
+        """Consume and remove first matching event from buffer.
+
+        Scans the event buffer for a QMP event matching the given job ID and
+        status. If found, removes it from the buffer and returns it.
+
+        Args:
+            job_id: Job ID to match in event data
+            status: Status to match (e.g. "concluded")
+
+        Returns:
+            Matching QmpEvent, or None if no match found.
+        """
+        for i, event in enumerate(self._event_buffer):
+            if event.job_id == job_id and event.status == status:
+                self._event_buffer.pop(i)
+                return event
+        return None
+
+    def _purge_job_events(self, job_id: str) -> None:
+        """Remove all buffered events for the given job ID.
+
+        Called after a job completes (by any path) to prevent stale events
+        from accumulating. In concurrent scenarios, concluded events for one
+        job can be buffered by _execute() calls from other coroutines after
+        _wait_for_job already observed completion via query-jobs.
+        """
+        self._event_buffer = [e for e in self._event_buffer if e.job_id != job_id]
 
     async def _wait_for_job(
         self,
         job_id: str,
         timeout: float = constants.QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS,
     ) -> None:
-        """Wait for async job to complete.
+        """Wait for async job to complete using event-driven approach.
+
+        Primary path: Checks _event_buffer for a JOB_STATUS_CHANGE(concluded)
+        event that was stashed by _execute() while reading QMP responses.
+
+        Fallback path: If no event found (e.g. job concluded and auto-dismissed
+        before any event was captured), queries jobs directly.
+
+        On completion (success or failure), purges all remaining events for
+        this job_id from the buffer to prevent stale event accumulation.
 
         Args:
             job_id: Job ID to wait for
@@ -428,38 +533,120 @@ class QemuStorageDaemon:
         Raises:
             QemuStorageDaemonError: If job times out or fails
         """
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            result = await self._execute("query-jobs")
-            # query-jobs returns a list of job dicts
-            raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while loop.time() < deadline:
+                # Primary path: check event buffer for concluded event
+                concluded_event = self._consume_event(job_id, "concluded")
+                if concluded_event:
+                    # Event found — query jobs once to get error details and dismiss.
+                    # Events don't carry error messages, only status changes.
+                    result = await self._execute("query-jobs")
+                    raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
 
-            # Find the job by ID and parse into dataclass
-            job: QmpJob | None = None
-            for raw in raw_jobs:
-                if raw.get("id") == job_id:
-                    job = self._parse_job(raw)
-                    break
+                    for raw in raw_jobs:
+                        if raw.get("id") == job_id:
+                            job = self._parse_job(raw)
+                            if job.status == "concluded":
+                                if job.error:
+                                    with contextlib.suppress(QemuStorageDaemonError):
+                                        await self._execute("job-dismiss", {"id": job_id})
+                                    raise QemuStorageDaemonError(f"Job {job_id} failed: {job.error}")
+                                # Dismiss completed job
+                                await self._execute("job-dismiss", {"id": job_id})
+                                return
+                            # Event said concluded but query-jobs disagrees; fall through
+                            break
 
-            if not job:
-                # Job completed and was auto-removed
-                return
+                    # Job already auto-dismissed (not in query-jobs list)
+                    return
 
-            if job.status == "concluded":
-                # Check for error
-                if job.error:
-                    # Dismiss job before raising
-                    with contextlib.suppress(QemuStorageDaemonError):
-                        await self._execute("job-dismiss", {"id": job_id})
-                    raise QemuStorageDaemonError(f"Job {job_id} failed: {job.error}")
+                # Fallback: query jobs directly (handles auto-dismiss race)
+                result = await self._execute("query-jobs")
+                raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
 
-                # Dismiss completed job
-                await self._execute("job-dismiss", {"id": job_id})
-                return
+                job: QmpJob | None = None
+                for raw in raw_jobs:
+                    if raw.get("id") == job_id:
+                        job = self._parse_job(raw)
+                        break
 
-            await asyncio.sleep(0.01)
+                if not job:
+                    # Job completed and was auto-removed
+                    return
 
-        raise QemuStorageDaemonError(f"Job {job_id} timed out after {timeout}s")
+                if job.status == "concluded":
+                    if job.error:
+                        with contextlib.suppress(QemuStorageDaemonError):
+                            await self._execute("job-dismiss", {"id": job_id})
+                        raise QemuStorageDaemonError(f"Job {job_id} failed: {job.error}")
+                    await self._execute("job-dismiss", {"id": job_id})
+                    return
+
+                # Safety net: polling at 50ms (5x slower than before — events are primary)
+                await asyncio.sleep(0.05)
+
+            raise QemuStorageDaemonError(f"Job {job_id} timed out after {timeout}s")
+        finally:
+            # Purge any stale events for this job (e.g. concluded events that
+            # arrived after we already observed completion via query-jobs)
+            self._purge_job_events(job_id)
+
+    @staticmethod
+    def _reap_stale_daemons() -> int:
+        """Remove stale QSD sockets from dead parent processes and kill orphaned daemons.
+
+        Socket filenames encode the parent PID: qsd-{pid}-{random}.sock.
+        When the parent dies (crash, OOM, kill -9), the daemon becomes an orphan.
+        This method finds such orphans and cleans them up.
+
+        Returns:
+            Number of stale sockets cleaned up.
+        """
+        tmpdir = Path(tempfile.gettempdir())
+        pattern = re.compile(r"^qsd-(\d+)-[0-9a-f]+\.sock$")
+        cleaned = 0
+
+        for sock_path in tmpdir.glob("qsd-*.sock"):
+            match = pattern.match(sock_path.name)
+            if not match:
+                continue
+
+            parent_pid = int(match.group(1))
+
+            # Check if parent PID is alive
+            try:
+                os.kill(parent_pid, 0)
+                # Parent alive, skip
+                continue
+            except PermissionError:
+                # Parent alive but not ours, skip
+                continue
+            except ProcessLookupError:
+                pass  # Parent dead, proceed to cleanup
+
+            # Find and kill the QSD process whose cmdline contains this socket path
+            sock_str = str(sock_path)
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):  # type: ignore[reportUnknownMemberType]
+                try:
+                    cmdline: list[str] = proc.info.get("cmdline") or []  # type: ignore[union-attr]
+                    if sock_str in " ".join(cmdline):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        logger.debug(
+                            "Killed orphaned QSD process",
+                            extra={"pid": proc.pid, "socket": sock_str},
+                        )
+                except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+            # Remove stale socket (regardless of whether QSD process was found)
+            with contextlib.suppress(OSError):
+                sock_path.unlink()
+                cleaned += 1
+                logger.debug("Removed stale QSD socket", extra={"socket": sock_str})
+
+        return cleaned
 
     async def _cleanup_connection(self) -> None:
         """Close QMP connection."""
@@ -482,7 +669,7 @@ class QemuStorageDaemon:
             # Force kill
             with contextlib.suppress(ProcessLookupError):
                 await self._process.terminate()
-            with contextlib.suppress(asyncio.TimeoutError):
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._process.wait(), timeout=2.0)
 
         self._process = None

@@ -30,7 +30,10 @@ async def validate_kernel_initramfs(kernel_path: Path, arch: HostArch) -> None:
         return
 
     arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
-    kernel = kernel_path / f"vmlinuz-{arch_suffix}"
+    # Accept either vmlinux (PVH direct boot, x86_64) or vmlinuz (compressed)
+    kernel = kernel_path / f"vmlinux-{arch_suffix}"
+    if not await aiofiles.os.path.exists(kernel):
+        kernel = kernel_path / f"vmlinuz-{arch_suffix}"
     initramfs = kernel_path / f"initramfs-{arch_suffix}"
 
     if not await aiofiles.os.path.exists(kernel):

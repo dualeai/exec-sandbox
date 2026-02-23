@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmError
+from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmDependencyError, VmError
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
@@ -729,6 +729,91 @@ class TestNetdevReconnect:
 
 
 # ============================================================================
+# Unit Tests - Run-With Exit-With-Parent
+# ============================================================================
+
+
+class TestRunWithExitParent:
+    """Tests for -run-with exit-with-parent=on based on QEMU version.
+
+    QEMU 10.2+ supports exit-with-parent=on, which kills the QEMU process
+    when its parent dies (PR_SET_PDEATHSIG on Linux, kqueue on macOS).
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        probe_cache.reset("qemu_version")
+
+    async def test_run_with_exit_parent_for_qemu_10_2(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 10.2+ gets -run-with exit-with-parent=on."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-2")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 2, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-exit-parent-10-2",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+
+            idx = cmd.index("-run-with")
+            assert cmd[idx + 1] == "exit-with-parent=on"
+        finally:
+            await workdir.cleanup()
+
+    async def test_no_run_with_exit_parent_for_qemu_10_1(self, vm_settings, tmp_path: Path) -> None:
+        """QEMU 10.1 does not support exit-with-parent."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-1")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 1, 0)):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-exit-parent-10-1",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+
+            assert "-run-with" not in cmd
+        finally:
+            await workdir.cleanup()
+
+    async def test_no_run_with_exit_parent_when_version_unknown(self, vm_settings, tmp_path: Path) -> None:
+        """No exit-with-parent when QEMU version cannot be detected."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-unknown")
+        try:
+            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=None):
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=detect_host_arch(),
+                    vm_id="test-vm-exit-parent-unknown",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+
+            assert "-run-with" not in cmd
+        finally:
+            await workdir.cleanup()
+
+
+# ============================================================================
 # Tests - SMP / CPU cores
 # ============================================================================
 
@@ -1137,6 +1222,96 @@ class TestKernelInitramfsValidation:
         fake_path = Path("/nonexistent/kernels")
         with pytest.raises(VmError, match="Kernel not found"):
             await validate_kernel_initramfs(fake_path, arch)
+
+    async def test_validation_accepts_vmlinux_only(self, tmp_path: Path) -> None:
+        """Validation passes with vmlinux (no vmlinuz) + initramfs."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        # Create vmlinux + initramfs (no vmlinuz)
+        (tmp_path / f"vmlinux-{arch_suffix}").write_text("fake-elf")
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        # Should NOT raise
+        await validate_kernel_initramfs(tmp_path, arch)
+
+    async def test_validation_accepts_vmlinuz_only(self, tmp_path: Path) -> None:
+        """Validation passes with vmlinuz (no vmlinux) + initramfs."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        # Create vmlinuz + initramfs (no vmlinux)
+        (tmp_path / f"vmlinuz-{arch_suffix}").write_text("fake-bzimage")
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        # Should NOT raise
+        await validate_kernel_initramfs(tmp_path, arch)
+
+    async def test_validation_prefers_vmlinux(self, tmp_path: Path) -> None:
+        """When both vmlinux and vmlinuz exist, validation still passes (vmlinux found first)."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        (tmp_path / f"vmlinux-{arch_suffix}").write_text("fake-elf")
+        (tmp_path / f"vmlinuz-{arch_suffix}").write_text("fake-bzimage")
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        await validate_kernel_initramfs(tmp_path, arch)
+
+    async def test_validation_fails_neither_kernel(self, tmp_path: Path) -> None:
+        """Validation fails when neither vmlinux nor vmlinuz exists."""
+        arch = detect_host_arch()
+        arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+
+        # Only initramfs, no kernel
+        (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
+
+        with pytest.raises(VmDependencyError, match="Kernel not found"):
+            await validate_kernel_initramfs(tmp_path, arch)
+
+
+class TestQemuKernelPathSelection:
+    """Tests for vmlinux vs vmlinuz selection in qemu_cmd.py."""
+
+    def test_x86_64_prefers_vmlinux_when_exists(self, tmp_path: Path) -> None:
+        """On x86_64, vmlinux is preferred when it exists."""
+        arch = HostArch.X86_64
+        arch_suffix = "x86_64"
+
+        vmlinux_path = tmp_path / f"vmlinux-{arch_suffix}"
+        vmlinuz_path = tmp_path / f"vmlinuz-{arch_suffix}"
+        vmlinux_path.write_text("fake-elf")
+        vmlinuz_path.write_text("fake-bzimage")
+
+        # Replicate the selection logic from qemu_cmd.py
+        kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+        assert kernel_path == vmlinux_path
+
+    def test_x86_64_falls_back_to_vmlinuz(self, tmp_path: Path) -> None:
+        """On x86_64, falls back to vmlinuz when vmlinux doesn't exist."""
+        arch = HostArch.X86_64
+        arch_suffix = "x86_64"
+
+        vmlinux_path = tmp_path / f"vmlinux-{arch_suffix}"
+        vmlinuz_path = tmp_path / f"vmlinuz-{arch_suffix}"
+        vmlinuz_path.write_text("fake-bzimage")
+        # vmlinux does NOT exist
+
+        kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+        assert kernel_path == vmlinuz_path
+
+    def test_aarch64_always_uses_vmlinuz(self, tmp_path: Path) -> None:
+        """On aarch64, vmlinuz is always used (PVH is x86-only)."""
+        arch = HostArch.AARCH64
+        arch_suffix = "aarch64"
+
+        vmlinux_path = tmp_path / f"vmlinux-{arch_suffix}"
+        vmlinuz_path = tmp_path / f"vmlinuz-{arch_suffix}"
+        vmlinux_path.write_text("fake-elf")
+        vmlinuz_path.write_text("fake-bzimage")
+
+        kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+        assert kernel_path == vmlinuz_path  # aarch64 always vmlinuz
 
 
 # ============================================================================

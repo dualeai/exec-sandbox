@@ -2,6 +2,7 @@
 name ?= exec_sandbox
 python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires-python)
 rust_version ?= 1.93
+alpine_version ?= 3.23
 
 # Versions
 version_full ?= $(shell $(MAKE) --silent version-full)
@@ -25,6 +26,9 @@ version-pypi:
 rust-version:
 	@echo $(rust_version)
 
+alpine-version:
+	@echo $(alpine_version)
+
 # ============================================================================
 # Installation
 # ============================================================================
@@ -35,7 +39,7 @@ install-sys:
 install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
-	$(MAKE) --directory guest-agent install
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory gvproxy-wrapper install
 
@@ -49,7 +53,7 @@ install-deps:
 upgrade:
 	uv lock --upgrade --refresh
 	$(MAKE) build-catalogs
-	$(MAKE) --directory guest-agent upgrade
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) upgrade
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) upgrade
 	$(MAKE) --directory gvproxy-wrapper upgrade
 
@@ -59,12 +63,23 @@ build-catalogs:
 	uv run --script scripts/build_package_catalogs.py src/exec_sandbox/resources
 
 # ============================================================================
-# Image Building
+# Building
 # ============================================================================
 
-build-images:
-	@echo "🔨 Building QEMU base images..."
-	RUST_VERSION=$(rust_version) ./scripts/build-images.sh
+IMAGE_ARCH ?= $$(uname -m)
+IMAGE_VARIANT ?= all
+
+# Build everything: VM images (guest-agent, tiny-init, kernel, qcow2) + host binaries (gvproxy-wrapper).
+# Native arch by default, use IMAGE_ARCH=all for cross-arch.
+# Usage: make build [IMAGE_ARCH=all|x86_64|aarch64] [IMAGE_VARIANT=python|node|raw|all]
+# Note: arm64 is normalized to aarch64 in the recipe to match script expectations.
+build:
+	$(MAKE) --directory gvproxy-wrapper build
+	@echo "🔨 Building QEMU images (arch=$(IMAGE_ARCH), variant=$(IMAGE_VARIANT))..."
+	RUST_VERSION=$(rust_version) ALPINE_VERSION=$(alpine_version) ./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
+
+# Kept as alias for backwards compatibility and CI scripts.
+build-images: build
 
 # ============================================================================
 # Testing
@@ -80,7 +95,7 @@ test-static:
 	uv run pyright .
 	uv run -m vulture src/ scripts/ --min-confidence 80
 	shellcheck scripts/*.sh cicd/*.sh
-	$(MAKE) --directory guest-agent test-static
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-static
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
@@ -94,8 +109,8 @@ test-sudo:
 
 # Unit tests only (fast)
 test-unit:
-	uv run pytest tests/ -v -n auto -m "unit"
-	$(MAKE) --directory guest-agent test-unit
+	$(MAKE) test-func
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
 
@@ -110,7 +125,7 @@ test-slow:
 lint:
 	uv run ruff format .
 	uv run ruff check --fix .
-	$(MAKE) --directory guest-agent lint
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) lint
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) lint
 	$(MAKE) --directory gvproxy-wrapper lint
 
@@ -190,20 +205,11 @@ bench-pool-flamegraph:
 	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 
 # ============================================================================
-# Building
-# ============================================================================
-
-build:
-	$(MAKE) --directory guest-agent build
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) build
-	$(MAKE) --directory gvproxy-wrapper build
-
-# ============================================================================
 # Cleanup
 # ============================================================================
 
 clean:
-	$(MAKE) --directory guest-agent clean
+	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) clean
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) clean
 	$(MAKE) --directory gvproxy-wrapper clean
 	rm -rf .pytest_cache .coverage htmlcov

@@ -1,10 +1,14 @@
 """Integration tests for streaming file transfers under memory pressure and concurrency.
 
 Validates that the zstd-compressed chunked file transfer protocol:
-1. Handles large files (30-50 MB) in low-memory VMs without OOM
+1. Handles large files (30-150 MB) in VMs without OOM
 2. Supports concurrent parallel file transfers via asyncio.gather
 3. Keeps guest memory usage low during transfers (streaming, not buffering)
 4. Handles interleaved success/failure correctly (dispatcher multiplexing)
+5. Measures upload/download throughput (write_file/read_file MiB/s)
+
+Note: /home/user is tmpfs (50% of guest RAM). Files written there consume guest
+RAM directly, so tests use 512 MB VMs for large files (tmpfs cap = 256 MB).
 
 All tests require real VMs via the scheduler fixture.
 """
@@ -13,6 +17,7 @@ import asyncio
 import hashlib
 import os
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -39,18 +44,18 @@ class TestStreamingLargeFiles:
     """Prove streaming works for files that would OOM with the old buffered approach."""
 
     async def test_write_read_30mb_in_128mb_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write 30 MB to a 128 MB VM and read it back with SHA256 verification.
+        """Write 30 MB and read it back with SHA256 verification.
 
-        With the old base64 approach, 30 MB would require ~110 MB of guest RAM
-        just for decode + content, leaving nothing for the OS in 128 MB.
-        Streaming only needs ~128 KB decompression buffer.
+        /home/user is tmpfs (50% of RAM), so file writes consume guest RAM.
+        Uses 512 MB VM (256 MB tmpfs cap) to avoid ENOSPC.
+        Streaming only needs ~128 KB decompression buffer in the guest.
         """
         size = 30 * 1024 * 1024
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_30mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("large_30mb.bin", content)
             await session.read_file("large_30mb.bin", destination=dest)
 
@@ -62,18 +67,17 @@ class TestStreamingLargeFiles:
         )
 
     async def test_write_read_file_larger_than_vm_memory(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write a 150 MB file to a 128 MB VM — file is larger than total RAM.
+        """Write a 150 MB file — larger than what fits in default tmpfs.
 
-        The file is 17% larger than the VM's entire memory.  With the old
-        buffered approach this would be impossible (~550 MB peak for base64).
-        Streaming only needs ~64 KB decompression buffer in the guest.
+        /home/user tmpfs is 50% of RAM. Uses 512 MB VM (256 MB tmpfs) so the
+        150 MB file fits. Streaming only needs ~64 KB decompression buffer.
         """
         size = 150 * 1024 * 1024
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_150mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("large_150mb.bin", content)
             await session.read_file("large_150mb.bin", destination=dest)
 
@@ -194,7 +198,7 @@ class TestStreamingMemoryEfficiency:
         size = 30 * 1024 * 1024
         content = os.urandom(size)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("mem_test_30mb.bin", content)
 
             # Read /proc/meminfo to check available memory
@@ -233,7 +237,7 @@ class TestStreamingMemoryEfficiency:
         """
         size = 20 * 1024 * 1024
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             for i in range(3):
                 content = os.urandom(size)
                 expected_hash = hashlib.sha256(content).hexdigest()
@@ -284,7 +288,7 @@ class TestStreamingMemoryEfficiency:
             print(f'pid={pid}')
         """)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             # Start background memory monitor
             start_result = await session.exec(monitor_code)
             assert start_result.exit_code == 0, f"Monitor start failed: {start_result.stderr}"
@@ -337,7 +341,7 @@ class TestStreamingMemoryEfficiency:
         content = os.urandom(size)
         dest = tmp_path / "read_mem_test_30mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             await session.write_file("read_mem_test_30mb.bin", content)
             await session.read_file("read_mem_test_30mb.bin", destination=dest)
 
@@ -398,7 +402,7 @@ class TestStreamingMemoryEfficiency:
             print(f'pid={pid}')
         """)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
             # First write the file to read back
             await session.write_file("peak_read_30mb.bin", content)
 
@@ -624,3 +628,60 @@ class TestInterleavedSuccessFailure:
             # At least the 3 pre-existing files should be visible
             for i in range(3):
                 assert f"file_{i}.txt" in file_names, f"file_{i}.txt missing from list"
+
+
+# =============================================================================
+# TestFileTransferThroughput - Upload/download MiB/s benchmarks
+# =============================================================================
+
+
+@skip_unless_hwaccel
+class TestFileTransferThroughput:
+    """Benchmark upload (write_file) and download (read_file) throughput.
+
+    Run with -s to see throughput output:
+        uv run pytest tests/test_file_io_streaming.py::TestFileTransferThroughput -v -s -n 0
+    """
+
+    @pytest.mark.parametrize("size_mib", [10, 50])
+    async def test_upload_throughput(self, scheduler: Scheduler, size_mib: int) -> None:
+        """Measure host->guest write_file throughput in MiB/s."""
+        size = size_mib * 1024 * 1024
+        content = os.urandom(size)
+        expected_hash = hashlib.sha256(content).hexdigest()
+
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=256) as session:
+            start = time.perf_counter()
+            await session.write_file("bench.bin", content)
+            elapsed = time.perf_counter() - start
+
+            throughput = size_mib / elapsed
+            # Verify integrity
+            result = await session.exec(
+                "import hashlib; print(hashlib.sha256(open('bench.bin','rb').read()).hexdigest())"
+            )
+            assert result.exit_code == 0, f"Hash check failed: {result.stderr}"
+            assert result.stdout.strip() == expected_hash, "Upload data corrupted"
+
+        print(f"\n  UPLOAD {size_mib} MiB: {elapsed:.1f}s, {throughput:.1f} MiB/s")  # noqa: T201
+
+    @pytest.mark.parametrize("size_mib", [10, 50])
+    async def test_download_throughput(self, scheduler: Scheduler, tmp_path: Path, size_mib: int) -> None:
+        """Measure guest->host read_file throughput in MiB/s."""
+        size = size_mib * 1024 * 1024
+        expected_content = bytes(range(256)) * (size // 256)
+        expected_hash = hashlib.sha256(expected_content).hexdigest()
+        dest = tmp_path / "bench_dl.bin"
+
+        async with await scheduler.session(language=Language.PYTHON, memory_mb=256) as session:
+            # Generate deterministic file in guest
+            await session.exec(f"open('bench.bin','wb').write(bytes(range(256)) * {size // 256})")
+            start = time.perf_counter()
+            await session.read_file("bench.bin", destination=dest)
+            elapsed = time.perf_counter() - start
+
+        throughput = size_mib / elapsed
+        assert dest.stat().st_size == size, "Download size mismatch"
+        actual_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
+        assert actual_hash == expected_hash, "Download data corrupted"
+        print(f"\n  DOWNLOAD {size_mib} MiB: {elapsed:.1f}s, {throughput:.1f} MiB/s")  # noqa: T201
