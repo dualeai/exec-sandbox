@@ -119,7 +119,16 @@ extract_for_arch() {
         need_initramfs=true
     fi
 
-    if [ "$need_kernel" = false ] && [ "$need_initramfs" = false ]; then
+    # vmlinux (uncompressed ELF for PVH direct boot) has no .hash sidecar —
+    # it's derived from vmlinuz and only matters for x86_64. If vmlinuz is
+    # cached but vmlinux is missing (e.g. first build after adding PVH support,
+    # or a prior build that failed extraction), we must still run extraction.
+    local need_vmlinux=false
+    if [ "$target_arch" = "x86_64" ] && [ ! -f "$OUTPUT_DIR/vmlinux-x86_64" ]; then
+        need_vmlinux=true
+    fi
+
+    if [ "$need_kernel" = false ] && [ "$need_initramfs" = false ] && [ "$need_vmlinux" = false ]; then
         echo "Kernel up-to-date: $target_arch (cache hit)"
         return 0
     fi
@@ -139,25 +148,47 @@ extract_for_arch() {
                 chmod 644 /output/vmlinuz-$target_arch
             "
         save_hash "$vmlinuz_file" "$kernel_hash"
+    fi
 
-        # Extract uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
-        if [ "$target_arch" = "x86_64" ]; then
-            local vmlinux_file="$OUTPUT_DIR/vmlinux-x86_64"
+    # Extract uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster).
+    #
+    # vmlinux is the raw ELF kernel extracted from the compressed vmlinuz
+    # (bzImage). QEMU's -kernel flag with microvm/PVH uses it to skip the
+    # real-mode boot stub, saving ~50ms per VM boot.
+    #
+    # Extraction runs when:
+    #   - vmlinux is missing (first build, or prior build failed extraction)
+    #   - vmlinuz was freshly rebuilt (kernel version changed)
+    # When both vmlinuz and vmlinux exist and vmlinuz is unchanged, skip.
+    #
+    # aarch64 does not use vmlinux — Image (flat binary) is loaded directly
+    # by QEMU's -kernel flag without a PVH entry point.
+    #
+    # Failure is fatal: vmlinux is not optional for x86_64. No fallback to
+    # vmlinuz — that would silently degrade boot latency.
+    if [ "$target_arch" = "x86_64" ]; then
+        local vmlinux_file="$OUTPUT_DIR/vmlinux-x86_64"
+        if [ ! -f "$vmlinux_file" ] || [ "$need_kernel" = true ]; then
             echo "Extracting vmlinux for PVH boot..."
-            if "$SCRIPT_DIR/extract-vmlinux.sh" "$vmlinuz_file" > "$vmlinux_file" 2>/dev/null; then
-                chmod 644 "$vmlinux_file"
-                # Verify PVH note exists (XEN_ELFNOTE_PHYS32_ENTRY)
-                if docker run --rm -v "$OUTPUT_DIR:/output" --platform linux/amd64 \
-                    "alpine:$ALPINE_VERSION" sh -c "apk add --no-cache binutils >/dev/null 2>&1 && readelf -n /output/vmlinux-x86_64 2>/dev/null | grep -q Xen"; then
-                    echo "vmlinux-x86_64: PVH note verified ($(du -h "$vmlinux_file" | cut -f1))"
-                else
-                    echo "Warning: vmlinux lacks PVH note, removing (will use vmlinuz)"
-                    rm -f "$vmlinux_file"
-                fi
-            else
-                echo "Warning: vmlinux extraction failed (will use vmlinuz)"
+            if ! "$SCRIPT_DIR/extract-vmlinux.sh" "$vmlinuz_file" > "$vmlinux_file"; then
+                echo "ERROR: vmlinux extraction failed for x86_64" >&2
                 rm -f "$vmlinux_file"
+                return 1
             fi
+            chmod 644 "$vmlinux_file"
+            # Verify PVH note (XEN_ELFNOTE_PHYS32_ENTRY) — the ELF note that
+            # tells QEMU/KVM where to jump for PVH boot. Without it, QEMU
+            # falls back to real-mode boot, negating the latency win.
+            # Uses Docker because readelf is not installed on macOS hosts.
+            if ! docker run --rm -v "$OUTPUT_DIR:/output" --platform linux/amd64 \
+                "alpine:$ALPINE_VERSION" sh -c "apk add --no-cache binutils >/dev/null 2>&1 && readelf -n /output/vmlinux-x86_64 2>/dev/null | grep -q Xen"; then
+                echo "ERROR: vmlinux lacks PVH note for x86_64" >&2
+                rm -f "$vmlinux_file"
+                return 1
+            fi
+            echo "vmlinux-x86_64: PVH note verified ($(du -h "$vmlinux_file" | cut -f1))"
+        else
+            echo "vmlinux up-to-date: x86_64 (cache hit)"
         fi
     fi
 
