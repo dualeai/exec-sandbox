@@ -2,7 +2,9 @@
 
 use std::process::Command as StdCommand;
 
-use crate::constants::{SANDBOX_GID, SANDBOX_UID};
+use std::sync::atomic::Ordering;
+
+use crate::constants::{NETWORK_NOTIFY, NETWORK_READY, SANDBOX_GID, SANDBOX_UID};
 
 // ============================================================================
 // Zombie reaping
@@ -36,27 +38,21 @@ pub(crate) async fn reap_zombies() {
 // Init environment setup
 // ============================================================================
 
-/// Handles userspace-only initialization after tiny-init.
-pub(crate) fn setup_init_environment() {
-    setup_env_and_permissions();
-    mount_home_tmpfs();
-    mount_readonly_paths();
-    setup_network();
-}
-
-/// Set PATH, UV_NO_CACHE, and harden directory permissions.
-fn setup_env_and_permissions() {
+/// A1: Phase 1 — minimal setup for Ping response (fast, <1ms).
+/// Sets environment variables only. Called before listen_virtio_serial().
+pub(crate) fn setup_phase1() {
     // SAFETY: called at startup before any threads are spawned
     unsafe { std::env::set_var("PATH", "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") };
-    eprintln!("Set PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-
     unsafe { std::env::set_var("UV_NO_CACHE", "1") };
-    eprintln!("Set UV_NO_CACHE=1");
+}
 
-    // CIS Benchmark 6.1.x compliance
-    chmod_paths("755", &["/etc", "/usr", "/var", "/sbin", "/bin"]);
+/// Phase 2 core — sync init: chmod, mounts, critical sysctl, dev setup (~10ms).
+/// Network, zram, and deferred sysctl run in background to unblock Ping.
+pub(crate) fn setup_phase2_core() {
+    // CIS Benchmark 6.1.x compliance (A2: libc::chmod, no fork/exec)
+    chmod_paths(0o755, &["/etc", "/usr", "/var", "/sbin", "/bin"]);
     chmod_paths(
-        "644",
+        0o644,
         &[
             "/etc/passwd",
             "/etc/group",
@@ -64,8 +60,56 @@ fn setup_env_and_permissions() {
             "/etc/hosts",
         ],
     );
-    chmod_paths("640", &["/etc/shadow"]);
-    eprintln!("Hardened system directory permissions (CIS 6.1.x)");
+    chmod_paths(0o640, &["/etc/shadow"]);
+
+    mount_home_tmpfs();
+    // ALL /proc/sys writes MUST happen before mount_readonly_paths() which
+    // makes /proc/sys read-only. This includes sysctl hardening AND zram
+    // VM tuning (swappiness, page-cluster, etc.).
+    apply_sysctl_critical();
+    apply_sysctl_deferred();
+    apply_zram_vm_tuning();
+    mount_readonly_paths();
+    setup_dev_symlinks();
+    setup_dev_shm();
+    pre_write_repl_wrappers();
+}
+
+/// Background zram setup: device wait, compression, mkswap, swapon, VM tuning.
+/// E3: Moved off critical path — zram is only needed under memory pressure,
+/// not for Ping/file I/O readiness.
+pub(crate) async fn setup_zram_background() {
+    tokio::task::spawn_blocking(setup_zram_swap).await.ok();
+}
+
+/// Background network setup: ip config + gvproxy verification.
+/// Runs on spawn_blocking (uses StdCommand for ip/ping, I/O-bound).
+/// Marks NETWORK_READY when complete; ExecuteCode/InstallPackages gate on this.
+pub(crate) async fn setup_network_background() {
+    tokio::task::spawn_blocking(|| {
+        setup_network();
+    })
+    .await
+    .ok();
+    mark_network_ready();
+}
+
+fn mark_network_ready() {
+    NETWORK_READY.store(true, Ordering::Release);
+    NETWORK_NOTIFY.notify_waiters();
+}
+
+/// Wait until network setup is complete. No-op if already ready.
+pub(crate) async fn wait_for_network() {
+    if NETWORK_READY.load(Ordering::Acquire) {
+        return;
+    }
+    // Re-check after registering the notified future to avoid TOCTOU race
+    let notified = NETWORK_NOTIFY.notified();
+    if NETWORK_READY.load(Ordering::Acquire) {
+        return;
+    }
+    notified.await;
 }
 
 /// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
@@ -86,9 +130,7 @@ fn mount_home_tmpfs() {
             data.as_ptr() as *const libc::c_void,
         )
     };
-    if ret == 0 {
-        eprintln!("Mounted tmpfs on /home/user (nosuid,nodev)");
-    } else {
+    if ret != 0 {
         eprintln!(
             "Warning: tmpfs mount on /home/user failed: {}",
             std::io::Error::last_os_error()
@@ -104,49 +146,38 @@ fn mount_readonly_paths() {
         .any(|p| p == "init.rw=1");
 
     if rw_mode {
-        eprintln!("init.rw=1: skipping /usr, /bin, /sbin read-only remounts");
+        log_verbose!("init.rw=1: skipping /usr, /bin, /sbin read-only remounts");
     } else {
-        for (path, label) in [
-            (c"/usr", "/usr read-only with nosuid"),
-            (c"/bin", "/bin read-only with nosuid"),
-            (c"/sbin", "/sbin read-only with nosuid"),
-        ] {
-            if mount_readonly(path) {
-                eprintln!("Mounted {label}");
-            }
+        for path in [c"/usr", c"/bin", c"/sbin"] {
+            let _ = mount_readonly(path);
         }
     }
 
-    for (path, label) in [
-        (c"/etc/hosts", "/etc/hosts read-only"),
-        (c"/etc/resolv.conf", "/etc/resolv.conf read-only"),
-        (c"/dev", "/dev read-only with nosuid"),
-        (c"/proc/sys", "/proc/sys read-only"),
-        (c"/proc/sysrq-trigger", "/proc/sysrq-trigger read-only"),
+    // A5: Removed per-mount eprintln! calls — each is an expensive serial write
+    // Note: /dev is NOT made read-only because:
+    //   1. It races with listen_virtio_serial() opening /dev/virtio-ports/* (A1 phase split)
+    //   2. setup_deferred_operations() creates /dev/fd symlinks and mounts /dev/shm
+    //   3. Dangerous device nodes (/dev/mem, /dev/kmem, /dev/port, /dev/vda, /dev/zram0)
+    //      are already removed by tiny-init and guest-agent respectively
+    for path in [
+        c"/etc/hosts",
+        c"/etc/resolv.conf",
+        c"/proc/sys",
+        c"/proc/sysrq-trigger",
     ] {
-        if mount_readonly(path) {
-            eprintln!("Mounted {label}");
-        }
+        let _ = mount_readonly(path);
     }
 }
 
 /// Configure loopback and eth0 network interfaces.
+/// No wait loop for eth0 — configure if present, skip if not.
+/// Called from spawn_blocking in setup_network_background().
 fn setup_network() {
     let _ = StdCommand::new("ip")
         .args(["link", "set", "lo", "up"])
         .status();
-    eprintln!("Loopback interface up");
-
-    // Wait for eth0 (up to 1 second)
-    for _ in 0..50 {
-        if std::path::Path::new("/sys/class/net/eth0").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
 
     if std::path::Path::new("/sys/class/net/eth0").exists() {
-        eprintln!("Configuring network...");
         let _ = StdCommand::new("ip")
             .args(["link", "set", "eth0", "up"])
             .status();
@@ -156,41 +187,324 @@ fn setup_network() {
         let _ = StdCommand::new("ip")
             .args(["route", "add", "default", "via", "192.168.127.1"])
             .status();
-        eprintln!("Network configured: 192.168.127.2/24 via 192.168.127.1");
 
-        // Verify gvproxy connectivity
-        let mut gvproxy_ok = false;
-        for delay_ms in [50, 100, 200, 400, 800, 1000, 1000] {
-            let result = StdCommand::new("ping")
-                .args(["-c", "1", "-W", "1", "192.168.127.1"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if let Ok(status) = result
-                && status.success()
-            {
-                eprintln!("gvproxy connectivity verified");
-                gvproxy_ok = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        }
-        if !gvproxy_ok {
-            eprintln!("Warning: gvproxy not reachable, package install may fail");
-        }
+        // Verify gvproxy connectivity. ExecuteCode/InstallPackages gate on
+        // NETWORK_READY, so network is guaranteed ready before code/package ops.
+        verify_gvproxy();
     } else {
         eprintln!("Warning: eth0 not found, network unavailable");
     }
 }
 
 // ============================================================================
+// Deferred operations (B1, B4, B5 — moved off tiny-init critical path)
+// ============================================================================
+
+/// B5: Create /dev/fd and /dev/std* symlinks.
+/// Required for bash process substitution <() and /dev/std* portability.
+fn setup_dev_symlinks() {
+    use std::os::unix::fs::symlink;
+    let _ = symlink("/proc/self/fd", "/dev/fd");
+    let _ = symlink("/proc/self/fd/0", "/dev/stdin");
+    let _ = symlink("/proc/self/fd/1", "/dev/stdout");
+    let _ = symlink("/proc/self/fd/2", "/dev/stderr");
+}
+
+/// B4: Mount /dev/shm for POSIX shared memory / semaphores.
+/// Only needed for Python multiprocessing and similar use cases.
+fn setup_dev_shm() {
+    let ret = unsafe {
+        let source = std::ffi::CString::new("tmpfs").unwrap();
+        let target = std::ffi::CString::new("/dev/shm").unwrap();
+        let fstype = std::ffi::CString::new("tmpfs").unwrap();
+        let data = std::ffi::CString::new("size=64M,noswap").unwrap();
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if ret != 0 {
+        // Non-fatal: only needed for multiprocessing
+        let _ = std::fs::create_dir_all("/dev/shm");
+        let ret2 = unsafe {
+            let source = std::ffi::CString::new("tmpfs").unwrap();
+            let target = std::ffi::CString::new("/dev/shm").unwrap();
+            let fstype = std::ffi::CString::new("tmpfs").unwrap();
+            let data = std::ffi::CString::new("size=64M,noswap").unwrap();
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                fstype.as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                data.as_ptr() as *const libc::c_void,
+            )
+        };
+        if ret2 != 0 {
+            eprintln!(
+                "Warning: /dev/shm mount failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// E4: Pre-write REPL wrapper scripts during init (saves 1-2ms on first spawn).
+/// Scripts are compile-time constants; writing them eagerly avoids async overhead later.
+fn pre_write_repl_wrappers() {
+    use crate::constants::SANDBOX_ROOT;
+    use crate::repl::wrappers::*;
+    let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER);
+    let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER);
+    let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER);
+}
+
+/// B1: Full zram device setup (moved from tiny-init).
+/// Includes: device wait, compression config, disksize, mkswap, swapon, VM tuning.
+fn setup_zram_swap() {
+    use std::io::Write;
+    use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
+
+    // Syscall numbers for swapon(2)
+    #[cfg(target_arch = "x86_64")]
+    const SYS_SWAPON: libc::c_long = 167;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SWAPON: libc::c_long = 224;
+    const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
+
+    // Wait for zram device to appear after module load (loaded by tiny-init)
+    // Exponential backoff: 0.5+1+2+4+8+16 = 31.5ms max
+    let delays_us = [500, 1000, 2000, 4000, 8000, 16000];
+    let found = {
+        let mut ok = false;
+        for &delay_us in &delays_us {
+            if Path::new("/sys/block/zram0").exists() {
+                ok = true;
+                break;
+            }
+            thread::sleep(Duration::from_micros(delay_us));
+        }
+        if !ok {
+            ok = Path::new("/sys/block/zram0").exists();
+        }
+        ok
+    };
+    if !found {
+        eprintln!("[zram] device not found, skipping");
+        return;
+    }
+
+    // Compression algorithm fallback chain: lz4 -> lzo-rle -> lzo
+    let algo = ["lz4", "lzo-rle", "lzo"]
+        .iter()
+        .find(|a| std::fs::write("/sys/block/zram0/comp_algorithm", a).is_ok());
+    if algo.is_none() {
+        eprintln!("[zram] failed to set compression algorithm, skipping");
+        return;
+    }
+
+    // Kernel 6.16+: algorithm-specific tuning via sysfs
+    let _ = std::fs::write("/sys/block/zram0/algorithm_params", "level=1");
+
+    let mem_kb: u64 = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0);
+
+    if mem_kb == 0 {
+        eprintln!("[zram] failed to read MemTotal, skipping");
+        return;
+    }
+
+    // disksize = 50% of RAM (in bytes)
+    let zram_size = mem_kb * 512;
+    if std::fs::write("/sys/block/zram0/disksize", zram_size.to_string()).is_err() {
+        eprintln!("[zram] failed to set disksize, skipping");
+        return;
+    }
+
+    // Build and write swap header (mkswap equivalent)
+    let header = match build_swap_header(zram_size) {
+        Some(h) => h,
+        None => {
+            eprintln!("[zram] device too small for swap, skipping");
+            return;
+        }
+    };
+    let header_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).open("/dev/zram0")?;
+        f.write_all(&header)
+    })();
+    if let Err(e) = header_result {
+        eprintln!("[zram] mkswap failed: {e}, skipping");
+        return;
+    }
+
+    // swapon with high priority
+    let dev = std::ffi::CString::new("/dev/zram0").unwrap();
+    let ret = unsafe { libc::syscall(SYS_SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) };
+    if ret < 0 {
+        eprintln!(
+            "[zram] swapon failed (errno={}), skipping",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    // Security: remove device node after swapon
+    let _ = std::fs::remove_file("/dev/zram0");
+
+    // VM tuning for zram is pre-applied in apply_zram_vm_tuning() before
+    // /proc/sys is made read-only. No sysctl writes needed here.
+}
+
+/// Build a swap header for the given device size.
+/// Returns a 4096-byte header or None if the size is too small.
+fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
+    let pages = (device_size / 4096).saturating_sub(1) as u32;
+    if pages < 10 {
+        return None; // kernel rejects tiny swap
+    }
+    let mut header = vec![0u8; 4096];
+    // SWAPSPACE2 signature at offset 4086
+    header[4086..4096].copy_from_slice(b"SWAPSPACE2");
+    // version = 1
+    header[1024..1028].copy_from_slice(&1u32.to_le_bytes());
+    // last_page (0-indexed: total_pages - 1, since page 0 is header)
+    header[1028..1032].copy_from_slice(&pages.to_le_bytes());
+    Some(header)
+}
+
+// ============================================================================
+// Sysctl hardening (moved from tiny-init for boot latency; modules_disabled stays in tiny-init)
+// ============================================================================
+
+/// E3: Critical sysctl — must be applied before any request handling.
+/// These block privilege escalation and info-leak vectors that sandbox
+/// code could exploit immediately.
+const SYSCTL_CRITICAL: &[(&str, &str)] = &[
+    // eBPF: CVE-2020-8835, CVE-2021-3490, CVE-2021-31440, CVE-2023-2163
+    ("/proc/sys/kernel/unprivileged_bpf_disabled", "2"),
+    // User namespaces: CVE-2022-0185, CVE-2023-0386
+    ("/proc/sys/kernel/unprivileged_userns_clone", "0"),
+    ("/proc/sys/user/max_user_namespaces", "0"),
+    // Kernel address exposure
+    ("/proc/sys/kernel/kptr_restrict", "2"),
+    // dmesg restriction
+    ("/proc/sys/kernel/dmesg_restrict", "1"),
+    // Perf events
+    ("/proc/sys/kernel/perf_event_paranoid", "3"),
+    // BPF JIT hardening
+    ("/proc/sys/net/core/bpf_jit_harden", "2"),
+    // userfaultfd
+    ("/proc/sys/vm/unprivileged_userfaultfd", "0"),
+    // YAMA ptrace_scope
+    ("/proc/sys/kernel/yama/ptrace_scope", "2"),
+];
+
+/// E3: Deferred sysctl — defense-in-depth settings safe to apply after Ping.
+/// These harden filesystem and limit attack surface but aren't exploitable
+/// in the window between Ping-ready and background completion.
+const SYSCTL_DEFERRED: &[(&str, &str)] = &[
+    // Filesystem link protections
+    ("/proc/sys/fs/protected_symlinks", "1"),
+    ("/proc/sys/fs/protected_hardlinks", "1"),
+    ("/proc/sys/fs/protected_fifos", "2"),
+    ("/proc/sys/fs/protected_regular", "2"),
+    // suid_dumpable
+    ("/proc/sys/fs/suid_dumpable", "0"),
+    // SysRq keyboard combos
+    ("/proc/sys/kernel/sysrq", "0"),
+    // Thread bomb mitigation
+    ("/proc/sys/kernel/threads-max", "1200"),
+];
+
+fn apply_sysctl_critical() {
+    for &(path, value) in SYSCTL_CRITICAL {
+        let _ = std::fs::write(path, value);
+    }
+}
+
+fn apply_sysctl_deferred() {
+    for &(path, value) in SYSCTL_DEFERRED {
+        let _ = std::fs::write(path, value);
+    }
+}
+
+/// Pre-apply zram VM tuning sysctls before /proc/sys is made read-only.
+/// These values are safe to set even before zram device setup completes:
+/// the kernel uses defaults until swapon, then these take effect.
+fn apply_zram_vm_tuning() {
+    let mem_kb: u64 = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0);
+
+    if mem_kb == 0 {
+        return;
+    }
+
+    let _ = std::fs::write("/proc/sys/vm/page-cluster", "0");
+    let _ = std::fs::write("/proc/sys/vm/swappiness", "180");
+    let _ = std::fs::write(
+        "/proc/sys/vm/min_free_kbytes",
+        (mem_kb * 4 / 100).to_string(),
+    );
+    let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "0");
+    let _ = std::fs::write("/proc/sys/vm/defrag_mode", "1");
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
-/// Set file mode on multiple paths (non-fatal).
-fn chmod_paths(mode: &str, paths: &[&str]) {
+/// Verify gvproxy connectivity with exponential backoff.
+/// Blocks phase 2 completion, so ExecuteCode/InstallPackages wait for network.
+/// Exponential backoff: 0.5+1+2+4+8+16 = 31.5ms between pings (max ~37.5s with ping -W 1).
+fn verify_gvproxy() {
+    let delays_us = [500, 1000, 2000, 4000, 8000, 16000];
+    for (i, &delay_us) in delays_us.iter().enumerate() {
+        match StdCommand::new("ping")
+            .args(["-c", "1", "-W", "1", "192.168.127.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(s) if s.success() => {
+                log_verbose!("Network verified: gvproxy reachable (attempt {})", i + 1);
+                return;
+            }
+            _ => {
+                std::thread::sleep(std::time::Duration::from_micros(delay_us));
+            }
+        }
+    }
+    eprintln!(
+        "Warning: gvproxy unreachable after {} attempts, network may fail",
+        delays_us.len()
+    );
+}
+
+/// A2: Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
+fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
     for path in paths {
-        let _ = StdCommand::new("chmod").args([mode, path]).status();
+        if let Ok(cpath) = std::ffi::CString::new(*path) {
+            unsafe { libc::chmod(cpath.as_ptr(), mode) };
+        }
     }
 }
 

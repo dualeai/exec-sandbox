@@ -17,8 +17,19 @@
 //! - /dev/virtio-ports/org.dualeai.cmd (host → guest, read-only)
 //! - /dev/virtio-ports/org.dualeai.event (guest → host, write-only)
 
-mod connection;
 mod constants;
+
+/// E4: Conditional logging — suppressed when `init.quiet=1` is on the kernel cmdline.
+/// Avoids MMIO/UART trap overhead for non-essential messages on the boot critical path.
+macro_rules! log_verbose {
+    ($($arg:tt)*) => {
+        if !*crate::constants::QUIET_MODE {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+mod connection;
 mod error;
 mod file_io;
 mod init;
@@ -29,11 +40,20 @@ mod validation;
 
 use constants::*;
 
+fn monotonic_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
 /// Listen on virtio-serial ports with reconnection loop.
 async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::fs::OpenOptions;
 
-    eprintln!(
+    log_verbose!(
         "Guest agent opening virtio-serial ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH}"
     );
 
@@ -42,7 +62,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let cmd_file = match connection::NonBlockingFile::open_read(CMD_PORT_PATH) {
             Ok(f) => {
-                eprintln!("Guest agent connected to command port (read, non-blocking)");
+                log_verbose!("Guest agent connected to command port (read, non-blocking)");
                 f
             }
             Err(e) => {
@@ -55,7 +75,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 
         match cmd_file.is_host_connected() {
             Ok(true) => {
-                eprintln!("Host is connected, proceeding with connection setup");
+                log_verbose!("Host is connected, proceeding with connection setup");
                 backoff_ms = INITIAL_BACKOFF_MS;
             }
             Ok(false) => {
@@ -78,7 +98,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 
         let event_file = match OpenOptions::new().write(true).open(EVENT_PORT_PATH).await {
             Ok(f) => {
-                eprintln!("Guest agent connected to event port (write)");
+                log_verbose!("Guest agent connected to event port (write)");
                 f
             }
             Err(e) => {
@@ -88,6 +108,8 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+
+        eprintln!("[timing] agent_connected: {}ms (monotonic)", monotonic_ms());
 
         let mut cmd_file = cmd_file;
         if let Err(e) = connection::handle_connection(&mut cmd_file, event_file).await {
@@ -99,13 +121,36 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::process::id() == 1 {
-        eprintln!("Guest agent running as PID 1 (init)...");
-        init::setup_init_environment();
-        eprintln!("Enabling zombie reaper...");
-        tokio::spawn(init::reap_zombies());
-    }
+    let t_start = monotonic_ms();
+    eprintln!("[timing] agent_start: {}ms (monotonic)", t_start);
 
-    eprintln!("Guest agent starting (dual ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH})...");
+    // Phase 1 — minimal setup (env vars only, <1ms)
+    init::setup_phase1();
+    let t_phase1 = monotonic_ms();
+    eprintln!(
+        "[timing] agent_phase1: {}ms ({}ms elapsed)",
+        t_phase1,
+        t_phase1 - t_start
+    );
+
+    // Phase 2 core — sync init (chmod, mounts, critical sysctl, dev setup, ~10ms)
+    // E3: zram and deferred sysctl moved to background tasks
+    init::setup_phase2_core();
+    let t_phase2 = monotonic_ms();
+    eprintln!(
+        "[timing] agent_phase2_core: {}ms ({}ms elapsed)",
+        t_phase2,
+        t_phase2 - t_start
+    );
+
+    // Background tasks — none block Ping/file I/O readiness.
+    // ExecuteCode/InstallPackages gate on NETWORK_READY only.
+    tokio::spawn(init::setup_network_background());
+    tokio::spawn(init::setup_zram_background());
+    tokio::spawn(init::reap_zombies());
+
+    log_verbose!(
+        "Guest agent starting (dual ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH})..."
+    );
     listen_virtio_serial().await
 }

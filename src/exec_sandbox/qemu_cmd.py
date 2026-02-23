@@ -376,15 +376,32 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # See: https://github.com/firecracker-microvm/firecracker
             # See: https://www.qemu.org/docs/master/system/i386/microvm.html
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
+            # C1: quiet + loglevel=0: suppress all non-emergency kernel messages (20-50ms)
+            " quiet loglevel=0"
+            # C2: Skip page zeroing on alloc/free — safe for ephemeral VMs (1-5% boot time)
+            " init_on_alloc=0 init_on_free=0"
+            # C3: Skip timer calibration — safe in virtualized env with reliable TSC (10-30ms)
+            " no_timer_check"
+            # C5: Skip SCSI bus scanning — no SCSI devices in microvm (5-10ms)
+            " scsi_mod.scan=none"
+            # C6: Disable Enhanced Disk Drive BIOS probing (2-5ms)
+            " edd=off"
+            # C7: Remove I/O port delay — no real hardware in VM (2-5ms)
+            " io_delay=none"
+            # C8: Disable kernel audit framework if compiled in (5-10ms)
+            " audit=0"
             # init.net=1: load network modules when networking is needed
             # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
             # init.balloon=1: load balloon module (always, needed for warm pool)
             + (" init.net=1" if (allow_network or expose_ports) else "")
             + (" init.rw=1" if direct_write else "")
             + " init.balloon=1"
+            # E4: Suppress non-essential guest console output (saves MMIO/UART traps)
+            + " init.quiet=1"
             # tsc=reliable only for x86_64 (TSC is x86-specific, ARM uses CNTVCT_EL0)
-            + (" tsc=reliable" if arch == HostArch.X86_64 else ""),
+            # C4: Explicit TSC clocksource selection, skip probing (5-10ms, x86_64 only)
+            + (" tsc=reliable clocksource=tsc" if arch == HostArch.X86_64 else ""),
         ]
     )
 
@@ -458,7 +475,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             qemu_args.extend(
                 [
                     "-device",
-                    f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128",
+                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
+                    f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128,event_idx=off",
                 ]
             )
         case HostOS.LINUX | HostOS.UNKNOWN:
@@ -468,7 +486,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                     # NOTE: Removed logical_block_size=4096,physical_block_size=4096
                     # Small ext4 filesystems (<512MB) use 1024-byte blocks by default, so forcing
                     # 4096-byte block size causes mount failures ("Invalid argument")
-                    f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128",
+                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
+                    f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off",
                 ]
             )
 
@@ -577,10 +596,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
     # - deflate-on-oom: guest returns memory under OOM pressure
     # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
+    #   D1: Disable during cold boot to avoid kernel page scanning overhead (10-20ms)
+    #   Warm pool VMs re-enable via QMP after boot completes
     qemu_args.extend(
         [
             "-device",
-            f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=on",
+            f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=off",
         ]
     )
 

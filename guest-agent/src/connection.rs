@@ -207,8 +207,24 @@ pub(crate) async fn handle_connection(
 
         eprintln!("Received request ({bytes_read} bytes)");
 
-        match serde_json::from_str::<GuestCommand>(&line) {
-            Ok(GuestCommand::Ping) => {
+        // Parse command first, then gate non-Ping commands on init phase 2
+        let cmd = match serde_json::from_str::<GuestCommand>(&line) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("JSON parse error: {e}");
+                let _ = send_streaming_error(
+                    &write_tx,
+                    format!("Invalid JSON: {e}"),
+                    "request_error",
+                    None,
+                )
+                .await;
+                continue;
+            }
+        };
+
+        match cmd {
+            GuestCommand::Ping => {
                 eprintln!("Processing: ping");
                 if send_response(&write_tx, &GuestResponse::Pong { version: VERSION })
                     .await
@@ -217,7 +233,7 @@ pub(crate) async fn handle_connection(
                     break Err("write queue closed".into());
                 }
             }
-            Ok(GuestCommand::WarmRepl { language }) => {
+            GuestCommand::WarmRepl { language } => {
                 eprintln!("Processing: warm_repl (language={language})");
                 let lang = match Language::parse(&language) {
                     Some(l) => l,
@@ -277,7 +293,9 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            Ok(GuestCommand::InstallPackages { language, packages }) => {
+            GuestCommand::InstallPackages { language, packages } => {
+                // Gate: wait for network setup (ip + gvproxy) before package install
+                crate::init::wait_for_network().await;
                 eprintln!(
                     "Processing: install_packages (language={language}, count={})",
                     packages.len()
@@ -321,12 +339,14 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            Ok(GuestCommand::ExecuteCode {
+            GuestCommand::ExecuteCode {
                 language,
                 code,
                 timeout,
                 env_vars,
-            }) => {
+            } => {
+                // Gate: wait for network setup (ip + gvproxy) before code execution
+                crate::init::wait_for_network().await;
                 eprintln!(
                     "Processing: execute_code (language={language}, code_size={}, timeout={timeout}s, env_vars={})",
                     code.len(),
@@ -352,11 +372,11 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            Ok(GuestCommand::WriteFile {
+            GuestCommand::WriteFile {
                 op_id,
                 path,
                 make_executable,
-            }) => {
+            } => {
                 eprintln!(
                     "Processing: write_file (op_id={op_id}, path={path}, executable={make_executable})"
                 );
@@ -393,7 +413,7 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            Ok(GuestCommand::FileChunk { op_id, data }) => {
+            GuestCommand::FileChunk { op_id, data } => {
                 if !active_writes.contains_key(&op_id) {
                     let _ = send_streaming_error(
                         &write_tx,
@@ -471,7 +491,7 @@ pub(crate) async fn handle_connection(
                     continue;
                 }
             }
-            Ok(GuestCommand::FileEnd { op_id }) => {
+            GuestCommand::FileEnd { op_id } => {
                 let ActiveWriteHandle {
                     chunk_tx,
                     task,
@@ -532,7 +552,7 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            Ok(GuestCommand::ReadFile { op_id, path }) => {
+            GuestCommand::ReadFile { op_id, path } => {
                 eprintln!("Processing: read_file (op_id={op_id}, path={path})");
                 match handle_read_file(&op_id, &path, &write_tx).await {
                     Ok(()) => {}
@@ -553,7 +573,7 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            Ok(GuestCommand::ListFiles { path }) => {
+            GuestCommand::ListFiles { path } => {
                 eprintln!("Processing: list_files (path={path})");
                 match handle_list_files(&path, &write_tx).await {
                     Ok(()) => {}
@@ -573,16 +593,6 @@ pub(crate) async fn handle_connection(
                         break Err(e.to_string().into());
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("JSON parse error: {e}");
-                let _ = send_streaming_error(
-                    &write_tx,
-                    format!("Invalid JSON: {e}"),
-                    "request_error",
-                    None,
-                )
-                .await;
             }
         }
     };

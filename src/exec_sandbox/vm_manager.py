@@ -1260,7 +1260,7 @@ class VmManager:
 
         async def check_guest_ready() -> None:
             """Single guest readiness check attempt."""
-            await vm.channel.connect(timeout_seconds=5)
+            await vm.channel.connect(timeout_seconds=1)
             response = await vm.channel.send_request(PingRequest(), timeout=5)
 
             # Ping returns PongMessage
@@ -1285,8 +1285,9 @@ class VmManager:
                 #
                 # Timeout is short (1s vs previous 2s) because sockets are usually not ready this early.
                 # The retry loop below handles actual connection with proper exponential backoff.
+                # E3: Reduced pre-connect timeout from 0.1s to 0.01s — speculative, enters retry loop faster
                 try:
-                    await vm.channel.connect(timeout_seconds=1)
+                    await vm.channel.connect(timeout_seconds=0.005)
                     logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": vm.vm_id})
                 except (TimeoutError, OSError) as e:
                     # Expected - sockets may not be ready yet, retry loop will handle
@@ -1297,9 +1298,10 @@ class VmManager:
                     retry=retry_if_exception_type(
                         (TimeoutError, OSError, json.JSONDecodeError, RuntimeError, asyncio.IncompleteReadError)
                     ),
-                    # Reduced min from 0.1s to 0.01s for faster guest detection (agent ready in ~200-300ms)
-                    wait=wait_random_exponential(multiplier=0.05, min=0.01, max=1.0),
-                    before_sleep=before_sleep_log(logger, logging.DEBUG),
+                    # E1: Tighter retry backoff for faster guest detection
+                    # E4: Reduced max from 0.2s to 0.05s — retries cap at 50ms intervals,
+                    # catching guest readiness within ~10ms instead of ~150ms overshoot
+                    wait=wait_random_exponential(multiplier=0.02, min=0.005, max=0.05),
                 ):
                     with attempt:
                         guest_task = asyncio.create_task(check_guest_ready())

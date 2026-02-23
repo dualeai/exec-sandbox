@@ -123,7 +123,7 @@ class GuestChannel(Protocol):
     Uses structural typing (Protocol) instead of inheritance.
     """
 
-    async def connect(self, timeout_seconds: int) -> None:
+    async def connect(self, timeout_seconds: float) -> None:
         """Establish connection to guest agent."""
         ...
 
@@ -253,7 +253,7 @@ class UnixSocketChannel:
         self._write_task: asyncio.Task[None] | None = None
         self._shutdown_event: asyncio.Event = asyncio.Event()
 
-    async def connect(self, timeout_seconds: int) -> None:
+    async def connect(self, timeout_seconds: float) -> None:
         """Connect to guest via Unix socket with mandatory peer verification.
 
         Single connection attempt with timeout (no retry).
@@ -578,7 +578,7 @@ class DualPortChannel:
         self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
         self._dispatcher: FileOpDispatcher | None = None
 
-    async def connect(self, timeout_seconds: int) -> None:
+    async def connect(self, timeout_seconds: float) -> None:
         """Connect both command and event ports.
 
         Connects in parallel for speed. Single connection attempt with timeout (no retry).

@@ -1,9 +1,9 @@
-//! REPL process lifecycle: spawn and write wrapper scripts.
+//! REPL process lifecycle: spawn wrapper scripts.
+//! E4: Wrapper scripts are pre-written by init::setup_phase2_core().
 
 use tokio::process::Command;
 
 use crate::constants::*;
-use crate::repl::wrappers::*;
 use crate::types::Language;
 
 /// State for a persistent REPL process.
@@ -14,32 +14,13 @@ pub(crate) struct ReplState {
     pub(crate) stderr: tokio::process::ChildStderr,
 }
 
-/// Write REPL wrapper script to SANDBOX_ROOT for the given language.
-pub(crate) async fn write_repl_wrapper(
-    language: Language,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match language {
-        Language::Python => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER).await?
-        }
-        Language::Javascript => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER).await?
-        }
-        Language::Raw => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?
-        }
-    }
-    Ok(())
-}
-
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally.
+/// E4: Wrapper scripts are pre-written by init::setup_phase2_core().
 pub(crate) async fn spawn_repl(
     language: Language,
 ) -> Result<ReplState, Box<dyn std::error::Error>> {
-    write_repl_wrapper(language).await?;
-
     let mut cmd = match language {
         Language::Python => {
             let mut c = Command::new("python3");

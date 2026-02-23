@@ -10,25 +10,19 @@ use std::time::Duration;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod syscall_nr {
     pub(crate) const FINIT_MODULE: libc::c_long = 313;
-    pub(crate) const SWAPON: libc::c_long = 167;
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod syscall_nr {
     pub(crate) const FINIT_MODULE: libc::c_long = 273;
-    pub(crate) const SWAPON: libc::c_long = 224;
 }
 
 // Mount flags
 pub(crate) const MS_NOSUID: libc::c_ulong = 0x2;
 pub(crate) const MS_NODEV: libc::c_ulong = 0x4;
-pub(crate) const MS_NOEXEC: libc::c_ulong = 0x8;
 pub(crate) const MS_RDONLY: libc::c_ulong = 0x1;
 pub(crate) const MS_NOATIME: libc::c_ulong = 0x400;
 pub(crate) const MS_MOVE: libc::c_ulong = 0x2000;
-
-// Swap flags
-pub(crate) const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
 
 /// Write to stderr using raw syscall (safe before Rust stdio init).
 ///
@@ -55,6 +49,13 @@ macro_rules! log_fmt {
             libc::write(2, b"\n".as_ptr() as *const libc::c_void, 1);
         }
     }};
+}
+
+/// Get monotonic time in microseconds (for boot timing instrumentation).
+pub(crate) fn monotonic_us() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
 }
 
 pub(crate) fn last_errno() -> i32 {

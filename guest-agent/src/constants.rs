@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use crate::repl::ReplState;
 use crate::types::Language;
@@ -31,8 +31,9 @@ pub(crate) const WRITE_QUEUE_SIZE: usize = 128;
 pub(crate) const READ_TIMEOUT_MS: u64 = 12000; // 12s > 10s health check interval
 
 // Host disconnection backoff configuration
-pub(crate) const INITIAL_BACKOFF_MS: u64 = 50;
-pub(crate) const MAX_BACKOFF_MS: u64 = 1000;
+// Reduced to 1ms: virtio-serial port is typically ready within 1-2ms
+pub(crate) const INITIAL_BACKOFF_MS: u64 = 1;
+pub(crate) const MAX_BACKOFF_MS: u64 = 200;
 
 // Environment variable limits
 pub(crate) const MAX_ENV_VARS: usize = 100;
@@ -63,6 +64,17 @@ pub(crate) const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
 
 // Graceful termination configuration
 pub(crate) const TERM_GRACE_PERIOD_SECONDS: u64 = 5;
+
+/// E4: Quiet mode — suppress non-essential eprintln! on the boot critical path.
+/// Each eprintln! triggers an MMIO trap through the console device (~0.1-5ms per line
+/// depending on console type: virtio-console, PL011, ISA serial).
+/// Enabled by `init.quiet=1` on the kernel command line.
+pub(crate) static QUIET_MODE: LazyLock<bool> = LazyLock::new(|| {
+    std::fs::read_to_string("/proc/cmdline")
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .any(|p| p == "init.quiet=1")
+});
 
 /// Blocked dangerous environment variables (case-insensitive check at validation time).
 pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
@@ -111,6 +123,11 @@ pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
     "MALLOC_TRACE",
     "MALLOC_PERTURB_",
 ];
+
+/// Network readiness gate: signals when ip + gvproxy setup is complete.
+/// ExecuteCode/InstallPackages wait on this; Ping/file I/O respond immediately.
+pub(crate) static NETWORK_READY: AtomicBool = AtomicBool::new(false);
+pub(crate) static NETWORK_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 /// Monotonic counter for sentinel IDs. Combined with nanosecond timestamp
 /// to produce unique, unpredictable IDs without the uuid crate dependency.
