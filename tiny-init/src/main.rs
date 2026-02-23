@@ -44,7 +44,7 @@ fn load_modules(kver: &str) {
     let m = format!("/lib/modules/{}/kernel", kver);
     let load = |modules: &[&str], base: &str| {
         for module in modules {
-            sys::load_module(&format!("{}/{}", base, module), false);
+            sys::load_module(&format!("{}/{}", base, module));
         }
     };
 
@@ -136,7 +136,7 @@ fn mount_rootfs() {
     if sys::mount("/dev/vda", "/mnt", "ext4", mount_flags, "") != 0 {
         // Fallback: try without specifying fstype
         if sys::mount("/dev/vda", "/mnt", "", mount_flags, "") != 0 {
-            sys::error("mount /dev/vda failed");
+            log_error!("mount /dev/vda failed");
             sys::fallback_shell();
         }
     }
@@ -154,7 +154,7 @@ fn mount_rootfs() {
 fn switch_root() -> ! {
     // cd /mnt
     if std::env::set_current_dir("/mnt").is_err() {
-        sys::error("chdir /mnt failed");
+        log_error!("chdir /mnt failed");
         sys::fallback_shell();
     }
 
@@ -189,7 +189,7 @@ fn switch_root() -> ! {
     // Step 2: chroot .
     let chroot_ret = unsafe { libc::chroot(dot.as_ptr()) };
     if chroot_ret != 0 {
-        sys::error("chroot failed");
+        log_error!("chroot failed");
         sys::fallback_shell();
     }
 
@@ -247,12 +247,12 @@ fn switch_root() -> ! {
     let args: [*const libc::c_char; 2] = [prog.as_ptr(), std::ptr::null()];
     unsafe { libc::execv(prog.as_ptr(), args.as_ptr()) };
 
-    // execv only returns on error - report errno for debugging
-    let errno = sys::last_errno();
+    // execv only returns on error
     // Common errno: 2=ENOENT, 8=ENOEXEC (wrong arch), 13=EACCES, 14=EFAULT
-    log_fmt!("[init] execv failed: errno={}", errno);
-
-    sys::error("execv guest-agent failed");
+    log_error!(
+        "execv /usr/local/bin/guest-agent failed: errno={}",
+        sys::last_errno()
+    );
     sys::fallback_shell();
 }
 
@@ -264,12 +264,16 @@ fn main() {
     // B5: /dev symlinks deferred to guest-agent
 
     device::redirect_to_console();
-    log_fmt!("[timing] mount_vfs: {}.{}ms", (t1 - t0) / 1000, ((t1 - t0) % 1000) / 100);
+    log_info!(
+        "[timing] mount_vfs: {}.{}ms",
+        (t1 - t0) / 1000,
+        ((t1 - t0) % 1000) / 100
+    );
 
     let kver = match sys::get_kernel_version() {
         Some(v) => v,
         None => {
-            sys::error("uname failed");
+            log_error!("uname failed");
             sys::fallback_shell();
         }
     };
@@ -277,34 +281,58 @@ fn main() {
 
     load_modules(&kver);
     let t4 = sys::monotonic_us();
-    log_fmt!("[timing] load_modules: {}.{}ms", (t4 - t3) / 1000, ((t4 - t3) % 1000) / 100);
+    log_info!(
+        "[timing] load_modules: {}.{}ms",
+        (t4 - t3) / 1000,
+        ((t4 - t3) % 1000) / 100
+    );
 
     zram::load_zram_modules(&kver);
     let t5 = sys::monotonic_us();
-    log_fmt!("[timing] zram_modules: {}.{}ms", (t5 - t4) / 1000, ((t5 - t4) % 1000) / 100);
+    log_info!(
+        "[timing] zram_modules: {}.{}ms",
+        (t5 - t4) / 1000,
+        ((t5 - t4) % 1000) / 100
+    );
 
     // B2: Wait for vda + virtio-ports in parallel (independent devices)
     let vda_handle = std::thread::spawn(|| device::wait_for_block_device("/dev/vda"));
     let virtio_ok = device::wait_for_virtio_ports();
     let vda_ok = vda_handle.join().unwrap_or(false);
     if !vda_ok {
-        sys::error("timeout waiting for /dev/vda");
+        log_error!("timeout waiting for /dev/vda");
     }
     if virtio_ok {
         device::setup_virtio_ports();
     }
     let t6 = sys::monotonic_us();
-    log_fmt!("[timing] wait_devices: {}.{}ms", (t6 - t5) / 1000, ((t6 - t5) % 1000) / 100);
+    log_info!(
+        "[timing] wait_devices: {}.{}ms",
+        (t6 - t5) / 1000,
+        ((t6 - t5) % 1000) / 100
+    );
 
     mount_rootfs();
     let t7 = sys::monotonic_us();
-    log_fmt!("[timing] mount_rootfs: {}.{}ms", (t7 - t6) / 1000, ((t7 - t6) % 1000) / 100);
+    log_info!(
+        "[timing] mount_rootfs: {}.{}ms",
+        (t7 - t6) / 1000,
+        ((t7 - t6) % 1000) / 100
+    );
 
     disable_module_loading();
     let t8 = sys::monotonic_us();
-    log_fmt!("[timing] modules_disabled: {}.{}ms", (t8 - t7) / 1000, ((t8 - t7) % 1000) / 100);
+    log_info!(
+        "[timing] modules_disabled: {}.{}ms",
+        (t8 - t7) / 1000,
+        ((t8 - t7) % 1000) / 100
+    );
 
-    log_fmt!("[timing] init_total: {}.{}ms", (t8 - t0) / 1000, ((t8 - t0) % 1000) / 100);
+    log_info!(
+        "[timing] init_total: {}.{}ms",
+        (t8 - t0) / 1000,
+        ((t8 - t0) % 1000) / 100
+    );
     switch_root();
 }
 

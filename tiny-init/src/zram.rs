@@ -25,9 +25,9 @@ fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
 /// phase 2 to keep it off the critical boot path.
 pub(crate) fn load_zram_modules(kver: &str) {
     let m = format!("/lib/modules/{}/kernel", kver);
-    sys::load_module(&format!("{}/lib/lz4/lz4_compress.ko", m), false);
-    sys::load_module(&format!("{}/crypto/lz4.ko", m), false);
-    sys::load_module(&format!("{}/drivers/block/zram/zram.ko", m), false);
+    sys::load_module(&format!("{}/lib/lz4/lz4_compress.ko", m));
+    sys::load_module(&format!("{}/crypto/lz4.ko", m));
+    sys::load_module(&format!("{}/drivers/block/zram/zram.ko", m));
 }
 
 // B1: Device setup (disksize, mkswap, swapon, VM tuning) moved to guest-agent

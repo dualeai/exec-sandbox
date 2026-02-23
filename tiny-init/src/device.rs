@@ -121,13 +121,10 @@ pub(crate) fn remove_device_node(path: &str) {
     if let Ok(cpath) = CString::new(path)
         && unsafe { libc::chmod(cpath.as_ptr(), 0) } == 0
     {
-        log_fmt!(
-            "[init] WARNING: could not remove {}, chmod 000 applied",
-            path
-        );
+        log_warn!("could not remove {}, chmod 000 applied", path);
         return;
     }
-    log_fmt!("[init] WARNING: could not remove or chmod {}", path);
+    log_warn!("could not remove or chmod {}", path);
 }
 
 #[cfg(test)]

@@ -41,19 +41,33 @@ pub(crate) const MS_MOVE: libc::c_ulong = 0x2000;
 ///
 /// See: https://github.com/rust-lang/rust/issues/24821
 /// See: https://rust-lang.github.io/rfcs/1014-stdout-existential-crisis.html
-macro_rules! log_fmt {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
+macro_rules! _log_write {
+    ($level:literal, $($arg:tt)*) => {{
+        let msg = format!(concat!("[", $level, "] {}\n"), format_args!($($arg)*));
         unsafe {
             libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            libc::write(2, b"\n".as_ptr() as *const libc::c_void, 1);
         }
     }};
 }
 
+macro_rules! log_info {
+    ($($arg:tt)*) => { _log_write!("INFO", $($arg)*) };
+}
+
+macro_rules! log_warn {
+    ($($arg:tt)*) => { _log_write!("WARN", $($arg)*) };
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => { _log_write!("ERROR", $($arg)*) };
+}
+
 /// Get monotonic time in microseconds (for boot timing instrumentation).
 pub(crate) fn monotonic_us() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
 }
@@ -100,24 +114,21 @@ pub(crate) fn mount_move(source: &str, target: &str) -> i32 {
     }
 }
 
-pub(crate) fn load_module(path: &str, debug: bool) -> bool {
+#[allow(unused_variables)] // `name` used only by log_debug! (elided in release)
+pub(crate) fn load_module(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
 
     let path_cstr = match CString::new(path) {
         Ok(p) => p,
         Err(_) => {
-            if debug {
-                log_fmt!("[module] {}: invalid path", name);
-            }
+            log_debug!("[module] {}: invalid path", name);
             return false;
         }
     };
 
     let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
-        if debug {
-            log_fmt!("[module] {}: open failed (errno={})", name, last_errno());
-        }
+        log_debug!("[module] {}: open failed (errno={})", name, last_errno());
         return false;
     }
 
@@ -131,24 +142,19 @@ pub(crate) fn load_module(path: &str, debug: bool) -> bool {
         )
     };
 
+    // Capture errno from finit_module BEFORE close() can clobber it
+    let finit_errno = if ret != 0 { last_errno() } else { 0 };
     unsafe { libc::close(fd) };
 
     if ret == 0 {
-        if debug {
-            log_fmt!("[module] {}: ok", name);
-        }
+        log_debug!("[module] {}: ok", name);
         return true;
     }
-    let errno = last_errno();
-    if errno == libc::EEXIST {
-        if debug {
-            log_fmt!("[module] {}: built-in", name);
-        }
+    if finit_errno == libc::EEXIST {
+        log_debug!("[module] {}: built-in", name);
         return true;
     }
-    if debug {
-        log_fmt!("[module] {}: errno={}", name, errno);
-    }
+    log_debug!("[module] {}: errno={}", name, finit_errno);
     false
 }
 
@@ -172,10 +178,6 @@ pub(crate) fn cmdline_has(flag: &str) -> bool {
     fs::read_to_string("/proc/cmdline")
         .map(|s| parse_cmdline_has(&s, flag))
         .unwrap_or(false)
-}
-
-pub(crate) fn error(msg: &str) {
-    log_fmt!("[init] ERROR: {}", msg);
 }
 
 pub(crate) fn fallback_shell() -> ! {
