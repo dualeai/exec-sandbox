@@ -28,7 +28,7 @@ pub(crate) const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max single 
 pub(crate) const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
 // Bounded channel size for the guest→host write queue.
 pub(crate) const WRITE_QUEUE_SIZE: usize = 128;
-pub(crate) const READ_TIMEOUT_MS: u64 = 12000; // 12s > 10s health check interval
+pub(crate) const READ_TIMEOUT_MS: u64 = 18000; // 18s > 15s health check interval
 
 // Host disconnection backoff configuration
 // Reduced to 1ms: virtio-serial port is typically ready within 1-2ms

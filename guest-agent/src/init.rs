@@ -69,10 +69,16 @@ pub(crate) fn setup_phase2_core() {
     apply_sysctl_critical();
     apply_sysctl_deferred();
     apply_zram_vm_tuning();
-    mount_readonly_paths();
+    // Reduce virtio-blk readahead from default 128 KB to 32 KB. Python startup
+    // reads hundreds of scattered small .pyc files (4-16 KB each) — 128 KB
+    // prefetch causes 8-32x I/O amplification per file. 32 KB reduces wasted
+    // prefetch while still helping sequential reads of larger .so files.
+    let _ = std::fs::write("/sys/block/vda/queue/read_ahead_kb", "32");
+    // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()
+    // which now makes /dev read-only.
     setup_dev_symlinks();
     setup_dev_shm();
-    pre_write_repl_wrappers();
+    mount_readonly_paths();
 }
 
 /// Background zram setup: device wait, compression, mkswap, swapon, VM tuning.
@@ -154,12 +160,14 @@ fn mount_readonly_paths() {
     }
 
     // A5: Removed per-mount log_info! calls — each is an expensive serial write
-    // Note: /dev is NOT made read-only because:
-    //   1. It races with listen_virtio_serial() opening /dev/virtio-ports/* (A1 phase split)
-    //   2. setup_deferred_operations() creates /dev/fd symlinks and mounts /dev/shm
-    //   3. Dangerous device nodes (/dev/mem, /dev/kmem, /dev/port, /dev/vda, /dev/zram0)
-    //      are already removed by tiny-init and guest-agent respectively
+    // /dev is safe to make read-only here: setup_dev_symlinks() and setup_dev_shm()
+    // run before this function. listen_virtio_serial() opens existing device files
+    // (not creating new ones), so read-only /dev doesn't block it. The background
+    // zram setup opens /dev/zram0 (an existing block device) for write — the block
+    // device layer bypasses VFS permission checks, so RO bind mount doesn't block it.
+    // The remove_file("/dev/zram0") at cleanup is already `let _ =` (ignores EROFS).
     for path in [
+        c"/dev",
         c"/etc/hosts",
         c"/etc/resolv.conf",
         c"/proc/sys",
@@ -248,14 +256,17 @@ fn setup_dev_shm() {
     }
 }
 
-/// E4: Pre-write REPL wrapper scripts during init (saves 1-2ms on first spawn).
-/// Scripts are compile-time constants; writing them eagerly avoids async overhead later.
-fn pre_write_repl_wrappers() {
+/// Lazily write REPL wrapper scripts on first spawn (deferred from init for boot speed).
+/// Scripts are compile-time constants; std::sync::Once ensures write-once semantics.
+pub(crate) fn ensure_repl_wrappers() {
     use crate::constants::SANDBOX_ROOT;
     use crate::repl::wrappers::*;
-    let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER);
-    let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER);
-    let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER);
+        let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER);
+        let _ = std::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER);
+    });
 }
 
 /// B1: Full zram device setup (moved from tiny-init).

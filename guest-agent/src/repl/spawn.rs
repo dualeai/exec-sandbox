@@ -1,5 +1,5 @@
 //! REPL process lifecycle: spawn wrapper scripts.
-//! E4: Wrapper scripts are pre-written by init::setup_phase2_core().
+//! Wrapper scripts are lazily written on first spawn via init::ensure_repl_wrappers().
 
 use tokio::process::Command;
 
@@ -17,10 +17,13 @@ pub(crate) struct ReplState {
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally.
-/// E4: Wrapper scripts are pre-written by init::setup_phase2_core().
+/// Wrapper scripts are lazily written on first call (deferred from init for boot speed).
 pub(crate) async fn spawn_repl(
     language: Language,
 ) -> Result<ReplState, Box<dyn std::error::Error>> {
+    // Lazily write REPL wrapper scripts on first spawn
+    crate::init::ensure_repl_wrappers();
+
     let mut cmd = match language {
         Language::Python => {
             let mut c = Command::new("python3");

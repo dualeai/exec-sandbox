@@ -1,6 +1,4 @@
-//! zram swap setup.
-
-use crate::sys;
+//! zram swap header utilities.
 
 /// Build a swap header for the given device size.
 /// Returns a 4096-byte header or None if the size is too small.
@@ -19,19 +17,6 @@ fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
     header[1028..1032].copy_from_slice(&pages.to_le_bytes());
     Some(header)
 }
-
-/// B1: Load zram modules only (before modules_disabled=1).
-/// Device setup (disksize, mkswap, swapon, VM tuning) is deferred to guest-agent
-/// phase 2 to keep it off the critical boot path.
-pub(crate) fn load_zram_modules(kver: &str) {
-    let m = format!("/lib/modules/{}/kernel", kver);
-    sys::load_module(&format!("{}/lib/lz4/lz4_compress.ko", m));
-    sys::load_module(&format!("{}/crypto/lz4.ko", m));
-    sys::load_module(&format!("{}/drivers/block/zram/zram.ko", m));
-}
-
-// B1: Device setup (disksize, mkswap, swapon, VM tuning) moved to guest-agent
-// phase 2 (init::setup_deferred_operations). Only module loading remains here.
 
 #[cfg(test)]
 mod tests {

@@ -1,21 +1,10 @@
 //! Syscall wrappers, constants, and kernel queries.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-
-// Syscall numbers
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod syscall_nr {
-    pub(crate) const FINIT_MODULE: libc::c_long = 313;
-}
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod syscall_nr {
-    pub(crate) const FINIT_MODULE: libc::c_long = 273;
-}
 
 // Mount flags
 pub(crate) const MS_NOSUID: libc::c_ulong = 0x2;
@@ -112,62 +101,6 @@ pub(crate) fn mount_move(source: &str, target: &str) -> i32 {
             std::ptr::null(),
         )
     }
-}
-
-#[allow(unused_variables)] // `name` used only by log_debug! (elided in release)
-pub(crate) fn load_module(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-
-    let path_cstr = match CString::new(path) {
-        Ok(p) => p,
-        Err(_) => {
-            log_debug!("[module] {}: invalid path", name);
-            return false;
-        }
-    };
-
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        log_debug!("[module] {}: open failed (errno={})", name, last_errno());
-        return false;
-    }
-
-    let params = CString::new("").unwrap();
-    let ret = unsafe {
-        libc::syscall(
-            syscall_nr::FINIT_MODULE,
-            fd,
-            params.as_ptr(),
-            0 as libc::c_int,
-        )
-    };
-
-    // Capture errno from finit_module BEFORE close() can clobber it
-    let finit_errno = if ret != 0 { last_errno() } else { 0 };
-    unsafe { libc::close(fd) };
-
-    if ret == 0 {
-        log_debug!("[module] {}: ok", name);
-        return true;
-    }
-    if finit_errno == libc::EEXIST {
-        log_debug!("[module] {}: built-in", name);
-        return true;
-    }
-    log_debug!("[module] {}: errno={}", name, finit_errno);
-    false
-}
-
-pub(crate) fn get_kernel_version() -> Option<String> {
-    let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut utsname) } != 0 {
-        return None;
-    }
-    Some(
-        unsafe { CStr::from_ptr(utsname.release.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
 }
 
 fn parse_cmdline_has(cmdline: &str, flag: &str) -> bool {

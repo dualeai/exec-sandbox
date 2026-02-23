@@ -55,10 +55,12 @@ runs:
         run-id: ${{ steps.latest-run.outputs.run_id }}
       continue-on-error: true
 
-    - name: Extract kernel
+    - name: Build kernel + initramfs
       shell: bash
       env:
         ALPINE_VERSION: ${{ inputs.alpine-version }}
+        BUILDX_CACHE_FROM: type=gha,ignore-error=true
+        BUILDX_CACHE_TO: type=gha,mode=max,ignore-error=true
       run: ./scripts/extract-kernel.sh ${{ inputs.arch }}
 
     - name: Build qcow2

@@ -1,6 +1,7 @@
 //! Minimal init for QEMU microVMs
 //!
-//! Handles kernel modules, zram, devtmpfs, read-only rootfs mount, and switch_root.
+//! Custom kernel (CONFIG_MODULES=n): all drivers are built-in.
+//! Handles devtmpfs, read-only rootfs mount, and switch_root.
 
 #[macro_use]
 mod sys;
@@ -10,56 +11,6 @@ mod zram;
 use std::ffi::CString;
 use std::fs;
 
-// Module paths relative to /lib/modules/<kver>/kernel/
-const CORE_MODULES: &[&str] = &[
-    "drivers/virtio/virtio_mmio.ko",
-    "drivers/block/virtio_blk.ko",
-];
-
-const NET_MODULES: &[&str] = &[
-    "net/core/failover.ko",
-    "drivers/net/net_failover.ko",
-    "drivers/net/virtio_net.ko",
-];
-
-const BALLOON_MODULES: &[&str] = &["drivers/virtio/virtio_balloon.ko"];
-
-// Alpine 3.23 / kernel 6.18 paths
-const FS_MODULES: &[&str] = &[
-    "lib/crc/crc16.ko",
-    "crypto/crc32c-cryptoapi.ko",
-    "fs/mbcache.ko",
-    "fs/jbd2/jbd2.ko",
-    "fs/ext4/ext4.ko",
-];
-
-/// Disable kernel module loading (irreversible once set to 1).
-/// MUST run after all modules are loaded (CORE, FS, NET, BALLOON, ZRAM).
-/// All other sysctl hardening is deferred to guest-agent for boot latency.
-fn disable_module_loading() {
-    let _ = fs::write("/proc/sys/kernel/modules_disabled", "1");
-}
-
-fn load_modules(kver: &str) {
-    let m = format!("/lib/modules/{}/kernel", kver);
-    let load = |modules: &[&str], base: &str| {
-        for module in modules {
-            sys::load_module(&format!("{}/{}", base, module));
-        }
-    };
-
-    load(CORE_MODULES, &m);
-    load(FS_MODULES, &m);
-
-    // Optional modules (sequential after CORE — NET depends on virtio)
-    if sys::cmdline_has("init.net=1") {
-        load(NET_MODULES, &m);
-    }
-    if sys::cmdline_has("init.balloon=1") {
-        load(BALLOON_MODULES, &m);
-    }
-}
-
 fn mount_virtual_filesystems() {
     sys::mount("devtmpfs", "/dev", "devtmpfs", 0, "");
 
@@ -67,12 +18,6 @@ fn mount_virtual_filesystems() {
     // /dev/mem exposes raw physical memory, /dev/kmem kernel virtual memory,
     // /dev/port raw I/O ports (x86). Even with CONFIG_STRICT_DEVMEM, the nodes
     // exist and leak kernel config info. Removing them is defense-in-depth.
-    //
-    // Why not lockdown=confidentiality? Alpine's linux-virt APKBUILD strips
-    // modules (INSTALL_MOD_STRIP=1) which destroys the .PKCS7_message ELF
-    // section containing signatures. Lockdown enforces signature verification,
-    // so finit_module() returns EPERM for every module, preventing boot.
-    // See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=941827
     for path in ["/dev/mem", "/dev/kmem", "/dev/port"] {
         device::remove_device_node(path);
     }
@@ -270,31 +215,6 @@ fn main() {
         ((t1 - t0) % 1000) / 100
     );
 
-    let kver = match sys::get_kernel_version() {
-        Some(v) => v,
-        None => {
-            log_error!("uname failed");
-            sys::fallback_shell();
-        }
-    };
-    let t3 = sys::monotonic_us();
-
-    load_modules(&kver);
-    let t4 = sys::monotonic_us();
-    log_info!(
-        "[timing] load_modules: {}.{}ms",
-        (t4 - t3) / 1000,
-        ((t4 - t3) % 1000) / 100
-    );
-
-    zram::load_zram_modules(&kver);
-    let t5 = sys::monotonic_us();
-    log_info!(
-        "[timing] zram_modules: {}.{}ms",
-        (t5 - t4) / 1000,
-        ((t5 - t4) % 1000) / 100
-    );
-
     // B2: Wait for vda + virtio-ports in parallel (independent devices)
     let vda_handle = std::thread::spawn(|| device::wait_for_block_device("/dev/vda"));
     let virtio_ok = device::wait_for_virtio_ports();
@@ -305,84 +225,25 @@ fn main() {
     if virtio_ok {
         device::setup_virtio_ports();
     }
-    let t6 = sys::monotonic_us();
+    let t2 = sys::monotonic_us();
     log_info!(
         "[timing] wait_devices: {}.{}ms",
-        (t6 - t5) / 1000,
-        ((t6 - t5) % 1000) / 100
+        (t2 - t1) / 1000,
+        ((t2 - t1) % 1000) / 100
     );
 
     mount_rootfs();
-    let t7 = sys::monotonic_us();
+    let t3 = sys::monotonic_us();
     log_info!(
         "[timing] mount_rootfs: {}.{}ms",
-        (t7 - t6) / 1000,
-        ((t7 - t6) % 1000) / 100
-    );
-
-    disable_module_loading();
-    let t8 = sys::monotonic_us();
-    log_info!(
-        "[timing] modules_disabled: {}.{}ms",
-        (t8 - t7) / 1000,
-        ((t8 - t7) % 1000) / 100
+        (t3 - t2) / 1000,
+        ((t3 - t2) % 1000) / 100
     );
 
     log_info!(
         "[timing] init_total: {}.{}ms",
-        (t8 - t0) / 1000,
-        ((t8 - t0) % 1000) / 100
+        (t3 - t0) / 1000,
+        ((t3 - t0) % 1000) / 100
     );
     switch_root();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Module loading array data invariant tests
-
-    #[test]
-    fn module_paths_end_with_ko() {
-        for &path in CORE_MODULES
-            .iter()
-            .chain(NET_MODULES)
-            .chain(BALLOON_MODULES)
-            .chain(FS_MODULES)
-        {
-            assert!(path.ends_with(".ko"), "not a .ko file: {}", path);
-        }
-    }
-
-    #[test]
-    fn module_paths_are_relative() {
-        for &path in CORE_MODULES
-            .iter()
-            .chain(NET_MODULES)
-            .chain(BALLOON_MODULES)
-            .chain(FS_MODULES)
-        {
-            assert!(!path.starts_with('/'), "should be relative: {}", path);
-        }
-    }
-
-    #[test]
-    fn module_no_duplicates() {
-        let all: Vec<&str> = CORE_MODULES
-            .iter()
-            .chain(NET_MODULES)
-            .chain(BALLOON_MODULES)
-            .chain(FS_MODULES)
-            .copied()
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        for path in &all {
-            assert!(seen.insert(path), "duplicate module: {}", path);
-        }
-    }
-
-    #[test]
-    fn ext4_module_present() {
-        assert!(FS_MODULES.contains(&"fs/ext4/ext4.ko"));
-    }
 }

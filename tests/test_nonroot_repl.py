@@ -311,5 +311,5 @@ print(f"ret={ret} errno={err}")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
-        # Should get EPERM (1)
-        assert "errno=1" in result.stdout or "errno=2" in result.stdout
+        # EPERM=1 (no CAP_SYS_MODULE), ENOENT=2, or ENOSYS=38 (CONFIG_MODULES=n)
+        assert "errno=1" in result.stdout or "errno=2" in result.stdout or "errno=38" in result.stdout

@@ -598,7 +598,11 @@ build_qcow2() {
             chmod 644 /build/rootfs/etc/passwd /build/rootfs/etc/group /build/rootfs/etc/resolv.conf /build/rootfs/etc/hosts
             [ -f /build/rootfs/etc/shadow ] && chmod 640 /build/rootfs/etc/shadow
             virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
-            qemu-img convert -f raw -O qcow2 -c -m 8 -W /build/rootfs.raw /output/$output_name.qcow2
+            # Optimize ext4 for read-only rootfs:
+            # - Remove journal (rootfs is mounted read-only, saves ~4MB + mount overhead)
+            # - Set reserved blocks to 0% (no root reserved space needed)
+            tune2fs -O ^has_journal -m 0 /build/rootfs.raw
+            qemu-img convert -f raw -O qcow2 -c -m 8 -W -o cluster_size=128k /build/rootfs.raw /output/$output_name.qcow2
             rm -rf /build/rootfs /build/rootfs.raw
         "
 

@@ -3,13 +3,14 @@
 #
 # Orchestrates the build of all VM image components:
 #   1. guest-agent + tiny-init (Rust binaries, in parallel)
-#   2. kernel + initramfs (from Alpine, needs tiny-init)
+#   2. kernel + initramfs + vmlinux (extract-kernel.sh orchestrates all three)
 #   3. qcow2 disk images (python, node, raw variants)
 #
 # Artifact dependency graph:
 #
 #   tiny-init src → tiny-init binary → initramfs (QEMU -initrd, NOT inside qcow2)
 #   guest-agent src → guest-agent binary → embedded in qcow2 (guestfish-patchable)
+#   kernel config fragment → custom vmlinuz (CONFIG_MODULES=n, all drivers built-in)
 #   rootfs packages (Alpine, Python, Node) → qcow2 (full rebuild only)
 #
 # Caching: each artifact has a .hash sidecar file (content-addressable input key,
@@ -56,9 +57,10 @@ build_for_arch() {
     wait $pid_agent || { echo "[$arch] Guest-agent build failed" >&2; return 1; }
     wait $pid_init || { echo "[$arch] tiny-init build failed" >&2; return 1; }
 
-    # Step 2: Extract kernel + build initramfs (needs tiny-init)
-    echo "[$arch] Extracting kernel + building initramfs..."
-    "$SCRIPT_DIR/extract-kernel.sh" "$arch" || { echo "[$arch] Kernel extraction failed" >&2; return 1; }
+    # Step 2: Build kernel + initramfs + vmlinux (extract-kernel.sh orchestrates)
+    # Kernel build (build-kernel.sh) runs first, then initramfs + vmlinux extraction.
+    echo "[$arch] Building kernel + initramfs..."
+    "$SCRIPT_DIR/extract-kernel.sh" "$arch" || { echo "[$arch] Kernel build failed" >&2; return 1; }
 
     # Step 3: Build qcow2 images (parallelized inside build-qcow2.sh)
     echo "[$arch] Building qcow2 images..."

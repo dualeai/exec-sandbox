@@ -57,8 +57,8 @@ pub(crate) fn wait_for_block_device(path: &str) -> bool {
         Err(_) => return false,
     };
 
-    // B3: Tighter exponential backoff: 0.2+0.5+1+2+4+8+16 = 31.7ms max
-    poll_backoff(&[200, 500, 1000, 2000, 4000, 8000, 16000], || {
+    // Tighter exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8ms max
+    poll_backoff(&[100, 200, 500, 1000, 2000, 4000, 8000], || {
         let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         if fd >= 0 {
             unsafe { libc::close(fd) };
@@ -72,8 +72,8 @@ pub(crate) fn wait_for_block_device(path: &str) -> bool {
 pub(crate) fn wait_for_virtio_ports() -> bool {
     // Wait for virtio-ports directory to have entries
     // Uses any() to stop at first entry (more efficient than count())
-    // B3: Tighter exponential backoff: 0.2+0.5+1+2+4+8+16 = 31.7ms max
-    poll_backoff(&[200, 500, 1000, 2000, 4000, 8000, 16000], || {
+    // Tighter exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8ms max
+    poll_backoff(&[100, 200, 500, 1000, 2000, 4000, 8000], || {
         fs::read_dir("/sys/class/virtio-ports")
             .map(|mut entries| entries.any(|e| e.is_ok()))
             .unwrap_or(false)

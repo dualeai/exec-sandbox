@@ -188,8 +188,8 @@ WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
 
-WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 10
-"""Health check interval for warm VMs in seconds (matches K8s/Cloud Run periodSeconds default)."""
+WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 15
+"""Health check interval for warm VMs in seconds."""
 
 WARM_POOL_HEALTH_CHECK_MAX_RETRIES: Final[int] = 3
 """Maximum retry attempts before declaring VM unhealthy (matches K8s failureThreshold)."""
