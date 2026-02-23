@@ -42,7 +42,8 @@ compute_hash() {
         echo "rust=$RUST_VERSION"
         cat "$REPO_ROOT/guest-agent/Cargo.lock" 2>/dev/null || true
         cat "$REPO_ROOT/guest-agent/Cargo.toml" 2>/dev/null || true
-        find "$REPO_ROOT/guest-agent/src" -type f -name "*.rs" -print0 2>/dev/null | \
+        # Hash all source files: .rs code + embedded scripts (.py, .mjs, .sh via include_str!())
+        find "$REPO_ROOT/guest-agent/src" -type f \( -name "*.rs" -o -name "*.py" -o -name "*.mjs" -o -name "*.sh" \) -print0 2>/dev/null | \
             sort -z | xargs -0 cat 2>/dev/null || true
     ) | sha256sum | cut -d' ' -f1
 }
