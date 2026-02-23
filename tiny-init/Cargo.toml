@@ -11,6 +11,10 @@ categories = ["virtualization"]
 [dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+serial_test = "3"
+proptest = "1"
+
 [profile.release]
 opt-level = "z"       # Optimize for size
 lto = true            # Link-time optimization
