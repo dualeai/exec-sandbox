@@ -113,7 +113,7 @@ pub(crate) async fn spawn_repl(
         let pid = match child.id() {
             Some(id) => id as libc::pid_t,
             None => {
-                eprintln!("WARNING: REPL child exited before prlimit64(RLIMIT_NPROC)");
+                log_warn!("REPL child exited before prlimit64(RLIMIT_NPROC)");
                 0
             }
         };
@@ -129,7 +129,7 @@ pub(crate) async fn spawn_repl(
             };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
-                eprintln!("WARNING: prlimit64(RLIMIT_NPROC) failed for pid {pid}: {err}");
+                log_warn!("prlimit64(RLIMIT_NPROC) failed for pid {pid}: {err}");
             }
         }
     }
@@ -138,7 +138,7 @@ pub(crate) async fn spawn_repl(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    eprintln!("Spawned REPL for language={}", language.as_str());
+    log_info!("Spawned REPL for language={}", language.as_str());
 
     Ok(ReplState {
         child,

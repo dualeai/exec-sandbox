@@ -19,12 +19,24 @@
 
 mod constants;
 
-/// E4: Conditional logging — suppressed when `init.quiet=1` is on the kernel cmdline.
-/// Avoids MMIO/UART trap overhead for non-essential messages on the boot critical path.
-macro_rules! log_verbose {
+/// Logging macros — severity-leveled wrappers around eprintln!.
+///
+/// Output format: `[LEVEL] message` — consistent with tiny-init's convention
+/// for greppable serial console output across the full boot chain.
+///
+/// `log_error!` and `log_warn!` always print (rare, important).
+/// `log_info!` is gated on `init.quiet=1` to avoid MMIO/UART trap overhead
+/// on the boot critical path.
+macro_rules! log_error {
+    ($($arg:tt)*) => { eprintln!("[ERROR] {}", format_args!($($arg)*)) };
+}
+macro_rules! log_warn {
+    ($($arg:tt)*) => { eprintln!("[WARN] {}", format_args!($($arg)*)) };
+}
+macro_rules! log_info {
     ($($arg:tt)*) => {
         if !*crate::constants::QUIET_MODE {
-            eprintln!($($arg)*);
+            eprintln!("[INFO] {}", format_args!($($arg)*));
         }
     };
 }
@@ -53,7 +65,7 @@ fn monotonic_ms() -> u64 {
 async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::fs::OpenOptions;
 
-    log_verbose!(
+    log_info!(
         "Guest agent opening virtio-serial ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH}"
     );
 
@@ -62,11 +74,11 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let cmd_file = match connection::NonBlockingFile::open_read(CMD_PORT_PATH) {
             Ok(f) => {
-                log_verbose!("Guest agent connected to command port (read, non-blocking)");
+                log_info!("Guest agent connected to command port (read, non-blocking)");
                 f
             }
             Err(e) => {
-                eprintln!("Failed to open command port: {e}, retrying in {backoff_ms}ms...");
+                log_error!("Failed to open command port: {e}, retrying in {backoff_ms}ms...");
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
@@ -75,18 +87,18 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 
         match cmd_file.is_host_connected() {
             Ok(true) => {
-                log_verbose!("Host is connected, proceeding with connection setup");
+                log_info!("Host is connected, proceeding with connection setup");
                 backoff_ms = INITIAL_BACKOFF_MS;
             }
             Ok(false) => {
-                eprintln!("Host not connected (POLLHUP), waiting {backoff_ms}ms before retry...");
+                log_warn!("Host not connected (POLLHUP), waiting {backoff_ms}ms before retry...");
                 drop(cmd_file);
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
             Err(e) => {
-                eprintln!(
+                log_error!(
                     "Failed to check host connection status: {e}, retrying in {backoff_ms}ms..."
                 );
                 drop(cmd_file);
@@ -98,22 +110,22 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 
         let event_file = match OpenOptions::new().write(true).open(EVENT_PORT_PATH).await {
             Ok(f) => {
-                log_verbose!("Guest agent connected to event port (write)");
+                log_info!("Guest agent connected to event port (write)");
                 f
             }
             Err(e) => {
-                eprintln!("Failed to open event port: {e}, retrying in {backoff_ms}ms...");
+                log_error!("Failed to open event port: {e}, retrying in {backoff_ms}ms...");
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
         };
 
-        eprintln!("[timing] agent_connected: {}ms (monotonic)", monotonic_ms());
+        log_info!("[timing] agent_connected: {}ms (monotonic)", monotonic_ms());
 
         let mut cmd_file = cmd_file;
         if let Err(e) = connection::handle_connection(&mut cmd_file, event_file).await {
-            eprintln!("Connection error: {e}, reopening ports...");
+            log_error!("Connection error: {e}, reopening ports...");
             tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
         }
     }
@@ -122,12 +134,12 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_start = monotonic_ms();
-    eprintln!("[timing] agent_start: {}ms (monotonic)", t_start);
+    log_info!("[timing] agent_start: {}ms (monotonic)", t_start);
 
     // Phase 1 — minimal setup (env vars only, <1ms)
     init::setup_phase1();
     let t_phase1 = monotonic_ms();
-    eprintln!(
+    log_info!(
         "[timing] agent_phase1: {}ms ({}ms elapsed)",
         t_phase1,
         t_phase1 - t_start
@@ -137,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // E3: zram and deferred sysctl moved to background tasks
     init::setup_phase2_core();
     let t_phase2 = monotonic_ms();
-    eprintln!(
+    log_info!(
         "[timing] agent_phase2_core: {}ms ({}ms elapsed)",
         t_phase2,
         t_phase2 - t_start
@@ -149,8 +161,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(init::setup_zram_background());
     tokio::spawn(init::reap_zombies());
 
-    log_verbose!(
-        "Guest agent starting (dual ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH})..."
-    );
+    log_info!("Guest agent starting (dual ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH})...");
     listen_virtio_serial().await
 }

@@ -172,7 +172,7 @@ pub(crate) async fn graceful_terminate_process_group(
     if term_result == -1 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!("SIGTERM to process group {pid} failed: {errno}");
+            log_error!("SIGTERM to process group {pid} failed: {errno}");
         }
         let _ = child.wait().await;
         return Ok(());
@@ -181,8 +181,8 @@ pub(crate) async fn graceful_terminate_process_group(
     // Phase 2: Wait for grace period
     match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
         Ok(Ok(_)) => return Ok(()),
-        Ok(Err(e)) => eprintln!("Wait error after SIGTERM: {e}"),
-        Err(_) => eprintln!(
+        Ok(Err(e)) => log_error!("Wait error after SIGTERM: {e}"),
+        Err(_) => log_warn!(
             "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
         ),
     }
@@ -192,7 +192,7 @@ pub(crate) async fn graceful_terminate_process_group(
     if kill_result == -1 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!("SIGKILL to process group {pid} failed: {errno}");
+            log_error!("SIGKILL to process group {pid} failed: {errno}");
         }
     }
 

@@ -126,7 +126,7 @@ pub(crate) fn prepend_env_vars(
                         .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
                         || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                     {
-                        eprintln!("Skipping invalid shell env var key: {:?}", key);
+                        log_warn!("Skipping invalid shell env var key: {:?}", key);
                         continue;
                     }
                     let escaped_val = value.replace('\'', "'\"'\"'");

@@ -53,7 +53,7 @@ pub(crate) async fn execute_code_streaming(
         match states.remove(&language) {
             Some(mut existing) => match existing.child.try_wait() {
                 Ok(Some(_)) => {
-                    eprintln!("REPL for {} died, spawning fresh", language.as_str());
+                    log_warn!("REPL for {} died, spawning fresh", language.as_str());
                     was_fresh_spawn = true;
                     spawn_repl(language)
                         .await
@@ -103,7 +103,7 @@ pub(crate) async fn execute_code_streaming(
     }
     .await;
     if let Err(e) = write_result {
-        eprintln!("REPL stdin write failed: {e}");
+        log_error!("REPL stdin write failed: {e}");
         let _ = repl.child.kill().await;
         let _ = repl.child.wait().await;
         return Err(CmdError::execution(format!(
@@ -243,7 +243,7 @@ pub(crate) async fn execute_code_streaming(
         Ok(()) => {
             let status = repl.child.wait().await;
             let exit_code = status.map(exit_code_from_status).unwrap_or(-1);
-            eprintln!(
+            log_warn!(
                 "REPL for {} died with exit_code={}",
                 language.as_str(),
                 exit_code
@@ -261,7 +261,7 @@ pub(crate) async fn execute_code_streaming(
             .await?;
         }
         Err(_) => {
-            eprintln!(
+            log_warn!(
                 "REPL for {} timed out after {}s, killing",
                 language.as_str(),
                 effective_timeout

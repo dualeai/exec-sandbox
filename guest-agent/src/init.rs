@@ -17,7 +17,7 @@ pub(crate) async fn reap_zombies() {
     let mut sigchld = match signal(SignalKind::child()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: Failed to register SIGCHLD handler: {e}");
+            log_warn!("Failed to register SIGCHLD handler: {e}");
             return;
         }
     };
@@ -131,8 +131,8 @@ fn mount_home_tmpfs() {
         )
     };
     if ret != 0 {
-        eprintln!(
-            "Warning: tmpfs mount on /home/user failed: {}",
+        log_warn!(
+            "tmpfs mount on /home/user failed: {}",
             std::io::Error::last_os_error()
         );
     }
@@ -146,14 +146,14 @@ fn mount_readonly_paths() {
         .any(|p| p == "init.rw=1");
 
     if rw_mode {
-        log_verbose!("init.rw=1: skipping /usr, /bin, /sbin read-only remounts");
+        log_info!("init.rw=1: skipping /usr, /bin, /sbin read-only remounts");
     } else {
         for path in [c"/usr", c"/bin", c"/sbin"] {
             let _ = mount_readonly(path);
         }
     }
 
-    // A5: Removed per-mount eprintln! calls — each is an expensive serial write
+    // A5: Removed per-mount log_info! calls — each is an expensive serial write
     // Note: /dev is NOT made read-only because:
     //   1. It races with listen_virtio_serial() opening /dev/virtio-ports/* (A1 phase split)
     //   2. setup_deferred_operations() creates /dev/fd symlinks and mounts /dev/shm
@@ -192,7 +192,7 @@ fn setup_network() {
         // NETWORK_READY, so network is guaranteed ready before code/package ops.
         verify_gvproxy();
     } else {
-        eprintln!("Warning: eth0 not found, network unavailable");
+        log_warn!("eth0 not found, network unavailable");
     }
 }
 
@@ -243,10 +243,7 @@ fn setup_dev_shm() {
             )
         };
         if ret2 != 0 {
-            eprintln!(
-                "Warning: /dev/shm mount failed: {}",
-                std::io::Error::last_os_error()
-            );
+            log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
         }
     }
 }
@@ -294,7 +291,7 @@ fn setup_zram_swap() {
         ok
     };
     if !found {
-        eprintln!("[zram] device not found, skipping");
+        log_warn!("[zram] device not found, skipping");
         return;
     }
 
@@ -303,7 +300,7 @@ fn setup_zram_swap() {
         .iter()
         .find(|a| std::fs::write("/sys/block/zram0/comp_algorithm", a).is_ok());
     if algo.is_none() {
-        eprintln!("[zram] failed to set compression algorithm, skipping");
+        log_warn!("[zram] failed to set compression algorithm, skipping");
         return;
     }
 
@@ -321,14 +318,14 @@ fn setup_zram_swap() {
         .unwrap_or(0);
 
     if mem_kb == 0 {
-        eprintln!("[zram] failed to read MemTotal, skipping");
+        log_warn!("[zram] failed to read MemTotal, skipping");
         return;
     }
 
     // disksize = 50% of RAM (in bytes)
     let zram_size = mem_kb * 512;
     if std::fs::write("/sys/block/zram0/disksize", zram_size.to_string()).is_err() {
-        eprintln!("[zram] failed to set disksize, skipping");
+        log_warn!("[zram] failed to set disksize, skipping");
         return;
     }
 
@@ -336,7 +333,7 @@ fn setup_zram_swap() {
     let header = match build_swap_header(zram_size) {
         Some(h) => h,
         None => {
-            eprintln!("[zram] device too small for swap, skipping");
+            log_warn!("[zram] device too small for swap, skipping");
             return;
         }
     };
@@ -345,7 +342,7 @@ fn setup_zram_swap() {
         f.write_all(&header)
     })();
     if let Err(e) = header_result {
-        eprintln!("[zram] mkswap failed: {e}, skipping");
+        log_warn!("[zram] mkswap failed: {e}, skipping");
         return;
     }
 
@@ -353,7 +350,7 @@ fn setup_zram_swap() {
     let dev = std::ffi::CString::new("/dev/zram0").unwrap();
     let ret = unsafe { libc::syscall(SYS_SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) };
     if ret < 0 {
-        eprintln!(
+        log_warn!(
             "[zram] swapon failed (errno={}), skipping",
             std::io::Error::last_os_error()
         );
@@ -485,7 +482,7 @@ fn verify_gvproxy() {
             .status()
         {
             Ok(s) if s.success() => {
-                log_verbose!("Network verified: gvproxy reachable (attempt {})", i + 1);
+                log_info!("Network verified: gvproxy reachable (attempt {})", i + 1);
                 return;
             }
             _ => {
@@ -493,8 +490,8 @@ fn verify_gvproxy() {
             }
         }
     }
-    eprintln!(
-        "Warning: gvproxy unreachable after {} attempts, network may fail",
+    log_warn!(
+        "gvproxy unreachable after {} attempts, network may fail",
         delays_us.len()
     );
 }
@@ -519,8 +516,8 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
             std::ptr::null(),
         );
         if ret != 0 {
-            eprintln!(
-                "Warning: bind mount {} failed: {}",
+            log_warn!(
+                "bind mount {} failed: {}",
                 path.to_string_lossy(),
                 std::io::Error::last_os_error()
             );
@@ -534,8 +531,8 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
             std::ptr::null(),
         );
         if ret != 0 {
-            eprintln!(
-                "Warning: RO remount {} failed: {}",
+            log_warn!(
+                "RO remount {} failed: {}",
                 path.to_string_lossy(),
                 std::io::Error::last_os_error()
             );

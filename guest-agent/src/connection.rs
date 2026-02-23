@@ -148,13 +148,13 @@ pub(crate) async fn handle_connection(
         let mut pending = 0u32;
         while let Some(data) = write_rx.recv().await {
             if let Err(e) = writer.write_all(&data).await {
-                eprintln!("Write error: {e}");
+                log_error!("Write error: {e}");
                 break;
             }
             pending += 1;
             if pending >= 16 || write_rx.is_empty() {
                 if let Err(e) = writer.flush().await {
-                    eprintln!("Flush error: {e}");
+                    log_error!("Flush error: {e}");
                     break;
                 }
                 pending = 0;
@@ -177,16 +177,16 @@ pub(crate) async fn handle_connection(
 
         let bytes_read = match read_result {
             Ok(Ok(0)) => {
-                eprintln!("Connection closed by client");
+                log_info!("Connection closed by client");
                 break Ok(());
             }
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
-                eprintln!("Read error: {e}");
+                log_error!("Read error: {e}");
                 break Err(e.into());
             }
             Err(_) => {
-                eprintln!("Read timeout after {READ_TIMEOUT_MS}ms, reconnecting...");
+                log_warn!("Read timeout after {READ_TIMEOUT_MS}ms, reconnecting...");
                 break Err("read timeout - triggering reconnect".into());
             }
         };
@@ -205,13 +205,13 @@ pub(crate) async fn handle_connection(
             continue;
         }
 
-        eprintln!("Received request ({bytes_read} bytes)");
+        log_info!("Received request ({bytes_read} bytes)");
 
         // Parse command first, then gate non-Ping commands on init phase 2
         let cmd = match serde_json::from_str::<GuestCommand>(&line) {
             Ok(cmd) => cmd,
             Err(e) => {
-                eprintln!("JSON parse error: {e}");
+                log_error!("JSON parse error: {e}");
                 let _ = send_streaming_error(
                     &write_tx,
                     format!("Invalid JSON: {e}"),
@@ -225,7 +225,7 @@ pub(crate) async fn handle_connection(
 
         match cmd {
             GuestCommand::Ping => {
-                eprintln!("Processing: ping");
+                log_info!("Processing: ping");
                 if send_response(&write_tx, &GuestResponse::Pong { version: VERSION })
                     .await
                     .is_err()
@@ -234,7 +234,7 @@ pub(crate) async fn handle_connection(
                 }
             }
             GuestCommand::WarmRepl { language } => {
-                eprintln!("Processing: warm_repl (language={language})");
+                log_info!("Processing: warm_repl (language={language})");
                 let lang = match Language::parse(&language) {
                     Some(l) => l,
                     None => {
@@ -260,7 +260,7 @@ pub(crate) async fn handle_connection(
                 match spawn_repl(lang).await {
                     Ok(repl) => {
                         REPL_STATES.lock().await.insert(lang, repl);
-                        eprintln!("REPL pre-warmed for {language}");
+                        log_info!("REPL pre-warmed for {language}");
                         if send_response(
                             &write_tx,
                             &GuestResponse::WarmReplAck {
@@ -276,7 +276,7 @@ pub(crate) async fn handle_connection(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: eager REPL spawn failed: {e}");
+                        log_warn!("Eager REPL spawn failed: {e}");
                         if send_response(
                             &write_tx,
                             &GuestResponse::WarmReplAck {
@@ -296,7 +296,7 @@ pub(crate) async fn handle_connection(
             GuestCommand::InstallPackages { language, packages } => {
                 // Gate: wait for network setup (ip + gvproxy) before package install
                 crate::init::wait_for_network().await;
-                eprintln!(
+                log_info!(
                     "Processing: install_packages (language={language}, count={})",
                     packages.len()
                 );
@@ -347,7 +347,7 @@ pub(crate) async fn handle_connection(
             } => {
                 // Gate: wait for network setup (ip + gvproxy) before code execution
                 crate::init::wait_for_network().await;
-                eprintln!(
+                log_info!(
                     "Processing: execute_code (language={language}, code_size={}, timeout={timeout}s, env_vars={})",
                     code.len(),
                     env_vars.len()
@@ -377,7 +377,7 @@ pub(crate) async fn handle_connection(
                 path,
                 make_executable,
             } => {
-                eprintln!(
+                log_info!(
                     "Processing: write_file (op_id={op_id}, path={path}, executable={make_executable})"
                 );
                 #[allow(clippy::map_entry)] // Entry API incompatible with async error path
@@ -451,9 +451,11 @@ pub(crate) async fn handle_connection(
                     drop(handle.chunk_tx);
                     match handle.task.await {
                         Ok(Err(write_err)) => {
-                            eprintln!(
+                            log_error!(
                                 "Write pipeline error for '{}' (op_id={}): {}",
-                                write_err.path_display, write_err.op_id, write_err.message
+                                write_err.path_display,
+                                write_err.op_id,
+                                write_err.message
                             );
                             let _ = send_streaming_error(
                                 &write_tx,
@@ -529,9 +531,11 @@ pub(crate) async fn handle_connection(
                         }
                     }
                     Ok(Err(write_err)) => {
-                        eprintln!(
+                        log_error!(
                             "Write pipeline error for '{}' (op_id={}): {}",
-                            write_err.path_display, write_err.op_id, write_err.message
+                            write_err.path_display,
+                            write_err.op_id,
+                            write_err.message
                         );
                         let _ = send_streaming_error(
                             &write_tx,
@@ -553,7 +557,7 @@ pub(crate) async fn handle_connection(
                 }
             }
             GuestCommand::ReadFile { op_id, path } => {
-                eprintln!("Processing: read_file (op_id={op_id}, path={path})");
+                log_info!("Processing: read_file (op_id={op_id}, path={path})");
                 match handle_read_file(&op_id, &path, &write_tx).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
@@ -574,7 +578,7 @@ pub(crate) async fn handle_connection(
                 }
             }
             GuestCommand::ListFiles { path } => {
-                eprintln!("Processing: list_files (path={path})");
+                log_info!("Processing: list_files (path={path})");
                 match handle_list_files(&path, &write_tx).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {

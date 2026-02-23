@@ -65,7 +65,7 @@ pub(crate) const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
 // Graceful termination configuration
 pub(crate) const TERM_GRACE_PERIOD_SECONDS: u64 = 5;
 
-/// E4: Quiet mode — suppress non-essential eprintln! on the boot critical path.
+/// E4: Quiet mode — suppress non-essential log_info! on the boot critical path.
 /// Each eprintln! triggers an MMIO trap through the console device (~0.1-5ms per line
 /// depending on console type: virtio-console, PL011, ISA serial).
 /// Enabled by `init.quiet=1` on the kernel command line.
