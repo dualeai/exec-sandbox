@@ -223,6 +223,11 @@ class Scheduler:
         self._started = False
         logger.info("Scheduler shutdown complete")
 
+    async def wait_pool_ready(self, timeout: float = 120) -> None:
+        """Wait until the warm pool is fully populated. No-op if pool is disabled."""
+        if self._warm_pool:
+            await self._warm_pool.wait_until_ready(timeout)
+
     async def run(
         self,
         code: str,

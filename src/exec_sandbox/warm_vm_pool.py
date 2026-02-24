@@ -202,6 +202,31 @@ class WarmVMPool:
             },
         )
 
+    async def wait_until_ready(self, timeout: float = 120) -> None:
+        """Wait until all language pools are fully populated.
+
+        Polls pool sizes every 200ms until all queues report full().
+        Returns on timeout with a warning if pools never fill (e.g. boot failures).
+
+        Args:
+            timeout: Maximum seconds to wait before returning.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if all(pool.full() for pool in self.pools.values()):
+                return
+            await asyncio.sleep(0.2)
+        logger.warning(
+            "wait_until_ready timed out",
+            extra={
+                "timeout": timeout,
+                **{
+                    f"{lang.value}_pool": f"{self.pools[lang].qsize()}/{self.pool_size_per_language}"
+                    for lang in Language
+                },
+            },
+        )
+
     async def get_vm(
         self,
         language: Language,

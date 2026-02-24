@@ -375,10 +375,9 @@ async def run_benchmarks(
 
     # Warm pool benchmark (if enabled)
     if pool > 0:
-        # Scale wait time more aggressively for larger pools
-        wait_time = pool * 1.0 + 5
-        print(f"\nWaiting {wait_time:.0f}s for warm pool to initialize...")
-        await asyncio.sleep(wait_time)
+        print("\nWaiting for warm pool to replenish...")
+        await scheduler.wait_pool_ready()
+        print("Warm pool ready.")
 
         # Use pool size as concurrency to ensure all VMs come from pool
         for lang in langs:
