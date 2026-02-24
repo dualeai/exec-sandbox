@@ -98,10 +98,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # highmem=off: Keep all RAM below 4GB for simpler memory mapping (faster boot)
         # gic-version=3: Explicit GIC version for TCG (ITS not modeled in TCG)
         # virtualization=off: Disable nested virt emulation (not needed, faster TCG)
+        # its=off: Disable GICv3 ITS (Interrupt Translation Service) — we use virtio-mmio
+        #   (not PCI), so MSI-X translation is unused; skips kernel ITS init (1-3ms)
+        # dtb-randomness=off: Skip writing random seeds to DTB — redundant with
+        #   random.trust_cpu=on in kernel cmdline
         machine_type = (
-            "virt,virtualization=off,highmem=off,gic-version=3,mem-merge=off"
+            "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off"
             if is_macos
-            else "virt,virtualization=off,highmem=off,gic-version=3,mem-merge=off,dump-guest-core=off"
+            else "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,dump-guest-core=off"
         )
         # ARM64 always uses virtio-console (no ISA serial on virt machine)
         use_virtio_console = True
@@ -327,13 +331,19 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-accel",
             accel,
             "-cpu",
-            # For hardware accel use host CPU, for TCG use optimized emulated CPUs
+            # For hardware accel use host CPU with nested virt flags masked;
+            # for TCG use optimized emulated CPUs.
+            # -svm,-vmx: Hide AMD SVM and Intel VMX flags from guest to prevent
+            # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
+            # These flags are x86-specific — ARM64 HVF uses plain "host".
             # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
             # x86 TCG: Haswell required for AVX2 (Python/Bun built for x86_64_v3)
             # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
                 "host"
+                if accel_type in (AccelType.HVF, AccelType.KVM) and arch == HostArch.AARCH64
+                else "host,-svm,-vmx"
                 if accel_type in (AccelType.HVF, AccelType.KVM)
                 else "cortex-a57"
                 if arch == HostArch.AARCH64
@@ -351,40 +361,40 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-initrd",
             str(initramfs_path),
             "-append",
-            # Boot params: console varies by machine type, minimal kernel logging
             # =============================================================
-            # Boot Parameter Optimizations (validated Jan 2025):
-            # - noresume: Skip hibernate resume check (VMs don't hibernate)
-            # - swiotlb=noforce: Disable software I/O TLB (virtio uses direct DMA)
-            # - panic=-1: Immediate reboot on panic (boot timeout handles loops)
-            # - i8042.nokbd: Skip keyboard port check (no PS/2 in VM)
-            # - tsc=reliable: Trust TSC clocksource (x86_64 only, kvmclock stable)
-            # - rootflags=noatime: hint only; tiny-init mounts rootfs with
-            #   MS_RDONLY|MS_NOATIME|MS_NOSUID|MS_NODEV (read-only rootfs)
-            # - numa_balancing=0: Disable NUMA page migration scanner (single-vCPU
-            #   guest has one NUMA node; scanner wastes cycles on TLB shootdowns)
-            #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html
-            # - page_alloc.shuffle=0: Disable page allocator free-list shuffling.
-            #   Reduces allocator overhead with no security downside (KASLR uses
-            #   boot-time randomization, not ongoing free-list shuffling).
-            #   Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
-            # - mitigations: Left at kernel default (mitigations=auto) to match
-            #   AWS Lambda/Firecracker security posture. Enables speculative
-            #   execution mitigations relevant to the actual CPU (Spectre, MDS, etc.).
-            #   Ref: https://docs.kernel.org/admin-guide/hw-vuln/spectre.html
-            #   Ref: CVE-2025-40300 (VMSCAPE Spectre-BTI guest-to-host via KVM)
-            # See: https://github.com/firecracker-microvm/firecracker
-            # See: https://www.qemu.org/docs/master/system/i386/microvm.html
+            # Kernel Command Line (runtime-only params)
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait=2 fsck.mode=skip reboot=t panic=-1 preempt=none i8042.noaux i8042.nomux i8042.nopnp i8042.nokbd init=/init random.trust_cpu=on raid=noautodetect noresume swiotlb=noforce numa_balancing=0 page_alloc.shuffle=0"
-            # init.net=1: load network modules when networking is needed
-            # Required for: allow_network=True (gvproxy) OR expose_ports (QEMU hostfwd)
-            # init.balloon=1: load balloon module (always, needed for warm pool)
-            + (" init.net=1" if (allow_network or expose_ports) else "")
+            # Most boot optimizations are enforced at compile time via kernel
+            # config (exec-sandbox.config). Only params with NO CONFIG equivalent
+            # remain here. See exec-sandbox.config for the full CONFIG↔cmdline map.
+            #
+            # Removed (enforced by CONFIG): init_on_alloc, init_on_free,
+            #   scsi_mod.scan, audit, transparent_hugepage, slab_nomerge,
+            #   nomodule, preempt, noresume, raid, numa_balancing, i8042.*,
+            #   random.trust_cpu, panic, rcupdate.rcu_expedited, edd,
+            #   noautogroup, io_delay
+            # =============================================================
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            # Suppress all non-emergency kernel messages (20-50ms)
+            " quiet loglevel=0"
+            # Skip timer calibration — safe in virtualized env with reliable TSC (10-30ms)
+            " no_timer_check"
+            # Keep expedited RCU after boot (built-in boot expediting covers boot phase)
+            " rcupdate.rcu_normal_after_boot=0"
+            # Limit userspace /dev/kmsg writes
+            " printk.devkmsg=off"
+            # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
+            + (" 8250.nr_uarts=0" if use_virtio_console and arch == HostArch.X86_64 else "")
+            # Force haltpoll cpuidle governor from first idle cycle — polls in-guest
+            # before HLT to avoid VM-exit cost (overrides menu, the NO_HZ_IDLE default)
+            + " cpuidle.governor=haltpoll"
+            # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
+            + " deferred_probe_timeout=0"
             + (" init.rw=1" if direct_write else "")
-            + " init.balloon=1"
-            # tsc=reliable only for x86_64 (TSC is x86-specific, ARM uses CNTVCT_EL0)
-            + (" tsc=reliable" if arch == HostArch.X86_64 else ""),
+            # Suppress non-essential guest console output (saves MMIO/UART traps)
+            + " init.quiet=1"
+            # Explicit TSC clocksource selection, skip probing (5-10ms, x86_64 only)
+            + (" tsc=reliable clocksource=tsc" if arch == HostArch.X86_64 else ""),
         ]
     )
 
@@ -458,7 +468,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             qemu_args.extend(
                 [
                     "-device",
-                    f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128",
+                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
+                    f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128,event_idx=off",
                 ]
             )
         case HostOS.LINUX | HostOS.UNKNOWN:
@@ -468,7 +479,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                     # NOTE: Removed logical_block_size=4096,physical_block_size=4096
                     # Small ext4 filesystems (<512MB) use 1024-byte blocks by default, so forcing
                     # 4096-byte block size causes mount failures ("Invalid argument")
-                    f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128",
+                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
+                    f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off",
                 ]
             )
 
@@ -577,10 +589,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
     # - deflate-on-oom: guest returns memory under OOM pressure
     # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
+    #   D1: Disable during cold boot to avoid kernel page scanning overhead (10-20ms)
+    #   Warm pool VMs re-enable via QMP after boot completes
     qemu_args.extend(
         [
             "-device",
-            f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=on",
+            f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=off",
         ]
     )
 

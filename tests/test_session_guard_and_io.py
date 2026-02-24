@@ -1,14 +1,14 @@
 # pyright: reportPrivateUsage=false
 """Unit tests for Session._guard(), _resolve_content(), write_file streaming protocol,
-and FileOpDispatcher routing.
+FileOpDispatcher routing, and DualPortChannel reconnection probe.
 
 Tests the orchestration layer WITHOUT requiring VMs. All VM/channel interactions
 are mocked. Covers:
 - _guard() lifecycle checks, lock serialization, idle timer reset
 - _resolve_content() sync/async file reads, boundary validation
 - WriteFileRequest header serialization: validity, escaping
-- UnixSocketChannel.send_raw_request()
 - FileOpDispatcher message routing by op_id
+- DualPortChannel._probe_guest_ready() reconnection probe
 """
 
 import asyncio
@@ -19,18 +19,22 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from exec_sandbox import constants
 from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.guest_agent_protocol import (
+    ExecutionCompleteMessage,
     FileChunkResponseMessage,
+    FileListMessage,
     FileReadCompleteMessage,
     FileWriteAckMessage,
+    OutputChunkMessage,
     PongMessage,
     StreamingErrorMessage,
     StreamingMessage,
     WriteFileRequest,
 )
-from exec_sandbox.guest_channel import FileOpDispatcher, UnixSocketChannel
+from exec_sandbox.guest_channel import DualPortChannel, FileOpDispatcher
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 from exec_sandbox.session import Session
 
@@ -612,75 +616,6 @@ class TestWriteFilePathValidation:
 
 
 # ============================================================================
-# UnixSocketChannel.send_raw_request()
-# ============================================================================
-
-
-class TestUnixSocketSendRawRequest:
-    """Tests for UnixSocketChannel.send_raw_request()."""
-
-    async def test_not_connected_raises(self) -> None:
-        """send_raw_request on unconnected channel raises RuntimeError."""
-        channel = UnixSocketChannel(socket_path="/tmp/test.sock", expected_uid=1000)
-        with pytest.raises(RuntimeError, match="not connected"):
-            await channel.send_raw_request(b"data\n", timeout=10)
-
-    async def test_dead_write_worker_raises(self) -> None:
-        """send_raw_request detects a crashed write worker."""
-        channel = UnixSocketChannel(socket_path="/tmp/test.sock", expected_uid=1000)
-        channel._reader = AsyncMock()
-        channel._writer = MagicMock()
-
-        # Simulate a crashed write worker
-        failed_task: asyncio.Task[None] = asyncio.ensure_future(asyncio.sleep(0))
-        await failed_task  # Let it complete
-        # Make it look like it raised
-        dead_task = asyncio.create_task(_raise_task())
-        try:
-            await dead_task
-        except RuntimeError:
-            pass
-        channel._write_task = dead_task
-
-        with pytest.raises(RuntimeError, match="Write worker crashed"):
-            await channel.send_raw_request(b"data\n", timeout=10)
-
-    async def test_queues_write_and_reads_response(self) -> None:
-        """send_raw_request queues data via write_queue and reads response."""
-        channel = UnixSocketChannel(socket_path="/tmp/test.sock", expected_uid=1000)
-        reader = AsyncMock()
-        writer = MagicMock()
-        writer.write = MagicMock()
-        writer.drain = AsyncMock()
-        channel._reader = reader
-        channel._writer = writer
-
-        # Create a live write worker that actually drains the queue
-        channel._shutdown_event.clear()
-        channel._write_task = asyncio.create_task(channel._write_worker())
-
-        ack = FileWriteAckMessage(op_id="test", path="test.txt", bytes_written=42)
-        reader.readuntil = AsyncMock(return_value=(ack.model_dump_json() + "\n").encode())
-
-        result = await channel.send_raw_request(b'{"test":"data"}\n', timeout=10)
-        assert isinstance(result, FileWriteAckMessage)
-        assert result.bytes_written == 42
-
-        # Cleanup
-        channel._shutdown_event.set()
-        channel._write_task.cancel()
-        try:
-            await channel._write_task
-        except asyncio.CancelledError:
-            pass
-
-
-async def _raise_task() -> None:
-    """Helper: task that raises RuntimeError (for dead-worker simulation)."""
-    raise RuntimeError("simulated crash")
-
-
-# ============================================================================
 # WriteFileRequest header serialization
 # ============================================================================
 
@@ -919,22 +854,24 @@ class TestFileOpDispatcherRouting:
         assert msg.message == "fail"
 
         # Default queue should be empty
-        assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
 
-    async def test_error_without_op_id_routes_to_default(self) -> None:
-        """Error without op_id goes to default queue."""
+    async def test_error_without_op_id_is_discarded(self) -> None:
+        """Error without op_id is discarded (no default queue)."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
-        await dispatcher.register_op("op-A")
+        op_queue = await dispatcher.register_op("op-A")
+        # Error without op_id — discarded
         _feed(reader, {"type": "error", "error_type": "timeout", "message": "fail"})
+        # Subsequent message with op_id — routed correctly
+        _feed(reader, {"type": "error", "op_id": "op-A", "error_type": "x", "message": "y"})
 
-        msg = await asyncio.wait_for(dispatcher._default_queue.get(), timeout=1.0)
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
         assert isinstance(msg, StreamingErrorMessage)
-        assert msg.op_id is None
+        assert msg.op_id == "op-A"
 
         await dispatcher.stop()
 
@@ -951,21 +888,23 @@ class TestFileOpDispatcherRouting:
         assert isinstance(msg, FileChunkResponseMessage)
         assert msg.op_id == "op-A"
 
-        assert dispatcher._default_queue.empty()
-
         await dispatcher.stop()
 
-    async def test_non_file_message_routes_to_default(self) -> None:
-        """Pong (no op_id) goes to default queue."""
+    async def test_non_file_message_without_op_id_is_discarded(self) -> None:
+        """Pong without op_id is discarded, doesn't pollute op queues."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
-        await dispatcher.register_op("op-A")
+        op_queue = await dispatcher.register_op("op-A")
+        # Pong without op_id — discarded
         _feed(reader, {"type": "pong", "version": "1.0"})
+        # Subsequent message with op_id — still routes correctly
+        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "op-A"})
 
-        msg = await asyncio.wait_for(dispatcher._default_queue.get(), timeout=1.0)
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
         assert isinstance(msg, PongMessage)
+        assert msg.op_id == "op-A"
 
         await dispatcher.stop()
 
@@ -999,7 +938,6 @@ class TestFileOpDispatcherRouting:
         assert len(b_msgs) == 1  # 1 error
         assert len(c_msgs) == 2  # 1 chunk + 1 complete
         assert isinstance(b_msgs[0], StreamingErrorMessage)
-        assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
 
@@ -1032,8 +970,6 @@ class TestFileOpDispatcherRouting:
         assert isinstance(m3[0], StreamingErrorMessage)
         assert "disk" in m3[0].message
 
-        assert dispatcher._default_queue.empty()
-
         await dispatcher.stop()
 
     async def test_concurrent_5_ops_all_error(self) -> None:
@@ -1054,8 +990,6 @@ class TestFileOpDispatcherRouting:
             assert len(msgs) == 1
             assert isinstance(msgs[0], StreamingErrorMessage)
             assert msgs[0].message == f"err-{i}"
-
-        assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
 
@@ -1081,8 +1015,6 @@ class TestFileOpDispatcherRouting:
             assert isinstance(msgs[0], FileChunkResponseMessage)
             assert isinstance(msgs[1], FileReadCompleteMessage)
 
-        assert dispatcher._default_queue.empty()
-
         await dispatcher.stop()
 
     # ------------------------------------------------------------------
@@ -1102,21 +1034,21 @@ class TestFileOpDispatcherRouting:
         await asyncio.sleep(0.05)
 
         # Message should be discarded, not in default queue or op-A queue
-        assert dispatcher._default_queue.empty()
+
         assert qa.empty()
 
         await dispatcher.stop()
 
-    async def test_error_with_empty_string_op_id_goes_to_default(self) -> None:
-        """Error with op_id=\"\" goes to default (empty string is falsy)."""
+    async def test_empty_string_op_id_routes_to_op_queue(self) -> None:
+        """Empty string op_id is a valid op_id and routes to its registered queue."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
-        await dispatcher.register_op("op-A")
+        q_empty = await dispatcher.register_op("")
         _feed(reader, {"type": "error", "error_type": "io_error", "message": "fail", "op_id": ""})
 
-        msg = await asyncio.wait_for(dispatcher._default_queue.get(), timeout=1.0)
+        msg = await asyncio.wait_for(q_empty.get(), timeout=1.0)
         assert isinstance(msg, StreamingErrorMessage)
 
         await dispatcher.stop()
@@ -1135,7 +1067,6 @@ class TestFileOpDispatcherRouting:
         await asyncio.sleep(0.05)
 
         # Message should be discarded, not pollute default queue
-        assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
 
@@ -1159,7 +1090,6 @@ class TestFileOpDispatcherRouting:
         await asyncio.sleep(0.05)
 
         # Second message should be discarded, not in default queue
-        assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
 
@@ -1167,18 +1097,17 @@ class TestFileOpDispatcherRouting:
     # Weird / out-of-bounds cases
     # ------------------------------------------------------------------
 
-    async def test_error_with_op_id_matching_different_message_type(self) -> None:
-        """Pong goes to default, error with op_id goes to op queue."""
+    async def test_pong_discarded_error_with_op_id_routed(self) -> None:
+        """Pong without op_id is discarded, error with op_id routes to op queue."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
         op_queue = await dispatcher.register_op("op-A")
+        # Pong without op_id — discarded
         _feed(reader, {"type": "pong", "version": "1.0"})
+        # Error with op_id — routed to op queue
         _feed(reader, {"type": "error", "op_id": "op-A", "error_type": "x", "message": "y"})
-
-        pong = await asyncio.wait_for(dispatcher._default_queue.get(), timeout=1.0)
-        assert isinstance(pong, PongMessage)
 
         err = await asyncio.wait_for(op_queue.get(), timeout=1.0)
         assert isinstance(err, StreamingErrorMessage)
@@ -1215,8 +1144,6 @@ class TestFileOpDispatcherRouting:
             msgs = await _drain(queues[f"op-{i}"])
             assert len(msgs) == 1, f"op-{i} got {len(msgs)} messages"
 
-        assert dispatcher._default_queue.empty()
-
         await dispatcher.stop()
 
     async def test_same_op_id_receives_multiple_messages_in_order(self) -> None:
@@ -1235,8 +1162,6 @@ class TestFileOpDispatcherRouting:
         for i, msg in enumerate(msgs):
             assert isinstance(msg, FileChunkResponseMessage)
             assert msg.data == f"chunk-{i}"
-
-        assert dispatcher._default_queue.empty()
 
         await dispatcher.stop()
 
@@ -1267,3 +1192,329 @@ class TestExposedPorts:
         mock_vm.exposed_ports = [ExposedPort(internal=8080, external=3000)]
         await session.close()
         assert session.exposed_ports == [ExposedPort(internal=8080, external=3000)]
+
+
+# ============================================================================
+# DualPortChannel reconnection probe tests
+# ============================================================================
+#
+# Tests the _probe_guest_ready behaviour: observable outcomes (returns vs
+# raises) given a simulated guest that is ready, transiently unresponsive,
+# or permanently down.  No mock-interaction assertions — type-checking
+# already validates the interface contracts.
+# ============================================================================
+
+
+def _make_probe_channel(
+    send_request_side_effect: object,
+) -> DualPortChannel:
+    """Build a DualPortChannel with a scripted guest response sequence.
+
+    Pass a list where each entry is either a message the guest returns
+    or an exception that simulates a transport failure.  The probe's
+    retry loop consumes one entry per attempt.
+    """
+    channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+    channel.send_request = AsyncMock(side_effect=send_request_side_effect)
+    channel._raw_connect = AsyncMock()
+    channel.close = AsyncMock()
+    return channel
+
+
+class TestDualPortConnectLifecycle:
+    """Tests for connect() orchestration: when probing happens (and when it doesn't)."""
+
+    async def test_first_connect_does_not_probe(self) -> None:
+        """Boot-time connect has zero probe overhead."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._probe_guest_ready = AsyncMock()
+
+        await channel.connect(timeout_seconds=5.0)
+
+        assert channel._has_been_connected is True
+        # Probe should not have fired — this is the boot path
+        channel._probe_guest_ready.assert_not_awaited()
+
+    async def test_reconnect_does_probe(self) -> None:
+        """After a successful connect, subsequent connects probe the guest."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._probe_guest_ready = AsyncMock()
+        channel.close = AsyncMock()
+
+        await channel.connect(timeout_seconds=5.0)  # first
+        await channel.connect(timeout_seconds=5.0)  # second — should probe
+
+        channel._probe_guest_ready.assert_awaited_once()
+
+    async def test_idempotent_when_already_connected(self) -> None:
+        """connect() on an already-connected channel is a no-op."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._cmd_channel.is_connected = MagicMock(return_value=True)
+        channel._event_channel.is_connected = MagicMock(return_value=True)
+
+        await channel.connect(timeout_seconds=5.0)
+
+        # _raw_connect should not have been called — already connected
+        channel._raw_connect.assert_not_awaited()
+
+    async def test_has_been_connected_survives_close(self) -> None:
+        """close() does not reset the flag, so next connect will always probe."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._probe_guest_ready = AsyncMock()
+        channel.close = AsyncMock()
+
+        await channel.connect(timeout_seconds=5.0)
+        await channel.close()
+
+        assert channel._has_been_connected is True
+
+
+class TestDualPortProbeSuccess:
+    """Probe returns (doesn't raise) when the guest eventually responds."""
+
+    async def test_guest_ready_immediately(self) -> None:
+        """Guest responds with PongMessage on first attempt — probe returns."""
+        channel = _make_probe_channel([PongMessage(version="1.0")])
+        # Should not raise
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_ready_after_transient_timeouts(self) -> None:
+        """Guest unresponsive twice then ready — probe returns."""
+        channel = _make_probe_channel(
+            [
+                TimeoutError(),
+                TimeoutError(),
+                PongMessage(version="1.0"),
+            ]
+        )
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_ready_after_mixed_transport_errors(self) -> None:
+        """Different transport failures then success — probe is resilient."""
+        channel = _make_probe_channel(
+            [
+                TimeoutError(),
+                OSError("reset"),
+                ConnectionError("refused"),
+                asyncio.IncompleteReadError(b"", 100),
+                PongMessage(version="1.0"),
+            ]
+        )
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_ready_on_last_possible_attempt(self) -> None:
+        """Guest responds on the very last retry — boundary case."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [PongMessage(version="1.0")])
+        # Should succeed, not raise
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+
+class TestDualPortProbeFailure:
+    """Probe raises TimeoutError when the guest never becomes ready."""
+
+    async def test_all_attempts_timeout(self) -> None:
+        """Guest never responds — TimeoutError with descriptive message."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        channel = _make_probe_channel([TimeoutError()] * max_retries)
+
+        with pytest.raises(TimeoutError, match=f"after {max_retries} reconnection attempts"):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_all_attempts_connection_error(self) -> None:
+        """Guest socket broken every time — same TimeoutError."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        channel = _make_probe_channel([ConnectionError()] * max_retries)
+
+        with pytest.raises(TimeoutError, match="reconnection attempts"):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_returns_wrong_message_type(self) -> None:
+        """Guest returns StreamingErrorMessage instead of PongMessage — treated as failure."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        wrong_msg = StreamingErrorMessage(error_type="unknown", message="not a pong")
+        channel = _make_probe_channel([wrong_msg] * max_retries)
+
+        with pytest.raises(TimeoutError, match="reconnection attempts"):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_one_more_failure_than_budget_still_raises(self) -> None:
+        """MAX_RETRIES-1 failures + wrong message type = still raises."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        wrong_msg = StreamingErrorMessage(error_type="unknown", message="bad")
+        channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [wrong_msg])
+
+        with pytest.raises(TimeoutError):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+
+# ============================================================================
+# op_id routing — stale message isolation
+# ============================================================================
+
+
+class TestOpIdDispatcherRouting:
+    """Tests op_id-based message routing through the dispatcher.
+
+    Verifies that messages with op_id are routed to per-op queues,
+    and stale messages (unregistered op_id) are discarded.
+    """
+
+    async def test_pong_with_op_id_routes_to_op_queue(self) -> None:
+        """PongMessage with op_id routes to registered op queue."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("ping-1")
+        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "ping-1"})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, PongMessage)
+        assert msg.op_id == "ping-1"
+
+        await dispatcher.stop()
+
+    async def test_complete_with_op_id_routes_to_op_queue(self) -> None:
+        """ExecutionCompleteMessage with op_id routes to registered op queue."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("exec-1")
+        _feed(reader, {"type": "complete", "exit_code": 0, "execution_time_ms": 100, "op_id": "exec-1"})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, ExecutionCompleteMessage)
+        assert msg.op_id == "exec-1"
+
+        await dispatcher.stop()
+
+    async def test_stdout_with_op_id_routes_to_op_queue(self) -> None:
+        """OutputChunkMessage with op_id routes to registered op queue."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("exec-1")
+        _feed(reader, {"type": "stdout", "chunk": "hello", "op_id": "exec-1"})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, OutputChunkMessage)
+        assert msg.op_id == "exec-1"
+
+        await dispatcher.stop()
+
+    async def test_file_list_with_op_id_routes_to_op_queue(self) -> None:
+        """FileListMessage with op_id routes to registered op queue."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("list-1")
+        _feed(reader, {"type": "file_list", "path": "", "entries": [], "op_id": "list-1"})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, FileListMessage)
+        assert msg.op_id == "list-1"
+
+        await dispatcher.stop()
+
+    async def test_stale_pong_discarded(self) -> None:
+        """Stale PongMessage (unregistered op_id) is discarded, not queued."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        # Feed a stale PongMessage from a previous probe — no queue registered
+        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "probe-1"})
+
+        # Now register a queue for list_files and feed its response
+        op_queue = await dispatcher.register_op("list-1")
+        _feed(reader, {"type": "file_list", "path": "", "entries": [], "op_id": "list-1"})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, FileListMessage)
+        assert msg.op_id == "list-1"
+
+        # Default queue empty — stale pong was discarded
+
+        await dispatcher.stop()
+
+    async def test_message_without_op_id_is_discarded(self) -> None:
+        """Message without op_id is discarded (no default queue)."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("probe-1")
+        # Pong without op_id — discarded
+        _feed(reader, {"type": "pong", "version": "1.0"})
+        # Subsequent op_id message — still routes
+        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "probe-1"})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, PongMessage)
+        assert msg.op_id == "probe-1"
+
+        await dispatcher.stop()
+
+    async def test_interleaved_exec_and_list(self) -> None:
+        """Two ops interleaved: exec and list_files, each gets its own messages."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        exec_queue = await dispatcher.register_op("exec-1")
+        list_queue = await dispatcher.register_op("list-1")
+
+        # Interleave messages
+        _feed(reader, {"type": "stdout", "chunk": "hello", "op_id": "exec-1"})
+        _feed(reader, {"type": "file_list", "path": "", "entries": [], "op_id": "list-1"})
+        _feed(reader, {"type": "stderr", "chunk": "err", "op_id": "exec-1"})
+        _feed(reader, {"type": "complete", "exit_code": 0, "execution_time_ms": 50, "op_id": "exec-1"})
+
+        exec_msgs = await _drain(exec_queue)
+        list_msgs = await _drain(list_queue)
+
+        assert len(exec_msgs) == 3  # stdout, stderr, complete
+        assert len(list_msgs) == 1  # file_list
+        assert isinstance(exec_msgs[-1], ExecutionCompleteMessage)
+        assert isinstance(list_msgs[0], FileListMessage)
+
+        await dispatcher.stop()
+
+    async def test_empty_op_id_routes_to_op_queue(self) -> None:
+        """Empty string op_id is truthy and routes to op queue."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("")
+        _feed(reader, {"type": "pong", "version": "1.0", "op_id": ""})
+
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, PongMessage)
+
+        await dispatcher.stop()
+
+    async def test_message_after_unregister_discarded(self) -> None:
+        """Message arriving after unregister_op is discarded."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("op-1")
+        await dispatcher.unregister_op("op-1")
+
+        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "op-1"})
+        # Wait a bit for the dispatch loop to process
+        await asyncio.sleep(0.1)
+
+        assert op_queue.empty()
+
+        await dispatcher.stop()

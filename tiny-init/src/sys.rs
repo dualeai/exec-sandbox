@@ -1,34 +1,17 @@
 //! Syscall wrappers, constants, and kernel queries.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-// Syscall numbers
-#[cfg(target_arch = "x86_64")]
-pub(crate) mod syscall_nr {
-    pub(crate) const FINIT_MODULE: libc::c_long = 313;
-    pub(crate) const SWAPON: libc::c_long = 167;
-}
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod syscall_nr {
-    pub(crate) const FINIT_MODULE: libc::c_long = 273;
-    pub(crate) const SWAPON: libc::c_long = 224;
-}
-
 // Mount flags
 pub(crate) const MS_NOSUID: libc::c_ulong = 0x2;
 pub(crate) const MS_NODEV: libc::c_ulong = 0x4;
-pub(crate) const MS_NOEXEC: libc::c_ulong = 0x8;
 pub(crate) const MS_RDONLY: libc::c_ulong = 0x1;
 pub(crate) const MS_NOATIME: libc::c_ulong = 0x400;
 pub(crate) const MS_MOVE: libc::c_ulong = 0x2000;
-
-// Swap flags
-pub(crate) const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
 
 /// Write to stderr using raw syscall (safe before Rust stdio init).
 ///
@@ -47,14 +30,35 @@ pub(crate) const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
 ///
 /// See: https://github.com/rust-lang/rust/issues/24821
 /// See: https://rust-lang.github.io/rfcs/1014-stdout-existential-crisis.html
-macro_rules! log_fmt {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
+macro_rules! _log_write {
+    ($level:literal, $($arg:tt)*) => {{
+        let msg = format!(concat!("[", $level, "] {}\n"), format_args!($($arg)*));
         unsafe {
             libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            libc::write(2, b"\n".as_ptr() as *const libc::c_void, 1);
         }
     }};
+}
+
+macro_rules! log_info {
+    ($($arg:tt)*) => { _log_write!("INFO", $($arg)*) };
+}
+
+macro_rules! log_warn {
+    ($($arg:tt)*) => { _log_write!("WARN", $($arg)*) };
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => { _log_write!("ERROR", $($arg)*) };
+}
+
+/// Get monotonic time in microseconds (for boot timing instrumentation).
+pub(crate) fn monotonic_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
 }
 
 pub(crate) fn last_errno() -> i32 {
@@ -99,70 +103,6 @@ pub(crate) fn mount_move(source: &str, target: &str) -> i32 {
     }
 }
 
-pub(crate) fn load_module(path: &str, debug: bool) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-
-    let path_cstr = match CString::new(path) {
-        Ok(p) => p,
-        Err(_) => {
-            if debug {
-                log_fmt!("[module] {}: invalid path", name);
-            }
-            return false;
-        }
-    };
-
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        if debug {
-            log_fmt!("[module] {}: open failed (errno={})", name, last_errno());
-        }
-        return false;
-    }
-
-    let params = CString::new("").unwrap();
-    let ret = unsafe {
-        libc::syscall(
-            syscall_nr::FINIT_MODULE,
-            fd,
-            params.as_ptr(),
-            0 as libc::c_int,
-        )
-    };
-
-    unsafe { libc::close(fd) };
-
-    if ret == 0 {
-        if debug {
-            log_fmt!("[module] {}: ok", name);
-        }
-        return true;
-    }
-    let errno = last_errno();
-    if errno == libc::EEXIST {
-        if debug {
-            log_fmt!("[module] {}: built-in", name);
-        }
-        return true;
-    }
-    if debug {
-        log_fmt!("[module] {}: errno={}", name, errno);
-    }
-    false
-}
-
-pub(crate) fn get_kernel_version() -> Option<String> {
-    let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut utsname) } != 0 {
-        return None;
-    }
-    Some(
-        unsafe { CStr::from_ptr(utsname.release.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
 fn parse_cmdline_has(cmdline: &str, flag: &str) -> bool {
     cmdline.split_whitespace().any(|arg| arg == flag)
 }
@@ -171,10 +111,6 @@ pub(crate) fn cmdline_has(flag: &str) -> bool {
     fs::read_to_string("/proc/cmdline")
         .map(|s| parse_cmdline_has(&s, flag))
         .unwrap_or(false)
-}
-
-pub(crate) fn error(msg: &str) {
-    log_fmt!("[init] ERROR: {}", msg);
 }
 
 pub(crate) fn fallback_shell() -> ! {

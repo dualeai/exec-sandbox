@@ -223,6 +223,11 @@ class Scheduler:
         self._started = False
         logger.info("Scheduler shutdown complete")
 
+    async def wait_pool_ready(self, timeout: float = 120) -> None:
+        """Wait until the warm pool is fully populated. No-op if pool is disabled."""
+        if self._warm_pool:
+            await self._warm_pool.wait_until_ready(timeout)
+
     async def run(
         self,
         code: str,
@@ -499,10 +504,6 @@ class Scheduler:
             raise SandboxError("Scheduler not started. Use: async with Scheduler() as scheduler:")
 
         # Validate memory before acquiring resources
-        # NOTE: The global MIN_MEMORY_MB=128 works for Python (19MB RSS) but
-        # JavaScript (Bun, 42MB RSS) swap-thrashes at 128MB. Callers using
-        # Language.JAVASCRIPT should use memory_mb >= 160 (ideally 192+).
-        # The --smol flag in guest-agent mitigates this but doesn't eliminate it.
         memory = memory_mb or self.config.default_memory_mb
         if memory < constants.MIN_MEMORY_MB:
             raise VmConfigError(

@@ -1,6 +1,6 @@
 # exec-sandbox
 
-Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 8-layer security isolation.
+Secure code execution in isolated lightweight VMs (QEMU microVMs). Python library for running untrusted Python, JavaScript, and shell code with 9-layer security isolation.
 
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
@@ -356,19 +356,24 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript). Set >0 to enable |
-| `default_memory_mb` | 256 | VM memory (128-2048 MB). Effective ~25% higher with memory compression (zram) |
+| `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript, Raw). Set >0 to enable |
+| `default_memory_mb` | 256 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
 | `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache |
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
+| `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
+| `memory_overcommit_ratio` | 1.5 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
+| `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = host_cpus × ratio |
+| `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
+| `resource_monitor_interval_seconds` | 5.0 | Interval between resource monitor ticks (1-60s) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
-Environment variables: `EXEC_SANDBOX_MAX_CONCURRENT_VMS`, `EXEC_SANDBOX_IMAGES_DIR`, etc.
+Environment variables: `EXEC_SANDBOX_IMAGES_DIR`, `EXEC_SANDBOX_CACHE_DIR`, `EXEC_SANDBOX_OFFLINE`, etc.
 
 ## Memory Optimization
 
@@ -455,6 +460,8 @@ Returned by `Session.list_files()`.
 | `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
+| `EnvVarValidationError` | Environment variable validation failed |
+| `SocketAuthError` | Socket peer authentication failed |
 | `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
 | `AssetError` | Asset download/verification failed |
 
@@ -496,8 +503,8 @@ packages=["pandas"]         # PackageNotAllowedError! Must pin version
 on_stdout=lambda chunk: time.sleep(1)        # Blocks!
 on_stdout=lambda chunk: buffer.append(chunk)  # Fast
 
-# Memory overhead: pre-started VMs use warm_pool_size × 2 languages × 256MB
-# warm_pool_size=5 → 5 VMs/lang × 2 × 256MB = 2.5GB for warm pool alone
+# Memory overhead: pre-started VMs use warm_pool_size × 3 languages × 192MB
+# warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
 default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
@@ -520,7 +527,7 @@ Pool(2).map(lambda x: x**2, [1, 2, 3])  # Works (cloudpickle handles lambda seri
 async with await scheduler.session(language="python") as session:
     await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
     await session.exec("import subprocess; subprocess.Popen(['sleep', '300'])")
-    # Both sleep processes are still running! VM PID limit (100) prevents unbounded growth
+    # Both sleep processes are still running! VM process limit (RLIMIT_NPROC=1024) prevents unbounded growth
     # All processes are cleaned up when session.close() destroys the VM
 ```
 
@@ -534,8 +541,8 @@ async with await scheduler.session(language="python") as session:
 | Max packages | 50 |
 | Max env vars | 100 |
 | Max exposed ports | 10 |
-| Max file size (I/O) | 50MB |
-| Max file path length | 255 chars |
+| Max file size (I/O) | 500MB |
+| Max file path length | 4096 bytes (255 per component) |
 | Execution timeout | 1-300s |
 | VM memory | 128MB minimum (no upper bound) |
 | Max concurrent VMs | Resource-aware (auto-computed from host memory + CPU) |
@@ -545,13 +552,14 @@ async with await scheduler.session(language="python") as session:
 | Layer | Technology | Protection |
 |-------|------------|------------|
 | 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
-| 2 | Unprivileged QEMU | No root privileges, minimal exposure |
-| 3 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
-| 4 | System call filtering (seccomp) | Blocks unauthorized OS calls |
-| 5 | Resource limits (cgroups v2) | Memory, CPU, process limits |
-| 6 | Process isolation (namespaces) | Separate process, network, filesystem views |
-| 7 | Security policies (AppArmor/SELinux) | When available |
-| 8 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
+| 2 | Custom hardened kernel | Modules disabled at compile time, io_uring compiled out, slab/memory hardening, ~300 subsystems removed |
+| 3 | Unprivileged QEMU | No root privileges, minimal exposure |
+| 4 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
+| 5 | System call filtering (seccomp) | Blocks unauthorized OS calls |
+| 6 | Resource limits (cgroups v2) | Memory, CPU, process limits |
+| 7 | Process isolation (namespaces) | Separate process, network, filesystem views |
+| 8 | Security policies (AppArmor/SELinux) | When available |
+| 9 | Socket authentication (SO_PEERCRED/LOCAL_PEERCRED) | Verifies QEMU process identity |
 
 **Guarantees:**
 

@@ -178,37 +178,3 @@ class TestBalloonClientUnit:
 
         with pytest.raises(BalloonError, match="Not connected"):
             await client._execute("query-balloon")
-
-
-class TestBalloonClientConstants:
-    """Tests for balloon-related constants."""
-
-    def test_balloon_inflate_target_reasonable(self) -> None:
-        """BALLOON_INFLATE_TARGET_MB should be reasonable for idle VMs."""
-        from exec_sandbox import constants
-
-        # Should be at least 32MB for kernel overhead
-        assert constants.BALLOON_INFLATE_TARGET_MB >= 32
-        # Should be less than default memory (otherwise no benefit)
-        assert constants.BALLOON_INFLATE_TARGET_MB < constants.DEFAULT_MEMORY_MB
-
-    def test_balloon_timeouts_reasonable(self) -> None:
-        """Balloon timeouts should be reasonable."""
-        from exec_sandbox import constants
-
-        # At least 1 second
-        assert constants.BALLOON_INFLATE_TIMEOUT_SECONDS >= 1.0
-        assert constants.BALLOON_DEFLATE_TIMEOUT_SECONDS >= 1.0
-        # Not too long (would block warm pool operations)
-        assert constants.BALLOON_INFLATE_TIMEOUT_SECONDS <= 30.0
-        assert constants.BALLOON_DEFLATE_TIMEOUT_SECONDS <= 30.0
-
-    def test_package_version_format(self) -> None:
-        """__version__ should be valid semver format (used for cache key)."""
-        from exec_sandbox import __version__
-
-        parts = __version__.split(".")
-        assert len(parts) >= 2, f"Expected at least major.minor, got {__version__}"
-        # Major and minor should be numeric
-        assert parts[0].isdigit(), f"Invalid major version '{parts[0]}' in {__version__}"
-        assert parts[1].isdigit(), f"Invalid minor version '{parts[1]}' in {__version__}"

@@ -70,23 +70,90 @@ def _patch_cloudpickle() -> None:
     _reduction.ForkingPickler = _CloudForkingPickler  # type: ignore[assignment]
     _reduction.dump = _cloud_dump  # type: ignore[assignment]
 
+    # Also patch the separate name binding in multiprocessing.connection:
+    # Connection.send() uses _ForkingPickler captured at module import time,
+    # which is a different reference than reduction.ForkingPickler.
+    import multiprocessing.connection as _mp_conn  # noqa: PLC0415
 
-# Intercept multiprocessing.Process.start() to trigger lazy patching.
-# After first call, restores the original start() to avoid overhead.
+    _mp_conn._ForkingPickler = _CloudForkingPickler  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+# Lazy cloudpickle patching: triggered on first Process.start() OR Pool().
+# Python 3.14 changed default start method from fork to forkserver — Pool()
+# workers are created by a server process, bypassing Process.start() in the
+# parent. We intercept both entry points so whichever runs first applies the
+# patch without adding import overhead to boot.
 _mp_orig_start = multiprocessing.Process.start
 _mp_patched = False
 
 
-def _lazy_mp_start(self: multiprocessing.Process) -> None:
+def _ensure_cloudpickle() -> None:
     global _mp_patched  # noqa: PLW0603
-    if not _mp_patched:
-        _mp_patched = True
+    if _mp_patched:
+        return
+    _mp_patched = True
+    import contextlib  # noqa: PLC0415
+
+    with contextlib.suppress(ImportError):
         _patch_cloudpickle()
-        multiprocessing.Process.start = _mp_orig_start  # type: ignore[assignment]
+    # Restore original start (remove proxy overhead for subsequent calls)
+    multiprocessing.Process.start = _mp_orig_start  # type: ignore[assignment]
+
+
+def _lazy_mp_start(self: multiprocessing.Process) -> None:
+    _ensure_cloudpickle()
     return _mp_orig_start(self)
 
 
 multiprocessing.Process.start = _lazy_mp_start  # type: ignore[assignment]
+
+# Defer multiprocessing.pool import + Pool.__init__ patch to first Pool() use.
+# `import multiprocessing.pool` pulls in ~10 transitive modules (queues,
+# synchronize, etc.) — 30-80ms warm cache, 1-3s cold cache. Since most user
+# code never uses Pool, we defer until actually needed.
+# multiprocessing.Pool is a re-export of multiprocessing.pool.Pool — when user
+# code does `multiprocessing.Pool()` or `from multiprocessing import Pool`,
+# Python auto-imports multiprocessing.pool, which triggers our patch.
+_mp_pool_patched = False
+
+
+def _ensure_pool_patched() -> None:
+    global _mp_pool_patched  # noqa: PLW0603
+    if _mp_pool_patched:
+        return
+    _mp_pool_patched = True
+    import multiprocessing.pool  # noqa: PLC0415
+
+    _mp_pool_orig_init = multiprocessing.pool.Pool.__init__
+
+    def _lazy_pool_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        _ensure_cloudpickle()
+        # Restore original init (one-shot proxy)
+        multiprocessing.pool.Pool.__init__ = _mp_pool_orig_init  # type: ignore[assignment]
+        return _mp_pool_orig_init(self, *args, **kwargs)
+
+    multiprocessing.pool.Pool.__init__ = _lazy_pool_init  # type: ignore[assignment]
+
+
+# Replace multiprocessing.Pool in the module dict with a wrapper that triggers
+# cloudpickle + pool patching BEFORE Pool.__init__ runs. CPython populates
+# Pool into multiprocessing.__dict__ eagerly via globals().update() at import
+# time (no __getattr__ — see PEP 562). The value is a bound method on the
+# default context that lazily does `from multiprocessing.pool import Pool`.
+# We swap it so `multiprocessing.Pool()` or `from multiprocessing import Pool`
+# gets our wrapper, which ensures cloudpickle is ready before any pickling.
+_mp_orig_pool_method = multiprocessing.Pool  # type: ignore[attr-defined]
+
+
+def _lazy_mp_pool(*args: Any, **kwargs: Any) -> Any:
+    _ensure_cloudpickle()
+    _ensure_pool_patched()
+    # Restore original (one-shot wrapper)
+    multiprocessing.Pool = _mp_orig_pool_method  # type: ignore[attr-defined]
+    return _mp_orig_pool_method(*args, **kwargs)
+
+
+multiprocessing.Pool = _lazy_mp_pool  # type: ignore[attr-defined]
 
 # PID guard: forked children inherit the REPL wrapper. Record parent PID so
 # children that escape user code (via sys.exit(), exception, or fall-through)

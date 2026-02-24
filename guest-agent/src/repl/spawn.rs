@@ -1,9 +1,9 @@
-//! REPL process lifecycle: spawn and write wrapper scripts.
+//! REPL process lifecycle: spawn wrapper scripts.
+//! Wrapper scripts are lazily written on first spawn via init::ensure_repl_wrappers().
 
 use tokio::process::Command;
 
 use crate::constants::*;
-use crate::repl::wrappers::*;
 use crate::types::Language;
 
 /// State for a persistent REPL process.
@@ -14,31 +14,15 @@ pub(crate) struct ReplState {
     pub(crate) stderr: tokio::process::ChildStderr,
 }
 
-/// Write REPL wrapper script to SANDBOX_ROOT for the given language.
-pub(crate) async fn write_repl_wrapper(
-    language: Language,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match language {
-        Language::Python => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.py"), PYTHON_REPL_WRAPPER).await?
-        }
-        Language::Javascript => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.mjs"), JS_REPL_WRAPPER).await?
-        }
-        Language::Raw => {
-            tokio::fs::write(format!("{SANDBOX_ROOT}/_repl.sh"), SHELL_REPL_WRAPPER).await?
-        }
-    }
-    Ok(())
-}
-
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally.
+/// Wrapper scripts are lazily written on first call (deferred from init for boot speed).
 pub(crate) async fn spawn_repl(
     language: Language,
 ) -> Result<ReplState, Box<dyn std::error::Error>> {
-    write_repl_wrapper(language).await?;
+    // Lazily write REPL wrapper scripts on first spawn
+    crate::init::ensure_repl_wrappers();
 
     let mut cmd = match language {
         Language::Python => {
@@ -69,6 +53,19 @@ pub(crate) async fn spawn_repl(
                 format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
             c.env("BUN_JSC_useFTLJIT", "0");
+            // Minimize background thread CPU when idle. Without these, JSC's
+            // concurrent GC/JIT threads and Bun's GC timer cause ~20-25% CPU
+            // even when the main thread is blocked in libc.read().
+            // See: oven-sh/bun#27365, oven-sh/bun#21081
+            c.env("BUN_GC_TIMER_DISABLE", "1"); // Disable Bun's 1s GC repeating timer
+            c.env("BUN_JSC_useConcurrentGC", "false"); // No background GC marker threads
+            c.env("BUN_JSC_useConcurrentJIT", "false"); // No background JIT compilation
+            // Reduce idle RSS. Tighter growth factor limits heap expansion;
+            // earlier critical threshold triggers GC sooner; mimalloc purge
+            // returns freed pages to the OS immediately (important for balloon).
+            c.env("BUN_JSC_miniVMHeapGrowthFactor", "1.05"); // 5% growth (default 1.20)
+            c.env("BUN_JSC_criticalGCMemoryThreshold", "0.50"); // Aggressive GC at 50% of RAM
+            c.env("MIMALLOC_PURGE_DELAY", "0"); // Immediate page release to OS
             c
         }
         Language::Raw => {
@@ -119,7 +116,7 @@ pub(crate) async fn spawn_repl(
         let pid = match child.id() {
             Some(id) => id as libc::pid_t,
             None => {
-                eprintln!("WARNING: REPL child exited before prlimit64(RLIMIT_NPROC)");
+                log_warn!("REPL child exited before prlimit64(RLIMIT_NPROC)");
                 0
             }
         };
@@ -135,7 +132,7 @@ pub(crate) async fn spawn_repl(
             };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
-                eprintln!("WARNING: prlimit64(RLIMIT_NPROC) failed for pid {pid}: {err}");
+                log_warn!("prlimit64(RLIMIT_NPROC) failed for pid {pid}: {err}");
             }
         }
     }
@@ -144,7 +141,7 @@ pub(crate) async fn spawn_repl(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    eprintln!("Spawned REPL for language={}", language.as_str());
+    log_info!("Spawned REPL for language={}", language.as_str());
 
     Ok(ReplState {
         child,

@@ -6,12 +6,15 @@ Integration tests: Real VM pool operations (requires QEMU + images).
 
 import asyncio
 import contextlib
+import time
+from statistics import median as _median
 from unittest.mock import AsyncMock
 
 import pytest
 
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
+from exec_sandbox.platform_utils import ProcessWrapper
 
 from .conftest import skip_unless_hwaccel
 
@@ -835,6 +838,299 @@ class TestHealthcheckIntegration:
             assert result is False  # Unhealthy
             assert python_pool.qsize() == 0  # VM NOT restored to pool
 
+        finally:
+            await pool.stop()
+
+
+# ============================================================================
+# Integration Tests - Warm Pool Idle CPU (Require QEMU + Images)
+# ============================================================================
+
+# --- Idle CPU measurement constants ---
+#
+# Shared across all TestWarmPoolIdleCpu tests. Centralised here so threshold
+# tuning, sample-rate changes, etc. only need a single edit.
+
+CPU_SAMPLE_INTERVAL_S: float = 1.0
+"""Interval between cpu_percent samples (seconds)."""
+
+CPU_SAMPLES_DEFAULT: int = 15
+"""Default sample count for standard tests (~15 s window)."""
+
+CPU_SAMPLES_SUSTAINED: int = 30
+"""Sample count for the sustained / slow test (~30 s window)."""
+
+CPU_MEDIAN_THRESHOLD: float = 2.0
+"""Idle median CPU must be below this (%). Observed: Python ~0.2 %, Raw ~0.2 %."""
+
+CPU_P95_THRESHOLD: float = 10.0
+"""Idle p95 CPU must be below this (%). Absorbs transient health-check spikes."""
+
+CPU_CONSECUTIVE_SPIKE_THRESHOLD: float = 5.0
+"""Per-sample threshold for the consecutive-spike detector."""
+
+CPU_MAX_CONSECUTIVE_SPIKES: int = 3
+"""Max consecutive samples > CPU_CONSECUTIVE_SPIKE_THRESHOLD before failure."""
+
+SETTLE_SLEEP_S: float = 3.0
+"""Post-start settling time (balloon inflate + REPL warmup)."""
+
+CPU_SAMPLES_MIN: int = 5
+"""Minimum samples required for meaningful p95 (guard against small-N bugs)."""
+
+WAKEUPS_MAX_PER_SECOND: float = 50.0
+"""Max idle context switches/sec. Observed baseline: ~19-21/sec on macOS HVF
+(LAPIC timer + balloon free-page-reporting + QEMU event loop polling).
+Linux KVM expected similar (~15-25/sec). Threshold at ~2.5x baseline catches
+spin-loops while absorbing CI noise and health-check bursts."""
+
+
+# --- CPU measurement helpers ---
+
+
+def _p95(samples: list[float]) -> float:
+    """95th percentile (allows ~1 outlier per 15-20 samples)."""
+    assert len(samples) >= CPU_SAMPLES_MIN, f"Need >= {CPU_SAMPLES_MIN} samples for meaningful p95, got {len(samples)}"
+    s = sorted(samples)
+    idx = int(0.95 * (len(s) - 1))
+    return s[idx]
+
+
+async def _collect_cpu_samples(
+    proc: ProcessWrapper,
+    n_samples: int = CPU_SAMPLES_DEFAULT,
+    interval_s: float = CPU_SAMPLE_INTERVAL_S,
+) -> list[float]:
+    """Collect CPU % samples using non-blocking psutil pattern.
+
+    Primes cpu_percent (first call returns 0.0, discarded),
+    then collects n_samples at interval_s intervals.
+    Each sample represents average CPU over the preceding interval.
+    """
+    assert proc.psutil_proc is not None
+    proc.psutil_proc.cpu_percent(interval=None)  # Prime (discard 0.0)
+    await asyncio.sleep(interval_s)
+
+    samples: list[float] = []
+    for _ in range(n_samples):
+        cpu = proc.psutil_proc.cpu_percent(interval=None)
+        samples.append(cpu)
+        await asyncio.sleep(interval_s)
+    return samples
+
+
+async def _collect_cpu_samples_bulk(
+    procs: list[ProcessWrapper],
+    n_samples: int = CPU_SAMPLES_DEFAULT,
+    interval_s: float = CPU_SAMPLE_INTERVAL_S,
+) -> list[list[float]]:
+    """Collect CPU % samples from multiple processes in the same time window.
+
+    Non-blocking bulk pattern: primes all, then samples all each interval.
+    """
+    for proc in procs:
+        assert proc.psutil_proc is not None
+        proc.psutil_proc.cpu_percent(interval=None)  # Prime all
+    await asyncio.sleep(interval_s)
+
+    all_samples: list[list[float]] = [[] for _ in procs]
+    for _ in range(n_samples):
+        for i, proc in enumerate(procs):
+            assert proc.psutil_proc is not None
+            cpu = proc.psutil_proc.cpu_percent(interval=None)
+            all_samples[i].append(cpu)
+        await asyncio.sleep(interval_s)
+    return all_samples
+
+
+def _assert_cpu_idle(
+    samples: list[float],
+    *,
+    label: str = "VM",
+    median_threshold: float = CPU_MEDIAN_THRESHOLD,
+    p95_threshold: float = CPU_P95_THRESHOLD,
+) -> None:
+    """Assert CPU samples indicate idle behavior (median + p95)."""
+    med = _median(samples)
+    p95_val = _p95(samples)
+    assert med < median_threshold, f"{label} median CPU {med:.1f}% >= {median_threshold}% (sorted: {sorted(samples)})"
+    assert p95_val < p95_threshold, f"{label} p95 CPU {p95_val:.1f}% >= {p95_threshold}% (sorted: {sorted(samples)})"
+
+
+# --- Tests ---
+
+
+@skip_unless_hwaccel
+class TestWarmPoolIdleCpu:
+    """Integration tests verifying warm pool VMs consume zero CPU when idle.
+
+    Warm pool VMs are pre-booted and sit idle waiting for allocation. If they
+    consume CPU while idle, that's wasted compute cost at scale. These tests
+    enforce the invariant: no execution = no CPU.
+
+    Measurement: sample cpu_percent every 1s over 10-15s.
+    Assertions: median < 2%, p95 < 10%.
+    """
+
+    @pytest.mark.parametrize(
+        "lang",
+        [
+            pytest.param(Language.PYTHON, id="python"),
+            pytest.param(Language.JAVASCRIPT, id="javascript"),
+            pytest.param(Language.RAW, id="raw"),
+        ],
+    )
+    async def test_idle_zero_cpu(self, vm_manager, lang: Language) -> None:
+        """Each language VM idles at near-zero CPU and low wakeup rate."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            # Get VM directly from internal queue (no balloon deflation, no replenishment)
+            vm = pool.pools[lang].get_nowait()
+
+            # Snapshot context switches before CPU sampling window
+            assert vm.process.psutil_proc is not None
+            cs_before = vm.process.psutil_proc.num_ctx_switches()
+            t_before = time.monotonic()
+
+            samples = await _collect_cpu_samples(vm.process)
+
+            # Snapshot after — measures wakeups over the same window as CPU
+            cs_after = vm.process.psutil_proc.num_ctx_switches()
+            t_after = time.monotonic()
+
+            _assert_cpu_idle(samples, label=lang.value)
+
+            delta_cs = (cs_after.voluntary + cs_after.involuntary) - (cs_before.voluntary + cs_before.involuntary)
+            wakeups_per_sec = delta_cs / (t_after - t_before)
+            assert wakeups_per_sec < WAKEUPS_MAX_PER_SECOND, (
+                f"{lang.value} idle wakeups/sec {wakeups_per_sec:.1f} >= {WAKEUPS_MAX_PER_SECOND}"
+            )
+
+            pool.pools[lang].put_nowait(vm)
+        finally:
+            await pool.stop()
+
+    async def test_idle_after_health_check_ping(self, vm_manager) -> None:
+        """CPU settles back to ~0% after health check wakes guest agent."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            vm = pool.pools[Language.PYTHON].get_nowait()
+
+            # Manually trigger health check (connect + ping + pong wakes guest)
+            healthy = await pool._check_vm_health(vm)
+            assert healthy, "VM should be healthy"
+
+            # CPU should settle back to idle after the ping
+            samples = await _collect_cpu_samples(vm.process, n_samples=10)
+            _assert_cpu_idle(samples, label="post-healthcheck")
+
+            pool.pools[Language.PYTHON].put_nowait(vm)
+        finally:
+            await pool.stop()
+
+    async def test_multiple_vms_idle_no_interference(self, vm_manager) -> None:
+        """Multiple VMs don't interfere with each other's idle CPU (thundering herd)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=2)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        vms = []
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            # Get all VMs from all language pools (2 each = 6 total)
+            for lang in Language:
+                for _ in range(pool.pool_size_per_language):
+                    try:
+                        vm = pool.pools[lang].get_nowait()
+                        vms.append((lang, vm))
+                    except asyncio.QueueEmpty:
+                        break
+
+            assert len(vms) >= 2, f"Expected at least 2 VMs, got {len(vms)}"
+
+            all_samples = await _collect_cpu_samples_bulk(
+                [vm.process for _, vm in vms],
+            )
+
+            for i, ((lang, _), samples) in enumerate(zip(vms, all_samples, strict=True)):
+                _assert_cpu_idle(samples, label=f"VM {i} ({lang.value})")
+
+            # Put VMs back
+            for lang, vm in vms:
+                pool.pools[lang].put_nowait(vm)
+        finally:
+            await pool.stop()
+
+    async def test_balloon_inflation_cpu_is_transient(self, vm_manager) -> None:
+        """Balloon inflation CPU spike settles within bounded time."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            # Do NOT wait — start measuring immediately after start()
+            vm = pool.pools[Language.PYTHON].get_nowait()
+
+            # Balloon inflation happened during start(); p95 absorbs initial spike
+            samples = await _collect_cpu_samples(vm.process)
+            _assert_cpu_idle(samples, label="post-balloon")
+
+            pool.pools[Language.PYTHON].put_nowait(vm)
+        finally:
+            await pool.stop()
+
+    @pytest.mark.slow
+    async def test_idle_cpu_sustained_over_time(self, vm_manager) -> None:
+        """No CPU drift over 30s (spans ~3 health check cycles)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            vm = pool.pools[Language.PYTHON].get_nowait()
+
+            samples = await _collect_cpu_samples(vm.process, n_samples=CPU_SAMPLES_SUSTAINED)
+            _assert_cpu_idle(samples, label="sustained")
+
+            # Additional check: no sustained busy period
+            consecutive_high = 0
+            max_consecutive_high = 0
+            for cpu in samples:
+                if cpu > CPU_CONSECUTIVE_SPIKE_THRESHOLD:
+                    consecutive_high += 1
+                    max_consecutive_high = max(max_consecutive_high, consecutive_high)
+                else:
+                    consecutive_high = 0
+
+            assert max_consecutive_high < CPU_MAX_CONSECUTIVE_SPIKES, (
+                f"Sustained busy period: {max_consecutive_high} consecutive samples "
+                f">{CPU_CONSECUTIVE_SPIKE_THRESHOLD}% (sorted: {sorted(samples)})"
+            )
+
+            pool.pools[Language.PYTHON].put_nowait(vm)
         finally:
             await pool.stop()
 

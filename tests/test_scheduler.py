@@ -12,7 +12,7 @@ from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_fast_balloon
+from tests.conftest import skip_unless_fast_balloon, skip_unless_hwaccel
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -1179,6 +1179,7 @@ console.log("output=" + result.code.trim());
 ]
 
 
+@skip_unless_hwaccel
 class TestPackageInstallation:
     """Integration tests for package installation with real QEMU VMs.
 
@@ -1187,6 +1188,9 @@ class TestPackageInstallation:
     - QEMU exit code detection issues (macOS HVF vs Linux KVM)
     - Filesystem sync issues with cache=unsafe
     - Snapshot corruption during package install
+
+    Requires hardware acceleration (KVM/HVF) - snapshot creation spawns
+    extra QEMU VMs that exhaust thread limits under TCG emulation.
     """
 
     @pytest.mark.parametrize("language,packages,code,expected_outputs", PACKAGE_INSTALL_TEST_CASES)

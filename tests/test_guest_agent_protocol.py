@@ -51,12 +51,12 @@ class TestPingRequest:
         """PingRequest serializes correctly."""
         req = PingRequest()
         data = req.model_dump()
-        assert data == {"action": "ping"}
+        assert data == {"action": "ping", "op_id": None}
 
     def test_serialize_to_json(self) -> None:
-        """PingRequest serializes to JSON."""
+        """PingRequest serializes to JSON (exclude_none matches wire format)."""
         req = PingRequest()
-        json_str = req.model_dump_json()
+        json_str = req.model_dump_json(exclude_none=True)
         assert json_str == '{"action":"ping"}'
 
 
@@ -70,7 +70,7 @@ class TestWarmReplRequest:
     def test_serialize_python(self) -> None:
         req = WarmReplRequest(language=Language.PYTHON)
         data = req.model_dump()
-        assert data == {"action": "warm_repl", "language": "python"}
+        assert data == {"action": "warm_repl", "language": "python", "op_id": None}
 
     def test_serialize_javascript(self) -> None:
         req = WarmReplRequest(language=Language.JAVASCRIPT)
@@ -563,7 +563,7 @@ class TestPongMessage:
         """PongMessage serializes correctly."""
         msg = PongMessage(version="2.1.0")
         data = msg.model_dump()
-        assert data == {"type": "pong", "version": "2.1.0"}
+        assert data == {"type": "pong", "version": "2.1.0", "op_id": None}
 
 
 class TestStreamingErrorMessage:
@@ -1056,13 +1056,13 @@ class TestListFilesRequest:
         """ListFilesRequest serializes correctly."""
         req = ListFilesRequest(path="data")
         data = req.model_dump()
-        assert data == {"action": "list_files", "path": "data"}
+        assert data == {"action": "list_files", "path": "data", "op_id": None}
 
     def test_serialize_default_path(self) -> None:
         """ListFilesRequest serializes default empty path."""
         req = ListFilesRequest()
         data = req.model_dump()
-        assert data == {"action": "list_files", "path": ""}
+        assert data == {"action": "list_files", "path": "", "op_id": None}
 
 
 # ============================================================================
@@ -1204,6 +1204,7 @@ class TestFileListMessage:
             "type": "file_list",
             "path": "project",
             "entries": [{"name": "app.js", "is_dir": False, "size": 512}],
+            "op_id": None,
         }
 
     def test_serialize_to_json(self) -> None:
@@ -1522,3 +1523,163 @@ class TestFilePathValidationPropertyBased:
             assert req.path == malicious_path
         except ValidationError:
             pass  # Pydantic rejected it -- also fine
+
+
+# ============================================================================
+# op_id on Requests
+# ============================================================================
+
+
+class TestRequestOpId:
+    """Tests for op_id field on GuestAgentRequest base class."""
+
+    def test_ping_request_no_op_id_excludes_from_json(self) -> None:
+        """PingRequest without op_id omits it from JSON (exclude_none)."""
+        req = PingRequest()
+        json_str = req.model_dump_json(exclude_none=True)
+        assert "op_id" not in json_str
+
+    def test_ping_request_with_op_id_includes_in_json(self) -> None:
+        """PingRequest with op_id includes it in JSON."""
+        req = PingRequest(op_id="abc")
+        json_str = req.model_dump_json(exclude_none=True)
+        assert '"op_id":"abc"' in json_str
+
+    def test_ping_request_op_id_default_none(self) -> None:
+        """PingRequest op_id defaults to None."""
+        req = PingRequest()
+        assert req.op_id is None
+
+    def test_execute_request_with_op_id(self) -> None:
+        """ExecuteCodeRequest carries op_id."""
+        req = ExecuteCodeRequest(language=Language.PYTHON, code="1+1", op_id="xyz")
+        assert req.op_id == "xyz"
+        json_str = req.model_dump_json(exclude_none=True)
+        assert '"op_id":"xyz"' in json_str
+
+    def test_list_files_request_with_op_id(self) -> None:
+        """ListFilesRequest carries op_id."""
+        req = ListFilesRequest(op_id="list-1")
+        assert req.op_id == "list-1"
+
+    def test_write_file_request_op_id_still_required(self) -> None:
+        """WriteFileRequest still requires op_id (child class override)."""
+        with pytest.raises(ValidationError):
+            WriteFileRequest(path="test.txt")  # type: ignore[call-arg]
+
+    def test_write_file_request_with_op_id(self) -> None:
+        """WriteFileRequest works with explicit op_id."""
+        req = WriteFileRequest(op_id="abc", path="test.txt")
+        assert req.op_id == "abc"
+
+    def test_warm_repl_request_with_op_id(self) -> None:
+        """WarmReplRequest carries op_id."""
+        req = WarmReplRequest(language=Language.PYTHON, op_id="warm-1")
+        assert req.op_id == "warm-1"
+
+    def test_install_packages_request_with_op_id(self) -> None:
+        """InstallPackagesRequest carries op_id."""
+        req = InstallPackagesRequest(language=Language.PYTHON, packages=["requests==2.31.0"], op_id="pkg-1")
+        assert req.op_id == "pkg-1"
+
+
+# ============================================================================
+# op_id on Responses
+# ============================================================================
+
+
+class TestResponseOpId:
+    """Tests for op_id field on response models."""
+
+    def test_pong_with_op_id(self) -> None:
+        """PongMessage parses op_id from JSON."""
+        import json
+
+        data = json.loads('{"type":"pong","version":"1.0","op_id":"abc"}')
+        msg = PongMessage(**data)
+        assert msg.op_id == "abc"
+
+    def test_pong_without_op_id_backward_compat(self) -> None:
+        """PongMessage without op_id defaults to None (backward compat)."""
+        import json
+
+        data = json.loads('{"type":"pong","version":"1.0"}')
+        msg = PongMessage(**data)
+        assert msg.op_id is None
+
+    def test_output_chunk_with_op_id(self) -> None:
+        """OutputChunkMessage accepts op_id."""
+        msg = OutputChunkMessage(type="stdout", chunk="hello", op_id="abc")
+        assert msg.op_id == "abc"
+
+    def test_output_chunk_without_op_id(self) -> None:
+        """OutputChunkMessage defaults op_id to None."""
+        msg = OutputChunkMessage(type="stdout", chunk="hello")
+        assert msg.op_id is None
+
+    def test_execution_complete_with_op_id(self) -> None:
+        """ExecutionCompleteMessage accepts op_id."""
+        msg = ExecutionCompleteMessage(exit_code=0, execution_time_ms=100, op_id="abc")
+        assert msg.op_id == "abc"
+
+    def test_execution_complete_without_op_id(self) -> None:
+        """ExecutionCompleteMessage defaults op_id to None."""
+        msg = ExecutionCompleteMessage(exit_code=0, execution_time_ms=100)
+        assert msg.op_id is None
+
+    def test_file_list_with_op_id(self) -> None:
+        """FileListMessage accepts op_id."""
+        msg = FileListMessage(path="", entries=[], op_id="abc")
+        assert msg.op_id == "abc"
+
+    def test_file_list_without_op_id(self) -> None:
+        """FileListMessage defaults op_id to None."""
+        msg = FileListMessage(path="", entries=[])
+        assert msg.op_id is None
+
+    def test_warm_repl_ack_with_op_id(self) -> None:
+        """WarmReplAckMessage accepts op_id."""
+        msg = WarmReplAckMessage(language="python", status="ok", op_id="abc")
+        assert msg.op_id == "abc"
+
+    def test_warm_repl_ack_without_op_id(self) -> None:
+        """WarmReplAckMessage defaults op_id to None."""
+        msg = WarmReplAckMessage(language="python", status="ok")
+        assert msg.op_id is None
+
+    def test_streaming_error_op_id_unchanged(self) -> None:
+        """StreamingErrorMessage already had op_id — still works."""
+        msg = StreamingErrorMessage(message="fail", error_type="io", op_id="abc")
+        assert msg.op_id == "abc"
+
+    def test_file_write_ack_op_id_unchanged(self) -> None:
+        """FileWriteAckMessage has required op_id — unchanged."""
+        msg = FileWriteAckMessage(op_id="abc", path="f.txt", bytes_written=42)
+        assert msg.op_id == "abc"
+
+    def test_discriminated_union_pong_with_op_id(self) -> None:
+        """StreamingMessage union parses PongMessage with op_id."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # type: ignore[type-arg]
+        msg = adapter.validate_json('{"type":"pong","version":"1.0","op_id":"abc"}')
+        assert isinstance(msg, PongMessage)
+        assert msg.op_id == "abc"
+
+    def test_discriminated_union_complete_with_op_id(self) -> None:
+        """StreamingMessage union parses ExecutionCompleteMessage with op_id."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # type: ignore[type-arg]
+        msg = adapter.validate_json('{"type":"complete","exit_code":0,"execution_time_ms":100,"op_id":"abc"}')
+        assert isinstance(msg, ExecutionCompleteMessage)
+        assert msg.op_id == "abc"
+
+    def test_discriminated_union_file_list_with_op_id(self) -> None:
+        """StreamingMessage union parses FileListMessage with op_id."""
+        from pydantic import TypeAdapter
+
+        adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # type: ignore[type-arg]
+        msg = adapter.validate_json('{"type":"file_list","path":"","entries":[],"op_id":"abc"}')
+        assert isinstance(msg, FileListMessage)
+        assert msg.op_id == "abc"

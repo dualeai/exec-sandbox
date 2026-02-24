@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::mpsc;
 
 use crate::constants::*;
-use crate::error::{CmdError, send_response};
+use crate::error::{CmdError, ResponseWriter};
 use crate::types::{FileEntry, GuestResponse};
 
 // ============================================================================
@@ -67,7 +67,6 @@ pub(crate) struct ActiveWriteHandle {
     pub(crate) chunk_tx: mpsc::Sender<Vec<u8>>,
     pub(crate) task: tokio::task::JoinHandle<Result<WriteResult, WriteError>>,
     pub(crate) path_display: String,
-    pub(crate) op_id: String,
 }
 
 pub(crate) struct WriteResult {
@@ -149,62 +148,51 @@ pub(crate) fn validate_file_path(relative_path: &str) -> Result<std::path::PathB
 pub(crate) async fn handle_read_file(
     op_id: &str,
     path: &str,
-    write_tx: &mpsc::Sender<Vec<u8>>,
+    writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
-    let resolved_path = validate_file_path(path).map_err(|e| {
-        CmdError::validation(format!("Invalid path '{path}': {e}")).with_op_id(op_id)
-    })?;
+    let resolved_path = validate_file_path(path)
+        .map_err(|e| CmdError::validation(format!("Invalid path '{path}': {e}")))?;
 
     if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        return Err(CmdError::validation("Cannot read a directory").with_op_id(op_id));
+        return Err(CmdError::validation("Cannot read a directory"));
     }
 
-    let canonical_path = tokio::fs::canonicalize(&resolved_path).await.map_err(|e| {
-        CmdError::io(
-            format!("File not found or inaccessible '{path}': {e}"),
-            Some(op_id),
-        )
-    })?;
+    let canonical_path = tokio::fs::canonicalize(&resolved_path)
+        .await
+        .map_err(|e| CmdError::io(format!("File not found or inaccessible '{path}': {e}")))?;
 
     let sandbox_canonical = tokio::fs::canonicalize(SANDBOX_ROOT)
         .await
         .unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
     if !canonical_path.starts_with(&sandbox_canonical) {
-        return Err(
-            CmdError::validation(format!("Path '{path}' resolves outside sandbox"))
-                .with_op_id(op_id),
-        );
+        return Err(CmdError::validation(format!(
+            "Path '{path}' resolves outside sandbox"
+        )));
     }
 
     let metadata = tokio::fs::metadata(&canonical_path)
         .await
-        .map_err(|e| CmdError::io(format!("Cannot read '{path}': {e}"), Some(op_id)))?;
+        .map_err(|e| CmdError::io(format!("Cannot read '{path}': {e}")))?;
 
     if metadata.is_dir() {
-        return Err(
-            CmdError::validation(format!("'{path}' is a directory, not a file")).with_op_id(op_id),
-        );
+        return Err(CmdError::validation(format!(
+            "'{path}' is a directory, not a file"
+        )));
     }
     if metadata.len() as usize > MAX_FILE_SIZE_BYTES {
         return Err(CmdError::validation(format!(
             "File too large: {} bytes (max {})",
             metadata.len(),
             MAX_FILE_SIZE_BYTES
-        ))
-        .with_op_id(op_id));
+        )));
     }
 
     let file_size = metadata.len();
     let file = std::fs::File::open(&canonical_path)
-        .map_err(|e| CmdError::io(format!("Failed to read '{path}': {e}"), Some(op_id)))?;
+        .map_err(|e| CmdError::io(format!("Failed to read '{path}': {e}")))?;
 
-    let mut encoder =
-        zstd::stream::read::Encoder::new(file, FILE_TRANSFER_ZSTD_LEVEL).map_err(|e| {
-            CmdError::io(
-                format!("Compression init failed for '{path}': {e}"),
-                Some(op_id),
-            )
-        })?;
+    let mut encoder = zstd::stream::read::Encoder::new(file, FILE_TRANSFER_ZSTD_LEVEL)
+        .map_err(|e| CmdError::io(format!("Compression init failed for '{path}': {e}")))?;
 
     let mut buf = vec![0u8; FILE_TRANSFER_CHUNK_SIZE];
     loop {
@@ -212,42 +200,35 @@ pub(crate) async fn handle_read_file(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                return Err(CmdError::io(format!("Compression error: {e}"), Some(op_id)));
+                return Err(CmdError::io(format!("Compression error: {e}")));
             }
         };
         let chunk_b64 = BASE64.encode(&buf[..n]);
-        send_response(
-            write_tx,
-            &GuestResponse::FileChunk {
+        writer
+            .send(&GuestResponse::FileChunk {
                 op_id: op_id.to_string(),
                 data: chunk_b64,
-            },
-        )
-        .await?;
+            })
+            .await?;
     }
 
-    send_response(
-        write_tx,
-        &GuestResponse::FileReadComplete {
+    writer
+        .send(&GuestResponse::FileReadComplete {
             op_id: op_id.to_string(),
             path: path.to_string(),
             size: file_size,
-        },
-    )
-    .await
+        })
+        .await
 }
 
 /// Handle list_files command: read directory entries.
-pub(crate) async fn handle_list_files(
-    path: &str,
-    write_tx: &mpsc::Sender<Vec<u8>>,
-) -> Result<(), CmdError> {
+pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
     let resolved_path = validate_file_path(path)
         .map_err(|e| CmdError::validation(format!("Invalid path '{path}': {e}")))?;
 
     let mut read_dir = tokio::fs::read_dir(&resolved_path)
         .await
-        .map_err(|e| CmdError::io(format!("Cannot list '{path}': {e}"), None))?;
+        .map_err(|e| CmdError::io(format!("Cannot list '{path}': {e}")))?;
 
     let mut entries = Vec::new();
     while let Ok(Some(entry)) = read_dir.next_entry().await {
@@ -264,14 +245,12 @@ pub(crate) async fn handle_list_files(
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    send_response(
-        write_tx,
-        &GuestResponse::FileList {
+    writer
+        .send(&GuestResponse::FileList {
             path: path.to_string(),
             entries,
-        },
-    )
-    .await
+        })
+        .await
 }
 
 /// Set up a pipelined file write operation.
@@ -281,25 +260,20 @@ pub(crate) async fn handle_write_file(
     op_id: &str,
     path: &str,
     make_executable: bool,
-    write_tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<ActiveWriteHandle, CmdError> {
-    let resolved_path = validate_file_path(path).map_err(|e| {
-        CmdError::validation(format!("Invalid path '{path}': {e}")).with_op_id(op_id)
-    })?;
+    let resolved_path = validate_file_path(path)
+        .map_err(|e| CmdError::validation(format!("Invalid path '{path}': {e}")))?;
 
     if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        return Err(
-            CmdError::validation("Cannot write to sandbox root directory").with_op_id(op_id),
-        );
+        return Err(CmdError::validation(
+            "Cannot write to sandbox root directory",
+        ));
     }
 
     if let Some(parent) = resolved_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        return Err(CmdError::io(
-            format!("Failed to create directories: {e}"),
-            Some(op_id),
-        ));
+        return Err(CmdError::io(format!("Failed to create directories: {e}")));
     }
 
     let tmp_path = resolved_path
@@ -308,7 +282,7 @@ pub(crate) async fn handle_write_file(
         .join(format!(".wr.{op_id}.tmp"));
 
     let file = std::fs::File::create(&tmp_path)
-        .map_err(|e| CmdError::io(format!("Failed to create temp file: {e}"), Some(op_id)))?;
+        .map_err(|e| CmdError::io(format!("Failed to create temp file: {e}")))?;
 
     let counting_writer = CountingWriter {
         inner: file,
@@ -319,10 +293,7 @@ pub(crate) async fn handle_write_file(
         Ok(d) => d,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(CmdError::io(
-                format!("Decompression init failed: {e}"),
-                Some(op_id),
-            ));
+            return Err(CmdError::io(format!("Decompression init failed: {e}")));
         }
     };
 
@@ -391,17 +362,10 @@ pub(crate) async fn handle_write_file(
         })
     });
 
-    // Note: handle_write_file previously returned Ok(None) on validation errors.
-    // Now those are Err(CmdError::Reply), and success always returns the handle.
-    // The unused write_tx parameter is kept for API consistency; validation errors
-    // now propagate via CmdError to the dispatcher.
-    let _ = write_tx;
-
     Ok(ActiveWriteHandle {
         chunk_tx,
         task,
         path_display: path.to_string(),
-        op_id: op_id.to_string(),
     })
 }
 

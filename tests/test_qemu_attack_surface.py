@@ -388,7 +388,11 @@ for dev in glob.glob('/dev/*'):
     safe = {'null', 'zero', 'full', 'random', 'urandom', 'tty',
             'console', 'ptmx', 'pts', 'shm', 'mqueue', 'fd',
             'stdin', 'stdout', 'stderr', 'kmsg', 'cpu_dma_latency',
-            'virtio-ports', 'iommu'}
+            'virtio-ports', 'iommu', 'zram0',
+            'gpiochip0',   # PL061 GPIO on ARM64 QEMU virt (selected by GPIO_PL061)
+            'nvme-fabrics',  # NVMe fabrics control plane (no NVMe hardware, benign)
+            'vmci',     # VMware VMCI kernel driver (AMD platform artifact, no host exposure)
+            'nvram'}    # Non-volatile RAM device (architecture-specific, read-only)
     if basename not in safe and not basename.startswith(('tty', 'vcs', 'vcsa', 'hvc', 'vport', 'rtc')):
         try:
             st = os.stat(dev)

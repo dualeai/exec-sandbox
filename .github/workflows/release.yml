@@ -328,11 +328,13 @@ jobs:
           cp artifacts/vm-images-x86_64/* release/
           cp artifacts/vm-images-aarch64/* release/
 
-          # Compress large files
+          # Compress large files (nullglob: vmlinux is x86_64 only, glob may not match for aarch64)
           cd release
+          shopt -s nullglob
           for f in *.qcow2 vmlinux-* vmlinuz-* initramfs-*; do
             zstd -19 --rm "$f"
           done
+          shopt -u nullglob
 
           # Generate checksums
           sha256sum * > SHA256SUMS

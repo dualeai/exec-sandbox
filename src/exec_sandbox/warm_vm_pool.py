@@ -21,7 +21,7 @@ L2 Disk Snapshots:
 Memory Optimization (Balloon):
 - Idle pool VMs have balloon inflated (guest has BALLOON_INFLATE_TARGET_MB)
 - Before execution, balloon deflates (guest gets full memory back)
-- Reduces idle memory by 50% per VM (128MB idle vs 256MB active)
+- Reduces idle memory per VM (160MB idle vs 192MB active)
 
 Example:
     ```python
@@ -199,6 +199,31 @@ class WarmVMPool:
             extra={
                 "boot_duration_s": f"{boot_duration:.2f}",
                 **{f"{lang.value}_vms": self.pools[lang].qsize() for lang in Language},
+            },
+        )
+
+    async def wait_until_ready(self, timeout: float = 120) -> None:
+        """Wait until all language pools are fully populated.
+
+        Polls pool sizes every 200ms until all queues report full().
+        Returns on timeout with a warning if pools never fill (e.g. boot failures).
+
+        Args:
+            timeout: Maximum seconds to wait before returning.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if all(pool.full() for pool in self.pools.values()):
+                return
+            await asyncio.sleep(0.2)
+        logger.warning(
+            "wait_until_ready timed out",
+            extra={
+                "timeout": timeout,
+                **{
+                    f"{lang.value}_pool": f"{self.pools[lang].qsize()}/{self.pool_size_per_language}"
+                    for lang in Language
+                },
             },
         )
 
@@ -565,7 +590,6 @@ class WarmVMPool:
         try:
             response = await vm.channel.send_request(
                 WarmReplRequest(language=language),
-                timeout=15,  # REPL startup can take ~1s
             )
             if isinstance(response, WarmReplAckMessage) and response.status == "ok":
                 logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
@@ -763,7 +787,7 @@ class WarmVMPool:
             logger.debug("Health check: establishing fresh connection", extra={"vm_id": vm.vm_id})
             await vm.channel.connect(timeout_seconds=5)
             logger.debug("Health check: sending ping request", extra={"vm_id": vm.vm_id})
-            response = await vm.channel.send_request(PingRequest(), timeout=5)
+            response = await vm.channel.send_request(PingRequest())
             logger.debug(
                 "Health check: received response",
                 extra={"vm_id": vm.vm_id, "response_type": type(response).__name__},

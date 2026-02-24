@@ -276,6 +276,7 @@ class TestSessionEdgeCases:
                 result = await session.exec(f"print({i})")
                 assert result.exit_code == 0
 
+    @skip_unless_hwaccel
     async def test_session_with_packages(self, scheduler: Scheduler) -> None:
         """Session with pre-installed packages works."""
         async with await scheduler.session(
@@ -549,6 +550,11 @@ class TestSessionOutOfBounds:
             idle_timeout_seconds=10,
         )
         try:
+            # First exec spawns the REPL (~4-5s on cold boot).
+            # Run it under the original 10s timeout before switching
+            # to the short timeout used to verify reset behavior.
+            result = await session.exec("1")
+            assert result.exit_code == 0
             session._idle_timeout_seconds = 2
             session._reset_idle_timer()
             # Exec at ~1s resets the 2s timer

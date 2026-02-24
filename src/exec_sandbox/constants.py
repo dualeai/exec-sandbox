@@ -6,8 +6,11 @@ from typing import Final
 # VM Memory and Resource Defaults
 # ============================================================================
 
-DEFAULT_MEMORY_MB: Final[int] = 256
-"""Default guest VM memory allocation in MB (reduced from 512MB for cost optimization)."""
+DEFAULT_MEMORY_MB: Final[int] = 192
+"""Default guest VM memory allocation in MB.
+
+History: 512MB → 256MB (cost optimization) → 192MB (Bun needs ~42MB RSS + kernel
+overhead; 192MB provides sufficient headroom while reducing per-VM cost)."""
 
 MIN_MEMORY_MB: Final[int] = 128
 """Minimum guest VM memory in MB.
@@ -46,6 +49,22 @@ VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""
+
+GUEST_REQUEST_TIMEOUT_SECONDS: Final[int] = 5
+"""Default timeout for guest agent request/response (ping, warm_repl, etc.)."""
+
+GUEST_RECONNECT_PROBE_TIMEOUT: Final[float] = 0.5
+"""Timeout per ping probe when verifying guest is ready after reconnection.
+
+After close()+connect(), QEMU's chardev socket accepts before the guest agent
+has reopened its virtio-serial port fds. Data sent in this window is silently
+dropped. A lightweight PingRequest confirms the guest is actually listening."""
+
+GUEST_RECONNECT_PROBE_MAX_RETRIES: Final[int] = 5
+"""Maximum reconnection probe attempts before raising TimeoutError."""
+
+GUEST_RECONNECT_PROBE_DELAY: Final[float] = 0.05
+"""Delay between reconnection probe retries (50ms)."""
 
 EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 8
 """Hard timeout margin above soft timeout (host watchdog protection).
@@ -185,8 +204,8 @@ WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
 
-WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 10
-"""Health check interval for warm VMs in seconds (matches K8s/Cloud Run periodSeconds default)."""
+WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 15
+"""Health check interval for warm VMs in seconds."""
 
 WARM_POOL_HEALTH_CHECK_MAX_RETRIES: Final[int] = 3
 """Maximum retry attempts before declaring VM unhealthy (matches K8s failureThreshold)."""
@@ -201,14 +220,16 @@ WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
 # Balloon Memory Management (for warm pool memory efficiency)
 # ============================================================================
 
-BALLOON_INFLATE_TARGET_MB: Final[int] = 128
+BALLOON_INFLATE_TARGET_MB: Final[int] = 160
 """Target guest memory in MB when inflating balloon for idle warm pool VMs.
 Inflating the balloon reduces guest memory, allowing host to reclaim.
 
 History: 64MB caused unresponsive guests (only ~14MB headroom). 96MB still
 caused freezes on kernel 6.18 where ~38MB overhead + guest-agent + Python
-leaves <20MB free under pressure. 128MB provides reliable headroom (~50MB
-free after overhead) while still achieving 50% memory reduction vs 256MB."""
+leaves <20MB free under pressure. 128MB caused ~20% QEMU vCPU overhead on
+Bun VMs (42MB RSS) because the balloon driver couldn't reach target and kept
+retrying page reclaim. 160MB provides sufficient headroom for all runtimes
+(~70MB free after Bun overhead) while achieving 17% memory reduction vs 192MB."""
 
 BALLOON_TOLERANCE_MB: Final[int] = 40
 """Tolerance in MB for balloon target polling. Allows early exit when balloon is

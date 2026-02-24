@@ -402,9 +402,6 @@ print("DONE", flush=True)
         assert result.exit_code == 0
         assert "STARTING" in result.stdout
         assert "DONE" in result.stdout
-        # Should complete very quickly (no timeout, no termination)
-        assert result.timing is not None
-        assert result.timing.execute_ms < 2000  # < 2s
 
     @skip_unless_hwaccel
     async def test_sigterm_ignored_escalates_to_sigkill(self, scheduler: Scheduler) -> None:

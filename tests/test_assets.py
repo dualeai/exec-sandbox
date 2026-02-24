@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from exec_sandbox.asset_downloader import decompress_zstd
 from exec_sandbox.assets import (
     _find_asset,  # pyright: ignore[reportPrivateUsage]
     _find_images_dir,  # pyright: ignore[reportPrivateUsage]
@@ -427,7 +428,15 @@ class TestConcurrentDecompression:
 
 
 class TestFetchKernel:
-    """Tests for fetch_kernel() function."""
+    """Tests for fetch_kernel() function.
+
+    Every test patches __file__ and _versioned_cache_dir for full isolation,
+    ensuring results are deterministic regardless of what exists on disk.
+    """
+
+    # =========================================================================
+    # Original tests (fixed for isolation)
+    # =========================================================================
 
     async def test_returns_cached_kernel(self, tmp_path: Path) -> None:
         """Returns cached kernel without downloading."""
@@ -438,21 +447,11 @@ class TestFetchKernel:
         kernel = tmp_path / f"vmlinuz-{arch}"
         kernel.touch()
 
-        with patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}):
-            result = await fetch_kernel()
-            assert result == kernel
-
-    async def test_returns_decompressed_kernel(self, tmp_path: Path) -> None:
-        """Returns decompressed kernel when .zst is requested but only decompressed exists."""
-        from exec_sandbox.asset_downloader import get_current_arch
-        from exec_sandbox.assets import fetch_kernel
-
-        arch = get_current_arch()
-        # Only decompressed version exists
-        kernel = tmp_path / f"vmlinuz-{arch}"
-        kernel.touch()
-
-        with patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}):
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
             result = await fetch_kernel()
             assert result == kernel
 
@@ -470,7 +469,11 @@ class TestFetchKernel:
         (override_dir / f"vmlinuz-{arch}").write_text("override")
         (env_dir / f"vmlinuz-{arch}").write_text("env")
 
-        with patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}):
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
             result = await fetch_kernel(override=override_dir)
             assert result == override_dir / f"vmlinuz-{arch}"
 
@@ -478,10 +481,13 @@ class TestFetchKernel:
         """Fetches kernel for specified architecture."""
         from exec_sandbox.assets import fetch_kernel
 
-        # Create kernel for specific arch
         (tmp_path / "vmlinuz-aarch64").touch()
 
-        with patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}):
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
             result = await fetch_kernel(arch="aarch64")
             assert result == tmp_path / "vmlinuz-aarch64"
 
@@ -506,6 +512,372 @@ class TestFetchKernel:
             mock_registry.assert_called_once()
             mock_assets.return_value.fetch.assert_called_once()
             assert result == downloaded_kernel
+
+    # =========================================================================
+    # Category 1: vmlinux preference within same directory (x86_64)
+    # =========================================================================
+
+    async def test_x86_64_prefers_vmlinux_over_vmlinuz_same_dir(self, tmp_path: Path) -> None:
+        """On x86_64, vmlinux is preferred over vmlinuz in the same directory."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-x86_64").touch()
+        (env_dir / "vmlinuz-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinux-x86_64"
+
+    async def test_x86_64_prefers_zst_over_decompressed_vmlinux(self, tmp_path: Path) -> None:
+        """On x86_64, vmlinux .zst is preferred over decompressed vmlinux."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-x86_64.zst").touch()
+        (env_dir / "vmlinux-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinux-x86_64.zst"
+
+    async def test_x86_64_prefers_zst_over_decompressed_vmlinuz(self, tmp_path: Path) -> None:
+        """On x86_64 with no vmlinux, vmlinuz .zst is preferred over decompressed."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinuz-x86_64.zst").touch()
+        (env_dir / "vmlinuz-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinuz-x86_64.zst"
+
+    # =========================================================================
+    # Category 2: Directory priority beats kernel type (the bug regression)
+    # =========================================================================
+
+    async def test_env_vmlinuz_beats_local_vmlinux(self, tmp_path: Path) -> None:
+        """Env dir vmlinuz wins over images/dist/ vmlinux — the exact CI bug."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinuz-x86_64").touch()
+
+        # Point __file__ so images/dist resolves to a controlled dir
+        local_dist = tmp_path / "images" / "dist"
+        local_dist.mkdir(parents=True)
+        (local_dist / "vmlinux-x86_64").touch()
+        fake_file = str(tmp_path / "src" / "exec_sandbox" / "assets.py")
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", fake_file),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinuz-x86_64"
+
+    async def test_override_vmlinuz_beats_env_vmlinux(self, tmp_path: Path) -> None:
+        """Override vmlinuz wins over env dir vmlinux."""
+        from exec_sandbox.assets import fetch_kernel
+
+        override_dir = tmp_path / "override"
+        override_dir.mkdir()
+        (override_dir / "vmlinuz-x86_64").touch()
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64", override=override_dir)
+            assert result == override_dir / "vmlinuz-x86_64"
+
+    async def test_env_vmlinuz_beats_cache_vmlinux(self, tmp_path: Path) -> None:
+        """Env dir vmlinuz wins over cache dir vmlinux."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinuz-x86_64").touch()
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "vmlinux-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=cache_dir),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinuz-x86_64"
+
+    # =========================================================================
+    # Category 3: Architecture (aarch64 ignores vmlinux)
+    # =========================================================================
+
+    async def test_aarch64_ignores_vmlinux_returns_vmlinuz(self, tmp_path: Path) -> None:
+        """On aarch64, vmlinux is ignored even when present; vmlinuz returned."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-aarch64").touch()
+        (env_dir / "vmlinuz-aarch64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="aarch64")
+            assert result == env_dir / "vmlinuz-aarch64"
+
+    async def test_aarch64_skips_vmlinux_only_dir(self, tmp_path: Path) -> None:
+        """On aarch64, dir with only vmlinux is skipped; falls to next dir."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-aarch64").touch()  # Ignored for aarch64
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "vmlinuz-aarch64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=cache_dir),
+        ):
+            result = await fetch_kernel(arch="aarch64")
+            assert result == cache_dir / "vmlinuz-aarch64"
+
+    async def test_aarch64_prefers_zst_over_decompressed(self, tmp_path: Path) -> None:
+        """On aarch64, vmlinuz .zst is preferred over decompressed vmlinuz."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinuz-aarch64.zst").touch()
+        (env_dir / "vmlinuz-aarch64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="aarch64")
+            assert result == env_dir / "vmlinuz-aarch64.zst"
+
+    # =========================================================================
+    # Category 4: Edge cases
+    # =========================================================================
+
+    async def test_empty_higher_priority_dir_falls_through(self, tmp_path: Path) -> None:
+        """Empty override dir is skipped; env dir kernel returned."""
+        from exec_sandbox.assets import fetch_kernel
+
+        override_dir = tmp_path / "override"
+        override_dir.mkdir()  # Empty
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinuz-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64", override=override_dir)
+            assert result == env_dir / "vmlinuz-x86_64"
+
+    async def test_only_vmlinux_decompressed_in_dir(self, tmp_path: Path) -> None:
+        """Single dir with only decompressed vmlinux is returned on x86_64."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinux-x86_64"
+
+    async def test_only_cache_has_kernel(self, tmp_path: Path) -> None:
+        """Override, env, and local all empty — cache dir kernel returned."""
+        from exec_sandbox.assets import fetch_kernel
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "vmlinuz-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=cache_dir),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == cache_dir / "vmlinuz-x86_64"
+
+    # =========================================================================
+    # Category 5: Download fallback
+    # =========================================================================
+
+    async def test_download_prefers_vmlinux_x86_64_when_in_registry(self, tmp_path: Path) -> None:
+        """No local files, registry has vmlinux — downloads vmlinux."""
+        from exec_sandbox.assets import fetch_kernel
+
+        downloaded = tmp_path / "vmlinux-x86_64"
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty"),
+            patch("exec_sandbox.assets.ensure_registry_loaded", new_callable=AsyncMock),
+            patch("exec_sandbox.assets.get_assets") as mock_assets,
+        ):
+            mock_assets.return_value.registry = {"vmlinux-x86_64.zst": "sha256:abc"}
+            mock_assets.return_value.fetch = AsyncMock(return_value=downloaded)
+
+            result = await fetch_kernel(arch="x86_64")
+
+            mock_assets.return_value.fetch.assert_called_once_with("vmlinux-x86_64.zst", processor=decompress_zstd)
+            assert result == downloaded
+
+    async def test_download_falls_back_to_vmlinuz_when_vmlinux_not_in_registry(self, tmp_path: Path) -> None:
+        """No local files, registry lacks vmlinux — downloads vmlinuz."""
+        from exec_sandbox.assets import fetch_kernel
+
+        downloaded = tmp_path / "vmlinuz-x86_64"
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty"),
+            patch("exec_sandbox.assets.ensure_registry_loaded", new_callable=AsyncMock),
+            patch("exec_sandbox.assets.get_assets") as mock_assets,
+        ):
+            mock_assets.return_value.registry = {}  # No vmlinux
+            mock_assets.return_value.fetch = AsyncMock(return_value=downloaded)
+
+            result = await fetch_kernel(arch="x86_64")
+
+            mock_assets.return_value.fetch.assert_called_once_with("vmlinuz-x86_64.zst", processor=decompress_zstd)
+            assert result == downloaded
+
+    async def test_download_aarch64_always_vmlinuz(self, tmp_path: Path) -> None:
+        """On aarch64, always downloads vmlinuz even if vmlinux is in registry."""
+        from exec_sandbox.assets import fetch_kernel
+
+        downloaded = tmp_path / "vmlinuz-aarch64"
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty"),
+            patch("exec_sandbox.assets.ensure_registry_loaded", new_callable=AsyncMock),
+            patch("exec_sandbox.assets.get_assets") as mock_assets,
+        ):
+            mock_assets.return_value.registry = {"vmlinux-aarch64.zst": "sha256:abc"}
+            mock_assets.return_value.fetch = AsyncMock(return_value=downloaded)
+
+            result = await fetch_kernel(arch="aarch64")
+
+            mock_assets.return_value.fetch.assert_called_once_with("vmlinuz-aarch64.zst", processor=decompress_zstd)
+            assert result == downloaded
+
+    # =========================================================================
+    # Category 6: Weird / adversarial
+    # =========================================================================
+
+    async def test_wrong_arch_vmlinux_ignored(self, tmp_path: Path) -> None:
+        """vmlinux for wrong arch is not matched; falls through to download."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-aarch64").touch()  # Wrong arch for x86_64 request
+
+        downloaded = tmp_path / "vmlinuz-x86_64"
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+            patch("exec_sandbox.assets.ensure_registry_loaded", new_callable=AsyncMock) as mock_registry,
+            patch("exec_sandbox.assets.get_assets") as mock_assets,
+        ):
+            mock_assets.return_value.registry = {}
+            mock_assets.return_value.fetch = AsyncMock(return_value=downloaded)
+
+            result = await fetch_kernel(arch="x86_64")
+
+            mock_registry.assert_called_once()
+            assert result == downloaded
+
+    async def test_local_found_skips_download_entirely(self, tmp_path: Path) -> None:
+        """When kernel found locally, ensure_registry_loaded is never called."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinuz-x86_64").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+            patch("exec_sandbox.assets.ensure_registry_loaded", new_callable=AsyncMock) as mock_registry,
+        ):
+            result = await fetch_kernel(arch="x86_64")
+
+            mock_registry.assert_not_called()
+            assert result == env_dir / "vmlinuz-x86_64"
+
+    async def test_vmlinux_decompressed_beats_vmlinuz_zst_same_dir(self, tmp_path: Path) -> None:
+        """On x86_64, decompressed vmlinux beats vmlinuz .zst in the same dir."""
+        from exec_sandbox.assets import fetch_kernel
+
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "vmlinux-x86_64").touch()
+        (env_dir / "vmlinuz-x86_64.zst").touch()
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(env_dir)}, clear=False),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/src/exec_sandbox/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
+        ):
+            result = await fetch_kernel(arch="x86_64")
+            assert result == env_dir / "vmlinux-x86_64"
 
 
 class TestFetchInitramfs:

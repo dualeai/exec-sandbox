@@ -1,7 +1,6 @@
 //! Package installation (pip, bun) with validation.
 
 use tokio::process::Command;
-use tokio::sync::mpsc;
 
 use crate::constants::*;
 use crate::error::*;
@@ -115,7 +114,7 @@ pub(crate) fn validate_package_name(pkg: &str) -> Result<(), String> {
 pub(crate) async fn install_packages(
     language: Language,
     packages: &[String],
-    write_tx: &mpsc::Sender<Vec<u8>>,
+    writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
     use std::time::Instant;
     use tokio::time::Duration;
@@ -227,35 +226,29 @@ pub(crate) async fn install_packages(
     }
 
     if !stdout_lines.is_empty() {
-        send_response(
-            write_tx,
-            &GuestResponse::Stdout {
+        writer
+            .send(&GuestResponse::Stdout {
                 chunk: stdout_lines.join("\n") + "\n",
-            },
-        )
-        .await?;
+            })
+            .await?;
     }
 
     if !stderr_lines.is_empty() {
-        send_response(
-            write_tx,
-            &GuestResponse::Stderr {
+        writer
+            .send(&GuestResponse::Stderr {
                 chunk: stderr_lines.join("\n") + "\n",
-            },
-        )
-        .await?;
+            })
+            .await?;
     }
 
-    send_response(
-        write_tx,
-        &GuestResponse::Complete {
+    writer
+        .send(&GuestResponse::Complete {
             exit_code,
             execution_time_ms: duration_ms,
             spawn_ms: None,
             process_ms: None,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     Ok(())
 }

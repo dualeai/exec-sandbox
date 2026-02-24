@@ -17,11 +17,6 @@ from exec_sandbox.warm_vm_pool import Language
 
 from .conftest import skip_unless_fast_balloon
 
-# Maximum concurrent VMs for stress tests. QEMU creates 5-15 threads per VM;
-# with pytest-xdist this can exhaust thread limits (SIGABRT). Value of 3 is
-# safe while still testing concurrency.
-_MAX_CONCURRENT_VMS = 3
-
 # Memory-intensive tests that push VMs to near-maximum utilization (250MB in 256MB VM)
 # require fast balloon/memory operations. On x64 CI runners with nested virtualization
 # (GitHub Actions on Azure), these operations are 50-100x slower due to missing
@@ -224,13 +219,13 @@ class TestZramMemoryExpansion:
     """Tests for zram enabling memory expansion beyond physical RAM."""
 
     async def test_allocate_well_beyond_physical_ram(self, scheduler: Scheduler) -> None:
-        """VM should allocate 240MB when only ~175MB available (37% over)."""
+        """VM should allocate well beyond available RAM using zram."""
         result = await scheduler.run(
             code="""
 import gc
 gc.collect()
 
-# Get available memory before
+# Get available memory before allocation
 with open('/proc/meminfo') as f:
     for line in f:
         if 'MemAvailable' in line:
@@ -240,8 +235,12 @@ with open('/proc/meminfo') as f:
 available_mb = available_kb // 1024
 print(f'Available memory: {available_mb}MB')
 
-# Allocate 240MB (significantly more than available ~175MB)
-target_mb = 240
+# Allocate 130% of available — must exceed physical RAM via zram
+target_mb = int(available_mb * 1.3)
+# Round up to nearest 10MB chunk boundary
+target_mb = ((target_mb + 9) // 10) * 10
+print(f'Target allocation: {target_mb}MB')
+
 chunks = []
 allocated = 0
 try:
@@ -509,8 +508,7 @@ with open('/proc/swaps') as f:
 
 print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
 """
-            # Run VMs concurrently (limited by _MAX_CONCURRENT_VMS to avoid thread exhaustion)
-            tasks = [sched.run(code=code, language=Language.PYTHON) for _ in range(_MAX_CONCURRENT_VMS)]
+            tasks = [sched.run(code=code, language=Language.PYTHON) for _ in range(3)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # All should succeed
@@ -558,7 +556,7 @@ print(f'PASS: VM{vm_id} hash={{h.hexdigest()[:16]}}')
 """
                 return await sched.run(code=code, language=Language.PYTHON)
 
-            tasks = [run_vm_with_signature(i) for i in range(_MAX_CONCURRENT_VMS)]
+            tasks = [run_vm_with_signature(i) for i in range(3)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             hashes: list[str] = []
@@ -575,24 +573,4 @@ print(f'PASS: VM{vm_id} hash={{h.hexdigest()[:16]}}')
                         hashes.append(h)
 
             # All hashes should be different (each VM has unique signature)
-            assert len(set(hashes)) == _MAX_CONCURRENT_VMS, (
-                f"Expected {_MAX_CONCURRENT_VMS} unique hashes, got: {hashes}"
-            )
-
-
-# ============================================================================
-# Constants Tests
-# ============================================================================
-
-
-class TestMemoryConstants:
-    """Tests for memory-related constants."""
-
-    def test_default_memory_allows_zram_expansion(self) -> None:
-        """DEFAULT_MEMORY_MB with zram should allow ~1.5x effective memory."""
-        from exec_sandbox import constants
-
-        # Default memory should be at least 256MB
-        assert constants.DEFAULT_MEMORY_MB >= 256
-        # With zram at 50% and ~2.5x compression, effective ~1.25x expansion
-        # So 256MB VM can handle ~320MB allocations
+            assert len(set(hashes)) == 3, f"Expected 3 unique hashes, got: {hashes}"

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -114,7 +116,7 @@ class OverlayPool:
             images_path: Directory containing base images (for auto-discovery)
             pool_dir: Optional pool directory (default: tempdir/exec-sandbox-overlay-pool)
         """
-        self._pool_dir = pool_dir or Path(tempfile.gettempdir()) / "exec-sandbox-overlay-pool"
+        self._pool_dir = pool_dir or Path(tempfile.gettempdir()) / f"exec-sandbox-overlay-pool-{os.getpid()}"
         self._pool_size = pool_size
         self._images_path = images_path
         self._pools: dict[str, asyncio.Queue[Path]] = {}  # base_image_path -> queue
@@ -160,6 +162,58 @@ class OverlayPool:
         matches = [p.resolve() for p in self._images_path.glob("*-base-*.qcow2")]
         return sorted(matches)
 
+    @staticmethod
+    def _cleanup_stale_pool_dirs() -> int:
+        """Remove stale PID-scoped pool directories from dead processes.
+
+        Directory names encode the owner PID: exec-sandbox-overlay-pool-{pid}.
+        When the owner dies (crash, OOM, kill -9), the directory becomes stale.
+        Also cleans up the legacy singleton directory (no PID suffix).
+
+        Returns:
+            Number of stale directories cleaned up.
+        """
+        tmpdir = Path(tempfile.gettempdir())
+        pattern = re.compile(r"^exec-sandbox-overlay-pool-(\d+)$")
+        cleaned = 0
+
+        for pool_dir in tmpdir.glob("exec-sandbox-overlay-pool*"):
+            if not pool_dir.is_dir():
+                continue
+
+            match = pattern.match(pool_dir.name)
+            if match:
+                # PID-scoped directory: check if owner is alive
+                owner_pid = int(match.group(1))
+                try:
+                    os.kill(owner_pid, 0)
+                    # Owner alive, skip
+                    continue
+                except PermissionError:
+                    # Owner alive but not ours, skip
+                    continue
+                except ProcessLookupError:
+                    pass  # Owner dead, proceed to cleanup
+            elif pool_dir.name == "exec-sandbox-overlay-pool":
+                # Legacy singleton directory (no PID suffix): always clean up
+                pass
+            else:
+                # Non-matching directory (e.g. exec-sandbox-overlay-pool-abc), skip
+                continue
+
+            # Remove stale directory
+            try:
+                shutil.rmtree(pool_dir)
+                cleaned += 1
+                logger.debug("Removed stale overlay pool directory", extra={"pool_dir": str(pool_dir)})
+            except OSError as e:
+                logger.debug(
+                    "Failed to remove stale overlay pool directory",
+                    extra={"pool_dir": str(pool_dir), "error": str(e)},
+                )
+
+        return cleaned
+
     async def start(self, base_images: list[Path] | None = None) -> None:
         """Start the overlay pool and pre-create overlays for base images.
 
@@ -176,6 +230,14 @@ class OverlayPool:
         """
         if self._started:
             raise RuntimeError("Overlay pool already started - call stop() first")
+
+        # Clean up stale pool directories from dead processes
+        try:
+            count = await asyncio.to_thread(self._cleanup_stale_pool_dirs)
+            if count:
+                logger.info("Cleaned up stale overlay pool directories", extra={"count": count})
+        except OSError:
+            logger.debug("Stale pool directory cleanup failed (non-critical)", exc_info=True)
 
         # Clear shutdown event to allow restart after previous shutdown
         self._shutdown_event.clear()
@@ -257,9 +319,9 @@ class OverlayPool:
             self._daemon = None
 
         # Clean up pool directory
-        if self._pool_dir.exists():
+        if await aiofiles.os.path.exists(self._pool_dir):
             try:
-                shutil.rmtree(self._pool_dir)
+                await asyncio.to_thread(shutil.rmtree, self._pool_dir)
             except OSError as e:
                 logger.warning(
                     "Failed to cleanup overlay pool directory",
@@ -290,7 +352,7 @@ class OverlayPool:
             QemuStorageDaemonError: Failed to create overlay via daemon
         """
         # Prevent silent overwrite of existing files
-        if target_path.exists():
+        if await aiofiles.os.path.exists(target_path):
             raise FileExistsError(f"Target overlay already exists: {target_path}")
 
         key = str(base_image.resolve())
@@ -327,12 +389,12 @@ class OverlayPool:
                 )
                 # Clean up the orphaned overlay file
                 with contextlib.suppress(OSError):
-                    if overlay_path.exists():
-                        overlay_path.unlink()
+                    if await aiofiles.os.path.exists(overlay_path):
+                        await aiofiles.os.remove(overlay_path)
                 # Clean up partial target that cross-FS copy may have created
                 with contextlib.suppress(OSError):
-                    if target_path.exists():
-                        target_path.unlink()
+                    if await aiofiles.os.path.exists(target_path):
+                        await aiofiles.os.remove(target_path)
                 # Fall through to slow path
         except asyncio.QueueEmpty:
             logger.debug(
@@ -366,6 +428,14 @@ class OverlayPool:
                     raise RuntimeError("Daemon must be started")
                 await self._daemon.create_overlay(base_image, overlay_path)
 
+                # Defense-in-depth: verify file was actually created
+                if not await aiofiles.os.path.exists(overlay_path):
+                    logger.warning(
+                        "Daemon returned success but overlay file missing",
+                        extra={"overlay_path": str(overlay_path), "base_image": str(base_image)},
+                    )
+                    return
+
                 # Add to pool (non-blocking, may fail if full)
                 pool = self._pools.get(key)
                 if pool:
@@ -374,7 +444,7 @@ class OverlayPool:
                     except asyncio.QueueFull:
                         # Pool is full, clean up extra overlay
                         with contextlib.suppress(OSError):
-                            overlay_path.unlink()
+                            await aiofiles.os.remove(overlay_path)
             except (OSError, QemuStorageDaemonError) as e:
                 logger.warning(
                     "Failed to create pooled overlay",

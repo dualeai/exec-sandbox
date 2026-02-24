@@ -1,6 +1,7 @@
 //! Minimal init for QEMU microVMs
 //!
-//! Handles kernel modules, zram, devtmpfs, read-only rootfs mount, and switch_root.
+//! Custom kernel (CONFIG_MODULES=n): all drivers are built-in.
+//! Handles devtmpfs, read-only rootfs mount, and switch_root.
 
 #[macro_use]
 mod sys;
@@ -9,117 +10,6 @@ mod zram;
 
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::fs::symlink;
-
-// Module paths relative to /lib/modules/<kver>/kernel/
-const CORE_MODULES: &[&str] = &[
-    "drivers/virtio/virtio_mmio.ko",
-    "drivers/block/virtio_blk.ko",
-];
-
-const NET_MODULES: &[&str] = &[
-    "net/core/failover.ko",
-    "drivers/net/net_failover.ko",
-    "drivers/net/virtio_net.ko",
-];
-
-const BALLOON_MODULES: &[&str] = &["drivers/virtio/virtio_balloon.ko"];
-
-// Alpine 3.23 / kernel 6.18 paths
-const FS_MODULES: &[&str] = &[
-    "lib/crc/crc16.ko",
-    "crypto/crc32c-cryptoapi.ko",
-    "fs/mbcache.ko",
-    "fs/jbd2/jbd2.ko",
-    "fs/ext4/ext4.ko",
-];
-
-// Security: harden kernel attack surface via sysctl.
-// These settings disable kernel subsystems that have been repeatedly exploited
-// for privilege escalation and sandbox escape. Each write may fail silently
-// if the sysctl doesn't exist (older kernel), which is acceptable.
-const SYSCTL_HARDENING: &[(&str, &str)] = &[
-    // eBPF: CVE-2020-8835, CVE-2021-3490, CVE-2021-31440, CVE-2023-2163
-    // Value 2 = disabled for all (even CAP_SYS_ADMIN requires BPF token)
-    ("/proc/sys/kernel/unprivileged_bpf_disabled", "2"),
-    // User namespaces: CVE-2022-0185, CVE-2023-0386
-    // Value 0 = no unprivileged user namespaces (prevents gaining CAP_SYS_ADMIN)
-    // unprivileged_userns_clone is Debian/Ubuntu-specific
-    ("/proc/sys/kernel/unprivileged_userns_clone", "0"),
-    // user.max_user_namespaces is the portable alternative (works on Alpine)
-    ("/proc/sys/user/max_user_namespaces", "0"),
-    // Kernel address exposure: aids exploitation of CVE-2023-3269 (StackRot) etc.
-    // Value 2 = restrict to CAP_SYSLOG (even root can't read without capability)
-    ("/proc/sys/kernel/kptr_restrict", "2"),
-    // dmesg: kernel log may leak addresses, module info, hardware details
-    // Value 1 = restrict to CAP_SYSLOG
-    ("/proc/sys/kernel/dmesg_restrict", "1"),
-    // Perf events: can be used for side-channel attacks and kernel exploitation
-    // Value 3 = disabled for all (even CAP_PERFMON)
-    ("/proc/sys/kernel/perf_event_paranoid", "3"),
-    // BPF JIT hardening: prevents JIT spraying attacks (CVE-2024-56615)
-    // Value 2 = JIT hardening for all users (blinding constants in BPF JIT)
-    ("/proc/sys/net/core/bpf_jit_harden", "2"),
-    // userfaultfd: used in kernel race condition exploits to pause execution
-    // at precise points during memory operations (UAF, double-free, TOCTOU).
-    // Value 0 = restrict to CAP_SYS_PTRACE holders only.
-    ("/proc/sys/vm/unprivileged_userfaultfd", "0"),
-    // YAMA ptrace_scope: restricts ptrace regardless of dumpable flag.
-    // Value 2 = only CAP_SYS_PTRACE can ptrace (admin-only).
-    // CVE-2022-30594: PTRACE_O_SUSPEND_SECCOMP bypass via ptrace.
-    ("/proc/sys/kernel/yama/ptrace_scope", "2"),
-    // Filesystem link protections: prevent symlink/hardlink attacks in
-    // world-writable directories (defense-in-depth for /tmp).
-    ("/proc/sys/fs/protected_symlinks", "1"),
-    ("/proc/sys/fs/protected_hardlinks", "1"),
-    ("/proc/sys/fs/protected_fifos", "2"),
-    ("/proc/sys/fs/protected_regular", "2"),
-    // suid_dumpable: controls core dump behavior for setuid processes.
-    // Value 0 = no core dumps for processes that crossed privilege boundary.
-    // Note: does NOT prevent same-UID exec from setting dumpable=1.
-    ("/proc/sys/fs/suid_dumpable", "0"),
-    // SysRq: disable keyboard-triggered Magic SysRq functions.
-    // NOTE: This does NOT protect /proc/sysrq-trigger — the kernel's
-    // write_sysrq_trigger() bypasses the sysrq_enabled bitmask (check_mask=false
-    // in drivers/tty/sysrq.c). The procfs trigger is blocked by a read-only
-    // bind-mount in guest-agent instead. This only disables Alt+SysRq+key combos.
-    // Value 0 = all keyboard SysRq functions disabled.
-    ("/proc/sys/kernel/sysrq", "0"),
-    // Thread bomb mitigation: limit total system-wide threads.
-    // Default is memory-proportional (~1,659 on a 512MB VM, computed as
-    // mempages / (8 * THREAD_SIZE / PAGE_SIZE) in kernel/fork.c:fork_init).
-    // Value 1200 leaves headroom for ~150 kernel threads (kthreadd, kworker,
-    // ksoftirqd, etc.) while capping user-space thread bombs. RLIMIT_NPROC=1024
-    // per-UID is the primary defense; this is defense-in-depth.
-    // See: https://docs.kernel.org/admin-guide/sysctl/kernel.html
-    ("/proc/sys/kernel/threads-max", "1200"),
-    // MUST be last — disable kernel module loading (irreversible once set to 1).
-    // All modules (virtio, ext4, zram, etc.) are loaded above before this point.
-    ("/proc/sys/kernel/modules_disabled", "1"),
-];
-
-fn apply_sysctl_hardening() {
-    for &(path, value) in SYSCTL_HARDENING {
-        let _ = fs::write(path, value);
-    }
-}
-
-fn load_modules(kver: &str) {
-    let m = format!("/lib/modules/{}/kernel", kver);
-    let load = |modules: &[&str]| {
-        for module in modules {
-            sys::load_module(&format!("{}/{}", m, module), false);
-        }
-    };
-    load(CORE_MODULES);
-    if sys::cmdline_has("init.net=1") {
-        load(NET_MODULES);
-    }
-    if sys::cmdline_has("init.balloon=1") {
-        load(BALLOON_MODULES);
-    }
-    load(FS_MODULES);
-}
 
 fn mount_virtual_filesystems() {
     sys::mount("devtmpfs", "/dev", "devtmpfs", 0, "");
@@ -128,31 +18,12 @@ fn mount_virtual_filesystems() {
     // /dev/mem exposes raw physical memory, /dev/kmem kernel virtual memory,
     // /dev/port raw I/O ports (x86). Even with CONFIG_STRICT_DEVMEM, the nodes
     // exist and leak kernel config info. Removing them is defense-in-depth.
-    //
-    // Why not lockdown=confidentiality? Alpine's linux-virt APKBUILD strips
-    // modules (INSTALL_MOD_STRIP=1) which destroys the .PKCS7_message ELF
-    // section containing signatures. Lockdown enforces signature verification,
-    // so finit_module() returns EPERM for every module, preventing boot.
-    // See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=941827
     for path in ["/dev/mem", "/dev/kmem", "/dev/port"] {
         device::remove_device_node(path);
     }
 
-    // Shared memory for POSIX semaphores (Python multiprocessing, etc.)
-    // nosuid|nodev|noexec: CIS Benchmark 1.1.15 hardening. Won't break
-    // multiprocessing — POSIX semaphores use shm_open()+mmap(), not execve().
-    // Why 64MB: sufficient for POSIX semaphores and small shared memory segments.
-    // Python multiprocessing default segment is ~1MB; larger allocations (numpy
-    // shared arrays, torch tensors) need more but are out of scope for lightweight
-    // sandboxes. 64MB is 25% of default 256MB guest RAM — a generous ceiling.
-    let _ = fs::create_dir("/dev/shm");
-    sys::mount(
-        "tmpfs",
-        "/dev/shm",
-        "tmpfs",
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
-        "size=64M,mode=1777,noswap",
-    );
+    // B4: /dev/shm mount deferred to guest-agent (only needed for Python multiprocessing).
+    // Guest-agent mounts it lazily before first use, saving ~2-5ms on critical path.
 
     // hidepid=2: hide /proc/[pid] entries for processes not owned by the
     // querying user. Prevents UID 1000 from reading /proc/1/maps (memory layout
@@ -192,16 +63,10 @@ fn mount_virtual_filesystems() {
     );
 }
 
-fn setup_dev_symlinks() {
-    // /dev/fd symlinks — not created by devtmpfs, must be done in userspace.
-    // Required for bash process substitution <(), and /dev/std* for portability.
-    // See: https://gitlab.alpinelinux.org/alpine/aports/-/issues/1465
-    let _ = fs::remove_dir_all("/dev/fd"); // guard: devtmpfs may create it as a dir
-    let _ = symlink("/proc/self/fd", "/dev/fd");
-    let _ = symlink("/proc/self/fd/0", "/dev/stdin");
-    let _ = symlink("/proc/self/fd/1", "/dev/stdout");
-    let _ = symlink("/proc/self/fd/2", "/dev/stderr");
-}
+// B5: /dev/fd symlinks deferred to guest-agent phase 2.
+// Not needed for guest-agent startup or kernel boot. Required for bash
+// process substitution <() and /dev/std* portability.
+// See: https://gitlab.alpinelinux.org/alpine/aports/-/issues/1465
 
 fn mount_rootfs() {
     // Mount root filesystem.
@@ -216,7 +81,7 @@ fn mount_rootfs() {
     if sys::mount("/dev/vda", "/mnt", "ext4", mount_flags, "") != 0 {
         // Fallback: try without specifying fstype
         if sys::mount("/dev/vda", "/mnt", "", mount_flags, "") != 0 {
-            sys::error("mount /dev/vda failed");
+            log_error!("mount /dev/vda failed");
             sys::fallback_shell();
         }
     }
@@ -234,7 +99,7 @@ fn mount_rootfs() {
 fn switch_root() -> ! {
     // cd /mnt
     if std::env::set_current_dir("/mnt").is_err() {
-        sys::error("chdir /mnt failed");
+        log_error!("chdir /mnt failed");
         sys::fallback_shell();
     }
 
@@ -269,7 +134,7 @@ fn switch_root() -> ! {
     // Step 2: chroot .
     let chroot_ret = unsafe { libc::chroot(dot.as_ptr()) };
     if chroot_ret != 0 {
-        sys::error("chroot failed");
+        log_error!("chroot failed");
         sys::fallback_shell();
     }
 
@@ -327,140 +192,58 @@ fn switch_root() -> ! {
     let args: [*const libc::c_char; 2] = [prog.as_ptr(), std::ptr::null()];
     unsafe { libc::execv(prog.as_ptr(), args.as_ptr()) };
 
-    // execv only returns on error - report errno for debugging
-    let errno = sys::last_errno();
+    // execv only returns on error
     // Common errno: 2=ENOENT, 8=ENOEXEC (wrong arch), 13=EACCES, 14=EFAULT
-    log_fmt!("[init] execv failed: errno={}", errno);
-
-    sys::error("execv guest-agent failed");
+    log_error!(
+        "execv /usr/local/bin/guest-agent failed: errno={}",
+        sys::last_errno()
+    );
     sys::fallback_shell();
 }
 
 fn main() {
+    let t0 = sys::monotonic_us();
     mount_virtual_filesystems();
-    setup_dev_symlinks();
+    let t1 = sys::monotonic_us();
+
+    // B5: /dev symlinks deferred to guest-agent
+
     device::redirect_to_console();
+    log_info!(
+        "[timing] mount_vfs: {}.{}ms",
+        (t1 - t0) / 1000,
+        ((t1 - t0) % 1000) / 100
+    );
 
-    let kver = match sys::get_kernel_version() {
-        Some(v) => v,
-        None => {
-            sys::error("uname failed");
-            sys::fallback_shell();
-        }
-    };
-
-    load_modules(&kver);
-    zram::setup_zram(&kver);
-
-    if !device::wait_for_block_device("/dev/vda") {
-        sys::error("timeout waiting for /dev/vda");
+    // B2: Wait for vda + virtio-ports in parallel (independent devices)
+    let vda_handle = std::thread::spawn(|| device::wait_for_block_device("/dev/vda"));
+    let virtio_ok = device::wait_for_virtio_ports();
+    let vda_ok = vda_handle.join().unwrap_or(false);
+    if !vda_ok {
+        log_error!("timeout waiting for /dev/vda");
     }
-    device::wait_for_virtio_ports();
-    device::setup_virtio_ports();
+    if virtio_ok {
+        device::setup_virtio_ports();
+    }
+    let t2 = sys::monotonic_us();
+    log_info!(
+        "[timing] wait_devices: {}.{}ms",
+        (t2 - t1) / 1000,
+        ((t2 - t1) % 1000) / 100
+    );
 
     mount_rootfs();
-    apply_sysctl_hardening();
+    let t3 = sys::monotonic_us();
+    log_info!(
+        "[timing] mount_rootfs: {}.{}ms",
+        (t3 - t2) / 1000,
+        ((t3 - t2) % 1000) / 100
+    );
+
+    log_info!(
+        "[timing] init_total: {}.{}ms",
+        (t3 - t0) / 1000,
+        ((t3 - t0) % 1000) / 100
+    );
     switch_root();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // SYSCTL_HARDENING data invariant tests
-
-    #[test]
-    fn sysctl_modules_disabled_is_last() {
-        // CRITICAL: modules_disabled=1 is irreversible, must be last
-        let last = SYSCTL_HARDENING.last().unwrap();
-        assert_eq!(last.0, "/proc/sys/kernel/modules_disabled");
-        assert_eq!(last.1, "1");
-    }
-
-    #[test]
-    fn sysctl_no_duplicate_paths() {
-        let mut seen = std::collections::HashSet::new();
-        for &(path, _) in SYSCTL_HARDENING {
-            assert!(seen.insert(path), "duplicate sysctl: {}", path);
-        }
-    }
-
-    #[test]
-    fn sysctl_paths_are_valid() {
-        for &(path, value) in SYSCTL_HARDENING {
-            assert!(
-                path.starts_with("/proc/sys/"),
-                "invalid sysctl path: {}",
-                path
-            );
-            assert!(!value.is_empty(), "empty value for: {}", path);
-        }
-    }
-
-    #[test]
-    fn sysctl_table_not_empty() {
-        assert!(
-            SYSCTL_HARDENING.len() >= 15,
-            "sysctl table unexpectedly small"
-        );
-    }
-
-    #[test]
-    fn sysctl_values_are_numeric() {
-        // All current sysctl values are integers
-        for &(path, value) in SYSCTL_HARDENING {
-            assert!(
-                value.parse::<u32>().is_ok(),
-                "non-numeric value '{}' for: {}",
-                value,
-                path
-            );
-        }
-    }
-
-    // Module loading array data invariant tests
-
-    #[test]
-    fn module_paths_end_with_ko() {
-        for &path in CORE_MODULES
-            .iter()
-            .chain(NET_MODULES)
-            .chain(BALLOON_MODULES)
-            .chain(FS_MODULES)
-        {
-            assert!(path.ends_with(".ko"), "not a .ko file: {}", path);
-        }
-    }
-
-    #[test]
-    fn module_paths_are_relative() {
-        for &path in CORE_MODULES
-            .iter()
-            .chain(NET_MODULES)
-            .chain(BALLOON_MODULES)
-            .chain(FS_MODULES)
-        {
-            assert!(!path.starts_with('/'), "should be relative: {}", path);
-        }
-    }
-
-    #[test]
-    fn module_no_duplicates() {
-        let all: Vec<&str> = CORE_MODULES
-            .iter()
-            .chain(NET_MODULES)
-            .chain(BALLOON_MODULES)
-            .chain(FS_MODULES)
-            .copied()
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        for path in &all {
-            assert!(seen.insert(path), "duplicate module: {}", path);
-        }
-    }
-
-    #[test]
-    fn ext4_module_present() {
-        assert!(FS_MODULES.contains(&"fs/ext4/ext4.ko"));
-    }
 }

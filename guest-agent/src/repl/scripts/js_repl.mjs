@@ -1,15 +1,25 @@
 // Security: set PR_SET_DUMPABLE=0 to prevent ptrace from other UID 1000 processes.
 // Must be done here (after exec) because begin_new_exec() always resets dumpable
 // to 1, regardless of credential state. Blocks CVE-2022-30594 style attacks.
+//
+// Blocking I/O: libc.read() replaces Bun.stdin.stream() for stdin reads.
+// Bun's stream API sets O_NONBLOCK and polls the event loop at ~20-25% CPU
+// when idle. Blocking libc.read() lets the thread sleep in the kernel (0% CPU).
+// See: oven-sh/bun#10080, #21081, #27365
 import { dlopen, FFIType } from 'bun:ffi';
-try {
-    const _libc = dlopen('libc.so.6', { prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 } });
-    _libc.symbols.prctl(4, 0, 0, 0, 0);  // PR_SET_DUMPABLE=0
-    _libc.close();
-} catch (_) {}
-
 import { createContext, runInContext } from 'node:vm';
 import { Readable } from 'node:stream';
+import { releaseWeakRefs } from 'bun:jsc';
+const libc = dlopen('libc.so.6', {
+    prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 },
+    read:  { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
+    fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+});
+libc.symbols.prctl(4, 0, 0, 0, 0);  // PR_SET_DUMPABLE=0
+// Ensure stdin is blocking — Bun's runtime may set O_NONBLOCK on fd 0.
+const _flags = libc.symbols.fcntl(0, 3/*F_GETFL*/, 0);
+if (_flags >= 0) libc.symbols.fcntl(0, 4/*F_SETFL*/, _flags & ~2048/*O_NONBLOCK*/);
+
 // Use 'ts' loader to accept both JavaScript and TypeScript syntax (TS is a
 // superset of JS). We avoid 'tsx' because Bun's TSX parser has open bugs with
 // generic arrow defaults (<T = any>() => {}, see oven-sh/bun#4985) and
@@ -46,6 +56,11 @@ const sandboxBun = new Proxy(Bun, {
         if (prop === 'stdin') return nullStdin;
         const val = target[prop];
         return typeof val === 'function' ? val.bind(target) : val;
+    },
+    set(target, prop, value) {
+        if (prop === 'stdin') return true;
+        target[prop] = value;
+        return true;
     }
 });
 const ctx = createContext({
@@ -70,8 +85,15 @@ let unhandledRejection = null;
 process.on('unhandledRejection', (reason) => {
     unhandledRejection = reason;
 });
-const stdin = Bun.stdin.stream();
-const reader = stdin.getReader();
+// Reclaim initialization garbage before entering idle read loop.
+// Saves ~3-8MB RSS that would otherwise persist until first user execution.
+releaseWeakRefs();
+Bun.gc(true);
+Bun.shrink();
+// --- Blocking stdin reader via libc.read() ---
+// Thread sleeps in kernel until data arrives, achieving 0% idle CPU.
+// The original Bun.stdin.stream().getReader() polls at ~20-25% due to
+// O_NONBLOCK + event loop scheduling overhead.
 let buf = new Uint8Array(0);
 const dec = new TextDecoder();
 function cat(a, b) {
@@ -79,7 +101,14 @@ function cat(a, b) {
     r.set(a); r.set(b, a.length);
     return r;
 }
-async function readLine() {
+const _rdBuf = new Uint8Array(65536);
+function _rd() {
+    const n = libc.symbols.read(0, _rdBuf, 65536);
+    if (n <= 0) return false;  // EOF or error
+    buf = cat(buf, _rdBuf.subarray(0, n));
+    return true;
+}
+function readLine() {
     while (true) {
         const idx = buf.indexOf(10);
         if (idx !== -1) {
@@ -87,28 +116,24 @@ async function readLine() {
             buf = buf.slice(idx + 1);
             return line;
         }
-        const { done, value } = await reader.read();
-        if (done) return null;
-        buf = cat(buf, value);
+        if (!_rd()) return null;
     }
 }
-async function readN(n) {
+function readN(n) {
     while (buf.length < n) {
-        const { done, value } = await reader.read();
-        if (done) return null;
-        buf = cat(buf, value);
+        if (!_rd()) return null;
     }
     const data = buf.slice(0, n);
     buf = buf.slice(n);
     return dec.decode(data);
 }
 while (true) {
-    const header = await readLine();
+    const header = readLine();
     if (header === null) break;
     const sp = header.indexOf(' ');
     const sentinelId = header.substring(0, sp);
     const codeLen = parseInt(header.substring(sp + 1), 10);
-    const code = await readN(codeLen);
+    const code = readN(codeLen);
     if (code === null) break;
     let exitCode = 0;
     unhandledRejection = null;

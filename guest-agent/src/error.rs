@@ -14,65 +14,41 @@ use crate::types::{GuestResponse, Language};
 /// Two variants mirror the h2 crate's stream-error vs connection-error pattern:
 /// - `Reply`: non-fatal — send error response to host, continue with next command.
 /// - `Fatal`: connection-level — write queue closed or port I/O failure, drop connection.
+#[derive(Debug)]
 pub(crate) enum CmdError {
     Reply {
         message: String,
         error_type: &'static str,
-        op_id: Option<String>,
     },
     Fatal(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl CmdError {
-    /// Validation error (no op_id).
     pub(crate) fn validation(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
             error_type: "validation_error",
-            op_id: None,
         }
     }
 
-    /// I/O error with optional op_id.
-    pub(crate) fn io(msg: impl Into<String>, op_id: Option<&str>) -> Self {
+    pub(crate) fn io(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
             error_type: "io_error",
-            op_id: op_id.map(String::from),
         }
     }
 
-    /// Timeout error (no op_id).
     pub(crate) fn timeout(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
             error_type: "timeout_error",
-            op_id: None,
         }
     }
 
-    /// Execution error (no op_id).
     pub(crate) fn execution(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
             error_type: "execution_error",
-            op_id: None,
-        }
-    }
-
-    /// Attach an op_id to a Reply error. No-op on Fatal.
-    pub(crate) fn with_op_id(self, id: &str) -> Self {
-        match self {
-            Self::Reply {
-                message,
-                error_type,
-                ..
-            } => Self::Reply {
-                message,
-                error_type,
-                op_id: Some(id.to_string()),
-            },
-            fatal => fatal,
         }
     }
 }
@@ -93,10 +69,65 @@ impl From<mpsc::error::SendError<Vec<u8>>> for CmdError {
 }
 
 // ============================================================================
-// Response helpers
+// ResponseWriter — op_id-aware response sender
+// ============================================================================
+
+/// Wraps a write channel and an optional `op_id`.  Every message sent through
+/// this writer gets `op_id` injected into its JSON (unless the message already
+/// carries one, e.g. file-transfer responses with their own `op_id`).
+pub(crate) struct ResponseWriter {
+    write_tx: mpsc::Sender<Vec<u8>>,
+    op_id: Option<String>,
+}
+
+impl ResponseWriter {
+    pub(crate) fn new(write_tx: mpsc::Sender<Vec<u8>>, op_id: Option<String>) -> Self {
+        Self { write_tx, op_id }
+    }
+
+    /// Serialize `msg` to JSON, inject `op_id` (preserving any existing one),
+    /// append newline, and queue for sending.
+    pub(crate) async fn send(&self, msg: &GuestResponse) -> Result<(), CmdError> {
+        let mut value = serde_json::to_value(msg).map_err(|e| CmdError::Fatal(e.into()))?;
+
+        // Inject op_id only if the message doesn't already have one
+        if let Some(ref id) = self.op_id
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.entry("op_id")
+                .or_insert_with(|| serde_json::Value::String(id.clone()));
+        }
+
+        let mut bytes = serde_json::to_vec(&value).map_err(|e| CmdError::Fatal(e.into()))?;
+        bytes.push(b'\n');
+        self.write_tx.send(bytes).await?;
+        Ok(())
+    }
+
+    /// Build and send an Error response using the writer's `op_id`.
+    pub(crate) async fn send_error(
+        &self,
+        message: String,
+        error_type: &str,
+    ) -> Result<(), CmdError> {
+        self.send(&GuestResponse::Error {
+            message,
+            error_type: error_type.to_string(),
+            op_id: self.op_id.clone(),
+            version: Some(VERSION),
+        })
+        .await
+    }
+}
+
+// ============================================================================
+// Response helpers (pre-parse error paths where no op_id is available)
 // ============================================================================
 
 /// Serialize a GuestResponse to JSON + newline and queue it for sending.
+///
+/// Used only for pre-parse error paths (before `op_id` is extracted from JSON).
+/// Prefer `ResponseWriter::send()` for all other cases.
 pub(crate) async fn send_response(
     write_tx: &mpsc::Sender<Vec<u8>>,
     msg: &GuestResponse,
@@ -108,6 +139,9 @@ pub(crate) async fn send_response(
 }
 
 /// Send an error response to the host.
+///
+/// Used only for pre-parse error paths (before `op_id` is extracted from JSON).
+/// Prefer `ResponseWriter::send_error()` for all other cases.
 pub(crate) async fn send_streaming_error(
     write_tx: &mpsc::Sender<Vec<u8>>,
     message: String,
@@ -172,7 +206,7 @@ pub(crate) async fn graceful_terminate_process_group(
     if term_result == -1 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!("SIGTERM to process group {pid} failed: {errno}");
+            log_error!("SIGTERM to process group {pid} failed: {errno}");
         }
         let _ = child.wait().await;
         return Ok(());
@@ -181,8 +215,8 @@ pub(crate) async fn graceful_terminate_process_group(
     // Phase 2: Wait for grace period
     match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
         Ok(Ok(_)) => return Ok(()),
-        Ok(Err(e)) => eprintln!("Wait error after SIGTERM: {e}"),
-        Err(_) => eprintln!(
+        Ok(Err(e)) => log_error!("Wait error after SIGTERM: {e}"),
+        Err(_) => log_warn!(
             "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
         ),
     }
@@ -192,7 +226,7 @@ pub(crate) async fn graceful_terminate_process_group(
     if kill_result == -1 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!("SIGKILL to process group {pid} failed: {errno}");
+            log_error!("SIGKILL to process group {pid} failed: {errno}");
         }
     }
 
@@ -248,28 +282,24 @@ mod tests {
             CmdError::Reply {
                 message,
                 error_type,
-                op_id,
             } => {
                 assert_eq!(message, "bad input");
                 assert_eq!(error_type, "validation_error");
-                assert!(op_id.is_none());
             }
             CmdError::Fatal(_) => panic!("expected Reply"),
         }
     }
 
     #[test]
-    fn test_cmd_error_io_with_op_id() {
-        let err = CmdError::io("disk full", Some("op1"));
+    fn test_cmd_error_io() {
+        let err = CmdError::io("disk full");
         match err {
             CmdError::Reply {
                 message,
                 error_type,
-                op_id,
             } => {
                 assert_eq!(message, "disk full");
                 assert_eq!(error_type, "io_error");
-                assert_eq!(op_id.as_deref(), Some("op1"));
             }
             CmdError::Fatal(_) => panic!("expected Reply"),
         }
@@ -282,22 +312,6 @@ mod tests {
             CmdError::Reply { error_type, .. } => assert_eq!(error_type, "timeout_error"),
             CmdError::Fatal(_) => panic!("expected Reply"),
         }
-    }
-
-    #[test]
-    fn test_cmd_error_with_op_id_on_reply() {
-        let err = CmdError::validation("msg").with_op_id("op1");
-        match err {
-            CmdError::Reply { op_id, .. } => assert_eq!(op_id.as_deref(), Some("op1")),
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
-    #[test]
-    fn test_cmd_error_with_op_id_on_fatal_is_noop() {
-        let err = CmdError::Fatal("boom".into());
-        let err = err.with_op_id("op1");
-        assert!(matches!(err, CmdError::Fatal(_)));
     }
 
     #[test]
@@ -338,5 +352,209 @@ mod tests {
             }
             CmdError::Fatal(_) => panic!("expected Reply"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // ResponseWriter
+    // -------------------------------------------------------------------------
+
+    /// Helper: send a message through ResponseWriter and return the JSON value.
+    async fn writer_send_json(op_id: Option<&str>, msg: &GuestResponse) -> serde_json::Value {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let writer = ResponseWriter::new(tx, op_id.map(String::from));
+        writer.send(msg).await.unwrap();
+        let bytes = rx.recv().await.unwrap();
+        // strip trailing newline
+        let json_bytes = &bytes[..bytes.len() - 1];
+        serde_json::from_slice(json_bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_op_id_into_pong() {
+        let val = writer_send_json(Some("abc"), &GuestResponse::Pong { version: "1.0" }).await;
+        assert_eq!(val["op_id"], "abc");
+        assert_eq!(val["type"], "pong");
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_op_id_into_stdout() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::Stdout {
+                chunk: "hello".into(),
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_op_id_into_stderr() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::Stderr {
+                chunk: "oops".into(),
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_op_id_into_complete() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::Complete {
+                exit_code: 0,
+                execution_time_ms: 100,
+                spawn_ms: None,
+                process_ms: None,
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_op_id_into_file_list() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::FileList {
+                path: "".into(),
+                entries: vec![],
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_op_id_into_warm_repl_ack() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::WarmReplAck {
+                language: "python".into(),
+                status: "ok".into(),
+                message: None,
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_preserve_existing_file_write_ack_op_id() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::FileWriteAck {
+                op_id: "orig".into(),
+                path: "f.txt".into(),
+                bytes_written: 42,
+            },
+        )
+        .await;
+        // Existing op_id preserved, not overwritten
+        assert_eq!(val["op_id"], "orig");
+    }
+
+    #[tokio::test]
+    async fn response_writer_preserve_existing_file_chunk_op_id() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::FileChunk {
+                op_id: "orig".into(),
+                data: "SGVsbG8=".into(),
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "orig");
+    }
+
+    #[tokio::test]
+    async fn response_writer_preserve_existing_file_read_complete_op_id() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::FileReadComplete {
+                op_id: "orig".into(),
+                path: "f.txt".into(),
+                size: 100,
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "orig");
+    }
+
+    #[tokio::test]
+    async fn response_writer_preserve_existing_error_op_id() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::Error {
+                message: "fail".into(),
+                error_type: "io_error".into(),
+                op_id: Some("orig".into()),
+                version: Some(VERSION),
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "orig");
+    }
+
+    #[tokio::test]
+    async fn response_writer_inject_into_error_without_op_id() {
+        let val = writer_send_json(
+            Some("abc"),
+            &GuestResponse::Error {
+                message: "fail".into(),
+                error_type: "io_error".into(),
+                op_id: None,
+                version: Some(VERSION),
+            },
+        )
+        .await;
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_no_op_id_writer_produces_no_op_id() {
+        let val = writer_send_json(None, &GuestResponse::Pong { version: "1.0" }).await;
+        assert!(val.get("op_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn response_writer_send_error() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let writer = ResponseWriter::new(tx, Some("abc".into()));
+        writer.send_error("boom".into(), "io_error").await.unwrap();
+        let bytes = rx.recv().await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(val["type"], "error");
+        assert_eq!(val["message"], "boom");
+        assert_eq!(val["error_type"], "io_error");
+        assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_special_chars_in_op_id() {
+        let val = writer_send_json(Some("a\"b\\c"), &GuestResponse::Pong { version: "1.0" }).await;
+        assert_eq!(val["op_id"], "a\"b\\c");
+    }
+
+    #[tokio::test]
+    async fn response_writer_unicode_op_id() {
+        let val = writer_send_json(Some("日本語"), &GuestResponse::Pong { version: "1.0" }).await;
+        assert_eq!(val["op_id"], "日本語");
+    }
+
+    #[tokio::test]
+    async fn response_writer_long_op_id() {
+        let long_id = "x".repeat(1000);
+        let val = writer_send_json(Some(&long_id), &GuestResponse::Pong { version: "1.0" }).await;
+        assert_eq!(val["op_id"].as_str().unwrap().len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn response_writer_empty_op_id() {
+        let val = writer_send_json(Some(""), &GuestResponse::Pong { version: "1.0" }).await;
+        assert_eq!(val["op_id"], "");
     }
 }
