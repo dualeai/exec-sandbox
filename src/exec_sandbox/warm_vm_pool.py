@@ -21,7 +21,7 @@ L2 Disk Snapshots:
 Memory Optimization (Balloon):
 - Idle pool VMs have balloon inflated (guest has BALLOON_INFLATE_TARGET_MB)
 - Before execution, balloon deflates (guest gets full memory back)
-- Reduces idle memory by 50% per VM (128MB idle vs 256MB active)
+- Reduces idle memory per VM (160MB idle vs 192MB active)
 
 Example:
     ```python
