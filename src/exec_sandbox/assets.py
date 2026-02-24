@@ -152,12 +152,32 @@ async def ensure_registry_loaded() -> None:
     await assets.load_registry_from_github(GITHUB_OWNER, GITHUB_REPO, version)
 
 
+def _kernel_candidates(arch: str) -> list[str]:
+    """
+    Kernel filenames in preference order for the given architecture.
+
+    For x86_64: vmlinux (PVH direct boot, ~50ms faster) is preferred over vmlinuz.
+    For aarch64: only vmlinuz is used.
+    Within each type, .zst (compressed) is preferred over decompressed.
+    """
+    candidates: list[str] = []
+    if arch == "x86_64":
+        candidates.append(f"vmlinux-{arch}.zst")
+        candidates.append(f"vmlinux-{arch}")
+    candidates.append(f"vmlinuz-{arch}.zst")
+    candidates.append(f"vmlinuz-{arch}")
+    return candidates
+
+
 async def fetch_kernel(arch: str | None = None, override: Path | None = None) -> Path:
     """
     Fetch kernel for the given architecture.
 
     Prefers vmlinux (PVH direct boot, x86_64 only, ~50ms faster) over vmlinuz.
     Falls back to vmlinuz if vmlinux is not available.
+
+    Search respects directory priority order: override > env var > images/dist/ > cache.
+    Within each directory, vmlinux is preferred over vmlinuz.
 
     Args:
         arch: Architecture ("x86_64" or "aarch64"). Defaults to current machine.
@@ -167,35 +187,32 @@ async def fetch_kernel(arch: str | None = None, override: Path | None = None) ->
         Path to the decompressed kernel file.
     """
     arch = arch or get_current_arch()
+    candidates = _kernel_candidates(arch)
 
-    # Prefer vmlinux for PVH direct boot (x86_64 only)
-    if arch == "x86_64":
-        vmlinux_fname = f"vmlinux-{arch}.zst"
-        if local_path := await _find_asset(vmlinux_fname, override):
-            logger.debug("Using cached vmlinux kernel", extra={"arch": arch, "path": str(local_path)})
-            return local_path
-
-    # Fall back to vmlinuz (always available)
-    fname = f"vmlinuz-{arch}.zst"
-
-    # Check local cache first
-    if local_path := await _find_asset(fname, override):
-        logger.debug("Using cached kernel", extra={"arch": arch, "path": str(local_path)})
-        return local_path
+    # Check each search path in priority order.
+    # Within each directory, prefer vmlinux (PVH direct boot, x86_64 only).
+    for directory in _get_search_paths(override):
+        for name in candidates:
+            path = directory / name
+            if await aiofiles.os.path.exists(path):
+                logger.debug("Using cached kernel", extra={"arch": arch, "path": str(path)})
+                return path
 
     # Not found locally, download from GitHub
     await ensure_registry_loaded()
     assets = get_assets()
 
-    # Try vmlinux first for x86_64 (PVH direct boot)
-    if arch == "x86_64":
-        vmlinux_fname = f"vmlinux-{arch}.zst"
-        if vmlinux_fname in assets.registry:
-            logger.debug("Fetching vmlinux kernel", extra={"arch": arch, "file": vmlinux_fname})
-            return await assets.fetch(vmlinux_fname, processor=decompress_zstd)
+    # Try preferred kernel from registry (vmlinux for x86_64, then vmlinuz)
+    download_candidates = [n for n in candidates if n.endswith(".zst")]
+    for name in download_candidates:
+        if name in assets.registry:
+            logger.debug("Fetching kernel", extra={"arch": arch, "file": name})
+            return await assets.fetch(name, processor=decompress_zstd)
 
-    logger.debug("Fetching kernel", extra={"arch": arch, "file": fname})
-    return await assets.fetch(fname, processor=decompress_zstd)
+    # Fallback to vmlinuz (will fail at fetch time if truly missing)
+    fallback = download_candidates[-1]
+    logger.debug("Fetching kernel", extra={"arch": arch, "file": fallback})
+    return await assets.fetch(fallback, processor=decompress_zstd)
 
 
 async def fetch_initramfs(arch: str | None = None, override: Path | None = None) -> Path:
@@ -402,18 +419,15 @@ async def ensure_assets(
     # Try to find existing assets first
     if images_dir := await _find_images_dir(override):
         # Validate that essential files exist (not just the directory)
-        # Accept either vmlinux (PVH direct boot) or vmlinuz (compressed)
         arch = get_current_arch()
-        kernel_path = images_dir / f"vmlinux-{arch}"
-        if not await aiofiles.os.path.exists(kernel_path):
-            kernel_path = images_dir / f"vmlinuz-{arch}"
-        if await aiofiles.os.path.exists(kernel_path):
-            logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
-            return images_dir
+        for name in _kernel_candidates(arch):
+            if await aiofiles.os.path.exists(images_dir / name):
+                logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
+                return images_dir
         # Directory exists but kernel is missing - fall through to download
         logger.debug(
             "Directory exists but kernel missing",
-            extra={"images_dir": str(images_dir), "kernel": str(kernel_path)},
+            extra={"images_dir": str(images_dir)},
         )
 
     # Not found - either download or error
