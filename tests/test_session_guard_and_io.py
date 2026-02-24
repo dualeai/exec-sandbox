@@ -1,6 +1,6 @@
 # pyright: reportPrivateUsage=false
 """Unit tests for Session._guard(), _resolve_content(), write_file streaming protocol,
-and FileOpDispatcher routing.
+FileOpDispatcher routing, and DualPortChannel reconnection probe.
 
 Tests the orchestration layer WITHOUT requiring VMs. All VM/channel interactions
 are mocked. Covers:
@@ -9,6 +9,7 @@ are mocked. Covers:
 - WriteFileRequest header serialization: validity, escaping
 - UnixSocketChannel.send_raw_request()
 - FileOpDispatcher message routing by op_id
+- DualPortChannel._probe_guest_ready() reconnection probe
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from exec_sandbox import constants
 from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import SessionClosedError
 from exec_sandbox.guest_agent_protocol import (
@@ -30,7 +32,7 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingMessage,
     WriteFileRequest,
 )
-from exec_sandbox.guest_channel import FileOpDispatcher, UnixSocketChannel
+from exec_sandbox.guest_channel import DualPortChannel, FileOpDispatcher, UnixSocketChannel
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 from exec_sandbox.session import Session
 
@@ -1267,3 +1269,161 @@ class TestExposedPorts:
         mock_vm.exposed_ports = [ExposedPort(internal=8080, external=3000)]
         await session.close()
         assert session.exposed_ports == [ExposedPort(internal=8080, external=3000)]
+
+
+# ============================================================================
+# DualPortChannel reconnection probe tests
+# ============================================================================
+#
+# Tests the _probe_guest_ready behaviour: observable outcomes (returns vs
+# raises) given a simulated guest that is ready, transiently unresponsive,
+# or permanently down.  No mock-interaction assertions — type-checking
+# already validates the interface contracts.
+# ============================================================================
+
+
+def _make_probe_channel(
+    send_request_side_effect: object,
+) -> DualPortChannel:
+    """Build a DualPortChannel with a scripted guest response sequence.
+
+    Pass a list where each entry is either a message the guest returns
+    or an exception that simulates a transport failure.  The probe's
+    retry loop consumes one entry per attempt.
+    """
+    channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+    channel.send_request = AsyncMock(side_effect=send_request_side_effect)
+    channel._raw_connect = AsyncMock()
+    channel.close = AsyncMock()
+    return channel
+
+
+class TestDualPortConnectLifecycle:
+    """Tests for connect() orchestration: when probing happens (and when it doesn't)."""
+
+    async def test_first_connect_does_not_probe(self) -> None:
+        """Boot-time connect has zero probe overhead."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._probe_guest_ready = AsyncMock()
+
+        await channel.connect(timeout_seconds=5.0)
+
+        assert channel._has_been_connected is True
+        # Probe should not have fired — this is the boot path
+        channel._probe_guest_ready.assert_not_awaited()
+
+    async def test_reconnect_does_probe(self) -> None:
+        """After a successful connect, subsequent connects probe the guest."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._probe_guest_ready = AsyncMock()
+        channel.close = AsyncMock()
+
+        await channel.connect(timeout_seconds=5.0)  # first
+        await channel.connect(timeout_seconds=5.0)  # second — should probe
+
+        channel._probe_guest_ready.assert_awaited_once()
+
+    async def test_idempotent_when_already_connected(self) -> None:
+        """connect() on an already-connected channel is a no-op."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._cmd_channel.is_connected = MagicMock(return_value=True)
+        channel._event_channel.is_connected = MagicMock(return_value=True)
+
+        await channel.connect(timeout_seconds=5.0)
+
+        # _raw_connect should not have been called — already connected
+        channel._raw_connect.assert_not_awaited()
+
+    async def test_has_been_connected_survives_close(self) -> None:
+        """close() does not reset the flag, so next connect will always probe."""
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._raw_connect = AsyncMock()
+        channel._probe_guest_ready = AsyncMock()
+        channel.close = AsyncMock()
+
+        await channel.connect(timeout_seconds=5.0)
+        await channel.close()
+
+        assert channel._has_been_connected is True
+
+
+class TestDualPortProbeSuccess:
+    """Probe returns (doesn't raise) when the guest eventually responds."""
+
+    async def test_guest_ready_immediately(self) -> None:
+        """Guest responds with PongMessage on first attempt — probe returns."""
+        channel = _make_probe_channel([PongMessage(version="1.0")])
+        # Should not raise
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_ready_after_transient_timeouts(self) -> None:
+        """Guest unresponsive twice then ready — probe returns."""
+        channel = _make_probe_channel(
+            [
+                TimeoutError(),
+                TimeoutError(),
+                PongMessage(version="1.0"),
+            ]
+        )
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_ready_after_mixed_transport_errors(self) -> None:
+        """Different transport failures then success — probe is resilient."""
+        channel = _make_probe_channel(
+            [
+                TimeoutError(),
+                OSError("reset"),
+                ConnectionError("refused"),
+                asyncio.IncompleteReadError(b"", 100),
+                PongMessage(version="1.0"),
+            ]
+        )
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_ready_on_last_possible_attempt(self) -> None:
+        """Guest responds on the very last retry — boundary case."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [PongMessage(version="1.0")])
+        # Should succeed, not raise
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+
+class TestDualPortProbeFailure:
+    """Probe raises TimeoutError when the guest never becomes ready."""
+
+    async def test_all_attempts_timeout(self) -> None:
+        """Guest never responds — TimeoutError with descriptive message."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        channel = _make_probe_channel([TimeoutError()] * max_retries)
+
+        with pytest.raises(TimeoutError, match=f"after {max_retries} reconnection attempts"):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_all_attempts_connection_error(self) -> None:
+        """Guest socket broken every time — same TimeoutError."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        channel = _make_probe_channel([ConnectionError()] * max_retries)
+
+        with pytest.raises(TimeoutError, match="reconnection attempts"):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_guest_returns_wrong_message_type(self) -> None:
+        """Guest returns StreamingErrorMessage instead of PongMessage — treated as failure."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        wrong_msg = StreamingErrorMessage(error_type="unknown", message="not a pong")
+        channel = _make_probe_channel([wrong_msg] * max_retries)
+
+        with pytest.raises(TimeoutError, match="reconnection attempts"):
+            await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_one_more_failure_than_budget_still_raises(self) -> None:
+        """MAX_RETRIES-1 failures + wrong message type = still raises."""
+        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        wrong_msg = StreamingErrorMessage(error_type="unknown", message="bad")
+        channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [wrong_msg])
+
+        with pytest.raises(TimeoutError):
+            await channel._probe_guest_ready(caller_timeout=5.0)

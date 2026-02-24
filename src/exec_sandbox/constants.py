@@ -53,6 +53,19 @@ GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 GUEST_REQUEST_TIMEOUT_SECONDS: Final[int] = 5
 """Default timeout for guest agent request/response (ping, warm_repl, etc.)."""
 
+GUEST_RECONNECT_PROBE_TIMEOUT: Final[float] = 0.5
+"""Timeout per ping probe when verifying guest is ready after reconnection.
+
+After close()+connect(), QEMU's chardev socket accepts before the guest agent
+has reopened its virtio-serial port fds. Data sent in this window is silently
+dropped. A lightweight PingRequest confirms the guest is actually listening."""
+
+GUEST_RECONNECT_PROBE_MAX_RETRIES: Final[int] = 5
+"""Maximum reconnection probe attempts before raising TimeoutError."""
+
+GUEST_RECONNECT_PROBE_DELAY: Final[float] = 0.05
+"""Delay between reconnection probe retries (50ms)."""
+
 EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 8
 """Hard timeout margin above soft timeout (host watchdog protection).
 Accounts for:

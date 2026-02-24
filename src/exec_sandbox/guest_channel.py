@@ -19,6 +19,8 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
+    PingRequest,
+    PongMessage,
     StreamingErrorMessage,
     StreamingMessage,
 )
@@ -578,13 +580,34 @@ class DualPortChannel:
         self._cmd_channel: UnixSocketChannel = UnixSocketChannel(cmd_socket, expected_uid)
         self._event_channel: UnixSocketChannel = UnixSocketChannel(event_socket, expected_uid)
         self._dispatcher: FileOpDispatcher | None = None
+        self._has_been_connected: bool = False
 
     async def connect(self, timeout_seconds: float) -> None:
         """Connect both command and event ports.
 
         Connects in parallel for speed. Single connection attempt with timeout (no retry).
         Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
+
+        On reconnection (after a previous close()), probes the guest agent with a
+        PingRequest to ensure the guest has reopened its virtio-serial port.  QEMU
+        accepts the host socket before the guest agent is ready; data sent in that
+        window is silently dropped, causing 30s timeouts downstream.
         """
+        # Already connected — nothing to do
+        if self._cmd_channel.is_connected() and self._event_channel.is_connected():
+            return
+
+        await self._raw_connect(timeout_seconds)
+
+        # On reconnection, probe the guest to confirm the virtio-serial path
+        # is end-to-end ready.  Skipped on first boot (zero overhead).
+        if self._has_been_connected:
+            await self._probe_guest_ready(timeout_seconds)
+
+        self._has_been_connected = True
+
+    async def _raw_connect(self, timeout_seconds: float) -> None:
+        """Low-level connect: open sockets and start dispatcher."""
         # Connect both ports in parallel for speed
         await asyncio.gather(
             self._cmd_channel.connect(timeout_seconds),
@@ -597,6 +620,42 @@ class DualPortChannel:
             if reader:
                 self._dispatcher = FileOpDispatcher(reader)
                 self._dispatcher.start()
+
+    async def _probe_guest_ready(self, caller_timeout: float) -> None:
+        """Send PingRequest and wait for PongMessage to confirm guest is listening.
+
+        After close()+connect(), QEMU's chardev socket accepts before the guest
+        agent has reopened its virtio-serial port fds.  This probe retries until
+        the guest actually responds or the retry budget is exhausted.
+        """
+        for attempt in range(constants.GUEST_RECONNECT_PROBE_MAX_RETRIES):
+            try:
+                response = await asyncio.wait_for(
+                    self.send_request(PingRequest(), timeout=int(constants.GUEST_RECONNECT_PROBE_TIMEOUT + 1)),
+                    timeout=constants.GUEST_RECONNECT_PROBE_TIMEOUT,
+                )
+                if isinstance(response, PongMessage):
+                    logger.debug(
+                        "Reconnection probe succeeded",
+                        extra={"attempt": attempt + 1},
+                    )
+                    return
+            except (TimeoutError, OSError, asyncio.IncompleteReadError, ConnectionError):
+                pass
+
+            # Guest not ready yet — close, wait, reconnect
+            logger.debug(
+                "Reconnection probe failed, retrying",
+                extra={"attempt": attempt + 1, "max": constants.GUEST_RECONNECT_PROBE_MAX_RETRIES},
+            )
+            await self.close()
+            await asyncio.sleep(constants.GUEST_RECONNECT_PROBE_DELAY)
+            await self._raw_connect(caller_timeout)
+
+        raise TimeoutError(
+            f"Guest agent did not respond to ping after {constants.GUEST_RECONNECT_PROBE_MAX_RETRIES} "
+            f"reconnection attempts"
+        )
 
     async def send_command(
         self,
