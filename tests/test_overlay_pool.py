@@ -8,6 +8,8 @@ Test philosophy:
 
 import asyncio
 import errno
+import os
+import shutil
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -145,6 +147,34 @@ class TestOverlayPoolPureLogic:
         with pytest.raises(FileExistsError, match="already exists"):
             await pool.acquire(Path("/fake/base.qcow2"), target)
 
+    def test_default_pool_dir_includes_pid(self) -> None:
+        """OverlayPool() with no custom pool_dir uses PID-scoped path."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        pool = OverlayPool(pool_size=0)
+        assert pool._pool_dir.name == f"exec-sandbox-overlay-pool-{os.getpid()}"
+
+    def test_custom_pool_dir_ignores_pid(self, tmp_path: Path) -> None:
+        """OverlayPool with explicit pool_dir uses that exact path, no PID suffix."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        custom = tmp_path / "custom"
+        pool = OverlayPool(pool_size=0, pool_dir=custom)
+        assert pool._pool_dir == custom
+
+    def test_two_pools_different_pids_different_dirs(self) -> None:
+        """Two pools with different PIDs get different pool directories."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        with patch("os.getpid", return_value=1111):
+            pool_a = OverlayPool(pool_size=0)
+        with patch("os.getpid", return_value=2222):
+            pool_b = OverlayPool(pool_size=0)
+
+        assert pool_a._pool_dir != pool_b._pool_dir
+        assert pool_a._pool_dir.name.endswith("-1111")
+        assert pool_b._pool_dir.name.endswith("-2222")
+
     async def test_mkdir_permission_error_disables_pool_precreation(self, tmp_path: Path) -> None:
         """Permission error during mkdir disables pool pre-creation but daemon stays started."""
         from exec_sandbox.overlay_pool import OverlayPool
@@ -160,6 +190,124 @@ class TestOverlayPoolPureLogic:
         # But no pools are created due to mkdir failure
         assert len(pool._pools) == 0
         await pool.stop()
+
+
+# ============================================================================
+# Stale Pool Directory Cleanup Tests
+# ============================================================================
+
+
+class TestOverlayPoolStaleCleanup:
+    """Tests for _cleanup_stale_pool_dirs static method."""
+
+    def test_removes_dir_for_dead_pid(self, tmp_path: Path) -> None:
+        """Directory for a nonexistent PID is cleaned up."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        stale_dir = tmp_path / "exec-sandbox-overlay-pool-99999"
+        stale_dir.mkdir()
+        (stale_dir / "overlay.qcow2").write_text("stale")
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            # PID 99999 doesn't exist -> ProcessLookupError
+            with patch("os.kill", side_effect=ProcessLookupError):
+                cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 1
+        assert not stale_dir.exists()
+
+    def test_preserves_dir_for_alive_pid(self, tmp_path: Path) -> None:
+        """Directory for current PID is NOT cleaned up."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        alive_dir = tmp_path / f"exec-sandbox-overlay-pool-{os.getpid()}"
+        alive_dir.mkdir()
+        (alive_dir / "overlay.qcow2").write_text("active")
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 0
+        assert alive_dir.exists()
+
+    def test_removes_legacy_singleton_dir(self, tmp_path: Path) -> None:
+        """Legacy directory without PID suffix is always cleaned up."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        legacy_dir = tmp_path / "exec-sandbox-overlay-pool"
+        legacy_dir.mkdir()
+        (legacy_dir / "overlay.qcow2").write_text("legacy")
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 1
+        assert not legacy_dir.exists()
+
+    def test_skips_non_matching_dirs(self, tmp_path: Path) -> None:
+        """Directories that don't match the pool naming pattern are ignored."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        other_dir = tmp_path / "other-directory-123"
+        other_dir.mkdir()
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 0
+        assert other_dir.exists()
+
+    def test_skips_non_numeric_suffix(self, tmp_path: Path) -> None:
+        """Directory with non-numeric PID suffix is ignored."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        bad_dir = tmp_path / "exec-sandbox-overlay-pool-abc"
+        bad_dir.mkdir()
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 0
+        assert bad_dir.exists()
+
+    def test_handles_rmtree_permission_error(self, tmp_path: Path) -> None:
+        """PermissionError during rmtree is suppressed, no crash."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        stale_dir = tmp_path / "exec-sandbox-overlay-pool-99999"
+        stale_dir.mkdir()
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            with patch("os.kill", side_effect=ProcessLookupError):
+                with patch("shutil.rmtree", side_effect=PermissionError("Access denied")):
+                    cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        # rmtree failed, so count is 0 (cleaned++ only happens after successful rmtree)
+        assert cleaned == 0
+
+    def test_handles_empty_tmpdir(self, tmp_path: Path) -> None:
+        """No matching directories returns 0, no error."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 0
+
+    def test_handles_kill_permission_error(self, tmp_path: Path) -> None:
+        """PID exists but os.kill raises PermissionError -> skip (not ours)."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        dir_other = tmp_path / "exec-sandbox-overlay-pool-12345"
+        dir_other.mkdir()
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            # PermissionError means process is alive but we can't signal it
+            with patch("os.kill", side_effect=PermissionError):
+                cleaned = OverlayPool._cleanup_stale_pool_dirs()
+
+        assert cleaned == 0
+        assert dir_other.exists()
 
 
 # ============================================================================
@@ -367,6 +515,191 @@ class TestOverlayPoolErrorHandling:
             await pool.stop()  # Should not raise
 
         assert not pool._started
+
+    # --- C: File existence verification after daemon creation ---
+
+    async def test_daemon_success_but_file_missing_not_enqueued(self, mock_pool: types.SimpleNamespace) -> None:
+        """Daemon returns success but file doesn't exist -> not enqueued, warning logged."""
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+
+        # Mock daemon that "succeeds" but doesn't actually create a file
+        mp.mock_daemon.create_overlay = AsyncMock()  # does nothing (no file created)
+
+        await mp.pool._create_and_enqueue(mp.base_image, key)
+
+        # Queue should be empty - file didn't exist so it wasn't enqueued
+        assert mp.pool._pools[key].qsize() == 0
+
+    async def test_daemon_success_and_file_exists_enqueued(self, mock_pool: types.SimpleNamespace) -> None:
+        """Daemon returns success and file exists -> enqueued."""
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+
+        # Mock daemon that actually creates the file
+        async def create_file(_base: Path, overlay: Path) -> None:
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            overlay.write_text("overlay")
+
+        mp.mock_daemon.create_overlay = AsyncMock(side_effect=create_file)
+
+        await mp.pool._create_and_enqueue(mp.base_image, key)
+
+        assert mp.pool._pools[key].qsize() == 1
+
+    # --- D: Cross-process isolation ---
+
+    async def test_stop_only_deletes_own_pool_dir(self, tmp_path: Path) -> None:
+        """Pool A's stop() removes dir-A but NOT dir-B."""
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        dir_a = tmp_path / "pool-a"
+        dir_b = tmp_path / "pool-b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "overlay.qcow2").write_text("a")
+        (dir_b / "overlay.qcow2").write_text("b")
+
+        pool_a = OverlayPool(pool_size=0, pool_dir=dir_a)
+        await pool_a.start([])
+        await pool_a.stop()
+
+        assert not dir_a.exists()
+        assert dir_b.exists()
+        assert (dir_b / "overlay.qcow2").read_text() == "b"
+
+    async def test_pool_dir_deleted_externally_all_fallback(
+        self, mock_pool: types.SimpleNamespace, tmp_path: Path
+    ) -> None:
+        """Queue has entries, pool_dir deleted externally, all concurrent acquires fallback to on-demand."""
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+
+        # Add 5 fake overlays to the queue
+        for i in range(5):
+            overlay = mp.pool_dir / f"overlay-{i}.qcow2"
+            overlay.write_text(f"content-{i}")
+            await mp.pool._pools[key].put(overlay)
+
+        # Delete pool directory externally (simulates cross-process deletion)
+        shutil.rmtree(mp.pool_dir)
+
+        # All 5 concurrent acquires should fallback to on-demand
+        targets = [tmp_path / f"target-{i}.qcow2" for i in range(5)]
+        results = await asyncio.gather(*[mp.pool.acquire(mp.base_image, t) for t in targets])
+
+        # All should be False (on-demand), none from pool
+        assert all(r is False for r in results)
+        assert mp.mock_daemon.create_overlay.call_count == 5
+        await mp.pool.stop()
+
+    # --- E: _create_and_enqueue edge cases ---
+
+    async def test_create_enqueue_daemon_error_not_queued(self, mock_pool: types.SimpleNamespace) -> None:
+        """Daemon raises QemuStorageDaemonError -> queue stays empty."""
+        from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
+
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+        mp.mock_daemon.create_overlay.side_effect = QemuStorageDaemonError("daemon error")
+
+        await mp.pool._create_and_enqueue(mp.base_image, key)
+
+        assert mp.pool._pools[key].qsize() == 0
+
+    async def test_create_enqueue_oserror_not_queued(self, mock_pool: types.SimpleNamespace) -> None:
+        """Daemon raises OSError -> queue stays empty."""
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+        mp.mock_daemon.create_overlay.side_effect = OSError("disk full")
+
+        await mp.pool._create_and_enqueue(mp.base_image, key)
+
+        assert mp.pool._pools[key].qsize() == 0
+
+    async def test_create_enqueue_queue_full_cleans_file(self, tmp_path: Path) -> None:
+        """Queue maxsize=1, already full -> new overlay file is deleted."""
+        from exec_sandbox.overlay_pool import OverlayPool
+        from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
+
+        pool_dir = tmp_path / "pool"
+        pool_dir.mkdir()
+        pool = OverlayPool(pool_size=1, pool_dir=pool_dir)
+
+        base_image = Path("/fake/base.qcow2")
+        key = str(base_image.resolve())
+        pool._pools[key] = asyncio.Queue(maxsize=1)
+        # Fill the queue
+        existing = pool_dir / "existing.qcow2"
+        existing.write_text("existing")
+        await pool._pools[key].put(existing)
+
+        pool._started = True
+        mock_daemon = AsyncMock(spec=QemuStorageDaemon)
+
+        # Daemon creates a real file
+        async def create_file(_base: Path, overlay: Path) -> None:
+            overlay.write_text("new-overlay")
+
+        mock_daemon.create_overlay = AsyncMock(side_effect=create_file)
+        pool._daemon = mock_daemon
+
+        await pool._create_and_enqueue(base_image, key)
+
+        # Queue still has maxsize=1, original entry remains
+        assert pool._pools[key].qsize() == 1
+        # The new overlay file should have been cleaned up (QueueFull path)
+        # We can't know the exact filename (uuid), but only 1 file should remain
+        remaining_files = list(pool_dir.glob("*.qcow2"))
+        # existing.qcow2 + the new file was deleted
+        assert len(remaining_files) == 1
+        assert remaining_files[0].name == "existing.qcow2"
+
+    async def test_create_enqueue_pool_removed_during_creation(self, mock_pool: types.SimpleNamespace) -> None:
+        """Pool key removed from _pools dict mid-creation -> no crash, file orphaned."""
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+
+        # Daemon creates a real file
+        async def create_file(_base: Path, overlay: Path) -> None:
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            overlay.write_text("orphaned")
+            # Remove pool key during creation
+            mp.pool._pools.pop(key, None)
+
+        mp.mock_daemon.create_overlay = AsyncMock(side_effect=create_file)
+
+        await mp.pool._create_and_enqueue(mp.base_image, key)
+
+        # No crash, queue doesn't exist anymore
+        assert key not in mp.pool._pools
+
+    # --- F: Whole-directory deletion scenario ---
+
+    async def test_pool_dir_vanishes_all_acquire_fallback(
+        self, mock_pool: types.SimpleNamespace, tmp_path: Path
+    ) -> None:
+        """Pre-populate queue with N paths, delete pool_dir, N concurrent acquire -> all fallback to on-demand."""
+        mp = mock_pool
+        key = str(mp.base_image.resolve())
+        n = 5
+
+        # Add N fake overlays
+        for i in range(n):
+            overlay = mp.pool_dir / f"overlay-{i}.qcow2"
+            overlay.write_text(f"content-{i}")
+            await mp.pool._pools[key].put(overlay)
+
+        # Delete pool directory
+        shutil.rmtree(mp.pool_dir)
+
+        # All N concurrent acquires should fallback
+        targets = [tmp_path / f"t-{i}.qcow2" for i in range(n)]
+        results = await asyncio.gather(*[mp.pool.acquire(mp.base_image, t) for t in targets])
+
+        assert all(r is False for r in results)
+        assert mp.mock_daemon.create_overlay.call_count == n
+        await mp.pool.stop()
 
 
 # ============================================================================
