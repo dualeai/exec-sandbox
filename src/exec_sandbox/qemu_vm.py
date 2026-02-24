@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, TextIO
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from exec_sandbox import cgroup, constants
 from exec_sandbox.exceptions import EnvVarValidationError, VmBootTimeoutError, VmPermanentError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
@@ -381,9 +383,24 @@ class QemuVM:
                 timeout=timeout_seconds,
                 env_vars=env_vars or {},
             )
+        except ValidationError as e:
+            # Check if the validation error is on the "code" field (e.g. null bytes).
+            # Code validation errors return ExecutionResult(exit_code=-1) so callers
+            # get a result rather than an exception.
+            code_errors = [err for err in e.errors() if "code" in err.get("loc", ())]
+            if code_errors:
+                return ExecutionResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=str(e),
+                    timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
+                )
+            # Other validation errors (env vars, timeout, etc.) are domain exceptions.
+            raise EnvVarValidationError(
+                str(e),
+                context={"vm_id": self.vm_id},
+            ) from e
         except Exception as e:
-            # Convert Pydantic ValidationError to domain exception so callers
-            # catching SandboxError will handle invalid env vars properly.
             raise EnvVarValidationError(
                 str(e),
                 context={"vm_id": self.vm_id},
