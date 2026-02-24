@@ -50,6 +50,9 @@ VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""
 
+GUEST_REQUEST_TIMEOUT_SECONDS: Final[int] = 5
+"""Default timeout for guest agent request/response (ping, warm_repl, etc.)."""
+
 EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 8
 """Hard timeout margin above soft timeout (host watchdog protection).
 Accounts for:

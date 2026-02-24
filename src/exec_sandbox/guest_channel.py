@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import TypeAdapter
 
+from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
@@ -130,13 +131,13 @@ class GuestChannel(Protocol):
     async def send_request(
         self,
         request: GuestAgentRequest,
-        timeout: int,
+        timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
     ) -> StreamingMessage:
         """Send JSON request, receive JSON response.
 
         Args:
             request: Pydantic request model (e.g., PingRequest, ReadFileRequest, ListFilesRequest)
-            timeout: Response timeout in seconds (required, no default)
+            timeout: Response timeout in seconds. Default: 5.
 
         Returns:
             StreamingMessage (e.g., PongMessage, FileListMessage)
@@ -323,7 +324,7 @@ class UnixSocketChannel:
     async def send_request(
         self,
         request: GuestAgentRequest,
-        timeout: int,
+        timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
     ) -> StreamingMessage:
         """Send JSON + newline, receive JSON + newline.
 
@@ -668,7 +669,7 @@ class DualPortChannel:
     async def send_request(
         self,
         request: GuestAgentRequest,
-        timeout: int,
+        timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
     ) -> StreamingMessage:
         """Send command and receive single response (compatibility method).
 
@@ -677,7 +678,7 @@ class DualPortChannel:
 
         Args:
             request: Pydantic request model
-            timeout: Total timeout in seconds
+            timeout: Total timeout in seconds. Default: 5.
 
         Returns:
             First StreamingMessage from event port
@@ -803,7 +804,7 @@ async def reconnecting_channel(
     Usage:
         # GOOD - one-off command
         async with reconnecting_channel(vm.channel) as ch:
-            response = await ch.send_request(PingRequest(), timeout=5)
+            response = await ch.send_request(PingRequest())
 
         # BAD - streaming operation
         async with reconnecting_channel(vm.channel) as ch:

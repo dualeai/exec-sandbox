@@ -1261,7 +1261,7 @@ class VmManager:
         async def check_guest_ready() -> None:
             """Single guest readiness check attempt."""
             await vm.channel.connect(timeout_seconds=1)
-            response = await vm.channel.send_request(PingRequest(), timeout=5)
+            response = await vm.channel.send_request(PingRequest())
 
             # Ping returns PongMessage
             if not isinstance(response, PongMessage):

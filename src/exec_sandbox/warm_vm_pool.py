@@ -590,7 +590,6 @@ class WarmVMPool:
         try:
             response = await vm.channel.send_request(
                 WarmReplRequest(language=language),
-                timeout=15,  # REPL startup can take ~1s
             )
             if isinstance(response, WarmReplAckMessage) and response.status == "ok":
                 logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
@@ -788,7 +787,7 @@ class WarmVMPool:
             logger.debug("Health check: establishing fresh connection", extra={"vm_id": vm.vm_id})
             await vm.channel.connect(timeout_seconds=5)
             logger.debug("Health check: sending ping request", extra={"vm_id": vm.vm_id})
-            response = await vm.channel.send_request(PingRequest(), timeout=5)
+            response = await vm.channel.send_request(PingRequest())
             logger.debug(
                 "Health check: received response",
                 extra={"vm_id": vm.vm_id, "response_type": type(response).__name__},
