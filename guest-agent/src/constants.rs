@@ -31,9 +31,11 @@ pub(crate) const WRITE_QUEUE_SIZE: usize = 128;
 pub(crate) const READ_TIMEOUT_MS: u64 = 18000; // 18s > 15s health check interval
 
 // Host disconnection backoff configuration
-// Reduced to 1ms: virtio-serial port is typically ready within 1-2ms
+// INITIAL: 1ms for fast reconnect (virtio-serial port typically ready in 1-2ms).
+// MAX: 1000ms to keep orphan VM CPU low (~1% vs 5x higher at 200ms).
+// Exponential backoff reaches 1000ms after ~10 attempts (~2s).
 pub(crate) const INITIAL_BACKOFF_MS: u64 = 1;
-pub(crate) const MAX_BACKOFF_MS: u64 = 200;
+pub(crate) const MAX_BACKOFF_MS: u64 = 1000;
 
 // Environment variable limits
 pub(crate) const MAX_ENV_VARS: usize = 100;
