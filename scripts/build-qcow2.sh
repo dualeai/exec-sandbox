@@ -602,6 +602,15 @@ build_qcow2() {
             # - Remove journal (rootfs is mounted read-only, saves ~4MB + mount overhead)
             # - Set reserved blocks to 0% (no root reserved space needed)
             tune2fs -O ^has_journal -m 0 /build/rootfs.raw
+            # Convert to qcow2 with compression. Options:
+            # - -c: zlib compression (smaller image, one-time build cost)
+            # - -m 8 -W: 8 parallel coroutines + out-of-order writes
+            # - cluster_size=128k: match overlay cluster size for aligned CoW
+            # Note: lazy_refcounts is intentionally omitted here. It defers
+            # refcount metadata writes for better performance, but this base
+            # image is opened read-only as a backing file at runtime — no
+            # writes ever hit it, so the optimization would be inert. Overlays
+            # (where all VM writes land) enable it via overlay_pool.py / QSD.
             qemu-img convert -f raw -O qcow2 -c -m 8 -W -o cluster_size=128k /build/rootfs.raw /output/$output_name.qcow2
             rm -rf /build/rootfs /build/rootfs.raw
         "
