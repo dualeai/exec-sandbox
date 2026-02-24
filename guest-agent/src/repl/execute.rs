@@ -5,18 +5,20 @@ use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 
 use crate::constants::*;
-use crate::error::*;
+use crate::error::{
+    CmdError, ResponseWriter, exit_code_from_status, graceful_terminate_process_group,
+    parse_language,
+};
 use crate::repl::spawn::spawn_repl;
 use crate::types::GuestResponse;
 use crate::validation::{prepend_env_vars, validate_execute_params};
 
 /// Helper to flush a buffer as a Stdout/Stderr response message.
 async fn flush_output_buffer(
-    write_tx: &mpsc::Sender<Vec<u8>>,
+    writer: &ResponseWriter,
     buffer: &mut String,
     chunk_type: &str,
 ) -> Result<(), CmdError> {
@@ -28,7 +30,7 @@ async fn flush_output_buffer(
         "stderr" => GuestResponse::Stderr { chunk: data },
         _ => GuestResponse::Stdout { chunk: data },
     };
-    send_response(write_tx, &msg).await
+    writer.send(&msg).await
 }
 
 /// Parse a single stderr line for a sentinel marker, returning the exit code if found.
@@ -198,7 +200,7 @@ pub(crate) async fn execute_code_streaming(
     code: &str,
     timeout: u64,
     env_vars: &HashMap<String, String>,
-    write_tx: &mpsc::Sender<Vec<u8>>,
+    writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
     let language = parse_language(language_str, "supported: python, javascript, raw")?;
 
@@ -296,8 +298,8 @@ pub(crate) async fn execute_code_streaming(
         loop {
             tokio::select! {
                 _ = flush_timer.tick() => {
-                    let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
-                    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
                 }
 
                 result = repl.stdout.read(&mut stdout_bytes), if !stdout_done => {
@@ -306,7 +308,7 @@ pub(crate) async fn execute_code_streaming(
                         Ok(n) => {
                             stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
                             if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
+                                let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
                             }
                         }
                         Err(_) => stdout_done = true,
@@ -326,7 +328,7 @@ pub(crate) async fn execute_code_streaming(
                                 sentinel_exit_code = Some(code);
                             }
                             if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+                                let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
                             }
                         }
                         Err(_) => stderr_done = true,
@@ -349,8 +351,8 @@ pub(crate) async fn execute_code_streaming(
     if !stderr_line_buf.is_empty() {
         stderr_buffer.push_str(&stderr_line_buf);
     }
-    let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
-    let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
+    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let process_ms = Some(process_start.elapsed().as_millis() as u64);
@@ -360,16 +362,14 @@ pub(crate) async fn execute_code_streaming(
             let exit_code = sentinel_exit_code.unwrap();
             REPL_STATES.lock().await.insert(language, repl);
 
-            send_response(
-                write_tx,
-                &GuestResponse::Complete {
+            writer
+                .send(&GuestResponse::Complete {
                     exit_code,
                     execution_time_ms: duration_ms,
                     spawn_ms,
                     process_ms,
-                },
-            )
-            .await?;
+                })
+                .await?;
         }
         Ok(()) => {
             let status = repl.child.wait().await;
@@ -380,16 +380,14 @@ pub(crate) async fn execute_code_streaming(
                 exit_code
             );
 
-            send_response(
-                write_tx,
-                &GuestResponse::Complete {
+            writer
+                .send(&GuestResponse::Complete {
                     exit_code,
                     execution_time_ms: duration_ms,
                     spawn_ms,
                     process_ms,
-                },
-            )
-            .await?;
+                })
+                .await?;
         }
         Err(_) => {
             log_warn!(
@@ -417,18 +415,16 @@ pub(crate) async fn execute_code_streaming(
                 if !stderr_line_buf.is_empty() {
                     stderr_buffer.push_str(&stderr_line_buf);
                 }
-                let _ = flush_output_buffer(write_tx, &mut stdout_buffer, "stdout").await;
-                let _ = flush_output_buffer(write_tx, &mut stderr_buffer, "stderr").await;
-                send_response(
-                    write_tx,
-                    &GuestResponse::Complete {
+                let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                writer
+                    .send(&GuestResponse::Complete {
                         exit_code,
                         execution_time_ms: duration_ms,
                         spawn_ms,
                         process_ms,
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 return Ok(());
             }
 

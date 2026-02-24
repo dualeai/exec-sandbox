@@ -712,7 +712,7 @@ class QemuVM:
         targeting the same destination.  On success the temp file is
         atomically renamed to *destination*, so readers never see a
         partial / corrupted file.  On error the temp file is removed.
-        Peak memory is bounded by queue depths (4 items x ~200KB = ~800KB),
+        Peak memory is bounded by queue depths (OP_QUEUE_DEPTH items x ~200KB),
         not file size.
 
         Args:

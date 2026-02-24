@@ -24,6 +24,7 @@ class GuestAgentRequest(BaseModel):
     """Base class for all guest agent requests."""
 
     action: str = Field(description="Action to perform")
+    op_id: str | None = Field(default=None, description="Operation ID for request-response correlation")
 
 
 class PingRequest(GuestAgentRequest):
@@ -164,7 +165,7 @@ class WriteFileRequest(GuestAgentRequest):
     """
 
     action: Literal["write_file"] = Field(default="write_file")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID (UUID4 hex) for correlating chunks")
+    op_id: str = Field(description="Operation ID (UUID4 hex) for correlating chunks")  # type: ignore[assignment]
     path: str = Field(
         min_length=1,
         max_length=MAX_FILE_PATH_LENGTH,
@@ -181,7 +182,7 @@ class FileChunkRequest(GuestAgentRequest):
     """
 
     action: Literal["file_chunk"] = Field(default="file_chunk")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID matching the initiating WriteFileRequest")
+    op_id: str = Field(description="Operation ID matching the initiating WriteFileRequest")  # type: ignore[assignment]
     data: str = Field(max_length=200_000, description="Base64-encoded zstd-compressed chunk")
 
 
@@ -193,7 +194,7 @@ class FileEndRequest(GuestAgentRequest):
     """
 
     action: Literal["file_end"] = Field(default="file_end")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID matching the initiating WriteFileRequest")
+    op_id: str = Field(description="Operation ID matching the initiating WriteFileRequest")  # type: ignore[assignment]
 
 
 class ReadFileRequest(GuestAgentRequest):
@@ -207,7 +208,7 @@ class ReadFileRequest(GuestAgentRequest):
     """
 
     action: Literal["read_file"] = Field(default="read_file")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID (UUID4 hex) for correlating response chunks")
+    op_id: str = Field(description="Operation ID (UUID4 hex) for correlating response chunks")  # type: ignore[assignment]
     path: str = Field(
         min_length=1,
         max_length=MAX_FILE_PATH_LENGTH,
@@ -230,7 +231,17 @@ class ListFilesRequest(GuestAgentRequest):
 # ============================================================================
 
 
-class OutputChunkMessage(BaseModel):
+class GuestAgentResponse(BaseModel):
+    """Base class for all guest agent responses.
+
+    Every response carries an optional op_id for request-response correlation.
+    The guest agent echoes back the op_id from the request.
+    """
+
+    op_id: str | None = Field(default=None, description="Operation ID echoed from the request")
+
+
+class OutputChunkMessage(GuestAgentResponse):
     """Streaming output chunk from code execution.
 
     Batching strategy (Jan 2026 best practice):
@@ -249,7 +260,7 @@ class OutputChunkMessage(BaseModel):
     )
 
 
-class ExecutionCompleteMessage(BaseModel):
+class ExecutionCompleteMessage(GuestAgentResponse):
     """Final completion message for ANY command (exec, install_packages, etc).
 
     Sent after stdout/stderr streaming completes. ALL commands stream output
@@ -269,24 +280,23 @@ class ExecutionCompleteMessage(BaseModel):
     )
 
 
-class StreamingErrorMessage(BaseModel):
+class StreamingErrorMessage(GuestAgentResponse):
     """Error message during streaming execution."""
 
     type: Literal["error"] = "error"
     message: str = Field(description="Error message")
     error_type: str = Field(description="Error classification")
-    op_id: str | None = Field(default=None, description="Operation ID for file transfer error routing")
     version: str | None = Field(default=None, description="Guest agent version")
 
 
-class PongMessage(BaseModel):
+class PongMessage(GuestAgentResponse):
     """Response to ping request."""
 
     type: Literal["pong"] = "pong"
     version: str = Field(description="Guest agent version")
 
 
-class WarmReplAckMessage(BaseModel):
+class WarmReplAckMessage(GuestAgentResponse):
     """Acknowledgement for REPL pre-warming."""
 
     type: Literal["warm_repl_ack"] = "warm_repl_ack"
@@ -300,16 +310,16 @@ class WarmReplAckMessage(BaseModel):
 # ============================================================================
 
 
-class FileWriteAckMessage(BaseModel):
+class FileWriteAckMessage(GuestAgentResponse):
     """Acknowledgment after completing a streaming file write."""
 
     type: Literal["file_write_ack"] = "file_write_ack"
-    op_id: str = Field(description="Operation ID echoed from WriteFileRequest")
+    op_id: str = Field(description="Operation ID echoed from WriteFileRequest")  # type: ignore[assignment]
     path: str = Field(description="Path of written file (relative to sandbox root)")
     bytes_written: int = Field(description="Number of bytes written (decompressed)")
 
 
-class FileChunkResponseMessage(BaseModel):
+class FileChunkResponseMessage(GuestAgentResponse):
     """A chunk of zstd-compressed file data (guest → host).
 
     Part of a streaming file read response. Each chunk contains
@@ -317,18 +327,18 @@ class FileChunkResponseMessage(BaseModel):
     """
 
     type: Literal["file_chunk"] = "file_chunk"
-    op_id: str = Field(description="Operation ID from ReadFileRequest")
+    op_id: str = Field(description="Operation ID from ReadFileRequest")  # type: ignore[assignment]
     data: str = Field(description="Base64-encoded zstd-compressed chunk")
 
 
-class FileReadCompleteMessage(BaseModel):
+class FileReadCompleteMessage(GuestAgentResponse):
     """Signals end of a streaming file read (guest → host).
 
     Sent after all FileChunkResponseMessage messages for a read operation.
     """
 
     type: Literal["file_read_complete"] = "file_read_complete"
-    op_id: str = Field(description="Operation ID from ReadFileRequest")
+    op_id: str = Field(description="Operation ID from ReadFileRequest")  # type: ignore[assignment]
     path: str = Field(description="Path of read file (relative to sandbox root)")
     size: int = Field(description="Original file size in bytes (before compression)")
 
@@ -341,7 +351,7 @@ class FileEntryInfo(BaseModel):
     size: int = Field(description="File size in bytes (0 for directories)")
 
 
-class FileListMessage(BaseModel):
+class FileListMessage(GuestAgentResponse):
     """Directory listing response from the sandbox."""
 
     type: Literal["file_list"] = "file_list"

@@ -16,6 +16,17 @@ use crate::repl::execute::execute_code_streaming;
 use crate::repl::spawn::spawn_repl;
 use crate::types::{GuestCommand, GuestResponse, Language};
 
+/// Extract `op_id` from raw JSON before serde deserialization.
+///
+/// This avoids adding `op_id` to the `GuestCommand` enum — the guest doesn't
+/// need it in the typed command, only the response writer does.
+fn extract_op_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("op_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
 // ============================================================================
 // NonBlockingFile
 // ============================================================================
@@ -207,9 +218,11 @@ pub(crate) async fn handle_connection(
 
         log_info!("Received request ({bytes_read} bytes)");
 
-        // Parse command first, then gate non-Ping commands on init phase 2
-        let cmd = match serde_json::from_str::<GuestCommand>(&line) {
-            Ok(cmd) => cmd,
+        // Two-phase parse: extract op_id from raw JSON, then deserialize command.
+        // This avoids adding op_id to GuestCommand — the guest doesn't need it
+        // in the typed enum, only the ResponseWriter does.
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(e) => {
                 log_error!("JSON parse error: {e}");
                 let _ = send_streaming_error(
@@ -222,11 +235,29 @@ pub(crate) async fn handle_connection(
                 continue;
             }
         };
+        let op_id = extract_op_id(&value);
+        let cmd: GuestCommand = match serde_json::from_value(value) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                log_error!("Command parse error: {e}");
+                let _ = send_streaming_error(
+                    &write_tx,
+                    format!("Invalid command: {e}"),
+                    "request_error",
+                    op_id.as_deref(),
+                )
+                .await;
+                continue;
+            }
+        };
+
+        let writer = ResponseWriter::new(write_tx.clone(), op_id);
 
         match cmd {
             GuestCommand::Ping => {
                 log_info!("Processing: ping");
-                if send_response(&write_tx, &GuestResponse::Pong { version: VERSION })
+                if writer
+                    .send(&GuestResponse::Pong { version: VERSION })
                     .await
                     .is_err()
                 {
@@ -238,19 +269,17 @@ pub(crate) async fn handle_connection(
                 let lang = match Language::parse(&language) {
                     Some(l) => l,
                     None => {
-                        if send_response(
-                            &write_tx,
-                            &GuestResponse::WarmReplAck {
+                        if writer
+                            .send(&GuestResponse::WarmReplAck {
                                 language,
                                 status: "error".to_string(),
                                 message: Some(
                                     "Unsupported language (supported: python, javascript, raw)"
                                         .to_string(),
                                 ),
-                            },
-                        )
-                        .await
-                        .is_err()
+                            })
+                            .await
+                            .is_err()
                         {
                             break Err("write queue closed".into());
                         }
@@ -261,32 +290,28 @@ pub(crate) async fn handle_connection(
                     Ok(repl) => {
                         REPL_STATES.lock().await.insert(lang, repl);
                         log_info!("REPL pre-warmed for {language}");
-                        if send_response(
-                            &write_tx,
-                            &GuestResponse::WarmReplAck {
+                        if writer
+                            .send(&GuestResponse::WarmReplAck {
                                 language,
                                 status: "ok".to_string(),
                                 message: None,
-                            },
-                        )
-                        .await
-                        .is_err()
+                            })
+                            .await
+                            .is_err()
                         {
                             break Err("write queue closed".into());
                         }
                     }
                     Err(e) => {
                         log_warn!("Eager REPL spawn failed: {e}");
-                        if send_response(
-                            &write_tx,
-                            &GuestResponse::WarmReplAck {
+                        if writer
+                            .send(&GuestResponse::WarmReplAck {
                                 language,
                                 status: "error".to_string(),
                                 message: Some(e.to_string()),
-                            },
-                        )
-                        .await
-                        .is_err()
+                            })
+                            .await
+                            .is_err()
                         {
                             break Err("write queue closed".into());
                         }
@@ -303,34 +328,30 @@ pub(crate) async fn handle_connection(
                 let lang = match Language::parse(&language) {
                     Some(l) => l,
                     None => {
-                        if send_streaming_error(
-                            &write_tx,
-                            format!(
-                                "Unsupported language '{}' for package installation (supported: python, javascript)",
-                                language
-                            ),
-                            "validation_error",
-                            None,
-                        )
-                        .await
-                        .is_err()
+                        if writer
+                            .send_error(
+                                format!(
+                                    "Unsupported language '{}' for package installation (supported: python, javascript)",
+                                    language
+                                ),
+                                "validation_error",
+                            )
+                            .await
+                            .is_err()
                         {
                             break Err("write queue closed".into());
                         }
                         continue;
                     }
                 };
-                match install_packages(lang, &packages, &write_tx).await {
+                match install_packages(lang, &packages, &writer).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
                         message,
                         error_type,
-                        op_id,
+                        ..
                     }) => {
-                        if send_streaming_error(&write_tx, message, error_type, op_id.as_deref())
-                            .await
-                            .is_err()
-                        {
+                        if writer.send_error(message, error_type).await.is_err() {
                             break Err("write queue closed".into());
                         }
                     }
@@ -352,18 +373,14 @@ pub(crate) async fn handle_connection(
                     code.len(),
                     env_vars.len()
                 );
-                match execute_code_streaming(&language, &code, timeout, &env_vars, &write_tx).await
-                {
+                match execute_code_streaming(&language, &code, timeout, &env_vars, &writer).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
                         message,
                         error_type,
-                        op_id,
+                        ..
                     }) => {
-                        if send_streaming_error(&write_tx, message, error_type, op_id.as_deref())
-                            .await
-                            .is_err()
-                        {
+                        if writer.send_error(message, error_type).await.is_err() {
                             break Err("write queue closed".into());
                         }
                     }
@@ -382,30 +399,23 @@ pub(crate) async fn handle_connection(
                 );
                 #[allow(clippy::map_entry)] // Entry API incompatible with async error path
                 if active_writes.contains_key(&op_id) {
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        format!("Duplicate op_id '{op_id}' for write_file"),
-                        "validation_error",
-                        Some(&op_id),
-                    )
-                    .await;
+                    let _ = writer
+                        .send_error(
+                            format!("Duplicate op_id '{op_id}' for write_file"),
+                            "validation_error",
+                        )
+                        .await;
                 } else {
-                    match handle_write_file(&op_id, &path, make_executable, &write_tx).await {
+                    match handle_write_file(&op_id, &path, make_executable).await {
                         Ok(handle) => {
                             active_writes.insert(op_id, handle);
                         }
                         Err(CmdError::Reply {
                             message,
                             error_type,
-                            op_id: err_op_id,
+                            ..
                         }) => {
-                            let _ = send_streaming_error(
-                                &write_tx,
-                                message,
-                                error_type,
-                                err_op_id.as_deref(),
-                            )
-                            .await;
+                            let _ = writer.send_error(message, error_type).await;
                         }
                         Err(CmdError::Fatal(e)) => {
                             break Err(e.to_string().into());
@@ -415,13 +425,12 @@ pub(crate) async fn handle_connection(
             }
             GuestCommand::FileChunk { op_id, data } => {
                 if !active_writes.contains_key(&op_id) {
-                    let _ = send_streaming_error(
-                        &write_tx,
-                        format!("No active write for op_id '{op_id}'"),
-                        "protocol_error",
-                        Some(&op_id),
-                    )
-                    .await;
+                    let _ = writer
+                        .send_error(
+                            format!("No active write for op_id '{op_id}'"),
+                            "protocol_error",
+                        )
+                        .await;
                     continue;
                 }
                 let decoded = match BASE64.decode(&data) {
@@ -429,16 +438,15 @@ pub(crate) async fn handle_connection(
                     Err(e) => {
                         let handle = active_writes.remove(&op_id).unwrap();
                         drop(handle.chunk_tx);
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!(
-                                "Invalid base64 in chunk for '{}': {}",
-                                handle.path_display, e
-                            ),
-                            "validation_error",
-                            Some(&op_id),
-                        )
-                        .await;
+                        let _ = writer
+                            .send_error(
+                                format!(
+                                    "Invalid base64 in chunk for '{}': {}",
+                                    handle.path_display, e
+                                ),
+                                "validation_error",
+                            )
+                            .await;
                         continue;
                     }
                 };
@@ -457,37 +465,31 @@ pub(crate) async fn handle_connection(
                                 write_err.op_id,
                                 write_err.message
                             );
-                            let _ = send_streaming_error(
-                                &write_tx,
-                                write_err.message,
-                                &write_err.error_type,
-                                Some(&write_err.op_id),
-                            )
-                            .await;
+                            let _ = writer
+                                .send_error(write_err.message, &write_err.error_type)
+                                .await;
                         }
                         Ok(Ok(_)) => {
-                            let _ = send_streaming_error(
-                                &write_tx,
-                                format!(
-                                    "Write pipeline unexpectedly closed for '{}'",
-                                    handle.path_display
-                                ),
-                                "io_error",
-                                Some(&op_id),
-                            )
-                            .await;
+                            let _ = writer
+                                .send_error(
+                                    format!(
+                                        "Write pipeline unexpectedly closed for '{}'",
+                                        handle.path_display
+                                    ),
+                                    "io_error",
+                                )
+                                .await;
                         }
                         Err(join_err) => {
-                            let _ = send_streaming_error(
-                                &write_tx,
-                                format!(
-                                    "Internal error writing '{}': {}",
-                                    handle.path_display, join_err
-                                ),
-                                "io_error",
-                                Some(&handle.op_id),
-                            )
-                            .await;
+                            let _ = writer
+                                .send_error(
+                                    format!(
+                                        "Internal error writing '{}': {}",
+                                        handle.path_display, join_err
+                                    ),
+                                    "io_error",
+                                )
+                                .await;
                         }
                     }
                     continue;
@@ -498,17 +500,16 @@ pub(crate) async fn handle_connection(
                     chunk_tx,
                     task,
                     path_display,
-                    op_id: handle_op_id,
+                    ..
                 } = match active_writes.remove(&op_id) {
                     Some(h) => h,
                     None => {
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!("No active write for op_id '{op_id}'"),
-                            "protocol_error",
-                            Some(&op_id),
-                        )
-                        .await;
+                        let _ = writer
+                            .send_error(
+                                format!("No active write for op_id '{op_id}'"),
+                                "protocol_error",
+                            )
+                            .await;
                         continue;
                     }
                 };
@@ -516,16 +517,14 @@ pub(crate) async fn handle_connection(
                 drop(chunk_tx);
                 match task.await {
                     Ok(Ok(result)) => {
-                        if send_response(
-                            &write_tx,
-                            &GuestResponse::FileWriteAck {
+                        if writer
+                            .send(&GuestResponse::FileWriteAck {
                                 op_id: result.op_id,
                                 path: result.path_display,
                                 bytes_written: result.bytes_written,
-                            },
-                        )
-                        .await
-                        .is_err()
+                            })
+                            .await
+                            .is_err()
                         {
                             break Err("write queue closed".into());
                         }
@@ -537,38 +536,30 @@ pub(crate) async fn handle_connection(
                             write_err.op_id,
                             write_err.message
                         );
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            write_err.message,
-                            &write_err.error_type,
-                            Some(&write_err.op_id),
-                        )
-                        .await;
+                        let _ = writer
+                            .send_error(write_err.message, &write_err.error_type)
+                            .await;
                     }
                     Err(join_err) => {
-                        let _ = send_streaming_error(
-                            &write_tx,
-                            format!("Internal error writing '{}': {}", path_display, join_err),
-                            "io_error",
-                            Some(&handle_op_id),
-                        )
-                        .await;
+                        let _ = writer
+                            .send_error(
+                                format!("Internal error writing '{}': {}", path_display, join_err),
+                                "io_error",
+                            )
+                            .await;
                     }
                 }
             }
             GuestCommand::ReadFile { op_id, path } => {
                 log_info!("Processing: read_file (op_id={op_id}, path={path})");
-                match handle_read_file(&op_id, &path, &write_tx).await {
+                match handle_read_file(&op_id, &path, &writer).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
                         message,
                         error_type,
-                        op_id,
+                        ..
                     }) => {
-                        if send_streaming_error(&write_tx, message, error_type, op_id.as_deref())
-                            .await
-                            .is_err()
-                        {
+                        if writer.send_error(message, error_type).await.is_err() {
                             break Err("write queue closed".into());
                         }
                     }
@@ -579,17 +570,14 @@ pub(crate) async fn handle_connection(
             }
             GuestCommand::ListFiles { path } => {
                 log_info!("Processing: list_files (path={path})");
-                match handle_list_files(&path, &write_tx).await {
+                match handle_list_files(&path, &writer).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
                         message,
                         error_type,
-                        op_id,
+                        ..
                     }) => {
-                        if send_streaming_error(&write_tx, message, error_type, op_id.as_deref())
-                            .await
-                            .is_err()
-                        {
+                        if writer.send_error(message, error_type).await.is_err() {
                             break Err("write queue closed".into());
                         }
                     }
@@ -604,4 +592,66 @@ pub(crate) async fn handle_connection(
     drop(write_tx);
     let _ = write_handle.await;
     result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // extract_op_id
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn op_id_present() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"action":"ping","op_id":"abc"}"#).unwrap();
+        assert_eq!(extract_op_id(&v), Some("abc".into()));
+    }
+
+    #[test]
+    fn op_id_missing() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"action":"ping"}"#).unwrap();
+        assert_eq!(extract_op_id(&v), None);
+    }
+
+    #[test]
+    fn op_id_null() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"action":"ping","op_id":null}"#).unwrap();
+        assert_eq!(extract_op_id(&v), None);
+    }
+
+    #[test]
+    fn op_id_empty_string() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"action":"ping","op_id":""}"#).unwrap();
+        assert_eq!(extract_op_id(&v), Some("".into()));
+    }
+
+    #[test]
+    fn op_id_non_string_int() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"action":"ping","op_id":123}"#).unwrap();
+        assert_eq!(extract_op_id(&v), None);
+    }
+
+    #[test]
+    fn op_id_from_file_command() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"action":"write_file","op_id":"abc","path":"x"}"#).unwrap();
+        assert_eq!(extract_op_id(&v), Some("abc".into()));
+        // Also verify the command still deserializes correctly
+        let cmd: GuestCommand = serde_json::from_value(v).unwrap();
+        match cmd {
+            GuestCommand::WriteFile { op_id, path, .. } => {
+                assert_eq!(op_id, "abc");
+                assert_eq!(path, "x");
+            }
+            _ => panic!("expected WriteFile"),
+        }
+    }
 }

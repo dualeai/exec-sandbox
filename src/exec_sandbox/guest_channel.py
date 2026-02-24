@@ -11,8 +11,9 @@ import contextlib
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Protocol, runtime_checkable
+from uuid import uuid4
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
@@ -39,6 +40,12 @@ logger = get_logger(__name__)
 # memory bounded during file transfers (prevents O(file_size) buffering).
 STREAM_BUFFER_LIMIT = 512 * 1024  # 512KB
 
+# Per-operation queue depth for op_id-routed message dispatch.
+# Must be deep enough that slow consumers (e.g., disk I/O during file reads)
+# don't stall the dispatch loop (which blocks ALL concurrent operations).
+# Matches the host-side outbound write queue depth for balanced flow control.
+OP_QUEUE_DEPTH = 64
+
 # Cached TypeAdapter for StreamingMessage discriminated union
 # Performance: Avoids rebuilding validators on every message (1000s of allocations per execution)
 # Pydantic TypeAdapter is expensive to construct - caching eliminates this overhead in hot paths
@@ -48,15 +55,14 @@ _STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(Streamin
 class FileOpDispatcher:
     """Routes event messages by op_id to waiting coroutines.
 
-    Shared multiplexer that reads from the event channel and routes file transfer
-    messages by op_id to per-operation queues. Non-file messages (execution output,
-    pong, errors without op_id) go to a default queue consumed by stream_events().
+    Shared multiplexer that reads from the event channel and routes messages
+    by op_id to per-operation queues.  Messages without op_id (pre-parse errors)
+    are logged and discarded.
     """
 
     def __init__(self, reader: asyncio.StreamReader):
         self._reader = reader
         self._op_queues: dict[str, asyncio.Queue[StreamingMessage]] = {}
-        self._default_queue: asyncio.Queue[StreamingMessage] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()  # protects _op_queues registration
 
@@ -73,14 +79,9 @@ class FileOpDispatcher:
             self._task = None
 
     async def register_op(self, op_id: str) -> asyncio.Queue[StreamingMessage]:
-        """Register an op_id and return its dedicated bounded queue.
-
-        Bounded to 4 items (~800KB) to provide backpressure through the
-        dispatch loop → StreamReader → TCP transport → guest agent chain.
-        Prevents O(file_size) memory accumulation during reads.
-        """
+        """Register an op_id and return its dedicated bounded queue."""
         async with self._lock:
-            q: asyncio.Queue[StreamingMessage] = asyncio.Queue(maxsize=4)
+            q: asyncio.Queue[StreamingMessage] = asyncio.Queue(maxsize=OP_QUEUE_DEPTH)
             self._op_queues[op_id] = q
             return q
 
@@ -89,23 +90,31 @@ class FileOpDispatcher:
         async with self._lock:
             self._op_queues.pop(op_id, None)
 
-    async def get_default_message(self, timeout: float) -> StreamingMessage:
-        """Get a message from the default queue (non-file-transfer messages)."""
-        return await asyncio.wait_for(self._default_queue.get(), timeout=timeout)
-
     async def _dispatch_loop(self) -> None:
-        """Read messages from the event channel and route by op_id."""
+        """Read messages from the event channel and route by op_id.
+
+        Backpressure: when a per-op queue is full (OP_QUEUE_DEPTH), the
+        dispatch loop blocks until the consumer drains.  This stalls all
+        concurrent operations on this channel — the OP_QUEUE_DEPTH constant
+        is sized to absorb bursts while the consumer processes messages.
+        """
         while True:
             try:
                 data = await self._reader.readuntil(b"\n")
             except asyncio.IncompleteReadError:
                 break
-            msg = _STREAMING_MESSAGE_ADAPTER.validate_json(data.rstrip(b"\n"))
+            try:
+                msg = _STREAMING_MESSAGE_ADAPTER.validate_json(data.rstrip(b"\n"))
+            except ValidationError:
+                logger.warning(
+                    "Dispatch loop: failed to parse message, discarding",
+                    extra={"raw": data[:200]},
+                    exc_info=True,
+                )
+                continue
             op_id = getattr(msg, "op_id", None)
-            if op_id:
+            if op_id is not None:
                 # Route to registered op queue, or discard if orphaned.
-                # Late messages after unregister_op() must NOT pollute the
-                # default queue (which feeds stream_events / execution output).
                 queue = self._op_queues.get(op_id)
                 if queue:
                     await queue.put(msg)
@@ -115,7 +124,12 @@ class FileOpDispatcher:
                         extra={"op_id": op_id, "msg_type": type(msg).__name__},
                     )
             else:
-                await self._default_queue.put(msg)
+                # Messages without op_id are pre-parse errors or legacy —
+                # no consumer, so log and discard to prevent memory leak.
+                logger.debug(
+                    "Discarding message without op_id",
+                    extra={"msg_type": type(msg).__name__},
+                )
 
 
 @runtime_checkable
@@ -143,25 +157,6 @@ class GuestChannel(Protocol):
 
         Returns:
             StreamingMessage (e.g., PongMessage, FileListMessage)
-        """
-        ...
-
-    async def send_raw_request(
-        self,
-        data: bytes,
-        timeout: int,
-    ) -> StreamingMessage:
-        """Send pre-serialized JSON bytes and receive single response.
-
-        Bypasses Pydantic serialization for performance-critical paths
-        (e.g., large file writes where we build the JSON frame manually).
-
-        Args:
-            data: Pre-serialized JSON bytes (must end with newline)
-            timeout: Response timeout in seconds
-
-        Returns:
-            StreamingMessage parsed from response
         """
         ...
 
@@ -379,51 +374,6 @@ class UnixSocketChannel:
             self._writer = None
             raise
 
-    async def send_raw_request(
-        self,
-        data: bytes,
-        timeout: int,
-    ) -> StreamingMessage:
-        """Send pre-serialized JSON bytes and receive single response.
-
-        Bypasses Pydantic serialization for performance-critical paths.
-        Queues write to prevent blocking when virtio-serial buffer full.
-        """
-        if not self._reader or not self._writer:
-            raise RuntimeError("Channel not connected")
-        if not data.endswith(b"\n"):
-            raise ValueError("send_raw_request data must end with newline")
-
-        # Validate write worker is alive (fail-fast if crashed)
-        if self._write_task and self._write_task.done():
-            try:
-                self._write_task.result()
-            except Exception as e:
-                raise RuntimeError(f"Write worker crashed: {type(e).__name__}: {e}") from e
-            raise RuntimeError("Write worker exited unexpectedly")
-
-        try:
-            # Queue write instead of blocking (fail-fast if queue full)
-            try:
-                await asyncio.wait_for(self._write_queue.put(data), timeout=5.0)
-            except TimeoutError as e:
-                raise RuntimeError("Write queue full - guest agent not draining") from e
-
-            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
-            return _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-
-        except TimeoutError:
-            raise
-        except (
-            asyncio.IncompleteReadError,
-            OSError,
-            BrokenPipeError,
-            ConnectionError,
-        ):
-            self._reader = None
-            self._writer = None
-            raise
-
     async def stream_messages(
         self,
         request: GuestAgentRequest,
@@ -452,18 +402,16 @@ class UnixSocketChannel:
         except TimeoutError as e:
             raise RuntimeError("Write queue full - guest agent not draining") from e
 
-        # Read and yield messages until completion or error
-        while True:
-            # Read next JSON line
-            response_data = await asyncio.wait_for(self._reader.readuntil(b"\n"), timeout=float(timeout))
+        # Read and yield messages until completion or error.
+        # Timeout wraps the entire stream (total wall-clock), not per-message.
+        async with asyncio.timeout(timeout):
+            while True:
+                response_data = await self._reader.readuntil(b"\n")
+                message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
+                yield message
 
-            # Parse as streaming message (direct bytes, no decode/strip allocation)
-            message = _STREAMING_MESSAGE_ADAPTER.validate_json(response_data.rstrip(b"\n"))
-            yield message
-
-            # Stop if complete or error
-            if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
-                break
+                if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
+                    break
 
     async def close(self) -> None:
         """Close Unix socket connection with graceful queue drain."""
@@ -554,16 +502,13 @@ class DualPortChannel:
 
         await channel.connect(timeout_seconds=5)
 
-        # Send command
-        await channel.send_command(ExecuteCodeRequest(...))
+        # Request-response (auto-assigns op_id, routes reply)
+        response = await channel.send_request(PingRequest())
 
-        # Stream events (concurrent with commands)
-        async for event in channel.stream_events():
-            if isinstance(event, OutputChunkMessage):
-                print(event.chunk)
-
-        # Can send ping DURING execution!
-        await channel.send_command(PingRequest())
+        # Stream execution output (auto op_id routing)
+        async for msg in channel.stream_messages(ExecuteCodeRequest(...), timeout=30):
+            if isinstance(msg, OutputChunkMessage):
+                print(msg.chunk)
 
         await channel.close()
     """
@@ -640,7 +585,7 @@ class DualPortChannel:
                         extra={"attempt": attempt + 1},
                     )
                     return
-            except (TimeoutError, OSError, asyncio.IncompleteReadError, ConnectionError):
+            except (TimeoutError, OSError, asyncio.IncompleteReadError, ConnectionError, RuntimeError):
                 pass
 
             # Guest not ready yet — close, wait, reconnect
@@ -694,88 +639,50 @@ class DualPortChannel:
         if self._dispatcher:
             await self._dispatcher.unregister_op(op_id)
 
-    async def stream_events(
+    @asynccontextmanager
+    async def _with_op_id(
         self,
-        timeout: int = 300,
-    ) -> AsyncGenerator[StreamingMessage]:
-        """Stream events from event port via dispatcher.
+        request: GuestAgentRequest,
+    ) -> AsyncGenerator[asyncio.Queue[StreamingMessage]]:
+        """Tag request with auto-generated op_id, send it, and yield its routed queue.
 
-        Reads messages from the default queue (non-file-transfer messages).
-        Can be called concurrently with send_command() on command port.
-
-        Args:
-            timeout: Total timeout in seconds (default: 300s = 5min)
-
-        Yields:
-            StreamingMessage: OutputChunkMessage, ExecutionCompleteMessage, StreamingErrorMessage
-
-        Raises:
-            RuntimeError: If event channel not connected
-            asyncio.TimeoutError: If no message received within timeout
+        Handles op_id generation, queue registration, command dispatch, and
+        cleanup in a single context manager. Used by send_request() and
+        stream_messages() to avoid duplicating the correlation logic.
         """
         if not self._dispatcher:
             raise RuntimeError("Dispatcher not initialized - channel not connected")
 
-        # Read and yield messages until completion or error
-        while True:
-            message = await self._dispatcher.get_default_message(timeout=float(timeout))
-            yield message
+        op_id = uuid4().hex
+        tagged_request = request.model_copy(update={"op_id": op_id})
+        op_queue = await self.register_op(op_id)
 
-            # Stop if complete or error
-            if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
-                break
+        try:
+            await self.send_command(tagged_request, timeout=5)
+            yield op_queue
+        finally:
+            await self.unregister_op(op_id)
 
     async def send_request(
         self,
         request: GuestAgentRequest,
         timeout: int = constants.GUEST_REQUEST_TIMEOUT_SECONDS,
     ) -> StreamingMessage:
-        """Send command and receive single response (compatibility method).
-
-        For simple request-response (e.g., ping), sends on command port
-        and reads first response from event port.
+        """Send command and receive single response via op_id-routed queue.
 
         Args:
             request: Pydantic request model
             timeout: Total timeout in seconds. Default: 5.
 
         Returns:
-            First StreamingMessage from event port
+            First StreamingMessage matching the op_id
 
         Raises:
             RuntimeError: If channels not connected
             asyncio.TimeoutError: If no response within timeout
         """
-        # Send command
-        await self.send_command(request, timeout=5)
-
-        # Read first event
-        async for message in self.stream_events(timeout=timeout):
-            return message
-
-        # Should never reach here (stream_events always yields at least one message)
-        raise RuntimeError("No response from event port")
-
-    async def send_raw_request(
-        self,
-        data: bytes,
-        timeout: int,
-    ) -> StreamingMessage:
-        """Send pre-serialized JSON bytes and receive single response.
-
-        Enqueues raw data on command port and reads first event from event port.
-        """
-        if not data.endswith(b"\n"):
-            raise ValueError("send_raw_request data must end with newline")
-
-        # Enqueue raw bytes on command channel
-        await self._cmd_channel.enqueue_write(data, timeout=5.0)
-
-        # Read first event
-        async for message in self.stream_events(timeout=timeout):
-            return message
-
-        raise RuntimeError("No response from event port")
+        async with self._with_op_id(request) as op_queue:
+            return await asyncio.wait_for(op_queue.get(), timeout=float(timeout))
 
     def stream_messages(
         self,
@@ -803,13 +710,17 @@ class DualPortChannel:
         request: GuestAgentRequest,
         timeout: int,
     ) -> AsyncGenerator[StreamingMessage]:
-        """Implementation of stream_messages (async generator)."""
-        # Send command
-        await self.send_command(request, timeout=5)
+        """Implementation of stream_messages (async generator).
 
-        # Stream all events
-        async for message in self.stream_events(timeout=timeout):
-            yield message
+        Timeout wraps the entire stream (total wall-clock), not per-message.
+        """
+        async with self._with_op_id(request) as op_queue:
+            async with asyncio.timeout(timeout):
+                while True:
+                    message = await op_queue.get()
+                    yield message
+                    if isinstance(message, (ExecutionCompleteMessage, StreamingErrorMessage)):
+                        break
 
     async def close(self) -> None:
         """Close both command and event ports.
