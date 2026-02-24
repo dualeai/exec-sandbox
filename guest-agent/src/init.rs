@@ -89,7 +89,7 @@ pub(crate) async fn setup_zram_background() {
 }
 
 /// Background network setup: ip config + gvproxy verification.
-/// Runs on spawn_blocking (uses StdCommand for ip/ping, I/O-bound).
+/// Runs on spawn_blocking (uses StdCommand for ip, I/O-bound).
 /// Marks NETWORK_READY when complete; ExecuteCode/InstallPackages gate on this.
 pub(crate) async fn setup_network_background() {
     tokio::task::spawn_blocking(|| {
@@ -482,29 +482,60 @@ fn apply_zram_vm_tuning() {
 
 /// Verify gvproxy connectivity with exponential backoff.
 /// Blocks phase 2 completion, so ExecuteCode/InstallPackages wait for network.
-/// Exponential backoff: 0.5+1+2+4+8+16 = 31.5ms between pings (max ~37.5s with ping -W 1).
+///
+/// DNS-first verification (no fork/exec):
+/// UDP DNS query to gateway:53 — any response proves both L3 routing AND DNS proxy
+/// are ready (can't get a UDP response without working L3). We query `_probe.internal`
+/// which is guaranteed to hit gvproxy's DNS proxy without external dependencies.
+/// Any response (including NXDOMAIN) = ready.
+///
+/// If DNS fails after all retries, a single TCP probe to gateway:1 distinguishes
+/// "no L3" from "L3 ok but DNS broken" — for diagnostics only.
 fn verify_gvproxy() {
-    let delays_us = [500, 1000, 2000, 4000, 8000, 16000];
-    for (i, &delay_us) in delays_us.iter().enumerate() {
-        match StdCommand::new("ping")
-            .args(["-c", "1", "-W", "1", "192.168.127.1"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        {
-            Ok(s) if s.success() => {
-                log_info!("Network verified: gvproxy reachable (attempt {})", i + 1);
-                return;
-            }
-            _ => {
-                std::thread::sleep(std::time::Duration::from_micros(delay_us));
+    use std::net::{SocketAddr, TcpStream, UdpSocket};
+
+    // DNS probe: proves both L3 routing and DNS proxy readiness in one shot.
+    // Minimal DNS query for "_probe.internal" (type A, class IN).
+    #[rustfmt::skip]
+    let dns_query: &[u8] = &[
+        0x00, 0x01, // Transaction ID
+        0x01, 0x00, // Flags: standard query, recursion desired
+        0x00, 0x01, // Questions: 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Answers/Authority/Additional: 0
+        // QNAME: _probe.internal
+        6, b'_', b'p', b'r', b'o', b'b', b'e',
+        8, b'i', b'n', b't', b'e', b'r', b'n', b'a', b'l',
+        0, // root label
+        0x00, 0x01, // QTYPE: A
+        0x00, 0x01, // QCLASS: IN
+    ];
+    let delays_ms: &[u64] = &[1, 2, 5, 10, 25, 50, 100, 200, 500, 1000];
+    for (i, &delay_ms) in delays_ms.iter().enumerate() {
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .ok();
+            if sock.send_to(dns_query, "192.168.127.1:53").is_ok() {
+                let mut buf = [0u8; 512];
+                if sock.recv(&mut buf).is_ok() {
+                    log_info!("Network verified via DNS (attempt {})", i + 1);
+                    return;
+                }
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
-    log_warn!(
-        "gvproxy unreachable after {} attempts, network may fail",
-        delays_us.len()
-    );
+
+    // DNS failed — single TCP probe for diagnostics (distinguish L3 vs DNS failure)
+    let addr: SocketAddr = "192.168.127.1:1".parse().unwrap();
+    let l3_ok = match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() == Some(libc::ECONNREFUSED),
+    };
+    if l3_ok {
+        log_warn!("gvproxy L3 reachable but DNS not responding, external connectivity may fail");
+    } else {
+        log_warn!("gvproxy unreachable (no L3), network will not work");
+    }
 }
 
 /// A2: Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
