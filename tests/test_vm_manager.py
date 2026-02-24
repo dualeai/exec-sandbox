@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmDependencyError, VmError
-from exec_sandbox.models import Language
+from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.system_probes import (
@@ -726,6 +726,114 @@ class TestNetdevReconnect:
             assert not netdev_found, "netdev should not be present when network is disabled"
         finally:
             await workdir.cleanup()
+
+
+# ============================================================================
+# Unit Tests - NIC None (Cold-Start Optimization)
+# ============================================================================
+
+
+class TestQemuNicNone:
+    """-nic none suppresses QEMU's default NIC when no network is needed.
+
+    Without -nic none, non-microvm machine types (ARM64 virt, x86 pc/q35)
+    create a default NIC that causes the guest-agent's verify_gvproxy() to
+    burn ~4s in exponential-backoff retries. Adding -nic none eliminates
+    this cold-start overhead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        probe_cache.reset("qemu_version")
+
+    @pytest.fixture
+    async def workdir(self):
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        wd = await VmWorkingDirectory.create("test-vm-nic-none")
+        try:
+            yield wd
+        finally:
+            await wd.cleanup()
+
+    @pytest.mark.parametrize(
+        "allow_network, expose_ports, expect_nic_none",
+        [
+            pytest.param(False, None, True, id="no-network"),
+            pytest.param(True, None, False, id="allow-network"),
+            pytest.param(
+                False,
+                [ExposedPort(internal=8080, external=9090)],
+                False,
+                id="expose-ports-only",
+            ),
+            pytest.param(
+                True,
+                [ExposedPort(internal=8080, external=9090)],
+                False,
+                id="both-network-and-ports",
+            ),
+            pytest.param(False, [], True, id="empty-expose-ports"),
+        ],
+    )
+    async def test_nic_none_flag(
+        self,
+        vm_settings,
+        workdir,
+        allow_network: bool,
+        expose_ports: list[ExposedPort] | None,
+        expect_nic_none: bool,
+    ) -> None:
+        """Verify -nic none presence/absence based on network configuration."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=detect_host_arch(),
+                vm_id="test-vm-nic-none",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=allow_network,
+                expose_ports=expose_ports,
+            )
+
+        has_nic_none = "-nic" in cmd and cmd[cmd.index("-nic") + 1] == "none"
+        assert has_nic_none == expect_nic_none
+        if expect_nic_none:
+            assert "-netdev" not in cmd
+            assert not any("virtio-net" in arg for arg in cmd)
+        else:
+            assert "-netdev" in cmd
+
+    async def test_nic_none_coexists_with_nodefaults(self, vm_settings, workdir) -> None:
+        """-nic none and -nodefaults coexist on microvm (redundant but harmless)."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+        from exec_sandbox.vm_types import AccelType
+
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=AccelType.KVM),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-nic-none",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert "-nic" in cmd
+        assert cmd[cmd.index("-nic") + 1] == "none"
+        assert "-nodefaults" in cmd
 
 
 # ============================================================================
