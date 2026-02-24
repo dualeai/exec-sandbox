@@ -63,6 +63,7 @@ def iterations(request: pytest.FixtureRequest) -> int:
     return request.param
 
 
+@skip_unless_hwaccel
 @pytest.mark.slow
 async def test_no_memory_leak_without_network(iterations: int, images_dir: Path) -> None:
     """Verify host memory returns to baseline after N VM executions."""
@@ -94,6 +95,7 @@ async def test_no_memory_leak_without_network(iterations: int, images_dir: Path)
     )
 
 
+@skip_unless_hwaccel
 @pytest.mark.slow
 async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) -> None:
     """Verify no leak with network enabled (gvproxy) over N executions."""
@@ -351,6 +353,7 @@ async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path, tmp_path
     )
 
 
+@skip_unless_hwaccel
 @pytest.mark.slow
 async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_dir: Path) -> None:
     """Measure peak RAM overhead per concurrent VM execution."""
