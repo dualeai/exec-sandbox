@@ -276,6 +276,7 @@ class TestSessionEdgeCases:
                 result = await session.exec(f"print({i})")
                 assert result.exit_code == 0
 
+    @skip_unless_hwaccel
     async def test_session_with_packages(self, scheduler: Scheduler) -> None:
         """Session with pre-installed packages works."""
         async with await scheduler.session(
