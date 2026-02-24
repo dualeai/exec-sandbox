@@ -599,10 +599,19 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     )
 
     # =============================================================
-    # Network Configuration: Three Modes (all via gvproxy)
+    # Network Configuration: Three Modes + No-Network
     # =============================================================
     # All modes use gvproxy with socket networking for fast boot (~300ms).
     # SLIRP was removed because it's ~40x slower (~11s boot).
+    #
+    # Mode 0: No network (default)
+    #   - Explicit "-nic none" suppresses QEMU's default NIC
+    #   - Without this, machine types without -nodefaults (ARM64 virt,
+    #     x86 pc/q35) create a default NIC, causing the guest-agent's
+    #     verify_gvproxy() to burn ~4s in exponential-backoff retries
+    #   - microvm already uses -nodefaults so -nic none is redundant
+    #     but harmless there
+    #   - See: https://www.qemu.org/docs/master/system/qemu-manpage.html
     #
     # Mode 1: Port forwarding only (expose_ports + no allow_network)
     #   - Uses gvproxy with BlockAllOutbound (no internet)
@@ -657,6 +666,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 f"virtio-net-{virtio_suffix},netdev=net0,mq=off,csum=off,gso=off,host_tso4=off,host_tso6=off,mrg_rxbuf=off,ctrl_rx=off,guest_announce=off",
             ]
         )
+    else:
+        # Suppress QEMU's default NIC.  Without this, machine types that don't
+        # use -nodefaults (ARM64 virt, x86 pc/q35) create a default virtio-net
+        # device, causing the guest-agent to detect eth0 and run verify_gvproxy()
+        # with exponential-backoff retries (~4s) before marking NETWORK_READY.
+        # ExecuteCode/InstallPackages gate on NETWORK_READY, so the default NIC
+        # adds ~4s to every cold-start execution even when no network is needed.
+        qemu_args.extend(["-nic", "none"])
 
     # QMP (QEMU Monitor Protocol) socket for VM control operations
     qemu_args.extend(
