@@ -301,7 +301,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # | Configuration            | Console     | Reason                         |
     # +--------------------------+-------------+--------------------------------+
     # | x86 microvm + TSC        | hvc0        | Non-legacy, virtio-console     |
-    # | x86 microvm - TSC        | ttyS0       | Legacy mode, ISA serial        |
+    # | x86 microvm - TSC        | hvc0        | ISA serial off, virtio-console |
     # | x86 pc (TCG only)        | ttyS0       | Software emulation fallback    |
     # | ARM64 virt               | ttyAMA0     | PL011 UART (always available)  |
     # +--------------------------+-------------+--------------------------------+
@@ -456,8 +456,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     )
 
     # Platform-specific memory configuration
-    # Note: -mem-prealloc removed for faster boot (demand-paging is fine for ephemeral VMs)
-    host_os = detect_host_os()
+    # Note: -mem-prealloc tested for cold-start on HVF (pre-populates host pages)
+    # but had NO effect — ARM VHE Stage-2 PTEs are still created lazily by hardware
+    # on first guest access, regardless of host page presence.
 
     # Layer 3: Seccomp sandbox - Linux only
     if detect_host_os() != HostOS.MACOS:

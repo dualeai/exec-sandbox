@@ -141,6 +141,6 @@ pub(crate) static NETWORK_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 /// to produce unique, unpredictable IDs without the uuid crate dependency.
 pub(crate) static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Module-level REPL storage. Persists across 12s guest agent reconnect cycles.
+/// Module-level REPL storage. Persists across guest agent reconnect cycles (READ_TIMEOUT_MS=18s).
 pub(crate) static REPL_STATES: LazyLock<TokioMutex<HashMap<Language, ReplState>>> =
     LazyLock::new(|| TokioMutex::new(HashMap::new()));

@@ -499,8 +499,10 @@ build_qcow2() {
     cp "$guest_agent" "$rootfs_dir/usr/local/bin/guest-agent"
     chmod 555 "$rootfs_dir/usr/local/bin/guest-agent"
 
-    # Configure DNS (gvproxy gateway) - duplicate for Alpine musl quirk
-    # Note: init-wrapper.sh and network-init.start removed - logic moved to guest-agent
+    # Configure DNS (gvproxy gateway).
+    # Duplicate entry: musl-libc's resolver reads only the first TWO nameserver
+    # lines and falls back to 127.0.0.1 if fewer than two are present. With a
+    # single entry, transient UDP loss causes immediate SERVFAIL instead of retry.
     echo "nameserver 192.168.127.1" > "$rootfs_dir/etc/resolv.conf"
     echo "nameserver 192.168.127.1" >> "$rootfs_dir/etc/resolv.conf"
 

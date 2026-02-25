@@ -46,8 +46,8 @@ pub(crate) fn setup_phase1() {
     unsafe { std::env::set_var("UV_NO_CACHE", "1") };
 }
 
-/// Phase 2 core — sync init: chmod, mounts, critical sysctl, dev setup (~10ms).
-/// Network, zram, and deferred sysctl run in background to unblock Ping.
+/// Phase 2 core — sync init: chmod, mounts, sysctl hardening, dev setup (~10ms).
+/// Called from spawn_blocking before port is opened. Network and zram run in background.
 pub(crate) fn setup_phase2_core() {
     // CIS Benchmark 6.1.x compliance (A2: libc::chmod, no fork/exec)
     chmod_paths(0o755, &["/etc", "/usr", "/var", "/sbin", "/bin"]);

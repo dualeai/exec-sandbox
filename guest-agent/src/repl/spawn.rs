@@ -84,6 +84,10 @@ pub(crate) async fn spawn_repl(
 
     // Defense-in-depth: harden the REPL child process before exec.
     // We handle uid/gid/prctl ALL in pre_exec to control ordering.
+    //
+    // SAFETY: pre_exec runs between fork() and exec() in the child process.
+    // All operations are async-signal-safe libc calls (prctl, setgid, setuid).
+    // No heap allocation, no Rust stdlib calls, no mutex locking.
     unsafe {
         cmd.pre_exec(|| {
             // 1. Block privilege escalation via execve
