@@ -1,7 +1,6 @@
 """exec-sandbox: Secure code execution in microVMs.
 
-A standalone Python library for executing untrusted code in isolated QEMU microVMs
-with 6-layer security architecture.
+A standalone Python library for executing untrusted code in isolated QEMU microVMs.
 
 Quick Start (single execution):
     ```python
@@ -40,14 +39,6 @@ With Configuration:
             packages=["pandas==2.2.0"],
         )
     ```
-
-Security Architecture (6 layers):
-    1. KVM/HVF hardware virtualization (CPU ring -1 isolation)
-    2. Unprivileged QEMU process (no root required)
-    3. Seccomp syscall filtering
-    4. cgroup v2 resource limits (memory, CPU, PIDs)
-    5. Linux namespaces (PID, network, mount, UTS, IPC)
-    6. MAC policies (AppArmor/SELinux when available)
 
 Requirements:
     - QEMU 8.0+ with KVM (Linux) or HVF (macOS) acceleration

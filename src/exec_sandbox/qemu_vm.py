@@ -55,14 +55,6 @@ class QemuVM:
     Lifecycle managed by VmManager.
     Communicates via GuestChannel (dual-port virtio-serial).
 
-    Security:
-    - Layer 1: Hardware isolation (KVM) or TCG software emulation
-    - Layer 2: Unprivileged user (qemu-vm if available, optional)
-    - Layer 3: Seccomp syscall filtering
-    - Layer 4: cgroup v2 resource limits
-    - Layer 5: Linux namespaces (PID, net, mount, UTS, IPC)
-    - Layer 6: SELinux/AppArmor (optional production hardening)
-
     Context Manager Usage:
         Supports async context manager protocol for automatic cleanup:
 

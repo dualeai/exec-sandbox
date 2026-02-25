@@ -552,7 +552,7 @@ async with await scheduler.session(language="python") as session:
 | Layer | Technology | Protection |
 |-------|------------|------------|
 | 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
-| 2 | Custom hardened kernel | Modules disabled at compile time, io_uring compiled out, slab/memory hardening, ~300 subsystems removed |
+| 2 | Custom hardened kernel | Modules disabled at compile time, io_uring compiled out, slab/memory hardening, ~360+ subsystems removed |
 | 3 | Unprivileged QEMU | No root privileges, minimal exposure |
 | 4 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
 | 5 | System call filtering (seccomp) | Blocks unauthorized OS calls |
@@ -620,7 +620,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
 | `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
-All images are based on **Alpine Linux 3.23** (Linux 6.18 LTS, musl libc) and include common tools for AI agent workflows.
+All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and include common tools for AI agent workflows.
 
 ### Common Tools (all images)
 
@@ -641,7 +641,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18 LTS, musl libc) and in
 | Python | 3.14 | [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (musl) |
 | uv | 0.9+ | 10-100x faster than pip ([docs](https://docs.astral.sh/uv/)) |
 | gcc, musl-dev | Alpine | For C extensions (numpy, pandas, etc.) |
-| cloudpickle | 3.1 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
+| cloudpickle | 3.1.2 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
 
 **Usage notes:**
 - Use `uv pip install` instead of `pip install` (pip not included)

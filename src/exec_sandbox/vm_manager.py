@@ -1,8 +1,7 @@
-"""QEMU microVM lifecycle management with multi-layer security.
+"""QEMU microVM lifecycle management.
 
 Architecture:
 - Supports Linux with KVM or TCG acceleration
-- 6-layer security: KVM + unprivileged + seccomp + cgroups + namespaces + MAC
 - qcow2 snapshot-based boot <400ms
 - Dual-port virtio-serial guest communication
 
@@ -120,7 +119,6 @@ class VmManager:
     Architecture:
     - Runtime detection: KVM or TCG acceleration
     - qcow2 snapshot-based boot with CoW overlays
-    - 6-layer security architecture
     - Dual-port virtio-serial guest communication
     - cgroup v2 resource limits
 
