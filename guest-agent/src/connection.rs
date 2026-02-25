@@ -287,19 +287,44 @@ pub(crate) async fn handle_connection(
                     }
                 };
                 match spawn_repl(lang).await {
-                    Ok(repl) => {
-                        REPL_STATES.lock().await.insert(lang, repl);
-                        log_info!("REPL pre-warmed for {language}");
-                        if writer
-                            .send(&GuestResponse::WarmReplAck {
-                                language,
-                                status: "ok".to_string(),
-                                message: None,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
+                    Ok(mut repl) => {
+                        // Exercise the REPL with a no-op to block until the interpreter
+                        // is fully loaded. Without this, spawn_repl returns after fork+exec
+                        // (~4ms) but Python/Bun take ~10s to finish importing modules.
+                        // The pool would advertise the VM as ready prematurely.
+                        let warm_start = std::time::Instant::now();
+                        match crate::repl::execute::warm_exercise_repl(&mut repl, lang).await {
+                            Ok(()) => {
+                                let warm_ms = warm_start.elapsed().as_millis();
+                                REPL_STATES.lock().await.insert(lang, repl);
+                                log_info!("REPL pre-warmed for {language} ({warm_ms}ms)");
+                                if writer
+                                    .send(&GuestResponse::WarmReplAck {
+                                        language,
+                                        status: "ok".to_string(),
+                                        message: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break Err("write queue closed".into());
+                                }
+                            }
+                            Err(e) => {
+                                log_warn!("REPL warm-up failed for {language}: {e}");
+                                let _ = repl.child.kill().await;
+                                if writer
+                                    .send(&GuestResponse::WarmReplAck {
+                                        language,
+                                        status: "error".to_string(),
+                                        message: Some(format!("warm-up failed: {e}")),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break Err("write queue closed".into());
+                                }
+                            }
                         }
                     }
                     Err(e) => {

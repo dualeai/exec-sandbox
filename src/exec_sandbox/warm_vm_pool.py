@@ -383,7 +383,9 @@ class WarmVMPool:
         try:
             vm = await self._boot_warm_vm(language, index)
 
-            # Pre-warm REPL at full memory (hides ~800ms Python startup).
+            # Pre-warm REPL at full memory (hides ~10s Python/Bun startup on HVF).
+            # The guest agent exercises the REPL with a no-op and blocks until
+            # the interpreter sentinel arrives, ensuring true readiness.
             # Must run BEFORE balloon inflate: Bun (42MB RSS) swap-thrashes
             # when starting at 128MB. After startup, Bun idles at ~42MB RSS
             # which fits comfortably in the ballooned 128MB target.

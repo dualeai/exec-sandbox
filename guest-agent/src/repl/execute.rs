@@ -196,6 +196,95 @@ async fn drain_after_sigterm(
     sentinel_exit_code
 }
 
+/// Generate a unique sentinel ID and its prefix for matching on stderr.
+fn generate_sentinel() -> (String, String) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let count = SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{nanos}_{count}");
+    let prefix = format!("__SENTINEL_{}_", id);
+    (id, prefix)
+}
+
+/// Write a code submission (header + body) to the REPL's stdin.
+async fn submit_code_to_repl(
+    stdin: &mut tokio::process::ChildStdin,
+    sentinel_id: &str,
+    code: &[u8],
+) -> std::io::Result<()> {
+    let header = format!("{} {}\n", sentinel_id, code.len());
+    stdin.write_all(header.as_bytes()).await?;
+    stdin.write_all(code).await?;
+    stdin.flush().await
+}
+
+/// Exercise a freshly-spawned REPL with a no-op to block until the interpreter
+/// is fully loaded.
+///
+/// The warm pool calls this so `wait_pool_ready()` doesn't return until the
+/// interpreter has actually finished loading (Python ~10s, Bun ~9s on HVF).
+/// Without this, `spawn_repl()` returns after fork+exec (~4ms) but the
+/// interpreter is still importing modules from EROFS.
+pub(crate) async fn warm_exercise_repl(
+    repl: &mut crate::repl::spawn::ReplState,
+    language: crate::types::Language,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::types::Language;
+
+    let (sentinel_id, sentinel_prefix) = generate_sentinel();
+
+    // Language-appropriate no-op code
+    let code: &[u8] = match language {
+        Language::Python => b"pass",
+        Language::Javascript => b"void 0",
+        Language::Raw => b":",
+    };
+
+    submit_code_to_repl(&mut repl.stdin, &sentinel_id, code).await?;
+
+    log_info!(
+        "[warm] sent no-op to {} REPL, waiting for readiness...",
+        language.as_str(),
+    );
+
+    // Wait for sentinel on stderr (this is where the interpreter startup time is spent)
+    let mut stderr_line_buf = String::new();
+    let mut stderr_discard = String::new();
+    let mut buf = [0u8; 4096];
+    let timeout = Duration::from_secs(120); // generous timeout for cold start
+
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let n = repl.stderr.read(&mut buf).await?;
+            if n == 0 {
+                return Err("REPL stderr closed before sentinel".into());
+            }
+            if let Some(_exit_code) = process_stderr_chunk(
+                &buf[..n],
+                &mut stderr_line_buf,
+                &sentinel_prefix,
+                &mut stderr_discard,
+            ) {
+                return Ok(());
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            // Drain any stdout the no-op may have produced
+            drain_stdout(&mut repl.stdout, &mut String::new(), 50).await;
+            log_info!("[warm] {} REPL ready", language.as_str());
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("REPL warm-up timed out (120s)".into()),
+    }
+}
+
 /// Execute code via persistent REPL with streaming output.
 pub(crate) async fn execute_code_streaming(
     language_str: &str,
@@ -253,26 +342,14 @@ pub(crate) async fn execute_code_streaming(
     );
 
     // Generate unique sentinel
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let count = SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let sentinel_id = format!("{nanos}_{count}");
-    let sentinel_prefix = format!("__SENTINEL_{}_", sentinel_id);
+    let (sentinel_id, sentinel_prefix) = generate_sentinel();
 
     // Prepend env var setup to user code
     let full_code = prepend_env_vars(language, code, env_vars);
     let code_bytes = full_code.as_bytes();
 
     // Write header + code to REPL stdin
-    let header = format!("{} {}\n", sentinel_id, code_bytes.len());
-    let write_result = async {
-        repl.stdin.write_all(header.as_bytes()).await?;
-        repl.stdin.write_all(code_bytes).await?;
-        repl.stdin.flush().await
-    }
-    .await;
+    let write_result = submit_code_to_repl(&mut repl.stdin, &sentinel_id, code_bytes).await;
     if let Err(e) = write_result {
         log_error!("REPL stdin write failed: {e}");
         let _ = repl.child.kill().await;
