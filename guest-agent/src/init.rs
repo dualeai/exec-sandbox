@@ -67,7 +67,7 @@ pub(crate) fn setup_phase2_core() {
     // makes /proc/sys read-only. This includes sysctl hardening AND zram
     // VM tuning (swappiness, page-cluster, etc.).
     apply_sysctl_critical();
-    apply_sysctl_deferred();
+    apply_sysctl_non_critical();
     apply_zram_vm_tuning();
     // Match EROFS 16KB physical cluster size (-C16384 in mkfs.erofs).
     //
@@ -449,10 +449,10 @@ const SYSCTL_CRITICAL: &[(&str, &str)] = &[
     ("/proc/sys/kernel/yama/ptrace_scope", "2"),
 ];
 
-/// E3: Deferred sysctl — defense-in-depth settings safe to apply after Ping.
-/// These harden filesystem and limit attack surface but aren't exploitable
-/// in the window between Ping-ready and background completion.
-const SYSCTL_DEFERRED: &[(&str, &str)] = &[
+/// E3: Non-critical sysctl — defense-in-depth settings applied synchronously
+/// in phase 2 core (before port open). These harden filesystem and limit
+/// attack surface but aren't exploitable during early boot.
+const SYSCTL_NON_CRITICAL: &[(&str, &str)] = &[
     // Filesystem link protections
     ("/proc/sys/fs/protected_symlinks", "1"),
     ("/proc/sys/fs/protected_hardlinks", "1"),
@@ -472,8 +472,8 @@ fn apply_sysctl_critical() {
     }
 }
 
-fn apply_sysctl_deferred() {
-    for &(path, value) in SYSCTL_DEFERRED {
+fn apply_sysctl_non_critical() {
+    for &(path, value) in SYSCTL_NON_CRITICAL {
         let _ = std::fs::write(path, value);
     }
 }
