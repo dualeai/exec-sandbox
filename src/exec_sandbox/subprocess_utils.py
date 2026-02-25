@@ -7,40 +7,10 @@ Follows best practices from Python 3.11+ asyncio.TaskGroup pattern.
 import asyncio
 from collections.abc import Callable
 
-import aiofiles
-import aiofiles.os
-
 from exec_sandbox._logging import get_logger
 from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
-
-
-async def read_log_tail(path: str, max_bytes: int) -> str:
-    """
-    Read the last max_bytes of a log file for debugging.
-
-    Shows the most recent output which is typically most relevant for debugging
-    failures (e.g., the error that caused the crash, not early boot messages).
-
-    Args:
-        path: Path to the log file
-        max_bytes: Maximum bytes to read from end of file
-
-    Returns:
-        The last max_bytes of file content, or error/status message
-    """
-    if not await aiofiles.os.path.exists(path):
-        return "(file not found)"
-
-    try:
-        async with aiofiles.open(path) as f:
-            content = await f.read()
-        if not content:
-            return "(empty)"
-        return content[-max_bytes:]
-    except OSError as e:
-        return f"(failed to read: {e})"
 
 
 async def drain_subprocess_output(

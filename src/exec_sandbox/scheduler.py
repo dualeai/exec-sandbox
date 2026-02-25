@@ -242,6 +242,7 @@ class Scheduler:
         env_vars: dict[str, str] | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
+        on_boot_log: Callable[[str], None] | None = None,
     ) -> ExecutionResult:
         """Execute code in an isolated microVM.
 
@@ -266,6 +267,8 @@ class Scheduler:
             env_vars: Environment variables to set in the VM.
             on_stdout: Callback for stdout chunks (streaming). Called as chunks arrive.
             on_stderr: Callback for stderr chunks (streaming). Called as chunks arrive.
+            on_boot_log: Callback for boot console output (kernel, init, guest-agent).
+                When provided, enables verbose boot logging automatically.
 
         Returns:
             ExecutionResult with stdout, stderr, exit_code, timing info, and exposed_ports.
@@ -321,6 +324,7 @@ class Scheduler:
             allowed_domains=allowed_domains,
             expose_ports=expose_ports,
             task_id=f"run-{id(code)}",
+            on_boot_log=on_boot_log,
         )
 
         run_start_time = asyncio.get_event_loop().time()
@@ -396,6 +400,7 @@ class Scheduler:
         allowed_domains: list[str] | None = None,
         expose_ports: list[PortMapping | int] | None = None,
         idle_timeout_seconds: int | None = None,
+        on_boot_log: Callable[[str], None] | None = None,
     ) -> Session:
         """Create a persistent session for multi-step code execution.
 
@@ -413,6 +418,8 @@ class Scheduler:
             allowed_domains: Whitelist of domains if allow_network=True.
             expose_ports: List of ports to expose from guest to host.
             idle_timeout_seconds: Auto-close after inactivity. Default: config setting.
+            on_boot_log: Callback for boot console output (kernel, init, guest-agent).
+                When provided, enables verbose boot logging automatically.
 
         Returns:
             Session for executing code. Use as async context manager:
@@ -445,6 +452,7 @@ class Scheduler:
             allowed_domains=allowed_domains,
             expose_ports=expose_ports,
             task_id=f"session-{id(self)}",
+            on_boot_log=on_boot_log,
         )
 
         # _vm_manager guaranteed non-None by _prepare_vm
@@ -477,6 +485,7 @@ class Scheduler:
         allowed_domains: list[str] | None,
         expose_ports: list[PortMapping | int] | None,
         task_id: str,
+        on_boot_log: Callable[[str], None] | None = None,
     ) -> tuple[QemuVM, list[ExposedPort], bool]:
         """Create and boot a VM with the given configuration.
 
@@ -491,6 +500,7 @@ class Scheduler:
             allowed_domains: Whitelist of domains.
             expose_ports: Ports to expose from guest to host.
             task_id: Identifier for this VM (e.g., "run-..." or "session-...").
+            on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
             Tuple of (vm, resolved_ports, is_cold_boot).
@@ -545,11 +555,12 @@ class Scheduler:
             )
 
         # Try warm pool first (instant allocation)
-        # Warm pool VMs don't have networking, so skip if networking is needed
+        # Bypass warm pool when: networking needed, packages required, or boot log
+        # requested (warm pool VMs booted without on_boot_log — callback would never fire)
         vm: QemuVM | None = None
         is_cold_boot = False
         needs_network: bool = allow_network or bool(resolved_ports)
-        if self._warm_pool and not packages and not needs_network:
+        if self._warm_pool and not packages and not needs_network and on_boot_log is None:
             vm = await self._warm_pool.get_vm(language, packages)
 
         # Cold boot if no warm VM available
@@ -571,6 +582,7 @@ class Scheduler:
                 allow_network=allow_network,
                 allowed_domains=allowed_domains,
                 expose_ports=resolved_ports if resolved_ports else None,
+                on_boot_log=on_boot_log,
             )
 
         return vm, resolved_ports, is_cold_boot

@@ -421,6 +421,24 @@ time.sleep(30)
         if result.execution_time_ms is not None:
             assert result.execution_time_ms >= 0
 
+    async def test_on_boot_log_receives_boot_output(self, scheduler: Scheduler) -> None:
+        """on_boot_log callback receives kernel/init boot output."""
+        boot_lines: list[str] = []
+
+        result = await scheduler.run(
+            code="print('hello')",
+            language=Language.PYTHON,
+            on_boot_log=boot_lines.append,
+        )
+
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+        # Boot output should contain init or timing markers from tiny-init/guest-agent
+        assert len(boot_lines) > 0, "on_boot_log callback should receive boot output"
+        assert any(
+            "init" in line.lower() or "timing" in line.lower() or "info" in line.lower() for line in boot_lines
+        ), f"Expected boot markers in output, got: {boot_lines[:5]}"
+
 
 class TestSchedulerJavaScript:
     """JavaScript execution tests."""

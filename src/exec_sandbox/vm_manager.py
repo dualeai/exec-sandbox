@@ -23,8 +23,9 @@ import logging
 import os
 import re
 import signal
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import TextIO
 from uuid import uuid4
 
 import aiofiles.os
@@ -65,7 +66,7 @@ from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
-from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, read_log_tail
+from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception
 from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
@@ -260,6 +261,7 @@ class VmManager:
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
         expose_ports: list[ExposedPort] | None = None,
+        on_boot_log: Callable[[str], None] | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -280,6 +282,9 @@ class VmManager:
             expose_ports: List of ports to expose from guest to host.
                 Mode 1: Works without allow_network (QEMU hostfwd, no internet).
                 Mode 2: Works with allow_network (gvproxy API, with internet).
+            on_boot_log: Optional callback for streaming boot console output.
+                When provided, enables verbose kernel/init logging and calls
+                the callback with each line of boot output.
 
         Returns:
             QemuVM handle for code execution
@@ -326,6 +331,7 @@ class VmManager:
                         allowed_domains=allowed_domains,
                         direct_write_target=direct_write_target,
                         expose_ports=expose_ports,
+                        on_boot_log=on_boot_log,
                     )
                     # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
                     vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
@@ -353,6 +359,7 @@ class VmManager:
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
         expose_ports: list[ExposedPort] | None = None,
+        on_boot_log: Callable[[str], None] | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM (implementation).
 
@@ -377,6 +384,8 @@ class VmManager:
             expose_ports: List of ports to expose from guest to host.
                 Mode 1: Works without allow_network (QEMU hostfwd, no internet).
                 Mode 2: Works with allow_network (gvproxy API, with internet).
+            on_boot_log: Optional callback for streaming boot console output.
+                When provided, enables verbose kernel/init logging.
 
         Returns:
             QemuVM handle for code execution
@@ -451,7 +460,7 @@ class VmManager:
         gvproxy_log_task: asyncio.Task[None] | None = None
         qemu_proc: ProcessWrapper | None = None
         qemu_log_task: asyncio.Task[None] | None = None
-        console_log: TextIO | None = None
+        console_lines: deque[str] = deque(maxlen=constants.CONSOLE_RING_LINES)
         vm_created = False  # Flag to skip cleanup if VM successfully created
 
         try:
@@ -516,6 +525,7 @@ class VmManager:
                 allow_network,
                 expose_ports=expose_ports,
                 direct_write=direct_write_target is not None,
+                debug_boot=on_boot_log is not None,
             )
 
             # Step 6: Create dual-port Unix socket communication channel for guest agent
@@ -653,27 +663,21 @@ class VmManager:
 
                 # Background task to drain QEMU output (prevent 64KB pipe deadlock)
                 # Started AFTER crash check to ensure we can capture error output
-                console_log_path = workdir.console_log
-
-                # Open file asynchronously to avoid blocking the event loop
-                # The file handle itself stays synchronous for simple write callbacks
-                loop = asyncio.get_running_loop()
-                console_log = await loop.run_in_executor(
-                    None,
-                    lambda: console_log_path.open("w", buffering=1),  # Line buffering
-                )
-
-                # Capture in local variable for type narrowing (console_log is definitely not None here)
-                # Type assertion: we just opened the file above, so console_log is a valid TextIO
-                assert console_log is not None  # noqa: S101 - type narrowing, not runtime check
-                _console_log: TextIO = console_log
 
                 def write_to_console(line: str) -> None:
-                    """Write line to console log file and structured logs."""
-                    try:
-                        _console_log.write(f"[{vm_id}] {line}\n")
-                    except OSError as e:
-                        logger.error(f"Console write failed: {e}", extra={"context_id": vm_id})
+                    """Capture console line in memory ring buffer and forward to boot log callback."""
+                    nonlocal on_boot_log
+                    console_lines.append(line)
+                    if on_boot_log is not None:
+                        try:
+                            on_boot_log(line)
+                        except Exception:  # noqa: BLE001 - user-provided callback, must not kill drain task
+                            logger.warning(
+                                "on_boot_log callback raised, disabling",
+                                extra={"vm_id": vm_id},
+                                exc_info=True,
+                            )
+                            on_boot_log = None
 
                 qemu_log_task = asyncio.create_task(
                     drain_subprocess_output(
@@ -705,10 +709,10 @@ class VmManager:
                 workdir,
                 channel,
                 language,
+                console_lines,
                 gvproxy_proc,
                 qemu_log_task,
                 gvproxy_log_task,
-                console_log,
             )
 
             # Register VM in registry (before BOOTING to ensure tracking)
@@ -746,13 +750,8 @@ class VmManager:
                 # Capture QEMU output for debugging
                 stdout_text, stderr_text = await self._capture_qemu_output(qemu_proc)
 
-                # Flush console log before reading to ensure all buffered content is written
-                if console_log:
-                    with contextlib.suppress(OSError):
-                        console_log.flush()
-
-                # Read console log (last N bytes for debugging)
-                console_output = await read_log_tail(str(console_log_path), constants.CONSOLE_LOG_MAX_BYTES)
+                # Snapshot console lines from in-memory ring buffer
+                console_snapshot = "\n".join(console_lines) if console_lines else "(empty)"
 
                 # Build command string for debugging
                 import shlex  # noqa: PLC0415
@@ -766,7 +765,7 @@ class VmManager:
                         "vm_id": vm_id,
                         "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
                         "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
-                        "console_log": console_output,
+                        "console_log": console_snapshot,
                         "qemu_running": qemu_proc.returncode is None,
                         "qemu_returncode": qemu_proc.returncode,
                         "qemu_cmd": qemu_cmd_str[:1000],
@@ -795,12 +794,12 @@ class VmManager:
                     f"qemu_binary={qemu_binary}, qemu_running={qemu_proc.returncode is None}, "
                     f"returncode={qemu_proc.returncode}, "
                     f"stderr: {stderr_text[:200] if stderr_text else '(empty)'}, "
-                    f"console: {console_output[-constants.CONSOLE_LOG_PREVIEW_BYTES :] if console_output else '(empty)'}",
+                    f"console: {console_snapshot[-4000:]}",
                     context={
                         "vm_id": vm_id,
                         "language": language,
                         "timeout_seconds": constants.VM_BOOT_TIMEOUT_SECONDS,
-                        "console_log": console_output,
+                        "console_log": console_snapshot,
                         "qemu_running": qemu_proc.returncode is None,
                         "qemu_returncode": qemu_proc.returncode,
                         "qemu_cmd": qemu_cmd_str[:1000],
@@ -845,11 +844,6 @@ class VmManager:
                         "gvproxy_started": gvproxy_proc is not None,
                     },
                 )
-
-                # Close console log file if opened (prevent resource leak)
-                if console_log is not None:
-                    with contextlib.suppress(OSError):
-                        console_log.close()
 
                 # Cancel log drain task if started
                 if qemu_log_task is not None and not qemu_log_task.done():
@@ -950,7 +944,7 @@ class VmManager:
             unregister_process(gvproxy_proc)
 
         # Phase 2: Cleanup workdir and cgroup in parallel (after processes dead)
-        # workdir.cleanup() removes overlay, sockets, and console log in one operation
+        # workdir.cleanup() removes overlay and sockets in one operation
         async def cleanup_workdir() -> bool:
             if workdir is None:
                 return True
@@ -1005,11 +999,6 @@ class VmManager:
             vm: QemuVM handle to destroy
         """
         try:
-            # Close console log file before cancelling tasks
-            if vm.console_log:
-                with contextlib.suppress(OSError):
-                    vm.console_log.close()
-
             # Cancel output reader tasks (prevent pipe deadlock during cleanup)
             if vm.qemu_log_task and not vm.qemu_log_task.done():
                 vm.qemu_log_task.cancel()
@@ -1235,8 +1224,8 @@ class VmManager:
                 sig = -vm.process.returncode
                 signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"signal {sig}"
 
-            # Read console log (last N bytes for debugging)
-            console_output = await read_log_tail(str(vm.workdir.console_log), constants.CONSOLE_LOG_MAX_BYTES)
+            # Snapshot console lines from in-memory ring buffer
+            console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
 
             logger.error(
                 "QEMU process exited unexpectedly",
@@ -1246,14 +1235,13 @@ class VmManager:
                     "signal": signal_name,
                     "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
                     "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
-                    "console_log": console_output,
+                    "console_log": console_snapshot,
                 },
             )
             stderr_preview = stderr_text[:200] if stderr_text else "(empty)"
-            console_preview = console_output[-constants.CONSOLE_LOG_PREVIEW_BYTES :] if console_output else "(empty)"
             raise VmQemuCrashError(
                 f"QEMU process died (exit code {vm.process.returncode}, {signal_name}). "
-                f"stderr: {stderr_preview}, console: {console_preview}"
+                f"stderr: {stderr_preview}, console: {console_snapshot[-4000:]}"
             )
 
         async def check_guest_ready() -> None:
@@ -1326,12 +1314,8 @@ class VmManager:
                         await guest_task
 
         except TimeoutError:
-            # Flush console log before reading to ensure all buffered content is written
-            if vm.console_log:
-                with contextlib.suppress(OSError):
-                    vm.console_log.flush()
-
-            console_output = await read_log_tail(str(vm.workdir.console_log), constants.CONSOLE_LOG_MAX_BYTES)
+            # Snapshot console lines from in-memory ring buffer
+            console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
 
             logger.error(
                 "Guest agent timeout",
@@ -1339,7 +1323,7 @@ class VmManager:
                     "vm_id": vm.vm_id,
                     "timeout": timeout,
                     "qemu_running": vm.process.returncode is None,
-                    "console_output": console_output,
+                    "console_log": console_snapshot,
                     "overlay_image": str(vm.overlay_image) if vm.overlay_image else "(none)",
                 },
             )

@@ -8,9 +8,10 @@ import asyncio
 import contextlib
 import json
 import sys
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, TextIO
+from typing import IO, TYPE_CHECKING
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -85,10 +86,10 @@ class QemuVM:
         workdir: VmWorkingDirectory,
         channel: GuestChannel,
         language: Language,
+        console_lines: deque[str],
         gvproxy_proc: "ProcessWrapper | None" = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
-        console_log: TextIO | None = None,
     ):
         """Initialize VM handle.
 
@@ -99,10 +100,10 @@ class QemuVM:
             workdir: Working directory containing overlay, sockets, and logs
             channel: Communication channel for guest agent
             language: Programming language for this VM
+            console_lines: In-memory ring buffer of QEMU console output lines (for error diagnostics)
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
-            console_log: Optional file handle for QEMU console log
         """
         self.vm_id = vm_id
         self.process = process
@@ -110,10 +111,10 @@ class QemuVM:
         self.workdir = workdir
         self.channel = channel
         self.language = language
+        self.console_lines = console_lines
         self.gvproxy_proc = gvproxy_proc
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
-        self.console_log: TextIO | None = console_log
         self._destroyed = False
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
@@ -893,7 +894,7 @@ class QemuVM:
 
         # Step 3-4: Parallel cleanup (cgroup + workdir)
         # After QEMU terminates, cleanup tasks are independent
-        # workdir.cleanup() removes overlay, sockets, and console log in one operation
+        # workdir.cleanup() removes overlay and sockets in one operation
         await asyncio.gather(
             cgroup.cleanup_cgroup(self.cgroup_path, self.vm_id),
             self.workdir.cleanup(),

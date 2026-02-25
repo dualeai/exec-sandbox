@@ -32,6 +32,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     allow_network: bool,
     expose_ports: list[ExposedPort] | None = None,
     direct_write: bool = False,
+    debug_boot: bool = False,
 ) -> list[str]:
     """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -48,6 +49,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             with hostfwd (Mode 1). When set with allow_network, port
             forwarding is handled by gvproxy API (Mode 2).
         direct_write: Mount rootfs read-write (for snapshot creation).
+        debug_boot: Enable verbose kernel/init boot logging. When True,
+            sets loglevel=7, printk.devkmsg=on, init.quiet=0 for full
+            boot diagnostics.
 
     Returns:
         QEMU command as list of strings
@@ -374,14 +378,15 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #   noautogroup, io_delay
             # =============================================================
             f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
-            # Suppress all non-emergency kernel messages (20-50ms)
-            " quiet loglevel=0"
+            # Boot verbosity: debug_boot enables full kernel/init logging for diagnostics
+            # Note: loglevel=7 overrides loglevel=1 set in console_params (kernel uses last occurrence)
+            + (" loglevel=7" if debug_boot else " quiet loglevel=0")
             # Skip timer calibration — safe in virtualized env with reliable TSC (10-30ms)
-            " no_timer_check"
+            + " no_timer_check"
             # Keep expedited RCU after boot (built-in boot expediting covers boot phase)
-            " rcupdate.rcu_normal_after_boot=0"
-            # Limit userspace /dev/kmsg writes
-            " printk.devkmsg=off"
+            + " rcupdate.rcu_normal_after_boot=0"
+            # /dev/kmsg access: on for debug, off for production
+            + (" printk.devkmsg=on" if debug_boot else " printk.devkmsg=off")
             # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
             + (" 8250.nr_uarts=0" if use_virtio_console and arch == HostArch.X86_64 else "")
             # =============================================================
@@ -437,8 +442,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
             + (" init.rw=1" if direct_write else "")
-            # Suppress non-essential guest console output (saves MMIO/UART traps)
-            + " init.quiet=1"
+            # Guest-agent log verbosity: init.quiet=0 un-gates log_info! macros
+            + (" init.quiet=0" if debug_boot else " init.quiet=1")
             # Explicit TSC clocksource selection, skip probing (5-10ms, x86_64 only)
             + (" tsc=reliable clocksource=tsc" if arch == HostArch.X86_64 else ""),
         ]

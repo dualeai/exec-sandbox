@@ -49,14 +49,6 @@ class TestVmWorkingDirectoryProperties:
         finally:
             await workdir.cleanup()
 
-    async def test_console_log_property(self):
-        """console_log returns correct path."""
-        workdir = await VmWorkingDirectory.create("test-vm-console")
-        try:
-            assert workdir.console_log == workdir.path / "console.log"
-        finally:
-            await workdir.cleanup()
-
     async def test_cmd_socket_is_string(self):
         """cmd_socket returns string path (for QEMU args)."""
         workdir = await VmWorkingDirectory.create("test-vm-cmd")

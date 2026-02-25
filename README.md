@@ -81,6 +81,9 @@ sbx run 'print(1)' 'print(2)' script.py
 # Multiple inline codes
 sbx run -c 'print(1)' -c 'print(2)'
 
+# Debug boot (stream kernel/init logs to stderr)
+sbx run --debug 'print("hello")'
+
 ```
 
 **CLI Options:**
@@ -101,6 +104,7 @@ sbx run -c 'print(1)' -c 'print(2)'
 | `--no-validation` | | Skip package allowlist validation | false |
 | `--upload` | | Upload file `LOCAL:GUEST` (repeatable) | - |
 | `--download` | | Download file `GUEST:LOCAL` or `GUEST` (repeatable) | - |
+| `--debug` | | Stream kernel/init boot logs to stderr | false |
 
 ### Python API
 
@@ -214,6 +218,22 @@ async with Scheduler() as scheduler:
         on_stdout=lambda chunk: print(f"[OUT] {chunk}", end=""),
         on_stderr=lambda chunk: print(f"[ERR] {chunk}", end=""),
     )
+```
+
+#### Boot Log Streaming
+
+Stream kernel, tiny-init, and guest-agent boot output for diagnostics:
+
+```python
+async with Scheduler() as scheduler:
+    boot_lines: list[str] = []
+    result = await scheduler.run(
+        code="print('hello')",
+        language="python",
+        on_boot_log=boot_lines.append,  # Automatically enables verbose boot
+    )
+    for line in boot_lines:
+        print(f"[boot] {line}")
 ```
 
 #### Network Access
@@ -495,6 +515,7 @@ async with await scheduler.session(language="python") as session:
 config = SchedulerConfig(warm_pool_size=1)
 await scheduler.run(code="...", packages=["pandas==2.2.0"])  # Bypasses warm pool, fresh start (400ms)
 await scheduler.run(code="...")                        # Uses warm pool (1-2ms)
+await scheduler.run(code="...", on_boot_log=print)     # Bypasses warm pool (needs cold boot for logs)
 
 # Version specifiers are required (security + caching)
 packages=["pandas==2.2.0"]  # Valid, cacheable
@@ -502,7 +523,7 @@ packages=["pandas"]         # PackageNotAllowedError! Must pin version
 
 # Streaming callbacks must be fast (blocks async execution)
 on_stdout=lambda chunk: time.sleep(1)        # Blocks!
-on_stdout=lambda chunk: buffer.append(chunk)  # Fast
+on_stdout=lambda chunk: buffer.append(chunk)  # Fast (same applies to on_boot_log)
 
 # Memory overhead: pre-started VMs use warm_pool_size × 3 languages × 192MB
 # warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone

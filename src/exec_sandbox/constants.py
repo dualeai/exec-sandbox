@@ -159,11 +159,11 @@ NPM_PACKAGE_DOMAINS: Final[list[str]] = [
 # System Limits
 # ============================================================================
 
-CONSOLE_LOG_MAX_BYTES: Final[int] = 8000
-"""Maximum bytes to capture from VM console log for debugging (context/structured logs)."""
+CONSOLE_RING_LINES: Final[int] = 500
+"""In-memory ring buffer size (lines) for QEMU console output.
 
-CONSOLE_LOG_PREVIEW_BYTES: Final[int] = 4000
-"""Maximum bytes for console log preview in error messages."""
+Kernel loglevel=7 can emit 300-600 lines before init starts.
+500 keeps the diagnostic tail intact for boot failure analysis."""
 
 QEMU_OUTPUT_MAX_BYTES: Final[int] = 2000
 """Maximum bytes to capture from QEMU stdout/stderr."""
