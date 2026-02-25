@@ -128,7 +128,7 @@ class TestSnapshotManagerIntegration:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
@@ -142,7 +142,7 @@ class TestSnapshotManagerIntegration:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Test with packages
@@ -181,7 +181,7 @@ class TestSnapshotManagerIntegration:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create snapshot (this boots a VM and installs packages)
@@ -225,7 +225,7 @@ class TestL2Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create a minimal valid qcow2 file
@@ -260,7 +260,7 @@ class TestL2Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create qcow2 with backing file that doesn't exist
@@ -332,7 +332,7 @@ class TestL2Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create a wrong backing file (not the expected base image)
@@ -389,7 +389,7 @@ class TestL2Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Get the correct base image path
@@ -429,7 +429,7 @@ class TestL2Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
@@ -447,7 +447,7 @@ class TestL2Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Create multiple snapshots
@@ -502,7 +502,7 @@ class TestL3Cache:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         with pytest.raises(SnapshotError) as exc_info:
@@ -541,7 +541,7 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -612,7 +612,7 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -665,7 +665,7 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -709,7 +709,7 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="nonexistent-bucket",
                 s3_region="us-east-1",
@@ -772,7 +772,7 @@ class TestL3Cache:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket=bucket_name,
                 s3_region="us-east-1",
@@ -888,7 +888,7 @@ class TestCacheHierarchy:
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(
+        vm_manager = await make_vm_manager(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket="test-bucket",
             s3_region="us-east-1",
@@ -973,7 +973,7 @@ class TestCacheHierarchy:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -1057,7 +1057,7 @@ class TestCacheHierarchy:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -1153,7 +1153,7 @@ class TestCacheHierarchy:
             )
             settings.snapshot_cache_dir.mkdir(parents=True)
 
-            vm_manager = make_vm_manager(
+            vm_manager = await make_vm_manager(
                 snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
@@ -1235,7 +1235,7 @@ class TestCacheHierarchy:
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(
+        vm_manager = await make_vm_manager(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
@@ -1295,7 +1295,7 @@ class TestCacheHierarchy:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
@@ -1320,7 +1320,7 @@ class TestCacheHierarchy:
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
         # Same "package" name but different languages
@@ -1346,7 +1346,7 @@ class TestCacheHierarchy:
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(
+        vm_manager = await make_vm_manager(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
@@ -1401,7 +1401,7 @@ class TestCacheHierarchy:
         )
         settings.snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = make_vm_manager(
+        vm_manager = await make_vm_manager(
             snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )

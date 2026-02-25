@@ -222,22 +222,30 @@ def make_vm_settings(images_dir: Path):
 
 
 @pytest.fixture
-def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
-    """Factory to create VmManager with optional Settings overrides.
+async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
+    """Factory to create started VmManager with optional Settings overrides.
+
+    Each VmManager is automatically started (overlay pool daemon, system probes)
+    and stopped on fixture teardown via AsyncExitStack.
 
     Usage:
-        def test_something(make_vm_manager, tmp_path):
-            vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        async def test_something(make_vm_manager, tmp_path):
+            vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
     """
+    from contextlib import AsyncExitStack
     from typing import Any
 
     from exec_sandbox.vm_manager import VmManager
 
-    def _make(**settings_overrides: Any) -> VmManager:
-        settings = make_vm_settings(**settings_overrides)
-        return VmManager(settings)  # type: ignore[arg-type]
+    async with AsyncExitStack() as stack:
 
-    return _make
+        async def _make(**settings_overrides: Any) -> VmManager:
+            settings = make_vm_settings(**settings_overrides)
+            manager = VmManager(settings)  # type: ignore[arg-type]
+            await stack.enter_async_context(manager)
+            return manager
+
+        yield _make
 
 
 # ============================================================================
