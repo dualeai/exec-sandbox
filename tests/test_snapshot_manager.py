@@ -249,12 +249,10 @@ class TestL2Cache:
         path = await snapshot_manager._check_l2_cache(cache_key)
         assert path == snapshot_path
 
-    async def test_l2_cache_removes_snapshot_with_missing_backing_file(
+    async def test_l2_cache_removes_corrupt_snapshot(
         self, make_vm_manager, make_vm_settings, tmp_path: Path
     ) -> None:
-        """L2 cache detects and removes snapshot with missing backing file."""
-        import asyncio
-
+        """L2 cache detects and removes corrupt qcow2 (fails qemu-img check)."""
         from exec_sandbox.snapshot_manager import SnapshotManager
 
         settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
@@ -263,164 +261,14 @@ class TestL2Cache:
         vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
         snapshot_manager = SnapshotManager(settings, vm_manager)
 
-        # Create qcow2 with backing file that doesn't exist
-        cache_key = "python-stale123"
+        cache_key = "python-corrupt123"
         snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
-        fake_backing = tmp_path / "nonexistent-base.qcow2"
+        snapshot_path.write_bytes(b"not a valid qcow2 file")
 
-        # First create a temporary backing file so qemu-img create succeeds
-        temp_backing = tmp_path / "temp-base.qcow2"
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(temp_backing),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        # Create snapshot with backing file
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            str(temp_backing),
-            str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0
-        assert snapshot_path.exists()
-
-        # Rebase to non-existent backing file (simulates image rebuild/deletion)
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "rebase",
-            "-u",
-            "-b",
-            str(fake_backing),
-            "-F",
-            "qcow2",
-            str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        # _check_l2_cache should detect missing backing file and remove snapshot
         result = await snapshot_manager._check_l2_cache(cache_key)
 
-        assert result is None, "Should return None for stale cache"
-        assert not snapshot_path.exists(), "Stale snapshot should be removed"
-
-    async def test_l2_cache_removes_snapshot_with_wrong_backing_file(
-        self, make_vm_manager, make_vm_settings, tmp_path: Path
-    ) -> None:
-        """L2 cache detects and removes snapshot pointing to wrong base image."""
-        import asyncio
-
-        from exec_sandbox.snapshot_manager import SnapshotManager
-
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
-
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
-
-        # Create a wrong backing file (not the expected base image)
-        wrong_backing = tmp_path / "wrong-base.qcow2"
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            str(wrong_backing),
-            "1M",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        # Create snapshot with wrong backing file
-        # Use cache key format: "python-v{version}-{img_hash}-base"
-        cache_key = "python-v0.0-xxxxxxxx-base"
-        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            str(wrong_backing),
-            str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0
-        assert snapshot_path.exists()
-
-        # _check_l2_cache should detect wrong backing file and remove snapshot
-        result = await snapshot_manager._check_l2_cache(cache_key)
-
-        assert result is None, "Should return None for mismatched backing file"
-        assert not snapshot_path.exists(), "Snapshot with wrong backing file should be removed"
-
-    async def test_l2_cache_accepts_valid_backing_file(
-        self, make_vm_manager, make_vm_settings, tmp_path: Path, images_dir: Path
-    ) -> None:
-        """L2 cache accepts snapshot with correct backing file."""
-        import asyncio
-
-        from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
-
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
-
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
-
-        # Get the correct base image path
-        base_image = vm_manager.get_base_image(Language.PYTHON)
-
-        # Compute cache key (will include base image hash)
-        cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, [])
-        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
-
-        # Create snapshot with correct backing file
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "qcow2",
-            "-b",
-            str(base_image.resolve()),
-            str(snapshot_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0
-
-        # _check_l2_cache should accept valid snapshot
-        result = await snapshot_manager._check_l2_cache(cache_key)
-
-        assert result == snapshot_path, "Should return path for valid cache"
-        assert snapshot_path.exists(), "Valid snapshot should NOT be removed"
+        assert result is None, "Should return None for corrupt qcow2"
+        assert not snapshot_path.exists(), "Corrupt snapshot should be removed"
 
     async def test_l2_cache_nonexistent_returns_none(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L2 cache returns None for non-existent snapshot."""
@@ -1120,6 +968,7 @@ class TestCacheHierarchy:
         Flow: L2 MISS → L3 HIT → download → L2 populated
         Then: L2 HIT → return immediately
         """
+        import asyncio
         from unittest.mock import AsyncMock, patch
 
         import boto3
@@ -1165,8 +1014,18 @@ class TestCacheHierarchy:
             cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["scipy==1.11.0"])
             l2_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
 
+            # Create a real qcow2 to upload to S3 (must pass qemu-img check on L2 hit)
+            real_qcow2 = tmp_path / "real-snapshot.qcow2"
+            proc = await asyncio.create_subprocess_exec(
+                "qemu-img", "create", "-f", "qcow2", str(real_qcow2), "1M",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            assert proc.returncode == 0
+            original_content = real_qcow2.read_bytes()
+
             # Pre-populate S3 only
-            original_content = b"scipy snapshot content"
             compressed = zstd.compress(original_content)
             s3_sync.put_object(
                 Bucket="test-snapshots",

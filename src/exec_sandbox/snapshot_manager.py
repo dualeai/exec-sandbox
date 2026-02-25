@@ -272,8 +272,7 @@ class SnapshotManager:
 
         Validates:
         1. Snapshot file exists
-        2. Valid qcow2 format
-        3. Backing file exists and matches expected base image
+        2. Valid qcow2 format (via qemu-img check)
 
         Args:
             cache_key: Snapshot cache key.
