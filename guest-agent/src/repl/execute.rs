@@ -66,9 +66,11 @@ fn process_stderr_chunk(
     stderr_line_buf.push_str(&String::from_utf8_lossy(chunk));
     let mut sentinel_exit_code: Option<i32> = None;
     while let Some(nl) = stderr_line_buf.find('\n') {
-        let line = stderr_line_buf[..nl].to_string();
-        *stderr_line_buf = stderr_line_buf[nl + 1..].to_string();
-        if let Some(code) = parse_stderr_line_for_sentinel(&line, sentinel_prefix, stderr_buffer) {
+        let line: String = stderr_line_buf.drain(..=nl).collect();
+        // drain includes the '\n'; strip it for sentinel parsing
+        let line = &line[..line.len() - 1];
+        if let Some(code) = parse_stderr_line_for_sentinel(line, sentinel_prefix, stderr_buffer) {
+            // Last sentinel wins if multiple appear in one chunk
             sentinel_exit_code = Some(code);
         }
     }
