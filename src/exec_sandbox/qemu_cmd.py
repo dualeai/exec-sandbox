@@ -33,6 +33,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     expose_ports: list[ExposedPort] | None = None,
     direct_write: bool = False,
     debug_boot: bool = False,
+    snapshot_drive: str | None = None,
 ) -> list[str]:
     """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -52,6 +53,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         debug_boot: Enable verbose kernel/init boot logging. When True,
             sets loglevel=7, printk.devkmsg=on, init.quiet=0 for full
             boot diagnostics.
+        snapshot_drive: Path to ext4 qcow2 for snapshot overlay (serial=snap).
+            When set, tiny-init discovers drives by serial number and mounts
+            EROFS base + ext4 snapshot via overlayfs. For snapshot creation
+            (direct_write=True), the ext4 drive is writable; for usage, read-only.
 
     Returns:
         QEMU command as list of strings
@@ -377,7 +382,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #   random.trust_cpu, panic, rcupdate.rcu_expedited, edd,
             #   noautogroup, io_delay
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
             # Boot verbosity: debug_boot enables full kernel/init logging for diagnostics
             # Note: loglevel=7 overrides loglevel=1 set in console_params (kernel uses last occurrence)
             + (" loglevel=7" if debug_boot else " quiet loglevel=0")
@@ -442,6 +447,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
             + (" init.rw=1" if direct_write else "")
+            + (" init.snap=1" if snapshot_drive else "")
             # Guest-agent log verbosity: init.quiet=0 un-gates log_info! macros
             + (" init.quiet=0" if debug_boot else " init.quiet=1")
             # Explicit TSC clocksource selection, skip probing (5-10ms, x86_64 only)
@@ -482,10 +488,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     if use_iothread:
         qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
 
-    # Disk configuration
-    # Uses overlay backed by either:
-    # - snapshot_path (cached L2 qcow2) for pre-installed packages
-    # - base_image for cold boot
+    # Disk configuration (EROFS base drive, serial=base)
+    # Uses qcow2 overlay backed by the EROFS base image
     qemu_args.extend(
         [
             "-drive",
@@ -514,26 +518,64 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     )
 
     # Platform-specific block device
+    # serial=base: stable identifier for tiny-init to find the EROFS rootfs drive,
+    # regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates virtio devices
+    # in reverse declaration order, so /dev/vda != first -device on ARM.
     match host_os:
         case HostOS.MACOS:
             qemu_args.extend(
                 [
                     "-device",
                     # D2: event_idx=off reduces interrupt coalescing overhead during boot
-                    f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128,event_idx=off",
+                    f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,num-queues=1,queue-size=128,event_idx=off",
                 ]
             )
         case HostOS.LINUX | HostOS.UNKNOWN:
             qemu_args.extend(
                 [
                     "-device",
-                    # NOTE: Removed logical_block_size=4096,physical_block_size=4096
-                    # Small ext4 filesystems (<512MB) use 1024-byte blocks by default, so forcing
-                    # 4096-byte block size causes mount failures ("Invalid argument")
                     # D2: event_idx=off reduces interrupt coalescing overhead during boot
-                    f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off",
+                    f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off",
                 ]
             )
+
+    # Snapshot overlay drive — ext4 layer for overlayfs merge with EROFS base.
+    # Presented as a second virtio-blk device; tiny-init detects it by serial=snap
+    # and sets up overlayfs automatically (rw for snapshot creation, ro for usage).
+    if snapshot_drive:
+        qemu_args.extend(
+            [
+                "-drive",
+                f"file={snapshot_drive},"
+                f"format=qcow2,"
+                f"if=none,"
+                f"id=hd1,"
+                f"cache=unsafe,"
+                f"aio={aio_mode},"
+                f"discard=unmap,"
+                f"detect-zeroes=unmap,"
+                f"werror=report,"
+                f"rerror=report,"
+                f"file.locking=off",
+            ]
+        )
+        match host_os:
+            case HostOS.MACOS:
+                qemu_args.extend(
+                    [
+                        "-device",
+                        f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,num-queues=1,queue-size=128,event_idx=off",
+                    ]
+                )
+            case HostOS.LINUX | HostOS.UNKNOWN:
+                qemu_args.extend(
+                    [
+                        "-device",
+                        f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off"
+                        if use_iothread
+                        else f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,num-queues=1,queue-size=128,event_idx=off",
+                    ]
+                )
 
     # Display/console configuration
     # -nographic: headless mode

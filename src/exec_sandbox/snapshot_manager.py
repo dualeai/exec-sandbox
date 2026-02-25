@@ -10,7 +10,7 @@ qcow2 optimizations:
 - cluster_size=128k: Balance between metadata and allocation
 
 Snapshot structure:
-- {cache_key}.qcow2: Disk state (backing file + package changes)
+- {cache_key}.qcow2: Standalone ext4 image (overlaid on EROFS base at boot)
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
-import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -44,7 +43,7 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.hash_utils import crc32, crc64
 from exec_sandbox.models import Language
-from exec_sandbox.overlay_pool import QemuImgError, create_qcow2_overlay
+from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 
@@ -287,57 +286,23 @@ class SnapshotManager:
         if not await aiofiles.os.path.exists(snapshot_path):
             return None
 
-        # Verify qcow2 format and get backing file info
+        # Verify qcow2 format (standalone ext4 snapshot, no backing file expected)
         try:
             proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
                     "qemu-img",
-                    "info",
-                    "--output=json",
+                    "check",
                     str(snapshot_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
             )
-            stdout, _stderr = await proc.communicate()
+            await proc.communicate()
 
             if proc.returncode != 0:
                 logger.debug("Invalid qcow2 snapshot, removing", extra={"cache_key": cache_key})
                 await aiofiles.os.remove(snapshot_path)
                 return None
-
-            # Parse JSON output to check backing file
-            info = json.loads(stdout.decode())
-            backing_file = info.get("backing-filename") or info.get("full-backing-filename")
-
-            if backing_file:
-                # Verify backing file exists
-                if not await aiofiles.os.path.exists(backing_file):
-                    logger.warning(
-                        "Snapshot backing file missing, removing stale cache",
-                        extra={"cache_key": cache_key, "backing_file": backing_file},
-                    )
-                    await aiofiles.os.remove(snapshot_path)
-                    return None
-
-                # Verify backing file matches expected base image by checking hash
-                # Extract language from cache_key (format: "{language}-v{version}-{hash|base}")
-                language_str = cache_key.split("-")[0]
-                try:
-                    expected_base = self.vm_manager.get_base_image(Language(language_str)).resolve()
-                    if Path(backing_file).resolve() != expected_base:
-                        logger.warning(
-                            "Snapshot backing file mismatch, removing stale cache",
-                            extra={
-                                "cache_key": cache_key,
-                                "backing_file": backing_file,
-                                "expected": str(expected_base),
-                            },
-                        )
-                        await aiofiles.os.remove(snapshot_path)
-                        return None
-                except (ValueError, KeyError):
-                    pass  # Can't determine expected base, skip validation
 
         except (OSError, FileNotFoundError):
             return None
@@ -384,17 +349,14 @@ class SnapshotManager:
         """
         start_time = asyncio.get_event_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
-        # Resolve to absolute path - qemu-img resolves backing file relative to snapshot location,
-        # so we need absolute path when snapshot_cache_dir differs from base_images_dir
-        base_image = self.vm_manager.get_base_image(language).resolve()
 
         # Acquire semaphore to limit concurrent snapshot creation
         async with self._creation_semaphore:
             vm = None  # Track VM for cleanup
 
             try:
-                # Step 1: Create qcow2 with backing file
-                await self._create_snapshot_image(snapshot_path, base_image, cache_key, language, packages, tenant_id)
+                # Step 1: Create standalone ext4 qcow2 for overlay (vdb)
+                await self._create_snapshot_image(snapshot_path, cache_key, language, packages, tenant_id)
 
                 # Step 2: Determine network configuration for snapshot creation
                 # ALWAYS enable network during snapshot creation (pip/npm needs it)
@@ -609,17 +571,19 @@ class SnapshotManager:
     async def _create_snapshot_image(
         self,
         snapshot_path: Path,
-        base_image: Path,
         cache_key: str,
         language: str,
         packages: list[str],
         tenant_id: str,
     ) -> None:
-        """Create qcow2 snapshot image with backing file.
+        """Create standalone ext4 qcow2 for snapshot overlay (vdb).
+
+        With EROFS rootfs, snapshots are standalone ext4 qcow2 images that serve
+        as the upper layer in overlayfs (merged with the read-only EROFS base on vda).
+        tiny-init formats and mounts this as ext4 writable during snapshot creation.
 
         Args:
             snapshot_path: Path to snapshot to create
-            base_image: Base image to use as backing file
             cache_key: Snapshot cache key
             language: Programming language
             packages: Package list
@@ -629,7 +593,23 @@ class SnapshotManager:
             SnapshotError: qemu-img command failed
         """
         try:
-            await create_qcow2_overlay(base_image, snapshot_path)
+            proc = ProcessWrapper(
+                await asyncio.create_subprocess_exec(
+                    "qemu-img",
+                    "create",
+                    "-f",
+                    "qcow2",
+                    "-o",
+                    "cluster_size=128k,lazy_refcounts=on,extended_l2=on",
+                    str(snapshot_path),
+                    "512M",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            )
+            _stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise QemuImgError(f"qemu-img create failed: {stderr.decode().strip()}")
         except QemuImgError as e:
             raise SnapshotError(
                 str(e),

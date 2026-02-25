@@ -38,7 +38,8 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 # Package lists for each variant
 # Common: essential tools for AI agent workflows
 # iputils: provides ping for guest-agent gvproxy connectivity check at boot
-COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file iputils"
+# e2fsprogs: mkfs.ext4 needed by tiny-init for snapshot creation (format vdb overlay drive)
+COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file iputils e2fsprogs"
 
 # Python: add build tools for C extensions (numpy, pandas, etc.)
 PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev jemalloc"
@@ -112,7 +113,7 @@ DOCKERFILE
 # =============================================================================
 
 # Compute rootfs hash — everything EXCEPT guest-agent binary.
-# Used to detect when only guest-agent changed (guestfish patch fast-path).
+# Kept as a component of the full hash for cache-key stability.
 compute_rootfs_hash() {
     local variant=$1
     local target_arch=$2
@@ -171,13 +172,6 @@ cache_hit() {
     else
         return 1
     fi
-}
-
-# Read rootfs hash from line 2 of .hash file (empty string if absent)
-read_rootfs_hash() {
-    local output_file=$1
-    local hash_file="${output_file}.hash"
-    sed -n '2p' "$hash_file" 2>/dev/null || echo ""
 }
 
 # Save hash after successful build
@@ -440,40 +434,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache && \
     apt-get update -qq && \
-    apt-get install -y -qq guestfs-tools qemu-utils >/dev/null 2>&1
+    apt-get install -y -qq erofs-utils qemu-utils >/dev/null 2>&1
 DOCKERFILE
 }
 
-# Patch guest-agent binary in an existing qcow2 image using guestfish.
-# Much faster than a full rebuild (~41s vs ~3:52 for python).
-patch_guest_agent() {
-    local qcow2_img=$1
-    local guest_agent=$2
-
-    echo "  Patching guest-agent in $qcow2_img..."
-    ensure_guestfs_image
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    cp "$guest_agent" "$tmp_dir/guest-agent"
-
-    # Replace binary in-place using guestfish.
-    # /dev/sda: libguestfs presents the first disk as SCSI (Debian's default backend).
-    # This matches our qcow2 images which have a single ext4 filesystem on the whole device
-    # (created by virt-make-fs --type=ext4 without a partition table).
-    docker run --rm \
-        -v "$tmp_dir:/patch" \
-        -v "$(dirname "$qcow2_img"):/output" \
-        --platform "$HOST_PLATFORM" \
-        "$GUESTFS_IMAGE" \
-        guestfish --rw -a "/output/$(basename "$qcow2_img")" run \
-            : mount /dev/sda / \
-            : upload /patch/guest-agent /usr/local/bin/guest-agent \
-            : chmod 0555 /usr/local/bin/guest-agent \
-            : sync
-
-    rm -rf "$tmp_dir"
-}
+## NOTE: guestfish patch fast-path removed — EROFS is read-only, can't patch in-place.
+## Any change (including guest-agent-only) triggers a full rebuild.
 
 build_qcow2() {
     local variant=$1
@@ -496,10 +462,9 @@ build_qcow2() {
 
     local qcow2_img="$OUTPUT_DIR/$output_name.qcow2"
 
-    # Three-way cache decision:
+    # Two-way cache decision (EROFS is read-only, no in-place patching):
     #   1. Full hash match → skip (nothing changed)
-    #   2. Rootfs hash match + qcow2 exists → guestfish patch (only guest-agent changed)
-    #   3. Rootfs hash miss → full rebuild (packages/versions changed)
+    #   2. Hash miss → full rebuild
     local rootfs_hash current_hash
     rootfs_hash=$(compute_rootfs_hash "$variant" "$target_arch")
     current_hash=$(compute_qcow2_hash "$rootfs_hash" "$guest_agent")
@@ -510,25 +475,10 @@ build_qcow2() {
         return 0
     fi
 
-    # Case 2: rootfs hash hit + valid image exists — only guest-agent changed, patch it
-    local cached_rootfs_hash
-    cached_rootfs_hash=$(read_rootfs_hash "$qcow2_img")
-    if [ -f "$qcow2_img" ] && [ -n "$cached_rootfs_hash" ] && [ "$cached_rootfs_hash" = "$rootfs_hash" ]; then
-        # Validate qcow2 header before patching (guards against truncated images from interrupted builds)
-        if qemu-img check "$qcow2_img" >/dev/null 2>&1; then
-            echo "Patching $output_name (guest-agent changed, rootfs unchanged)..."
-            echo "  Using guest-agent: $guest_agent"
-            patch_guest_agent "$qcow2_img" "$guest_agent"
-            save_hash "$qcow2_img" "$current_hash" "$rootfs_hash"
-            echo "Patched: $qcow2_img"
-            return 0
-        else
-            echo "WARNING: $output_name qcow2 is corrupt, falling through to full rebuild" >&2
-            rm -f "$qcow2_img" "${qcow2_img}.hash"
-        fi
-    fi
+    # Case 2 (guestfish patch) removed — EROFS is read-only, can't patch in-place.
+    # Any change triggers a full rebuild.
 
-    # Case 3: rootfs hash miss — full rebuild
+    # Case 3: hash miss — full rebuild
     echo "Building $output_name..."
     echo "  Using guest-agent: $guest_agent"
 
@@ -566,18 +516,14 @@ build_qcow2() {
     echo "user:x:1000:1000:sandbox:/home/user:/sbin/nologin" >> "$rootfs_dir/etc/passwd"
     echo "user:x:1000:" >> "$rootfs_dir/etc/group"
 
-    # Create qcow2 using Docker (virt-make-fs requires Linux)
-    echo "  Creating qcow2..."
+    # Create qcow2 with EROFS filesystem using Docker (mkfs.erofs requires Linux)
+    echo "  Creating EROFS qcow2..."
     mkdir -p "$OUTPUT_DIR"
-
-    local rootfs_size
-    rootfs_size=$(du -sm "$rootfs_dir" | cut -f1)
-    local img_size=$((rootfs_size + 100))
 
     # Build guestfs image with BuildKit cache (caches apt-get install across builds)
     ensure_guestfs_image
 
-    # Run virt-make-fs + qemu-img using cached image
+    # Run mkfs.erofs + qemu-img using cached image
     # Note: cleanup inside Docker because files created by Docker (root) and chowned
     # to UID 1000 cannot be deleted by the CI runner (UID 1001) on the host due to
     # /tmp sticky bit. Removing inside the container (as root) avoids this.
@@ -587,36 +533,94 @@ build_qcow2() {
         --platform "$HOST_PLATFORM" \
         "$GUESTFS_IMAGE" \
         bash -c "
-            # Fix ownership: macOS Docker export (VirtioFS) loses UID 0 on
-            # local output, so system files may be owned by the build user.
-            # Reset everything to root first, then set sandbox user's home.
-            # See: https://github.com/docker/for-mac/issues/6812
-            chown -R 0:0 /build/rootfs
-            chown -R 1000:1000 /build/rootfs/home/user
+            set -e
             # CIS Benchmark 6.1.x: harden /etc file permissions
             chmod 755 /build/rootfs/etc
             chmod 644 /build/rootfs/etc/passwd /build/rootfs/etc/group /build/rootfs/etc/resolv.conf /build/rootfs/etc/hosts
             [ -f /build/rootfs/etc/shadow ] && chmod 640 /build/rootfs/etc/shadow
-            virt-make-fs --format=raw --type=ext4 --size=+${img_size}M /build/rootfs /build/rootfs.raw
-            # Optimize ext4 for read-only rootfs:
-            # - Remove journal (rootfs is mounted read-only, saves ~4MB + mount overhead)
-            # - Set reserved blocks to 0% (no root reserved space needed)
-            tune2fs -O ^has_journal -m 0 /build/rootfs.raw
+            # Create EROFS image (read-only rootfs).
+            #
+            # Compression & cluster tuning:
+            #   -zlz4hc,12   LZ4HC at level 12 (max). Level 12 produces smaller images
+            #                than default 9 with negligible build-time cost. LZ4HC was
+            #                chosen over ZSTD/LZMA for decompression speed — cold-start
+            #                latency is the bottleneck, not image size.
+            #                Ref: erofs-utils PERFORMANCE.md benchmarks
+            #   -C16384      16KB physical cluster size. EROFS decompresses in pcluster-
+            #                sized units, so this is the read amplification granularity.
+            #                16KB is the sweet spot for mixed workloads (boot + REPL):
+            #                  - Random reads: 123 MiB/s (best), vs 67 MiB/s at 64KB
+            #                  - Sequential reads: ~850 MiB/s (vs 907 at 64KB, ~6% less)
+            #                Python startup reads hundreds of scattered .pyc files (4-16KB
+            #                each); 16KB clusters minimize read amplification per file.
+            #                Guest read_ahead_kb is set to 16 to match (guest-agent/init.rs).
+            #                Ref: erofs-utils PERFORMANCE.md (Debian rootfs dataset)
+            #
+            # Metadata compression:
+            #   -m4096:lz4hc,12  Compress inode metadata in 4KB pclusters with LZ4HC.
+            #                    Reduces image size and improves readdir throughput ~2.5x
+            #                    (926K → 2.38M files/sec in upstream benchmarks). Requires
+            #                    kernel 6.17+ (our kernel is 6.18).
+            #                    Ref: https://www.phoronix.com/news/Linux-6.17-EROFS
+            #
+            # Size optimizations:
+            #   -Efragments      Pack tail parts of compressed files into a packed inode.
+            #                    Matches SquashFS default behavior. Single most impactful
+            #                    size reduction (5-10%).
+            #   -Ededupe         Extent-level data deduplication (finer than SquashFS's
+            #                    file-level dedupe). Effective for rootfs with duplicate
+            #                    library content. Available since Linux 6.1.
+            #   -Eztailpacking   Inline tail pcluster of compressed files into metadata.
+            #                    Zero runtime cost, saves I/O for small files.
+            #                    Ref: erofs-utils docs, https://erofs.docs.kernel.org/en/latest/mkfs.html
+            #   NOTE: Do NOT use -Eall-fragments — it packs entire files into the packed
+            #         inode, degrading random-access performance (every read decompresses
+            #         through the packed inode). Ref: EROFS FAQ (not recommended).
+            #
+            # Reproducibility & ownership:
+            #   -T0          Epoch-0 timestamps for deterministic/reproducible builds.
+            #   --all-root   All files uid=0/gid=0 in the EROFS image. /home/user is
+            #                always tmpfs in the guest, so no user-owned files needed.
+            #
+            # EROFS vs ext4 for read-only rootfs (why we switched):
+            #   - 20x faster random reads (EROFS PERFORMANCE.md benchmark)
+            #   - 2.6x faster sequential reads
+            #   - Inline data for small files (no block allocation overhead)
+            #   - Tail packing (no wasted space at end of files)
+            #   - No journal (read-only, no recovery needed)
+            #   - Compact metadata (shorter mount time)
+            #   - Industry direction: RHEL 10, Fedora, containerd 2.1+, Android
+            #   Ref: https://erofs.docs.kernel.org/en/latest/features.html
+            #        https://sigma-star.at/blog/2022/07/squashfs-erofs/
+            mkfs.erofs \
+                -zlz4hc,12 \
+                -C16384 \
+                -T0 \
+                -m4096:lz4hc,12 \
+                -Efragments \
+                -Ededupe \
+                -Eztailpacking \
+                --all-root \
+                /build/rootfs.erofs /build/rootfs
+            # Pad EROFS image to 4096-byte alignment for qemu-img (raw block device).
+            # EROFS block size is 4096 bytes; aligning to match avoids an extra qcow2
+            # compression block of zero padding when qemu-img -c processes the tail.
+            erofs_size=\$(stat -c%s /build/rootfs.erofs)
+            aligned_size=\$(( (erofs_size + 4095) / 4096 * 4096 ))
+            truncate -s \$aligned_size /build/rootfs.erofs
             # Convert to qcow2 with compression. Options:
             # - -c: zlib compression (smaller image, one-time build cost)
             # - -m 8 -W: 8 parallel coroutines + out-of-order writes
-            # - cluster_size=128k: match overlay cluster size for aligned CoW
-            # Note: lazy_refcounts is intentionally omitted here. It defers
-            # refcount metadata writes for better performance, but this base
-            # image is opened read-only as a backing file at runtime — no
-            # writes ever hit it, so the optimization would be inert. Overlays
-            # (where all VM writes land) enable it via overlay_pool.py / QSD.
-            qemu-img convert -f raw -O qcow2 -c -m 8 -W -o cluster_size=128k /build/rootfs.raw /output/$output_name.qcow2
-            rm -rf /build/rootfs /build/rootfs.raw
+            # - cluster_size=128k: multiple of EROFS 16KB pcluster (8 pclusters
+            #   per qcow2 cluster). Larger qcow2 clusters compress better and
+            #   reduce L2 table metadata. CoW amplification is irrelevant here
+            #   because the EROFS base image is read-only (CoW only on overlays).
+            qemu-img convert -f raw -O qcow2 -c -m 8 -W -o cluster_size=128k /build/rootfs.erofs /output/$output_name.qcow2
+            rm -rf /build/rootfs /build/rootfs.erofs
         "
 
     rm -rf "$tmp_dir"
-    # Save full hash (line 1) + rootfs hash (line 2) for future patch fast-path
+    # Save full hash (line 1) + rootfs hash (line 2) for cache key
     save_hash "$qcow2_img" "$current_hash" "$rootfs_hash"
     echo "Built: $qcow2_img"
 }

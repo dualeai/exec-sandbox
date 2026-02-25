@@ -10,6 +10,7 @@ mod zram;
 
 use std::ffi::CString;
 use std::fs;
+use std::os::unix::process::CommandExt;
 
 fn mount_virtual_filesystems() {
     sys::mount("devtmpfs", "/dev", "devtmpfs", 0, "");
@@ -68,28 +69,172 @@ fn mount_virtual_filesystems() {
 // process substitution <() and /dev/std* portability.
 // See: https://gitlab.alpinelinux.org/alpine/aports/-/issues/1465
 
-fn mount_rootfs() {
-    // Mount root filesystem.
-    // Default: read-only (ro,noatime,nosuid,nodev) — matches AWS Lambda rootfs flags.
-    // init.rw=1: read-write — used for snapshot creation (package install to ext4).
-    let need_rw = sys::cmdline_has("init.rw=1");
-    let mount_flags = if need_rw {
-        sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
-    } else {
-        sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+/// Find a block device by its virtio serial number.
+/// Reads /sys/block/vd*/serial and returns the /dev/vdX path matching `target_serial`.
+/// ARM virt (MMIO) enumerates virtio devices in reverse declaration order,
+/// so /dev/vda is NOT always the first drive declared in QEMU args.
+fn find_block_device_by_serial(target_serial: &str) -> Option<String> {
+    let entries = match fs::read_dir("/sys/block") {
+        Ok(e) => e,
+        Err(_) => return None,
     };
-    if sys::mount("/dev/vda", "/mnt", "ext4", mount_flags, "") != 0 {
-        // Fallback: try without specifying fstype
-        if sys::mount("/dev/vda", "/mnt", "", mount_flags, "") != 0 {
-            log_error!("mount /dev/vda failed");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("vd") {
+            continue;
+        }
+        let serial_path = entry.path().join("serial");
+        if let Ok(serial) = fs::read_to_string(&serial_path)
+            && serial.trim() == target_serial
+        {
+            return Some(format!("/dev/{}", name_str));
+        }
+    }
+    None
+}
+
+fn mount_rootfs() {
+    // Discover drives by serial number (set in QEMU -device virtio-blk serial=).
+    // "base" = EROFS rootfs, "snap" = ext4 snapshot overlay.
+    // Cannot rely on /dev/vda ordering: ARM MMIO enumerates in reverse.
+    let base_dev = find_block_device_by_serial("base").unwrap_or_else(|| "/dev/vda".to_string());
+    let mut snap_dev = find_block_device_by_serial("snap");
+
+    // Defense against device enumeration race: if host indicated a snap drive
+    // should exist (init.snap=1 on cmdline) but we didn't find it, retry a few
+    // times. Built-in virtio-blk drivers probe before init, so this is rarely
+    // needed, but provides a safety net for loaded hosts.
+    if snap_dev.is_none() && sys::cmdline_has("init.snap=1") {
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            snap_dev = find_block_device_by_serial("snap");
+            if snap_dev.is_some() {
+                break;
+            }
+        }
+        if snap_dev.is_none() {
+            log_error!("init.snap=1 set but snap drive not found");
             sys::fallback_shell();
         }
     }
 
-    // Security: remove block device node after mount. The kernel references the
+    let erofs_flags = sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV;
+    let need_rw = sys::cmdline_has("init.rw=1");
+
+    if let Some(ref snap) = snap_dev {
+        // Two-drive mode: EROFS base + ext4 overlay, merged via overlayfs.
+        // Used for:
+        //   - Snapshot creation (init.rw=1): ext4 writable upper
+        //   - Snapshot usage: ext4 read-only, overlayfs provides merged view
+        //
+        // Mount hierarchy (on initramfs, before switch_root):
+        //   /lower      ← EROFS base (always ro)
+        //   /upper_dev  ← ext4 snapshot (rw or ro)
+        //   /mnt        ← overlayfs merge (switch_root target)
+
+        let _ = fs::create_dir("/lower");
+        let _ = fs::create_dir("/upper_dev");
+
+        // Mount EROFS base as lower layer
+        if sys::mount(&base_dev, "/lower", "erofs", erofs_flags, "") != 0 {
+            log_error!("mount {} (erofs) failed", base_dev);
+            sys::fallback_shell();
+        }
+
+        // Mount ext4 overlay layer (rw for snapshot creation, ro for snapshot usage)
+        if need_rw {
+            // Snapshot creation: format blank drive as ext4.
+            // Host creates a blank qcow2; we format here using mkfs.ext4 from
+            // the EROFS rootfs (already mounted at /lower).
+            //
+            // mkfs.ext4 is dynamically linked (Alpine musl). It can't execute
+            // directly from initramfs because the ELF interpreter resolves
+            // against the initramfs root (where /lib is empty). We bind-mount
+            // /dev into the EROFS rootfs and chroot so the linker resolves.
+            if sys::mount("/dev", "/lower/dev", "", sys::MS_BIND, "") != 0 {
+                log_error!(
+                    "bind mount /dev -> /lower/dev failed: errno={}",
+                    sys::last_errno()
+                );
+                sys::fallback_shell();
+            }
+            let snap_for_chroot = snap.clone();
+            let mkfs_status = unsafe {
+                std::process::Command::new("/sbin/mkfs.ext4")
+                    .args(["-q", "-O", "^has_journal", "-m", "0", &snap_for_chroot])
+                    .pre_exec(|| {
+                        let lower = CString::new("/lower").unwrap();
+                        let root = CString::new("/").unwrap();
+                        if libc::chroot(lower.as_ptr()) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::chdir(root.as_ptr()) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    })
+                    .status()
+            };
+            sys::umount("/lower/dev");
+            match mkfs_status {
+                Ok(s) if s.success() => {}
+                _ => {
+                    log_error!("mkfs.ext4 {} failed", snap);
+                    sys::fallback_shell();
+                }
+            }
+        }
+        let snap_flags = if need_rw {
+            sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+        } else {
+            sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+        };
+        if sys::mount(snap, "/upper_dev", "ext4", snap_flags, "") != 0 {
+            log_error!("mount {} (ext4) failed", snap);
+            sys::fallback_shell();
+        }
+
+        if need_rw {
+            // Snapshot creation: overlayfs with writable upper
+            let _ = fs::create_dir_all("/upper_dev/upper");
+            let _ = fs::create_dir_all("/upper_dev/work");
+            let ovl_opts = "lowerdir=/lower,upperdir=/upper_dev/upper,workdir=/upper_dev/work";
+            if sys::mount("overlay", "/mnt", "overlay", sys::MS_NOATIME, ovl_opts) != 0 {
+                log_error!("overlayfs mount failed (rw)");
+                sys::fallback_shell();
+            }
+        } else {
+            // Snapshot usage: overlayfs with two read-only lower layers.
+            // No upper/work needed for read-only overlay.
+            let ovl_opts = "lowerdir=/upper_dev/upper:/lower";
+            if sys::mount(
+                "overlay",
+                "/mnt",
+                "overlay",
+                sys::MS_RDONLY | sys::MS_NOATIME,
+                ovl_opts,
+            ) != 0
+            {
+                log_error!("overlayfs mount failed (ro)");
+                sys::fallback_shell();
+            }
+        }
+    } else {
+        // Single-drive mode: EROFS only, no snapshot overlay.
+        if sys::mount(&base_dev, "/mnt", "erofs", erofs_flags, "") != 0 {
+            log_error!("mount {} (erofs) failed", base_dev);
+            sys::fallback_shell();
+        }
+    }
+
+    // Security: remove block device nodes after mount. The kernel references the
     // device internally via bdevfs (indexed by major:minor), not the /dev path.
     // Prevents raw disk reads that bypass filesystem permissions.
-    device::remove_device_node("/dev/vda");
+    device::remove_device_node(&base_dev);
+    if let Some(ref snap) = snap_dev {
+        device::remove_device_node(snap);
+    }
 
     // Security: remove /dev/block/ directory (devtmpfs-created symlinks like 253:0 -> ../vda).
     // Eliminates alternative path to block device nodes.
@@ -216,6 +361,9 @@ fn main() {
     );
 
     // B2: Wait for vda + virtio-ports in parallel (independent devices)
+    // /dev/vda always exists (first virtio-blk enumerated by kernel), though its
+    // actual role (base vs snapshot) varies by architecture — mount_rootfs resolves
+    // the correct mapping via serial numbers.
     let vda_handle = std::thread::spawn(|| device::wait_for_block_device("/dev/vda"));
     let virtio_ok = device::wait_for_virtio_ports();
     let vda_ok = vda_handle.join().unwrap_or(false);

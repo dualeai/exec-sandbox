@@ -577,12 +577,12 @@ class Scheduler:
                 language=language,
                 tenant_id="exec-sandbox",
                 task_id=task_id,
-                backing_image=snapshot_path,
                 memory_mb=memory,
                 allow_network=allow_network,
                 allowed_domains=allowed_domains,
                 expose_ports=resolved_ports if resolved_ports else None,
                 on_boot_log=on_boot_log,
+                snapshot_drive=snapshot_path,
             )
 
         return vm, resolved_ports, is_cold_boot

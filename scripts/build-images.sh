@@ -9,14 +9,13 @@
 # Artifact dependency graph:
 #
 #   tiny-init src → tiny-init binary → initramfs (QEMU -initrd, NOT inside qcow2)
-#   guest-agent src → guest-agent binary → embedded in qcow2 (guestfish-patchable)
+#   guest-agent src → guest-agent binary → embedded in EROFS qcow2
 #   kernel config fragment → custom vmlinuz (CONFIG_MODULES=n, all drivers built-in)
-#   rootfs packages (Alpine, Python, Node) → qcow2 (full rebuild only)
+#   rootfs packages (Alpine, Python, Node) → EROFS qcow2 (full rebuild only)
 #
 # Caching: each artifact has a .hash sidecar file (content-addressable input key,
 # NOT an output checksum). When inputs match, the build step is skipped.
-# The qcow2 build has a 3-way cache: full hit → skip, rootfs hit → guestfish
-# patch (guest-agent only), miss → full rebuild.
+# EROFS is read-only, so any change triggers a full qcow2 rebuild.
 #
 # All build commands run inside Linux containers with the repo mounted.
 # This ensures consistent builds across macOS and Linux hosts.

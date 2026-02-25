@@ -255,13 +255,13 @@ class VmManager:
         language: Language,
         tenant_id: str,
         task_id: str,
-        backing_image: Path | None = None,
         memory_mb: int = constants.DEFAULT_MEMORY_MB,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
         expose_ports: list[ExposedPort] | None = None,
         on_boot_log: Callable[[str], None] | None = None,
+        snapshot_drive: Path | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -273,18 +273,21 @@ class VmManager:
             language: Programming language (python or javascript)
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
-            backing_image: Base image for overlay (default: language base image)
             memory_mb: Memory limit in MB (minimum 128, default 256)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
-            direct_write_target: If set, write directly to this file (no overlay).
-                Used for snapshot creation. Mutually exclusive with backing_image.
+            direct_write_target: If set, path to ext4 qcow2 for snapshot creation.
+                Attached as second drive (serial=snap, writable) for overlayfs
+                upper layer on EROFS base.
             expose_ports: List of ports to expose from guest to host.
                 Mode 1: Works without allow_network (QEMU hostfwd, no internet).
                 Mode 2: Works with allow_network (gvproxy API, with internet).
             on_boot_log: Optional callback for streaming boot console output.
                 When provided, enables verbose kernel/init logging and calls
                 the callback with each line of boot output.
+            snapshot_drive: Path to ext4 qcow2 snapshot (serial=snap, read-only).
+                When set, tiny-init discovers drives by serial number and mounts
+                EROFS base + ext4 snapshot via overlayfs.
 
         Returns:
             QemuVM handle for code execution
@@ -325,13 +328,13 @@ class VmManager:
                         language=language,
                         tenant_id=tenant_id,
                         task_id=task_id,
-                        backing_image=backing_image,
                         memory_mb=memory_mb,
                         allow_network=allow_network,
                         allowed_domains=allowed_domains,
                         direct_write_target=direct_write_target,
                         expose_ports=expose_ports,
                         on_boot_log=on_boot_log,
+                        snapshot_drive=snapshot_drive,
                     )
                     # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
                     vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
@@ -353,19 +356,19 @@ class VmManager:
         language: Language,
         tenant_id: str,
         task_id: str,
-        backing_image: Path | None = None,
         memory_mb: int = constants.DEFAULT_MEMORY_MB,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
         expose_ports: list[ExposedPort] | None = None,
         on_boot_log: Callable[[str], None] | None = None,
+        snapshot_drive: Path | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM (implementation).
 
         Workflow:
         1. Generate unique VM ID and CID
-        2. Create ephemeral qcow2 overlay from backing image (or write directly)
+        2. Create ephemeral qcow2 overlay from EROFS base image
         3. Set up cgroup v2 resource limits
         4. Build QEMU command (platform-specific)
         5. Launch QEMU subprocess
@@ -375,17 +378,20 @@ class VmManager:
             language: Programming language (python or javascript)
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
-            backing_image: Base image for overlay (default: language base image)
             memory_mb: Memory limit in MB (minimum 128, default 256)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
-            direct_write_target: If set, write directly to this file (no overlay).
-                Used for snapshot creation. Mutually exclusive with backing_image.
+            direct_write_target: If set, path to ext4 qcow2 for snapshot creation.
+                Attached as second drive (serial=snap, writable) for overlayfs
+                upper layer on EROFS base.
             expose_ports: List of ports to expose from guest to host.
                 Mode 1: Works without allow_network (QEMU hostfwd, no internet).
                 Mode 2: Works with allow_network (gvproxy API, with internet).
             on_boot_log: Optional callback for streaming boot console output.
                 When provided, enables verbose kernel/init logging.
+            snapshot_drive: Path to ext4 qcow2 snapshot (serial=snap, read-only).
+                When set, tiny-init discovers drives by serial number and mounts
+                EROFS base + ext4 snapshot via overlayfs.
 
         Returns:
             QemuVM handle for code execution
@@ -417,16 +423,12 @@ class VmManager:
         vm_id = f"{tenant_id}-{task_id}-{uuid4()}"
 
         # Validate mutual exclusivity
-        if backing_image and direct_write_target:
-            raise VmConfigError("backing_image and direct_write_target are mutually exclusive")
+        if snapshot_drive and direct_write_target:
+            raise VmConfigError("snapshot_drive and direct_write_target are mutually exclusive")
 
         # Step 1.5: Create working directory for all VM temp files
         # Uses tempfile.mkdtemp() for atomic, secure directory creation (mode 0700)
-        # For direct_write_target mode, use it as the overlay path
-        workdir = await VmWorkingDirectory.create(
-            vm_id,
-            custom_overlay_path=direct_write_target,
-        )
+        workdir = await VmWorkingDirectory.create(vm_id)
 
         # Domain whitelist semantics:
         # - None or [] = no filtering (full internet access)
@@ -452,7 +454,8 @@ class VmManager:
         # Note: gvproxy moved to boot phase to reduce contention under high concurrency
         # Resolve to absolute path - qemu-img resolves backing file relative to overlay location,
         # and VmWorkingDirectory places overlay in a temp dir, so relative paths would break
-        base_image = (backing_image or self.get_base_image(language)).resolve()
+        # Always use the EROFS base image for vda. Snapshots go on vdb (separate drive).
+        base_image = self.get_base_image(language).resolve()
 
         # Initialize ALL tracking variables before try block for finally cleanup
         cgroup_path: Path | None = None
@@ -478,36 +481,31 @@ class VmManager:
 
             # Unified setup phase: overlay + cgroup (gvproxy moved to boot phase)
             # This reduces setup contention under high concurrency
-            overlay_ms = 0  # Default for direct_write mode (no overlay)
-            if direct_write_target:
-                # Direct write mode - VM writes directly to target file (no overlay)
-                # Used for L2 snapshot creation where disk changes are written directly
-                workdir.use_qemu_vm_user = False  # target file owned by current user
-                cgroup_path = await cgroup.setup_cgroup(
-                    vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg
-                )
-            # Normal mode - create overlay backed by base image
-            # This allows the backing image to remain read-only and shareable
-            # Pool handles fast path (from pool) or slow path (on-demand) internally
-            else:
-                overlay_start = asyncio.get_event_loop().time()
-                try:
-                    await self._overlay_pool.acquire(base_image, workdir.overlay_image)
-                except (QemuImgError, QemuStorageDaemonError) as e:
-                    raise VmOverlayError(str(e)) from e
-                overlay_ms = round((asyncio.get_event_loop().time() - overlay_start) * 1000)
-                # Apply permissions in parallel with cgroup setup
-                perm_result, cgroup_result = await asyncio.gather(
-                    self._apply_overlay_permissions(base_image, workdir.overlay_image),
-                    cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg),
-                    return_exceptions=True,
-                )
-                if isinstance(perm_result, BaseException):
-                    raise perm_result
-                if isinstance(cgroup_result, BaseException):
-                    raise cgroup_result
-                cgroup_path = cgroup_result
-                workdir.use_qemu_vm_user = perm_result
+            #
+            # EROFS architecture: first drive (serial=base) always gets an overlay of
+            # the EROFS base image. Snapshot creation/usage adds a second drive
+            # (serial=snap, ext4). tiny-init discovers drives by serial number.
+            overlay_start = asyncio.get_event_loop().time()
+            try:
+                await self._overlay_pool.acquire(base_image, workdir.overlay_image)
+            except (QemuImgError, QemuStorageDaemonError) as e:
+                raise VmOverlayError(str(e)) from e
+            overlay_ms = round((asyncio.get_event_loop().time() - overlay_start) * 1000)
+            # Apply permissions in parallel with cgroup setup
+            perm_result, cgroup_result = await asyncio.gather(
+                self._apply_overlay_permissions(base_image, workdir.overlay_image),
+                cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg),
+                return_exceptions=True,
+            )
+            if isinstance(perm_result, BaseException):
+                raise perm_result
+            if isinstance(cgroup_result, BaseException):
+                raise cgroup_result
+            cgroup_path = cgroup_result
+            workdir.use_qemu_vm_user = perm_result
+
+            # Determine snapshot vdb path: direct_write_target for creation, snapshot_drive for usage
+            vdb_path = str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
             setup_complete_time = asyncio.get_event_loop().time()
 
             # Step 5: Build QEMU command (always Linux in container)
@@ -526,6 +524,7 @@ class VmManager:
                 expose_ports=expose_ports,
                 direct_write=direct_write_target is not None,
                 debug_boot=on_boot_log is not None,
+                snapshot_drive=vdb_path,
             )
 
             # Step 6: Create dual-port Unix socket communication channel for guest agent

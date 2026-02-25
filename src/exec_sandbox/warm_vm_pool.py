@@ -462,10 +462,10 @@ class WarmVMPool:
             language=language,
             tenant_id=tenant_id,
             task_id=task_id,
-            backing_image=snapshot_path,
             memory_mb=constants.DEFAULT_MEMORY_MB,
             allow_network=False,  # Warm pool VMs don't need network
             allowed_domains=None,
+            snapshot_drive=snapshot_path,
         )
 
     async def _replenish_pool(self, language: Language) -> None:

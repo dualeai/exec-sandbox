@@ -69,11 +69,34 @@ pub(crate) fn setup_phase2_core() {
     apply_sysctl_critical();
     apply_sysctl_deferred();
     apply_zram_vm_tuning();
-    // Reduce virtio-blk readahead from default 128 KB to 32 KB. Python startup
-    // reads hundreds of scattered small .pyc files (4-16 KB each) — 128 KB
-    // prefetch causes 8-32x I/O amplification per file. 32 KB reduces wasted
-    // prefetch while still helping sequential reads of larger .so files.
-    let _ = std::fs::write("/sys/block/vda/queue/read_ahead_kb", "32");
+    // Match EROFS 16KB physical cluster size (-C16384 in mkfs.erofs).
+    //
+    // EROFS decompresses in pcluster-sized units, so readahead must match:
+    //   - Below pcluster: wastes a decompression cycle (kernel fetches less than
+    //     one pcluster, forcing a second I/O to complete decompression)
+    //   - Above pcluster: prefetches unneeded clusters, wasting bandwidth/memory
+    //   - Equal: exactly one decompression per readahead — optimal
+    //
+    // 16KB was chosen over 64KB for better random-read performance during REPL
+    // sessions (Python imports hundreds of scattered 4-16KB .pyc files):
+    //   - 16KB clusters: 123 MiB/s random reads (best in EROFS benchmarks)
+    //   - 64KB clusters:  67 MiB/s random reads (~46% slower)
+    //   - Sequential reads: ~850 MiB/s at 16KB vs 907 at 64KB (~6% tradeoff)
+    // Ref: erofs-utils PERFORMANCE.md (Debian rootfs dataset)
+    //
+    // Set on all vd* block devices — device naming varies by architecture
+    // (ARM MMIO enumerates in reverse order), so we don't assume vda=base.
+    for entry in std::fs::read_dir("/sys/block")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("vd") {
+            let path = entry.path().join("queue/read_ahead_kb");
+            let _ = std::fs::write(path, "16");
+        }
+    }
     // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()
     // which now makes /dev read-only.
     setup_dev_symlinks();
