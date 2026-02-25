@@ -243,7 +243,7 @@ pub(crate) async fn execute_code_streaming(
     let spawn_ms = if was_fresh_spawn {
         Some(spawn_start.elapsed().as_millis() as u64)
     } else {
-        Some(0)
+        None
     };
     log_info!(
         "[timing] repl_acquired: {}ms (fresh={}, spawn={}ms)",

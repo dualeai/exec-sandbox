@@ -141,9 +141,9 @@ pub(crate) async fn spawn_repl(
         }
     }
 
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().expect("stdin piped at spawn");
+    let stdout = child.stdout.take().expect("stdout piped at spawn");
+    let stderr = child.stderr.take().expect("stderr piped at spawn");
 
     log_info!("Spawned REPL for language={}", language.as_str());
 
