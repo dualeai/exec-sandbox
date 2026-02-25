@@ -505,7 +505,9 @@ class VmManager:
             workdir.use_qemu_vm_user = perm_result
 
             # Determine snapshot vdb path: direct_write_target for creation, snapshot_drive for usage
-            vdb_path = str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
+            vdb_path = (
+                str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
+            )
             setup_complete_time = asyncio.get_event_loop().time()
 
             # Step 5: Build QEMU command (always Linux in container)

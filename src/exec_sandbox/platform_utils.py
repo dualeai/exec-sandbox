@@ -284,12 +284,12 @@ class ProcessWrapper:
         return await self.async_proc.wait()
 
     @property
-    def stdout(self):
+    def stdout(self) -> asyncio.StreamReader | None:
         """Process stdout stream."""
         return self.async_proc.stdout
 
     @property
-    def stderr(self):
+    def stderr(self) -> asyncio.StreamReader | None:
         """Process stderr stream."""
         return self.async_proc.stderr
 
