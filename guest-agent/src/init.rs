@@ -115,12 +115,19 @@ pub(crate) async fn setup_zram_background() {
 /// Runs on spawn_blocking (uses StdCommand for ip, I/O-bound).
 /// Marks NETWORK_READY when complete; ExecuteCode/InstallPackages gate on this.
 pub(crate) async fn setup_network_background() {
+    let t0 = crate::monotonic_ms();
     tokio::task::spawn_blocking(|| {
         setup_network();
     })
     .await
     .ok();
     mark_network_ready();
+    let t_done = crate::monotonic_ms();
+    log_info!(
+        "[timing] network_ready: {}ms ({}ms elapsed)",
+        t_done,
+        t_done - t0
+    );
 }
 
 fn mark_network_ready() {

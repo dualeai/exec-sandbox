@@ -367,7 +367,14 @@ pub(crate) async fn handle_connection(
                 env_vars,
             } => {
                 // Gate: wait for network setup (ip + gvproxy) before code execution
+                let t_net = crate::monotonic_ms();
                 crate::init::wait_for_network().await;
+                let t_net_done = crate::monotonic_ms();
+                log_info!(
+                    "[timing] wait_for_network: {}ms (at {}ms)",
+                    t_net_done - t_net,
+                    t_net_done
+                );
                 log_info!(
                     "Processing: execute_code (language={language}, code_size={}, timeout={timeout}s, env_vars={})",
                     code.len(),

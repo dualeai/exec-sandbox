@@ -52,7 +52,7 @@ mod validation;
 
 use constants::*;
 
-fn monotonic_ms() -> u64 {
+pub(crate) fn monotonic_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

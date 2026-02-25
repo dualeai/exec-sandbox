@@ -243,6 +243,12 @@ pub(crate) async fn execute_code_streaming(
     } else {
         Some(0)
     };
+    log_info!(
+        "[timing] repl_acquired: {}ms (fresh={}, spawn={}ms)",
+        crate::monotonic_ms(),
+        was_fresh_spawn,
+        spawn_ms.unwrap_or(0)
+    );
 
     // Generate unique sentinel
     let nanos = SystemTime::now()
@@ -274,7 +280,14 @@ pub(crate) async fn execute_code_streaming(
         )));
     }
 
+    log_info!(
+        "[timing] stdin_written: {}ms (code_len={})",
+        crate::monotonic_ms(),
+        code_bytes.len()
+    );
+
     let process_start = Instant::now();
+    let mut first_io_logged = false;
 
     // Stream output until sentinel, REPL death, or timeout
     let mut stdout_buffer = String::new();
@@ -306,6 +319,15 @@ pub(crate) async fn execute_code_streaming(
                     match result {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
+                            if !first_io_logged {
+                                first_io_logged = true;
+                                log_info!(
+                                    "[timing] first_repl_io: {}ms (stdout, {}ms after stdin_write, {} bytes)",
+                                    crate::monotonic_ms(),
+                                    process_start.elapsed().as_millis(),
+                                    n
+                                );
+                            }
                             stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
                             if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
                                 let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
@@ -319,6 +341,15 @@ pub(crate) async fn execute_code_streaming(
                     match result {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
+                            if !first_io_logged {
+                                first_io_logged = true;
+                                log_info!(
+                                    "[timing] first_repl_io: {}ms (stderr, {}ms after stdin_write, {} bytes)",
+                                    crate::monotonic_ms(),
+                                    process_start.elapsed().as_millis(),
+                                    n
+                                );
+                            }
                             if let Some(code) = process_stderr_chunk(
                                 &stderr_bytes[..n],
                                 &mut stderr_line_buf,
