@@ -5,7 +5,6 @@ Async probes use a shared cache container to avoid global statements.
 """
 
 import asyncio
-import logging
 import os
 import platform
 import re
@@ -17,6 +16,7 @@ from typing import Any, ParamSpec, TypeVar
 import aiofiles
 import aiofiles.os
 
+from exec_sandbox._logging import get_logger
 from exec_sandbox.permission_utils import can_access
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.vm_types import AccelType
@@ -24,7 +24,7 @@ from exec_sandbox.vm_types import AccelType
 P = ParamSpec("P")
 T = TypeVar("T")
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "NOT_CACHED",

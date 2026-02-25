@@ -6,8 +6,8 @@ the gvproxy-wrapper process that provides network connectivity with outbound fil
 
 import asyncio
 import json
-import logging
 
+from exec_sandbox._logging import get_logger
 from exec_sandbox.dns_filter import generate_outbound_allow_json
 from exec_sandbox.exceptions import VmDependencyError, VmGvproxyError
 from exec_sandbox.models import ExposedPort
@@ -17,7 +17,7 @@ from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def start_gvproxy(

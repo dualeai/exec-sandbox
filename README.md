@@ -319,6 +319,7 @@ exec-sandbox requires VM images (kernel, initramfs, qcow2) and binaries (gvproxy
 | `EXEC_SANDBOX_CACHE_DIR` | Override cache directory |
 | `EXEC_SANDBOX_OFFLINE` | Set to `1` to disable auto-download (fail if assets missing) |
 | `EXEC_SANDBOX_ASSET_VERSION` | Force specific release version |
+| `EXEC_SANDBOX_LOG_LEVEL` | Set log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 ### Pre-downloading for offline use
 

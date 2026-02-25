@@ -49,6 +49,7 @@ For S3 snapshot caching:
     pip install exec-sandbox[s3]
 """
 
+from exec_sandbox._logging import configure_logging
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
     AssetChecksumError,
@@ -122,6 +123,7 @@ __all__ = [
     "VmQemuCrashError",
     "VmTimeoutError",
     "VmTransientError",
+    "configure_logging",
 ]
 
 from importlib.metadata import PackageNotFoundError, version

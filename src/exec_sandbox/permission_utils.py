@@ -14,7 +14,6 @@ Security:
 
 import asyncio
 import grp
-import logging
 import os
 import pwd
 from functools import lru_cache
@@ -22,12 +21,13 @@ from pathlib import Path
 
 import aiofiles.os
 
+from exec_sandbox._logging import get_logger
 from exec_sandbox.platform_utils import HostOS, ProcessWrapper, detect_host_os
 
 # Minimum number of parts in an ACL entry (type:name:perms)
 _ACL_ENTRY_MIN_PARTS = 3
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # =============================================================================
 # Cache for probes

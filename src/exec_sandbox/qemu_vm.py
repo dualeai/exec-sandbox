@@ -7,7 +7,6 @@ code execution, state management, and resource cleanup.
 import asyncio
 import contextlib
 import json
-import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +16,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from exec_sandbox import cgroup, constants
+from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import EnvVarValidationError, VmBootTimeoutError, VmPermanentError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from exec_sandbox.admission import ResourceReservation
     from exec_sandbox.platform_utils import ProcessWrapper
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):

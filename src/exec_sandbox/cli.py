@@ -39,6 +39,7 @@ from exec_sandbox import (
     VmTimeoutError,
     __version__,
 )
+from exec_sandbox._logging import configure_logging
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
 from exec_sandbox.process_registry import force_kill_all, get_tracked_count
 
@@ -984,6 +985,8 @@ def run_command(
       sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
       sbx run --download output.csv -c "open('output.csv','w').write('data')"
     """
+    configure_logging(quiet=quiet)
+
     # Merge inline codes with positional sources
     all_sources: list[str] = list(inline_codes) + list(sources)
 
@@ -1098,6 +1101,8 @@ def prefetch_command(arch: str | None, quiet: bool) -> NoReturn:
       RUN sbx prefetch -q
       ENV EXEC_SANDBOX_OFFLINE=1
     """
+    configure_logging(quiet=quiet)
+
     result: PrefetchResult = asyncio.run(prefetch_all_assets(arch=arch))
     _display_prefetch_result(result, quiet=quiet)
     sys.exit(EXIT_SUCCESS if result.success else 1)

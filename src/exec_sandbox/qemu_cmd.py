@@ -4,9 +4,8 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
-import logging
-
 from exec_sandbox import cgroup, constants
+from exec_sandbox._logging import get_logger
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
 from exec_sandbox.settings import Settings
@@ -20,7 +19,7 @@ from exec_sandbox.system_probes import (
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
