@@ -69,20 +69,17 @@ pub(crate) fn setup_phase2_core() {
     apply_sysctl_critical();
     apply_sysctl_non_critical();
     apply_zram_vm_tuning();
-    // Match EROFS 16KB physical cluster size (-C16384 in mkfs.erofs).
+    // Readahead tuning for virtio-blk + EROFS.
     //
-    // EROFS decompresses in pcluster-sized units, so readahead must match:
-    //   - Below pcluster: wastes a decompression cycle (kernel fetches less than
-    //     one pcluster, forcing a second I/O to complete decompression)
-    //   - Above pcluster: prefetches unneeded clusters, wasting bandwidth/memory
-    //   - Equal: exactly one decompression per readahead — optimal
+    // EROFS pcluster is 16KB (-C16384). We set readahead to 128KB (8 pclusters)
+    // to batch more data per virtio-blk request, which is a reasonable default for
+    // sequential workloads (Python/Bun startup loads .pyc/.so files in order).
     //
-    // 16KB was chosen over 64KB for better random-read performance during REPL
-    // sessions (Python imports hundreds of scattered 4-16KB .pyc files):
-    //   - 16KB clusters: 123 MiB/s random reads (best in EROFS benchmarks)
-    //   - 64KB clusters:  67 MiB/s random reads (~46% slower)
-    //   - Sequential reads: ~850 MiB/s at 16KB vs 907 at 64KB (~6% tradeoff)
-    // Ref: erofs-utils PERFORMANCE.md (Debian rootfs dataset)
+    // NOTE: Tested 16KB vs 128KB readahead during cold-start investigation
+    // (session 4). No measurable wall-time improvement — the bottleneck is
+    // macOS Mach kernel hv_trap overhead (~360µs per VM exit), not I/O batch
+    // size. Kept at 128KB as a sensible default (fewer bio submissions for
+    // sequential reads), but this is NOT a cold-start fix.
     //
     // Set on all vd* block devices — device naming varies by architecture
     // (ARM MMIO enumerates in reverse order), so we don't assume vda=base.
@@ -406,15 +403,28 @@ fn setup_zram_swap() {
 }
 
 /// Build a swap header for the given device size.
-/// Returns a 4096-byte header or None if the size is too small.
+/// Returns a PAGE_SIZE-byte header or None if the size is too small.
+///
+/// The swap header layout is PAGE_SIZE-dependent:
+/// - Header occupies one page (PAGE_SIZE bytes)
+/// - SWAPSPACE2 signature at offset (PAGE_SIZE - 10)
+/// - Page count = device_size / PAGE_SIZE
+/// - Version + last_page at fixed offsets 1024 and 1028
+///
+/// Uses runtime sysconf(_SC_PAGESIZE) to support both 4KB (x86_64)
+/// and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES) kernels.
+///
+/// NOTE: Mirrored in tiny-init/src/zram.rs — keep both in sync.
 fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
-    let pages = (device_size / 4096).saturating_sub(1) as u32;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let pages = (device_size / page_size).saturating_sub(1) as u32;
     if pages < 10 {
         return None; // kernel rejects tiny swap
     }
-    let mut header = vec![0u8; 4096];
-    // SWAPSPACE2 signature at offset 4086
-    header[4086..4096].copy_from_slice(b"SWAPSPACE2");
+    let ps = page_size as usize;
+    let mut header = vec![0u8; ps];
+    // SWAPSPACE2 signature at offset (PAGE_SIZE - 10)
+    header[ps - 10..ps].copy_from_slice(b"SWAPSPACE2");
     // version = 1
     header[1024..1028].copy_from_slice(&1u32.to_le_bytes());
     // last_page (0-indexed: total_pages - 1, since page 0 is header)
