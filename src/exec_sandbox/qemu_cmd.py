@@ -469,8 +469,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             ]
         )
 
-    # Determine AIO mode based on cached startup probe
+    # Determine AIO mode and QEMU version based on cached startup probes
     io_uring_available = await probe_io_uring_support()
+    qemu_version = await probe_qemu_version()
     aio_mode = "io_uring" if io_uring_available else "threads"
     if not io_uring_available:
         logger.debug(
@@ -478,16 +479,16 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             extra={"reason": "syscall_probe_failed", "vm_id": vm_id},
         )
 
-    # IOThread configuration
-    match host_os:
-        case HostOS.LINUX:
-            use_iothread = True
-        case HostOS.MACOS | HostOS.UNKNOWN:
-            use_iothread = False
-
-    iothread_id = f"iothread0-{vm_id}" if use_iothread else None
-    if use_iothread:
-        qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
+    # IOThread — offloads block I/O completion (pread, qcow2 decompress) to a
+    # dedicated thread, separate from the vCPU thread. Safe and functional on
+    # all accelerators (KVM, HVF, TCG):
+    #   KVM:  ioeventfd enables zero-exit I/O kicks — clear performance win.
+    #   HVF:  no ioeventfd (no eventfd on macOS), so no cold-start benefit
+    #         (tested session 4: 9,798ms identical with/without). Bottleneck
+    #         is Mach kernel hv_trap (~360µs/exit), not QEMU I/O processing.
+    #   TCG:  software-emulated ioeventfd, moderate benefit (I/O off main loop).
+    iothread_id = f"iothread0-{vm_id}"
+    qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
 
     # Disk configuration (EROFS base drive, serial=base)
     # Uses qcow2 overlay backed by the EROFS base image
@@ -518,27 +519,19 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # Platform-specific block device
-    # serial=base: stable identifier for tiny-init to find the EROFS rootfs drive,
-    # regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates virtio devices
-    # in reverse declaration order, so /dev/vda != first -device on ARM.
-    match host_os:
-        case HostOS.MACOS:
-            qemu_args.extend(
-                [
-                    "-device",
-                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
-                    f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,num-queues=1,queue-size=128,event_idx=off",
-                ]
-            )
-        case HostOS.LINUX | HostOS.UNKNOWN:
-            qemu_args.extend(
-                [
-                    "-device",
-                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
-                    f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off",
-                ]
-            )
+    # Block device — serial=base: stable identifier for tiny-init to find the EROFS
+    # rootfs drive, regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates
+    # virtio devices in reverse declaration order, so /dev/vda != first -device on ARM.
+    # D2: event_idx=off reduces interrupt coalescing overhead during boot.
+    # queue-size=256: tested at 128 vs 256 during cold-start investigation (session 4);
+    # no measurable wall-time difference on HVF (bottleneck is Mach kernel, not queue
+    # depth). Kept at 256 as a reasonable setting for throughput workloads.
+    qemu_args.extend(
+        [
+            "-device",
+            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size=256,event_idx=off",
+        ]
+    )
 
     # Snapshot overlay drive — ext4 layer for overlayfs merge with EROFS base.
     # Presented as a second virtio-blk device; tiny-init detects it by serial=snap
@@ -560,23 +553,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 f"file.locking=off",
             ]
         )
-        match host_os:
-            case HostOS.MACOS:
-                qemu_args.extend(
-                    [
-                        "-device",
-                        f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,num-queues=1,queue-size=128,event_idx=off",
-                    ]
-                )
-            case HostOS.LINUX | HostOS.UNKNOWN:
-                qemu_args.extend(
-                    [
-                        "-device",
-                        f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off"
-                        if use_iothread
-                        else f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,num-queues=1,queue-size=128,event_idx=off",
-                    ]
-                )
+        qemu_args.extend(
+            [
+                "-device",
+                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size=256,event_idx=off",
+            ]
+        )
 
     # Display/console configuration
     # -nographic: headless mode
@@ -730,7 +712,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # Add reconnect parameter (version-dependent)
         # - QEMU 9.2+: reconnect-ms (milliseconds), reconnect removed in 10.0
         # - QEMU 8.0-9.1: reconnect (seconds), minimum 1s
-        qemu_version = await probe_qemu_version()
         if qemu_version is not None and qemu_version >= (9, 2, 0):
             netdev_opts += ",reconnect-ms=250"  # 250ms - balanced recovery
         elif qemu_version is not None and qemu_version >= (8, 0, 0):
@@ -779,7 +760,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Orphan protection: kill QEMU if parent process dies (QEMU 10.2+)
     # Uses PR_SET_PDEATHSIG on Linux, kqueue on macOS/FreeBSD
-    qemu_version = await probe_qemu_version()
     if qemu_version is not None and qemu_version >= (10, 2, 0):
         qemu_args.extend(["-run-with", "exit-with-parent=on"])
 
