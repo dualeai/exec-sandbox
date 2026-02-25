@@ -91,7 +91,7 @@ pub(crate) fn setup_phase2_core() {
         let name = entry.file_name();
         if name.to_string_lossy().starts_with("vd") {
             let path = entry.path().join("queue/read_ahead_kb");
-            let _ = std::fs::write(path, "16");
+            let _ = std::fs::write(path, "128");
         }
     }
     // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()
@@ -513,7 +513,6 @@ fn apply_zram_vm_tuning() {
         (mem_kb * 4 / 100).to_string(),
     );
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "0");
-    let _ = std::fs::write("/proc/sys/vm/defrag_mode", "1");
 }
 
 // ============================================================================

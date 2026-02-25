@@ -555,7 +555,7 @@ build_qcow2() {
             #                  - Sequential reads: ~850 MiB/s (vs 907 at 64KB, ~6% less)
             #                Python startup reads hundreds of scattered .pyc files (4-16KB
             #                each); 16KB clusters minimize read amplification per file.
-            #                Guest read_ahead_kb is set to 16 to match (guest-agent/init.rs).
+            #                Guest read_ahead_kb is set to 128 (8 pclusters, guest-agent/init.rs).
             #                Ref: erofs-utils PERFORMANCE.md (Debian rootfs dataset)
             #
             # Metadata compression:
