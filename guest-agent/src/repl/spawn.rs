@@ -26,7 +26,7 @@ pub(crate) async fn spawn_repl(
 
     let mut cmd = match language {
         Language::Python => {
-            let mut c = Command::new("python3");
+            let mut c = Command::new(format!("{PYTHON_HOME}/bin/python3"));
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
             c.env(
                 "PYTHONPATH",
@@ -41,11 +41,11 @@ pub(crate) async fn spawn_repl(
             // musl's allocator uses a global lock; Python calls malloc ~26k times during init.
             // Note: inherited by subprocesses (gcc, etc.) — harmless but visible.
             // See: https://developers.home-assistant.io/blog/2020/07/13/alpine-python/
-            c.env("LD_PRELOAD", "/usr/lib/libjemalloc.so.2");
+            c.env("LD_PRELOAD", JEMALLOC_LIB);
             c
         }
         Language::Javascript => {
-            let mut c = Command::new("bun");
+            let mut c = Command::new(BUN_BIN_PATH);
             c.arg("--smol");
             c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
             c.env(
@@ -69,7 +69,7 @@ pub(crate) async fn spawn_repl(
             c
         }
         Language::Raw => {
-            let mut c = Command::new("bash");
+            let mut c = Command::new(BASH_BIN_PATH);
             c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
             c

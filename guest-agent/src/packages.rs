@@ -149,7 +149,7 @@ pub(crate) async fn install_packages(
             c.arg("pip")
                 .arg("install")
                 .arg("--python")
-                .arg("/opt/python/bin/python3")
+                .arg(format!("{PYTHON_HOME}/bin/python3"))
                 .arg("--target")
                 .arg(PYTHON_SITE_PACKAGES);
             for pkg in packages {

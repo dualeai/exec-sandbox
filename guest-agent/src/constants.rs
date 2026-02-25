@@ -60,6 +60,12 @@ pub(crate) const SANDBOX_ROOT: &str = "/home/user";
 pub(crate) const PYTHON_SITE_PACKAGES: &str = "/usr/lib/python3/site-packages";
 pub(crate) const NODE_MODULES_SYSTEM: &str = "/usr/local/lib/node_modules";
 
+// Runtime paths — shared between spawn.rs (REPL commands).
+pub(crate) const JEMALLOC_LIB: &str = "/usr/lib/libjemalloc.so.2";
+pub(crate) const PYTHON_HOME: &str = "/opt/python";
+pub(crate) const BUN_BIN_PATH: &str = "/usr/local/bin/bun";
+pub(crate) const BASH_BIN_PATH: &str = "/bin/bash";
+
 // File transfer streaming
 pub(crate) const FILE_TRANSFER_CHUNK_SIZE: usize = 128 * 1024;
 pub(crate) const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
