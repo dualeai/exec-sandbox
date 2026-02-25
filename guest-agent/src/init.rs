@@ -248,26 +248,12 @@ fn setup_dev_symlinks() {
 /// B4: Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
 fn setup_dev_shm() {
-    let ret = unsafe {
-        let source = std::ffi::CString::new("tmpfs").unwrap();
-        let target = std::ffi::CString::new("/dev/shm").unwrap();
-        let fstype = std::ffi::CString::new("tmpfs").unwrap();
-        let data = std::ffi::CString::new("size=64M,noswap").unwrap();
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            data.as_ptr() as *const libc::c_void,
-        )
-    };
-    if ret != 0 {
-        // Non-fatal: only needed for multiprocessing
-        let _ = std::fs::create_dir_all("/dev/shm");
-        let ret2 = unsafe {
+    fn try_mount_shm() -> libc::c_int {
+        unsafe {
             let source = std::ffi::CString::new("tmpfs").unwrap();
             let target = std::ffi::CString::new("/dev/shm").unwrap();
             let fstype = std::ffi::CString::new("tmpfs").unwrap();
+            // noswap: kernel 6.3+ — prevents /dev/shm pages from being swapped to zram
             let data = std::ffi::CString::new("size=64M,noswap").unwrap();
             libc::mount(
                 source.as_ptr(),
@@ -276,8 +262,13 @@ fn setup_dev_shm() {
                 libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                 data.as_ptr() as *const libc::c_void,
             )
-        };
-        if ret2 != 0 {
+        }
+    }
+
+    if try_mount_shm() != 0 {
+        // Non-fatal: only needed for multiprocessing. Retry after mkdir.
+        let _ = std::fs::create_dir_all("/dev/shm");
+        if try_mount_shm() != 0 {
             log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
         }
     }
