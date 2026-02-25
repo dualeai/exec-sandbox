@@ -384,9 +384,56 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             " printk.devkmsg=off"
             # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
             + (" 8250.nr_uarts=0" if use_virtio_console and arch == HostArch.X86_64 else "")
-            # Force haltpoll cpuidle governor from first idle cycle — polls in-guest
-            # before HLT to avoid VM-exit cost (overrides menu, the NO_HZ_IDLE default)
-            + " cpuidle.governor=haltpoll"
+            # =============================================================
+            # Haltpoll cpuidle governor — KVM only
+            # =============================================================
+            # Polls in-guest for up to 200µs (guest_halt_poll_ns) before issuing
+            # HLT, avoiding VM-exit cost on short idle windows.  Measured: 20%
+            # latency reduction (sockperf), 4-71% FPS gain (Intel gaming study).
+            #
+            # Why KVM-only:
+            #
+            # 1. Governor registers unconditionally since kernel 6.x (the
+            #    kvm_para_available() guard was removed from init_haltpoll() to
+            #    allow bare-metal testing — LKML 2023-11 "governors/haltpoll:
+            #    Drop kvm_para_available() check").  The cpuidle-haltpoll DRIVER
+            #    still gates on kvm_para_available(), but the governor itself
+            #    activates on any hypervisor when forced via cmdline.
+            #
+            # 2. On KVM the trade-off is favorable: each HLT VM-exit costs
+            #    ~5-10µs, and the guest coordinates with the host via
+            #    MSR_KVM_POLL_CONTROL to suppress redundant host-side halt
+            #    polling.  On HVF neither mechanism exists — the 200µs
+            #    busy-loop (cpu_relax → ARM64 yield, running at full speed
+            #    in-guest) is pure overhead.
+            #
+            # 3. Measured impact on HVF (macOS ARM64, QEMU 10.2, kernel 6.18):
+            #    ~65% host-CPU per idle vCPU.  Background wakeups (RCU
+            #    callbacks from rcu_normal_after_boot=0, virtio interrupts)
+            #    trigger ~3k poll cycles/sec x 200us = ~65% busy.  The
+            #    adaptive algorithm keeps poll_limit_ns at max because
+            #    wakeups keep landing inside the poll window.
+            #
+            # 4. On HVF/TCG we disable cpuidle entirely (cpuidle.off=1).
+            #    QEMU's virt machine generates no idle-states DT nodes, so the
+            #    guest has only two cpuidle states: poll (busy-loop) and WFI.
+            #    Any governor (menu, TEO) would always pick WFI — the prediction
+            #    algorithm is wasted overhead.  cpuidle.off=1 bypasses the
+            #    framework and calls cpu_do_idle() (WFI) directly.  HVF properly
+            #    blocks the vCPU thread on WFI via qemu_wait_io_event() →
+            #    halt_cond, yielding <5% idle CPU.
+            #
+            # References:
+            #   - LWN: cpuidle haltpoll driver & governor
+            #     https://lwn.net/Articles/792618/
+            #   - LKML: Drop kvm_para_available() from governor
+            #     https://lkml.indiana.edu/hypermail/linux/kernel/2311.2/03791.html
+            #   - QEMU HVF WFI idle-CPU issue
+            #     https://gitlab.com/qemu-project/qemu/-/issues/959
+            #   - Kernel cpuidle docs
+            #     https://docs.kernel.org/admin-guide/pm/cpuidle.html
+            # =============================================================
+            + (" cpuidle.governor=haltpoll" if accel_type == AccelType.KVM else " cpuidle.off=1")
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
             + (" init.rw=1" if direct_write else "")

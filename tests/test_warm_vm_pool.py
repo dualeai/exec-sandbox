@@ -1136,6 +1136,139 @@ class TestWarmPoolIdleCpu:
 
 
 # ============================================================================
+# Integration Tests - CPU Idle After Execution
+# ============================================================================
+
+
+@skip_unless_hwaccel
+class TestPostExecutionCpuIdle:
+    """Integration tests verifying VMs return to idle CPU after code execution.
+
+    After executing user code, the VM should settle back to near-zero CPU.
+    If it doesn't, that indicates a cpuidle misconfiguration (e.g. haltpoll
+    busy-looping on HVF) or a guest-agent spin-loop.
+
+    Pattern: get warm VM → execute code → sleep(SETTLE) → sample CPU → assert idle.
+    Run with -n 0 for accurate CPU measurement.
+    """
+
+    @pytest.mark.parametrize(
+        "lang, code",
+        [
+            pytest.param(Language.PYTHON, "print('hello')", id="python"),
+            pytest.param(Language.JAVASCRIPT, "console.log('hello')", id="javascript"),
+            pytest.param(Language.RAW, "echo hello", id="raw"),
+        ],
+    )
+    async def test_cpu_idle_after_trivial_execution(self, vm_manager, lang: Language, code: str) -> None:
+        """CPU settles to idle after a trivial code execution."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            vm = await pool.get_vm(lang, packages=[])
+            assert vm is not None, f"No warm VM available for {lang.value}"
+
+            result = await vm.execute(code=code, timeout_seconds=30)
+            assert result.exit_code == 0
+
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            samples = await _collect_cpu_samples(vm.process, n_samples=10)
+            _assert_cpu_idle(samples, label=f"post-exec-{lang.value}")
+        finally:
+            await pool.stop()
+
+    async def test_cpu_idle_after_large_output(self, vm_manager) -> None:
+        """CPU settles to idle after generating ~100KB of stdout."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None, "No warm VM available for Python"
+
+            # ~100KB of output
+            result = await vm.execute(
+                code="print('x' * 1000, end='\\n')\n" * 100,
+                timeout_seconds=30,
+            )
+            assert result.exit_code == 0
+
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            samples = await _collect_cpu_samples(vm.process, n_samples=10)
+            _assert_cpu_idle(samples, label="post-large-output")
+        finally:
+            await pool.stop()
+
+    async def test_cpu_idle_after_failed_execution(self, vm_manager) -> None:
+        """CPU settles to idle even after a failed execution (non-zero exit)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None, "No warm VM available for Python"
+
+            result = await vm.execute(
+                code="raise RuntimeError('intentional failure')",
+                timeout_seconds=30,
+            )
+            assert result.exit_code != 0
+
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            samples = await _collect_cpu_samples(vm.process, n_samples=10)
+            _assert_cpu_idle(samples, label="post-failed-exec")
+        finally:
+            await pool.stop()
+
+    async def test_cpu_idle_after_sequential_executions(self, vm_manager) -> None:
+        """CPU settles to idle after 3 sequential executions on the same VM."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        config = SchedulerConfig(warm_pool_size=1)
+        pool = WarmVMPool(vm_manager, config)
+        await pool.start()
+
+        try:
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            assert vm is not None, "No warm VM available for Python"
+
+            for i in range(3):
+                result = await vm.execute(
+                    code=f"print('iteration {i}')",
+                    timeout_seconds=30,
+                )
+                assert result.exit_code == 0
+
+            await asyncio.sleep(SETTLE_SLEEP_S)
+
+            samples = await _collect_cpu_samples(vm.process, n_samples=10)
+            _assert_cpu_idle(samples, label="post-sequential-exec")
+        finally:
+            await pool.stop()
+
+
+# ============================================================================
 # Unit Tests - Replenish Race Condition Fix
 # ============================================================================
 

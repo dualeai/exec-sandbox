@@ -31,7 +31,7 @@ from exec_sandbox.validation import (
     validate_kernel_initramfs,
 )
 from exec_sandbox.vm_manager import _validate_identifier
-from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
+from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, AccelType, VmState
 from tests.conftest import skip_unless_hwaccel, skip_unless_linux, skip_unless_macos
 
 # ============================================================================
@@ -958,6 +958,148 @@ class TestSmpCpuCores:
             assert cmd[smp_idx + 1] == str(cpu_cores)
         finally:
             await workdir.cleanup()
+
+
+# ============================================================================
+# Unit Tests - cpuidle Governor Per Accel Type
+# ============================================================================
+
+
+class TestCpuidleGovernor:
+    """Verify cpuidle kernel cmdline is set correctly per acceleration type.
+
+    KVM → cpuidle.governor=haltpoll (in-guest polling avoids VM-exit cost).
+    HVF/TCG → cpuidle.off=1 (bypass cpuidle, call WFI directly).
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_version_cache(self) -> None:
+        """Clear QEMU version cache before each test."""
+        probe_cache.reset("qemu_version")
+
+    @pytest.fixture
+    async def workdir(self):
+        from exec_sandbox.vm_working_directory import VmWorkingDirectory
+
+        wd = await VmWorkingDirectory.create("test-vm-cpuidle")
+        try:
+            yield wd
+        finally:
+            await wd.cleanup()
+
+    def _extract_kernel_cmdline(self, cmd: list[str]) -> str:
+        """Extract the -append value from a QEMU command list."""
+        idx = cmd.index("-append")
+        return cmd[idx + 1]
+
+    @pytest.mark.parametrize(
+        "accel_type, expected_fragment",
+        [
+            pytest.param(AccelType.KVM, "cpuidle.governor=haltpoll", id="kvm"),
+            pytest.param(AccelType.HVF, "cpuidle.off=1", id="hvf"),
+            pytest.param(AccelType.TCG, "cpuidle.off=1", id="tcg"),
+        ],
+    )
+    async def test_cpuidle_per_accel_type(
+        self, vm_settings, workdir, accel_type: AccelType, expected_fragment: str
+    ) -> None:
+        """Each accel type gets the correct cpuidle directive."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-cpuidle",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        cmdline = self._extract_kernel_cmdline(cmd)
+        assert expected_fragment in cmdline, (
+            f"Expected '{expected_fragment}' in kernel cmdline for {accel_type.value}, got: {cmdline}"
+        )
+
+    @pytest.mark.parametrize(
+        "accel_type, present, absent",
+        [
+            pytest.param(AccelType.KVM, "cpuidle.governor=haltpoll", "cpuidle.off=1", id="kvm"),
+            pytest.param(AccelType.HVF, "cpuidle.off=1", "cpuidle.governor=haltpoll", id="hvf"),
+            pytest.param(AccelType.TCG, "cpuidle.off=1", "cpuidle.governor=haltpoll", id="tcg"),
+        ],
+    )
+    async def test_cpuidle_mutually_exclusive(
+        self, vm_settings, workdir, accel_type: AccelType, present: str, absent: str
+    ) -> None:
+        """Only one cpuidle strategy is present; the other is absent."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-cpuidle",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        cmdline = self._extract_kernel_cmdline(cmd)
+        assert present in cmdline, f"Expected '{present}' in cmdline for {accel_type.value}"
+        assert absent not in cmdline, f"'{absent}' should NOT be in cmdline for {accel_type.value}"
+
+    @pytest.mark.parametrize(
+        "accel_type",
+        [
+            pytest.param(AccelType.KVM, id="kvm"),
+            pytest.param(AccelType.HVF, id="hvf"),
+            pytest.param(AccelType.TCG, id="tcg"),
+        ],
+    )
+    async def test_exactly_one_cpuidle_directive(self, vm_settings, workdir, accel_type: AccelType) -> None:
+        """Exactly one cpuidle.* directive appears in the kernel cmdline."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-cpuidle",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        cmdline = self._extract_kernel_cmdline(cmd)
+        cpuidle_count = cmdline.count("cpuidle.")
+        assert cpuidle_count == 1, (
+            f"Expected exactly 1 cpuidle.* directive for {accel_type.value}, found {cpuidle_count} in: {cmdline}"
+        )
 
 
 # ============================================================================
