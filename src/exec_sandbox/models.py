@@ -116,6 +116,11 @@ class TimingBreakdown(BaseModel):
         default=None,
         description="Time waiting for guest agent to become ready (kernel + initramfs + agent init)",
     )
+    # L1 memory snapshot timing
+    l1_restore_ms: int | None = Field(
+        default=None,
+        description="L1 memory snapshot restore time in milliseconds",
+    )
     # Retry tracking (for CPU contention resilience)
     boot_retries: int = Field(
         default=0,
@@ -134,6 +139,7 @@ class ExecutionResult(BaseModel):
     external_memory_peak_mb: int | None = Field(default=None, description="Peak memory in MB (host cgroup)")
     timing: TimingBreakdown = Field(description="Detailed timing breakdown (setup, boot, execute, total)")
     warm_pool_hit: bool = Field(default=False, description="True if VM was allocated from warm pool (instant start)")
+    l1_cache_hit: bool = Field(default=False, description="VM restored from L1 memory snapshot")
     # Guest-reported granular timing (pass-through from guest agent)
     spawn_ms: int | None = Field(
         default=None,

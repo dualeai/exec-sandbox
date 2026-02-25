@@ -20,7 +20,7 @@ import contextlib
 import errno
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, ClassVar
 
 import aiofiles
 import aiofiles.os
@@ -34,6 +34,7 @@ else:
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
+from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmQemuCrashError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
@@ -41,11 +42,12 @@ from exec_sandbox.guest_agent_protocol import (
     OutputChunkMessage,
     StreamingErrorMessage,
 )
-from exec_sandbox.hash_utils import crc32, crc64
+from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
 from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
+from exec_sandbox.vm_types import VmState
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -54,7 +56,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class SnapshotManager:
+class DiskSnapshotManager(BaseCacheManager):
     """Manages qcow2 snapshot cache for disk caching.
 
     Architecture (2-tier):
@@ -73,6 +75,8 @@ class SnapshotManager:
     - ✅ Single qcow2 file per snapshot
     """
 
+    _cache_ext: ClassVar[str] = ".qcow2"
+
     def __init__(self, settings: Settings, vm_manager: VmManager):
         """Initialize qcow2 snapshot manager.
 
@@ -80,10 +84,9 @@ class SnapshotManager:
             settings: Application settings with cache configuration
             vm_manager: VmManager for VM operations
         """
+        super().__init__(settings.disk_snapshot_cache_dir)
         self.settings = settings
         self.vm_manager = vm_manager
-        self.cache_dir = settings.snapshot_cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # L3 client (lazy init)
         self._s3_session = None
@@ -101,9 +104,6 @@ class SnapshotManager:
         # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
         # S3 PutObject is atomic - aborted uploads leave no partial blobs
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
-
-        # Track background S3 upload tasks to prevent GC
-        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def check_cache(
         self,
@@ -194,9 +194,7 @@ class SnapshotManager:
             # Base images don't need S3 - they're already globally distributed
             if packages:
                 upload_task: asyncio.Task[None] = asyncio.create_task(self._upload_to_s3(cache_key, snapshot_path))
-                self._background_tasks.add(upload_task)
-                upload_task.add_done_callback(lambda t: self._background_tasks.discard(t))
-                upload_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                self._track_task(upload_task, name=f"s3-upload-{cache_key}")
 
             return snapshot_path
 
@@ -236,7 +234,7 @@ class SnapshotManager:
 
         # Include base image hash (first 8 chars) to invalidate cache on image rebuild
         base_image = self.vm_manager.get_base_image(language)
-        img_hash = self._get_base_image_hash(base_image)
+        img_hash = self.image_hash(base_image)
 
         base = f"{language.value}-v{version}-{img_hash}"
 
@@ -245,27 +243,6 @@ class SnapshotManager:
         packages_str = "".join(sorted(packages))
         packages_hash = crc64(packages_str)
         return f"{base}-{packages_hash}"
-
-    def _get_base_image_hash(self, base_image: Path) -> str:
-        """Get hash of base image for cache key.
-
-        Uses file modification time + size for fast hashing (avoids reading entire file).
-        This detects image rebuilds while being O(1) instead of O(n).
-
-        Args:
-            base_image: Path to base qcow2 image
-
-        Returns:
-            8-character hash string (CRC32 in hex)
-        """
-        try:
-            stat = base_image.stat()
-            # Combine mtime (nanoseconds) + size for unique fingerprint
-            fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
-            return crc32(fingerprint)
-        except OSError:
-            # If image doesn't exist, return placeholder (will fail later anyway)
-            return "missing0"
 
     async def _check_l2_cache(self, cache_key: str) -> Path | None:
         """Check L2 local cache for qcow2 snapshot.
@@ -346,7 +323,7 @@ class SnapshotManager:
             SnapshotError: Creation failed
             VmQemuCrashError: VM crashed during snapshot creation
         """
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
 
         # Acquire semaphore to limit concurrent snapshot creation
@@ -554,7 +531,7 @@ class SnapshotManager:
                         )
 
         # Record snapshot creation duration
-        duration_ms = round((asyncio.get_event_loop().time() - start_time) * 1000)
+        duration_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
         logger.info(
             "Snapshot created",
             extra={
@@ -749,41 +726,6 @@ class SnapshotManager:
                 },
             ) from e
 
-    async def _evict_oldest_snapshot(self) -> None:
-        """Evict single oldest snapshot (by atime).
-
-        Called lazily when disk full (ENOSPC).
-        Uses asyncio.to_thread for blocking glob and asyncio.gather for parallel stat.
-        """
-        # Run blocking glob in thread pool (non-blocking)
-        snapshot_files = await asyncio.to_thread(lambda: list(self.cache_dir.glob("*.qcow2")))
-
-        if not snapshot_files:
-            return
-
-        # Helper to get atime for a single file
-        async def get_atime(path: Path) -> tuple[Path, float] | None:
-            try:
-                if await aiofiles.os.path.isfile(path):
-                    stat = await aiofiles.os.stat(path)
-                    return (path, stat.st_atime)
-            except OSError:
-                pass
-            return None
-
-        # Parallel stat calls for all files
-        results = await asyncio.gather(*[get_atime(f) for f in snapshot_files])
-        snapshots = [r for r in results if r is not None]
-
-        if not snapshots:
-            return
-
-        # Find oldest (by atime)
-        oldest_file, _ = min(snapshots, key=lambda x: x[1])
-
-        # Delete oldest snapshot
-        await aiofiles.os.remove(oldest_file)
-
     async def _download_from_s3(self, cache_key: str) -> Path:
         """Download and decompress snapshot from S3 to L2 cache.
 
@@ -921,28 +863,5 @@ class SnapshotManager:
         )
 
     async def stop(self) -> None:
-        """Stop SnapshotManager and wait for background upload tasks to complete.
-
-        Should be called when the SnapshotManager is no longer needed.
-        Ensures all S3 uploads finish before stopping.
-        """
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
-
-    async def __aenter__(self) -> Self:
-        """Enter async context manager.
-
-        No async initialization needed - returns self immediately.
-        """
-        return self
-
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, stopping and waiting for background tasks."""
-        await self.stop()
-
-
-# Import VmState for type checking in finally block
-from exec_sandbox.vm_types import VmState  # noqa: E402
+        """Stop DiskSnapshotManager and wait for background upload tasks to complete."""
+        await super().stop()

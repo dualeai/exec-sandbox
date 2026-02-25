@@ -213,15 +213,15 @@ class TestSchedulerConfig:
 
 
 class TestSchedulerSnapshotInit:
-    """Tests for SnapshotManager initialization in Scheduler."""
+    """Tests for DiskSnapshotManager initialization in Scheduler."""
 
     async def test_snapshot_manager_initialized_without_s3(self, scheduler_config: SchedulerConfig) -> None:
-        """SnapshotManager is created even without S3 config (L2 cache works)."""
+        """DiskSnapshotManager is created even without S3 config (L2 cache works)."""
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
 
     async def test_snapshot_manager_initialized_with_s3(self, images_dir: Path) -> None:
-        """SnapshotManager is created with S3 config."""
+        """DiskSnapshotManager is created with S3 config."""
         config = SchedulerConfig(
             images_dir=images_dir,
             s3_bucket="test-bucket",
@@ -232,7 +232,7 @@ class TestSchedulerSnapshotInit:
             assert scheduler._snapshot_manager is not None
 
     async def test_snapshot_manager_has_vm_manager(self, scheduler_config: SchedulerConfig) -> None:
-        """SnapshotManager receives vm_manager reference."""
+        """DiskSnapshotManager receives vm_manager reference."""
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
             assert scheduler._snapshot_manager.vm_manager is scheduler._vm_manager

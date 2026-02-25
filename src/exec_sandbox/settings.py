@@ -31,8 +31,9 @@ class Settings(BaseSettings):
     kernel_path: Path = Path("/images/kernels")
     base_images_dir: Path = Path("/images")  # qcow2 base images
 
-    # Execution
-    snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-snapshots")  # noqa: S108
+    # Execution — both caches under /tmp/exec-sandbox-cache/
+    disk_snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-cache/disk-snapshots")  # noqa: S108
+    memory_snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-cache/memory-snapshots")  # noqa: S108
 
     # Snapshot cache (2-tier: L2=local disk, L3=S3)
     snapshot_cache_ttl_days: int = 14  # AWS Lambda SnapStart pattern

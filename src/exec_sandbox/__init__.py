@@ -49,6 +49,13 @@ For S3 snapshot caching:
     pip install exec-sandbox[s3]
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("exec-sandbox")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
+
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
@@ -125,10 +132,3 @@ __all__ = [
     "VmTransientError",
     "configure_logging",
 ]
-
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    __version__ = version("exec-sandbox")
-except PackageNotFoundError:
-    __version__ = "0.0.0.dev0"

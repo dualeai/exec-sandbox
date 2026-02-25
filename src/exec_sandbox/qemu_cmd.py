@@ -34,6 +34,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     direct_write: bool = False,
     debug_boot: bool = False,
     snapshot_drive: str | None = None,
+    defer_incoming: bool = False,
 ) -> list[str]:
     """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -57,6 +58,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             When set, tiny-init discovers drives by serial number and mounts
             EROFS base + ext4 snapshot via overlayfs. For snapshot creation
             (direct_write=True), the ext4 drive is writable; for usage, read-only.
+        defer_incoming: Start QEMU with `-incoming defer` for L1 memory snapshot
+            restore. The VM starts paused, waiting for a migration stream via QMP.
 
     Returns:
         QEMU command as list of strings
@@ -669,8 +672,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
     # - deflate-on-oom: guest returns memory under OOM pressure
     # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
-    #   D1: Disable during cold boot to avoid kernel page scanning overhead (10-20ms)
-    #   Warm pool VMs re-enable via QMP after boot completes
+    #   Disabled permanently to avoid kernel page scanning overhead (10-20ms)
     qemu_args.extend(
         [
             "-device",
@@ -761,6 +763,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             f"unix:{workdir.qmp_socket},server=on,wait=off",
         ]
     )
+
+    # L1 memory snapshot restore: QEMU starts paused, waiting for migration stream
+    if defer_incoming:
+        qemu_args.extend(["-incoming", "defer"])
 
     # Orphan protection: kill QEMU if parent process dies (QEMU 10.2+)
     # Uses PR_SET_PDEATHSIG on Linux, kqueue on macOS/FreeBSD

@@ -11,12 +11,12 @@ Secure code execution in isolated lightweight VMs (QEMU microVMs). Python librar
 ## Highlights
 
 - **Hardware isolation** - Each execution runs in a dedicated lightweight VM (QEMU with KVM/HVF hardware acceleration), not containers
-- **Fast startup** - 400ms fresh start, 1-2ms with pre-started VMs (warm pool)
+- **Fast startup** - 1-2ms with warm pool, ~100ms from L1 memory snapshot, ~400ms VM boot on cold start (+ 4-11s interpreter startup, amortized by L1)
 - **Simple API** - `run()` for one-shot execution, `session()` for stateful multi-step workflows with file I/O; plus `sbx` CLI for quick testing
 - **Streaming output** - Real-time output as code runs
-- **Smart caching** - Local + S3 remote cache for VM snapshots
+- **3-tier snapshot cache** - L1 memory snapshots (~100ms, interpreter warm), L2 disk snapshots (skip package install, interpreter cold-starts), L3 S3 remote cache for cross-host sharing
 - **Network control** - Disabled by default, optional domain allowlisting with defense-in-depth filtering (DNS + TLS SNI + DNS cross-validation to prevent spoofing)
-- **Memory optimization** - Compressed memory (zram) + unused memory reclamation (balloon) for ~30% more capacity, ~80% smaller snapshots
+- **Memory optimization** - Compressed swap (zram) + unused memory reclamation (virtio-balloon) on idle warm-pool VMs
 
 ## Installation
 
@@ -401,14 +401,14 @@ Environment variables: `EXEC_SANDBOX_IMAGES_DIR`, `EXEC_SANDBOX_CACHE_DIR`, `EXE
 VMs include automatic memory optimization (no configuration required):
 
 - **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
-- **Memory reclamation (virtio-balloon)** - 70-90% smaller snapshots
+- **Memory reclamation (virtio-balloon)** - Reclaims unused guest pages on idle warm-pool VMs (192→160 MB default), reducing host memory pressure
 
 ### Memory Architecture
 
 Guest RAM is a fixed budget shared between the kernel, userspace processes, and tmpfs mounts. tmpfs is demand-allocated — writing 10 MB of files consumes ~10 MB of the VM's memory budget.
 
 ```
-Guest RAM (default 256 MB)
+Guest RAM (default 192 MB)
 ├── Kernel + slab caches     (~20 MB fixed)
 ├── Userspace (code execution) (variable)
 ├── tmpfs mounts (on demand)
@@ -423,6 +423,64 @@ Guest RAM (default 256 MB)
 | `/home/user` | 50% of RAM | Writable home dir — installed packages, user scripts, data files |
 | `/tmp` | 128 MB | Scratch space for package managers (wheel builds), temp files |
 | `/dev/shm` | 64 MB | POSIX shared memory segments (Python multiprocessing semaphores) |
+
+## Snapshot Caching Architecture
+
+exec-sandbox uses a 3-tier snapshot cache to eliminate redundant work across executions. The first run with a given configuration pays the full cost (boot + package install); every subsequent run restores from cache.
+
+```
+Request arrives
+│
+├─ Warm pool hit? ──────────────── 1-2ms     (pre-started VM, REPL already warm)
+│
+├─ L1 memory snapshot? ────────── ~100ms     (full VM state restore — REPL already warm)
+│
+├─ L2 disk snapshot? ──────────── ~400ms boot + 4-11s REPL startup
+│                                             (packages cached, but interpreter cold-starts)
+│
+├─ L3 S3 remote cache? ────────── download + same as L2
+│
+└─ Cold miss ──────────────────── ~400ms boot + 4-11s REPL + package install
+```
+
+### L1: Memory Snapshots
+
+L1 captures the complete VM state — CPU registers, RAM pages, device state — via QEMU's [migration subsystem](https://www.qemu.org/docs/master/devel/migration/main.html). Restoring from L1 resumes the VM exactly where it was, with REPL already warm and packages loaded. No boot, no initialization.
+
+On QEMU >= 9.0, exec-sandbox enables [mapped-ram](https://www.qemu.org/docs/master/devel/migration/mapped-ram.html) for fixed-offset page storage (enabling parallel I/O) and [multifd](https://www.qemu.org/docs/master/devel/migration/main.html) for multi-threaded migration channels. Mapped-ram files are sparse — unused RAM pages become filesystem holes. A default 192 MB VM produces a file that appears as ~326 MB (`ls -l`) but consumes only ~50-100 MB of actual disk (Python ~86 MB, JavaScript ~96 MB, raw ~56 MB).
+
+**How L1 saves work:** After a cold boot, exec-sandbox schedules a background save — it boots a sacrificial VM with the same parameters, warms the REPL, saves the migration stream to disk via QMP (`stop` → `migrate` → poll → `quit`), and destroys the VM. The next request with matching parameters restores from the saved vmstate instead of booting.
+
+L1 cache keys include: language, packages, exec-sandbox version, base image hash, QEMU version, CPU architecture, acceleration type, memory size, CPU cores, network topology, migration format version, kernel hash, and initramfs hash. Any parameter change produces a different cache entry.
+
+### L2: Disk Snapshots
+
+L2 stores standalone ext4 qcow2 images with packages pre-installed. When a request needs packages (e.g., `pandas==2.2.0`), exec-sandbox checks L2 for a matching snapshot. On hit, the VM boots with the cached disk overlaid on the read-only EROFS base via overlayfs — skipping package installation but still going through kernel boot (~400ms) and interpreter startup (4-11s for Python/Bun on HVF, ~4-5s on KVM). The snapshot only contains the writable layer (installed packages and their files), not the full rootfs.
+
+This is where L1 matters: L1 snapshots the memory state *after* the interpreter is fully loaded, eliminating the 4-11s REPL startup cost entirely. An L1 save is automatically scheduled after every L2 cold boot, so the interpreter startup penalty is paid only once per unique configuration.
+
+### L3: S3 Remote Cache
+
+L3 extends L2 across machines. When an L2 snapshot is created, it's compressed with zstd and uploaded to S3 in the background. Other hosts can download and decompress it to populate their local L2 cache, avoiding redundant package installations across a fleet.
+
+### How It Compares
+
+The critical metric is **time to first code execution** — not just VM boot, but having the interpreter loaded and ready to run user code.
+
+| Platform | Isolation | Snapshot includes interpreter? | Time to first exec | macOS | License |
+|---|---|---|---|---|---|
+| **exec-sandbox** (warm pool) | QEMU (KVM/HVF) | Yes (REPL pre-warmed) | 1-2ms | Yes | Apache-2.0 |
+| **exec-sandbox** (L1) | QEMU (KVM/HVF) | Yes (memory snapshot) | ~100ms | Yes | Apache-2.0 |
+| **exec-sandbox** (L2/L3) | QEMU (KVM/HVF) | No — interpreter cold-starts | ~400ms boot + 4-11s REPL | Yes | Apache-2.0 |
+| [**E2B**](https://e2b.dev) | Firecracker (KVM) | [Yes](https://e2b.dev/docs/sandbox/persistence) (VM snapshot) | [~80-150ms](https://e2b.dev/docs) | No | Apache-2.0 |
+| [**Lambda SnapStart**](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html) | Firecracker (KVM) | [Yes](https://brooker.co.za/blog/2022/11/29/snapstart.html) (post-init snapshot) | [~182ms P50](https://aws.amazon.com/blogs/compute/optimizing-cold-start-performance-of-aws-lambda-using-advanced-priming-strategies-with-snapstart/) (Python) | No | AWS service |
+| [**Modal**](https://modal.com) | gVisor (userspace kernel) | [Yes](https://modal.com/blog/mem-snapshots) (alpha for sandboxes) | [1-3.5s](https://modal.com/blog/mem-snapshots) | No | Proprietary |
+| [**CodeSandbox**](https://codesandbox.io) | Firecracker (KVM) | [Yes](https://codesandbox.io/blog/how-we-clone-a-running-vm-in-2-seconds) (VM snapshot) | [~495ms avg](https://codesandbox.io/blog/how-we-scale-our-microvm-infrastructure-using-low-latency-memory-decompression) | No | Proprietary |
+| [**Daytona**](https://daytona.io) | Docker / Kata / Sysbox | [No](https://github.com/daytonaio/daytona/issues/2519) (filesystem only) | Container start + interpreter | No | AGPL-3.0 |
+
+**exec-sandbox's weakness:** L2/L3 hits pay the full interpreter startup cost (4-11s for Python/Bun) on every boot — only L1 and warm pool avoid this. Firecracker-based platforms (E2B, Lambda) always snapshot with the interpreter warm, so they never have this penalty. QEMU is also heavier than Firecracker (~5 MiB VMM overhead for Firecracker).
+
+**exec-sandbox's strength:** Runs on macOS (HVF) and Linux (KVM) with one codebase. Native REPL sessions with state persistence across `exec()` calls. L1 is automatically populated after every L2 cold boot, so the interpreter startup penalty is a one-time cost per unique configuration.
 
 ## Execution Result
 

@@ -204,7 +204,7 @@ def make_vm_settings(images_dir: Path):
 
     Usage:
         def test_something(make_vm_settings, tmp_path):
-            settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
+            settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
     """
     from typing import Any
 
@@ -230,7 +230,7 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
 
     Usage:
         async def test_something(make_vm_manager, tmp_path):
-            vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+            vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
     """
     from contextlib import AsyncExitStack
     from typing import Any

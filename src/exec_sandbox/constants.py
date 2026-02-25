@@ -51,7 +51,15 @@ GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""
 
 GUEST_REQUEST_TIMEOUT_SECONDS: Final[int] = 5
-"""Default timeout for guest agent request/response (ping, warm_repl, etc.)."""
+"""Default timeout for guest agent request/response (ping, etc.)."""
+
+WARM_REPL_TIMEOUT_SECONDS: Final[int] = 120
+"""Timeout for WarmReplRequest (REPL process startup in guest).
+
+Python REPL takes 11+ seconds on HVF (Alpine CPython cold start), and under
+resource contention (background save runs concurrently with user execution)
+it can take 2-3x longer. 120s is generous since this is used for background
+L1 saves and warm pool pre-warm — latency doesn't matter, only success."""
 
 GUEST_RECONNECT_PROBE_TIMEOUT: Final[float] = 0.5
 """Timeout per ping probe when verifying guest is ready after reconnection.
@@ -204,6 +212,12 @@ WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
 
+L1_SAVE_TENANT_ID: Final[str] = "l1-cache"
+"""Tenant ID for sacrificial VMs created during L1 background saves."""
+
+SCHEDULER_TENANT_ID: Final[str] = "exec-sandbox"
+"""Tenant ID for user-facing VMs created by the scheduler."""
+
 WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 15
 """Health check interval for warm VMs in seconds."""
 
@@ -240,6 +254,33 @@ BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 
 BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout for balloon deflate operation (restoring guest memory before execution)."""
+
+# ============================================================================
+# Memory Snapshot (L1 Cache)
+# ============================================================================
+
+MEMORY_SNAPSHOT_SAVE_TIMEOUT_SECONDS: Final[float] = 30.0
+"""Timeout for saving VM state to file (migrate command + poll)."""
+
+MEMORY_SNAPSHOT_RESTORE_TIMEOUT_SECONDS: Final[float] = 30.0
+"""Timeout for restoring VM state from file (migrate-incoming + poll)."""
+
+MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
+"""Timeout for individual QMP commands during migration."""
+
+MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+"""Interval between query-migrate polls (50ms)."""
+
+MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
+"""Minimum QEMU version for mapped-ram + multifd migration capabilities.
+Changing capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
+
+MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 2
+"""Migration format version. Bump when changing QMP capabilities or migration
+protocol to invalidate stale L1 cache entries. History:
+  v1: Plain streaming format (no mapped-ram)
+  v2: mapped-ram + multifd (QEMU >= 9.0)
+"""
 
 # ============================================================================
 # Overlay Pool

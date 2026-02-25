@@ -1,4 +1,4 @@
-"""Tests for SnapshotManager.
+"""Tests for DiskSnapshotManager.
 
 Unit tests: Cache key computation, filesystem operations.
 Integration tests: Snapshot creation with QEMU (requires images).
@@ -94,13 +94,13 @@ class TestCacheKeyComputation:
 
 
 class TestSettings:
-    """Tests for Settings used by SnapshotManager."""
+    """Tests for Settings used by DiskSnapshotManager."""
 
-    def test_settings_snapshot_cache_dir(self, make_vm_settings, tmp_path: Path) -> None:
-        """Settings has snapshot_cache_dir."""
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
+    def test_settings_disk_snapshot_cache_dir(self, make_vm_settings, tmp_path: Path) -> None:
+        """Settings has disk_snapshot_cache_dir."""
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
 
-        assert settings.snapshot_cache_dir == tmp_path / "cache"
+        assert settings.disk_snapshot_cache_dir == tmp_path / "cache"
 
     def test_settings_s3_config(self, make_vm_settings) -> None:
         """Settings has S3 configuration."""
@@ -118,18 +118,18 @@ class TestSettings:
 # ============================================================================
 
 
-class TestSnapshotManagerIntegration:
-    """Integration tests for SnapshotManager with real QEMU VMs."""
+class TestDiskSnapshotManagerIntegration:
+    """Integration tests for DiskSnapshotManager with real QEMU VMs."""
 
     async def test_l2_cache_miss(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L2 cache miss returns (None, False) for non-existent snapshot."""
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
         path = await snapshot_manager._check_l2_cache("nonexistent-abc123")
@@ -137,13 +137,13 @@ class TestSnapshotManagerIntegration:
 
     async def test_compute_cache_key(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """Test actual _compute_cache_key method."""
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Test with packages
         key = snapshot_manager._compute_cache_key(
@@ -176,13 +176,13 @@ class TestSnapshotManagerIntegration:
     @skip_unless_hwaccel
     async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """Create snapshot with packages (slow, requires VM, uses qemu-vm user on Linux)."""
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Create snapshot (this boots a VM and installs packages)
         snapshot_path = await snapshot_manager.get_or_create_snapshot(
@@ -220,17 +220,17 @@ class TestL2Cache:
         """L2 cache returns path when valid qcow2 snapshot exists."""
         import asyncio
 
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Create a minimal valid qcow2 file
         cache_key = "python-abc123"
-        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
         # Create actual qcow2 using qemu-img
         proc = await asyncio.create_subprocess_exec(
@@ -249,20 +249,18 @@ class TestL2Cache:
         path = await snapshot_manager._check_l2_cache(cache_key)
         assert path == snapshot_path
 
-    async def test_l2_cache_removes_corrupt_snapshot(
-        self, make_vm_manager, make_vm_settings, tmp_path: Path
-    ) -> None:
+    async def test_l2_cache_removes_corrupt_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L2 cache detects and removes corrupt qcow2 (fails qemu-img check)."""
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         cache_key = "python-corrupt123"
-        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
         snapshot_path.write_bytes(b"not a valid qcow2 file")
 
         result = await snapshot_manager._check_l2_cache(cache_key)
@@ -272,13 +270,13 @@ class TestL2Cache:
 
     async def test_l2_cache_nonexistent_returns_none(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """L2 cache returns None for non-existent snapshot."""
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Check for non-existent snapshot
         path = await snapshot_manager._check_l2_cache("nonexistent-key")
@@ -290,17 +288,17 @@ class TestL2Cache:
         import os
         import time
 
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Create multiple snapshots
-        oldest_path = settings.snapshot_cache_dir / "python-oldest.qcow2"
-        newest_path = settings.snapshot_cache_dir / "python-newest.qcow2"
+        oldest_path = settings.disk_snapshot_cache_dir / "python-oldest.qcow2"
+        newest_path = settings.disk_snapshot_cache_dir / "python-newest.qcow2"
 
         # Create both files
         for path in [oldest_path, newest_path]:
@@ -344,14 +342,14 @@ class TestL3Cache:
 
     async def test_get_s3_client_raises_without_bucket(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
         """_get_s3_client raises SnapshotError when s3_bucket not set."""
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.exceptions import SnapshotError
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache", s3_bucket=None)
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         with pytest.raises(SnapshotError) as exc_info:
             await snapshot_manager._get_s3_client()
@@ -362,7 +360,7 @@ class TestL3Cache:
         import boto3
         from moto.server import ThreadedMotoServer
 
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -382,24 +380,24 @@ class TestL3Cache:
             s3_sync.create_bucket(Bucket="test-snapshots")
 
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             # Create a test snapshot file
             cache_key = "python-test123"
-            snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+            snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
             snapshot_path.write_bytes(b"fake qcow2 content")
 
             # Upload using real aioboto3 client
@@ -411,7 +409,7 @@ class TestL3Cache:
             assert f"snapshots/{cache_key}.qcow2.zst" in keys
 
             # Verify compressed file was cleaned up
-            compressed_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2.zst"
+            compressed_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2.zst"
             assert not compressed_path.exists()
 
         finally:
@@ -424,7 +422,7 @@ class TestL3Cache:
         import boto3
         from moto.server import ThreadedMotoServer
 
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -453,20 +451,20 @@ class TestL3Cache:
             )
 
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             # Download using real aioboto3 client
             result = await snapshot_manager._download_from_s3("python-download123")
@@ -485,8 +483,8 @@ class TestL3Cache:
         import boto3
         from moto.server import ThreadedMotoServer
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.exceptions import SnapshotError
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -506,20 +504,20 @@ class TestL3Cache:
             s3_sync.create_bucket(Bucket="test-snapshots")
 
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             with pytest.raises(SnapshotError) as exc_info:
                 await snapshot_manager._download_from_s3("nonexistent-key")
@@ -534,7 +532,7 @@ class TestL3Cache:
         """S3 upload failure is silent (L2 cache still works)."""
         from moto.server import ThreadedMotoServer
 
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -550,23 +548,23 @@ class TestL3Cache:
 
         try:
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="nonexistent-bucket",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="nonexistent-bucket",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             cache_key = "python-fail123"
-            snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+            snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
             snapshot_path.write_bytes(b"test content")
 
             # Should not raise - silent failure (bucket doesn't exist)
@@ -590,7 +588,7 @@ class TestL3Cache:
         import boto3
         from moto.server import ThreadedMotoServer
 
-        from exec_sandbox.snapshot_manager import SnapshotManager
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -612,22 +610,22 @@ class TestL3Cache:
 
             # Configure semaphore to allow only 2 concurrent uploads
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket=bucket_name,
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
                 max_concurrent_s3_uploads=2,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket=bucket_name,
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
                 max_concurrent_s3_uploads=2,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             # Track concurrent uploads (inside semaphore-protected section)
             concurrent_count = 0
@@ -669,12 +667,12 @@ class TestL3Cache:
 
             # Create test snapshot files
             for i in range(5):
-                (settings.snapshot_cache_dir / f"test-{i}.qcow2").write_bytes(b"test data")
+                (settings.disk_snapshot_cache_dir / f"test-{i}.qcow2").write_bytes(b"test data")
 
             # Start 5 uploads simultaneously
             tasks = [
                 asyncio.create_task(
-                    snapshot_manager._upload_to_s3(f"test-{i}", settings.snapshot_cache_dir / f"test-{i}.qcow2")
+                    snapshot_manager._upload_to_s3(f"test-{i}", settings.disk_snapshot_cache_dir / f"test-{i}.qcow2")
                 )
                 for i in range(5)
             ]
@@ -726,26 +724,26 @@ class TestCacheHierarchy:
         import asyncio
         from unittest.mock import AsyncMock, patch
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         settings = make_vm_settings(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket="test-bucket",  # S3 configured but should NOT be called
             s3_region="us-east-1",
         )
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
         vm_manager = await make_vm_manager(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket="test-bucket",
             s3_region="us-east-1",
         )
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Pre-populate L2 cache with valid qcow2
         cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
-        snapshot_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
         # Create actual qcow2 using qemu-img
         proc = await asyncio.create_subprocess_exec(
@@ -793,8 +791,8 @@ class TestCacheHierarchy:
         import boto3
         from moto.server import ThreadedMotoServer
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -814,20 +812,20 @@ class TestCacheHierarchy:
             s3_sync.create_bucket(Bucket="test-snapshots")
 
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             # Compute cache key for the packages we'll request
             cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["numpy==1.26.0"])
@@ -842,7 +840,7 @@ class TestCacheHierarchy:
             )
 
             # L2 is empty (no file on disk)
-            assert not (settings.snapshot_cache_dir / f"{cache_key}.qcow2").exists()
+            assert not (settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2").exists()
 
             # Mock creation to verify it's NOT called
             with patch.object(snapshot_manager, "_create_snapshot", new_callable=AsyncMock) as mock_create:
@@ -877,8 +875,8 @@ class TestCacheHierarchy:
         import boto3
         from moto.server import ThreadedMotoServer
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -898,24 +896,24 @@ class TestCacheHierarchy:
             s3_sync.create_bucket(Bucket="test-snapshots")
 
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             # Compute cache key
             cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.1.0"])
-            expected_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+            expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
             # Mock _create_snapshot to simulate snapshot creation (avoids real QEMU)
             async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
@@ -974,8 +972,8 @@ class TestCacheHierarchy:
         import boto3
         from moto.server import ThreadedMotoServer
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         # Set fake AWS credentials for moto
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -995,29 +993,34 @@ class TestCacheHierarchy:
             s3_sync.create_bucket(Bucket="test-snapshots")
 
             settings = make_vm_settings(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            settings.snapshot_cache_dir.mkdir(parents=True)
+            settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
             vm_manager = await make_vm_manager(
-                snapshot_cache_dir=tmp_path / "cache",
+                disk_snapshot_cache_dir=tmp_path / "cache",
                 s3_bucket="test-snapshots",
                 s3_region="us-east-1",
                 s3_endpoint_url=endpoint_url,
             )
-            snapshot_manager = SnapshotManager(settings, vm_manager)
+            snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
             # Compute cache key
             cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["scipy==1.11.0"])
-            l2_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+            l2_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
             # Create a real qcow2 to upload to S3 (must pass qemu-img check on L2 hit)
             real_qcow2 = tmp_path / "real-snapshot.qcow2"
             proc = await asyncio.create_subprocess_exec(
-                "qemu-img", "create", "-f", "qcow2", str(real_qcow2), "1M",
+                "qemu-img",
+                "create",
+                "-f",
+                "qcow2",
+                str(real_qcow2),
+                "1M",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1085,20 +1088,20 @@ class TestCacheHierarchy:
         import asyncio
         from unittest.mock import AsyncMock, patch
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         settings = make_vm_settings(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,  # No S3
         )
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
         vm_manager = await make_vm_manager(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Compute cache keys for same packages in different orders
         key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["pandas==2.0.0", "numpy==1.25.0"])
@@ -1108,7 +1111,7 @@ class TestCacheHierarchy:
         assert key1 == key2
 
         # Pre-populate L2 with snapshot for these packages
-        snapshot_path = settings.snapshot_cache_dir / f"{key1}.qcow2"
+        snapshot_path = settings.disk_snapshot_cache_dir / f"{key1}.qcow2"
         proc = await asyncio.create_subprocess_exec(
             "qemu-img",
             "create",
@@ -1148,14 +1151,14 @@ class TestCacheHierarchy:
 
         Verifies cache isolation between different package sets.
         """
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         key1 = snapshot_manager._compute_cache_key(Language.PYTHON, ["requests==2.31.0"])
         key2 = snapshot_manager._compute_cache_key(Language.PYTHON, ["flask==3.0.0"])
@@ -1173,14 +1176,14 @@ class TestCacheHierarchy:
 
         Verifies cache isolation between languages.
         """
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
-        settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
-        vm_manager = await make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Same "package" name but different languages
         key_python = snapshot_manager._compute_cache_key(Language.PYTHON, ["test-pkg==1.0.0"])
@@ -1196,23 +1199,23 @@ class TestCacheHierarchy:
         import asyncio
         from unittest.mock import patch
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         settings = make_vm_settings(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,  # S3 disabled
         )
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
         vm_manager = await make_vm_manager(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         cache_key = snapshot_manager._compute_cache_key(Language.PYTHON, ["aiohttp==3.9.0"])
-        expected_path = settings.snapshot_cache_dir / f"{cache_key}.qcow2"
+        expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
         # Mock creation
         async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
@@ -1250,21 +1253,21 @@ class TestCacheHierarchy:
         """
         from unittest.mock import AsyncMock, patch
 
+        from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
         from exec_sandbox.exceptions import SnapshotError
         from exec_sandbox.models import Language
-        from exec_sandbox.snapshot_manager import SnapshotManager
 
         settings = make_vm_settings(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
-        settings.snapshot_cache_dir.mkdir(parents=True)
+        settings.disk_snapshot_cache_dir.mkdir(parents=True)
 
         vm_manager = await make_vm_manager(
-            snapshot_cache_dir=tmp_path / "cache",
+            disk_snapshot_cache_dir=tmp_path / "cache",
             s3_bucket=None,
         )
-        snapshot_manager = SnapshotManager(settings, vm_manager)
+        snapshot_manager = DiskSnapshotManager(settings, vm_manager)
 
         # Mock creation to fail
         with patch.object(

@@ -82,7 +82,7 @@ class QemuVM:
         self,
         vm_id: str,
         process: "ProcessWrapper",
-        cgroup_path: Path,
+        cgroup_path: Path | None,
         workdir: VmWorkingDirectory,
         channel: GuestChannel,
         language: Language,
@@ -127,6 +127,8 @@ class QemuVM:
         # Port forwarding - set by VmManager after boot
         # Stores the resolved port mappings for result reporting
         self.exposed_ports: list[ExposedPort] = []
+        # L1 memory snapshot restore flag
+        self.l1_restored: bool = False
 
     # -------------------------------------------------------------------------
     # Timing properties (backwards-compatible accessors to VmTiming)
@@ -415,9 +417,9 @@ class QemuVM:
 
             # Connect to guest agent with timing
             # Fixed init timeout (connection establishment, independent of execution timeout)
-            connect_start = asyncio.get_event_loop().time()
+            connect_start = asyncio.get_running_loop().time()
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            connect_ms = round((asyncio.get_event_loop().time() - connect_start) * 1000)
+            connect_ms = round((asyncio.get_running_loop().time() - connect_start) * 1000)
 
             # Stream execution output to console
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)

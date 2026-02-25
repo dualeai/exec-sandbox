@@ -12,6 +12,7 @@ Hierarchy:
     │   │   ├── VmGvproxyError         ← gvproxy startup issues
     │   │   └── VmCapacityError        ← pool full (temporary)
     │   ├── BalloonTransientError      ← balloon operations
+    │   ├── MigrationTransientError    ← memory snapshot migration
     │   └── CommunicationTransientError ← socket/network transient issues
     ├── PermanentError (non-retryable marker base)
     │   ├── VmPermanentError
@@ -27,6 +28,7 @@ Backward Compatibility:
     QemuImgError = VmOverlayError
     QemuStorageDaemonError = VmOverlayError
     BalloonError = BalloonTransientError
+    MigrationError = MigrationTransientError
 """
 
 from typing import Any
@@ -191,6 +193,14 @@ class BalloonTransientError(TransientError):
     """
 
 
+class MigrationTransientError(TransientError):
+    """Migration (memory snapshot) operation failed - may succeed on retry.
+
+    Raised when QEMU migration operations (save/restore memory snapshots) fail.
+    These are often transient due to QEMU state or resource contention.
+    """
+
+
 # =============================================================================
 # Backward Compatibility Aliases (Public API)
 # =============================================================================
@@ -206,6 +216,7 @@ VmBootError = VmTransientError
 QemuImgError = VmOverlayError
 QemuStorageDaemonError = VmOverlayError
 BalloonError = BalloonTransientError
+MigrationError = MigrationTransientError
 
 
 class SnapshotError(SandboxError):

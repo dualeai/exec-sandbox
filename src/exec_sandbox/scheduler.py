@@ -48,19 +48,22 @@ from typing import TYPE_CHECKING, Self
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.assets import ensure_assets, fetch_base_image
 from exec_sandbox.config import SchedulerConfig
+from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import SandboxError, VmConfigError
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
+from exec_sandbox.package_validator import PackageValidator
 from exec_sandbox.port_forward import resolve_port_mappings
+from exec_sandbox.resource_monitor import ResourceMonitor
 from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
+from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.warm_vm_pool import WarmVMPool
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
-    from exec_sandbox.resource_monitor import ResourceMonitor
-    from exec_sandbox.snapshot_manager import SnapshotManager
-    from exec_sandbox.vm_manager import VmManager
-    from exec_sandbox.warm_vm_pool import WarmVMPool
 
 logger = get_logger(__name__)
 
@@ -71,7 +74,8 @@ class Scheduler:
     The Scheduler is the main entry point for exec-sandbox. It handles:
     - VM pool management (max concurrent VMs, backpressure)
     - Warm VM pool (pre-booted VMs for instant execution)
-    - Snapshot caching (L2 local + L3 S3)
+    - L1 memory snapshot cache (QEMU migration, ~100ms restore)
+    - L2/L3 snapshot caching (local qcow2 + S3) for package installation
     - Package validation
 
     Thread-safety: Single Scheduler per process. Use asyncio for concurrency.
@@ -100,7 +104,8 @@ class Scheduler:
         self._images_dir: Path | None = None
         self._settings: Settings | None = None
         self._vm_manager: VmManager | None = None
-        self._snapshot_manager: SnapshotManager | None = None
+        self._snapshot_manager: DiskSnapshotManager | None = None
+        self._memory_snapshot_manager: MemorySnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
         self._resource_monitor: ResourceMonitor | None = None
         self._started = False
@@ -111,9 +116,11 @@ class Scheduler:
         Startup sequence:
         1. Resolve images directory (downloads from GitHub if needed)
         2. Create Settings from SchedulerConfig
-        3. Initialize VmManager
-        4. Initialize SnapshotManager (if S3 configured)
-        5. Start WarmVMPool (if warm_pool_size > 0)
+        3. Initialize VmManager (runs async system probes)
+        4. Initialize DiskSnapshotManager (L2 local always; L3 S3 optional)
+        5. Initialize MemorySnapshotManager (L1 memory snapshot cache)
+        6. Start WarmVMPool (if warm_pool_size > 0)
+        7. Start ResourceMonitor
 
         Returns:
             Self for use in context
@@ -136,8 +143,6 @@ class Scheduler:
         )
 
         # Resolve images directory (downloads if needed and allowed)
-        from exec_sandbox.assets import ensure_assets  # noqa: PLC0415
-
         self._images_dir = await ensure_assets(
             override=self.config.images_dir,
             download=self.config.auto_download_assets,
@@ -147,26 +152,30 @@ class Scheduler:
         self._settings = self._create_settings()
 
         # Initialize VmManager (handles backpressure internally via semaphore)
-        from exec_sandbox.vm_manager import VmManager  # noqa: PLC0415
-
         self._vm_manager = VmManager(self._settings)
         await self._vm_manager.start()  # Pre-warms all system probe caches
 
-        # Initialize SnapshotManager (L2 local cache always available, L3 S3 optional)
-        from exec_sandbox.snapshot_manager import SnapshotManager  # noqa: PLC0415
+        # Initialize DiskSnapshotManager (L2 local cache always available, L3 S3 optional)
+        self._snapshot_manager = DiskSnapshotManager(self._settings, self._vm_manager)
 
-        self._snapshot_manager = SnapshotManager(self._settings, self._vm_manager)
+        # Initialize MemorySnapshotManager (L1 cache)
+        self._memory_snapshot_manager = MemorySnapshotManager(
+            self._settings,
+            self._vm_manager,
+            self._snapshot_manager,
+        )
 
         # Initialize WarmVMPool (optional)
         if self.config.warm_pool_size > 0:
-            from exec_sandbox.warm_vm_pool import WarmVMPool  # noqa: PLC0415
-
-            self._warm_pool = WarmVMPool(self._vm_manager, self.config, self._snapshot_manager)
+            self._warm_pool = WarmVMPool(
+                self._vm_manager,
+                self.config,
+                self._snapshot_manager,
+                memory_snapshot_manager=self._memory_snapshot_manager,
+            )
             await self._warm_pool.start()
 
         # Start ResourceMonitor (always-on, core component for observability)
-        from exec_sandbox.resource_monitor import ResourceMonitor  # noqa: PLC0415
-
         self._resource_monitor = ResourceMonitor(
             vm_manager=self._vm_manager,
             admission=self._vm_manager.admission,
@@ -184,9 +193,11 @@ class Scheduler:
         """Shutdown scheduler and clean up all resources.
 
         Shutdown sequence:
-        1. Stop WarmVMPool (drains and destroys pre-booted VMs)
-        2. Destroy any remaining VMs
-        3. Close SnapshotManager
+        1. Stop ResourceMonitor
+        2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
+        3. Stop WarmVMPool (drains and destroys pre-booted VMs)
+        4. Destroy any remaining active VMs
+        5. Stop VmManager (overlay pool cleanup)
 
         Always completes cleanup, even on exceptions.
         """
@@ -198,6 +209,13 @@ class Scheduler:
                 await self._resource_monitor.stop()
             except (OSError, RuntimeError) as e:
                 logger.error("ResourceMonitor stop error", extra={"error": str(e)})
+
+        # Stop MemorySnapshotManager (wait for background saves)
+        if self._memory_snapshot_manager:
+            try:
+                await self._memory_snapshot_manager.stop()
+            except (OSError, RuntimeError, TimeoutError) as e:
+                logger.error("MemorySnapshotManager stop error", extra={"error": str(e)})
 
         # Stop WarmVMPool first (drains VMs)
         if self._warm_pool:
@@ -327,10 +345,10 @@ class Scheduler:
             on_boot_log=on_boot_log,
         )
 
-        run_start_time = asyncio.get_event_loop().time()
+        run_start_time = asyncio.get_running_loop().time()
         try:
             # Execute code
-            execute_start_time = asyncio.get_event_loop().time()
+            execute_start_time = asyncio.get_running_loop().time()
             result = await vm.execute(
                 code=code,
                 timeout_seconds=timeout,
@@ -338,7 +356,7 @@ class Scheduler:
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
             )
-            execute_end_time = asyncio.get_event_loop().time()
+            execute_end_time = asyncio.get_running_loop().time()
 
             # Calculate timing
             execute_ms = round((execute_end_time - execute_start_time) * 1000)
@@ -357,6 +375,8 @@ class Scheduler:
             guest_wait_ms = vm.guest_wait_ms if is_cold_boot and vm.guest_wait_ms is not None else 0
             # Retry tracking (0 for warm pool since no boot retry needed)
             boot_retries = vm.timing.boot_retries if is_cold_boot and vm.timing.boot_retries is not None else 0
+            # L1 timing (setup_ms is the L1 restore time when l1_restored)
+            l1_restore_ms = vm.setup_ms if vm.l1_restored and vm.setup_ms is not None else None
 
             return ExecutionResult(
                 stdout=result.stdout,
@@ -377,8 +397,10 @@ class Scheduler:
                     qemu_fork_ms=qemu_fork_ms,
                     guest_wait_ms=guest_wait_ms,
                     boot_retries=boot_retries,
+                    l1_restore_ms=l1_restore_ms,
                 ),
                 warm_pool_hit=not is_cold_boot,
+                l1_cache_hit=vm.l1_restored,
                 spawn_ms=result.spawn_ms,  # Pass through from guest
                 process_ms=result.process_ms,  # Pass through from guest
                 exposed_ports=resolved_ports,  # Port forwarding mappings
@@ -475,7 +497,7 @@ class Scheduler:
             default_timeout_seconds=self.config.default_timeout_seconds,
         )
 
-    async def _prepare_vm(
+    async def _prepare_vm(  # noqa: PLR0912
         self,
         *,
         language: str | Language,
@@ -563,19 +585,55 @@ class Scheduler:
         if self._warm_pool and not packages and not needs_network and on_boot_log is None:
             vm = await self._warm_pool.get_vm(language, packages)
 
-        # Cold boot if no warm VM available
+        if vm is None:
+            is_cold_boot = True
+
+            # L1 memory snapshot restore (~100ms)
+            # Cache key includes network topology (needs_network, not just allow_network)
+            # because expose_ports also adds a virtio-net device.
+            # Skip when on_boot_log requested (L1 skips boot, callback would never fire).
+            if self._memory_snapshot_manager and on_boot_log is None:
+                try:
+                    vmstate_path = await self._memory_snapshot_manager.check_cache(
+                        language,
+                        packages,
+                        memory,
+                        allow_network=needs_network,
+                    )
+                    if vmstate_path:
+                        l2_path = await self._memory_snapshot_manager.get_l2_for_l1(language, packages)
+                        vm = await self._vm_manager.restore_vm(
+                            language,
+                            constants.SCHEDULER_TENANT_ID,
+                            task_id,
+                            vmstate_path=vmstate_path,
+                            memory_mb=memory,
+                            snapshot_drive=l2_path,
+                            allow_network=needs_network,
+                        )
+                        logger.info(
+                            "VM restored from L1 cache",
+                            extra={"vm_id": vm.vm_id, "language": language},
+                        )
+                except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
+                    logger.warning(
+                        "L1 restore failed, falling back to cold boot",
+                        extra={"language": language, "error": str(e)},
+                        exc_info=True,
+                    )
+                    vm = None
+
+        # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
         if vm is None:
             is_cold_boot = True
 
             # Auto-download base image if needed
             if self.config.auto_download_assets:
-                from exec_sandbox.assets import fetch_base_image  # noqa: PLC0415
-
                 await fetch_base_image(language)
 
             vm = await self._vm_manager.create_vm(
                 language=language,
-                tenant_id="exec-sandbox",
+                tenant_id=constants.SCHEDULER_TENANT_ID,
                 task_id=task_id,
                 memory_mb=memory,
                 allow_network=allow_network,
@@ -584,6 +642,16 @@ class Scheduler:
                 on_boot_log=on_boot_log,
                 snapshot_drive=snapshot_path,
             )
+
+            # Schedule background L1 save for next time
+            if self._memory_snapshot_manager:
+                await self._memory_snapshot_manager.schedule_background_save(
+                    language,
+                    packages,
+                    memory,
+                    snapshot_drive=snapshot_path,
+                    allow_network=needs_network,
+                )
 
         return vm, resolved_ports, is_cold_boot
 
@@ -607,7 +675,8 @@ class Scheduler:
         return Settings(
             base_images_dir=images_dir,
             kernel_path=kernel_path,
-            snapshot_cache_dir=self.config.snapshot_cache_dir,
+            disk_snapshot_cache_dir=self.config.disk_snapshot_cache_dir,
+            memory_snapshot_cache_dir=self.config.memory_snapshot_cache_dir,
             s3_bucket=self.config.s3_bucket,
             s3_region=self.config.s3_region,
             max_concurrent_s3_uploads=self.config.max_concurrent_s3_uploads,
@@ -627,8 +696,6 @@ class Scheduler:
         Raises:
             PackageNotAllowedError: Package not in allowlist
         """
-        from exec_sandbox.package_validator import PackageValidator  # noqa: PLC0415
-
         validator = await PackageValidator.create()
         validator.validate(packages, language)
 
@@ -654,7 +721,7 @@ class Scheduler:
         snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
             language=language,
             packages=packages,
-            tenant_id="exec-sandbox",
+            tenant_id=constants.SCHEDULER_TENANT_ID,
             task_id=f"snapshot-{hash(tuple(sorted(packages)))}",
             memory_mb=memory_mb,
         )

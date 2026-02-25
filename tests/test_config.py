@@ -26,7 +26,7 @@ class TestSchedulerConfigValidation:
         assert config.default_memory_mb == 256
         assert config.default_timeout_seconds == 30
         assert config.images_dir is None
-        assert config.snapshot_cache_dir == Path("/tmp/exec-sandbox-cache")
+        assert config.disk_snapshot_cache_dir == Path("/tmp/exec-sandbox-cache/disk-snapshots")
         assert config.s3_bucket is None
         assert config.s3_region == "us-east-1"
         assert config.s3_prefix == "snapshots/"
