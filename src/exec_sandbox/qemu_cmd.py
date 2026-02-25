@@ -377,12 +377,16 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # remain here. See exec-sandbox.config for the full CONFIG↔cmdline map.
             #
             # Removed (enforced by CONFIG): init_on_alloc, init_on_free,
-            #   scsi_mod.scan, audit, transparent_hugepage, slab_nomerge,
-            #   nomodule, preempt, noresume, raid, numa_balancing, i8042.*,
-            #   random.trust_cpu, panic, rcupdate.rcu_expedited, edd,
-            #   noautogroup, io_delay
+            #   scsi_mod.scan, audit, slab_nomerge, nomodule, preempt,
+            #   noresume, raid, numa_balancing, i8042.*, random.trust_cpu,
+            #   panic, rcupdate.rcu_expedited, edd, noautogroup, io_delay
             # =============================================================
             f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            # THP: CONFIG_TRANSPARENT_HUGEPAGE=y enables EROFS large folios
+            # (16-64KB per fault instead of 4KB), but transparent_hugepage=never
+            # disables anonymous 2MB hugepages (no khugepaged, no compaction stalls).
+            # File-backed large folios work regardless of this sysfs setting.
+            + " transparent_hugepage=never"
             # Boot verbosity: debug_boot enables full kernel/init logging for diagnostics
             # Note: loglevel=7 overrides loglevel=1 set in console_params (kernel uses last occurrence)
             + (" loglevel=7" if debug_boot else " quiet loglevel=0")
