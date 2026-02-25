@@ -380,7 +380,7 @@ create_node_rootfs() {
     docker run --rm \
         -v "$rootfs_dir:/rootfs" \
         --platform "$docker_platform" \
-        "oven/bun:1.3-alpine" \
+        "oven/bun:${BUN_VERSION}-alpine" \
         sh -c "cp /usr/local/bin/bun /rootfs/usr/local/bin/bun"
 }
 
