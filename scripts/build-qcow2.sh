@@ -383,6 +383,12 @@ create_node_rootfs() {
         --platform "$docker_platform" \
         "oven/bun:${BUN_VERSION}-alpine" \
         sh -c "cp /usr/local/bin/bun /rootfs/usr/local/bin/bun"
+
+    # Note: No bytecode precompilation for Bun (unlike Python's compileall).
+    # Bun's --bytecode flag is a bundler feature that requires known entrypoints,
+    # there is no per-file "bun compileall" equivalent to walk node_modules.
+    # JSC's native parser is fast enough that cold-start impact is minimal.
+    # See: https://github.com/oven-sh/bun/issues/6798
 }
 
 # Create raw Alpine rootfs (no runtime)
