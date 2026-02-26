@@ -34,7 +34,7 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingMessage,
     WriteFileRequest,
 )
-from exec_sandbox.guest_channel import DualPortChannel, FileOpDispatcher
+from exec_sandbox.guest_channel import DualPortChannel, FileOpDispatcher, UnixSocketChannel
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 from exec_sandbox.session import Session
 
@@ -1518,3 +1518,72 @@ class TestOpIdDispatcherRouting:
         assert op_queue.empty()
 
         await dispatcher.stop()
+
+
+# ============================================================================
+# UnixSocketChannel — write worker failure handling
+# ============================================================================
+
+
+# Exception scenarios for dead write worker parametrize
+_DEAD_WORKER_CASES = [
+    pytest.param(asyncio.CancelledError(), "Write worker was cancelled", id="cancelled"),
+    pytest.param(ConnectionResetError("broken pipe"), "Write worker crashed: ConnectionResetError", id="crashed"),
+    pytest.param(None, "Write worker exited unexpectedly", id="clean-exit"),
+]
+
+
+class TestWriteWorkerFailureHandling:
+    """Tests for UnixSocketChannel behavior when the write worker is dead.
+
+    Covers the fail-fast checks at the top of send_request() and
+    stream_messages() that inspect _write_task.result() before proceeding.
+    """
+
+    @staticmethod
+    def _make_channel_with_dead_writer(
+        task_exception: BaseException | None = None,
+    ) -> UnixSocketChannel:
+        """Build a UnixSocketChannel whose write worker has already finished.
+
+        Args:
+            task_exception: If set, the write task finished with this exception.
+                If None, the task finished cleanly (no exception).
+        """
+        ch = UnixSocketChannel("/fake/socket.sock", expected_uid=0)
+        # Simulate connected state
+        ch._reader = asyncio.StreamReader()
+        ch._writer = MagicMock()
+
+        # Build a pre-resolved future to simulate a dead write worker.
+        # Using a Future (not Task) is fine — code under test only calls
+        # .done() and .result(), which are shared API.
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        if task_exception is not None:
+            fut.set_exception(task_exception)
+        else:
+            fut.set_result(None)
+        ch._write_task = fut  # type: ignore[assignment]  # Future, not Task — OK for test
+        return ch
+
+    @pytest.mark.parametrize("task_exception,expected_match", _DEAD_WORKER_CASES)
+    async def test_send_request_dead_write_worker(
+        self, task_exception: BaseException | None, expected_match: str
+    ) -> None:
+        """send_request() raises RuntimeError when write worker is dead."""
+        ch = self._make_channel_with_dead_writer(task_exception)
+
+        with pytest.raises(RuntimeError, match=expected_match):
+            await ch.send_request(PongMessage(version="1.0"))  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("task_exception,expected_match", _DEAD_WORKER_CASES)
+    async def test_stream_messages_dead_write_worker(
+        self, task_exception: BaseException | None, expected_match: str
+    ) -> None:
+        """stream_messages() raises RuntimeError when write worker is dead."""
+        ch = self._make_channel_with_dead_writer(task_exception)
+
+        with pytest.raises(RuntimeError, match=expected_match):
+            async for _ in ch.stream_messages(PongMessage(version="1.0"), timeout=5):  # type: ignore[arg-type]
+                pass

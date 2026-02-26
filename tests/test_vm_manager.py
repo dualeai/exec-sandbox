@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmDependencyError, VmError
+from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmDependencyError, VmError, VmQemuCrashError
 from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
@@ -2569,3 +2569,180 @@ class TestExecuteEnvVarValidation:
     async def test_adversarial_values_raise_env_var_validation_error(self, vm, env_vars: dict[str, str]) -> None:
         with pytest.raises(EnvVarValidationError):
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+
+
+# ============================================================================
+# Unit Tests - _wait_for_guest task racing
+# ============================================================================
+
+
+class TestWaitForGuest:
+    """Tests for _wait_for_guest death_task/guest_task racing logic.
+
+    Verifies correct behavior when QEMU dies, guest becomes ready,
+    or timeouts fire during boot wait.
+    """
+
+    @staticmethod
+    def _make_mock_vm(
+        process_wait_event: asyncio.Event | None = None,
+        returncode: int = 0,
+        connect_side_effect: object = None,
+        send_request_side_effect: object = None,
+    ) -> QemuVM:
+        """Build a QemuVM with mocked process and channel.
+
+        Args:
+            process_wait_event: If set, process.wait() blocks until event is set.
+                If None, process.wait() returns immediately (QEMU exits).
+            returncode: Process return code after exit.
+            connect_side_effect: Side effect for channel.connect().
+            send_request_side_effect: Side effect for channel.send_request().
+        """
+        from collections import deque
+
+        from exec_sandbox.guest_agent_protocol import PongMessage
+
+        mock_process = AsyncMock()
+        if process_wait_event is not None:
+
+            async def _blocking_wait() -> None:
+                await process_wait_event.wait()
+
+            mock_process.wait = AsyncMock(side_effect=_blocking_wait)
+        mock_process.returncode = returncode
+        mock_process.communicate = AsyncMock(return_value=(b"", b""))
+
+        mock_channel = AsyncMock()
+        if connect_side_effect is not None:
+            mock_channel.connect = AsyncMock(side_effect=connect_side_effect)
+        if send_request_side_effect is not None:
+            mock_channel.send_request = AsyncMock(side_effect=send_request_side_effect)
+        else:
+            mock_channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
+
+        mock_vm = AsyncMock(spec=QemuVM)
+        mock_vm.vm_id = "test-wait-for-guest"
+        mock_vm.process = mock_process
+        mock_vm.channel = mock_channel
+        mock_vm.console_lines = deque(maxlen=100)
+        return mock_vm
+
+    async def _wait_with_alive_process(
+        self, unit_test_vm_manager, vm, alive: asyncio.Event, timeout: float = 5
+    ) -> None:
+        """Call _wait_for_guest, ensuring the mock process is unblocked on exit."""
+        try:
+            await unit_test_vm_manager._wait_for_guest(vm, timeout=timeout)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            alive.set()
+
+    # ------------------------------------------------------------------
+    # Normal: guest becomes ready
+    # ------------------------------------------------------------------
+
+    async def test_guest_ready_immediately(self, unit_test_vm_manager) -> None:
+        """Guest responds to ping on first attempt."""
+        alive = asyncio.Event()
+        vm = self._make_mock_vm(process_wait_event=alive)
+        await self._wait_with_alive_process(unit_test_vm_manager, vm, alive)
+
+    async def test_guest_ready_after_retries(self, unit_test_vm_manager) -> None:
+        """Guest fails with retryable errors then succeeds."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+
+        alive = asyncio.Event()
+        attempts = iter(
+            [
+                OSError("connection refused"),
+                OSError("connection refused"),
+                PongMessage(version="1.0"),
+            ]
+        )
+
+        def side_effect(*_args, **_kwargs):
+            result = next(attempts)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        vm = self._make_mock_vm(process_wait_event=alive, send_request_side_effect=side_effect)
+        await self._wait_with_alive_process(unit_test_vm_manager, vm, alive)
+
+    # ------------------------------------------------------------------
+    # QEMU crashes — process exits before guest is ready
+    # ------------------------------------------------------------------
+
+    async def test_qemu_crash_raises_vm_error(self, unit_test_vm_manager) -> None:
+        """QEMU dies with non-zero exit code during boot."""
+        # Guest must not respond instantly, otherwise it wins the race
+        vm = self._make_mock_vm(returncode=1, connect_side_effect=OSError("connection refused"))
+
+        with pytest.raises(VmQemuCrashError):
+            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    async def test_qemu_crash_signal_raises_vm_error(self, unit_test_vm_manager) -> None:
+        """QEMU killed by signal (negative return code)."""
+        vm = self._make_mock_vm(returncode=-9, connect_side_effect=OSError("connection refused"))
+
+        with pytest.raises(VmQemuCrashError):
+            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    @patch("exec_sandbox.vm_manager.detect_host_os", return_value=HostOS.MACOS)
+    async def test_macos_clean_exit_during_boot_raises_vm_error(self, _mock_os, unit_test_vm_manager) -> None:
+        """macOS QEMU exits cleanly (code 0) during boot → must raise, not CancelledError.
+
+        Regression test: monitor_process_death() returned normally on macOS
+        with exit code 0, causing fall-through to await a cancelled guest_task.
+        Verifies:
+        - VmQemuCrashError is raised (not CancelledError)
+        - Error message contains "clean exit"
+        - Error context includes host_os for diagnostics
+        """
+        vm = self._make_mock_vm(returncode=0)
+
+        with pytest.raises(VmQemuCrashError, match="clean exit") as exc_info:
+            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+        assert exc_info.value.context.get("host_os") == "macos"
+
+    @patch("exec_sandbox.vm_manager.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.TCG)
+    @patch("exec_sandbox.vm_manager.detect_host_os", return_value=HostOS.LINUX)
+    async def test_tcg_clean_exit_during_boot_raises_vm_error(
+        self, _mock_os, _mock_accel, unit_test_vm_manager
+    ) -> None:
+        """TCG exits with code 0 during boot (ARM64 timing race)."""
+        vm = self._make_mock_vm(returncode=0)
+
+        with pytest.raises(VmQemuCrashError):
+            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    # ------------------------------------------------------------------
+    # Timeout — guest never becomes ready
+    # ------------------------------------------------------------------
+
+    async def test_timeout_when_guest_never_ready(self, unit_test_vm_manager) -> None:
+        """Guest never responds, timeout fires."""
+        alive = asyncio.Event()
+        vm = self._make_mock_vm(
+            process_wait_event=alive,
+            connect_side_effect=OSError("connection refused"),
+        )
+
+        with pytest.raises(TimeoutError):
+            await self._wait_with_alive_process(unit_test_vm_manager, vm, alive, timeout=0.5)
+
+    # ------------------------------------------------------------------
+    # Edge: non-retryable guest error
+    # ------------------------------------------------------------------
+
+    async def test_non_retryable_guest_error_propagates(self, unit_test_vm_manager) -> None:
+        """Guest check raises non-retryable error (not in tenacity retry list)."""
+        alive = asyncio.Event()
+        vm = self._make_mock_vm(
+            process_wait_event=alive,
+            send_request_side_effect=ValueError("unexpected protocol error"),
+        )
+
+        with pytest.raises(ValueError, match="unexpected protocol error"):
+            await self._wait_with_alive_process(unit_test_vm_manager, vm, alive)

@@ -5,6 +5,7 @@ the gvproxy-wrapper process that provides network connectivity with outbound fil
 """
 
 import asyncio
+import contextlib
 import json
 
 from exec_sandbox._logging import get_logger
@@ -20,7 +21,7 @@ from exec_sandbox.vm_working_directory import VmWorkingDirectory
 logger = get_logger(__name__)
 
 
-async def start_gvproxy(
+async def start_gvproxy(  # noqa: PLR0915
     vm_id: str,
     allowed_domains: list[str] | None,
     language: str,
@@ -231,10 +232,18 @@ async def start_gvproxy(
                 "socket_path": str(socket_path),
             },
         ) from None
-
-    # Close parent's copy of FD now that gvproxy is fully initialized
-    # (child has its own via pass_fds, socket stays alive)
-    parent_sock.close()
+    except BaseException:
+        # CancelledError or other unexpected exception — clean up socket and process
+        parent_sock.close()
+        with contextlib.suppress(ProcessLookupError):
+            await proc.terminate()
+        with contextlib.suppress(ProcessLookupError):
+            await proc.wait()
+        raise
+    else:
+        # Close parent's copy of FD now that gvproxy is fully initialized
+        # (child has its own via pass_fds, socket stays alive)
+        parent_sock.close()
 
     # Grant qemu-vm user access to socket via ACL (more secure than chmod 666)
     # Only needed on Linux when qemu-vm user exists; skipped on macOS

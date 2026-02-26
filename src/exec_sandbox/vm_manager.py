@@ -1278,15 +1278,19 @@ class VmManager:
             """Monitor QEMU process death - kernel-notified, instant."""
             await vm.process.wait()
 
-            # macOS HVF: Clean QEMU exit (code 0) is expected with -no-reboot
-            # when VM shuts down normally after execution completes.
+            # macOS HVF: QEMU exits with code 0 when -no-reboot is set.
+            # This closure is only used during boot (inside _wait_for_guest),
+            # where any QEMU exit is an error — raise to trigger tenacity retry.
             host_os = detect_host_os()
             if host_os == HostOS.MACOS and vm.process.returncode == 0:
-                logger.info(
-                    "QEMU process exited cleanly (expected on macOS with -no-reboot)",
-                    extra={"vm_id": vm.vm_id, "exit_code": 0},
+                logger.warning(
+                    "QEMU exited with code 0 during boot on macOS (will retry)",
+                    extra={"vm_id": vm.vm_id, "exit_code": 0, "host_os": "macos"},
                 )
-                return
+                raise VmQemuCrashError(
+                    "QEMU process exited during boot (macOS clean exit)",
+                    context={"vm_id": vm.vm_id, "exit_code": 0, "host_os": "macos"},
+                )
 
             # TCG emulation: Exit code 0 during boot indicates timing race on
             # ARM64 GIC/virtio-MMIO initialization (translation cache pressure,
@@ -1393,6 +1397,12 @@ class VmManager:
                             with contextlib.suppress(BaseException):
                                 await guest_task
                             await death_task  # Re-raise VmError
+                            # Safety net: monitor_process_death should always raise,
+                            # but guard against future code paths that return normally.
+                            raise VmQemuCrashError(
+                                "QEMU process exited during boot (clean exit)",
+                                context={"vm_id": vm.vm_id, "exit_code": vm.process.returncode},
+                            )
 
                         # Guest task completed - check result (raises if failed, triggering retry)
                         await guest_task
