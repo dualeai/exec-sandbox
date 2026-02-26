@@ -52,31 +52,41 @@ class TestGetCacheDir:
 
     def test_darwin_platform(self):
         """Should use Library/Caches on macOS."""
-        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.MACOS):
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.MACOS):
             with patch.dict("os.environ", {}, clear=True):
                 result = get_cache_dir()
                 assert "Library/Caches" in str(result)
 
     def test_linux_platform(self):
         """Should use .cache on Linux."""
-        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.LINUX):
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {}, clear=True):
                 result = get_cache_dir()
                 assert ".cache" in str(result)
 
     def test_linux_xdg_cache_home(self):
         """Should respect XDG_CACHE_HOME on Linux."""
-        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.LINUX):
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg/cache"}):
                 result = get_cache_dir()
                 assert result == Path("/xdg/cache/exec-sandbox")
 
     def test_unknown_platform_fallback(self):
         """Should fall back to .cache on unknown platforms."""
-        with patch("exec_sandbox.asset_downloader.detect_host_os", return_value=HostOS.UNKNOWN):
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.UNKNOWN):
             with patch.dict("os.environ", {}, clear=True):
                 result = get_cache_dir()
                 assert ".cache" in str(result)
+
+
+class TestGetCacheDirReExport:
+    """Tests for get_cache_dir re-export from platform_utils."""
+
+    def test_reexport_identity(self):
+        """get_cache_dir in asset_downloader is the same object as in platform_utils."""
+        from exec_sandbox.platform_utils import get_cache_dir as platform_get_cache_dir
+
+        assert get_cache_dir is platform_get_cache_dir
 
 
 class TestOsCache:

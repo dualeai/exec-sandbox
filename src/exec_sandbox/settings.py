@@ -3,9 +3,11 @@
 from pathlib import Path
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from exec_sandbox import constants
+from exec_sandbox.platform_utils import get_cache_dir
 
 
 class Settings(BaseSettings):
@@ -31,9 +33,9 @@ class Settings(BaseSettings):
     kernel_path: Path = Path("/images/kernels")
     base_images_dir: Path = Path("/images")  # qcow2 base images
 
-    # Execution — both caches under /tmp/exec-sandbox-cache/
-    disk_snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-cache/disk-snapshots")  # noqa: S108
-    memory_snapshot_cache_dir: Path = Path("/tmp/exec-sandbox-cache/memory-snapshots")  # noqa: S108
+    # Execution — both caches under OS-specific cache directory
+    disk_snapshot_cache_dir: Path = Field(default_factory=lambda: get_cache_dir() / "disk-snapshots")
+    memory_snapshot_cache_dir: Path = Field(default_factory=lambda: get_cache_dir() / "memory-snapshots")
 
     # Snapshot cache (2-tier: L2=local disk, L3=S3)
     snapshot_cache_ttl_days: int = 14  # AWS Lambda SnapStart pattern

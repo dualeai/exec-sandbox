@@ -382,7 +382,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
-| `snapshot_cache_dir` | /tmp/exec-sandbox-cache | Local snapshot cache |
+| `snapshot_cache_dir` | OS cache dir (see below) | Local snapshot cache (macOS: ~/Library/Caches/exec-sandbox/, Linux: ~/.cache/exec-sandbox/) |
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |

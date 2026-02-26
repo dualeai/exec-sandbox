@@ -14,13 +14,11 @@ import os
 import platform
 from enum import Enum, auto
 from functools import cache
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import Literal
 
 import psutil
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class HostOS(Enum):
@@ -145,6 +143,32 @@ def get_arch_name(convention: Literal["kernel", "go"] = "kernel") -> str:
             return "aarch64"
         case _:
             raise ValueError(f"Unsupported architecture: {arch}")
+
+
+def get_cache_dir(app_name: str = "exec-sandbox") -> Path:
+    """Get platform-specific cache directory.
+
+    Returns:
+        - macOS: ~/Library/Caches/<app_name>/
+        - Linux: ~/.cache/<app_name>/ (or $XDG_CACHE_HOME/<app_name>/)
+
+    Override with EXEC_SANDBOX_CACHE_DIR environment variable.
+    """
+    if env_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
+        return Path(env_path)
+
+    match detect_host_os():
+        case HostOS.MACOS:
+            return Path.home() / "Library" / "Caches" / app_name
+        case HostOS.LINUX:
+            # XDG_CACHE_HOME takes precedence if set
+            xdg_cache = os.environ.get("XDG_CACHE_HOME")
+            if xdg_cache:
+                return Path(xdg_cache) / app_name
+            return Path.home() / ".cache" / app_name
+        case _:
+            # Fallback for other platforms
+            return Path.home() / ".cache" / app_name
 
 
 # ---------------------------------------------------------------------------
