@@ -58,6 +58,7 @@ from exec_sandbox.exceptions import SocketAuthError
 from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage, WarmReplAckMessage, WarmReplRequest
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
+from exec_sandbox.platform_utils import advise_willneed
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -176,11 +177,29 @@ class WarmVMPool:
 
         boot_start = asyncio.get_running_loop().time()
 
-        # Build list of all VMs to boot (parallel execution)
+        # Pre-warm vmstate files into kernel page cache so concurrent L1
+        # restores hit RAM instead of storage.  advise_willneed() issues an
+        # async, zero-copy kernel readahead (F_RDADVISE on macOS,
+        # posix_fadvise WILLNEED on Linux) and returns near-instantly; the
+        # 15ms boot stagger below gives the kernel time to complete the I/O.
+        if self.memory_snapshot_manager:
+            for language in Language:
+                vmstate = await self.memory_snapshot_manager.check_cache(language, [], constants.DEFAULT_MEMORY_MB)
+                if vmstate:
+                    advise_willneed(vmstate)
+
+        # Build list of all VMs to boot, staggered by 15ms to avoid macOS dyld
+        # contention.  Each QEMU fork+exec resolves ~170 dylibs under a global
+        # dyld lock; overlapping spawns serialize on that lock and degrade from
+        # ~150ms to 250-400ms per VM.  15ms ≈ single-process dyld resolve time,
+        # so the next spawn starts just as the previous one releases the lock.
         boot_coroutines: list[Coroutine[Any, Any, None]] = []
+        boot_order = 0
         for language in Language:
             logger.info(f"Pre-booting {self.pool_size_per_language} {language.value} VMs (parallel)")
-            boot_coroutines.extend(self._boot_and_add_vm(language, index=i) for i in range(self.pool_size_per_language))
+            for i in range(self.pool_size_per_language):
+                boot_coroutines.append(self._boot_and_add_vm(language, index=i, boot_delay=boot_order * 0.015))
+                boot_order += 1
 
         # Boot all VMs in parallel
         results: list[None | BaseException] = await asyncio.gather(*boot_coroutines, return_exceptions=True)
@@ -377,6 +396,7 @@ class WarmVMPool:
         self,
         language: Language,
         index: int,
+        boot_delay: float = 0,
     ) -> None:
         """Boot VM and add to pool (used for parallel startup).
 
@@ -386,7 +406,10 @@ class WarmVMPool:
         Args:
             language: Programming language enum
             index: VM index in pool (for unique ID)
+            boot_delay: Seconds to wait before booting (staggers fork/exec)
         """
+        if boot_delay > 0:
+            await asyncio.sleep(boot_delay)
         vm: QemuVM | None = None
         try:
             vm = await self._boot_warm_vm(language, index)

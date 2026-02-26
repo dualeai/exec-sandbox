@@ -286,7 +286,7 @@ class MigrationClient:
         logger.info("VM state restored", extra={"vmstate_path": str(vmstate_path)})
 
     async def _poll_migration(self, timeout: float) -> None:
-        """Poll query-migrate at 50ms intervals until completed/failed.
+        """Poll query-migrate at 5ms intervals until completed/failed.
 
         Raises:
             MigrationTransientError: Migration failed or timed out

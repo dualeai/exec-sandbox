@@ -1,14 +1,21 @@
-"""Subprocess output handling utilities.
+"""Subprocess lifecycle utilities.
 
-Provides concurrent stdout/stderr draining to prevent pipe buffer deadlocks.
-Follows best practices from Python 3.11+ asyncio.TaskGroup pattern.
+- drain_subprocess_output: concurrent stdout/stderr draining (prevents 64KB pipe deadlock)
+- wait_for_socket: poll for a Unix socket created by a child process after fork+exec
 """
 
+from __future__ import annotations
+
 import asyncio
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.platform_utils import ProcessWrapper
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
 
@@ -122,3 +129,50 @@ def log_task_exception(task: asyncio.Task[None]) -> None:
             extra={"task_name": task.get_name()},
             exc_info=exc,
         )
+
+
+async def wait_for_socket(
+    path: Path,
+    *,
+    timeout: float,
+    poll_interval: float = 0.002,
+    abort_check: Callable[[], None] | None = None,
+) -> None:
+    """Wait for a Unix socket to appear and accept connections.
+
+    Used after fork+exec of QEMU or QSD to wait for the process to create its
+    QMP control socket. Polls the filesystem because there is no async event
+    to await (the file is created by an external process).
+
+    Two-phase wait: first the socket file must exist, then a probe-connect
+    must succeed. This closes the TOCTOU gap between file creation and
+    listen() completion that caused spurious ConnectionRefusedError under load.
+
+    Args:
+        path: Path to the socket file.
+        timeout: Maximum seconds to wait before raising TimeoutError.
+        poll_interval: Seconds between checks (default 2ms).
+        abort_check: Optional callable invoked each poll iteration. Should raise
+            to abort the wait early (e.g. when the spawning process has died).
+
+    Raises:
+        TimeoutError: Socket did not appear or accept connections within *timeout* seconds.
+    """
+    async with asyncio.timeout(timeout):
+        # Phase 1: wait for socket file to exist
+        while not path.exists():
+            if abort_check is not None:
+                abort_check()
+            await asyncio.sleep(poll_interval)
+
+        # Phase 2: verify socket accepts connections
+        while True:
+            if abort_check is not None:
+                abort_check()
+            try:
+                _r, w = await asyncio.open_unix_connection(str(path))
+                w.close()
+                await w.wait_closed()
+                return
+            except (ConnectionRefusedError, ConnectionResetError):
+                await asyncio.sleep(poll_interval)

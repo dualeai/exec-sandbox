@@ -71,7 +71,7 @@ from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
-from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception
+from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, wait_for_socket
 from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
@@ -784,7 +784,7 @@ class VmManager:
                     cgroup_path=infra.cgroup_path,
                 )
 
-    async def restore_vm(  # noqa: PLR0915 - linear sequence, splitting adds indirection
+    async def restore_vm(
         self,
         language: Language,
         tenant_id: str,
@@ -890,9 +890,7 @@ class VmManager:
             # Wait for QMP socket to exist (QEMU needs a few ms after fork)
             qemu_version = await probe_qemu_version()
             try:
-                async with asyncio.timeout(5.0):
-                    while not vm.qmp_socket.exists():  # noqa: ASYNC110 - polling filesystem, not async event
-                        await asyncio.sleep(0.01)
+                await wait_for_socket(vm.qmp_socket, timeout=5.0)
             except TimeoutError as e:
                 await vm.destroy()
                 raise VmTransientError(

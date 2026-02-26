@@ -268,8 +268,8 @@ MEMORY_SNAPSHOT_RESTORE_TIMEOUT_SECONDS: Final[float] = 30.0
 MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
 """Timeout for individual QMP commands during migration."""
 
-MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
-"""Interval between query-migrate polls (50ms)."""
+MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.005
+"""Interval between query-migrate polls (5ms)."""
 
 MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
 """Minimum QEMU version for mapped-ram + multifd migration capabilities.

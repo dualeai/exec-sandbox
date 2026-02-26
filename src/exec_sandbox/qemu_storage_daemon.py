@@ -46,6 +46,7 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import VmOverlayError as QemuStorageDaemonError
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.process_registry import register_process, unregister_process
+from exec_sandbox.subprocess_utils import wait_for_socket
 
 logger = get_logger(__name__)
 
@@ -307,18 +308,17 @@ class QemuStorageDaemon:
         Raises:
             QemuStorageDaemonError: If socket doesn't appear within timeout
         """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            if self._socket_path and self._socket_path.exists():
-                return
-            # Check if process died
+        if not self._socket_path:
+            raise QemuStorageDaemonError("No socket path configured")
+
+        def _check_process_alive() -> None:
             if self._process and self._process.returncode is not None:
                 raise QemuStorageDaemonError(f"Daemon process exited with code {self._process.returncode}")
-            await asyncio.sleep(0.05)
-        raise QemuStorageDaemonError(
-            f"Daemon socket not ready after {timeout}s",
-        )
+
+        try:
+            await wait_for_socket(self._socket_path, timeout=timeout, abort_check=_check_process_alive)
+        except TimeoutError as e:
+            raise QemuStorageDaemonError(f"Daemon socket not ready after {timeout}s") from e
 
     async def _connect_qmp(self) -> None:
         """Establish QMP connection and complete handshake.

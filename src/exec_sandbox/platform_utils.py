@@ -4,15 +4,23 @@ Uses psutil's built-in OS detection constants for robust platform identification
 Provides PID-reuse safe process management wrappers.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
+import ctypes
+import ctypes.util
+import os
 import platform
 from enum import Enum, auto
 from functools import cache
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import psutil
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class HostOS(Enum):
@@ -137,6 +145,68 @@ def get_arch_name(convention: Literal["kernel", "go"] = "kernel") -> str:
             return "aarch64"
         case _:
             raise ValueError(f"Unsupported architecture: {arch}")
+
+
+# ---------------------------------------------------------------------------
+# Page-cache advisory prefetch
+# ---------------------------------------------------------------------------
+#
+# Asks the kernel to asynchronously read a file into the page cache (zero-copy,
+# returns near-instantly).  Used before concurrent QEMU restores so that every
+# process hits RAM instead of storage.
+#
+# macOS: fcntl(fd, F_RDADVISE=44, struct radvisory{off_t, int})
+#        — "Issue an advisory read async with no copy to user"
+#        — F_RDADVISE is not exposed by Python's fcntl module (cpython#113092),
+#          so we call libc directly via ctypes.
+# Linux: os.posix_fadvise(fd, 0, size, POSIX_FADV_WILLNEED)
+#        — Recent kernels (≥3.x) perform truly async readahead.
+#
+# References:
+#   darwin-xnu  bsd/sys/fcntl.h  (F_RDADVISE = 44, struct radvisory)
+#   PostgreSQL  commit 2024-08-27 "Add prefetching support on macOS"
+
+# macOS ctypes plumbing (module-level so the CDLL is loaded once)
+_F_RDADVISE = 44  # from darwin-xnu/bsd/sys/fcntl.h
+
+
+class _Radvisory(ctypes.Structure):
+    """macOS struct radvisory { off_t ra_offset; int ra_count; }."""
+
+    _fields_ = [  # noqa: RUF012 - ctypes protocol requires mutable _fields_
+        ("ra_offset", ctypes.c_int64),  # off_t
+        ("ra_count", ctypes.c_int),  # int
+    ]
+
+
+_libc_path = ctypes.util.find_library("c")
+_libc = ctypes.CDLL(_libc_path) if _libc_path else None
+
+
+def advise_willneed(path: Path) -> None:
+    """Ask the kernel to prefetch *path* into the page cache.
+
+    Non-blocking, zero-copy.  The kernel schedules background I/O and the call
+    returns near-instantly; actual disk reads happen asynchronously.
+
+    Best-effort: silently ignored on unsupported platforms or on failure (the
+    file is advisory, not required — QEMU will simply read from disk).
+    """
+    fd = -1
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        size = os.fstat(fd).st_size
+        host = detect_host_os()
+        if host is HostOS.MACOS and _libc is not None:
+            advisory = _Radvisory(ra_offset=0, ra_count=min(size, 2**31 - 1))
+            _libc.fcntl(fd, _F_RDADVISE, ctypes.byref(advisory))
+        elif host is HostOS.LINUX:
+            os.posix_fadvise(fd, 0, size, os.POSIX_FADV_WILLNEED)  # type: ignore[attr-defined]
+    except OSError:
+        pass  # Advisory — silently degrade
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 # Transient psutil exceptions that may occur during process inspection
