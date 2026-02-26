@@ -24,34 +24,34 @@ from exec_sandbox.scheduler import Scheduler
 class TestDangerousDeviceNodes:
     """Dangerous device nodes are removed by tiny-init after devtmpfs mount."""
 
-    async def test_dev_mem_not_exists(self, scheduler: Scheduler) -> None:
+    async def test_dev_mem_not_exists(self, dual_scheduler: Scheduler) -> None:
         """/dev/mem (raw physical memory) must not exist."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.path.exists('/dev/mem'))",
             language=Language.PYTHON,
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
 
-    async def test_dev_kmem_not_exists(self, scheduler: Scheduler) -> None:
+    async def test_dev_kmem_not_exists(self, dual_scheduler: Scheduler) -> None:
         """/dev/kmem (kernel virtual memory) must not exist."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.path.exists('/dev/kmem'))",
             language=Language.PYTHON,
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
 
-    async def test_dev_port_not_exists(self, scheduler: Scheduler) -> None:
+    async def test_dev_port_not_exists(self, dual_scheduler: Scheduler) -> None:
         """/dev/port (raw I/O port access) must not exist."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.path.exists('/dev/port'))",
             language=Language.PYTHON,
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
 
-    async def test_dev_mem_open_fails(self, scheduler: Scheduler) -> None:
+    async def test_dev_mem_open_fails(self, dual_scheduler: Scheduler) -> None:
         """open('/dev/mem') fails even if node is somehow recreated (defense-in-depth)."""
         code = """\
 try:
@@ -61,7 +61,7 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -80,25 +80,25 @@ with open('/proc/mounts') as f:
             break
 """
 
-    async def test_noexec_flag(self, scheduler: Scheduler) -> None:
+    async def test_noexec_flag(self, dual_scheduler: Scheduler) -> None:
         """/dev/shm has noexec mount flag."""
-        result = await scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "noexec" in result.stdout
 
-    async def test_nosuid_flag(self, scheduler: Scheduler) -> None:
+    async def test_nosuid_flag(self, dual_scheduler: Scheduler) -> None:
         """/dev/shm has nosuid mount flag."""
-        result = await scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "nosuid" in result.stdout
 
-    async def test_nodev_flag(self, scheduler: Scheduler) -> None:
+    async def test_nodev_flag(self, dual_scheduler: Scheduler) -> None:
         """/dev/shm has nodev mount flag."""
-        result = await scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "nodev" in result.stdout
 
-    async def test_exec_blocked_on_dev_shm(self, scheduler: Scheduler) -> None:
+    async def test_exec_blocked_on_dev_shm(self, dual_scheduler: Scheduler) -> None:
         """Script execution is blocked on /dev/shm (noexec enforcement)."""
         code = """\
 import os, stat, subprocess
@@ -117,11 +117,11 @@ except OSError as e:
     else:
         print(f"error={e}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
-    async def test_multiprocessing_pool_still_works(self, scheduler: Scheduler) -> None:
+    async def test_multiprocessing_pool_still_works(self, dual_scheduler: Scheduler) -> None:
         """multiprocessing.Pool works despite noexec on /dev/shm (regression canary).
 
         POSIX semaphores use shm_open() + mmap(), not execve(), so noexec
@@ -137,7 +137,7 @@ with Pool(processes=2) as pool:
     result = pool.map(square, [1, 2, 3, 4, 5])
 print(result)
 """
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
             timeout_seconds=30,
@@ -162,19 +162,19 @@ with open('/proc/mounts') as f:
 
     # --- Normal cases: verify mount options are applied ---
 
-    async def test_nosuid_flag(self, scheduler: Scheduler) -> None:
+    async def test_nosuid_flag(self, dual_scheduler: Scheduler) -> None:
         """/tmp has nosuid mount flag (CIS 1.1.4)."""
-        result = await scheduler.run(code=self.TMP_MOUNT_LINE, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=self.TMP_MOUNT_LINE, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "nosuid" in result.stdout
 
-    async def test_nodev_flag(self, scheduler: Scheduler) -> None:
+    async def test_nodev_flag(self, dual_scheduler: Scheduler) -> None:
         """/tmp has nodev mount flag (CIS 1.1.3)."""
-        result = await scheduler.run(code=self.TMP_MOUNT_LINE, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=self.TMP_MOUNT_LINE, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "nodev" in result.stdout
 
-    async def test_no_noexec_flag(self, scheduler: Scheduler) -> None:
+    async def test_no_noexec_flag(self, dual_scheduler: Scheduler) -> None:
         """/tmp does NOT have noexec (would break uv wheel install, PyInstaller)."""
         code = """\
 with open('/proc/mounts') as f:
@@ -185,25 +185,25 @@ with open('/proc/mounts') as f:
             print(f'NOEXEC_PRESENT:{"noexec" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NOEXEC_PRESENT:False" in result.stdout
 
-    async def test_sticky_bit(self, scheduler: Scheduler) -> None:
+    async def test_sticky_bit(self, dual_scheduler: Scheduler) -> None:
         """/tmp has sticky bit (mode 1777) preventing cross-user file deletion."""
         code = "import os, stat; s = os.stat('/tmp'); print(f'{stat.S_IMODE(s.st_mode):o}')"
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "1777"
 
-    async def test_inode_limit_is_explicit(self, scheduler: Scheduler) -> None:
+    async def test_inode_limit_is_explicit(self, dual_scheduler: Scheduler) -> None:
         """Verify /tmp has an explicit inode limit via statvfs (not unlimited)."""
         code = "import os; s = os.statvfs('/tmp'); print(f'INODES:{s.f_files}')"
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "INODES:16384"
 
-    async def test_tmpfs_size_128m(self, scheduler: Scheduler) -> None:
+    async def test_tmpfs_size_128m(self, dual_scheduler: Scheduler) -> None:
         """Verify /tmp size is 128MB."""
         code = """\
 import os
@@ -211,13 +211,13 @@ s = os.statvfs('/tmp')
 size_mb = (s.f_blocks * s.f_frsize) / (1024 * 1024)
 print(f'SIZE_MB:{size_mb:.0f}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "SIZE_MB:128"
 
     # --- Normal cases: verify functionality is preserved ---
 
-    async def test_exec_works_on_tmp(self, scheduler: Scheduler) -> None:
+    async def test_exec_works_on_tmp(self, dual_scheduler: Scheduler) -> None:
         """Script execution works on /tmp (noexec NOT set)."""
         code = """\
 import os, stat, subprocess
@@ -228,11 +228,11 @@ os.chmod(path, stat.S_IRWXU)
 r = subprocess.run([path], capture_output=True, text=True, timeout=5)
 print(r.stdout.strip())
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXEC_OK" in result.stdout
 
-    async def test_tempfile_module_works(self, scheduler: Scheduler) -> None:
+    async def test_tempfile_module_works(self, dual_scheduler: Scheduler) -> None:
         """Python tempfile module works normally on /tmp."""
         code = """\
 import tempfile, os
@@ -243,14 +243,14 @@ print(f'CREATED:{os.path.exists(name)}')
 os.unlink(name)
 print(f'DELETED:{not os.path.exists(name)}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "CREATED:True" in result.stdout
         assert "DELETED:True" in result.stdout
 
     # --- Edge cases: boundary conditions ---
 
-    async def test_inode_exhaustion_produces_oserror(self, scheduler: Scheduler) -> None:
+    async def test_inode_exhaustion_produces_oserror(self, dual_scheduler: Scheduler) -> None:
         """Creating files beyond inode limit produces OSError (ENOSPC), not crash."""
         code = """\
 import os
@@ -265,7 +265,7 @@ except OSError as e:
     print(f'FILE_LIMIT:{count}')
     print(f'ERRNO:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "FILE_LIMIT:NONE:" not in result.stdout
         assert "FILE_LIMIT:" in result.stdout
@@ -275,7 +275,7 @@ except OSError as e:
         # ENOSPC = errno 28
         assert "ERRNO:28" in result.stdout
 
-    async def test_files_still_writable_below_inode_limit(self, scheduler: Scheduler) -> None:
+    async def test_files_still_writable_below_inode_limit(self, dual_scheduler: Scheduler) -> None:
         """Can create ~1000 files and write data to them (well within 16K limit)."""
         code = """\
 import os
@@ -287,14 +287,14 @@ with open('/tmp/data_999.txt') as f:
     print(f'CONTENT:{f.read()}')
 print(f'COUNT:{len(os.listdir("/tmp"))}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "CONTENT:content_999" in result.stdout
         assert "COUNT:" in result.stdout, f"stdout: {result.stdout}"
         count = int(result.stdout.split("COUNT:")[1].strip())
         assert count >= 1000
 
-    async def test_subdirectories_consume_inodes(self, scheduler: Scheduler) -> None:
+    async def test_subdirectories_consume_inodes(self, dual_scheduler: Scheduler) -> None:
         """Directories consume inodes too — mkdir counts against nr_inodes."""
         code = """\
 import os
@@ -307,7 +307,7 @@ try:
 except OSError:
     print(f'DIR_LIMIT:{count}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "DIR_LIMIT:" in result.stdout, f"stdout: {result.stdout}"
         count = int(result.stdout.split("DIR_LIMIT:")[1].strip())
@@ -315,7 +315,7 @@ except OSError:
 
     # --- Weird cases: unusual patterns ---
 
-    async def test_rapid_create_delete_cycle(self, scheduler: Scheduler) -> None:
+    async def test_rapid_create_delete_cycle(self, dual_scheduler: Scheduler) -> None:
         """Rapid create/delete cycles reclaim inodes correctly."""
         code = """\
 import os
@@ -327,11 +327,11 @@ for i in range(50000):
     os.unlink(path)
 print('CYCLE_OK')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
         assert result.exit_code == 0
         assert "CYCLE_OK" in result.stdout
 
-    async def test_symlinks_consume_inodes(self, scheduler: Scheduler) -> None:
+    async def test_symlinks_consume_inodes(self, dual_scheduler: Scheduler) -> None:
         """Symlinks consume inodes from the same pool."""
         code = """\
 import os
@@ -346,14 +346,14 @@ try:
 except OSError:
     print(f'SYMLINK_LIMIT:{count}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "SYMLINK_LIMIT:" in result.stdout, f"stdout: {result.stdout}"
         count = int(result.stdout.split("SYMLINK_LIMIT:")[1].strip())
         # 1 target file + N symlinks; should exhaust near 16384
         assert 16000 <= count <= 16384
 
-    async def test_hardlinks_consume_inodes(self, scheduler: Scheduler) -> None:
+    async def test_hardlinks_consume_inodes(self, dual_scheduler: Scheduler) -> None:
         """Hard links on tmpfs consume inodes (each dentry needs its own inode).
 
         Unlike on-disk filesystems, tmpfs allocates a new inode per dentry,
@@ -372,7 +372,7 @@ s_after = os.statvfs('/tmp')
 inodes_used = s_before.f_ffree - s_after.f_ffree
 print(f'INODES_USED:{inodes_used}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INODES_USED:" in result.stdout, f"stdout: {result.stdout}"
         inodes_used = int(result.stdout.split("INODES_USED:")[1].strip())
@@ -380,7 +380,7 @@ print(f'INODES_USED:{inodes_used}')
         # (tmpfs calls shmem_reserve_inode() per link, unlike on-disk filesystems)
         assert inodes_used == 101
 
-    async def test_empty_files_same_cost_as_large_files(self, scheduler: Scheduler) -> None:
+    async def test_empty_files_same_cost_as_large_files(self, dual_scheduler: Scheduler) -> None:
         """Empty files consume 1 inode each — same as files with data."""
         code = """\
 import os
@@ -396,7 +396,7 @@ s_after = os.statvfs('/tmp')
 inodes_used = s_before.f_ffree - s_after.f_ffree
 print(f'INODES_USED:{inodes_used}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INODES_USED:" in result.stdout, f"stdout: {result.stdout}"
         inodes_used = int(result.stdout.split("INODES_USED:")[1].strip())
@@ -405,7 +405,7 @@ print(f'INODES_USED:{inodes_used}')
 
     # --- Out of bounds: security enforcement ---
 
-    async def test_mknod_blocked(self, scheduler: Scheduler) -> None:
+    async def test_mknod_blocked(self, dual_scheduler: Scheduler) -> None:
         """Device node creation on /tmp fails (nodev + non-root, defense-in-depth).
 
         Non-root lacks CAP_MKNOD (primary block). The nodev mount flag is a
@@ -422,11 +422,11 @@ except PermissionError:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert result.stdout.startswith("BLOCKED:")
 
-    async def test_suid_bit_ignored_on_tmp(self, scheduler: Scheduler) -> None:
+    async def test_suid_bit_ignored_on_tmp(self, dual_scheduler: Scheduler) -> None:
         """SUID bit on /tmp binaries is ignored during execve() due to nosuid.
 
         Copies a real ELF binary (id) to /tmp, sets SUID, and executes it.
@@ -452,14 +452,14 @@ print(f'OUTPUT:{r.stdout.strip()}')
 # id(1) prints "euid=0(root)" only when effective UID differs from real UID.
 print(f'NO_ROOT_EUID:{"euid=0" not in r.stdout}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "SUID_BIT_SET:True" in result.stdout
         assert "NO_ROOT_EUID:True" in result.stdout
 
-    async def test_inode_exhaustion_doesnt_crash_vm(self, scheduler: Scheduler) -> None:
+    async def test_inode_exhaustion_doesnt_crash_vm(self, dual_scheduler: Scheduler) -> None:
         """Exhausting /tmp inodes doesn't crash the VM — other paths still work."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await dual_scheduler.session(language=Language.PYTHON) as session:
             # Step 1: Exhaust inodes
             exhaust = """\
 import os
@@ -519,25 +519,25 @@ class TestBlockDeviceHardening:
 
     # --- Normal cases: device nodes removed and filesystem still works ---
 
-    async def test_dev_vda_not_exists(self, scheduler: Scheduler) -> None:
+    async def test_dev_vda_not_exists(self, dual_scheduler: Scheduler) -> None:
         """/dev/vda (root block device) must not exist after mount."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.path.exists('/dev/vda'))",
             language=Language.PYTHON,
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
 
-    async def test_zram_swap_active(self, scheduler: Scheduler) -> None:
+    async def test_zram_swap_active(self, dual_scheduler: Scheduler) -> None:
         """zram swap is active — guest-agent sets up /dev/zram0 then removes the device node for security."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('zram0' in open('/proc/swaps').read())",
             language=Language.PYTHON,
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "True"
 
-    async def test_filesystem_still_works(self, scheduler: Scheduler) -> None:
+    async def test_filesystem_still_works(self, dual_scheduler: Scheduler) -> None:
         """Read/write on the root filesystem works after /dev/vda removal."""
         code = """\
 import os
@@ -549,23 +549,23 @@ with open(path) as f:
 os.unlink(path)
 print(f'OK:{data}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "OK:block device node removed" in result.stdout
 
     # --- Edge cases: alternative paths to block device are closed ---
 
-    async def test_dev_block_symlinks_broken(self, scheduler: Scheduler) -> None:
+    async def test_dev_block_symlinks_broken(self, dual_scheduler: Scheduler) -> None:
         """/dev/block/ directory is removed by tiny-init (eliminates symlink access path)."""
         code = """\
 import os
 print(f'EXISTS:{os.path.exists("/dev/block")}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXISTS:False" in result.stdout
 
-    async def test_dev_root_not_accessible(self, scheduler: Scheduler) -> None:
+    async def test_dev_root_not_accessible(self, dual_scheduler: Scheduler) -> None:
         """/dev/root (sometimes auto-created by kernel) doesn't exist or is broken."""
         code = """\
 import os
@@ -581,11 +581,11 @@ if exists:
 else:
     print('NOT_EXISTS')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() in ("NOT_EXISTS", "BLOCKED")
 
-    async def test_proc_partitions_readable_but_no_data_access(self, scheduler: Scheduler) -> None:
+    async def test_proc_partitions_readable_but_no_data_access(self, dual_scheduler: Scheduler) -> None:
         """/proc/partitions shows vda metadata but the device node is gone."""
         code = """\
 # /proc/partitions should still list vda (kernel metadata, not a device node)
@@ -604,14 +604,14 @@ except FileNotFoundError:
 except (PermissionError, OSError):
     print('DEV_VDA_OPEN:blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "PROC_HAS_VDA:True" in result.stdout
         assert "DEV_VDA_OPEN:not_found" in result.stdout
 
     # --- Weird cases: attempts to recreate block device access ---
 
-    async def test_mknod_blocked(self, scheduler: Scheduler) -> None:
+    async def test_mknod_blocked(self, dual_scheduler: Scheduler) -> None:
         """mknod with block device type fails — UID 1000 lacks CAP_MKNOD."""
         code = """\
 import os, stat
@@ -624,11 +624,11 @@ except PermissionError:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip().startswith("BLOCKED:")
 
-    async def test_dev_vda_open_fails(self, scheduler: Scheduler) -> None:
+    async def test_dev_vda_open_fails(self, dual_scheduler: Scheduler) -> None:
         """open('/dev/vda') fails (defense-in-depth, same pattern as /dev/mem test)."""
         code = """\
 try:
@@ -638,13 +638,13 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     # --- Out of bounds cases: no block device nodes remain anywhere in /dev ---
 
-    async def test_no_block_devices_in_dev(self, scheduler: Scheduler) -> None:
+    async def test_no_block_devices_in_dev(self, dual_scheduler: Scheduler) -> None:
         """Only expected block device nodes exist under /dev (zram for swap)."""
         code = """\
 import os, stat
@@ -667,7 +667,7 @@ if block_devices:
 else:
     print('NONE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "NONE", f"Unexpected block device nodes found: {result.stdout.strip()}"
 
@@ -693,7 +693,7 @@ class TestLoopDeviceBlocked:
 
     # --- Normal: verify loop infrastructure absent ---
 
-    async def test_no_loop_devices_exist(self, scheduler: Scheduler) -> None:
+    async def test_no_loop_devices_exist(self, dual_scheduler: Scheduler) -> None:
         """No /dev/loop* nodes exist anywhere under /dev."""
         code = """\
 import os
@@ -710,11 +710,11 @@ if loop_devices:
 else:
     print('NONE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "NONE", f"Loop device nodes found: {result.stdout.strip()}"
 
-    async def test_loop_module_not_loaded(self, scheduler: Scheduler) -> None:
+    async def test_loop_module_not_loaded(self, dual_scheduler: Scheduler) -> None:
         """loop kernel module is not loaded (or modules disabled entirely)."""
         code = """\
 try:
@@ -725,13 +725,13 @@ except FileNotFoundError:
     # CONFIG_MODULES=n: /proc/modules doesn't exist — no modules at all
     print('MODULES_DISABLED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "LOOP_LOADED:False" in result.stdout or "MODULES_DISABLED" in result.stdout
 
-    async def test_dev_loop_control_not_exists(self, scheduler: Scheduler) -> None:
+    async def test_dev_loop_control_not_exists(self, dual_scheduler: Scheduler) -> None:
         """/dev/loop-control (dynamic loop allocation, Linux 3.1+) does not exist."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.path.exists('/dev/loop-control'))",
             language=Language.PYTHON,
         )
@@ -740,7 +740,7 @@ except FileNotFoundError:
 
     # --- Edge: tools that need loop devices fail gracefully ---
 
-    async def test_losetup_associate_fails(self, scheduler: Scheduler) -> None:
+    async def test_losetup_associate_fails(self, dual_scheduler: Scheduler) -> None:
         """losetup cannot associate a file with a loop device — no /dev/loop* nodes."""
         code = """\
 import subprocess
@@ -758,25 +758,41 @@ r = subprocess.run(
 )
 print(f'LOSETUP_RC:{r.returncode}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
         assert result.exit_code == 0
         assert "LOSETUP_RC:0" not in result.stdout, f"Expected losetup associate to fail.\nstdout: {result.stdout}"
 
-    async def test_mkfs_ext4_not_available(self, scheduler: Scheduler) -> None:
-        """mkfs.ext4 is not installed (e2fsprogs not in image package list)."""
+    async def test_mkfs_ext4_not_exploitable(self, dual_scheduler: Scheduler) -> None:
+        """mkfs.ext4 exists (needed by tiny-init for snapshots) but cannot format block devices.
+
+        e2fsprogs was added in b836e56 for ext4 overlay drive formatting by
+        tiny-init (running as root).  The sandbox user (UID 1000) cannot
+        exploit it because loop devices are blocked (CONFIG_BLK_DEV_LOOP=n)
+        and /dev/vd* nodes are not accessible.
+        """
         code = """\
-import shutil
-print(f'MKFS_EXT4:{shutil.which("mkfs.ext4") is not None}')
+import subprocess, shutil
+has_mkfs = shutil.which("mkfs.ext4") is not None
+print(f'HAS_MKFS:{has_mkfs}')
+# Attempt to format the rootfs block device — must fail
+r = subprocess.run(
+    ["mkfs.ext4", "-F", "/dev/vda"],
+    capture_output=True, text=True, timeout=5,
+)
+print(f'FORMAT_RC:{r.returncode}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
-        assert "MKFS_EXT4:False" in result.stdout
+        assert "HAS_MKFS:True" in result.stdout
+        assert "FORMAT_RC:0" not in result.stdout, (
+            f"Sandbox user should not be able to format block devices.\nstdout: {result.stdout}"
+        )
 
     # --- Out of bounds: full attack chains blocked ---
 
-    async def test_loop_module_load_blocked(self, scheduler: Scheduler) -> None:
+    async def test_loop_module_load_blocked(self, dual_scheduler: Scheduler) -> None:
         """modprobe loop fails — modules_disabled=1 is irreversible."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="modprobe loop 2>&1; echo EXIT:$?",
             language=Language.RAW,
         )
@@ -785,7 +801,7 @@ print(f'MKFS_EXT4:{shutil.which("mkfs.ext4") is not None}')
             f"Expected modprobe loop to fail with modules_disabled=1.\nstdout: {result.stdout}"
         )
 
-    async def test_file_backed_loop_mount_blocked(self, scheduler: Scheduler) -> None:
+    async def test_file_backed_loop_mount_blocked(self, dual_scheduler: Scheduler) -> None:
         """Full CVE-2025-6019 attack chain: create file, losetup, mount — every step fails."""
         code = """\
 import subprocess
@@ -816,7 +832,7 @@ results.append(f'MOUNT_EXIT:{r.returncode}')
 for line in results:
     print(line)
 """
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
             timeout_seconds=30,
@@ -847,7 +863,7 @@ class TestProcSysHardening:
 
     # --- Normal: direct writes to dangerous sysctl paths ---
 
-    async def test_proc_sys_mount_is_readonly(self, scheduler: Scheduler) -> None:
+    async def test_proc_sys_mount_is_readonly(self, dual_scheduler: Scheduler) -> None:
         """/proc/sys has ro flag in /proc/mounts."""
         code = """\
 with open('/proc/mounts') as f:
@@ -860,11 +876,11 @@ with open('/proc/mounts') as f:
     else:
         print('MOUNT_NOT_FOUND')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "RO:True" in result.stdout, f"Expected /proc/sys to be mounted read-only.\nstdout: {result.stdout}"
 
-    async def test_write_core_pattern_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_core_pattern_blocked(self, dual_scheduler: Scheduler) -> None:
         """Critical: pipe-to-binary root execution via core_pattern cannot be set."""
         code = """\
 try:
@@ -874,13 +890,13 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to core_pattern to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_write_modprobe_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_modprobe_blocked(self, dual_scheduler: Scheduler) -> None:
         """Critical: module autoloader path cannot be hijacked."""
         code = """\
 try:
@@ -890,13 +906,13 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to modprobe to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_write_randomize_va_space_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_randomize_va_space_blocked(self, dual_scheduler: Scheduler) -> None:
         """ASLR cannot be disabled via randomize_va_space."""
         code = """\
 try:
@@ -906,13 +922,13 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to randomize_va_space to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_write_ip_forward_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_ip_forward_blocked(self, dual_scheduler: Scheduler) -> None:
         """IP forwarding cannot be enabled (prevents network pivoting)."""
         code = """\
 try:
@@ -922,13 +938,13 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to ip_forward to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_write_hostname_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_hostname_blocked(self, dual_scheduler: Scheduler) -> None:
         """Hostname sysctl cannot be changed."""
         code = """\
 try:
@@ -938,13 +954,13 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to hostname to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_write_overcommit_memory_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_overcommit_memory_blocked(self, dual_scheduler: Scheduler) -> None:
         """OOM policy cannot be changed via overcommit_memory."""
         code = """\
 try:
@@ -954,13 +970,13 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to overcommit_memory to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_write_panic_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_panic_blocked(self, dual_scheduler: Scheduler) -> None:
         """Panic behavior cannot be changed."""
         code = """\
 try:
@@ -970,11 +986,11 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected write to panic to be blocked.\nstdout: {result.stdout}"
 
-    async def test_write_panic_on_oom_blocked(self, scheduler: Scheduler) -> None:
+    async def test_write_panic_on_oom_blocked(self, dual_scheduler: Scheduler) -> None:
         """Kernel panic on OOM cannot be enabled."""
         code = """\
 try:
@@ -984,20 +1000,20 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected write to panic_on_oom to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_read_sysctl_still_works(self, scheduler: Scheduler) -> None:
+    async def test_read_sysctl_still_works(self, dual_scheduler: Scheduler) -> None:
         """Reading sysctl values still works (read-only, not hidden)."""
         code = """\
 with open('/proc/sys/vm/swappiness') as f:
     val = f.read().strip()
 print(f'SWAPPINESS:{val}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "SWAPPINESS:" in result.stdout
         val = int(result.stdout.split("SWAPPINESS:")[1].strip())
@@ -1005,7 +1021,7 @@ print(f'SWAPPINESS:{val}')
 
     # --- Edge: indirect write vectors ---
 
-    async def test_shell_redirect_write_blocked(self, scheduler: Scheduler) -> None:
+    async def test_shell_redirect_write_blocked(self, dual_scheduler: Scheduler) -> None:
         """Shell redirect to /proc/sys is blocked too."""
         code = """\
 import subprocess
@@ -1016,12 +1032,12 @@ r = subprocess.run(
 print(r.stdout)
 print(r.stderr, end='')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         out = result.stdout + result.stderr
         assert "EXIT:0" not in result.stdout or "Read-only" in out or "Permission denied" in out
 
-    async def test_open_modes_all_blocked(self, scheduler: Scheduler) -> None:
+    async def test_open_modes_all_blocked(self, dual_scheduler: Scheduler) -> None:
         """O_WRONLY, O_RDWR, and O_WRONLY|O_APPEND are all rejected on /proc/sys files."""
         code = """\
 import os
@@ -1038,13 +1054,13 @@ for mode_name, mode_flag in [('O_WRONLY', os.O_WRONLY), ('O_RDWR', os.O_RDWR), (
 for r in results:
     print(r)
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "O_WRONLY:BLOCKED:" in result.stdout
         assert "O_RDWR:BLOCKED:" in result.stdout
         assert "O_APPEND:BLOCKED:" in result.stdout
 
-    async def test_nested_path_write_blocked(self, scheduler: Scheduler) -> None:
+    async def test_nested_path_write_blocked(self, dual_scheduler: Scheduler) -> None:
         """Read-only applies recursively to deeply nested sysctl paths."""
         code = """\
 import os
@@ -1067,11 +1083,11 @@ for path in nested_paths:
 else:
     print('NO_NESTED_PATH_FOUND')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "BLOCKED:" in result.stdout, f"Expected nested sysctl write to be blocked.\nstdout: {result.stdout}"
 
-    async def test_symlink_write_through_blocked(self, scheduler: Scheduler) -> None:
+    async def test_symlink_write_through_blocked(self, dual_scheduler: Scheduler) -> None:
         """Symlink pointing to /proc/sys path — write through symlink is blocked."""
         code = """\
 import os
@@ -1086,7 +1102,7 @@ except OSError as e:
 finally:
     os.unlink('/tmp/sys_link')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected symlink write-through to be blocked.\nstdout: {result.stdout}"
@@ -1094,7 +1110,7 @@ finally:
 
     # --- Weird: unconventional bypass attempts ---
 
-    async def test_proc_self_fd_reopen_blocked(self, scheduler: Scheduler) -> None:
+    async def test_proc_self_fd_reopen_blocked(self, dual_scheduler: Scheduler) -> None:
         """Open O_RDONLY, reopen via /proc/self/fd/{fd} O_WRONLY — still blocked."""
         code = """\
 import os
@@ -1109,13 +1125,13 @@ except OSError as e:
 finally:
     os.close(fd_ro)
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected /proc/self/fd reopen to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_ctypes_direct_syscall_blocked(self, scheduler: Scheduler) -> None:
+    async def test_ctypes_direct_syscall_blocked(self, dual_scheduler: Scheduler) -> None:
         """libc.open(path, O_WRONLY) — kernel enforcement, not Python."""
         code = """\
 import ctypes, os, errno
@@ -1134,11 +1150,11 @@ else:
     os.close(fd)
     print("OPENED")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected ctypes open to be blocked.\nstdout: {result.stdout}"
 
-    async def test_truncate_sysctl_blocked(self, scheduler: Scheduler) -> None:
+    async def test_truncate_sysctl_blocked(self, dual_scheduler: Scheduler) -> None:
         """os.truncate() on a sysctl file is blocked at VFS layer."""
         code = """\
 import os
@@ -1149,11 +1165,11 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected truncate to be blocked.\nstdout: {result.stdout}"
 
-    async def test_binfmt_misc_register_blocked(self, scheduler: Scheduler) -> None:
+    async def test_binfmt_misc_register_blocked(self, dual_scheduler: Scheduler) -> None:
         """Cannot register custom binary format interpreters via binfmt_misc."""
         code = """\
 import os
@@ -1171,7 +1187,7 @@ else:
     except OSError as e:
         print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected binfmt_misc register to be blocked.\nstdout: {result.stdout}"
@@ -1179,7 +1195,7 @@ else:
 
     # --- Out of bounds: privilege escalation to remount ---
 
-    async def test_remount_rw_blocked(self, scheduler: Scheduler) -> None:
+    async def test_remount_rw_blocked(self, dual_scheduler: Scheduler) -> None:
         """mount -o remount,rw /proc/sys requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess
@@ -1189,13 +1205,13 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, (
             f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
         )
 
-    async def test_bind_mount_shadow_blocked(self, scheduler: Scheduler) -> None:
+    async def test_bind_mount_shadow_blocked(self, dual_scheduler: Scheduler) -> None:
         """Bind tmpfs over /proc/sys requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess
@@ -1205,11 +1221,11 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected tmpfs shadow mount to fail.\nstdout: {result.stdout}"
 
-    async def test_umount_proc_sys_blocked(self, scheduler: Scheduler) -> None:
+    async def test_umount_proc_sys_blocked(self, dual_scheduler: Scheduler) -> None:
         """umount /proc/sys requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess
@@ -1219,11 +1235,11 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected umount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
 
-    async def test_mount_second_proc_blocked(self, scheduler: Scheduler) -> None:
+    async def test_mount_second_proc_blocked(self, dual_scheduler: Scheduler) -> None:
         """Mount new procfs at /tmp/proc requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess, os
@@ -1234,11 +1250,11 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected secondary procfs mount to fail.\nstdout: {result.stdout}"
 
-    async def test_sysrq_disabled(self, scheduler: Scheduler) -> None:
+    async def test_sysrq_disabled(self, dual_scheduler: Scheduler) -> None:
         """kernel.sysrq must be 0 (or absent with CONFIG_MAGIC_SYSRQ=n)."""
         code = """\
 try:
@@ -1249,7 +1265,7 @@ except FileNotFoundError:
     # CONFIG_MAGIC_SYSRQ=n: sysctl doesn't exist — SysRq fully compiled out
     print('SYSRQ_ABSENT')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "SYSRQ:0" in result.stdout or "SYSRQ_ABSENT" in result.stdout, (
             f"Expected kernel.sysrq=0 or absent. stdout: {result.stdout}"
@@ -1272,7 +1288,7 @@ class TestDevReadonlyHardening:
 
     # --- Normal: standard write attempts fail ---
 
-    async def test_dev_vda_write_fails(self, scheduler: Scheduler) -> None:
+    async def test_dev_vda_write_fails(self, dual_scheduler: Scheduler) -> None:
         """open('/dev/vda', 'wb') fails — node removed + /dev read-only."""
         code = """\
 try:
@@ -1282,11 +1298,11 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
-    async def test_dev_vda_readwrite_os_open(self, scheduler: Scheduler) -> None:
+    async def test_dev_vda_readwrite_os_open(self, dual_scheduler: Scheduler) -> None:
         """os.open('/dev/vda', O_RDWR) fails (different syscall flags than Python open)."""
         code = """\
 import os
@@ -1297,11 +1313,11 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
-    async def test_dev_mounted_readonly(self, scheduler: Scheduler) -> None:
+    async def test_dev_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
         """/dev is mounted read-only; mknod returns EROFS."""
         code = """\
 import os, stat
@@ -1325,7 +1341,7 @@ try:
 except OSError as e:
     print(f'MKNOD:errno_{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "DEV_RO:True" in result.stdout
         # EROFS (30) or EPERM (1) — both acceptable, EROFS preferred
@@ -1334,7 +1350,7 @@ except OSError as e:
 
     # --- Normal: mmap attacks blocked (requires open() first) ---
 
-    async def test_dev_vda_mmap_blocked(self, scheduler: Scheduler) -> None:
+    async def test_dev_vda_mmap_blocked(self, dual_scheduler: Scheduler) -> None:
         """open('/dev/vda', 'rb') + mmap fails — node removed."""
         code = """\
 import mmap
@@ -1347,11 +1363,11 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
-    async def test_dev_mem_mmap_blocked(self, scheduler: Scheduler) -> None:
+    async def test_dev_mem_mmap_blocked(self, dual_scheduler: Scheduler) -> None:
         """open('/dev/mem', 'rb') + mmap fails — node removed."""
         code = """\
 import mmap
@@ -1364,11 +1380,11 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
-    async def test_dev_vda_mmap_write_blocked(self, scheduler: Scheduler) -> None:
+    async def test_dev_vda_mmap_write_blocked(self, dual_scheduler: Scheduler) -> None:
         """open('/dev/vda', 'r+b') + writable mmap fails — node removed."""
         code = """\
 import mmap
@@ -1381,13 +1397,13 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     # --- Edge: alternative access paths closed ---
 
-    async def test_proc_self_root_traversal_blocked(self, scheduler: Scheduler) -> None:
+    async def test_proc_self_root_traversal_blocked(self, dual_scheduler: Scheduler) -> None:
         """/proc/self/root/dev/vda fails (WithSecure Labs traversal vector)."""
         code = """\
 try:
@@ -1397,11 +1413,11 @@ try:
 except (FileNotFoundError, PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
-    async def test_mknod_tmp_nodev(self, scheduler: Scheduler) -> None:
+    async def test_mknod_tmp_nodev(self, dual_scheduler: Scheduler) -> None:
         """mknod in /tmp fails — nodev mount flag blocks block device creation."""
         code = """\
 import os, stat
@@ -1413,11 +1429,11 @@ except PermissionError:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:")
 
-    async def test_open_by_handle_at_blocked(self, scheduler: Scheduler) -> None:
+    async def test_open_by_handle_at_blocked(self, dual_scheduler: Scheduler) -> None:
         """open_by_handle_at syscall fails without CAP_DAC_READ_SEARCH (Shocker exploit)."""
         code = """\
 import ctypes, ctypes.util, errno, struct
@@ -1446,14 +1462,14 @@ elif ret == -1:
 else:
     print('unexpected_success')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "BLOCKED:" in result.stdout
         assert "unexpected_success" not in result.stdout
 
     # --- Weird: creative bypass attempts ---
 
-    async def test_mknod_raw_syscall_blocked(self, scheduler: Scheduler) -> None:
+    async def test_mknod_raw_syscall_blocked(self, dual_scheduler: Scheduler) -> None:
         """ctypes SYS_mknod proves kernel-level deny (Kata CVE-2020-2023 chain)."""
         code = """\
 import ctypes, ctypes.util, errno, os, stat, platform
@@ -1484,22 +1500,22 @@ if ret == -1:
 else:
     print('unexpected_success')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "BLOCKED:" in result.stdout
         assert "unexpected_success" not in result.stdout
 
-    async def test_debugfs_not_available(self, scheduler: Scheduler) -> None:
+    async def test_debugfs_not_available(self, dual_scheduler: Scheduler) -> None:
         """debugfs binary doesn't exist in minimal Alpine rootfs."""
         code = """\
 import shutil
 print(f'DEBUGFS:{shutil.which("debugfs") is not None}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "DEBUGFS:False" in result.stdout
 
-    async def test_sysfs_block_no_data_path(self, scheduler: Scheduler) -> None:
+    async def test_sysfs_block_no_data_path(self, dual_scheduler: Scheduler) -> None:
         """/sys/dev/block/ exposes metadata only, no writable raw IO interface."""
         code = """\
 import os
@@ -1523,12 +1539,12 @@ else:
     else:
         print('SAFE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         out = result.stdout.strip()
         assert out in ("NO_SYSFS_BLOCK", "SAFE"), f"Dangerous sysfs paths found: {out}"
 
-    async def test_uevent_helper_not_writable(self, scheduler: Scheduler) -> None:
+    async def test_uevent_helper_not_writable(self, dual_scheduler: Scheduler) -> None:
         """/sys/kernel/uevent_helper not writable by UID 1000."""
         code = """\
 import os
@@ -1544,13 +1560,13 @@ else:
     except (PermissionError, OSError) as e:
         print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "WRITTEN" not in result.stdout
 
     # --- Out of bounds: comprehensive/adversarial ---
 
-    async def test_no_block_devices_outside_dev(self, scheduler: Scheduler) -> None:
+    async def test_no_block_devices_outside_dev(self, dual_scheduler: Scheduler) -> None:
         """No block device nodes in /tmp or /home (catches smuggled nodes)."""
         code = """\
 import os, stat
@@ -1574,11 +1590,11 @@ if block_devices:
 else:
     print('NONE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.strip() == "NONE", f"Block devices outside /dev: {result.stdout}"
 
-    async def test_effective_caps_no_mknod(self, scheduler: Scheduler) -> None:
+    async def test_effective_caps_no_mknod(self, dual_scheduler: Scheduler) -> None:
         """CAP_MKNOD (bit 27) and CAP_DAC_READ_SEARCH (bit 2) are both clear."""
         code = """\
 with open('/proc/self/status') as f:
@@ -1591,12 +1607,12 @@ with open('/proc/self/status') as f:
             print(f'CAP_DAC_READ_SEARCH:{cap_dac_read_search}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "CAP_MKNOD:False" in result.stdout
         assert "CAP_DAC_READ_SEARCH:False" in result.stdout
 
-    async def test_sysrq_trigger_not_writable(self, scheduler: Scheduler) -> None:
+    async def test_sysrq_trigger_not_writable(self, dual_scheduler: Scheduler) -> None:
         """/proc/sysrq-trigger bind-mounted read-only (EROFS).
 
         Writing 'c' = kernel crash, 'b' = reboot (DoS). kernel.sysrq=0 does NOT
@@ -1611,7 +1627,7 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected sysrq-trigger write to be blocked.\nstdout: {result.stdout}"
@@ -1639,7 +1655,7 @@ with open('/proc/mounts') as f:
             break
 """
 
-    async def test_root_has_ro_flag(self, scheduler: Scheduler) -> None:
+    async def test_root_has_ro_flag(self, dual_scheduler: Scheduler) -> None:
         """Root filesystem has ro mount flag."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1650,11 +1666,11 @@ with open('/proc/mounts') as f:
             print(f'RO:{"ro" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "RO:True" in result.stdout, f"Expected / to be mounted read-only.\nstdout: {result.stdout}"
 
-    async def test_root_has_nosuid_flag(self, scheduler: Scheduler) -> None:
+    async def test_root_has_nosuid_flag(self, dual_scheduler: Scheduler) -> None:
         """Root filesystem has nosuid mount flag."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1665,11 +1681,11 @@ with open('/proc/mounts') as f:
             print(f'NOSUID:{"nosuid" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NOSUID:True" in result.stdout, f"Expected / to have nosuid.\nstdout: {result.stdout}"
 
-    async def test_root_has_nodev_flag(self, scheduler: Scheduler) -> None:
+    async def test_root_has_nodev_flag(self, dual_scheduler: Scheduler) -> None:
         """Root filesystem has nodev mount flag."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1680,11 +1696,11 @@ with open('/proc/mounts') as f:
             print(f'NODEV:{"nodev" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NODEV:True" in result.stdout, f"Expected / to have nodev.\nstdout: {result.stdout}"
 
-    async def test_write_to_var_fails(self, scheduler: Scheduler) -> None:
+    async def test_write_to_var_fails(self, dual_scheduler: Scheduler) -> None:
         """Writing to /var fails with EROFS on read-only rootfs."""
         code = """\
 try:
@@ -1694,11 +1710,11 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected write to /var to fail.\nstdout: {result.stdout}"
 
-    async def test_create_file_in_sbin_fails(self, scheduler: Scheduler) -> None:
+    async def test_create_file_in_sbin_fails(self, dual_scheduler: Scheduler) -> None:
         """Writing to /sbin fails with EROFS on read-only rootfs."""
         code = """\
 try:
@@ -1708,11 +1724,11 @@ try:
 except OSError as e:
     print(f'BLOCKED:{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected write to /sbin to fail.\nstdout: {result.stdout}"
 
-    async def test_remount_rw_root_fails(self, scheduler: Scheduler) -> None:
+    async def test_remount_rw_root_fails(self, dual_scheduler: Scheduler) -> None:
         """mount -o remount,rw / requires CAP_SYS_ADMIN — fails as UID 1000."""
         code = """\
 import subprocess
@@ -1722,11 +1738,11 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected remount rw / to fail.\nstdout: {result.stdout}"
 
-    async def test_home_user_still_writable(self, scheduler: Scheduler) -> None:
+    async def test_home_user_still_writable(self, dual_scheduler: Scheduler) -> None:
         """/home/user is writable (tmpfs overlay on read-only rootfs)."""
         code = """\
 import os
@@ -1738,11 +1754,11 @@ with open(path) as f:
 os.unlink(path)
 print(f'OK:{data}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "OK:writable" in result.stdout
 
-    async def test_tmp_still_writable(self, scheduler: Scheduler) -> None:
+    async def test_tmp_still_writable(self, dual_scheduler: Scheduler) -> None:
         """/tmp is writable (separate tmpfs mount)."""
         code = """\
 import os
@@ -1754,11 +1770,11 @@ with open(path) as f:
 os.unlink(path)
 print(f'OK:{data}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "OK:writable" in result.stdout
 
-    async def test_dev_shm_still_writable(self, scheduler: Scheduler) -> None:
+    async def test_dev_shm_still_writable(self, dual_scheduler: Scheduler) -> None:
         """/dev/shm is writable (separate tmpfs mount)."""
         code = """\
 import os
@@ -1770,7 +1786,7 @@ with open(path) as f:
 os.unlink(path)
 print(f'OK:{data}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "OK:writable" in result.stdout
 
@@ -1795,7 +1811,7 @@ with open('/proc/mounts') as f:
             break
 """
 
-    async def test_is_tmpfs(self, scheduler: Scheduler) -> None:
+    async def test_is_tmpfs(self, dual_scheduler: Scheduler) -> None:
         """/home/user filesystem type is tmpfs."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1807,11 +1823,11 @@ with open('/proc/mounts') as f:
     else:
         print('MOUNT_NOT_FOUND')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "FSTYPE:tmpfs" in result.stdout, f"Expected /home/user to be tmpfs.\nstdout: {result.stdout}"
 
-    async def test_nosuid_flag(self, scheduler: Scheduler) -> None:
+    async def test_nosuid_flag(self, dual_scheduler: Scheduler) -> None:
         """/home/user has nosuid mount flag."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1822,11 +1838,11 @@ with open('/proc/mounts') as f:
             print(f'NOSUID:{"nosuid" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NOSUID:True" in result.stdout
 
-    async def test_nodev_flag(self, scheduler: Scheduler) -> None:
+    async def test_nodev_flag(self, dual_scheduler: Scheduler) -> None:
         """/home/user has nodev mount flag."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1837,11 +1853,11 @@ with open('/proc/mounts') as f:
             print(f'NODEV:{"nodev" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NODEV:True" in result.stdout
 
-    async def test_no_noexec_flag(self, scheduler: Scheduler) -> None:
+    async def test_no_noexec_flag(self, dual_scheduler: Scheduler) -> None:
         """/home/user does NOT have noexec (uv/bun install executables)."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1852,21 +1868,21 @@ with open('/proc/mounts') as f:
             print(f'NOEXEC_PRESENT:{"noexec" in opts}')
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NOEXEC_PRESENT:False" in result.stdout
 
-    async def test_cloudpickle_importable(self, scheduler: Scheduler) -> None:
+    async def test_cloudpickle_importable(self, dual_scheduler: Scheduler) -> None:
         """cloudpickle is importable (loaded from /usr/lib/python3/site-packages)."""
         code = """\
 import cloudpickle
 print(f'VERSION:{cloudpickle.__version__}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "VERSION:" in result.stdout
 
-    async def test_owned_by_uid_1000(self, scheduler: Scheduler) -> None:
+    async def test_owned_by_uid_1000(self, dual_scheduler: Scheduler) -> None:
         """/home/user is owned by UID 1000 (sandbox user)."""
         code = """\
 import os
@@ -1874,7 +1890,7 @@ s = os.stat('/home/user')
 print(f'UID:{s.st_uid}')
 print(f'GID:{s.st_gid}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "UID:1000" in result.stdout
         assert "GID:1000" in result.stdout
@@ -1899,7 +1915,7 @@ class TestSystemBinaryHardening:
 
     # --- Normal: verify read-only mount flags ---
 
-    async def test_bin_mounted_readonly(self, scheduler: Scheduler) -> None:
+    async def test_bin_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
         """/bin has 'ro' flag in /proc/mounts."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1920,11 +1936,11 @@ with open('/proc/mounts') as f:
         else:
             print('NOT_FOUND')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "RO:True" in result.stdout, f"Expected /bin to be read-only.\nstdout: {result.stdout}"
 
-    async def test_sbin_mounted_readonly(self, scheduler: Scheduler) -> None:
+    async def test_sbin_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
         """/sbin has 'ro' flag in /proc/mounts."""
         code = """\
 with open('/proc/mounts') as f:
@@ -1945,13 +1961,13 @@ with open('/proc/mounts') as f:
         else:
             print('NOT_FOUND')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "RO:True" in result.stdout, f"Expected /sbin to be read-only.\nstdout: {result.stdout}"
 
     # --- Normal: write attempts blocked ---
 
-    async def test_cannot_replace_bin_sh(self, scheduler: Scheduler) -> None:
+    async def test_cannot_replace_bin_sh(self, dual_scheduler: Scheduler) -> None:
         """os.unlink('/bin/sh') is blocked with EROFS."""
         code = """\
 import os, errno
@@ -1966,11 +1982,11 @@ except OSError as e:
     else:
         print(f'BLOCKED:errno_{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected unlink /bin/sh to be blocked.\nstdout: {result.stdout}"
 
-    async def test_cannot_overwrite_busybox(self, scheduler: Scheduler) -> None:
+    async def test_cannot_overwrite_busybox(self, dual_scheduler: Scheduler) -> None:
         """open('/bin/busybox', 'wb') is blocked."""
         code = """\
 import errno
@@ -1989,13 +2005,13 @@ except FileNotFoundError:
     # usrmerge: busybox may be at /usr/bin/busybox
     print('BLOCKED:not_found')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected busybox overwrite to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_cannot_create_file_in_bin(self, scheduler: Scheduler) -> None:
+    async def test_cannot_create_file_in_bin(self, dual_scheduler: Scheduler) -> None:
         """File creation in /bin is blocked."""
         code = """\
 import errno
@@ -2011,13 +2027,13 @@ except OSError as e:
     else:
         print(f'BLOCKED:errno_{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected file creation in /bin to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_cannot_create_file_in_sbin(self, scheduler: Scheduler) -> None:
+    async def test_cannot_create_file_in_sbin(self, dual_scheduler: Scheduler) -> None:
         """File creation in /sbin is blocked."""
         code = """\
 import errno
@@ -2033,13 +2049,13 @@ except OSError as e:
     else:
         print(f'BLOCKED:errno_{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected file creation in /sbin to be blocked.\nstdout: {result.stdout}"
         )
 
-    async def test_cannot_create_symlink_in_bin(self, scheduler: Scheduler) -> None:
+    async def test_cannot_create_symlink_in_bin(self, dual_scheduler: Scheduler) -> None:
         """Symlink creation in /bin is blocked."""
         code = """\
 import os, errno
@@ -2054,7 +2070,7 @@ except OSError as e:
     else:
         print(f'BLOCKED:errno_{e.errno}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected symlink creation in /bin to be blocked.\nstdout: {result.stdout}"
@@ -2062,9 +2078,9 @@ except OSError as e:
 
     # --- Edge: the specific attack vector ---
 
-    async def test_bin_sh_replacement_attack_blocked(self, scheduler: Scheduler) -> None:
+    async def test_bin_sh_replacement_attack_blocked(self, dual_scheduler: Scheduler) -> None:
         """rm /bin/sh via RAW language fails (the specific attack vector)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="rm /bin/sh 2>&1; echo EXIT:$?",
             language=Language.RAW,
         )
@@ -2073,7 +2089,7 @@ except OSError as e:
 
     # --- Normal: system binaries still functional ---
 
-    async def test_bin_sh_still_executable(self, scheduler: Scheduler) -> None:
+    async def test_bin_sh_still_executable(self, dual_scheduler: Scheduler) -> None:
         """/bin/sh -c 'echo OK' still works (read-only does not imply noexec)."""
         code = """\
 import subprocess
@@ -2084,12 +2100,12 @@ r = subprocess.run(
 print(f'OUTPUT:{r.stdout.strip()}')
 print(f'EXIT:{r.returncode}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "OUTPUT:OK" in result.stdout
         assert "EXIT:0" in result.stdout
 
-    async def test_busybox_applets_still_work(self, scheduler: Scheduler) -> None:
+    async def test_busybox_applets_still_work(self, dual_scheduler: Scheduler) -> None:
         """Busybox applets (ls, cat) still work from /bin."""
         code = """\
 import subprocess
@@ -2105,14 +2121,14 @@ r = subprocess.run(
 )
 print(f'CAT_EXIT:{r.returncode}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "LS_EXIT:0" in result.stdout
         assert "CAT_EXIT:0" in result.stdout
 
     # --- Weird: mount bypass attempts ---
 
-    async def test_remount_bin_rw_blocked(self, scheduler: Scheduler) -> None:
+    async def test_remount_bin_rw_blocked(self, dual_scheduler: Scheduler) -> None:
         """mount -o remount,rw /bin requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess
@@ -2122,13 +2138,13 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, (
             f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
         )
 
-    async def test_remount_sbin_rw_blocked(self, scheduler: Scheduler) -> None:
+    async def test_remount_sbin_rw_blocked(self, dual_scheduler: Scheduler) -> None:
         """mount -o remount,rw /sbin requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess
@@ -2138,13 +2154,13 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, (
             f"Expected remount to fail without CAP_SYS_ADMIN.\nstdout: {result.stdout}"
         )
 
-    async def test_bind_mount_shadow_bin_blocked(self, scheduler: Scheduler) -> None:
+    async def test_bind_mount_shadow_bin_blocked(self, dual_scheduler: Scheduler) -> None:
         """Bind tmpfs over /bin requires CAP_SYS_ADMIN."""
         code = """\
 import subprocess
@@ -2154,7 +2170,7 @@ r = subprocess.run(
 )
 print(f"EXIT:{r.returncode}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, f"Expected tmpfs shadow mount to fail.\nstdout: {result.stdout}"
 
@@ -2172,7 +2188,7 @@ class TestThreadBombMitigation:
 
     # --- Normal: verify limits are applied ---
 
-    async def test_rlimit_nproc_is_set(self, scheduler: Scheduler) -> None:
+    async def test_rlimit_nproc_is_set(self, dual_scheduler: Scheduler) -> None:
         """RLIMIT_NPROC soft and hard limits are both 1024."""
         code = """\
 import resource
@@ -2180,12 +2196,12 @@ soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
 print(f'NPROC_SOFT:{soft}')
 print(f'NPROC_HARD:{hard}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NPROC_SOFT:1024" in result.stdout
         assert "NPROC_HARD:1024" in result.stdout
 
-    async def test_threadpool_executor_still_works(self, scheduler: Scheduler) -> None:
+    async def test_threadpool_executor_still_works(self, dual_scheduler: Scheduler) -> None:
         """ThreadPoolExecutor(max_workers=4) works within the limit."""
         code = """\
 from concurrent.futures import ThreadPoolExecutor
@@ -2194,13 +2210,13 @@ with ThreadPoolExecutor(max_workers=4) as pool:
     results = list(pool.map(lambda x: x**2, range(100)))
 print(f'RESULT:{len(results)}:{results[-1]}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "RESULT:100:9801" in result.stdout
 
     # --- Edge: thread bomb is capped ---
 
-    async def test_thread_bomb_capped(self, scheduler: Scheduler) -> None:
+    async def test_thread_bomb_capped(self, dual_scheduler: Scheduler) -> None:
         """Thread bomb hits RLIMIT_NPROC well below the old ~1,659 ceiling."""
         code = """\
 import threading
@@ -2217,7 +2233,7 @@ except RuntimeError:
 
 print(f'THREAD_COUNT:{len(threads)}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
         assert result.exit_code == 0
         count_line = [line for line in result.stdout.splitlines() if line.startswith("THREAD_COUNT:")]
         assert count_line, f"Expected THREAD_COUNT in output.\nstdout: {result.stdout}"
@@ -2226,7 +2242,7 @@ print(f'THREAD_COUNT:{len(threads)}')
 
     # --- Out of bounds: cannot escalate limits ---
 
-    async def test_cannot_raise_nproc_limit(self, scheduler: Scheduler) -> None:
+    async def test_cannot_raise_nproc_limit(self, dual_scheduler: Scheduler) -> None:
         """User code cannot raise RLIMIT_NPROC above the hard limit."""
         code = """\
 import resource
@@ -2236,11 +2252,11 @@ try:
 except (ValueError, PermissionError, OSError) as e:
     print(f'RAISED:False:{type(e).__name__}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "RAISED:False" in result.stdout
 
-    async def test_fork_bomb_hits_nproc(self, scheduler: Scheduler) -> None:
+    async def test_fork_bomb_hits_nproc(self, dual_scheduler: Scheduler) -> None:
         """Fork bomb hits RLIMIT_NPROC, count is <= 1024."""
         code = """\
 import os
@@ -2265,7 +2281,7 @@ while True:
 
 print(f'FORK_COUNT:{count}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
         assert result.exit_code == 0
         count_line = [line for line in result.stdout.splitlines() if line.startswith("FORK_COUNT:")]
         assert count_line, f"Expected FORK_COUNT in output.\nstdout: {result.stdout}"

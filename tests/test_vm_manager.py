@@ -1378,7 +1378,7 @@ class TestTwoLayerHvfDetection:
 
 
 class TestCheckHwaccelAvailable:
-    """Tests for the synchronous check_hwaccel_available() wrapper."""
+    """Tests for check_hwaccel_available()."""
 
     @pytest.fixture(autouse=True)
     def clear_caches(self) -> None:
@@ -1387,21 +1387,21 @@ class TestCheckHwaccelAvailable:
         probe_cache.reset("hvf")
         probe_cache.reset("qemu_accels")
 
-    def test_returns_boolean(self) -> None:
+    async def test_returns_boolean(self) -> None:
         """check_hwaccel_available returns a boolean."""
-        result = check_hwaccel_available()
+        result = await check_hwaccel_available()
         assert isinstance(result, bool)
 
     @skip_unless_hwaccel
-    def test_hwaccel_available_when_expected(self) -> None:
+    async def test_hwaccel_available_when_expected(self) -> None:
         """Hardware acceleration is available on supported systems."""
         # This test only runs when hwaccel is expected to be available
-        assert check_hwaccel_available() is True
+        assert await check_hwaccel_available() is True
 
-    def test_consistent_results(self) -> None:
+    async def test_consistent_results(self) -> None:
         """Multiple calls return consistent results."""
-        result1 = check_hwaccel_available()
-        result2 = check_hwaccel_available()
+        result1 = await check_hwaccel_available()
+        result2 = await check_hwaccel_available()
         assert result1 == result2
 
 

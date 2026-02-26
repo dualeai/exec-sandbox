@@ -348,7 +348,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
             # These flags are x86-specific — ARM64 HVF uses plain "host".
             # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
-            # x86 TCG: Haswell required for AVX2 (Python/Bun built for x86_64_v3)
+            # x86 TCG: Haswell-IBRS required for AVX2 (Python/Bun built for
+            # x86_64_v3) and Spectre v2 mitigations (spec-ctrl + ibpb flags).
+            # Without -IBRS the guest kernel reports spectre_v2 as "Vulnerable".
+            # See: https://www.qemu.org/docs/master/system/i386/cpu.html
             # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
@@ -358,7 +361,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 if accel_type in (AccelType.HVF, AccelType.KVM)
                 else "cortex-a57"
                 if arch == HostArch.AARCH64
-                else "Haswell"
+                else "Haswell-IBRS"
             ),
             "-M",
             machine_type,

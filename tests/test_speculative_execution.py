@@ -43,7 +43,7 @@ class TestMitigationStatus:
     when mitigations are disabled.
     """
 
-    async def test_spectre_v2_mitigated(self, scheduler: Scheduler) -> None:
+    async def test_spectre_v2_mitigated(self, dual_scheduler: Scheduler) -> None:
         """Spectre v2 (branch target injection) must not report 'Vulnerable'.
 
         CVE-2017-5715: Branch target injection enables cross-boundary
@@ -59,7 +59,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "STATUS:" in stdout:
@@ -68,7 +68,7 @@ except PermissionError:
                 f"Spectre v2 should be mitigated, got: {status}"
             )
 
-    async def test_spectre_v1_mitigated(self, scheduler: Scheduler) -> None:
+    async def test_spectre_v1_mitigated(self, dual_scheduler: Scheduler) -> None:
         """Spectre v1 (bounds check bypass) must not report 'Vulnerable'.
 
         CVE-2017-5753: Conditional branch misprediction enables out-of-bounds
@@ -84,7 +84,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "STATUS:" in stdout:
@@ -93,7 +93,7 @@ except PermissionError:
                 f"Spectre v1 should be mitigated, got: {status}"
             )
 
-    async def test_mds_mitigated(self, scheduler: Scheduler) -> None:
+    async def test_mds_mitigated(self, dual_scheduler: Scheduler) -> None:
         """MDS (microarchitectural data sampling) must not report 'Vulnerable'.
 
         CVE-2018-12130: Enables reading stale data from CPU buffers.
@@ -109,7 +109,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "STATUS:" in stdout:
@@ -119,7 +119,7 @@ except PermissionError:
                 f"MDS should be mitigated or not affected, got: {status}"
             )
 
-    async def test_mitigations_not_disabled_in_cmdline(self, scheduler: Scheduler) -> None:
+    async def test_mitigations_not_disabled_in_cmdline(self, dual_scheduler: Scheduler) -> None:
         """Kernel cmdline must NOT contain 'mitigations=off' or 'nokaslr'.
 
         These were previously used for performance but disable critical
@@ -130,7 +130,7 @@ with open('/proc/cmdline') as f:
     cmdline = f.read().strip()
 print(f'CMDLINE:{cmdline}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         cmdline = result.stdout.strip().split("CMDLINE:", 1)[1]
         assert "mitigations=off" not in cmdline, f"mitigations=off must not be in kernel cmdline: {cmdline}"
@@ -151,7 +151,7 @@ class TestTimerPrecision:
     - Browser 100us coarsening (W3C High Resolution Time) is for JS event loops
     """
 
-    async def test_timer_resolution_measured(self, scheduler: Scheduler) -> None:
+    async def test_timer_resolution_measured(self, dual_scheduler: Scheduler) -> None:
         """Measure clock_gettime resolution — informational baseline only.
 
         Records minimum delta between consecutive CLOCK_MONOTONIC reads.
@@ -195,7 +195,7 @@ if deltas:
 else:
     print("NO_DELTAS")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # Informational only — just verify measurement succeeded
         assert "MIN_DELTA_NS:" in result.stdout or "NO_DELTAS" in result.stdout, (
@@ -214,7 +214,7 @@ class TestTimerSideChannelDefenses:
     coarsening. These tests verify the guest-visible effects.
     """
 
-    async def test_perf_event_paranoid_blocks_perf(self, scheduler: Scheduler) -> None:
+    async def test_perf_event_paranoid_blocks_perf(self, dual_scheduler: Scheduler) -> None:
         """perf_event_paranoid >= 3 disables perf counters for all users.
 
         Hardware performance counters are a precise side-channel primitive.
@@ -230,7 +230,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PERF_PARANOID:" in stdout and stdout.split(":")[1].lstrip("-").isdigit():
@@ -241,7 +241,7 @@ except PermissionError:
                 f"Expected perf_event_paranoid >= 3 or inaccessible. stdout: {stdout}"
             )
 
-    async def test_ksm_disabled(self, scheduler: Scheduler) -> None:
+    async def test_ksm_disabled(self, dual_scheduler: Scheduler) -> None:
         """KSM (Kernel Same-page Merging) must be disabled inside the guest.
 
         KSM enables cross-VM side channels by measuring page deduplication
@@ -259,7 +259,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # KSM run=0 means disabled, NOT_FOUND means not compiled in — both safe
@@ -267,7 +267,7 @@ except PermissionError:
             f"Expected KSM disabled (run=0) or not available. stdout: {stdout}"
         )
 
-    async def test_mem_merge_off_effect(self, scheduler: Scheduler) -> None:
+    async def test_mem_merge_off_effect(self, dual_scheduler: Scheduler) -> None:
         """Verify KSM pages_shared is 0 (effect of QEMU mem-merge=off).
 
         Even if KSM kernel support exists, mem-merge=off means QEMU never
@@ -283,7 +283,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "PAGES_SHARED:0" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
@@ -302,7 +302,7 @@ class TestCpuVulnerabilityTransparency:
     mitigations are active. This test documents the full exposure surface.
     """
 
-    async def test_vulnerability_files_readable(self, scheduler: Scheduler) -> None:
+    async def test_vulnerability_files_readable(self, dual_scheduler: Scheduler) -> None:
         """All vulnerability status files should be readable and documented.
 
         Enumerates /sys/devices/system/cpu/vulnerabilities/ to capture the
@@ -330,7 +330,7 @@ else:
             except (PermissionError, OSError) as e:
                 print(f'{name}:ERROR:{e}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "DIR_NOT_FOUND" not in stdout, "CPU vulnerability directory should exist"

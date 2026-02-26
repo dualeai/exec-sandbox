@@ -35,17 +35,31 @@ DEFAULT_TIMEOUT_SECONDS: Final[int] = 30
 MAX_TIMEOUT_SECONDS: Final[int] = 300
 """Maximum code execution timeout in seconds (5 minutes)."""
 
-VM_BOOT_TIMEOUT_SECONDS: Final[int] = 30
-"""VM boot timeout in seconds (guest agent ready check)."""
+VM_BOOT_TIMEOUT_SECONDS: Final[int] = 45
+"""VM boot timeout in seconds (guest agent ready check).
 
-VM_BOOT_MAX_RETRIES: Final[int] = 3
-"""Maximum retry attempts for VM boot failures (CPU contention resilience)."""
+Raised from 30s to 45s (1.5x) to accommodate CI nested virtualization
+overhead (AMD nested KVM: 50-90% CPU degradation per Cloud Hypervisor
+issue #4827). Bare-metal boots complete in <1s; the timeout is for the
+full boot + guest-agent ready sequence under worst-case contention."""
 
-VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.02
-"""Minimum backoff between VM boot retries (20ms base)."""
+VM_BOOT_MAX_RETRIES: Final[int] = 4
+"""Maximum retry attempts for VM boot failures (CPU contention resilience).
 
-VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
-"""Maximum backoff between VM boot retries (500ms cap with jitter)."""
+Raised from 3 to 4 to give transient overlay daemon errors (connection
+refused on startup) an extra attempt to recover."""
+
+VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.1
+"""Minimum backoff between VM boot retries (100ms base).
+
+Raised from 20ms to 100ms — under CI CPU contention the host scheduler
+needs time to reschedule the QEMU process; 20ms retries were too tight."""
+
+VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 2.0
+"""Maximum backoff between VM boot retries (2s cap with jitter).
+
+Raised from 500ms to 2s to let overlay daemon recover from transient
+connection-refused errors (daemon restart takes ~100-500ms)."""
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""

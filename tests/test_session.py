@@ -381,12 +381,26 @@ class TestSessionWeirdCases:
             assert result.exit_code == 0
             assert "spawned" in result.stdout
 
+            # Brief settle time — under CI CPU contention the daemon's
+            # reparenting to PID 1 (via init reaping the intermediate
+            # child) may race with the next exec call.
+            await asyncio.sleep(0.5)
+
             # Exec 2: verify daemon is alive and reparented to PID 1
+            # Retry /proc read briefly in case reparenting is still in-flight.
             result = await session.exec(
+                "import time\n"
                 "with open('/tmp/daemon.pid') as f:\n"
                 "    daemon_pid = f.read().strip()\n"
-                "with open(f'/proc/{daemon_pid}/stat') as f:\n"
-                "    stat = f.read()\n"
+                "for _attempt in range(5):\n"
+                "    try:\n"
+                "        with open(f'/proc/{daemon_pid}/stat') as f:\n"
+                "            stat = f.read()\n"
+                "        break\n"
+                "    except FileNotFoundError:\n"
+                "        time.sleep(0.2)\n"
+                "else:\n"
+                "    raise FileNotFoundError(f'/proc/{daemon_pid}/stat not found after retries')\n"
                 "# Parse ppid from after last ')' — comm field can contain spaces\n"
                 "ppid = stat[stat.rfind(')') + 2:].split()[1]\n"
                 "print(f'alive ppid={ppid}')"
