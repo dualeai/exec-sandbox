@@ -32,7 +32,7 @@ from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
 from exec_sandbox.hash_utils import crc64
 from exec_sandbox.migration_client import MigrationClient
-from exec_sandbox.permission_utils import get_expected_socket_uid
+from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_file_access
 from exec_sandbox.platform_utils import HostArch, detect_host_arch
 from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
 
@@ -266,6 +266,12 @@ class MemorySnapshotManager(BaseCacheManager):
         try:
             qemu_version = await probe_qemu_version()
             expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
+
+            # If QEMU runs as qemu-vm, pre-create tmp file and grant write
+            # access so the migrate command can write the vmstate.
+            if vm.use_qemu_vm_user:
+                tmp_path.touch()
+                await grant_qemu_vm_file_access(tmp_path, writable=True)
 
             async with MigrationClient(vm.qmp_socket, expected_uid) as client:
                 await client.save_snapshot(tmp_path, qemu_version=qemu_version)
