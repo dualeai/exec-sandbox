@@ -177,7 +177,7 @@ try {{
 }}
 """
     # RAW
-    return f'curl -sf --connect-timeout 5 --max-time 5 https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
+    return f'curl -sf --connect-timeout 5 --max-time 10 --retry 2 --retry-connrefused https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
 
 
 @pytest.mark.parametrize(
@@ -304,7 +304,7 @@ except OSError as e:
 async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
     """Test outbound filtering with RAW language using curl."""
     result = await scheduler.run(
-        code="curl -sf --max-time 10 https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
+        code="curl -sf --max-time 10 --retry 2 --retry-connrefused https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
         language=Language.RAW,
         allow_network=True,
         allowed_domains=["httpbin.org"],
