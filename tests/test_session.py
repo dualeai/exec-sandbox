@@ -359,14 +359,20 @@ class TestSessionWeirdCases:
     async def test_daemon_double_fork_survives_across_execs(self, scheduler: Scheduler) -> None:
         """Double-fork daemon survives across exec() calls, reparented to PID 1."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            # Exec 1: classic double-fork + setsid to create a daemon
+            # Exec 1: classic double-fork + setsid to create a daemon.
+            # The daemon resets PR_SET_DUMPABLE so its /proc entry is visible —
+            # the REPL sets dumpable=0 for ptrace protection, and forked children
+            # inherit this, making /proc/{pid}/ inaccessible to same-UID processes.
+            # After exec() the kernel resets dumpable to 1 automatically, but a
+            # pure-fork daemon never exec()s.
             result = await session.exec(
-                "import os, time\n"
+                "import os, time, ctypes\n"
                 "pid = os.fork()\n"
                 "if pid == 0:\n"
                 "    os.setsid()\n"
                 "    pid2 = os.fork()\n"
                 "    if pid2 == 0:\n"
+                "        ctypes.CDLL('libc.so.6').prctl(4, 1, 0, 0, 0)  # PR_SET_DUMPABLE=1\n"
                 "        with open('/tmp/daemon.pid', 'w') as f:\n"
                 "            f.write(str(os.getpid()))\n"
                 "        time.sleep(60)\n"
@@ -381,28 +387,26 @@ class TestSessionWeirdCases:
             assert result.exit_code == 0
             assert "spawned" in result.stdout
 
-            # Brief settle time — under CI CPU contention the daemon's
-            # reparenting to PID 1 (via init reaping the intermediate
-            # child) may race with the next exec call.
-            await asyncio.sleep(0.5)
-
-            # Exec 2: verify daemon is alive and reparented to PID 1
-            # Retry /proc read briefly in case reparenting is still in-flight.
+            # Exec 2: verify daemon is alive and reparented to PID 1.
+            # Retry briefly — reparenting to PID 1 (init reaping the
+            # intermediate child) is async and may race under CI load.
             result = await session.exec(
                 "import time\n"
                 "with open('/tmp/daemon.pid') as f:\n"
                 "    daemon_pid = f.read().strip()\n"
-                "for _attempt in range(5):\n"
+                "ppid = None\n"
+                "for _attempt in range(20):\n"
                 "    try:\n"
                 "        with open(f'/proc/{daemon_pid}/stat') as f:\n"
                 "            stat = f.read()\n"
-                "        break\n"
+                "        ppid = stat[stat.rfind(')') + 2:].split()[1]\n"
+                "        if ppid == '1':\n"
+                "            break\n"
                 "    except FileNotFoundError:\n"
-                "        time.sleep(0.2)\n"
-                "else:\n"
+                "        pass\n"
+                "    time.sleep(0.1)\n"
+                "if ppid is None:\n"
                 "    raise FileNotFoundError(f'/proc/{daemon_pid}/stat not found after retries')\n"
-                "# Parse ppid from after last ')' — comm field can contain spaces\n"
-                "ppid = stat[stat.rfind(')') + 2:].split()[1]\n"
                 "print(f'alive ppid={ppid}')"
             )
             assert result.exit_code == 0
