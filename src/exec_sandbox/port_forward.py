@@ -8,13 +8,13 @@ Architecture:
 - Mode 2: expose_ports with allow_network -> gvproxy configuration-based forwarding
 """
 
-import logging
 import socket
 
 from exec_sandbox import constants
+from exec_sandbox._logging import get_logger
 from exec_sandbox.models import ExposedPort, PortMapping
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def allocate_ephemeral_port(host: str = constants.PORT_FORWARD_BIND_HOST) -> int:

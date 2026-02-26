@@ -12,7 +12,7 @@ Architecture:
 Performance:
 - Default image (packages=[]): 1-2ms allocation (vs 400ms cold boot)
 - Custom packages: Fallback to cold boot (no change)
-- Memory overhead: ~256MB per pre-booted VM
+- Memory overhead: ~160MB idle (balloon inflated) / ~192MB active per VM
 
 L2 Disk Snapshots:
 - Uses L2 cache (local qcow2) for faster warm pool boots
@@ -55,8 +55,10 @@ from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.balloon_client import BalloonClient, BalloonError
 from exec_sandbox.exceptions import SocketAuthError
+from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage, WarmReplAckMessage, WarmReplRequest
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
+from exec_sandbox.platform_utils import advise_willneed
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -64,8 +66,9 @@ if TYPE_CHECKING:
     from tenacity.wait import wait_base
 
     from exec_sandbox.config import SchedulerConfig
+    from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
+    from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
     from exec_sandbox.qemu_vm import QemuVM
-    from exec_sandbox.snapshot_manager import SnapshotManager
     from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
@@ -106,18 +109,21 @@ class WarmVMPool:
         self,
         vm_manager: VmManager,
         config: SchedulerConfig,
-        snapshot_manager: SnapshotManager | None = None,
+        snapshot_manager: DiskSnapshotManager | None = None,
+        memory_snapshot_manager: MemorySnapshotManager | None = None,
     ):
         """Initialize warm VM pool.
 
         Args:
             vm_manager: VmManager for VM lifecycle
             config: Scheduler configuration
-            snapshot_manager: Optional SnapshotManager for L2 cache (faster refill)
+            snapshot_manager: Optional DiskSnapshotManager for L2 cache (faster refill)
+            memory_snapshot_manager: Optional MemorySnapshotManager for L1 cache
         """
         self.vm_manager = vm_manager
         self.config = config
         self.snapshot_manager = snapshot_manager
+        self.memory_snapshot_manager = memory_snapshot_manager
 
         # Pool size is explicitly configured via warm_pool_size
         # warm_pool_size=0 means warm pool disabled (caller should not create WarmVMPool)
@@ -169,13 +175,31 @@ class WarmVMPool:
             extra={"total_vms": self.pool_size_per_language * len(Language)},
         )
 
-        boot_start = asyncio.get_event_loop().time()
+        boot_start = asyncio.get_running_loop().time()
 
-        # Build list of all VMs to boot (parallel execution)
+        # Pre-warm vmstate files into kernel page cache so concurrent L1
+        # restores hit RAM instead of storage.  advise_willneed() issues an
+        # async, zero-copy kernel readahead (F_RDADVISE on macOS,
+        # posix_fadvise WILLNEED on Linux) and returns near-instantly; the
+        # 15ms boot stagger below gives the kernel time to complete the I/O.
+        if self.memory_snapshot_manager:
+            for language in Language:
+                vmstate = await self.memory_snapshot_manager.check_cache(language, [], constants.DEFAULT_MEMORY_MB)
+                if vmstate:
+                    advise_willneed(vmstate)
+
+        # Build list of all VMs to boot, staggered by 15ms to avoid macOS dyld
+        # contention.  Each QEMU fork+exec resolves ~170 dylibs under a global
+        # dyld lock; overlapping spawns serialize on that lock and degrade from
+        # ~150ms to 250-400ms per VM.  15ms ≈ single-process dyld resolve time,
+        # so the next spawn starts just as the previous one releases the lock.
         boot_coroutines: list[Coroutine[Any, Any, None]] = []
+        boot_order = 0
         for language in Language:
             logger.info(f"Pre-booting {self.pool_size_per_language} {language.value} VMs (parallel)")
-            boot_coroutines.extend(self._boot_and_add_vm(language, index=i) for i in range(self.pool_size_per_language))
+            for i in range(self.pool_size_per_language):
+                boot_coroutines.append(self._boot_and_add_vm(language, index=i, boot_delay=boot_order * 0.015))
+                boot_order += 1
 
         # Boot all VMs in parallel
         results: list[None | BaseException] = await asyncio.gather(*boot_coroutines, return_exceptions=True)
@@ -189,7 +213,7 @@ class WarmVMPool:
                     exc_info=result,
                 )
 
-        boot_duration = asyncio.get_event_loop().time() - boot_start
+        boot_duration = asyncio.get_running_loop().time() - boot_start
 
         # Start health check background task
         self._health_task = asyncio.create_task(self._health_check_loop())
@@ -211,8 +235,8 @@ class WarmVMPool:
         Args:
             timeout: Maximum seconds to wait before returning.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
             if all(pool.full() for pool in self.pools.values()):
                 return
             await asyncio.sleep(0.2)
@@ -372,24 +396,50 @@ class WarmVMPool:
         self,
         language: Language,
         index: int,
+        boot_delay: float = 0,
     ) -> None:
         """Boot VM and add to pool (used for parallel startup).
+
+        For index=0: If L1 cache is empty, saves L1 from the first warmed VM
+        (sacrificial save — VM is killed, then replaced from L1 cache).
 
         Args:
             language: Programming language enum
             index: VM index in pool (for unique ID)
+            boot_delay: Seconds to wait before booting (staggers fork/exec)
         """
+        if boot_delay > 0:
+            await asyncio.sleep(boot_delay)
         vm: QemuVM | None = None
         try:
             vm = await self._boot_warm_vm(language, index)
 
-            # Pre-warm REPL at full memory (hides ~800ms Python startup).
-            # Must run BEFORE balloon inflate: Bun (42MB RSS) swap-thrashes
-            # when starting at 128MB. After startup, Bun idles at ~42MB RSS
-            # which fits comfortably in the ballooned 128MB target.
-            # RAW (bash ~5MB RSS) has no such constraint but benefits from
-            # the same ordering for consistency.
-            await self._warm_repl(vm, language)
+            # L1-restored VMs already have warm REPL — skip warm_repl
+            if not vm.l1_restored:
+                # Pre-warm REPL at full memory (hides ~10s Python/Bun startup on HVF).
+                await self._warm_repl(vm, language)
+
+                # index=0 only: save L1 for future restores (one-time sacrificial save)
+                if self.memory_snapshot_manager and index == 0:
+                    l1_hit = await self.memory_snapshot_manager.check_cache(
+                        language,
+                        [],
+                        constants.DEFAULT_MEMORY_MB,
+                    )
+                    if not l1_hit:
+                        saved = await self.memory_snapshot_manager.save_snapshot(
+                            vm,
+                            language,
+                            [],
+                            constants.DEFAULT_MEMORY_MB,
+                        )
+                        if saved:
+                            # VM is dead after save — boot replacement (now from L1 cache)
+                            with contextlib.suppress(Exception):
+                                await self.vm_manager.destroy_vm(vm)
+                            vm = await self._boot_warm_vm(language, index)
+                            if not vm.l1_restored:
+                                await self._warm_repl(vm, language)
 
             # Inflate balloon to reduce idle memory footprint
             await self._inflate_balloon(vm)
@@ -402,6 +452,7 @@ class WarmVMPool:
                     "vm_id": vm.vm_id,
                     "index": index,
                     "total": self.pool_size_per_language,
+                    "l1_restored": vm.l1_restored,
                 },
             )
         except Exception as e:
@@ -423,7 +474,7 @@ class WarmVMPool:
     ) -> QemuVM:
         """Boot single warm VM with placeholder IDs.
 
-        Uses L2 cache for disk caching if available.
+        Tries L1 restore first (REPL already warm), falls back to L2/cold boot.
 
         Args:
             language: Programming language enum
@@ -432,19 +483,43 @@ class WarmVMPool:
         Returns:
             Booted QemuVM in READY state
         """
-        # Placeholder IDs for warm pool VMs
         tenant_id = constants.WARM_POOL_TENANT_ID
         task_id = f"warm-{language.value}-{index}"
 
-        # Check L2 cache for base image (check-only, no create)
-        # For base images (no packages), creating L2 cache is pointless - would boot VM
-        # just to shut it down with no data to cache. Boot from base image directly.
+        # Try L1 restore first (REPL already warm — skip _warm_repl)
+        if self.memory_snapshot_manager:
+            try:
+                vmstate = await self.memory_snapshot_manager.check_cache(
+                    language,
+                    [],
+                    constants.DEFAULT_MEMORY_MB,
+                )
+                if vmstate:
+                    vm = await self.vm_manager.restore_vm(
+                        language,
+                        tenant_id,
+                        task_id,
+                        vmstate_path=vmstate,
+                        memory_mb=constants.DEFAULT_MEMORY_MB,
+                    )
+                    logger.debug(
+                        "L1 cache hit for warm pool VM",
+                        extra={"language": language.value, "vm_id": vm.vm_id},
+                    )
+                    return vm
+            except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
+                logger.warning(
+                    "L1 restore failed for warm pool, falling back to cold boot",
+                    extra={"language": language.value, "error": str(e)},
+                )
+
+        # Fall back to L2/cold boot
         snapshot_path = None
         if self.snapshot_manager:
             try:
                 snapshot_path = await self.snapshot_manager.check_cache(
                     language=language,
-                    packages=[],  # Base image, no packages
+                    packages=[],
                 )
                 if snapshot_path:
                     logger.debug(
@@ -452,7 +527,6 @@ class WarmVMPool:
                         extra={"language": language.value, "snapshot_path": str(snapshot_path)},
                     )
             except (OSError, RuntimeError) as e:
-                # Graceful degradation: log and continue with cold boot
                 logger.warning(
                     "L2 cache check failed for warm pool, falling back to cold boot",
                     extra={"language": language.value, "error": str(e)},
@@ -462,10 +536,10 @@ class WarmVMPool:
             language=language,
             tenant_id=tenant_id,
             task_id=task_id,
-            backing_image=snapshot_path,
             memory_mb=constants.DEFAULT_MEMORY_MB,
-            allow_network=False,  # Warm pool VMs don't need network
+            allow_network=False,
             allowed_domains=None,
+            snapshot_drive=snapshot_path,
         )
 
     async def _replenish_pool(self, language: Language) -> None:
@@ -554,7 +628,7 @@ class WarmVMPool:
 
         This eliminates up to 5s of polling overhead on slow systems (nested
         virtualization) where balloon operations are degraded. Most code doesn't
-        need the full 256MB immediately - the idle memory (BALLOON_INFLATE_TARGET_MB)
+        need the full 192MB immediately - the idle memory (BALLOON_INFLATE_TARGET_MB)
         is sufficient for runtime startup, and full memory becomes available within ~1s.
 
         Graceful degradation: logs warning and continues if balloon fails.
@@ -582,14 +656,10 @@ class WarmVMPool:
 
         Fire-and-forget: failure is non-fatal (lazy spawn on first request).
         """
-        from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
-            WarmReplAckMessage,
-            WarmReplRequest,
-        )
-
         try:
             response = await vm.channel.send_request(
                 WarmReplRequest(language=language),
+                timeout=constants.WARM_REPL_TIMEOUT_SECONDS,
             )
             if isinstance(response, WarmReplAckMessage) and response.status == "ok":
                 logger.debug("REPL pre-warmed", extra={"vm_id": vm.vm_id, "language": language.value})
@@ -601,14 +671,14 @@ class WarmVMPool:
     async def _health_check_loop(self) -> None:
         """Background health check for warm VMs.
 
-        Pings guest agents every 30s to detect crashes.
-        Replaces unhealthy VMs automatically.
+        Pings guest agents every WARM_POOL_HEALTH_CHECK_INTERVAL seconds
+        (currently 15s) to detect crashes. Replaces unhealthy VMs automatically.
         """
         logger.info("Warm pool health check started")
 
         while not self._shutdown_event.is_set():
             try:
-                # Wait 30s or until shutdown
+                # Wait WARM_POOL_HEALTH_CHECK_INTERVAL or until shutdown
                 await asyncio.wait_for(
                     self._shutdown_event.wait(),
                     timeout=constants.WARM_POOL_HEALTH_CHECK_INTERVAL,
@@ -634,7 +704,7 @@ class WarmVMPool:
         if pool_size == 0:
             return
 
-        check_start = asyncio.get_event_loop().time()
+        check_start = asyncio.get_running_loop().time()
         logger.info(
             "Health check iteration starting",
             extra={"language": language.value, "pool_size": pool_size},
@@ -655,7 +725,7 @@ class WarmVMPool:
         healthy_count = sum(1 for r in results if r is True)
         unhealthy_count = len(results) - healthy_count
 
-        check_duration = asyncio.get_event_loop().time() - check_start
+        check_duration = asyncio.get_running_loop().time() - check_start
         logger.info(
             "Health check iteration complete",
             extra={
@@ -773,11 +843,6 @@ class WarmVMPool:
                 extra={"vm_id": vm.vm_id},
             )
             return False
-
-        from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
-            PingRequest,
-            PongMessage,
-        )
 
         async def _ping_guest() -> bool:
             """Single ping attempt - may raise on transient failure."""

@@ -251,6 +251,11 @@ pub(crate) async fn handle_connection(
             }
         };
 
+        // Reseed kernel CRNG before every command dispatch (~11μs).
+        // After L1 snapshot restore the VM resumes mid-loop with cloned CRNG;
+        // this forces divergence before any user code calls getrandom().
+        crate::reseed_crng();
+
         let writer = ResponseWriter::new(write_tx.clone(), op_id);
 
         match cmd {
@@ -287,19 +292,44 @@ pub(crate) async fn handle_connection(
                     }
                 };
                 match spawn_repl(lang).await {
-                    Ok(repl) => {
-                        REPL_STATES.lock().await.insert(lang, repl);
-                        log_info!("REPL pre-warmed for {language}");
-                        if writer
-                            .send(&GuestResponse::WarmReplAck {
-                                language,
-                                status: "ok".to_string(),
-                                message: None,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
+                    Ok(mut repl) => {
+                        // Exercise the REPL with a no-op to block until the interpreter
+                        // is fully loaded. Without this, spawn_repl returns after fork+exec
+                        // (~4ms) but Python/Bun take ~10s to finish importing modules.
+                        // The pool would advertise the VM as ready prematurely.
+                        let warm_start = std::time::Instant::now();
+                        match crate::repl::execute::warm_exercise_repl(&mut repl, lang).await {
+                            Ok(()) => {
+                                let warm_ms = warm_start.elapsed().as_millis();
+                                REPL_STATES.lock().await.insert(lang, repl);
+                                log_info!("REPL pre-warmed for {language} ({warm_ms}ms)");
+                                if writer
+                                    .send(&GuestResponse::WarmReplAck {
+                                        language,
+                                        status: "ok".to_string(),
+                                        message: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break Err("write queue closed".into());
+                                }
+                            }
+                            Err(e) => {
+                                log_warn!("REPL warm-up failed for {language}: {e}");
+                                let _ = repl.child.kill().await;
+                                if writer
+                                    .send(&GuestResponse::WarmReplAck {
+                                        language,
+                                        status: "error".to_string(),
+                                        message: Some(format!("warm-up failed: {e}")),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break Err("write queue closed".into());
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -367,7 +397,14 @@ pub(crate) async fn handle_connection(
                 env_vars,
             } => {
                 // Gate: wait for network setup (ip + gvproxy) before code execution
+                let t_net = crate::monotonic_ms();
                 crate::init::wait_for_network().await;
+                let t_net_done = crate::monotonic_ms();
+                log_info!(
+                    "[timing] wait_for_network: {}ms (at {}ms)",
+                    t_net_done - t_net,
+                    t_net_done
+                );
                 log_info!(
                     "Processing: execute_code (language={language}, code_size={}, timeout={timeout}s, env_vars={})",
                     code.len(),

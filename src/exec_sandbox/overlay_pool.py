@@ -39,7 +39,7 @@ async def create_qcow2_overlay(base_image: Path, overlay_path: Path) -> None:
     """Create qcow2 overlay with copy-on-write backing file.
 
     Subprocess-based overlay creation using qemu-img. Used by:
-    - SnapshotManager (snapshot creation)
+    - DiskSnapshotManager (snapshot creation)
 
     Note: OverlayPool uses QemuStorageDaemon for faster overlay creation.
 

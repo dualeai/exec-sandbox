@@ -5,7 +5,6 @@ Async probes use a shared cache container to avoid global statements.
 """
 
 import asyncio
-import logging
 import os
 import platform
 import re
@@ -17,6 +16,7 @@ from typing import Any, ParamSpec, TypeVar
 import aiofiles
 import aiofiles.os
 
+from exec_sandbox._logging import get_logger
 from exec_sandbox.permission_utils import can_access
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.vm_types import AccelType
@@ -24,7 +24,7 @@ from exec_sandbox.vm_types import AccelType
 P = ParamSpec("P")
 T = TypeVar("T")
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "NOT_CACHED",
@@ -433,10 +433,9 @@ async def check_hvf_available() -> bool:
     return True
 
 
-def check_hwaccel_available() -> bool:
+async def check_hwaccel_available() -> bool:
     """Check if hardware acceleration (KVM or HVF) is available.
 
-    Synchronous function for use in pytest skipif markers.
     TCG (software emulation) is 10-50x slower than hardware virtualization,
     making timing-sensitive tests unreliable.
 
@@ -447,16 +446,15 @@ def check_hwaccel_available() -> bool:
     host_os = detect_host_os()
 
     if host_os == HostOS.LINUX:
-        return asyncio.run(check_kvm_available())
+        return await check_kvm_available()
     if host_os == HostOS.MACOS:
-        return asyncio.run(check_hvf_available())
+        return await check_hvf_available()
     return False
 
 
-def check_fast_balloon_available() -> bool:
+async def check_fast_balloon_available() -> bool:
     """Check if fast balloon operations are expected (not degraded nested virtualization).
 
-    Synchronous function for use in pytest skipif markers.
     Used for timing-sensitive tests that include balloon inflate/deflate overhead.
 
     Background
@@ -505,7 +503,7 @@ def check_fast_balloon_available() -> bool:
           - macOS: HVF available (nested virt not possible on macOS)
         False otherwise (balloon operations may be slow, skip timing tests)
     """
-    if not check_hwaccel_available():
+    if not await check_hwaccel_available():
         return False
 
     host_os = detect_host_os()
@@ -514,7 +512,7 @@ def check_fast_balloon_available() -> bool:
     # On Linux x86_64, TSC_DEADLINE absence indicates degraded nested virt
     # See: https://www.qemu.org/docs/master/system/i386/microvm.html
     if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
-        return asyncio.run(check_tsc_deadline())
+        return await check_tsc_deadline()
 
     # On macOS, HVF availability implies not nested (macOS doesn't support nested virt)
     # If we got here, HVF is available, so balloon should be fast

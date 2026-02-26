@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -24,7 +25,10 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import click
 
@@ -39,6 +43,7 @@ from exec_sandbox import (
     VmTimeoutError,
     __version__,
 )
+from exec_sandbox._logging import configure_logging
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
 from exec_sandbox.process_registry import force_kill_all, get_tracked_count
 
@@ -524,6 +529,23 @@ def is_tty() -> bool:
     return sys.stdout.isatty()
 
 
+def _make_boot_log_callback(debug: bool) -> Callable[[str], None] | None:
+    """Create boot log callback for --debug mode, or None if disabled.
+
+    Uses click.echo() directly (not logging) because boot lines are raw
+    kernel/init console output with their own timestamps — wrapping them
+    in the logging formatter would double-prefix.  click.echo(err=True)
+    also handles ANSI stripping on non-TTY automatically.
+    """
+    if not debug:
+        return None
+
+    def _on_boot_log(line: str) -> None:
+        click.echo(click.style(f"[boot] {line}", dim=True), err=True)
+
+    return _on_boot_log
+
+
 async def run_code(
     code: str,
     language: Language,
@@ -539,6 +561,7 @@ async def run_code(
     no_validation: bool,
     upload_files: tuple[tuple[str, str], ...] = (),
     download_files: tuple[tuple[str, str], ...] = (),
+    debug: bool = False,
 ) -> int:
     """Execute code in sandbox and return exit code.
 
@@ -560,6 +583,7 @@ async def run_code(
         no_validation: Skip package validation
         upload_files: Files to upload before execution (local_path, guest_path)
         download_files: Files to download after execution (guest_path, local_path)
+        debug: Enable boot log streaming to stderr
 
     Returns:
         Exit code to return from CLI
@@ -579,6 +603,8 @@ async def run_code(
         if not json_output:
             click.echo(chunk, nl=False, err=True)
 
+    on_boot_log = _make_boot_log_callback(debug)
+
     try:
         async with Scheduler(config) as scheduler:
             if upload_files or download_files:
@@ -590,6 +616,7 @@ async def run_code(
                     allow_network=network,
                     allowed_domains=list(allowed_domains) if allowed_domains else None,
                     expose_ports=expose_ports,  # type: ignore[arg-type]
+                    on_boot_log=on_boot_log,
                 ) as session:
                     # Upload files
                     for local_path, guest_path in upload_files:
@@ -635,6 +662,7 @@ async def run_code(
                     env_vars=env_vars if env_vars else None,
                     on_stdout=on_stdout,
                     on_stderr=on_stderr,
+                    on_boot_log=on_boot_log,
                 )
 
         # JSON output mode
@@ -701,6 +729,7 @@ async def run_multiple(
     json_output: bool,
     quiet: bool,
     no_validation: bool,
+    debug: bool = False,
 ) -> int:
     """Execute multiple sources concurrently and return max exit code.
 
@@ -726,6 +755,8 @@ async def run_multiple(
         enable_package_validation=not no_validation,
     )
 
+    on_boot_log = _make_boot_log_callback(debug)
+
     results: list[MultiSourceResult] = []
     total_passed = 0
     total_failed = 0
@@ -746,6 +777,7 @@ async def run_multiple(
                         allowed_domains=list(allowed_domains) if allowed_domains else None,
                         expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
                         env_vars=env_vars if env_vars else None,
+                        on_boot_log=on_boot_log,
                     )
                     return MultiSourceResult(
                         index=idx,
@@ -928,6 +960,7 @@ def cli(ctx: click.Context) -> None:
     multiple=True,
     help="Download file GUEST:LOCAL or GUEST (repeatable)",
 )
+@click.option("--debug", is_flag=True, help="Enable DEBUG logging and stream kernel/init boot logs to stderr")
 def run_command(
     sources: tuple[str, ...],
     language: str | None,
@@ -944,6 +977,7 @@ def run_command(
     no_validation: bool,
     upload_files: tuple[str, ...],
     download_files: tuple[str, ...],
+    debug: bool,
 ) -> NoReturn:
     """Execute code in an isolated VM sandbox.
 
@@ -984,6 +1018,8 @@ def run_command(
       sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
       sbx run --download output.csv -c "open('output.csv','w').write('data')"
     """
+    configure_logging(quiet=quiet, level=logging.DEBUG if debug else None)
+
     # Merge inline codes with positional sources
     all_sources: list[str] = list(inline_codes) + list(sources)
 
@@ -1042,6 +1078,7 @@ def run_command(
                 no_validation=no_validation,
                 upload_files=parsed_uploads,
                 download_files=parsed_downloads,
+                debug=debug,
             )
         )
     else:
@@ -1059,6 +1096,7 @@ def run_command(
                 json_output=json_output,
                 quiet=quiet,
                 no_validation=no_validation,
+                debug=debug,
             )
         )
 
@@ -1098,6 +1136,8 @@ def prefetch_command(arch: str | None, quiet: bool) -> NoReturn:
       RUN sbx prefetch -q
       ENV EXEC_SANDBOX_OFFLINE=1
     """
+    configure_logging(quiet=quiet)
+
     result: PrefetchResult = asyncio.run(prefetch_all_assets(arch=arch))
     _display_prefetch_result(result, quiet=quiet)
     sys.exit(EXIT_SUCCESS if result.success else 1)

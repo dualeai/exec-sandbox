@@ -20,7 +20,8 @@ from pathlib import Path
 import psutil
 import pytest
 
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import Scheduler, SchedulerConfig, constants
+from exec_sandbox.guest_channel import OP_QUEUE_DEPTH
 from exec_sandbox.warm_vm_pool import Language
 from tests.conftest import skip_unless_hwaccel
 
@@ -185,16 +186,21 @@ _FILE_IO_SIZES_MB = [1, 5, 10]
 
 # --- Streaming pipeline overhead thresholds ---
 #
-# Write path: look-ahead pipelining fills the bounded write queue (maxsize=64)
-# before backpressure kicks in.  Queue capacity: 64 x ~175KB ≈ 11MB.
-# Memory is O(queue_capacity), bounded but higher than the read path.
-_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = 13
+# Both write and read paths use bounded queues (maxsize=OP_QUEUE_DEPTH).
+# Per queued item: FILE_TRANSFER_CHUNK_SIZE bytes compressed → base64 (4/3 expansion).
+# Queue capacity dominates; +2MB covers decode/decompress temporaries + StreamReader.
+# Memory is O(queue_capacity) — bounded, must NOT scale with file size.
+_QUEUE_CAPACITY_MB = OP_QUEUE_DEPTH * constants.FILE_TRANSFER_CHUNK_SIZE * 4 / 3 / (1024 * 1024)
+_PIPELINE_JITTER_MB = 2
+# Write path: look-ahead pipelining fills the bounded write queue before
+# backpressure kicks in.
+_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
 # Tracemalloc overhead for bytes-input write: BytesIO copy is tracked at ~file_size,
-# plus ~2MB from in-flight queue frames and compressor state.
-_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 2
-# Read path: op_queue (maxsize=4) x ~200KB + StreamReader + Pydantic parsing.
-# Still O(chunk_size), much lower than write pipeline.
-_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 5
+# plus ~3MB from in-flight queue frames and compressor state.
+_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 3
+# Read path: op_queue (maxsize=OP_QUEUE_DEPTH) buffers FileChunkResponseMessage
+# models while consumer awaits disk I/O per chunk.
+_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache, etc).
 _FILE_IO_RSS_OVERHEAD_MB = 10
 # Streaming chunk pipeline headroom for RSS tests (~500KB real, padded for jitter).
@@ -539,7 +545,7 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Pat
 
     content (os.urandom) is allocated BEFORE tracemalloc.start(), so NOT tracked.
     Tracked: BytesIO(content) copy in _resolve_content (~1x file_size) + chunk
-    pipeline (in-flight queue frames + compressor state).  Threshold: file_size + 2 MB.
+    pipeline (in-flight queue frames + compressor state).  Threshold: file_size + 3 MB.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
@@ -609,10 +615,10 @@ async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path
     """Measure Python-level allocation peak during read_file.
 
     Read loop: op_queue.get() → base64.b64decode → decompress → disk write,
-    per 128 KB chunk.  Bounded op_queue (maxsize=4) and StreamReader buffer
-    (512KB) keep memory at O(chunk_size).
-    Threshold: 3 MB flat (pipeline + GC/allocator jitter).
-    Must NOT scale with file size — proves streaming is O(chunk_size).
+    per 128 KB chunk.  Bounded op_queue (maxsize=OP_QUEUE_DEPTH) caps in-flight
+    data at O(queue_capacity).
+    Threshold derived from OP_QUEUE_DEPTH x chunk wire size + pipeline jitter.
+    Must NOT scale with file size — proves streaming is bounded.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
     content = os.urandom(size_bytes)

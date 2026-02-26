@@ -392,7 +392,8 @@ for dev in glob.glob('/dev/*'):
             'gpiochip0',   # PL061 GPIO on ARM64 QEMU virt (selected by GPIO_PL061)
             'nvme-fabrics',  # NVMe fabrics control plane (no NVMe hardware, benign)
             'vmci',     # VMware VMCI kernel driver (AMD platform artifact, no host exposure)
-            'nvram'}    # Non-volatile RAM device (architecture-specific, read-only)
+            'nvram',    # Non-volatile RAM device (architecture-specific, read-only)
+            'hwrng'}    # Hardware RNG via virtio-rng (feeds /dev/random entropy pool)
     if basename not in safe and not basename.startswith(('tty', 'vcs', 'vcsa', 'hvc', 'vport', 'rtc')):
         try:
             st = os.stat(dev)

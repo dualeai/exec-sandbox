@@ -193,7 +193,7 @@ class Session:
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
         async with self._guard():
-            execute_start = asyncio.get_event_loop().time()
+            execute_start = asyncio.get_running_loop().time()
             try:
                 result = await self._vm.execute(
                     code=code,
@@ -207,7 +207,7 @@ class Session:
                 await self.close()
                 raise
 
-            execute_end = asyncio.get_event_loop().time()
+            execute_end = asyncio.get_running_loop().time()
             execute_ms = round((execute_end - execute_start) * 1000)
 
             self._exec_count += 1

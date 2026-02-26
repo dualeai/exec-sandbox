@@ -60,6 +60,12 @@ pub(crate) const SANDBOX_ROOT: &str = "/home/user";
 pub(crate) const PYTHON_SITE_PACKAGES: &str = "/usr/lib/python3/site-packages";
 pub(crate) const NODE_MODULES_SYSTEM: &str = "/usr/local/lib/node_modules";
 
+// Runtime paths — shared between spawn.rs (REPL commands).
+pub(crate) const JEMALLOC_LIB: &str = "/usr/lib/libjemalloc.so.2";
+pub(crate) const PYTHON_HOME: &str = "/opt/python";
+pub(crate) const BUN_BIN_PATH: &str = "/usr/local/bin/bun";
+pub(crate) const BASH_BIN_PATH: &str = "/bin/bash";
+
 // File transfer streaming
 pub(crate) const FILE_TRANSFER_CHUNK_SIZE: usize = 128 * 1024;
 pub(crate) const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
@@ -135,6 +141,6 @@ pub(crate) static NETWORK_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 /// to produce unique, unpredictable IDs without the uuid crate dependency.
 pub(crate) static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Module-level REPL storage. Persists across 12s guest agent reconnect cycles.
+/// Module-level REPL storage. Persists across guest agent reconnect cycles (READ_TIMEOUT_MS=18s).
 pub(crate) static REPL_STATES: LazyLock<TokioMutex<HashMap<Language, ReplState>>> =
     LazyLock::new(|| TokioMutex::new(HashMap::new()));

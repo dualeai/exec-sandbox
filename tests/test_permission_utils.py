@@ -24,6 +24,7 @@ from exec_sandbox.permission_utils import (
     get_owner,
     get_qemu_vm_uid,
     grant_qemu_vm_access,
+    grant_qemu_vm_file_access,
     probe_qemu_vm_user,
     probe_sudo_as_qemu_vm,
     remove_acl_user,
@@ -492,13 +493,9 @@ class TestSudoRmReal:
         assert result is True
         assert not test_dir.exists()
 
+    @skip_unless_linux  # qemu-vm user only exists on Linux CI runners
     async def test_chown_to_qemu_vm(self, tmp_path: Path) -> None:
         """chown_to_qemu_vm changes ownership if user exists."""
-        # Check if qemu-vm user exists
-        qemu_uid = get_qemu_vm_uid()
-        if qemu_uid is None:
-            pytest.skip("qemu-vm user does not exist")
-
         test_file = tmp_path / "qemu_owned.txt"
         test_file.write_text("for qemu-vm")
 
@@ -583,10 +580,6 @@ class TestAclRealLinux:
 
     async def test_grant_qemu_vm_access_real(self, tmp_path: Path) -> None:
         """grant_qemu_vm_access sets ACL for qemu-vm user."""
-        qemu_uid = get_qemu_vm_uid()
-        if qemu_uid is None:
-            pytest.skip("qemu-vm user does not exist")
-
         test_file = tmp_path / "qemu_acl.txt"
         test_file.write_text("content")
 
@@ -598,3 +591,252 @@ class TestAclRealLinux:
         acl = await get_acl(test_file)
         assert acl is not None
         assert "user:qemu-vm" in acl
+
+
+# =============================================================================
+# grant_qemu_vm_file_access Tests
+# =============================================================================
+
+
+class TestGrantQemuVmFileAccess:
+    """Tests for grant_qemu_vm_file_access function.
+
+    Note: grant_qemu_vm_file_access traverses parent dirs all the way to /,
+    which requires root to chmod system dirs. In unit tests, we mock
+    ensure_traversable to isolate the file operation logic. The traversal
+    itself is tested separately in TestEnsureTraversable.
+    """
+
+    # ---- writable=False path ----
+
+    async def test_readonly_chmods_file(self, tmp_path: Path) -> None:
+        """writable=False makes file world-readable (a+r)."""
+        test_file = tmp_path / "test.qcow2"
+        test_file.write_bytes(b"\x00")
+        test_file.chmod(0o600)
+
+        with patch(
+            "exec_sandbox.permission_utils.ensure_traversable",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            result = await grant_qemu_vm_file_access(test_file, writable=False)
+
+        assert result is True
+        assert test_file.stat().st_mode & 0o004  # other-read bit
+
+    async def test_readonly_idempotent(self, tmp_path: Path) -> None:
+        """Calling twice with writable=False still succeeds."""
+        test_file = tmp_path / "test.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        with patch(
+            "exec_sandbox.permission_utils.ensure_traversable",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            assert await grant_qemu_vm_file_access(test_file, writable=False) is True
+            assert await grant_qemu_vm_file_access(test_file, writable=False) is True
+        assert test_file.stat().st_mode & 0o004
+
+    # ---- writable=True path (mocked chown, no real qemu-vm user) ----
+
+    async def test_writable_calls_chown(self, tmp_path: Path) -> None:
+        """writable=True calls chown_to_qemu_vm instead of chmod."""
+        test_file = tmp_path / "snap.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        with (
+            patch(
+                "exec_sandbox.permission_utils.ensure_traversable",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "exec_sandbox.permission_utils.chown_to_qemu_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_chown,
+        ):
+            result = await grant_qemu_vm_file_access(test_file, writable=True)
+
+        assert result is True
+        mock_chown.assert_awaited_once_with(test_file)
+
+    async def test_writable_does_not_chmod(self, tmp_path: Path) -> None:
+        """writable=True does not call chmod a+r."""
+        test_file = tmp_path / "snap.qcow2"
+        test_file.write_bytes(b"\x00")
+        test_file.chmod(0o600)
+
+        with (
+            patch(
+                "exec_sandbox.permission_utils.ensure_traversable",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "exec_sandbox.permission_utils.chown_to_qemu_vm",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            await grant_qemu_vm_file_access(test_file, writable=True)
+
+        # File should NOT have been made world-readable
+        assert not (test_file.stat().st_mode & 0o004)
+
+    # ---- Failure propagation ----
+
+    async def test_traversal_failure_skips_file_op(self, tmp_path: Path) -> None:
+        """If ensure_traversable fails, no chown/chmod is attempted."""
+        test_file = tmp_path / "snap.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        with (
+            patch(
+                "exec_sandbox.permission_utils.ensure_traversable",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "exec_sandbox.permission_utils.chown_to_qemu_vm",
+                new_callable=AsyncMock,
+            ) as mock_chown,
+            patch(
+                "exec_sandbox.permission_utils.chmod_async",
+                new_callable=AsyncMock,
+            ) as mock_chmod,
+        ):
+            result = await grant_qemu_vm_file_access(test_file, writable=True)
+
+        assert result is False
+        mock_chown.assert_not_awaited()
+        mock_chmod.assert_not_awaited()
+
+    async def test_chown_failure_returns_false(self, tmp_path: Path) -> None:
+        """writable=True returns False when chown fails."""
+        test_file = tmp_path / "snap.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        with (
+            patch(
+                "exec_sandbox.permission_utils.ensure_traversable",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "exec_sandbox.permission_utils.chown_to_qemu_vm",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await grant_qemu_vm_file_access(test_file, writable=True)
+
+        assert result is False
+
+    async def test_chmod_failure_returns_false(self, tmp_path: Path) -> None:
+        """writable=False returns False when chmod fails (nonexistent file)."""
+        nonexistent = tmp_path / "does_not_exist.qcow2"
+
+        with patch(
+            "exec_sandbox.permission_utils.ensure_traversable",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            result = await grant_qemu_vm_file_access(nonexistent, writable=False)
+
+        assert result is False
+
+    # ---- Parent directory computation ----
+
+    async def test_collects_all_ancestors(self, tmp_path: Path) -> None:
+        """Traversal collects every directory from parent up to root."""
+        deep = tmp_path / "l1" / "l2" / "l3"
+        deep.mkdir(parents=True)
+        test_file = deep / "file.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        collected: list[Path] = []
+
+        async def spy_ensure(dirs: list[Path]) -> bool:
+            collected.extend(dirs)
+            return True
+
+        with patch(
+            "exec_sandbox.permission_utils.ensure_traversable",
+            side_effect=spy_ensure,
+        ):
+            await grant_qemu_vm_file_access(test_file, writable=False)
+
+        # Must include immediate parent and all ancestors
+        assert deep in collected
+        assert (tmp_path / "l1" / "l2") in collected
+        assert (tmp_path / "l1") in collected
+        assert tmp_path in collected
+
+    async def test_file_at_shallow_path(self, tmp_path: Path) -> None:
+        """File directly in tmp_path still works."""
+        test_file = tmp_path / "shallow.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        with patch(
+            "exec_sandbox.permission_utils.ensure_traversable",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            result = await grant_qemu_vm_file_access(test_file, writable=False)
+
+        assert result is True
+
+    async def test_traversal_order_innermost_first(self, tmp_path: Path) -> None:
+        """Parent dirs are collected innermost-first (child before parent)."""
+        nested = tmp_path / "a" / "b"
+        nested.mkdir(parents=True)
+        test_file = nested / "f.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        collected: list[Path] = []
+
+        async def spy_ensure(dirs: list[Path]) -> bool:
+            collected.extend(dirs)
+            return True
+
+        with patch(
+            "exec_sandbox.permission_utils.ensure_traversable",
+            side_effect=spy_ensure,
+        ):
+            await grant_qemu_vm_file_access(test_file, writable=False)
+
+        # b must come before a (innermost first)
+        idx_b = collected.index(nested)
+        idx_a = collected.index(tmp_path / "a")
+        assert idx_b < idx_a
+
+
+# =============================================================================
+# grant_qemu_vm_file_access Sudo Integration Tests
+# =============================================================================
+
+
+@pytest.mark.sudo
+@skip_unless_linux  # qemu-vm user only exists on Linux CI runners
+class TestGrantQemuVmFileAccessReal:
+    """Real filesystem tests for grant_qemu_vm_file_access.
+
+    Run with: uv run pytest tests/test_permission_utils.py -v -m sudo
+    """
+
+    async def test_writable_chowns_to_qemu_vm(self, tmp_path: Path) -> None:
+        """writable=True chowns file to qemu-vm user on Linux."""
+        test_file = tmp_path / "snap.qcow2"
+        test_file.write_bytes(b"\x00")
+
+        result = await grant_qemu_vm_file_access(test_file, writable=True)
+
+        assert result is True
+        owner = await get_owner(test_file)
+        assert owner is not None
+        assert owner[0] == "qemu-vm"
+
+        await sudo_rm(test_file)

@@ -1,7 +1,7 @@
 """VM working directory management for isolated temp file handling.
 
 Provides atomic directory creation with secure cleanup for all VM-related
-temporary files (overlay, sockets, logs).
+temporary files (overlay, sockets).
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ logger = get_logger(__name__)
 class VmWorkingDirectory:
     """Manages a dedicated temporary directory for a single VM's files.
 
-    All VM-related temporary files (overlay image, sockets, console log) are
-    stored in a single directory created atomically via tempfile.mkdtemp().
+    All VM-related temporary files (overlay image, sockets) are stored in a
+    single directory created atomically via tempfile.mkdtemp().
     This simplifies cleanup (single rmtree) and ensures socket paths stay
     under the 108-byte Unix domain socket limit.
 
@@ -47,7 +47,6 @@ class VmWorkingDirectory:
         vm_id: VM identifier for logging
         path: Root directory path (created by mkdtemp with mode 0700)
         overlay_image: Path to qcow2 overlay file
-        console_log: Path to console log file
         cmd_socket: Path to command channel Unix socket (str for QEMU args)
         event_socket: Path to event channel Unix socket (str for QEMU args)
         qmp_socket: Path to QMP control socket
@@ -125,11 +124,6 @@ class VmWorkingDirectory:
         if self._custom_overlay_path is not None:
             return self._custom_overlay_path
         return self._path / "overlay.qcow2"
-
-    @property
-    def console_log(self) -> Path:
-        """Path to console log file."""
-        return self._path / "console.log"
 
     @property
     def cmd_socket(self) -> str:

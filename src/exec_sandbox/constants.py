@@ -35,23 +35,45 @@ DEFAULT_TIMEOUT_SECONDS: Final[int] = 30
 MAX_TIMEOUT_SECONDS: Final[int] = 300
 """Maximum code execution timeout in seconds (5 minutes)."""
 
-VM_BOOT_TIMEOUT_SECONDS: Final[int] = 30
-"""VM boot timeout in seconds (guest agent ready check)."""
+VM_BOOT_TIMEOUT_SECONDS: Final[int] = 45
+"""VM boot timeout in seconds (guest agent ready check).
 
-VM_BOOT_MAX_RETRIES: Final[int] = 3
-"""Maximum retry attempts for VM boot failures (CPU contention resilience)."""
+Raised from 30s to 45s (1.5x) to accommodate CI nested virtualization
+overhead (AMD nested KVM: 50-90% CPU degradation per Cloud Hypervisor
+issue #4827). Bare-metal boots complete in <1s; the timeout is for the
+full boot + guest-agent ready sequence under worst-case contention."""
 
-VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.02
-"""Minimum backoff between VM boot retries (20ms base)."""
+VM_BOOT_MAX_RETRIES: Final[int] = 4
+"""Maximum retry attempts for VM boot failures (CPU contention resilience).
 
-VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 0.5
-"""Maximum backoff between VM boot retries (500ms cap with jitter)."""
+Raised from 3 to 4 to give transient overlay daemon errors (connection
+refused on startup) an extra attempt to recover."""
+
+VM_BOOT_RETRY_MIN_SECONDS: Final[float] = 0.1
+"""Minimum backoff between VM boot retries (100ms base).
+
+Raised from 20ms to 100ms — under CI CPU contention the host scheduler
+needs time to reschedule the QEMU process; 20ms retries were too tight."""
+
+VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 2.0
+"""Maximum backoff between VM boot retries (2s cap with jitter).
+
+Raised from 500ms to 2s to let overlay daemon recover from transient
+connection-refused errors (daemon restart takes ~100-500ms)."""
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""
 
 GUEST_REQUEST_TIMEOUT_SECONDS: Final[int] = 5
-"""Default timeout for guest agent request/response (ping, warm_repl, etc.)."""
+"""Default timeout for guest agent request/response (ping, etc.)."""
+
+WARM_REPL_TIMEOUT_SECONDS: Final[int] = 120
+"""Timeout for WarmReplRequest (REPL process startup in guest).
+
+Python REPL takes 11+ seconds on HVF (Alpine CPython cold start), and under
+resource contention (background save runs concurrently with user execution)
+it can take 2-3x longer. 120s is generous since this is used for background
+L1 saves and warm pool pre-warm — latency doesn't matter, only success."""
 
 GUEST_RECONNECT_PROBE_TIMEOUT: Final[float] = 0.5
 """Timeout per ping probe when verifying guest is ready after reconnection.
@@ -159,11 +181,11 @@ NPM_PACKAGE_DOMAINS: Final[list[str]] = [
 # System Limits
 # ============================================================================
 
-CONSOLE_LOG_MAX_BYTES: Final[int] = 8000
-"""Maximum bytes to capture from VM console log for debugging (context/structured logs)."""
+CONSOLE_RING_LINES: Final[int] = 500
+"""In-memory ring buffer size (lines) for QEMU console output.
 
-CONSOLE_LOG_PREVIEW_BYTES: Final[int] = 4000
-"""Maximum bytes for console log preview in error messages."""
+Kernel loglevel=7 can emit 300-600 lines before init starts.
+500 keeps the diagnostic tail intact for boot failure analysis."""
 
 QEMU_OUTPUT_MAX_BYTES: Final[int] = 2000
 """Maximum bytes to capture from QEMU stdout/stderr."""
@@ -204,6 +226,12 @@ WARM_POOL_REPLENISH_CONCURRENCY_RATIO: Final[float] = 0.5
 WARM_POOL_TENANT_ID: Final[str] = "warm-pool"
 """Placeholder tenant ID for warm pool VMs."""
 
+L1_SAVE_TENANT_ID: Final[str] = "l1-cache"
+"""Tenant ID for sacrificial VMs created during L1 background saves."""
+
+SCHEDULER_TENANT_ID: Final[str] = "exec-sandbox"
+"""Tenant ID for user-facing VMs created by the scheduler."""
+
 WARM_POOL_HEALTH_CHECK_INTERVAL: Final[int] = 15
 """Health check interval for warm VMs in seconds."""
 
@@ -240,6 +268,33 @@ BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 
 BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout for balloon deflate operation (restoring guest memory before execution)."""
+
+# ============================================================================
+# Memory Snapshot (L1 Cache)
+# ============================================================================
+
+MEMORY_SNAPSHOT_SAVE_TIMEOUT_SECONDS: Final[float] = 30.0
+"""Timeout for saving VM state to file (migrate command + poll)."""
+
+MEMORY_SNAPSHOT_RESTORE_TIMEOUT_SECONDS: Final[float] = 30.0
+"""Timeout for restoring VM state from file (migrate-incoming + poll)."""
+
+MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
+"""Timeout for individual QMP commands during migration."""
+
+MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.005
+"""Interval between query-migrate polls (5ms)."""
+
+MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
+"""Minimum QEMU version for mapped-ram + multifd migration capabilities.
+Changing capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
+
+MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 2
+"""Migration format version. Bump when changing QMP capabilities or migration
+protocol to invalidate stale L1 cache entries. History:
+  v1: Plain streaming format (no mapped-ram)
+  v2: mapped-ram + multifd (QEMU >= 9.0)
+"""
 
 # ============================================================================
 # Overlay Pool

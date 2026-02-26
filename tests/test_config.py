@@ -5,11 +5,13 @@ No mocks - uses real filesystem and environment variables.
 """
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
 from exec_sandbox.config import SchedulerConfig
+from exec_sandbox.platform_utils import get_cache_dir
 
 # ============================================================================
 # Config Validation
@@ -26,7 +28,7 @@ class TestSchedulerConfigValidation:
         assert config.default_memory_mb == 256
         assert config.default_timeout_seconds == 30
         assert config.images_dir is None
-        assert config.snapshot_cache_dir == Path("/tmp/exec-sandbox-cache")
+        assert config.disk_snapshot_cache_dir == get_cache_dir() / "disk-snapshots"
         assert config.s3_bucket is None
         assert config.s3_region == "us-east-1"
         assert config.s3_prefix == "snapshots/"
@@ -107,3 +109,44 @@ class TestSchedulerConfigS3:
         """S3 is disabled when bucket is None."""
         config = SchedulerConfig()
         assert config.s3_bucket is None
+
+
+# ============================================================================
+# Cache Dir Integration
+# ============================================================================
+
+
+class TestSchedulerConfigCacheDir:
+    """Tests for snapshot cache dir defaults using get_cache_dir()."""
+
+    def test_env_override_affects_default(self) -> None:
+        """EXEC_SANDBOX_CACHE_DIR env var changes both cache dir defaults."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/env/cache"}):
+            config = SchedulerConfig()
+            assert str(config.disk_snapshot_cache_dir).startswith("/env/cache")
+            assert str(config.memory_snapshot_cache_dir).startswith("/env/cache")
+
+    def test_explicit_override_bypasses_get_cache_dir(self) -> None:
+        """Explicit path overrides get_cache_dir() factory default."""
+        config = SchedulerConfig(
+            disk_snapshot_cache_dir=Path("/explicit/disk"),
+            memory_snapshot_cache_dir=Path("/explicit/memory"),
+        )
+        assert config.disk_snapshot_cache_dir == Path("/explicit/disk")
+        assert config.memory_snapshot_cache_dir == Path("/explicit/memory")
+
+    def test_snapshot_subdirs_appended_to_cache_dir(self) -> None:
+        """Snapshot cache dirs end with expected subdirectory names."""
+        config = SchedulerConfig()
+        assert str(config.disk_snapshot_cache_dir).endswith("/disk-snapshots")
+        assert str(config.memory_snapshot_cache_dir).endswith("/memory-snapshots")
+
+    def test_default_factory_evaluates_at_instantiation(self) -> None:
+        """default_factory evaluates at each SchedulerConfig() call, not frozen."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/first"}):
+            config1 = SchedulerConfig()
+
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/second"}):
+            config2 = SchedulerConfig()
+
+        assert config1.disk_snapshot_cache_dir != config2.disk_snapshot_cache_dir

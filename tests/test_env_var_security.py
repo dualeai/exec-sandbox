@@ -29,9 +29,9 @@ class TestEnvVarSecurityIntegration:
     # Control Character Rejection (Guest Agent Validation)
     # =========================================================================
 
-    async def test_tab_allowed_by_guest(self, scheduler: Scheduler) -> None:
+    async def test_tab_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:
         """Tab character in env var value is allowed."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(repr(os.environ.get('FOO')))",
             language=Language.PYTHON,
             env_vars={"FOO": "col1\tcol2"},
@@ -39,9 +39,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code == 0
         assert "col1\\tcol2" in result.stdout
 
-    async def test_utf8_allowed_by_guest(self, scheduler: Scheduler) -> None:
+    async def test_utf8_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:
         """UTF-8 characters in env var value are allowed."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.environ.get('GREETING'))",
             language=Language.PYTHON,
             env_vars={"GREETING": "Hello 世界"},
@@ -53,9 +53,9 @@ class TestEnvVarSecurityIntegration:
     # Blocked Environment Variables (Security Blocklist)
     # =========================================================================
 
-    async def test_ld_preload_blocked(self, scheduler: Scheduler) -> None:
+    async def test_ld_preload_blocked(self, dual_scheduler: Scheduler) -> None:
         """LD_PRELOAD is blocked (arbitrary code execution via library injection)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('should not run')",
             language=Language.PYTHON,
             env_vars={"LD_PRELOAD": "/tmp/malicious.so"},
@@ -63,9 +63,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower() or "LD_PRELOAD" in result.stderr
 
-    async def test_ld_library_path_blocked(self, scheduler: Scheduler) -> None:
+    async def test_ld_library_path_blocked(self, dual_scheduler: Scheduler) -> None:
         """LD_LIBRARY_PATH is blocked (library search path manipulation)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('should not run')",
             language=Language.PYTHON,
             env_vars={"LD_LIBRARY_PATH": "/tmp/malicious"},
@@ -73,9 +73,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower()
 
-    async def test_node_options_blocked(self, scheduler: Scheduler) -> None:
+    async def test_node_options_blocked(self, dual_scheduler: Scheduler) -> None:
         """NODE_OPTIONS is blocked (Node.js runtime manipulation)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="console.log('should not run')",
             language=Language.JAVASCRIPT,
             env_vars={"NODE_OPTIONS": "--expose-gc --max-old-space-size=8192"},
@@ -83,9 +83,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower()
 
-    async def test_pythonstartup_blocked(self, scheduler: Scheduler) -> None:
+    async def test_pythonstartup_blocked(self, dual_scheduler: Scheduler) -> None:
         """PYTHONSTARTUP is blocked (arbitrary code execution on Python start)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('should not run')",
             language=Language.PYTHON,
             env_vars={"PYTHONSTARTUP": "/tmp/malicious.py"},
@@ -93,9 +93,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower()
 
-    async def test_bash_env_blocked(self, scheduler: Scheduler) -> None:
+    async def test_bash_env_blocked(self, dual_scheduler: Scheduler) -> None:
         """BASH_ENV is blocked (arbitrary code execution on bash start)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="echo 'should not run'",
             language=Language.RAW,
             env_vars={"BASH_ENV": "/tmp/malicious.sh"},
@@ -103,9 +103,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower()
 
-    async def test_path_blocked(self, scheduler: Scheduler) -> None:
+    async def test_path_blocked(self, dual_scheduler: Scheduler) -> None:
         """PATH is blocked (executable search path manipulation)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('should not run')",
             language=Language.PYTHON,
             env_vars={"PATH": "/tmp/malicious:/usr/bin"},
@@ -113,9 +113,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower()
 
-    async def test_glibc_tunables_blocked(self, scheduler: Scheduler) -> None:
+    async def test_glibc_tunables_blocked(self, dual_scheduler: Scheduler) -> None:
         """GLIBC_TUNABLES is blocked (CVE-2023-4911 mitigation)."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('should not run')",
             language=Language.PYTHON,
             env_vars={"GLIBC_TUNABLES": "glibc.tune.hwcaps=-AVX2"},
@@ -123,9 +123,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code != 0
         assert "blocked" in result.stderr.lower()
 
-    async def test_blocked_env_var_case_insensitive(self, scheduler: Scheduler) -> None:
+    async def test_blocked_env_var_case_insensitive(self, dual_scheduler: Scheduler) -> None:
         """Blocked env var check is case-insensitive."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="print('should not run')",
             language=Language.PYTHON,
             env_vars={"ld_preload": "/tmp/malicious.so"},  # lowercase
@@ -137,9 +137,9 @@ class TestEnvVarSecurityIntegration:
     # Valid Environment Variables (Positive Tests)
     # =========================================================================
 
-    async def test_custom_env_var_works(self, scheduler: Scheduler) -> None:
+    async def test_custom_env_var_works(self, dual_scheduler: Scheduler) -> None:
         """Custom env vars are passed to executed code."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="import os; print(os.environ.get('MY_VAR', 'not set'))",
             language=Language.PYTHON,
             env_vars={"MY_VAR": "hello_world"},
@@ -147,9 +147,9 @@ class TestEnvVarSecurityIntegration:
         assert result.exit_code == 0
         assert "hello_world" in result.stdout
 
-    async def test_multiple_env_vars_work(self, scheduler: Scheduler) -> None:
+    async def test_multiple_env_vars_work(self, dual_scheduler: Scheduler) -> None:
         """Multiple custom env vars work correctly."""
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code="""
 import os
 print(os.environ.get('VAR1'))

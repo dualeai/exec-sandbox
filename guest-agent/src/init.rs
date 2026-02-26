@@ -46,8 +46,8 @@ pub(crate) fn setup_phase1() {
     unsafe { std::env::set_var("UV_NO_CACHE", "1") };
 }
 
-/// Phase 2 core — sync init: chmod, mounts, critical sysctl, dev setup (~10ms).
-/// Network, zram, and deferred sysctl run in background to unblock Ping.
+/// Phase 2 core — sync init: chmod, mounts, sysctl hardening, dev setup (~10ms).
+/// Called from spawn_blocking before port is opened. Network and zram run in background.
 pub(crate) fn setup_phase2_core() {
     // CIS Benchmark 6.1.x compliance (A2: libc::chmod, no fork/exec)
     chmod_paths(0o755, &["/etc", "/usr", "/var", "/sbin", "/bin"]);
@@ -67,13 +67,33 @@ pub(crate) fn setup_phase2_core() {
     // makes /proc/sys read-only. This includes sysctl hardening AND zram
     // VM tuning (swappiness, page-cluster, etc.).
     apply_sysctl_critical();
-    apply_sysctl_deferred();
+    apply_sysctl_non_critical();
     apply_zram_vm_tuning();
-    // Reduce virtio-blk readahead from default 128 KB to 32 KB. Python startup
-    // reads hundreds of scattered small .pyc files (4-16 KB each) — 128 KB
-    // prefetch causes 8-32x I/O amplification per file. 32 KB reduces wasted
-    // prefetch while still helping sequential reads of larger .so files.
-    let _ = std::fs::write("/sys/block/vda/queue/read_ahead_kb", "32");
+    // Readahead tuning for virtio-blk + EROFS.
+    //
+    // EROFS pcluster is 16KB (-C16384). We set readahead to 128KB (8 pclusters)
+    // to batch more data per virtio-blk request, which is a reasonable default for
+    // sequential workloads (Python/Bun startup loads .pyc/.so files in order).
+    //
+    // NOTE: Tested 16KB vs 128KB readahead during cold-start investigation
+    // (session 4). No measurable wall-time improvement — the bottleneck is
+    // macOS Mach kernel hv_trap overhead (~360µs per VM exit), not I/O batch
+    // size. Kept at 128KB as a sensible default (fewer bio submissions for
+    // sequential reads), but this is NOT a cold-start fix.
+    //
+    // Set on all vd* block devices — device naming varies by architecture
+    // (ARM MMIO enumerates in reverse order), so we don't assume vda=base.
+    for entry in std::fs::read_dir("/sys/block")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("vd") {
+            let path = entry.path().join("queue/read_ahead_kb");
+            let _ = std::fs::write(path, "128");
+        }
+    }
     // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()
     // which now makes /dev read-only.
     setup_dev_symlinks();
@@ -92,12 +112,19 @@ pub(crate) async fn setup_zram_background() {
 /// Runs on spawn_blocking (uses StdCommand for ip, I/O-bound).
 /// Marks NETWORK_READY when complete; ExecuteCode/InstallPackages gate on this.
 pub(crate) async fn setup_network_background() {
+    let t0 = crate::monotonic_ms();
     tokio::task::spawn_blocking(|| {
         setup_network();
     })
     .await
     .ok();
     mark_network_ready();
+    let t_done = crate::monotonic_ms();
+    log_info!(
+        "[timing] network_ready: {}ms ({}ms elapsed)",
+        t_done,
+        t_done - t0
+    );
 }
 
 fn mark_network_ready() {
@@ -221,26 +248,12 @@ fn setup_dev_symlinks() {
 /// B4: Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
 fn setup_dev_shm() {
-    let ret = unsafe {
-        let source = std::ffi::CString::new("tmpfs").unwrap();
-        let target = std::ffi::CString::new("/dev/shm").unwrap();
-        let fstype = std::ffi::CString::new("tmpfs").unwrap();
-        let data = std::ffi::CString::new("size=64M,noswap").unwrap();
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            data.as_ptr() as *const libc::c_void,
-        )
-    };
-    if ret != 0 {
-        // Non-fatal: only needed for multiprocessing
-        let _ = std::fs::create_dir_all("/dev/shm");
-        let ret2 = unsafe {
+    fn try_mount_shm() -> libc::c_int {
+        unsafe {
             let source = std::ffi::CString::new("tmpfs").unwrap();
             let target = std::ffi::CString::new("/dev/shm").unwrap();
             let fstype = std::ffi::CString::new("tmpfs").unwrap();
+            // noswap: kernel 6.3+ — prevents /dev/shm pages from being swapped to zram
             let data = std::ffi::CString::new("size=64M,noswap").unwrap();
             libc::mount(
                 source.as_ptr(),
@@ -249,8 +262,13 @@ fn setup_dev_shm() {
                 libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
                 data.as_ptr() as *const libc::c_void,
             )
-        };
-        if ret2 != 0 {
+        }
+    }
+
+    if try_mount_shm() != 0 {
+        // Non-fatal: only needed for multiprocessing. Retry after mkdir.
+        let _ = std::fs::create_dir_all("/dev/shm");
+        if try_mount_shm() != 0 {
             log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
         }
     }
@@ -376,15 +394,28 @@ fn setup_zram_swap() {
 }
 
 /// Build a swap header for the given device size.
-/// Returns a 4096-byte header or None if the size is too small.
+/// Returns a PAGE_SIZE-byte header or None if the size is too small.
+///
+/// The swap header layout is PAGE_SIZE-dependent:
+/// - Header occupies one page (PAGE_SIZE bytes)
+/// - SWAPSPACE2 signature at offset (PAGE_SIZE - 10)
+/// - Page count = device_size / PAGE_SIZE
+/// - Version + last_page at fixed offsets 1024 and 1028
+///
+/// Uses runtime sysconf(_SC_PAGESIZE) to support both 4KB (x86_64)
+/// and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES) kernels.
+///
+/// NOTE: Mirrored in tiny-init/src/zram.rs — keep both in sync.
 fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
-    let pages = (device_size / 4096).saturating_sub(1) as u32;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let pages = (device_size / page_size).saturating_sub(1) as u32;
     if pages < 10 {
         return None; // kernel rejects tiny swap
     }
-    let mut header = vec![0u8; 4096];
-    // SWAPSPACE2 signature at offset 4086
-    header[4086..4096].copy_from_slice(b"SWAPSPACE2");
+    let ps = page_size as usize;
+    let mut header = vec![0u8; ps];
+    // SWAPSPACE2 signature at offset (PAGE_SIZE - 10)
+    header[ps - 10..ps].copy_from_slice(b"SWAPSPACE2");
     // version = 1
     header[1024..1028].copy_from_slice(&1u32.to_le_bytes());
     // last_page (0-indexed: total_pages - 1, since page 0 is header)
@@ -419,10 +450,10 @@ const SYSCTL_CRITICAL: &[(&str, &str)] = &[
     ("/proc/sys/kernel/yama/ptrace_scope", "2"),
 ];
 
-/// E3: Deferred sysctl — defense-in-depth settings safe to apply after Ping.
-/// These harden filesystem and limit attack surface but aren't exploitable
-/// in the window between Ping-ready and background completion.
-const SYSCTL_DEFERRED: &[(&str, &str)] = &[
+/// E3: Non-critical sysctl — defense-in-depth settings applied synchronously
+/// in phase 2 core (before port open). These harden filesystem and limit
+/// attack surface but aren't exploitable during early boot.
+const SYSCTL_NON_CRITICAL: &[(&str, &str)] = &[
     // Filesystem link protections
     ("/proc/sys/fs/protected_symlinks", "1"),
     ("/proc/sys/fs/protected_hardlinks", "1"),
@@ -442,8 +473,8 @@ fn apply_sysctl_critical() {
     }
 }
 
-fn apply_sysctl_deferred() {
-    for &(path, value) in SYSCTL_DEFERRED {
+fn apply_sysctl_non_critical() {
+    for &(path, value) in SYSCTL_NON_CRITICAL {
         let _ = std::fs::write(path, value);
     }
 }
@@ -473,7 +504,6 @@ fn apply_zram_vm_tuning() {
         (mem_kb * 4 / 100).to_string(),
     );
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "0");
-    let _ = std::fs::write("/proc/sys/vm/defrag_mode", "1");
 }
 
 // ============================================================================

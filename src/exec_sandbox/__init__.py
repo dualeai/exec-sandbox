@@ -1,7 +1,6 @@
 """exec-sandbox: Secure code execution in microVMs.
 
-A standalone Python library for executing untrusted code in isolated QEMU microVMs
-with 6-layer security architecture.
+A standalone Python library for executing untrusted code in isolated QEMU microVMs.
 
 Quick Start (single execution):
     ```python
@@ -41,14 +40,6 @@ With Configuration:
         )
     ```
 
-Security Architecture (6 layers):
-    1. KVM/HVF hardware virtualization (CPU ring -1 isolation)
-    2. Unprivileged QEMU process (no root required)
-    3. Seccomp syscall filtering
-    4. cgroup v2 resource limits (memory, CPU, PIDs)
-    5. Linux namespaces (PID, network, mount, UTS, IPC)
-    6. MAC policies (AppArmor/SELinux when available)
-
 Requirements:
     - QEMU 8.0+ with KVM (Linux) or HVF (macOS) acceleration
     - VM images from GitHub Releases
@@ -58,6 +49,14 @@ For S3 snapshot caching:
     pip install exec-sandbox[s3]
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("exec-sandbox")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
+
+from exec_sandbox._logging import configure_logging
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
     AssetChecksumError,
@@ -131,11 +130,5 @@ __all__ = [
     "VmQemuCrashError",
     "VmTimeoutError",
     "VmTransientError",
+    "configure_logging",
 ]
-
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    __version__ = version("exec-sandbox")
-except PackageNotFoundError:
-    __version__ = "0.0.0.dev0"

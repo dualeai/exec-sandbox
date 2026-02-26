@@ -52,13 +52,50 @@ mod validation;
 
 use constants::*;
 
-fn monotonic_ms() -> u64 {
+pub(crate) fn monotonic_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
+/// Force the kernel CRNG to reseed from its entropy input pool.
+///
+/// After L1 snapshot restore, the kernel CRNG state is byte-for-byte identical
+/// across all VMs restored from the same snapshot (CRNG_RESEED_INTERVAL is 300s,
+/// so the hwrng kthread won't feed new entropy in time). This ioctl forces an
+/// immediate reseed so each VM diverges before any user code calls getrandom().
+///
+/// Called at two points for defense-in-depth:
+/// 1. `listen_virtio_serial()` — on every (re)connection (covers cold boot)
+/// 2. `handle_connection()` — before every command dispatch (covers L1 restore,
+///    where the VM resumes mid-loop and never re-enters the connection setup)
+///
+/// Cost: ~11μs per call, negligible vs connection/exec overhead.
+fn reseed_crng() {
+    // RNDRESEEDCRNG = _IO('R', 0x07) = 0x5207
+    // libc::ioctl request type differs by target (c_ulong on glibc, c_int on musl)
+    const RNDRESEEDCRNG: libc::c_int = 0x5207;
+
+    unsafe {
+        let fd = libc::open(c"/dev/urandom".as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            log_warn!("reseed_crng: failed to open /dev/urandom");
+            return;
+        }
+        let ret = libc::ioctl(fd, RNDRESEEDCRNG as _);
+        libc::close(fd);
+        if ret < 0 {
+            log_warn!(
+                "reseed_crng: ioctl RNDRESEEDCRNG failed (errno={})",
+                *libc::__errno_location()
+            );
+        } else {
+            log_info!("reseed_crng: kernel CRNG reseeded");
+        }
+    }
 }
 
 /// Listen on virtio-serial ports with reconnection loop.
@@ -89,6 +126,7 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
             Ok(true) => {
                 log_info!("Host is connected, proceeding with connection setup");
                 backoff_ms = INITIAL_BACKOFF_MS;
+                reseed_crng();
             }
             Ok(false) => {
                 log_warn!("Host not connected (POLLHUP), waiting {backoff_ms}ms before retry...");

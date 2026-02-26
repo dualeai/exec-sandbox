@@ -69,6 +69,7 @@ _OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
     ("execution_time_ms", "guest_exec"),
     ("timing.overlay_ms", "overlay"),
     ("timing.connect_ms", "connect"),
+    ("timing.l1_restore_ms", "l1_restore"),
     ("spawn_ms", "spawn"),
     ("process_ms", "process"),
     ("timing.qemu_cmd_build_ms", "qemu_cmd_build"),
@@ -99,9 +100,12 @@ class TimingStats:
     gvproxy_start: list[float] = field(default_factory=list[float])
     qemu_fork: list[float] = field(default_factory=list[float])
     guest_wait: list[float] = field(default_factory=list[float])
+    # L1 memory snapshot timing
+    l1_restore: list[float] = field(default_factory=list[float])
     # Retry tracking
     boot_retries: list[int] = field(default_factory=list[int])
     warm_hits: int = 0
+    l1_hits: int = 0
     cold_boots: int = 0
 
 
@@ -116,6 +120,8 @@ def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -
             getattr(stats, stats_attr).append(value)
     if result.warm_pool_hit:
         stats.warm_hits += 1
+    elif result.l1_cache_hit:
+        stats.l1_hits += 1
     else:
         stats.cold_boots += 1
 
@@ -201,6 +207,7 @@ _MAIN_TREE: list[tuple[str, str, str | None]] = [
 
 _SETUP_BREAKDOWN: list[tuple[str, str, str | None]] = [
     ("Overlay", "overlay", "pool hit <1ms"),
+    ("L1 restore", "l1_restore", "memory snapshot"),
 ]
 
 _BOOT_BREAKDOWN: list[tuple[str, str, str | None]] = [
@@ -241,8 +248,15 @@ def print_stats(name: str, stats: TimingStats) -> None:
         return
 
     n = len(stats.e2e)
-    warm_cold = f" [{stats.warm_hits} warm, {stats.cold_boots} cold]" if stats.warm_hits else ""
-    print(f"\n{name} ({n} VMs concurrent){warm_cold}:")
+    parts: list[str] = []
+    if stats.warm_hits:
+        parts.append(f"{stats.warm_hits} warm")
+    if stats.l1_hits:
+        parts.append(f"{stats.l1_hits} L1")
+    if stats.cold_boots:
+        parts.append(f"{stats.cold_boots} cold")
+    source_info = f" [{', '.join(parts)}]" if parts else ""
+    print(f"\n{name} ({n} VMs concurrent){source_info}:")
     print("  Per-VM latency (median / p95):")
     print(f"    E2E:        {fmt_stats(stats.e2e)} ms")
     _render_tree("    ", _MAIN_TREE, stats)

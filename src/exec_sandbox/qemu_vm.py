@@ -7,16 +7,17 @@ code execution, state management, and resource cleanup.
 import asyncio
 import contextlib
 import json
-import logging
 import sys
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, TextIO
+from typing import IO, TYPE_CHECKING
 from uuid import uuid4
 
 from pydantic import ValidationError
 
 from exec_sandbox import cgroup, constants
+from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import EnvVarValidationError, VmBootTimeoutError, VmPermanentError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from exec_sandbox.admission import ResourceReservation
     from exec_sandbox.platform_utils import ProcessWrapper
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
@@ -54,14 +55,6 @@ class QemuVM:
 
     Lifecycle managed by VmManager.
     Communicates via GuestChannel (dual-port virtio-serial).
-
-    Security:
-    - Layer 1: Hardware isolation (KVM) or TCG software emulation
-    - Layer 2: Unprivileged user (qemu-vm if available, optional)
-    - Layer 3: Seccomp syscall filtering
-    - Layer 4: cgroup v2 resource limits
-    - Layer 5: Linux namespaces (PID, net, mount, UTS, IPC)
-    - Layer 6: SELinux/AppArmor (optional production hardening)
 
     Context Manager Usage:
         Supports async context manager protocol for automatic cleanup:
@@ -89,14 +82,14 @@ class QemuVM:
         self,
         vm_id: str,
         process: "ProcessWrapper",
-        cgroup_path: Path,
+        cgroup_path: Path | None,
         workdir: VmWorkingDirectory,
         channel: GuestChannel,
         language: Language,
+        console_lines: deque[str],
         gvproxy_proc: "ProcessWrapper | None" = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
-        console_log: TextIO | None = None,
     ):
         """Initialize VM handle.
 
@@ -107,10 +100,10 @@ class QemuVM:
             workdir: Working directory containing overlay, sockets, and logs
             channel: Communication channel for guest agent
             language: Programming language for this VM
+            console_lines: In-memory ring buffer of QEMU console output lines (for error diagnostics)
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
-            console_log: Optional file handle for QEMU console log
         """
         self.vm_id = vm_id
         self.process = process
@@ -118,10 +111,10 @@ class QemuVM:
         self.workdir = workdir
         self.channel = channel
         self.language = language
+        self.console_lines = console_lines
         self.gvproxy_proc = gvproxy_proc
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
-        self.console_log: TextIO | None = console_log
         self._destroyed = False
         self._state = VmState.CREATING
         self._state_lock = asyncio.Lock()
@@ -134,6 +127,8 @@ class QemuVM:
         # Port forwarding - set by VmManager after boot
         # Stores the resolved port mappings for result reporting
         self.exposed_ports: list[ExposedPort] = []
+        # L1 memory snapshot restore flag
+        self.l1_restored: bool = False
 
     # -------------------------------------------------------------------------
     # Timing properties (backwards-compatible accessors to VmTiming)
@@ -422,9 +417,9 @@ class QemuVM:
 
             # Connect to guest agent with timing
             # Fixed init timeout (connection establishment, independent of execution timeout)
-            connect_start = asyncio.get_event_loop().time()
+            connect_start = asyncio.get_running_loop().time()
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            connect_ms = round((asyncio.get_event_loop().time() - connect_start) * 1000)
+            connect_ms = round((asyncio.get_running_loop().time() - connect_start) * 1000)
 
             # Stream execution output to console
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
@@ -901,7 +896,7 @@ class QemuVM:
 
         # Step 3-4: Parallel cleanup (cgroup + workdir)
         # After QEMU terminates, cleanup tasks are independent
-        # workdir.cleanup() removes overlay, sockets, and console log in one operation
+        # workdir.cleanup() removes overlay and sockets in one operation
         await asyncio.gather(
             cgroup.cleanup_cgroup(self.cgroup_path, self.vm_id),
             self.workdir.cleanup(),

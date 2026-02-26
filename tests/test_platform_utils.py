@@ -7,6 +7,8 @@ No mocks - spawns actual processes.
 import asyncio
 import platform
 import sys
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -17,6 +19,7 @@ from exec_sandbox.platform_utils import (
     detect_host_arch,
     detect_host_os,
     get_arch_name,
+    get_cache_dir,
     get_os_name,
 )
 from tests.conftest import (
@@ -166,6 +169,115 @@ class TestGetArchName:
     def test_default_convention_is_kernel(self) -> None:
         """get_arch_name defaults to kernel convention."""
         assert get_arch_name() == get_arch_name("kernel")
+
+
+# ============================================================================
+# get_cache_dir
+# ============================================================================
+
+
+class TestGetCacheDir:
+    """Tests for get_cache_dir function."""
+
+    # --- Normal cases ---
+
+    def test_returns_path(self) -> None:
+        """Result is a Path."""
+        result = get_cache_dir()
+        assert isinstance(result, Path)
+
+    def test_default_app_name(self) -> None:
+        """Contains 'exec-sandbox' by default."""
+        result = get_cache_dir()
+        assert "exec-sandbox" in str(result)
+
+    def test_custom_app_name(self) -> None:
+        """Respects custom app name."""
+        result = get_cache_dir("my-app")
+        assert "my-app" in str(result)
+
+    def test_macos_uses_library_caches(self) -> None:
+        """macOS uses ~/Library/Caches."""
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.MACOS):
+            with patch.dict("os.environ", {}, clear=True):
+                result = get_cache_dir()
+                assert "Library/Caches" in str(result)
+
+    def test_linux_uses_dot_cache(self) -> None:
+        """Linux uses ~/.cache."""
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
+            with patch.dict("os.environ", {}, clear=True):
+                result = get_cache_dir()
+                assert ".cache" in str(result)
+
+    def test_unknown_platform_fallback(self) -> None:
+        """Unknown OS falls back to ~/.cache."""
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.UNKNOWN):
+            with patch.dict("os.environ", {}, clear=True):
+                result = get_cache_dir()
+                assert ".cache" in str(result)
+
+    # --- Env var overrides ---
+
+    def test_exec_sandbox_cache_dir_override(self) -> None:
+        """EXEC_SANDBOX_CACHE_DIR overrides everything."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom"}):
+            result = get_cache_dir()
+            assert result == Path("/custom")
+
+    def test_xdg_cache_home_on_linux(self) -> None:
+        """XDG_CACHE_HOME on Linux → /xdg/exec-sandbox."""
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
+            with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg"}, clear=True):
+                result = get_cache_dir()
+                assert result == Path("/xdg/exec-sandbox")
+
+    def test_xdg_cache_home_ignored_on_macos(self) -> None:
+        """XDG_CACHE_HOME is ignored on macOS."""
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.MACOS):
+            with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg"}, clear=True):
+                result = get_cache_dir()
+                assert "Library/Caches" in str(result)
+                assert "/xdg" not in str(result)
+
+    def test_exec_sandbox_cache_dir_takes_priority_over_xdg(self) -> None:
+        """EXEC_SANDBOX_CACHE_DIR wins over XDG_CACHE_HOME."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/override", "XDG_CACHE_HOME": "/xdg"}):
+            result = get_cache_dir()
+            assert result == Path("/override")
+
+    # --- Edge cases ---
+
+    def test_empty_xdg_cache_home_ignored(self) -> None:
+        """Empty XDG_CACHE_HOME is falsy, falls through to ~/.cache default."""
+        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
+            with patch.dict("os.environ", {"XDG_CACHE_HOME": ""}, clear=True):
+                result = get_cache_dir()
+                assert ".cache" in str(result)
+
+    def test_path_with_spaces(self) -> None:
+        """Path with spaces is preserved."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/path with spaces/cache"}):
+            result = get_cache_dir()
+            assert result == Path("/path with spaces/cache")
+
+    def test_path_with_unicode(self) -> None:
+        """Path with unicode characters is preserved."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/données/caché"}):
+            result = get_cache_dir()
+            assert result == Path("/données/caché")
+
+    def test_trailing_slash_normalized(self) -> None:
+        """Path normalizes trailing slashes."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom/path/"}):
+            result = get_cache_dir()
+            assert result == Path("/custom/path")
+
+    def test_relative_env_path(self) -> None:
+        """Relative path from env is used as-is."""
+        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "relative/path"}):
+            result = get_cache_dir()
+            assert result == Path("relative/path")
 
 
 # ============================================================================

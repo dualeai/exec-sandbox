@@ -4,9 +4,8 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
-import logging
-
 from exec_sandbox import cgroup, constants
+from exec_sandbox._logging import get_logger
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
 from exec_sandbox.settings import Settings
@@ -20,7 +19,7 @@ from exec_sandbox.system_probes import (
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
@@ -33,6 +32,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     allow_network: bool,
     expose_ports: list[ExposedPort] | None = None,
     direct_write: bool = False,
+    debug_boot: bool = False,
+    snapshot_drive: str | None = None,
+    defer_incoming: bool = False,
 ) -> list[str]:
     """Build QEMU command for Linux (KVM + unshare + namespaces).
 
@@ -49,6 +51,15 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             with hostfwd (Mode 1). When set with allow_network, port
             forwarding is handled by gvproxy API (Mode 2).
         direct_write: Mount rootfs read-write (for snapshot creation).
+        debug_boot: Enable verbose kernel/init boot logging. When True,
+            sets loglevel=7, printk.devkmsg=on, init.quiet=0 for full
+            boot diagnostics.
+        snapshot_drive: Path to ext4 qcow2 for snapshot overlay (serial=snap).
+            When set, tiny-init discovers drives by serial number and mounts
+            EROFS base + ext4 snapshot via overlayfs. For snapshot creation
+            (direct_write=True), the ext4 drive is writable; for usage, read-only.
+        defer_incoming: Start QEMU with `-incoming defer` for L1 memory snapshot
+            restore. The VM starts paused, waiting for a migration stream via QMP.
 
     Returns:
         QEMU command as list of strings
@@ -287,13 +298,17 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # For q35, we don't use these flags as the machine expects standard PC components
     if is_microvm:
         qemu_args.extend(["-nodefaults", "-no-user-config"])
+    elif arch == HostArch.X86_64:
+        # The pc (i440FX) machine includes a built-in ISA Floppy Disk Controller.
+        # Disable its drives so the kernel doesn't create /dev/fd0.
+        qemu_args.extend(["-global", "isa-fdc.driveA=", "-global", "isa-fdc.driveB="])
 
     # Console selection based on machine type and architecture:
     # +--------------------------+-------------+--------------------------------+
     # | Configuration            | Console     | Reason                         |
     # +--------------------------+-------------+--------------------------------+
     # | x86 microvm + TSC        | hvc0        | Non-legacy, virtio-console     |
-    # | x86 microvm - TSC        | ttyS0       | Legacy mode, ISA serial        |
+    # | x86 microvm - TSC        | hvc0        | ISA serial off, virtio-console |
     # | x86 pc (TCG only)        | ttyS0       | Software emulation fallback    |
     # | ARM64 virt               | ttyAMA0     | PL011 UART (always available)  |
     # +--------------------------+-------------+--------------------------------+
@@ -336,18 +351,27 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # -svm,-vmx: Hide AMD SVM and Intel VMX flags from guest to prevent
             # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
             # These flags are x86-specific — ARM64 HVF uses plain "host".
-            # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
-            # x86 TCG: Haswell required for AVX2 (Python/Bun built for x86_64_v3)
-            # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
+            # ARM64 TCG: neoverse-n2 (ARMv9.0) provides PAC, BTI, SVE, MTE,
+            # and SSBS/CSV2 side-channel flags. pauth-impdef=on forces the fast
+            # impdef algorithm (QEMU 10.0+ defaults to this for virt >= 10.0,
+            # but older versions use QARMA5 which costs ~50% of TCG cycles).
+            # x86 TCG: SapphireRapids-v2 provides full Spectre/MDS mitigation
+            # flags (spec-ctrl, stibp, ssbd, arch-capabilities, md-clear,
+            # mds-no, taa-no, gds-no, rfds-no). TCG silently strips AVX-512
+            # and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
+            # also lacks 256-bit vector ops (TCG_TARGET_HAS_v256=0), so AVX2
+            # is unavailable — effective ceiling is SSE4.2. On x86 hosts the
+            # effective ceiling is x86_64-v3 (AVX2/FMA).
+            # See: https://www.qemu.org/docs/master/system/i386/cpu.html
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
                 "host"
                 if accel_type in (AccelType.HVF, AccelType.KVM) and arch == HostArch.AARCH64
                 else "host,-svm,-vmx"
                 if accel_type in (AccelType.HVF, AccelType.KVM)
-                else "cortex-a57"
+                else "neoverse-n2,pauth-impdef=on"
                 if arch == HostArch.AARCH64
-                else "Haswell"
+                else "SapphireRapids-v2"
             ),
             "-M",
             machine_type,
@@ -369,38 +393,92 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # remain here. See exec-sandbox.config for the full CONFIG↔cmdline map.
             #
             # Removed (enforced by CONFIG): init_on_alloc, init_on_free,
-            #   scsi_mod.scan, audit, transparent_hugepage, slab_nomerge,
-            #   nomodule, preempt, noresume, raid, numa_balancing, i8042.*,
-            #   random.trust_cpu, panic, rcupdate.rcu_expedited, edd,
-            #   noautogroup, io_delay
+            #   scsi_mod.scan, audit, slab_nomerge, nomodule, preempt,
+            #   noresume, raid, numa_balancing, i8042.*, random.trust_cpu,
+            #   panic, rcupdate.rcu_expedited, edd, noautogroup, io_delay
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=ext4 rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
-            # Suppress all non-emergency kernel messages (20-50ms)
-            " quiet loglevel=0"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            # THP: CONFIG_TRANSPARENT_HUGEPAGE=y enables EROFS large folios
+            # (16-64KB per fault instead of 4KB), but transparent_hugepage=never
+            # disables anonymous 2MB hugepages (no khugepaged, no compaction stalls).
+            # File-backed large folios work regardless of this sysfs setting.
+            + " transparent_hugepage=never"
+            # Boot verbosity: debug_boot enables full kernel/init logging for diagnostics
+            # Note: loglevel=7 overrides loglevel=1 set in console_params (kernel uses last occurrence)
+            + (" loglevel=7" if debug_boot else " quiet loglevel=0")
             # Skip timer calibration — safe in virtualized env with reliable TSC (10-30ms)
-            " no_timer_check"
+            + " no_timer_check"
             # Keep expedited RCU after boot (built-in boot expediting covers boot phase)
-            " rcupdate.rcu_normal_after_boot=0"
-            # Limit userspace /dev/kmsg writes
-            " printk.devkmsg=off"
+            + " rcupdate.rcu_normal_after_boot=0"
+            # /dev/kmsg access: on for debug, off for production
+            + (" printk.devkmsg=on" if debug_boot else " printk.devkmsg=off")
             # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
             + (" 8250.nr_uarts=0" if use_virtio_console and arch == HostArch.X86_64 else "")
-            # Force haltpoll cpuidle governor from first idle cycle — polls in-guest
-            # before HLT to avoid VM-exit cost (overrides menu, the NO_HZ_IDLE default)
-            + " cpuidle.governor=haltpoll"
+            # =============================================================
+            # Haltpoll cpuidle governor — KVM only
+            # =============================================================
+            # Polls in-guest for up to 200µs (guest_halt_poll_ns) before issuing
+            # HLT, avoiding VM-exit cost on short idle windows.  Measured: 20%
+            # latency reduction (sockperf), 4-71% FPS gain (Intel gaming study).
+            #
+            # Why KVM-only:
+            #
+            # 1. Governor registers unconditionally since kernel 6.x (the
+            #    kvm_para_available() guard was removed from init_haltpoll() to
+            #    allow bare-metal testing — LKML 2023-11 "governors/haltpoll:
+            #    Drop kvm_para_available() check").  The cpuidle-haltpoll DRIVER
+            #    still gates on kvm_para_available(), but the governor itself
+            #    activates on any hypervisor when forced via cmdline.
+            #
+            # 2. On KVM the trade-off is favorable: each HLT VM-exit costs
+            #    ~5-10µs, and the guest coordinates with the host via
+            #    MSR_KVM_POLL_CONTROL to suppress redundant host-side halt
+            #    polling.  On HVF neither mechanism exists — the 200µs
+            #    busy-loop (cpu_relax → ARM64 yield, running at full speed
+            #    in-guest) is pure overhead.
+            #
+            # 3. Measured impact on HVF (macOS ARM64, QEMU 10.2, kernel 6.18):
+            #    ~65% host-CPU per idle vCPU.  Background wakeups (RCU
+            #    callbacks from rcu_normal_after_boot=0, virtio interrupts)
+            #    trigger ~3k poll cycles/sec x 200us = ~65% busy.  The
+            #    adaptive algorithm keeps poll_limit_ns at max because
+            #    wakeups keep landing inside the poll window.
+            #
+            # 4. On HVF/TCG we disable cpuidle entirely (cpuidle.off=1).
+            #    QEMU's virt machine generates no idle-states DT nodes, so the
+            #    guest has only two cpuidle states: poll (busy-loop) and WFI.
+            #    Any governor (menu, TEO) would always pick WFI — the prediction
+            #    algorithm is wasted overhead.  cpuidle.off=1 bypasses the
+            #    framework and calls cpu_do_idle() (WFI) directly.  HVF properly
+            #    blocks the vCPU thread on WFI via qemu_wait_io_event() →
+            #    halt_cond, yielding <5% idle CPU.
+            #
+            # References:
+            #   - LWN: cpuidle haltpoll driver & governor
+            #     https://lwn.net/Articles/792618/
+            #   - LKML: Drop kvm_para_available() from governor
+            #     https://lkml.indiana.edu/hypermail/linux/kernel/2311.2/03791.html
+            #   - QEMU HVF WFI idle-CPU issue
+            #     https://gitlab.com/qemu-project/qemu/-/issues/959
+            #   - Kernel cpuidle docs
+            #     https://docs.kernel.org/admin-guide/pm/cpuidle.html
+            # =============================================================
+            + (" cpuidle.governor=haltpoll" if accel_type == AccelType.KVM else " cpuidle.off=1")
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
             + (" init.rw=1" if direct_write else "")
-            # Suppress non-essential guest console output (saves MMIO/UART traps)
-            + " init.quiet=1"
+            + (" init.snap=1" if snapshot_drive else "")
+            # Guest-agent log verbosity: init.quiet=0 un-gates log_info! macros
+            + (" init.quiet=0" if debug_boot else " init.quiet=1")
             # Explicit TSC clocksource selection, skip probing (5-10ms, x86_64 only)
             + (" tsc=reliable clocksource=tsc" if arch == HostArch.X86_64 else ""),
         ]
     )
 
     # Platform-specific memory configuration
-    # Note: -mem-prealloc removed for faster boot (demand-paging is fine for ephemeral VMs)
-    host_os = detect_host_os()
+    # Note: -mem-prealloc tested for cold-start on HVF (pre-populates host pages)
+    # but had NO effect — ARM VHE Stage-2 PTEs are still created lazily by hardware
+    # on first guest access, regardless of host page presence.
 
     # Layer 3: Seccomp sandbox - Linux only
     if detect_host_os() != HostOS.MACOS:
@@ -411,8 +489,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             ]
         )
 
-    # Determine AIO mode based on cached startup probe
+    # Determine AIO mode and QEMU version based on cached startup probes
     io_uring_available = await probe_io_uring_support()
+    qemu_version = await probe_qemu_version()
     aio_mode = "io_uring" if io_uring_available else "threads"
     if not io_uring_available:
         logger.debug(
@@ -420,21 +499,19 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             extra={"reason": "syscall_probe_failed", "vm_id": vm_id},
         )
 
-    # IOThread configuration
-    match host_os:
-        case HostOS.LINUX:
-            use_iothread = True
-        case HostOS.MACOS | HostOS.UNKNOWN:
-            use_iothread = False
+    # IOThread — offloads block I/O completion (pread, qcow2 decompress) to a
+    # dedicated thread, separate from the vCPU thread. Safe and functional on
+    # all accelerators (KVM, HVF, TCG):
+    #   KVM:  ioeventfd enables zero-exit I/O kicks — clear performance win.
+    #   HVF:  no ioeventfd (no eventfd on macOS), so no cold-start benefit
+    #         (tested session 4: 9,798ms identical with/without). Bottleneck
+    #         is Mach kernel hv_trap (~360µs/exit), not QEMU I/O processing.
+    #   TCG:  software-emulated ioeventfd, moderate benefit (I/O off main loop).
+    iothread_id = f"iothread0-{vm_id}"
+    qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
 
-    iothread_id = f"iothread0-{vm_id}" if use_iothread else None
-    if use_iothread:
-        qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
-
-    # Disk configuration
-    # Uses overlay backed by either:
-    # - snapshot_path (cached L2 qcow2) for pre-installed packages
-    # - base_image for cold boot
+    # Disk configuration (EROFS base drive, serial=base)
+    # Uses qcow2 overlay backed by the EROFS base image
     qemu_args.extend(
         [
             "-drive",
@@ -462,27 +539,46 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # Platform-specific block device
-    match host_os:
-        case HostOS.MACOS:
-            qemu_args.extend(
-                [
-                    "-device",
-                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
-                    f"virtio-blk-{virtio_suffix},drive=hd0,num-queues=1,queue-size=128,event_idx=off",
-                ]
-            )
-        case HostOS.LINUX | HostOS.UNKNOWN:
-            qemu_args.extend(
-                [
-                    "-device",
-                    # NOTE: Removed logical_block_size=4096,physical_block_size=4096
-                    # Small ext4 filesystems (<512MB) use 1024-byte blocks by default, so forcing
-                    # 4096-byte block size causes mount failures ("Invalid argument")
-                    # D2: event_idx=off reduces interrupt coalescing overhead during boot
-                    f"virtio-blk-{virtio_suffix},drive=hd0,iothread={iothread_id},num-queues=1,queue-size=128,event_idx=off",
-                ]
-            )
+    # Block device — serial=base: stable identifier for tiny-init to find the EROFS
+    # rootfs drive, regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates
+    # virtio devices in reverse declaration order, so /dev/vda != first -device on ARM.
+    # D2: event_idx=off reduces interrupt coalescing overhead during boot.
+    # queue-size=256: tested at 128 vs 256 during cold-start investigation (session 4);
+    # no measurable wall-time difference on HVF (bottleneck is Mach kernel, not queue
+    # depth). Kept at 256 as a reasonable setting for throughput workloads.
+    qemu_args.extend(
+        [
+            "-device",
+            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size=256,event_idx=off",
+        ]
+    )
+
+    # Snapshot overlay drive — ext4 layer for overlayfs merge with EROFS base.
+    # Presented as a second virtio-blk device; tiny-init detects it by serial=snap
+    # and sets up overlayfs automatically (rw for snapshot creation, ro for usage).
+    if snapshot_drive:
+        qemu_args.extend(
+            [
+                "-drive",
+                f"file={snapshot_drive},"
+                f"format=qcow2,"
+                f"if=none,"
+                f"id=hd1,"
+                f"cache=unsafe,"
+                f"aio={aio_mode},"
+                f"discard=unmap,"
+                f"detect-zeroes=unmap,"
+                f"werror=report,"
+                f"rerror=report,"
+                f"file.locking=off",
+            ]
+        )
+        qemu_args.extend(
+            [
+                "-device",
+                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size=256,event_idx=off",
+            ]
+        )
 
     # Display/console configuration
     # -nographic: headless mode
@@ -589,12 +685,25 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
     # - deflate-on-oom: guest returns memory under OOM pressure
     # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
-    #   D1: Disable during cold boot to avoid kernel page scanning overhead (10-20ms)
-    #   Warm pool VMs re-enable via QMP after boot completes
+    #   Disabled permanently to avoid kernel page scanning overhead (10-20ms)
     qemu_args.extend(
         [
             "-device",
             f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=off",
+        ]
+    )
+
+    # virtio-rng: continuous host→guest entropy via /dev/urandom backend.
+    # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh
+    # entropy to reseed from after L1 snapshot restore. Without this, the input
+    # pool after restore contains only stale (cloned) entropy.
+    # max-bytes + period: rate-limit to 1024B/100ms (10KB/s) to avoid host exhaustion.
+    qemu_args.extend(
+        [
+            "-object",
+            "rng-random,id=rng0,filename=/dev/urandom",
+            "-device",
+            f"virtio-rng-{virtio_suffix},rng=rng0,max-bytes=1024,period=100",
         ]
     )
 
@@ -636,7 +745,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # Add reconnect parameter (version-dependent)
         # - QEMU 9.2+: reconnect-ms (milliseconds), reconnect removed in 10.0
         # - QEMU 8.0-9.1: reconnect (seconds), minimum 1s
-        qemu_version = await probe_qemu_version()
         if qemu_version is not None and qemu_version >= (9, 2, 0):
             netdev_opts += ",reconnect-ms=250"  # 250ms - balanced recovery
         elif qemu_version is not None and qemu_version >= (8, 0, 0):
@@ -683,9 +791,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
+    # L1 memory snapshot restore: QEMU starts paused, waiting for migration stream
+    if defer_incoming:
+        qemu_args.extend(["-incoming", "defer"])
+
     # Orphan protection: kill QEMU if parent process dies (QEMU 10.2+)
     # Uses PR_SET_PDEATHSIG on Linux, kqueue on macOS/FreeBSD
-    qemu_version = await probe_qemu_version()
     if qemu_version is not None and qemu_version >= (10, 2, 0):
         qemu_args.extend(["-run-with", "exit-with-parent=on"])
 

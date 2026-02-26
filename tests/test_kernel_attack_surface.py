@@ -41,7 +41,7 @@ class TestEbpfRestricted:
     should return EPERM for UID 1000.
     """
 
-    async def test_bpf_syscall_blocked(self, scheduler: Scheduler) -> None:
+    async def test_bpf_syscall_blocked(self, dual_scheduler: Scheduler) -> None:
         """bpf() syscall returns EPERM for unprivileged user.
 
         CVE-2020-8835: eBPF verifier fails to restrict register values,
@@ -58,7 +58,7 @@ ret = libc.syscall(nr, 5, ctypes.byref(attr), 128)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # EPERM=1 or ENOSYS=38 (both acceptable — blocked or syscall unavailable)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -66,7 +66,7 @@ print(f"ret={ret} errno={err}")
             f"Expected bpf() EPERM(1) or ENOSYS(38), got errno={errno_val}. stdout: {result.stdout}"
         )
 
-    async def test_bpf_jit_harden_sysctl(self, scheduler: Scheduler) -> None:
+    async def test_bpf_jit_harden_sysctl(self, dual_scheduler: Scheduler) -> None:
         """net.core.bpf_jit_harden should be 2 (hardened for all).
 
         CVE-2024-56615: eBPF DEVMAP integer overflow. JIT hardening blinds
@@ -82,14 +82,14 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "VALUE:2" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
             f"Expected bpf_jit_harden=2. stdout: {stdout}"
         )
 
-    async def test_unprivileged_bpf_disabled_sysctl(self, scheduler: Scheduler) -> None:
+    async def test_unprivileged_bpf_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
         """kernel.unprivileged_bpf_disabled should be 1 or 2.
 
         CVE-2021-3490, CVE-2021-31440, CVE-2023-2163: All require unprivileged
@@ -105,7 +105,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # Value of 1 or 2 means unprivileged BPF is disabled
         # NOT_FOUND means /proc/sys is restricted or sysctl doesn't exist
@@ -128,7 +128,7 @@ class TestIoUringDisabled:
     VM isolation is the primary security layer; disabling io_uring is defense-in-depth.
     """
 
-    async def test_io_uring_setup_returns_enosys(self, scheduler: Scheduler) -> None:
+    async def test_io_uring_setup_returns_enosys(self, dual_scheduler: Scheduler) -> None:
         """io_uring_setup() returns ENOSYS (compiled out) or succeeds (stock kernel)."""
         code = """\
 import ctypes
@@ -144,7 +144,7 @@ if ret >= 0:
     os.close(ret)
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         ret_val = int(stdout.split("ret=")[1].split()[0])
@@ -154,7 +154,7 @@ print(f"ret={ret} errno={err}")
             f"io_uring_setup should return ENOSYS(38) or succeed, got ret={ret_val} errno={errno_val}. stdout: {stdout}"
         )
 
-    async def test_io_uring_invalid_params_returns_enosys(self, scheduler: Scheduler) -> None:
+    async def test_io_uring_invalid_params_returns_enosys(self, dual_scheduler: Scheduler) -> None:
         """io_uring_setup(0, &params) returns ENOSYS (compiled out) or EINVAL (stock kernel)."""
         code = """\
 import ctypes
@@ -168,7 +168,7 @@ ret = libc.syscall(nr, 0, ctypes.byref(params))
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         errno_val = int(stdout.rsplit("errno=", 1)[1])
@@ -186,7 +186,7 @@ class TestNfTablesRestricted:
     Mitigations: UID 1000 lacks CAP_NET_ADMIN, blocking nftables operations.
     """
 
-    async def test_nftables_socket_blocked(self, scheduler: Scheduler) -> None:
+    async def test_nftables_socket_blocked(self, dual_scheduler: Scheduler) -> None:
         """Netlink nftables socket requires CAP_NET_ADMIN — blocked for UID 1000.
 
         CVE-2024-1086: use-after-free in nf_tables nft_verdict_init(),
@@ -204,7 +204,7 @@ except PermissionError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # Socket creation may succeed (AF_NETLINK doesn't always require CAP_NET_ADMIN).
@@ -214,7 +214,7 @@ except OSError as e:
             f"Unexpected nftables socket result. stdout: {stdout}"
         )
 
-    async def test_nftables_operation_blocked(self, scheduler: Scheduler) -> None:
+    async def test_nftables_operation_blocked(self, dual_scheduler: Scheduler) -> None:
         """nftables rule creation requires CAP_NET_ADMIN.
 
         CVE-2023-32233: use-after-free in nf_tables anonymous set handling.
@@ -242,7 +242,7 @@ except PermissionError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # Operation should fail at socket creation or sendto
         assert "SENT" not in result.stdout, (
@@ -260,7 +260,7 @@ class TestAfPacketRestricted:
     out-of-bounds write. Requires CAP_NET_RAW.
     """
 
-    async def test_af_packet_socket_blocked(self, scheduler: Scheduler) -> None:
+    async def test_af_packet_socket_blocked(self, dual_scheduler: Scheduler) -> None:
         """AF_PACKET socket requires CAP_NET_RAW — blocked for UID 1000."""
         code = """\
 import socket
@@ -274,7 +274,7 @@ except PermissionError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "blocked" in result.stdout or "ERROR:" in result.stdout, (
             f"AF_PACKET socket should be blocked. stdout: {result.stdout}"
@@ -293,7 +293,7 @@ class TestAfVsockRestricted:
     full guest-to-host escape. Demonstrated in real-world conditions.
     """
 
-    async def test_af_vsock_socket_blocked(self, scheduler: Scheduler) -> None:
+    async def test_af_vsock_socket_blocked(self, dual_scheduler: Scheduler) -> None:
         """AF_VSOCK socket should be blocked for UID 1000.
 
         exec-sandbox uses virtio-serial (not vsock) for guest-host communication.
@@ -312,7 +312,7 @@ except OSError as e:
     # EAFNOSUPPORT=97 (address family not supported) is also safe
     print(f"blocked:errno={e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # With CONFIG_VSOCK=n (custom kernel): EAFNOSUPPORT (blocked:errno=97)
         # With CONFIG_VSOCK=y: may succeed if vsock device present, or EPERM
@@ -334,7 +334,7 @@ class TestCgroupEscapeBlocked:
     file write. When last task exits, release_agent runs as root on host.
     """
 
-    async def test_cgroup_mount_blocked(self, scheduler: Scheduler) -> None:
+    async def test_cgroup_mount_blocked(self, dual_scheduler: Scheduler) -> None:
         """Mounting cgroup filesystem requires CAP_SYS_ADMIN — blocked."""
         code = """\
 import ctypes, os
@@ -347,7 +347,7 @@ err = ctypes.get_errno()
 os.rmdir("/tmp/cg")
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_ADMIN), ENODEV=19 (cgroup v1 fs not available),
         # ENOENT=2 (cgroup subsystem not found)
@@ -356,7 +356,7 @@ print(f"ret={ret} errno={err}")
             f"Expected cgroup mount to fail with EPERM(1), ENOENT(2), or ENODEV(19), got errno={errno_val}"
         )
 
-    async def test_cgroupfs_not_mounted(self, scheduler: Scheduler) -> None:
+    async def test_cgroupfs_not_mounted(self, dual_scheduler: Scheduler) -> None:
         """cgroupfs is intentionally not mounted inside the VM.
 
         Resource limits are enforced host-side on the QEMU process via
@@ -376,12 +376,12 @@ else:
         for e in entries:
             print(f"FOUND:{e}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout in {"NO_DIR", "EMPTY"}, f"cgroupfs should not be mounted inside VM. Found: {stdout}"
 
-    async def test_cgroup_release_agent_not_writable(self, scheduler: Scheduler) -> None:
+    async def test_cgroup_release_agent_not_writable(self, dual_scheduler: Scheduler) -> None:
         """No writable cgroup release_agent files exist.
 
         CVE-2022-0492: Writing to release_agent causes arbitrary command
@@ -403,7 +403,7 @@ else:
     for f in found:
         print(f)
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "WRITABLE:" not in result.stdout, f"release_agent should not be writable. stdout: {result.stdout}"
 
@@ -420,7 +420,7 @@ class TestUserNamespaceRestricted:
     CVE-2023-0386: OverlayFS privilege escalation via user namespaces.
     """
 
-    async def test_unshare_user_namespace(self, scheduler: Scheduler) -> None:
+    async def test_unshare_user_namespace(self, dual_scheduler: Scheduler) -> None:
         """unshare(CLONE_NEWUSER) behavior — document whether restricted.
 
         Many kernel exploits require user namespaces to gain CAP_SYS_ADMIN.
@@ -442,7 +442,7 @@ if ret == 0:
 else:
     print(f"UNSHARE:blocked errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "UNSHARE:ok" in stdout:
@@ -451,7 +451,7 @@ else:
             assert "MOUNT_ret=-1" in stdout, f"Mount in user namespace should fail. stdout: {stdout}"
         # If unshare is blocked entirely, that's also fine
 
-    async def test_max_user_namespaces_sysctl(self, scheduler: Scheduler) -> None:
+    async def test_max_user_namespaces_sysctl(self, dual_scheduler: Scheduler) -> None:
         """user.max_user_namespaces should be 0 (portable alternative to
         Debian-specific unprivileged_userns_clone).
 
@@ -468,7 +468,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # Value 0 blocks user namespace creation entirely
@@ -477,7 +477,7 @@ except PermissionError:
             f"Expected max_user_namespaces=0. stdout: {stdout}"
         )
 
-    async def test_unshare_mount_namespace_blocked(self, scheduler: Scheduler) -> None:
+    async def test_unshare_mount_namespace_blocked(self, dual_scheduler: Scheduler) -> None:
         """unshare(CLONE_NEWNS) requires CAP_SYS_ADMIN — blocked for UID 1000."""
         code = """\
 import ctypes
@@ -487,7 +487,7 @@ ret = libc.unshare(0x00020000)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # EPERM=1 (requires CAP_SYS_ADMIN outside user namespace)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -505,7 +505,7 @@ class TestPtraceRestricted:
     CVE-2019-2054: seccomp bypass via ptrace on kernels < 4.8.
     """
 
-    async def test_ptrace_pid1_blocked(self, scheduler: Scheduler) -> None:
+    async def test_ptrace_pid1_blocked(self, dual_scheduler: Scheduler) -> None:
         """ptrace(PTRACE_ATTACH, 1) must fail — protects guest-agent."""
         code = """\
 import ctypes
@@ -515,7 +515,7 @@ ret = libc.ptrace(16, 1, 0, 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # EPERM=1 (different UID + YAMA) or ESRCH=3 (process not ptraceable)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -523,7 +523,7 @@ print(f"ret={ret} errno={err}")
             f"Expected ptrace EPERM(1) or ESRCH(3), got errno={errno_val}. stdout: {result.stdout}"
         )
 
-    async def test_ptrace_self_dumpable_zero(self, scheduler: Scheduler) -> None:
+    async def test_ptrace_self_dumpable_zero(self, dual_scheduler: Scheduler) -> None:
         """PR_SET_DUMPABLE=0 prevents ptrace attachment from any process.
 
         This blocks CVE-2022-30594 style attacks where attacker attaches
@@ -546,14 +546,14 @@ libc = ctypes.CDLL("libc.so.6", use_errno=True)
 dumpable = libc.prctl(3, 0, 0, 0, 0)
 print(f"DUMPABLE:{dumpable}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # PR_SET_DUMPABLE must be 0 to prevent ptrace from other UID 1000 processes
         assert "DUMPABLE:0" in result.stdout, f"Expected dumpable=0. stdout: {result.stdout}"
         # No tracer should be attached
         assert "TRACER:0" in result.stdout, f"Expected no tracer. stdout: {result.stdout}"
 
-    async def test_yama_ptrace_scope(self, scheduler: Scheduler) -> None:
+    async def test_yama_ptrace_scope(self, dual_scheduler: Scheduler) -> None:
         """YAMA ptrace_scope must be >= 2 (admin-only ptrace).
 
         Level 2 means only CAP_SYS_PTRACE holders can ptrace. This is the
@@ -572,7 +572,7 @@ except FileNotFoundError:
 except PermissionError:
     print('YAMA:perm_denied')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # YAMA scope >= 2 blocks ptrace for non-CAP_SYS_PTRACE processes
@@ -596,7 +596,7 @@ class TestSuidProtection:
     splice, then execute for root shell. Mitigated by no_new_privs.
     """
 
-    async def test_no_suid_binaries_exist(self, scheduler: Scheduler) -> None:
+    async def test_no_suid_binaries_exist(self, dual_scheduler: Scheduler) -> None:
         """No SUID/SGID binaries should exist in the guest filesystem.
 
         Defense-in-depth: even though no_new_privs blocks SUID execution,
@@ -623,13 +623,13 @@ if suid_files:
 else:
     print("NO_SUID_BINARIES")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # If SUID binaries exist, no_new_privs still protects us,
         # but ideally there should be none
         if "SUID:" in result.stdout:
             # Verify no_new_privs is set (defense-in-depth)
-            nnp_result = await scheduler.run(
+            nnp_result = await dual_scheduler.run(
                 code='with open("/proc/self/status") as f:\n    for l in f:\n        if l.startswith("NoNewPrivs:"): print(l.strip())',
                 language=Language.PYTHON,
             )
@@ -637,7 +637,7 @@ else:
                 f"SUID binaries exist and no_new_privs is not set! SUID files: {result.stdout}"
             )
 
-    async def test_no_new_privs_set(self, scheduler: Scheduler) -> None:
+    async def test_no_new_privs_set(self, dual_scheduler: Scheduler) -> None:
         """no_new_privs must be set, preventing SUID bit from taking effect.
 
         CVE-2022-0847: Even if an attacker overwrites a SUID binary via
@@ -652,7 +652,7 @@ with open("/proc/self/status") as f:
             print(f"NO_NEW_PRIVS:{val}")
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NO_NEW_PRIVS:1" in result.stdout, f"Expected no_new_privs=1. stdout: {result.stdout}"
 
@@ -666,7 +666,7 @@ class TestProcInfoLeaks:
     CVE-2023-3269 (StackRot): Requires knowing kernel addresses to exploit.
     """
 
-    async def test_proc_kallsyms_restricted(self, scheduler: Scheduler) -> None:
+    async def test_proc_kallsyms_restricted(self, dual_scheduler: Scheduler) -> None:
         """Kernel symbol addresses in /proc/kallsyms should be zeroed.
 
         kptr_restrict >= 1 ensures unprivileged users see 0x0 addresses.
@@ -695,14 +695,14 @@ except PermissionError:
 except FileNotFoundError:
     print("NOT_FOUND")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "ZEROED:True" in stdout or "PERM_DENIED" in stdout or "EMPTY" in stdout or "NOT_FOUND" in stdout, (
             f"Kernel addresses should be hidden. stdout: {stdout}"
         )
 
-    async def test_proc_kcore_not_readable(self, scheduler: Scheduler) -> None:
+    async def test_proc_kcore_not_readable(self, dual_scheduler: Scheduler) -> None:
         """Kernel memory via /proc/kcore must not be readable."""
         code = """\
 try:
@@ -716,11 +716,11 @@ except FileNotFoundError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "READ:" not in result.stdout, f"/proc/kcore should not be readable. stdout: {result.stdout}"
 
-    async def test_proc_pid1_maps_not_readable(self, scheduler: Scheduler) -> None:
+    async def test_proc_pid1_maps_not_readable(self, dual_scheduler: Scheduler) -> None:
         """PID 1 memory map must not be readable by UID 1000.
 
         Reference: CVE-2023-3269 (StackRot) — memory layout leak aids exploitation.
@@ -735,11 +735,11 @@ except PermissionError:
 except FileNotFoundError:
     print("NOT_FOUND")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "BLOCKED" in result.stdout or "NOT_FOUND" in result.stdout
 
-    async def test_proc_hidepid_mount_option(self, scheduler: Scheduler) -> None:
+    async def test_proc_hidepid_mount_option(self, dual_scheduler: Scheduler) -> None:
         """Proc must be mounted with hidepid=2 to hide other users' processes.
 
         hidepid=2 makes /proc/[pid] directories invisible for PIDs not owned
@@ -762,11 +762,11 @@ with open('/proc/mounts') as f:
     else:
         print('HIDEPID:no_proc_mount')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "HIDEPID:enabled" in result.stdout, f"stdout: {result.stdout}"
 
-    async def test_proc_pid1_directory_invisible(self, scheduler: Scheduler) -> None:
+    async def test_proc_pid1_directory_invisible(self, dual_scheduler: Scheduler) -> None:
         """/proc/1 must be invisible to UID 1000 with hidepid=2.
 
         This is stronger than permission-denied — the directory does not exist
@@ -784,12 +784,12 @@ except FileNotFoundError:
 except PermissionError:
     print('LISTDIR:EPERM')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "EXISTS:False" in result.stdout
         assert "LISTDIR:ENOENT" in result.stdout
 
-    async def test_proc_self_still_accessible(self, scheduler: Scheduler) -> None:
+    async def test_proc_self_still_accessible(self, dual_scheduler: Scheduler) -> None:
         """/proc/self and /proc/{pid} must remain readable for the current process.
 
         Regression canary: hidepid=2 must not break process self-introspection.
@@ -808,7 +808,7 @@ with open(f'/proc/{pid}/status') as f:
     status = f.read()
 print(f'OWN_PID_STATUS:{"Name:" in status}')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "SELF_STATUS:True" in result.stdout
         assert "OWN_PID_STATUS:True" in result.stdout
@@ -820,7 +820,7 @@ print(f'OWN_PID_STATUS:{"Name:" in status}')
 class TestKernelExploitPrimitivesBlocked:
     """Operations that are first steps in kernel exploitation chains."""
 
-    async def test_unprivileged_userfaultfd_sysctl(self, scheduler: Scheduler) -> None:
+    async def test_unprivileged_userfaultfd_sysctl(self, dual_scheduler: Scheduler) -> None:
         """vm.unprivileged_userfaultfd should be 0.
 
         userfaultfd is the primary race condition primitive in kernel UAF exploits.
@@ -836,14 +836,14 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "VALUE:0" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
             f"Expected unprivileged_userfaultfd=0. stdout: {stdout}"
         )
 
-    async def test_userfaultfd_restricted(self, scheduler: Scheduler) -> None:
+    async def test_userfaultfd_restricted(self, dual_scheduler: Scheduler) -> None:
         """userfaultfd is commonly used in kernel race condition exploits.
 
         Many kernel UAF exploits use userfaultfd to pause execution at
@@ -864,14 +864,14 @@ if ret >= 0:
 else:
     print(f"BLOCKED:errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # userfaultfd should be blocked (EPERM=1 or ENOSYS=38)
         # If it's available, it's a potential race condition exploit primitive
         assert "BLOCKED:" in stdout, f"userfaultfd should be blocked for UID 1000. stdout: {stdout}"
 
-    async def test_keyctl_blocked(self, scheduler: Scheduler) -> None:
+    async def test_keyctl_blocked(self, dual_scheduler: Scheduler) -> None:
         """keyctl operations used in kernel exploitation for heap spraying."""
         code = """\
 import ctypes, platform
@@ -883,13 +883,13 @@ ret = libc.syscall(nr, 0, -1, 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # keyctl may succeed (returns keyring ID) or fail (ENOSYS/EPERM).
         # We can't block it without seccomp, but we document its availability.
         assert "ret=" in result.stdout, f"Unexpected keyctl output. stdout: {result.stdout}"
 
-    async def test_modules_disabled_sysctl(self, scheduler: Scheduler) -> None:
+    async def test_modules_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
         """kernel.modules_disabled=1 prevents ALL module loading (irreversible).
 
         With CONFIG_MODULES=y: set by tiny-init after module loading.
@@ -906,7 +906,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # modules_disabled=1 means module loading is permanently blocked
@@ -916,7 +916,7 @@ except PermissionError:
             f"Expected modules_disabled=1 or NOT_FOUND. stdout: {stdout}"
         )
 
-    async def test_kernel_module_loading_blocked(self, scheduler: Scheduler) -> None:
+    async def test_kernel_module_loading_blocked(self, dual_scheduler: Scheduler) -> None:
         """finit_module/init_module blocked for UID 1000.
 
         Prevents loading malicious kernel modules even if user manages
@@ -931,7 +931,7 @@ ret = libc.syscall(nr, -1, b"", 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_MODULE or modules_disabled=1)
         # ENOSYS=38 (CONFIG_MODULES=n — syscall doesn't exist, even stronger)
@@ -940,7 +940,7 @@ print(f"ret={ret} errno={err}")
             f"Expected finit_module EPERM(1) or ENOSYS(38), got errno={errno_val}. stdout: {result.stdout}"
         )
 
-    async def test_kexec_blocked(self, scheduler: Scheduler) -> None:
+    async def test_kexec_blocked(self, dual_scheduler: Scheduler) -> None:
         """kexec_load blocked — prevents replacing the running kernel."""
         code = """\
 import ctypes, platform
@@ -955,7 +955,7 @@ ret = libc.syscall(nr, 0, 0, 0, 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_BOOT) or ENOSYS=38 (not compiled into kernel)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -970,7 +970,7 @@ print(f"ret={ret} errno={err}")
 class TestFilesystemProtections:
     """Symlink/hardlink attacks in world-writable dirs like /tmp."""
 
-    async def test_protected_symlinks(self, scheduler: Scheduler) -> None:
+    async def test_protected_symlinks(self, dual_scheduler: Scheduler) -> None:
         """fs.protected_symlinks=1 prevents symlink attacks in sticky dirs."""
         code = """\
 try:
@@ -980,13 +980,13 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "PROTECTED_SYMLINKS:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected protected_symlinks=1. stdout: {result.stdout}"
         )
 
-    async def test_protected_hardlinks(self, scheduler: Scheduler) -> None:
+    async def test_protected_hardlinks(self, dual_scheduler: Scheduler) -> None:
         """fs.protected_hardlinks=1 prevents hardlink attacks."""
         code = """\
 try:
@@ -996,13 +996,13 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "PROTECTED_HARDLINKS:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected protected_hardlinks=1. stdout: {result.stdout}"
         )
 
-    async def test_protected_fifos(self, scheduler: Scheduler) -> None:
+    async def test_protected_fifos(self, dual_scheduler: Scheduler) -> None:
         """fs.protected_fifos=2 prevents FIFO attacks in sticky dirs."""
         code = """\
 try:
@@ -1012,7 +1012,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PROTECTED_FIFOS:" in stdout and stdout.split(":")[1].isdigit():
@@ -1021,7 +1021,7 @@ except (FileNotFoundError, PermissionError):
         else:
             assert "INACCESSIBLE" in stdout, f"Expected protected_fifos >= 2 or INACCESSIBLE. stdout: {stdout}"
 
-    async def test_protected_regular(self, scheduler: Scheduler) -> None:
+    async def test_protected_regular(self, dual_scheduler: Scheduler) -> None:
         """fs.protected_regular=2 prevents regular file attacks in sticky dirs."""
         code = """\
 try:
@@ -1031,7 +1031,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PROTECTED_REGULAR:" in stdout and stdout.split(":")[1].isdigit():
@@ -1040,7 +1040,7 @@ except (FileNotFoundError, PermissionError):
         else:
             assert "INACCESSIBLE" in stdout, f"Expected protected_regular >= 2 or INACCESSIBLE. stdout: {stdout}"
 
-    async def test_suid_dumpable(self, scheduler: Scheduler) -> None:
+    async def test_suid_dumpable(self, dual_scheduler: Scheduler) -> None:
         """fs.suid_dumpable=0 prevents core dumps for setuid processes."""
         code = """\
 try:
@@ -1050,7 +1050,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "SUID_DUMPABLE:0" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected suid_dumpable=0. stdout: {result.stdout}"
@@ -1063,7 +1063,7 @@ except (FileNotFoundError, PermissionError):
 class TestKernelInfoLeakSysctls:
     """Validate sysctl settings that prevent kernel information leaks."""
 
-    async def test_dmesg_restrict(self, scheduler: Scheduler) -> None:
+    async def test_dmesg_restrict(self, dual_scheduler: Scheduler) -> None:
         """kernel.dmesg_restrict=1 restricts dmesg to CAP_SYSLOG.
 
         Kernel logs leak addresses, module info, hardware details useful
@@ -1077,13 +1077,13 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "DMESG_RESTRICT:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected dmesg_restrict=1. stdout: {result.stdout}"
         )
 
-    async def test_perf_event_paranoid(self, scheduler: Scheduler) -> None:
+    async def test_perf_event_paranoid(self, dual_scheduler: Scheduler) -> None:
         """kernel.perf_event_paranoid=3 disables perf for all users.
 
         Perf events enable side-channel attacks and kernel exploitation.
@@ -1096,7 +1096,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PERF_PARANOID:" in stdout and stdout.split(":")[1].lstrip("-").isdigit():
@@ -1105,7 +1105,7 @@ except (FileNotFoundError, PermissionError):
         else:
             assert "INACCESSIBLE" in stdout, f"Expected perf_event_paranoid >= 3 or INACCESSIBLE. stdout: {stdout}"
 
-    async def test_kptr_restrict(self, scheduler: Scheduler) -> None:
+    async def test_kptr_restrict(self, dual_scheduler: Scheduler) -> None:
         """kernel.kptr_restrict=2 hides kernel pointers from all users.
 
         Required to prevent KASLR bypass. Value 2 restricts even CAP_SYSLOG.
@@ -1118,7 +1118,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "KPTR_RESTRICT:" in stdout and stdout.split(":")[1].isdigit():
@@ -1139,7 +1139,7 @@ class TestSequoiaMitigation:
     of directories needed for this exploit.
     """
 
-    async def test_deep_directory_creation_bounded(self, scheduler: Scheduler) -> None:
+    async def test_deep_directory_creation_bounded(self, dual_scheduler: Scheduler) -> None:
         """Inode limit on /tmp prevents creating deep directory structures.
 
         Sequoia requires creating >1GB of path components (~8 million nested
@@ -1168,7 +1168,7 @@ finally:
     except Exception:
         pass
 """
-        result = await scheduler.run(
+        result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
             timeout_seconds=30,

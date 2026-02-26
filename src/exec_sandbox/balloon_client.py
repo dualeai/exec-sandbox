@@ -7,7 +7,7 @@ Architecture:
 - Connects to QEMU's QMP (QEMU Monitor Protocol) Unix socket
 - Uses socket peer credential authentication (same as guest channel)
 - Balloon device reclaims memory by inflating a memory balloon inside the guest
-- Deflating the balloon returns memory to the host
+- Deflating the balloon returns memory to the guest (restoring full allocation)
 
 Usage:
     async with BalloonClient(qmp_socket_path, expected_uid) as client:

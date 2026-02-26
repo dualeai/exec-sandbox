@@ -10,7 +10,7 @@ qcow2 optimizations:
 - cluster_size=128k: Balance between metadata and allocation
 
 Snapshot structure:
-- {cache_key}.qcow2: Disk state (backing file + package changes)
+- {cache_key}.qcow2: Standalone ext4 image (overlaid on EROFS base at boot)
 """
 
 from __future__ import annotations
@@ -18,10 +18,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
-import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, ClassVar
 
 import aiofiles
 import aiofiles.os
@@ -35,6 +34,7 @@ else:
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
+from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmQemuCrashError, VmTransientError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
@@ -42,11 +42,12 @@ from exec_sandbox.guest_agent_protocol import (
     OutputChunkMessage,
     StreamingErrorMessage,
 )
-from exec_sandbox.hash_utils import crc32, crc64
+from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
-from exec_sandbox.overlay_pool import QemuImgError, create_qcow2_overlay
+from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
+from exec_sandbox.vm_types import VmState
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class SnapshotManager:
+class DiskSnapshotManager(BaseCacheManager):
     """Manages qcow2 snapshot cache for disk caching.
 
     Architecture (2-tier):
@@ -74,6 +75,8 @@ class SnapshotManager:
     - ✅ Single qcow2 file per snapshot
     """
 
+    _cache_ext: ClassVar[str] = ".qcow2"
+
     def __init__(self, settings: Settings, vm_manager: VmManager):
         """Initialize qcow2 snapshot manager.
 
@@ -81,10 +84,9 @@ class SnapshotManager:
             settings: Application settings with cache configuration
             vm_manager: VmManager for VM operations
         """
+        super().__init__(settings.disk_snapshot_cache_dir)
         self.settings = settings
         self.vm_manager = vm_manager
-        self.cache_dir = settings.snapshot_cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # L3 client (lazy init)
         self._s3_session = None
@@ -102,9 +104,6 @@ class SnapshotManager:
         # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
         # S3 PutObject is atomic - aborted uploads leave no partial blobs
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
-
-        # Track background S3 upload tasks to prevent GC
-        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def check_cache(
         self,
@@ -195,9 +194,7 @@ class SnapshotManager:
             # Base images don't need S3 - they're already globally distributed
             if packages:
                 upload_task: asyncio.Task[None] = asyncio.create_task(self._upload_to_s3(cache_key, snapshot_path))
-                self._background_tasks.add(upload_task)
-                upload_task.add_done_callback(lambda t: self._background_tasks.discard(t))
-                upload_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                self._track_task(upload_task, name=f"s3-upload-{cache_key}")
 
             return snapshot_path
 
@@ -237,7 +234,7 @@ class SnapshotManager:
 
         # Include base image hash (first 8 chars) to invalidate cache on image rebuild
         base_image = self.vm_manager.get_base_image(language)
-        img_hash = self._get_base_image_hash(base_image)
+        img_hash = self.image_hash(base_image)
 
         base = f"{language.value}-v{version}-{img_hash}"
 
@@ -247,34 +244,12 @@ class SnapshotManager:
         packages_hash = crc64(packages_str)
         return f"{base}-{packages_hash}"
 
-    def _get_base_image_hash(self, base_image: Path) -> str:
-        """Get hash of base image for cache key.
-
-        Uses file modification time + size for fast hashing (avoids reading entire file).
-        This detects image rebuilds while being O(1) instead of O(n).
-
-        Args:
-            base_image: Path to base qcow2 image
-
-        Returns:
-            8-character hash string (CRC32 in hex)
-        """
-        try:
-            stat = base_image.stat()
-            # Combine mtime (nanoseconds) + size for unique fingerprint
-            fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
-            return crc32(fingerprint)
-        except OSError:
-            # If image doesn't exist, return placeholder (will fail later anyway)
-            return "missing0"
-
     async def _check_l2_cache(self, cache_key: str) -> Path | None:
         """Check L2 local cache for qcow2 snapshot.
 
         Validates:
         1. Snapshot file exists
-        2. Valid qcow2 format
-        3. Backing file exists and matches expected base image
+        2. Valid qcow2 format (via qemu-img check)
 
         Args:
             cache_key: Snapshot cache key.
@@ -287,57 +262,23 @@ class SnapshotManager:
         if not await aiofiles.os.path.exists(snapshot_path):
             return None
 
-        # Verify qcow2 format and get backing file info
+        # Verify qcow2 format (standalone ext4 snapshot, no backing file expected)
         try:
             proc = ProcessWrapper(
                 await asyncio.create_subprocess_exec(
                     "qemu-img",
-                    "info",
-                    "--output=json",
+                    "check",
                     str(snapshot_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
             )
-            stdout, _stderr = await proc.communicate()
+            await proc.communicate()
 
             if proc.returncode != 0:
                 logger.debug("Invalid qcow2 snapshot, removing", extra={"cache_key": cache_key})
                 await aiofiles.os.remove(snapshot_path)
                 return None
-
-            # Parse JSON output to check backing file
-            info = json.loads(stdout.decode())
-            backing_file = info.get("backing-filename") or info.get("full-backing-filename")
-
-            if backing_file:
-                # Verify backing file exists
-                if not await aiofiles.os.path.exists(backing_file):
-                    logger.warning(
-                        "Snapshot backing file missing, removing stale cache",
-                        extra={"cache_key": cache_key, "backing_file": backing_file},
-                    )
-                    await aiofiles.os.remove(snapshot_path)
-                    return None
-
-                # Verify backing file matches expected base image by checking hash
-                # Extract language from cache_key (format: "{language}-v{version}-{hash|base}")
-                language_str = cache_key.split("-")[0]
-                try:
-                    expected_base = self.vm_manager.get_base_image(Language(language_str)).resolve()
-                    if Path(backing_file).resolve() != expected_base:
-                        logger.warning(
-                            "Snapshot backing file mismatch, removing stale cache",
-                            extra={
-                                "cache_key": cache_key,
-                                "backing_file": backing_file,
-                                "expected": str(expected_base),
-                            },
-                        )
-                        await aiofiles.os.remove(snapshot_path)
-                        return None
-                except (ValueError, KeyError):
-                    pass  # Can't determine expected base, skip validation
 
         except (OSError, FileNotFoundError):
             return None
@@ -382,19 +323,16 @@ class SnapshotManager:
             SnapshotError: Creation failed
             VmQemuCrashError: VM crashed during snapshot creation
         """
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
-        # Resolve to absolute path - qemu-img resolves backing file relative to snapshot location,
-        # so we need absolute path when snapshot_cache_dir differs from base_images_dir
-        base_image = self.vm_manager.get_base_image(language).resolve()
 
         # Acquire semaphore to limit concurrent snapshot creation
         async with self._creation_semaphore:
             vm = None  # Track VM for cleanup
 
             try:
-                # Step 1: Create qcow2 with backing file
-                await self._create_snapshot_image(snapshot_path, base_image, cache_key, language, packages, tenant_id)
+                # Step 1: Create standalone ext4 qcow2 for overlay (vdb)
+                await self._create_snapshot_image(snapshot_path, cache_key, language, packages, tenant_id)
 
                 # Step 2: Determine network configuration for snapshot creation
                 # ALWAYS enable network during snapshot creation (pip/npm needs it)
@@ -593,7 +531,7 @@ class SnapshotManager:
                         )
 
         # Record snapshot creation duration
-        duration_ms = round((asyncio.get_event_loop().time() - start_time) * 1000)
+        duration_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
         logger.info(
             "Snapshot created",
             extra={
@@ -609,17 +547,19 @@ class SnapshotManager:
     async def _create_snapshot_image(
         self,
         snapshot_path: Path,
-        base_image: Path,
         cache_key: str,
         language: str,
         packages: list[str],
         tenant_id: str,
     ) -> None:
-        """Create qcow2 snapshot image with backing file.
+        """Create standalone ext4 qcow2 for snapshot overlay (vdb).
+
+        With EROFS rootfs, snapshots are standalone ext4 qcow2 images that serve
+        as the upper layer in overlayfs (merged with the read-only EROFS base on vda).
+        tiny-init formats and mounts this as ext4 writable during snapshot creation.
 
         Args:
             snapshot_path: Path to snapshot to create
-            base_image: Base image to use as backing file
             cache_key: Snapshot cache key
             language: Programming language
             packages: Package list
@@ -629,7 +569,23 @@ class SnapshotManager:
             SnapshotError: qemu-img command failed
         """
         try:
-            await create_qcow2_overlay(base_image, snapshot_path)
+            proc = ProcessWrapper(
+                await asyncio.create_subprocess_exec(
+                    "qemu-img",
+                    "create",
+                    "-f",
+                    "qcow2",
+                    "-o",
+                    "cluster_size=128k,lazy_refcounts=on,extended_l2=on",
+                    str(snapshot_path),
+                    "512M",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            )
+            _stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise QemuImgError(f"qemu-img create failed: {stderr.decode().strip()}")
         except QemuImgError as e:
             raise SnapshotError(
                 str(e),
@@ -770,41 +726,6 @@ class SnapshotManager:
                 },
             ) from e
 
-    async def _evict_oldest_snapshot(self) -> None:
-        """Evict single oldest snapshot (by atime).
-
-        Called lazily when disk full (ENOSPC).
-        Uses asyncio.to_thread for blocking glob and asyncio.gather for parallel stat.
-        """
-        # Run blocking glob in thread pool (non-blocking)
-        snapshot_files = await asyncio.to_thread(lambda: list(self.cache_dir.glob("*.qcow2")))
-
-        if not snapshot_files:
-            return
-
-        # Helper to get atime for a single file
-        async def get_atime(path: Path) -> tuple[Path, float] | None:
-            try:
-                if await aiofiles.os.path.isfile(path):
-                    stat = await aiofiles.os.stat(path)
-                    return (path, stat.st_atime)
-            except OSError:
-                pass
-            return None
-
-        # Parallel stat calls for all files
-        results = await asyncio.gather(*[get_atime(f) for f in snapshot_files])
-        snapshots = [r for r in results if r is not None]
-
-        if not snapshots:
-            return
-
-        # Find oldest (by atime)
-        oldest_file, _ = min(snapshots, key=lambda x: x[1])
-
-        # Delete oldest snapshot
-        await aiofiles.os.remove(oldest_file)
-
     async def _download_from_s3(self, cache_key: str) -> Path:
         """Download and decompress snapshot from S3 to L2 cache.
 
@@ -942,28 +863,5 @@ class SnapshotManager:
         )
 
     async def stop(self) -> None:
-        """Stop SnapshotManager and wait for background upload tasks to complete.
-
-        Should be called when the SnapshotManager is no longer needed.
-        Ensures all S3 uploads finish before stopping.
-        """
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-            self._background_tasks.clear()
-
-    async def __aenter__(self) -> Self:
-        """Enter async context manager.
-
-        No async initialization needed - returns self immediately.
-        """
-        return self
-
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, stopping and waiting for background tasks."""
-        await self.stop()
-
-
-# Import VmState for type checking in finally block
-from exec_sandbox.vm_types import VmState  # noqa: E402
+        """Stop DiskSnapshotManager and wait for background upload tasks to complete."""
+        await super().stop()

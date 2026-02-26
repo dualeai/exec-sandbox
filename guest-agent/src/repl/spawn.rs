@@ -26,7 +26,7 @@ pub(crate) async fn spawn_repl(
 
     let mut cmd = match language {
         Language::Python => {
-            let mut c = Command::new("python3");
+            let mut c = Command::new(format!("{PYTHON_HOME}/bin/python3"));
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
             c.env(
                 "PYTHONPATH",
@@ -41,11 +41,11 @@ pub(crate) async fn spawn_repl(
             // musl's allocator uses a global lock; Python calls malloc ~26k times during init.
             // Note: inherited by subprocesses (gcc, etc.) — harmless but visible.
             // See: https://developers.home-assistant.io/blog/2020/07/13/alpine-python/
-            c.env("LD_PRELOAD", "/usr/lib/libjemalloc.so.2");
+            c.env("LD_PRELOAD", JEMALLOC_LIB);
             c
         }
         Language::Javascript => {
-            let mut c = Command::new("bun");
+            let mut c = Command::new(BUN_BIN_PATH);
             c.arg("--smol");
             c.arg(format!("{SANDBOX_ROOT}/_repl.mjs"));
             c.env(
@@ -69,7 +69,7 @@ pub(crate) async fn spawn_repl(
             c
         }
         Language::Raw => {
-            let mut c = Command::new("bash");
+            let mut c = Command::new(BASH_BIN_PATH);
             c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
             c
@@ -84,6 +84,10 @@ pub(crate) async fn spawn_repl(
 
     // Defense-in-depth: harden the REPL child process before exec.
     // We handle uid/gid/prctl ALL in pre_exec to control ordering.
+    //
+    // SAFETY: pre_exec runs between fork() and exec() in the child process.
+    // All operations are async-signal-safe libc calls (prctl, setgid, setuid).
+    // No heap allocation, no Rust stdlib calls, no mutex locking.
     unsafe {
         cmd.pre_exec(|| {
             // 1. Block privilege escalation via execve
@@ -137,9 +141,9 @@ pub(crate) async fn spawn_repl(
         }
     }
 
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().expect("stdin piped at spawn");
+    let stdout = child.stdout.take().expect("stdout piped at spawn");
+    let stderr = child.stderr.take().expect("stderr piped at spawn");
 
     log_info!("Spawned REPL for language={}", language.as_str());
 

@@ -23,11 +23,12 @@ Example:
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 - pydantic evaluates annotations at runtime
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from exec_sandbox import constants
+from exec_sandbox.platform_utils import get_cache_dir
 
 
 class SchedulerConfig(BaseModel):
@@ -48,8 +49,12 @@ class SchedulerConfig(BaseModel):
             - EXEC_SANDBOX_IMAGES_DIR env var
             - ./images/dist/ (local build)
             - ~/.cache/exec-sandbox/ (download cache)
-        snapshot_cache_dir: Local directory for snapshot cache (L2 cache).
-            Default: /tmp/exec-sandbox-cache
+        disk_snapshot_cache_dir: Local directory for L2 snapshot cache.
+            Default: OS-specific cache dir / disk-snapshots
+            (macOS: ~/Library/Caches/exec-sandbox/, Linux: ~/.cache/exec-sandbox/)
+        memory_snapshot_cache_dir: Local directory for L1 memory snapshot cache.
+            Default: OS-specific cache dir / memory-snapshots
+            (macOS: ~/Library/Caches/exec-sandbox/, Linux: ~/.cache/exec-sandbox/)
         s3_bucket: S3 bucket name for snapshot backup (L3 cache).
             If None, S3 backup is disabled. Requires aioboto3 optional dependency.
         s3_region: AWS region for S3 bucket. Default: us-east-1.
@@ -97,9 +102,13 @@ class SchedulerConfig(BaseModel):
         default=None,
         description="Directory containing VM images (auto-detect if None)",
     )
-    snapshot_cache_dir: Path = Field(
-        default=Path("/tmp/exec-sandbox-cache"),  # noqa: S108
-        description="Local snapshot cache directory (L2 cache)",
+    disk_snapshot_cache_dir: Path = Field(
+        default_factory=lambda: get_cache_dir() / "disk-snapshots",
+        description="Local disk snapshot cache directory (L2 cache)",
+    )
+    memory_snapshot_cache_dir: Path = Field(
+        default_factory=lambda: get_cache_dir() / "memory-snapshots",
+        description="Local memory snapshot cache directory (L1 cache)",
     )
 
     # S3 snapshot backup (optional)

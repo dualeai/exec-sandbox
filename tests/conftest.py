@@ -22,7 +22,7 @@ from exec_sandbox.vm_manager import VmManager
 # TCG (software emulation) is 10-50x slower than KVM/HVF, making these tests
 # unreliable on GitHub Actions macOS runners (no nested virtualization).
 skip_unless_hwaccel = pytest.mark.skipif(
-    not check_hwaccel_available(),
+    not asyncio.run(check_hwaccel_available()),
     reason="Requires hardware acceleration (KVM/HVF) - TCG too slow for timing-sensitive tests",
 )
 
@@ -32,7 +32,7 @@ skip_unless_hwaccel = pytest.mark.skipif(
 # requires both hwaccel AND TSC_DEADLINE (x86_64) to ensure fast balloon ops.
 # See check_fast_balloon_available() docstring for full rationale and references.
 skip_unless_fast_balloon = pytest.mark.skipif(
-    not check_fast_balloon_available(),
+    not asyncio.run(check_fast_balloon_available()),
     reason=(
         "Requires fast balloon operations - nested virtualization (CI runners) causes "
         "balloon timeouts. TSC_DEADLINE CPU feature missing indicates degraded nested virt."
@@ -121,6 +121,31 @@ async def scheduler(scheduler_config: SchedulerConfig) -> AsyncGenerator[Schedul
         yield sched
 
 
+@pytest.fixture(params=["hwaccel", "emulation"])
+async def dual_scheduler(
+    request: pytest.FixtureRequest,
+    images_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncGenerator[Scheduler, None]:
+    """Scheduler that runs each test under both hardware acceleration and TCG emulation.
+
+    - hwaccel: Uses KVM/HVF if available, skips if not.
+    - emulation: Forces QEMU TCG software emulation via EXEC_SANDBOX_FORCE_EMULATION.
+
+    This ensures security properties hold regardless of QEMU backend.
+    """
+    if request.param == "hwaccel":
+        if not await check_hwaccel_available():
+            pytest.skip("Hardware acceleration not available")
+        monkeypatch.delenv("EXEC_SANDBOX_FORCE_EMULATION", raising=False)
+    else:
+        monkeypatch.setenv("EXEC_SANDBOX_FORCE_EMULATION", "true")
+
+    config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False)
+    async with Scheduler(config) as sched:
+        yield sched
+
+
 # ============================================================================
 # VmManager Fixtures
 # ============================================================================
@@ -204,7 +229,7 @@ def make_vm_settings(images_dir: Path):
 
     Usage:
         def test_something(make_vm_settings, tmp_path):
-            settings = make_vm_settings(snapshot_cache_dir=tmp_path / "cache")
+            settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
     """
     from typing import Any
 
@@ -222,22 +247,30 @@ def make_vm_settings(images_dir: Path):
 
 
 @pytest.fixture
-def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
-    """Factory to create VmManager with optional Settings overrides.
+async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
+    """Factory to create started VmManager with optional Settings overrides.
+
+    Each VmManager is automatically started (overlay pool daemon, system probes)
+    and stopped on fixture teardown via AsyncExitStack.
 
     Usage:
-        def test_something(make_vm_manager, tmp_path):
-            vm_manager = make_vm_manager(snapshot_cache_dir=tmp_path / "cache")
+        async def test_something(make_vm_manager, tmp_path):
+            vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
     """
+    from contextlib import AsyncExitStack
     from typing import Any
 
     from exec_sandbox.vm_manager import VmManager
 
-    def _make(**settings_overrides: Any) -> VmManager:
-        settings = make_vm_settings(**settings_overrides)
-        return VmManager(settings)  # type: ignore[arg-type]
+    async with AsyncExitStack() as stack:
 
-    return _make
+        async def _make(**settings_overrides: Any) -> VmManager:
+            settings = make_vm_settings(**settings_overrides)
+            manager = VmManager(settings)  # type: ignore[arg-type]
+            await stack.enter_async_context(manager)
+            return manager
+
+        yield _make
 
 
 # ============================================================================

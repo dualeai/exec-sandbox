@@ -66,9 +66,11 @@ fn process_stderr_chunk(
     stderr_line_buf.push_str(&String::from_utf8_lossy(chunk));
     let mut sentinel_exit_code: Option<i32> = None;
     while let Some(nl) = stderr_line_buf.find('\n') {
-        let line = stderr_line_buf[..nl].to_string();
-        *stderr_line_buf = stderr_line_buf[nl + 1..].to_string();
-        if let Some(code) = parse_stderr_line_for_sentinel(&line, sentinel_prefix, stderr_buffer) {
+        let line: String = stderr_line_buf.drain(..=nl).collect();
+        // drain includes the '\n'; strip it for sentinel parsing
+        let line = &line[..line.len() - 1];
+        if let Some(code) = parse_stderr_line_for_sentinel(line, sentinel_prefix, stderr_buffer) {
+            // Last sentinel wins if multiple appear in one chunk
             sentinel_exit_code = Some(code);
         }
     }
@@ -194,6 +196,95 @@ async fn drain_after_sigterm(
     sentinel_exit_code
 }
 
+/// Generate a unique sentinel ID and its prefix for matching on stderr.
+fn generate_sentinel() -> (String, String) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let count = SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{nanos}_{count}");
+    let prefix = format!("__SENTINEL_{}_", id);
+    (id, prefix)
+}
+
+/// Write a code submission (header + body) to the REPL's stdin.
+async fn submit_code_to_repl(
+    stdin: &mut tokio::process::ChildStdin,
+    sentinel_id: &str,
+    code: &[u8],
+) -> std::io::Result<()> {
+    let header = format!("{} {}\n", sentinel_id, code.len());
+    stdin.write_all(header.as_bytes()).await?;
+    stdin.write_all(code).await?;
+    stdin.flush().await
+}
+
+/// Exercise a freshly-spawned REPL with a no-op to block until the interpreter
+/// is fully loaded.
+///
+/// The warm pool calls this so `wait_pool_ready()` doesn't return until the
+/// interpreter has actually finished loading (Python ~10s, Bun ~9s on HVF).
+/// Without this, `spawn_repl()` returns after fork+exec (~4ms) but the
+/// interpreter is still importing modules from EROFS.
+pub(crate) async fn warm_exercise_repl(
+    repl: &mut crate::repl::spawn::ReplState,
+    language: crate::types::Language,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::types::Language;
+
+    let (sentinel_id, sentinel_prefix) = generate_sentinel();
+
+    // Language-appropriate no-op code
+    let code: &[u8] = match language {
+        Language::Python => b"pass",
+        Language::Javascript => b"void 0",
+        Language::Raw => b":",
+    };
+
+    submit_code_to_repl(&mut repl.stdin, &sentinel_id, code).await?;
+
+    log_info!(
+        "[warm] sent no-op to {} REPL, waiting for readiness...",
+        language.as_str(),
+    );
+
+    // Wait for sentinel on stderr (this is where the interpreter startup time is spent)
+    let mut stderr_line_buf = String::new();
+    let mut stderr_discard = String::new();
+    let mut buf = [0u8; 4096];
+    let timeout = Duration::from_secs(120); // generous timeout for cold start
+
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let n = repl.stderr.read(&mut buf).await?;
+            if n == 0 {
+                return Err("REPL stderr closed before sentinel".into());
+            }
+            if let Some(_exit_code) = process_stderr_chunk(
+                &buf[..n],
+                &mut stderr_line_buf,
+                &sentinel_prefix,
+                &mut stderr_discard,
+            ) {
+                return Ok(());
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            // Drain any stdout the no-op may have produced
+            drain_stdout(&mut repl.stdout, &mut String::new(), 50).await;
+            log_info!("[warm] {} REPL ready", language.as_str());
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("REPL warm-up timed out (120s)".into()),
+    }
+}
+
 /// Execute code via persistent REPL with streaming output.
 pub(crate) async fn execute_code_streaming(
     language_str: &str,
@@ -238,33 +329,23 @@ pub(crate) async fn execute_code_streaming(
             }
         }
     };
-    let spawn_ms = if was_fresh_spawn {
-        Some(spawn_start.elapsed().as_millis() as u64)
-    } else {
-        Some(0)
-    };
+    let spawn_ms = spawn_start.elapsed().as_millis() as u64;
+    log_info!(
+        "[timing] repl_acquired: {}ms (fresh={}, spawn={}ms)",
+        crate::monotonic_ms(),
+        was_fresh_spawn,
+        spawn_ms
+    );
 
     // Generate unique sentinel
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let count = SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let sentinel_id = format!("{nanos}_{count}");
-    let sentinel_prefix = format!("__SENTINEL_{}_", sentinel_id);
+    let (sentinel_id, sentinel_prefix) = generate_sentinel();
 
     // Prepend env var setup to user code
     let full_code = prepend_env_vars(language, code, env_vars);
     let code_bytes = full_code.as_bytes();
 
     // Write header + code to REPL stdin
-    let header = format!("{} {}\n", sentinel_id, code_bytes.len());
-    let write_result = async {
-        repl.stdin.write_all(header.as_bytes()).await?;
-        repl.stdin.write_all(code_bytes).await?;
-        repl.stdin.flush().await
-    }
-    .await;
+    let write_result = submit_code_to_repl(&mut repl.stdin, &sentinel_id, code_bytes).await;
     if let Err(e) = write_result {
         log_error!("REPL stdin write failed: {e}");
         let _ = repl.child.kill().await;
@@ -274,7 +355,14 @@ pub(crate) async fn execute_code_streaming(
         )));
     }
 
+    log_info!(
+        "[timing] stdin_written: {}ms (code_len={})",
+        crate::monotonic_ms(),
+        code_bytes.len()
+    );
+
     let process_start = Instant::now();
+    let mut first_io_logged = false;
 
     // Stream output until sentinel, REPL death, or timeout
     let mut stdout_buffer = String::new();
@@ -306,6 +394,15 @@ pub(crate) async fn execute_code_streaming(
                     match result {
                         Ok(0) => stdout_done = true,
                         Ok(n) => {
+                            if !first_io_logged {
+                                first_io_logged = true;
+                                log_info!(
+                                    "[timing] first_repl_io: {}ms (stdout, {}ms after stdin_write, {} bytes)",
+                                    crate::monotonic_ms(),
+                                    process_start.elapsed().as_millis(),
+                                    n
+                                );
+                            }
                             stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
                             if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
                                 let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
@@ -319,6 +416,15 @@ pub(crate) async fn execute_code_streaming(
                     match result {
                         Ok(0) => stderr_done = true,
                         Ok(n) => {
+                            if !first_io_logged {
+                                first_io_logged = true;
+                                log_info!(
+                                    "[timing] first_repl_io: {}ms (stderr, {}ms after stdin_write, {} bytes)",
+                                    crate::monotonic_ms(),
+                                    process_start.elapsed().as_millis(),
+                                    n
+                                );
+                            }
                             if let Some(code) = process_stderr_chunk(
                                 &stderr_bytes[..n],
                                 &mut stderr_line_buf,
@@ -366,7 +472,7 @@ pub(crate) async fn execute_code_streaming(
                 .send(&GuestResponse::Complete {
                     exit_code,
                     execution_time_ms: duration_ms,
-                    spawn_ms,
+                    spawn_ms: Some(spawn_ms),
                     process_ms,
                 })
                 .await?;
@@ -384,7 +490,7 @@ pub(crate) async fn execute_code_streaming(
                 .send(&GuestResponse::Complete {
                     exit_code,
                     execution_time_ms: duration_ms,
-                    spawn_ms,
+                    spawn_ms: Some(spawn_ms),
                     process_ms,
                 })
                 .await?;
@@ -421,7 +527,7 @@ pub(crate) async fn execute_code_streaming(
                     .send(&GuestResponse::Complete {
                         exit_code,
                         execution_time_ms: duration_ms,
-                        spawn_ms,
+                        spawn_ms: Some(spawn_ms),
                         process_ms,
                     })
                     .await?;

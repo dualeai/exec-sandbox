@@ -336,6 +336,8 @@ class UnixSocketChannel:
             # Worker crashed - get exception for diagnostics
             try:
                 self._write_task.result()  # Re-raises exception if any
+            except asyncio.CancelledError:
+                raise RuntimeError("Write worker was cancelled") from None
             except Exception as e:
                 raise RuntimeError(f"Write worker crashed: {type(e).__name__}: {e}") from e
             # Worker exited cleanly (shouldn't happen unless shutdown)
@@ -390,6 +392,8 @@ class UnixSocketChannel:
         if self._write_task and self._write_task.done():
             try:
                 self._write_task.result()
+            except asyncio.CancelledError:
+                raise RuntimeError("Write worker was cancelled") from None
             except Exception as e:
                 raise RuntimeError(f"Write worker crashed: {type(e).__name__}: {e}") from e
             raise RuntimeError("Write worker exited unexpectedly")
