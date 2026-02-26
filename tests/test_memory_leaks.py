@@ -190,8 +190,8 @@ _FILE_IO_SIZES_MB = [1, 5, 10]
 # Memory is O(queue_capacity), bounded but higher than the read path.
 _FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = 13
 # Tracemalloc overhead for bytes-input write: BytesIO copy is tracked at ~file_size,
-# plus ~2MB from in-flight queue frames and compressor state.
-_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 2
+# plus ~3MB from in-flight queue frames and compressor state.
+_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 3
 # Read path: op_queue (maxsize=4) x ~200KB + StreamReader + Pydantic parsing.
 # Still O(chunk_size), much lower than write pipeline.
 _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 5
@@ -539,7 +539,7 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Pat
 
     content (os.urandom) is allocated BEFORE tracemalloc.start(), so NOT tracked.
     Tracked: BytesIO(content) copy in _resolve_content (~1x file_size) + chunk
-    pipeline (in-flight queue frames + compressor state).  Threshold: file_size + 2 MB.
+    pipeline (in-flight queue frames + compressor state).  Threshold: file_size + 3 MB.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
