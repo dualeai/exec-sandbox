@@ -4,7 +4,9 @@ Unit tests: Test validation, config, error handling (no QEMU needed).
 Integration tests: Test real VM execution (requires QEMU + images).
 """
 
+import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -236,6 +238,268 @@ class TestSchedulerSnapshotInit:
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
             assert scheduler._snapshot_manager.vm_manager is scheduler._vm_manager
+
+
+# ============================================================================
+# Unit Tests - Shutdown Ordering
+# ============================================================================
+
+
+class TestSchedulerShutdownOrdering:
+    """Tests for Scheduler.__aexit__ shutdown ordering.
+
+    The critical invariant: WarmVMPool.stop() must run BEFORE
+    MemorySnapshotManager.stop(). Background L1 save tasks create
+    sacrificial VMs via vm_manager.create_vm(), which blocks on
+    admission.acquire(). If the warm pool holds all resource slots,
+    stopping MemorySnapshotManager first deadlocks — stop() awaits
+    the background task, the task waits for a slot, and slots are
+    only freed when the pool drains.
+    """
+
+    @staticmethod
+    def _make_scheduler() -> Scheduler:
+        """Create a Scheduler with _started=True and mock managers."""
+        scheduler = Scheduler()
+        scheduler._started = True
+        scheduler._warm_pool = MagicMock()
+        scheduler._warm_pool.stop = AsyncMock()
+        scheduler._memory_snapshot_manager = MagicMock()
+        scheduler._memory_snapshot_manager.stop = AsyncMock()
+        scheduler._resource_monitor = MagicMock()
+        scheduler._resource_monitor.stop = AsyncMock()
+        scheduler._vm_manager = MagicMock()
+        scheduler._vm_manager.stop = AsyncMock()
+        scheduler._vm_manager.get_active_vms = MagicMock(return_value={})
+        return scheduler
+
+    # ------------------------------------------------------------------
+    # Normal cases
+    # ------------------------------------------------------------------
+
+    async def test_shutdown_order_warm_pool_before_memory_snapshot(self) -> None:
+        """WarmVMPool.stop() is called before MemorySnapshotManager.stop()."""
+        scheduler = self._make_scheduler()
+        call_order: list[str] = []
+
+        async def record_warm_pool() -> None:
+            call_order.append("warm_pool_stop")
+
+        async def record_memory_snapshot() -> None:
+            call_order.append("memory_snapshot_stop")
+
+        scheduler._warm_pool.stop.side_effect = record_warm_pool  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.side_effect = record_memory_snapshot  # type: ignore[union-attr]
+
+        await scheduler.__aexit__(None, None, None)
+
+        assert call_order.index("warm_pool_stop") < call_order.index("memory_snapshot_stop")
+
+    async def test_shutdown_completes_cleanly(self) -> None:
+        """All managers stop and _started becomes False."""
+        scheduler = self._make_scheduler()
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._resource_monitor.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        assert scheduler._started is False
+
+    async def test_shutdown_background_save_unblocks_after_pool_drain(self) -> None:
+        """Correct ordering unblocks a background save waiting on resources."""
+        scheduler = self._make_scheduler()
+        gate = asyncio.Event()
+
+        async def warm_pool_stop() -> None:
+            gate.set()  # Simulates freeing resource slots
+
+        async def memory_snapshot_stop() -> None:
+            await asyncio.wait_for(gate.wait(), timeout=2)  # Blocked until gate set
+
+        scheduler._warm_pool.stop.side_effect = warm_pool_stop  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.side_effect = memory_snapshot_stop  # type: ignore[union-attr]
+
+        # Should complete without timeout because warm_pool stops first
+        await asyncio.wait_for(scheduler.__aexit__(None, None, None), timeout=5)
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    async def test_shutdown_no_warm_pool(self) -> None:
+        """Shutdown works when _warm_pool is None."""
+        scheduler = self._make_scheduler()
+        scheduler._warm_pool = None
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_no_memory_snapshot_manager(self) -> None:
+        """Shutdown works when _memory_snapshot_manager is None."""
+        scheduler = self._make_scheduler()
+        scheduler._memory_snapshot_manager = None
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_no_resource_monitor(self) -> None:
+        """Shutdown works when _resource_monitor is None."""
+        scheduler = self._make_scheduler()
+        scheduler._resource_monitor = None
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_no_vm_manager(self) -> None:
+        """Shutdown works when _vm_manager is None."""
+        scheduler = self._make_scheduler()
+        scheduler._vm_manager = None
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        assert scheduler._started is False
+
+    async def test_shutdown_destroys_remaining_active_vms(self) -> None:
+        """Remaining active VMs are destroyed before vm_manager.stop()."""
+        scheduler = self._make_scheduler()
+        vm1, vm2 = MagicMock(), MagicMock()
+        scheduler._vm_manager.get_active_vms.return_value = {"vm-1": vm1, "vm-2": vm2}  # type: ignore[union-attr]
+        scheduler._vm_manager.destroy_vm = AsyncMock()  # type: ignore[union-attr]
+
+        await scheduler.__aexit__(None, None, None)
+
+        assert scheduler._vm_manager.destroy_vm.await_count == 2  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Error resilience
+    # ------------------------------------------------------------------
+
+    async def test_shutdown_warm_pool_error_continues(self) -> None:
+        """WarmVMPool.stop() error does not prevent other managers from stopping."""
+        scheduler = self._make_scheduler()
+        scheduler._warm_pool.stop.side_effect = OSError("pool drain failed")  # type: ignore[union-attr]
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_memory_snapshot_error_continues(self) -> None:
+        """MemorySnapshotManager.stop() error does not prevent VM cleanup."""
+        scheduler = self._make_scheduler()
+        scheduler._memory_snapshot_manager.stop.side_effect = RuntimeError("snapshot save failed")  # type: ignore[union-attr]
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_resource_monitor_error_continues(self) -> None:
+        """ResourceMonitor.stop() error does not prevent other managers from stopping."""
+        scheduler = self._make_scheduler()
+        scheduler._resource_monitor.stop.side_effect = RuntimeError("monitor failed")  # type: ignore[union-attr]
+
+        await scheduler.__aexit__(None, None, None)
+
+        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_destroy_vm_error_continues(self) -> None:
+        """One VM destroy failure does not prevent others from being destroyed."""
+        scheduler = self._make_scheduler()
+        vm1, vm2 = MagicMock(), MagicMock()
+        scheduler._vm_manager.get_active_vms.return_value = {"vm-1": vm1, "vm-2": vm2}  # type: ignore[union-attr]
+        # First call raises, second succeeds
+        scheduler._vm_manager.destroy_vm = AsyncMock(  # type: ignore[union-attr]
+            side_effect=[OSError("destroy failed"), None]
+        )
+
+        await scheduler.__aexit__(None, None, None)
+
+        # Both VMs should have had destroy attempted (gather with return_exceptions=True)
+        assert scheduler._vm_manager.destroy_vm.await_count == 2  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Deadlock / out-of-bounds
+    # ------------------------------------------------------------------
+
+    async def test_old_ordering_would_deadlock(self) -> None:
+        """Reversed order (memory_snapshot first) deadlocks because the gate is never set."""
+        gate = asyncio.Event()
+
+        async def memory_snapshot_stop() -> None:
+            await gate.wait()  # Blocks forever — warm_pool hasn't freed slots yet
+
+        async def warm_pool_stop() -> None:
+            gate.set()
+
+        # Manually call in the OLD (buggy) order
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(memory_snapshot_stop(), timeout=0.5)
+
+        # Warm pool stop would have freed the gate — but it never ran
+        assert not gate.is_set()
+
+    async def test_shutdown_with_real_admission_controller(self) -> None:
+        """End-to-end test with a real ResourceAdmissionController.
+
+        Uses a tight memory budget so two pool VMs fully exhaust capacity,
+        then a third acquire (background save) blocks until slots are freed.
+        Budget must account for CGROUP_MEMORY_OVERHEAD_MB added by acquire().
+        """
+        from exec_sandbox.admission import ResourceAdmissionController
+        from exec_sandbox.cgroup import CGROUP_MEMORY_OVERHEAD_MB
+
+        guest_mb = 512
+        total_per_vm = guest_mb + CGROUP_MEMORY_OVERHEAD_MB
+        # Budget fits exactly 2 VMs — third is blocked until one is released
+        budget_mb = total_per_vm * 2
+
+        admission = ResourceAdmissionController(
+            memory_overcommit_ratio=1.0,
+            cpu_overcommit_ratio=1.0,
+            host_memory_reserve_ratio=0.0,
+            host_memory_mb=budget_mb,
+            host_cpu_count=4,
+        )
+
+        # Fill all memory slots (simulating warm pool VMs)
+        r1 = await admission.acquire(vm_id="pool-1", memory_mb=guest_mb, cpu_cores=1, timeout=1)
+        r2 = await admission.acquire(vm_id="pool-2", memory_mb=guest_mb, cpu_cores=1, timeout=1)
+
+        # Background task tries to acquire — should block (budget exhausted)
+        acquired = asyncio.Event()
+
+        async def background_save() -> None:
+            await admission.acquire(vm_id="save-vm", memory_mb=guest_mb, cpu_cores=1, timeout=10)
+            acquired.set()
+
+        save_task = asyncio.create_task(background_save())
+
+        # Give the task a moment to start blocking
+        await asyncio.sleep(0.05)
+        assert not acquired.is_set()
+
+        # Simulating warm_pool.stop() — release slots
+        await admission.release(r1)
+        await admission.release(r2)
+
+        # Simulating memory_snapshot.stop() — wait for the background task
+        await asyncio.wait_for(save_task, timeout=5)
+        assert acquired.is_set()
 
 
 # ============================================================================

@@ -194,10 +194,17 @@ class Scheduler:
 
         Shutdown sequence:
         1. Stop ResourceMonitor
-        2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
-        3. Stop WarmVMPool (drains and destroys pre-booted VMs)
+        2. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
+        3. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
         4. Destroy any remaining active VMs
         5. Stop VmManager (overlay pool cleanup)
+
+        IMPORTANT: WarmVMPool must stop BEFORE MemorySnapshotManager. Background
+        L1 save tasks (from schedule_background_save) create sacrificial VMs via
+        vm_manager.create_vm(), which blocks on admission.acquire() until a
+        resource slot is available. If the warm pool holds all slots, stopping
+        MemorySnapshotManager first deadlocks: stop() awaits the background task,
+        the task waits for a slot, and slots are only freed when the pool drains.
 
         Always completes cleanup, even on exceptions.
         """
@@ -210,19 +217,19 @@ class Scheduler:
             except (OSError, RuntimeError) as e:
                 logger.error("ResourceMonitor stop error", extra={"error": str(e)})
 
-        # Stop MemorySnapshotManager (wait for background saves)
-        if self._memory_snapshot_manager:
-            try:
-                await self._memory_snapshot_manager.stop()
-            except (OSError, RuntimeError, TimeoutError) as e:
-                logger.error("MemorySnapshotManager stop error", extra={"error": str(e)})
-
-        # Stop WarmVMPool first (drains VMs)
+        # Stop WarmVMPool (drains VMs, frees resource slots for background saves)
         if self._warm_pool:
             try:
                 await self._warm_pool.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
                 logger.error("WarmVMPool stop error", extra={"error": str(e)})
+
+        # Stop MemorySnapshotManager (wait for background saves — now has resource slots)
+        if self._memory_snapshot_manager:
+            try:
+                await self._memory_snapshot_manager.stop()
+            except (OSError, RuntimeError, TimeoutError) as e:
+                logger.error("MemorySnapshotManager stop error", extra={"error": str(e)})
 
         # Destroy any remaining VMs
         if self._vm_manager:
