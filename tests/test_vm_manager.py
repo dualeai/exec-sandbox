@@ -1138,18 +1138,23 @@ class TestNetdevReconnectIntegration:
             task_id="integration",
             memory_mb=256,
             allow_network=True,
-            allowed_domains=["example.com"],
+            allowed_domains=["httpbin.org"],
+        )
+
+        # TLS on port 443 with SNI — OutboundAllow only permits TLS
+        # connections whose SNI matches a pattern (plain TCP is blocked).
+        tls_connect_code = (
+            "import socket, ssl\n"
+            "ctx = ssl.create_default_context()\n"
+            "s = socket.create_connection(('httpbin.org', 443), timeout=10)\n"
+            "ss = ctx.wrap_socket(s, server_hostname='httpbin.org')\n"
+            "ss.close()\n"
         )
 
         try:
             # Step 1: Verify initial network connectivity
             result1 = await vm.execute(
-                code=(
-                    "import socket\n"
-                    "s = socket.create_connection(('example.com', 80), timeout=10)\n"
-                    "s.close()\n"
-                    "print('INITIAL_OK')"
-                ),
+                code=tls_connect_code + "print('INITIAL_OK')",
                 timeout_seconds=30,
             )
             assert result1.exit_code == 0, f"Initial connection failed: {result1.stderr}"
@@ -1169,7 +1174,7 @@ class TestNetdevReconnectIntegration:
             # Step 4: Restart gvproxy on same socket path
             new_proc, _new_log_task = await start_gvproxy(
                 vm_id=vm.vm_id,
-                allowed_domains=["example.com"],
+                allowed_domains=["httpbin.org"],
                 language=vm.language.value,
                 workdir=vm.workdir,
             )
@@ -1184,12 +1189,7 @@ class TestNetdevReconnectIntegration:
 
             # Step 6: Verify network connectivity is restored
             result2 = await vm.execute(
-                code=(
-                    "import socket\n"
-                    "s = socket.create_connection(('example.com', 80), timeout=10)\n"
-                    "s.close()\n"
-                    "print('RECONNECT_OK')"
-                ),
+                code=tls_connect_code + "print('RECONNECT_OK')",
                 timeout_seconds=30,
             )
             assert result2.exit_code == 0, f"Reconnect failed: {result2.stderr}"
