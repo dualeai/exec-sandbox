@@ -59,9 +59,8 @@ from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
 from exec_sandbox.permission_utils import (
     chmod_async,
-    chown_to_qemu_vm,
-    ensure_traversable,
     get_qemu_vm_uid,
+    grant_qemu_vm_file_access,
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
@@ -620,6 +619,13 @@ class VmManager:
         infra = await self._setup_vm_infra(language, tenant_id, task_id, memory_mb)
         setup_complete_time = asyncio.get_running_loop().time()
 
+        # Grant qemu-vm access to extra drives (snapshot creation target or read-only snapshot).
+        # _setup_vm_infra only handles overlay/base images; extra drives need separate permissions.
+        if infra.workdir.use_qemu_vm_user and direct_write_target:
+            await grant_qemu_vm_file_access(direct_write_target, writable=True)
+        elif infra.workdir.use_qemu_vm_user and snapshot_drive:
+            await grant_qemu_vm_file_access(snapshot_drive, writable=False)
+
         # Phase 2: Build QEMU command (create-specific params)
         vdb_path = (
             str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
@@ -784,7 +790,7 @@ class VmManager:
                     cgroup_path=infra.cgroup_path,
                 )
 
-    async def restore_vm(
+    async def restore_vm(  # noqa: PLR0915
         self,
         language: Language,
         tenant_id: str,
@@ -843,6 +849,10 @@ class VmManager:
         except BaseException:
             await self._admission.release(reservation)
             raise
+
+        # Grant qemu-vm read access to snapshot drive if present
+        if infra.workdir.use_qemu_vm_user and snapshot_drive:
+            await grant_qemu_vm_file_access(snapshot_drive, writable=False)
 
         # Phase 2: Build QEMU command (restore-specific: defer_incoming, matching network topology)
         vdb_path = str(snapshot_drive) if snapshot_drive else None
@@ -1233,24 +1243,11 @@ class VmManager:
         # (probe_qemu_vm_user only checks if user exists, not sudo permissions)
         # Returns whether QEMU should run as qemu-vm user (based on chown success)
         if await probe_sudo_as_qemu_vm():
-            # Make base image accessible to qemu-vm user
-            # qemu-vm needs: read on file + execute on all parent directories
-            # This is safe because the base image is read-only (writes go to overlay)
+            # Make base image readable for qemu-vm (read-only, writes go to overlay)
+            if not await grant_qemu_vm_file_access(base_image, writable=False):
+                logger.debug("Could not grant qemu-vm read access to base image")
 
-            # Make all parent directories traversable (a+x) up to /tmp or root
-            current = base_image.parent
-            dirs_to_chmod: list[Path] = []
-            while current != current.parent and str(current) not in ("/", "/tmp"):  # noqa: S108
-                dirs_to_chmod.append(current)
-                current = current.parent
-
-            await ensure_traversable(dirs_to_chmod)
-
-            # Make base image readable
-            if not await chmod_async(base_image, "a+r"):
-                logger.debug("Could not chmod base image (qemu-vm may not have access)")
-
-            if await chown_to_qemu_vm(overlay_image):
+            if await grant_qemu_vm_file_access(overlay_image, writable=True):
                 # Make workdir accessible to qemu-vm for socket creation
                 # mkdtemp creates with mode 0700, but qemu-vm needs access to create sockets
                 workdir_path = overlay_image.parent

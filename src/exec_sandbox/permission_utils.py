@@ -613,6 +613,34 @@ async def grant_qemu_vm_access(path: Path) -> bool:
     return await set_acl_user(path, "qemu-vm", "rw")
 
 
+async def grant_qemu_vm_file_access(path: Path, *, writable: bool = False) -> bool:
+    """Grant qemu-vm user access to a file, including parent directory traversal.
+
+    Makes all parent directories traversable (a+x) up to filesystem root, then:
+    - writable=True: chowns the file to qemu-vm (read+write)
+    - writable=False: makes the file world-readable (a+r)
+
+    Args:
+        path: File path to grant access to
+        writable: Whether qemu-vm needs write access
+
+    Returns:
+        True if access was granted, False if any step failed
+    """
+    # Make parent directories traversable (a+x) up to root
+    current = path.parent
+    dirs_to_chmod: list[Path] = []
+    while current != current.parent:
+        dirs_to_chmod.append(current)
+        current = current.parent
+    if not await ensure_traversable(dirs_to_chmod):
+        return False
+
+    if writable:
+        return await chown_to_qemu_vm(path)
+    return await chmod_async(path, "a+r")
+
+
 async def ensure_traversable(dirs: list[Path]) -> bool:
     """Ensure directories are traversable (a+x) for qemu-vm user.
 
