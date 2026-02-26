@@ -329,16 +329,12 @@ pub(crate) async fn execute_code_streaming(
             }
         }
     };
-    let spawn_ms = if was_fresh_spawn {
-        Some(spawn_start.elapsed().as_millis() as u64)
-    } else {
-        None
-    };
+    let spawn_ms = spawn_start.elapsed().as_millis() as u64;
     log_info!(
         "[timing] repl_acquired: {}ms (fresh={}, spawn={}ms)",
         crate::monotonic_ms(),
         was_fresh_spawn,
-        spawn_ms.unwrap_or(0)
+        spawn_ms
     );
 
     // Generate unique sentinel
@@ -476,7 +472,7 @@ pub(crate) async fn execute_code_streaming(
                 .send(&GuestResponse::Complete {
                     exit_code,
                     execution_time_ms: duration_ms,
-                    spawn_ms,
+                    spawn_ms: Some(spawn_ms),
                     process_ms,
                 })
                 .await?;
@@ -494,7 +490,7 @@ pub(crate) async fn execute_code_streaming(
                 .send(&GuestResponse::Complete {
                     exit_code,
                     execution_time_ms: duration_ms,
-                    spawn_ms,
+                    spawn_ms: Some(spawn_ms),
                     process_ms,
                 })
                 .await?;
@@ -531,7 +527,7 @@ pub(crate) async fn execute_code_streaming(
                     .send(&GuestResponse::Complete {
                         exit_code,
                         execution_time_ms: duration_ms,
-                        spawn_ms,
+                        spawn_ms: Some(spawn_ms),
                         process_ms,
                     })
                     .await?;

@@ -143,7 +143,7 @@ class ExecutionResult(BaseModel):
     # Guest-reported granular timing (pass-through from guest agent)
     spawn_ms: int | None = Field(
         default=None,
-        description="Time for process spawn (fork/exec) in milliseconds (guest-reported)",
+        description="Time to acquire REPL process in milliseconds (guest-reported). Includes fork/exec on cold start, ~0ms on cache hit.",
     )
     process_ms: int | None = Field(
         default=None,
