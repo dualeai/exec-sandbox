@@ -27,6 +27,13 @@ RAW_IMAGE_TOOLS = [
     ("file", "file --version"),
     ("grep", "grep --version"),
     ("find", "find --version"),
+    ("sed", "sed --version"),
+    ("gawk", "gawk --version"),
+    ("diff", "diff --version"),
+    ("patch", "patch --version"),
+    ("less", "less --version"),
+    ("make", "make --version"),
+    ("tree", "tree --version"),
 ]
 
 

@@ -713,6 +713,13 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 | `coreutils` | Standard Unix utilities (ls, cp, mv, etc.) |
 | `grep` | GNU grep (PCRE via `-P`, `--include`, etc.) |
 | `findutils` | GNU find (`-printf`, `-regex`, etc.) |
+| `sed` | GNU sed (in-place editing, extended regex) |
+| `gawk` | GNU awk (`gensub`, `strftime`, FPAT, etc.) |
+| `diffutils` | GNU diff/diff3/sdiff (`--color`, unified format) |
+| `patch` | Apply unified diffs |
+| `less` | Pager (backward scroll, search) |
+| `make` | Build automation |
+| `tree` | Directory structure visualization |
 | `tar`, `gzip`, `unzip` | Archive extraction |
 | `file` | File type detection |
 

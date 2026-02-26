@@ -2133,6 +2133,9 @@ print(f'CAT_EXIT:{r.returncode}')
         [
             pytest.param("grep", "GNU grep", id="grep"),
             pytest.param("find", "GNU findutils", id="find"),
+            pytest.param("sed", "GNU sed", id="sed"),
+            pytest.param("gawk", "GNU Awk", id="gawk"),
+            pytest.param("diff", "diffutils", id="diff"),
         ],
     )
     async def test_gnu_tool_installed(self, dual_scheduler: Scheduler, binary: str, version_marker: str) -> None:
