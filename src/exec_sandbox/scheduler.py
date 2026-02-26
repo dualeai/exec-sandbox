@@ -610,6 +610,7 @@ class Scheduler:
                             memory_mb=memory,
                             snapshot_drive=l2_path,
                             allow_network=needs_network,
+                            allowed_domains=allowed_domains,
                         )
                         logger.info(
                             "VM restored from L1 cache",

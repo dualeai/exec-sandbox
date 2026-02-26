@@ -799,6 +799,7 @@ class VmManager:
         memory_mb: int = constants.DEFAULT_MEMORY_MB,
         snapshot_drive: Path | None = None,
         allow_network: bool = False,
+        allowed_domains: list[str] | None = None,
     ) -> QemuVM:
         """Restore VM from L1 memory snapshot (full CPU+RAM+device state).
 
@@ -815,6 +816,8 @@ class VmManager:
             allow_network: Network topology must match save-time config.
                 L1 snapshots with network have virtio-net device in migration
                 stream; restoring without matching topology causes migration failure.
+            allowed_domains: Whitelist of allowed domains for DNS/TLS filtering.
+                None for language defaults, empty list to block all outbound.
 
         Returns:
             QemuVM in READY state with l1_restored=True
@@ -873,12 +876,10 @@ class VmManager:
         gvproxy_log_task: asyncio.Task[None] | None = None
         if allow_network:
             # L1 restore with network: gvproxy needed for virtio-net backend.
-            # No domain filtering or port forwarding — just provide the socket
-            # backend so QEMU's netdev can connect. The guest's network stack
-            # resumes from the migration stream.
+            # The guest's network stack resumes from the migration stream.
             gvproxy_proc, gvproxy_log_task = await start_gvproxy(
                 infra.vm_id,
-                [],  # No domain filtering for L1 restore
+                allowed_domains,
                 language,
                 infra.workdir,
             )
