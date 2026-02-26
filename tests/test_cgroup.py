@@ -1006,8 +1006,8 @@ class TestCgroupConstants:
         assert CGROUP_APP_NAMESPACE == "code-exec"
 
     def test_memory_overhead_is_reasonable(self):
-        """Memory overhead is reasonable (100-500MB)."""
-        assert 100 <= CGROUP_MEMORY_OVERHEAD_MB <= 500
+        """Memory overhead is reasonable for microvm/virt machine types (32-128MB)."""
+        assert 32 <= CGROUP_MEMORY_OVERHEAD_MB <= 128
 
     def test_tcg_cache_size_is_reasonable(self):
         """TCG TB cache size is reasonable (256MB-1GB)."""

@@ -90,8 +90,12 @@ def test_budget_reserve_ratio_scales() -> None:
 async def test_memory_gate_blocks_when_budget_exhausted() -> None:
     """Acquire blocks when memory budget would be exceeded."""
     # 4GB host, 10% reserve, 1.0x overcommit → 3600MB budget
-    # Each VM: 256 + 200 overhead = 456MB
-    # 3600 / 456 ≈ 7 VMs fit
+    # Each VM: 256 + CGROUP_MEMORY_OVERHEAD_MB overhead
+    # Compute how many VMs fit, then the next one should block
+    total_per_vm = 256 + CGROUP_MEMORY_OVERHEAD_MB
+    budget_mb = 3_600  # 4000 * 0.9 * 1.0
+    n_fit = budget_mb // total_per_vm  # VMs that fit in budget
+
     ctrl = _make_controller(
         host_memory_mb=4_000.0,
         reserve_ratio=0.1,
@@ -99,11 +103,11 @@ async def test_memory_gate_blocks_when_budget_exhausted() -> None:
     )
 
     reservations = []
-    for i in range(7):
+    for i in range(n_fit):
         r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
         reservations.append(r)
 
-    # 8th should block (7 * 456 = 3192, next would be 3648 > 3600)
+    # Next should block (budget exhausted)
     acquire_task = asyncio.create_task(ctrl.acquire("vm-block", memory_mb=256, cpu_cores=_CPU, timeout=1.0))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
