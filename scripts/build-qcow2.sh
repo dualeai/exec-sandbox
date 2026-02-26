@@ -7,7 +7,7 @@
 #   raw    - Alpine only (no runtime)
 #
 # All images include common tools for AI agent workflows:
-#   git, jq, bash, coreutils, tar, gzip, unzip, file, curl
+#   git, jq, bash, coreutils, grep, findutils, tar, gzip, unzip, file, curl
 #
 # Requires: Docker
 #
@@ -39,7 +39,8 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 # Common: essential tools for AI agent workflows
 # iputils: provides ping for guest-agent gvproxy connectivity check at boot
 # e2fsprogs: mkfs.ext4 needed by tiny-init for snapshot creation (format vdb overlay drive)
-COMMON_PKGS="ca-certificates curl git jq bash coreutils tar gzip unzip file iputils e2fsprogs"
+# grep/findutils: GNU versions replace busybox (PCRE, --include, -printf, etc.)
+COMMON_PKGS="ca-certificates curl git jq bash coreutils grep findutils tar gzip unzip file iputils e2fsprogs"
 
 # Python: add build tools for C extensions (numpy, pandas, etc.)
 PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev jemalloc"

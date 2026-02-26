@@ -25,6 +25,8 @@ RAW_IMAGE_TOOLS = [
     ("gzip", "gzip --version"),
     ("unzip", "unzip -v"),
     ("file", "file --version"),
+    ("grep", "grep --version"),
+    ("find", "find --version"),
 ]
 
 

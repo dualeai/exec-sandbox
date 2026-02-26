@@ -14,6 +14,8 @@ Complements test_nonroot_repl.py (privilege escalation from UID 1000) with
 kernel/device-layer hardening that blocks access at the filesystem level.
 """
 
+import pytest
+
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
@@ -2125,6 +2127,26 @@ print(f'CAT_EXIT:{r.returncode}')
         assert result.exit_code == 0
         assert "LS_EXIT:0" in result.stdout
         assert "CAT_EXIT:0" in result.stdout
+
+    @pytest.mark.parametrize(
+        "binary, version_marker",
+        [
+            pytest.param("grep", "GNU grep", id="grep"),
+            pytest.param("find", "GNU findutils", id="find"),
+        ],
+    )
+    async def test_gnu_tool_installed(self, dual_scheduler: Scheduler, binary: str, version_marker: str) -> None:
+        """GNU coreutils variant is installed, not busybox."""
+        code = f"""\
+import subprocess
+r = subprocess.run(["{binary}", "--version"], capture_output=True, text=True, timeout=5)
+print(f'EXIT:{{r.returncode}}')
+print(f'GNU:{{{version_marker!r} in r.stdout}}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "EXIT:0" in result.stdout
+        assert "GNU:True" in result.stdout
 
     # --- Weird: mount bypass attempts ---
 

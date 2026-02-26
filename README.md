@@ -711,6 +711,8 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 | `jq` | JSON processing |
 | `bash` | Shell scripting |
 | `coreutils` | Standard Unix utilities (ls, cp, mv, etc.) |
+| `grep` | GNU grep (PCRE via `-P`, `--include`, etc.) |
+| `findutils` | GNU find (`-printf`, `-regex`, etc.) |
 | `tar`, `gzip`, `unzip` | Archive extraction |
 | `file` | File type detection |
 
