@@ -347,21 +347,24 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # -svm,-vmx: Hide AMD SVM and Intel VMX flags from guest to prevent
             # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
             # These flags are x86-specific — ARM64 HVF uses plain "host".
-            # ARM64 TCG: cortex-a57 is 3x faster than max (no pauth overhead)
-            # x86 TCG: Haswell-IBRS required for AVX2 (Python/Bun built for
-            # x86_64_v3) and Spectre v2 mitigations (spec-ctrl + ibpb flags).
-            # Without -IBRS the guest kernel reports spectre_v2 as "Vulnerable".
+            # ARM64 TCG: neoverse-n2 (ARMv9.0) provides PAC, BTI, SVE, MTE,
+            # and SSBS/CSV2 side-channel flags. QEMU 10.0+ uses pauth=impdef
+            # (negligible overhead), so the old cortex-a57 perf advantage is gone.
+            # x86 TCG: SapphireRapids-v2 provides x86_64-v3 (AVX2/FMA for
+            # Python/Bun) plus full Spectre/MDS mitigation flags (spec-ctrl,
+            # stibp, ssbd, arch-capabilities, md-clear, mds-no, taa-no, gds-no,
+            # rfds-no). TCG silently strips AVX-512/AMX (not emulated) — the
+            # effective instruction ceiling remains x86_64-v3 (Haswell-class).
             # See: https://www.qemu.org/docs/master/system/i386/cpu.html
-            # See: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1033643
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
                 "host"
                 if accel_type in (AccelType.HVF, AccelType.KVM) and arch == HostArch.AARCH64
                 else "host,-svm,-vmx"
                 if accel_type in (AccelType.HVF, AccelType.KVM)
-                else "cortex-a57"
+                else "neoverse-n2"
                 if arch == HostArch.AARCH64
-                else "Haswell-IBRS"
+                else "SapphireRapids-v2"
             ),
             "-M",
             machine_type,
