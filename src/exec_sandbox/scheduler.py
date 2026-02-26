@@ -219,6 +219,7 @@ class Scheduler:
 
         # Stop WarmVMPool (drains VMs, frees resource slots for background saves)
         if self._warm_pool:
+            logger.info("Draining warm VM pool, this may take a moment")
             try:
                 await self._warm_pool.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
@@ -226,6 +227,7 @@ class Scheduler:
 
         # Stop MemorySnapshotManager (wait for background saves — now has resource slots)
         if self._memory_snapshot_manager:
+            logger.info("Waiting for in-flight background snapshot saves to complete")
             try:
                 await self._memory_snapshot_manager.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
