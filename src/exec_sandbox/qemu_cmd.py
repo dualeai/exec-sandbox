@@ -348,13 +348,16 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
             # These flags are x86-specific — ARM64 HVF uses plain "host".
             # ARM64 TCG: neoverse-n2 (ARMv9.0) provides PAC, BTI, SVE, MTE,
-            # and SSBS/CSV2 side-channel flags. QEMU 10.0+ uses pauth=impdef
-            # (negligible overhead), so the old cortex-a57 perf advantage is gone.
-            # x86 TCG: SapphireRapids-v2 provides x86_64-v3 (AVX2/FMA for
-            # Python/Bun) plus full Spectre/MDS mitigation flags (spec-ctrl,
-            # stibp, ssbd, arch-capabilities, md-clear, mds-no, taa-no, gds-no,
-            # rfds-no). TCG silently strips AVX-512/AMX (not emulated) — the
-            # effective instruction ceiling remains x86_64-v3 (Haswell-class).
+            # and SSBS/CSV2 side-channel flags. pauth-impdef=on forces the fast
+            # impdef algorithm (QEMU 10.0+ defaults to this for virt >= 10.0,
+            # but older versions use QARMA5 which costs ~50% of TCG cycles).
+            # x86 TCG: SapphireRapids-v2 provides full Spectre/MDS mitigation
+            # flags (spec-ctrl, stibp, ssbd, arch-capabilities, md-clear,
+            # mds-no, taa-no, gds-no, rfds-no). TCG silently strips AVX-512
+            # and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
+            # also lacks 256-bit vector ops (TCG_TARGET_HAS_v256=0), so AVX2
+            # is unavailable — effective ceiling is SSE4.2. On x86 hosts the
+            # effective ceiling is x86_64-v3 (AVX2/FMA).
             # See: https://www.qemu.org/docs/master/system/i386/cpu.html
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
@@ -362,7 +365,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 if accel_type in (AccelType.HVF, AccelType.KVM) and arch == HostArch.AARCH64
                 else "host,-svm,-vmx"
                 if accel_type in (AccelType.HVF, AccelType.KVM)
-                else "neoverse-n2"
+                else "neoverse-n2,pauth-impdef=on"
                 if arch == HostArch.AARCH64
                 else "SapphireRapids-v2"
             ),
