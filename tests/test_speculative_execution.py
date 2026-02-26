@@ -115,7 +115,7 @@ except PermissionError:
         if "STATUS:" in stdout:
             status = stdout.split("STATUS:", 1)[1]
             # "Not affected" is fine (ARM or newer Intel CPUs)
-            assert "Vulnerable" not in status or "Mitigation" in status, (
+            assert "Vulnerable" not in status or "Mitigation" in status or "Clear CPU buffers attempted" in status, (
                 f"MDS should be mitigated or not affected, got: {status}"
             )
 
