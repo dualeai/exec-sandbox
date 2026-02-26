@@ -475,7 +475,7 @@ class Scheduler:
         """
         idle_timeout = idle_timeout_seconds or self.config.session_idle_timeout_seconds
 
-        vm, _resolved_ports, _is_cold_boot = await self._prepare_vm(
+        vm, resolved_ports, _is_cold_boot = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -485,6 +485,9 @@ class Scheduler:
             task_id=f"session-{id(self)}",
             on_boot_log=on_boot_log,
         )
+
+        # Store resolved ports on VM so Session.exposed_ports can read them
+        vm.exposed_ports = resolved_ports
 
         # _vm_manager guaranteed non-None by _prepare_vm
         if self._vm_manager is None:
