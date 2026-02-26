@@ -298,6 +298,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # For q35, we don't use these flags as the machine expects standard PC components
     if is_microvm:
         qemu_args.extend(["-nodefaults", "-no-user-config"])
+    elif arch == HostArch.X86_64:
+        # The pc (i440FX) machine includes a built-in ISA Floppy Disk Controller.
+        # Disable its drives so the kernel doesn't create /dev/fd0.
+        qemu_args.extend(["-global", "isa-fdc.driveA=", "-global", "isa-fdc.driveB="])
 
     # Console selection based on machine type and architecture:
     # +--------------------------+-------------+--------------------------------+
