@@ -26,7 +26,7 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.14.2}"
 PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-build-standalone
 UV_VERSION="${UV_VERSION:-0.9.24}"  # From astral-sh/uv
 CLOUDPICKLE_VERSION="${CLOUDPICKLE_VERSION:-3.1.2}"  # From https://github.com/cloudpipe/cloudpickle/releases
-BUN_VERSION="${BUN_VERSION:-1.3.5}"
+BUN_VERSION="${BUN_VERSION:-1.3.10}"
 ALPINE_VERSION="${ALPINE_VERSION:?ALPINE_VERSION must be set (exported by root Makefile)}"
 
 # Buildx cache configuration (for CI)
