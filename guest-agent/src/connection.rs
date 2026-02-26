@@ -251,6 +251,11 @@ pub(crate) async fn handle_connection(
             }
         };
 
+        // Reseed kernel CRNG before every command dispatch (~11μs).
+        // After L1 snapshot restore the VM resumes mid-loop with cloned CRNG;
+        // this forces divergence before any user code calls getrandom().
+        crate::reseed_crng();
+
         let writer = ResponseWriter::new(write_tx.clone(), op_id);
 
         match cmd {

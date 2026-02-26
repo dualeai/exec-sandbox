@@ -1,10 +1,13 @@
 """RNG quality validation for VM images.
 
 Tests that cryptographic randomness works correctly in VMs:
-1. Kernel entropy pool is properly seeded (random.trust_cpu=on working)
+1. Kernel entropy pool is properly seeded (random.trust_cpu=on + virtio-rng)
 2. /dev/urandom provides non-blocking, high-quality randomness
 3. Language-specific crypto APIs work correctly
 4. Different VMs produce different random sequences
+
+Note: L1 snapshot restore RNG uniqueness is tested separately in
+test_rng_l1_snapshot.py (validates the RNDRESEEDCRNG ioctl reseed).
 
 Based on:
 - NIST SP 800-90B entropy estimation principles

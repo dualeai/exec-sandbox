@@ -680,6 +680,20 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
+    # virtio-rng: continuous host→guest entropy via /dev/urandom backend.
+    # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh
+    # entropy to reseed from after L1 snapshot restore. Without this, the input
+    # pool after restore contains only stale (cloned) entropy.
+    # max-bytes + period: rate-limit to 1024B/100ms (10KB/s) to avoid host exhaustion.
+    qemu_args.extend(
+        [
+            "-object",
+            "rng-random,id=rng0,filename=/dev/urandom",
+            "-device",
+            f"virtio-rng-{virtio_suffix},rng=rng0,max-bytes=1024,period=100",
+        ]
+    )
+
     # =============================================================
     # Network Configuration: Three Modes + No-Network
     # =============================================================
