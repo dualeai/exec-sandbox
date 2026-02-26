@@ -17,6 +17,8 @@ References:
 import logging
 import os
 
+import click
+
 LIBRARY_LOGGER_NAME: str = "exec_sandbox"
 
 # NullHandler per Python library best practice -- prevents
@@ -28,6 +30,29 @@ _env_level = os.environ.get("EXEC_SANDBOX_LOG_LEVEL", "").strip().upper()
 _env_level_value = logging.getLevelNamesMapping().get(_env_level)
 if _env_level_value:  # excludes NOTSET (0) and missing keys (None)
     logging.getLogger(LIBRARY_LOGGER_NAME).setLevel(_env_level_value)
+
+_FMT = "%(levelname)s [%(asctime)s] %(name)s - %(message)s"
+_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+class _ClickHandler(logging.Handler):
+    """Handler that emits via click.echo(err=True) with dim styling.
+
+    Using click.echo() instead of StreamHandler.write() ensures ANSI codes
+    are automatically stripped when stderr is not a TTY (e.g. redirected to
+    a file or consumed by a parent process).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.formatter = logging.Formatter(fmt=_FMT, datefmt=_DATEFMT)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            click.echo(click.style(msg, dim=True), err=True)
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -46,7 +71,7 @@ def configure_logging(
 ) -> None:
     """Configure library logging for CLI / application entry points.
 
-    Adds a stderr StreamHandler if none exists (idempotent), then sets the
+    Adds a _ClickHandler if none exists (idempotent), then sets the
     log level.  Library consumers who configure their own handlers are
     unaffected -- the guard ensures we never stack duplicate handlers.
 
@@ -57,20 +82,11 @@ def configure_logging(
     """
     lib_logger = logging.getLogger(LIBRARY_LOGGER_NAME)
 
-    # Add a stderr handler if the only handler is the library NullHandler.
+    # Add a click handler if the only handler is the library NullHandler.
     # This makes EXEC_SANDBOX_LOG_LEVEL work out of the box for CLI users
     # while staying invisible to library consumers who set up their own handlers.
-    if not any(
-        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.NullHandler) for h in lib_logger.handlers
-    ):
-        handler = logging.StreamHandler()  # stderr by default
-        handler.setFormatter(
-            logging.Formatter(
-                fmt="%(levelname)s [%(asctime)s] %(name)s - %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-        )
-        lib_logger.addHandler(handler)
+    if not any(isinstance(h, _ClickHandler) for h in lib_logger.handlers):
+        lib_logger.addHandler(_ClickHandler())
 
     if quiet:
         lib_logger.setLevel(logging.ERROR)

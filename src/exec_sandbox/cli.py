@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -529,7 +530,13 @@ def is_tty() -> bool:
 
 
 def _make_boot_log_callback(debug: bool) -> Callable[[str], None] | None:
-    """Create boot log callback for --debug mode, or None if disabled."""
+    """Create boot log callback for --debug mode, or None if disabled.
+
+    Uses click.echo() directly (not logging) because boot lines are raw
+    kernel/init console output with their own timestamps — wrapping them
+    in the logging formatter would double-prefix.  click.echo(err=True)
+    also handles ANSI stripping on non-TTY automatically.
+    """
     if not debug:
         return None
 
@@ -953,7 +960,7 @@ def cli(ctx: click.Context) -> None:
     multiple=True,
     help="Download file GUEST:LOCAL or GUEST (repeatable)",
 )
-@click.option("--debug", is_flag=True, help="Stream kernel/init boot logs to stderr")
+@click.option("--debug", is_flag=True, help="Enable DEBUG logging and stream kernel/init boot logs to stderr")
 def run_command(
     sources: tuple[str, ...],
     language: str | None,
@@ -1011,7 +1018,7 @@ def run_command(
       sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
       sbx run --download output.csv -c "open('output.csv','w').write('data')"
     """
-    configure_logging(quiet=quiet)
+    configure_logging(quiet=quiet, level=logging.DEBUG if debug else None)
 
     # Merge inline codes with positional sources
     all_sources: list[str] = list(inline_codes) + list(sources)
