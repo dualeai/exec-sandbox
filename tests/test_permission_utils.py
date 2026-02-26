@@ -493,6 +493,7 @@ class TestSudoRmReal:
         assert result is True
         assert not test_dir.exists()
 
+    @skip_unless_linux  # qemu-vm user only exists on Linux CI runners
     async def test_chown_to_qemu_vm(self, tmp_path: Path) -> None:
         """chown_to_qemu_vm changes ownership if user exists."""
         test_file = tmp_path / "qemu_owned.txt"
@@ -819,6 +820,7 @@ class TestGrantQemuVmFileAccess:
 
 
 @pytest.mark.sudo
+@skip_unless_linux  # qemu-vm user only exists on Linux CI runners
 class TestGrantQemuVmFileAccessReal:
     """Real filesystem tests for grant_qemu_vm_file_access.
 
