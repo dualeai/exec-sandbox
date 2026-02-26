@@ -1756,14 +1756,17 @@ class TestAllImageTypes:
             kvm_available = await check_kvm_available()
             hvf_available = await check_hvf_available()
 
+            # ARM64 uses plain "host"; x86_64 disables nested virt flags (CVE-2024-50115)
+            expected_cpu = "host" if detect_host_arch() == HostArch.AARCH64 else "host,-svm,-vmx"
+
             if hvf_available:
                 # macOS with HVF available should use HVF (Hypervisor.framework)
                 assert accel_found == "hvf", f"Expected HVF on macOS, got: -accel {accel_found}"
-                assert cpu_found == "host", f"Expected '-cpu host' with HVF, got: -cpu {cpu_found}"
+                assert cpu_found == expected_cpu, f"Expected '-cpu {expected_cpu}' with HVF, got: -cpu {cpu_found}"
             elif kvm_available:
                 # Linux with KVM should use KVM
                 assert accel_found == "kvm", f"Expected KVM on Linux with KVM available, got: -accel {accel_found}"
-                assert cpu_found == "host", f"Expected '-cpu host' with KVM, got: -cpu {cpu_found}"
+                assert cpu_found == expected_cpu, f"Expected '-cpu {expected_cpu}' with KVM, got: -cpu {cpu_found}"
             else:
                 # Fallback to TCG (this is expected in some CI environments)
                 assert accel_found.startswith("tcg"), (
