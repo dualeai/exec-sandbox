@@ -37,8 +37,8 @@ OUTBOUND_FILTER_NORMAL_CASES = [
     # Multiple allowed domains
     pytest.param(
         Language.PYTHON,
-        ["httpbin.org", "google.com", "github.com"],
-        "github.com",
+        ["google.com", "pypi.org", "httpbin.org"],
+        "httpbin.org",
         True,
         id="normal-multiple-domains-third-connects",
     ),
