@@ -509,6 +509,7 @@ def concurrent_sessions(request: pytest.FixtureRequest) -> int:
     return request.param
 
 
+@skip_unless_hwaccel
 @pytest.mark.slow
 async def test_peak_ram_concurrent_file_io(
     concurrent_sessions: int, file_io_size_mb: int, images_dir: Path, tmp_path: Path
