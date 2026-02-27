@@ -85,6 +85,16 @@ pub(crate) static QUIET_MODE: LazyLock<bool> = LazyLock::new(|| {
 });
 
 /// Blocked dangerous environment variables (case-insensitive check at validation time).
+///
+/// SECURITY NOTE: These names are visible via `strings(1)` on the compiled binary.
+/// This is an accepted risk because:
+///   1. The list contains well-known dangerous vars documented in every Linux
+///      hardening guide — no information advantage is gained by reading the binary.
+///   2. The rootfs is read-only EROFS; the binary cannot be patched in-guest.
+///   3. The VM itself is the primary isolation boundary; this blocklist is
+///      defense-in-depth, not the sole security control.
+///   4. Obfuscation (e.g. compile-time hashing) would add complexity and a
+///      normalization step (case-insensitive matching) for negligible benefit.
 pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
     // Dynamic linker (arbitrary code execution)
     "LD_PRELOAD",
