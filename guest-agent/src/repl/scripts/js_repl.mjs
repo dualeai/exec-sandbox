@@ -63,6 +63,10 @@ const sandboxBun = new Proxy(Bun, {
         return true;
     }
 });
+// VM context globals: createContext() only provides ECMAScript built-ins
+// (Object, Array, Math, Promise, etc.). All Web API and Node/Bun globals
+// must be passed explicitly — they are NOT auto-injected.
+// See: https://bun.sh/docs/runtime/globals
 const ctx = createContext({
     Bun: sandboxBun,
     console, process: sandboxProcess, setTimeout, setInterval, clearTimeout, clearInterval,
@@ -72,7 +76,7 @@ const ctx = createContext({
     AbortController, AbortSignal, Event, EventTarget,
     WebAssembly,
     atob, btoa, structuredClone, queueMicrotask,
-    crypto,
+    crypto, performance,
     require,
     __import,
     module: { exports: {} },

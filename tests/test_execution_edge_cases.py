@@ -816,6 +816,22 @@ Promise.reject(new Error("test rejection"));
         # Exit code depends on Bun's behavior
         assert result.exit_code != 0 or "rejection" in result.stderr.lower()
 
+    # --- Web API globals ---
+
+    async def test_performance_global_available(self, scheduler: Scheduler) -> None:
+        """performance Web API is available in JS sandbox context."""
+        code = """\
+console.log('type=' + typeof performance);
+console.log('now_type=' + typeof performance.now);
+const t = performance.now();
+console.log('is_number=' + (typeof t === 'number' && t > 0));
+"""
+        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        assert result.exit_code == 0, f"stderr: {result.stderr}"
+        assert "type=object" in result.stdout
+        assert "now_type=function" in result.stdout
+        assert "is_number=true" in result.stdout
+
 
 # =============================================================================
 # JavaScript Dynamic Import (ESM import() via __import wrapper)
