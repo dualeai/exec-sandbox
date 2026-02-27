@@ -1166,6 +1166,217 @@ class TestFileOpDispatcherRouting:
         await dispatcher.stop()
 
 
+class TestDispatchLoopConnectionReset:
+    """Tests that _dispatch_loop exits cleanly on OSError variants.
+
+    The dispatch loop catches (IncompleteReadError, OSError) so that
+    connection resets — normal during peer disconnect or balloon stress —
+    are treated the same as EOF.
+
+    IMPORTANT: after injecting the error, we await the task directly to
+    confirm the loop exited via the except clause.  Calling stop() first
+    would cancel the task, making the test exercise CancelledError instead.
+    """
+
+    # ------------------------------------------------------------------
+    # Normal cases — parametrized over every error variant
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("error_cls", "error_args"),
+        [
+            pytest.param(ConnectionResetError, ("reset",), id="ConnectionResetError"),
+            pytest.param(BrokenPipeError, ("broken",), id="BrokenPipeError"),
+            pytest.param(OSError, (104, "Connection aborted"), id="OSError-custom-errno"),
+        ],
+    )
+    async def test_loop_exits_cleanly_on_oserror(
+        self, error_cls: type[OSError], error_args: tuple[object, ...]
+    ) -> None:
+        """Dispatch loop exits via except clause, task completes normally."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        await asyncio.sleep(0)  # let loop enter readuntil()
+
+        reader.set_exception(error_cls(*error_args))
+
+        # Wait for the loop to exit via the except clause (not cancellation)
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        await dispatcher.stop()
+        assert dispatcher._task is None
+
+    async def test_loop_exits_cleanly_on_eof(self) -> None:
+        """IncompleteReadError (EOF) exits cleanly — regression guard."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        await asyncio.sleep(0)  # let loop enter readuntil()
+
+        reader.feed_eof()
+
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        await dispatcher.stop()
+        assert dispatcher._task is None
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    async def test_messages_before_reset_are_delivered(self) -> None:
+        """Messages routed before ConnectionResetError are still in their queues."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("op-A")
+        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "before-reset"})
+
+        # Wait for message to be dispatched
+        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert isinstance(msg, FileChunkResponseMessage)
+        assert msg.data == "before-reset"
+
+        # Now simulate reset — loop is back in readuntil()
+        reader.set_exception(ConnectionResetError())
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        await dispatcher.stop()
+        assert dispatcher._task is None
+
+    async def test_stop_after_loop_exit_is_idempotent(self) -> None:
+        """Calling stop() twice after the loop already exited doesn't raise."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        await asyncio.sleep(0)  # let loop enter readuntil()
+
+        reader.set_exception(ConnectionResetError())
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        await dispatcher.stop()
+        await dispatcher.stop()  # second stop — no-op
+        assert dispatcher._task is None
+
+    # ------------------------------------------------------------------
+    # Weird / out-of-bounds cases
+    # ------------------------------------------------------------------
+
+    async def test_oserror_leaves_registered_queues_intact(self) -> None:
+        """After OSError exit, registered queues still exist but get no phantom messages."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("op-A")
+
+        reader.set_exception(ConnectionResetError())
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        await dispatcher.stop()
+
+        # Queue should be empty — no phantom messages injected
+        assert op_queue.empty()
+
+
+# ============================================================================
+# DualPortChannel.close() resiliency
+# ============================================================================
+
+
+def _make_close_channel(
+    *,
+    has_dispatcher: bool = True,
+    stop_side_effect: BaseException | None = None,
+) -> DualPortChannel:
+    """Build a DualPortChannel with mocked internals for close() testing."""
+    ch = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+    if has_dispatcher:
+        mock_disp = AsyncMock(spec=FileOpDispatcher)
+        if stop_side_effect is not None:
+            mock_disp.stop = AsyncMock(side_effect=stop_side_effect)
+        ch._dispatcher = mock_disp
+    ch._cmd_channel = AsyncMock(spec=UnixSocketChannel)
+    ch._event_channel = AsyncMock(spec=UnixSocketChannel)
+    return ch
+
+
+class TestDualPortChannelCloseResiliency:
+    """Tests that DualPortChannel.close() always clears _dispatcher.
+
+    Uses try/finally so that _dispatcher = None runs even if stop() raises,
+    preventing a poisoned dispatcher from blocking subsequent health check retries.
+    """
+
+    # ------------------------------------------------------------------
+    # Normal cases
+    # ------------------------------------------------------------------
+
+    async def test_close_clears_dispatcher_and_closes_channels(self) -> None:
+        """Normal close: dispatcher cleared, both channels closed."""
+        ch = _make_close_channel()
+
+        await ch.close()
+
+        assert ch._dispatcher is None
+        ch._cmd_channel.close.assert_awaited_once()
+        ch._event_channel.close.assert_awaited_once()
+
+    async def test_close_with_no_dispatcher_still_closes_channels(self) -> None:
+        """close() when _dispatcher is None still closes channels."""
+        ch = _make_close_channel(has_dispatcher=False)
+        assert ch._dispatcher is None
+
+        await ch.close()
+
+        assert ch._dispatcher is None
+        ch._cmd_channel.close.assert_awaited_once()
+        ch._event_channel.close.assert_awaited_once()
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
+
+    async def test_close_clears_dispatcher_when_stop_raises(self) -> None:
+        """If stop() raises RuntimeError, _dispatcher is still cleared to None."""
+        ch = _make_close_channel(stop_side_effect=RuntimeError("dispatch task exploded"))
+
+        with pytest.raises(RuntimeError, match="dispatch task exploded"):
+            await ch.close()
+
+        # Critical: dispatcher must be cleared despite the error
+        assert ch._dispatcher is None
+
+    async def test_close_idempotent(self) -> None:
+        """Calling close() twice is safe — second call is a no-op for dispatcher."""
+        ch = _make_close_channel()
+
+        await ch.close()
+        await ch.close()  # second call — _dispatcher already None
+
+        assert ch._dispatcher is None
+
+    # ------------------------------------------------------------------
+    # Weird / out-of-bounds cases
+    # ------------------------------------------------------------------
+
+    async def test_close_clears_dispatcher_on_base_exception(self) -> None:
+        """Even BaseException (e.g. KeyboardInterrupt) from stop() clears _dispatcher."""
+        ch = _make_close_channel(stop_side_effect=KeyboardInterrupt())
+
+        with pytest.raises(KeyboardInterrupt):
+            await ch.close()
+
+        assert ch._dispatcher is None
+
+
 # ============================================================================
 # exposed_ports property — delegates to VM
 # ============================================================================

@@ -101,7 +101,7 @@ class FileOpDispatcher:
         while True:
             try:
                 data = await self._reader.readuntil(b"\n")
-            except asyncio.IncompleteReadError:
+            except (asyncio.IncompleteReadError, OSError):
                 break
             try:
                 msg = _STREAMING_MESSAGE_ADAPTER.validate_json(data.rstrip(b"\n"))
@@ -745,8 +745,10 @@ class DualPortChannel:
         """
         # Stop dispatcher first
         if self._dispatcher:
-            await self._dispatcher.stop()
-            self._dispatcher = None
+            try:
+                await self._dispatcher.stop()
+            finally:
+                self._dispatcher = None
 
         # Close both ports in parallel
         await asyncio.gather(
