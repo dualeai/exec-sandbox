@@ -76,6 +76,9 @@ class Session:
         self._exec_count = 0
         self._exec_lock = asyncio.Lock()
         self._idle_timer_task: asyncio.Task[None] | None = None
+        # Strong refs to cancelled timer tasks awaiting CancelledError processing.
+        # done_callback auto-removes; close() gathers any remaining.
+        self._cancelled_timers: set[asyncio.Task[None]] = set()
         self._reset_idle_timer()
 
     # -------------------------------------------------------------------------
@@ -325,6 +328,13 @@ class Session:
         self._closed = True
         self._cancel_idle_timer()
 
+        # Await cancelled timer tasks so they process CancelledError before
+        # the event loop shuts down. Without this, GC'd coroutines trigger
+        # "Event loop is closed" on Python 3.14t.
+        if self._cancelled_timers:
+            await asyncio.gather(*self._cancelled_timers, return_exceptions=True)
+            self._cancelled_timers.clear()
+
         logger.info(
             "Closing session",
             extra={
@@ -368,10 +378,22 @@ class Session:
         self._idle_timer_task = asyncio.create_task(self._idle_timeout_handler())
 
     def _cancel_idle_timer(self) -> None:
-        """Cancel the idle timeout timer."""
+        """Cancel the idle timeout timer.
+
+        Adds the cancelled task to _cancelled_timers with a done callback
+        for auto-removal. This holds a strong reference, preventing GC
+        before the event loop processes CancelledError.
+
+        When the idle timeout fires naturally, the handler calls close()
+        which calls us. In that case current_task IS the timer task — skip
+        both cancel and tracking since it will complete on its own.
+        """
         if self._idle_timer_task is not None:
-            if not self._idle_timer_task.done():
+            if not self._idle_timer_task.done() and self._idle_timer_task is not asyncio.current_task():
                 self._idle_timer_task.cancel()
+                task = self._idle_timer_task
+                self._cancelled_timers.add(task)
+                task.add_done_callback(self._cancelled_timers.discard)
             self._idle_timer_task = None
 
     async def _idle_timeout_handler(self) -> None:

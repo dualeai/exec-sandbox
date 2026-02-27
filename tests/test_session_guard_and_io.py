@@ -1,6 +1,6 @@
 # pyright: reportPrivateUsage=false
 """Unit tests for Session._guard(), _resolve_content(), write_file streaming protocol,
-FileOpDispatcher routing, and DualPortChannel reconnection probe.
+FileOpDispatcher routing, DualPortChannel reconnection probe, and idle timer lifecycle.
 
 Tests the orchestration layer WITHOUT requiring VMs. All VM/channel interactions
 are mocked. Covers:
@@ -9,6 +9,7 @@ are mocked. Covers:
 - WriteFileRequest header serialization: validity, escaping
 - FileOpDispatcher message routing by op_id
 - DualPortChannel._probe_guest_ready() reconnection probe
+- Idle timer task lifecycle: orphan prevention, self-cancel, stress
 """
 
 import asyncio
@@ -1798,3 +1799,148 @@ class TestWriteWorkerFailureHandling:
         with pytest.raises(RuntimeError, match=expected_match):
             async for _ in ch.stream_messages(PongMessage(version="1.0"), timeout=5):  # type: ignore[arg-type]
                 pass
+
+
+# ============================================================================
+# Idle timer task lifecycle — orphaned task prevention
+# ============================================================================
+
+
+def _orphaned_timer_tasks() -> list[asyncio.Task[None]]:
+    """Return any idle_timeout_handler tasks still alive in the event loop."""
+    return [t for t in asyncio.all_tasks() if "idle_timeout_handler" in repr(t.get_coro())]
+
+
+class TestIdleTimerLifecycleNormal:
+    """Normal cases: close() properly awaits cancelled timer tasks."""
+
+    async def test_close_leaves_no_orphaned_tasks(self) -> None:
+        """Core regression test: close() must leave zero idle_timeout_handler tasks."""
+        session, _, _ = _make_session()
+        await session.close()
+        assert _orphaned_timer_tasks() == []
+
+    async def test_cancelled_timers_empty_after_close(self) -> None:
+        """Strong-ref set is cleared after close (no memory leak)."""
+        session, _, _ = _make_session()
+        await session.close()
+        assert session._cancelled_timers == set()
+
+    async def test_multiple_exec_then_close_no_orphans(self) -> None:
+        """Each exec() resets the timer; close() cleans up the final one."""
+        session, _, _ = _make_session()
+        for _ in range(5):
+            await session.exec("x = 1")
+        await session.close()
+        assert _orphaned_timer_tasks() == []
+        assert session._cancelled_timers == set()
+
+    async def test_context_manager_no_orphans(self) -> None:
+        """async with Session cleans up via __aexit__."""
+        session, _, _ = _make_session()
+        async with session:
+            await session.exec("x = 1")
+        assert _orphaned_timer_tasks() == []
+        assert session._cancelled_timers == set()
+
+
+class TestIdleTimerLifecycleEdge:
+    """Edge cases for cancelled timer cleanup."""
+
+    async def test_double_close_no_error(self) -> None:
+        """Second close() is idempotent — no crash, set stays empty."""
+        session, _, _ = _make_session()
+        await session.close()
+        await session.close()
+        assert _orphaned_timer_tasks() == []
+        assert session._cancelled_timers == set()
+
+    async def test_close_from_exec_error_path(self) -> None:
+        """VM failure in exec() triggers close() internally — no orphans."""
+        session, mock_vm, _ = _make_session()
+        mock_vm.execute = AsyncMock(side_effect=RuntimeError("VM died"))
+        with pytest.raises(RuntimeError, match="VM died"):
+            await session.exec("x = 1")
+        # exec() called close() internally on VM failure
+        assert session.closed
+        assert _orphaned_timer_tasks() == []
+        assert session._cancelled_timers == set()
+
+    async def test_done_callback_auto_cleans_between_execs(self) -> None:
+        """Cancelled timers are removed by done_callback before close()."""
+        session, _, _ = _make_session()
+
+        # First exec cancels the initial timer
+        await session.exec("x = 1")
+        # Yield twice: once for CancelledError delivery, once for done_callback
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # The auto-removal callback should have cleaned _cancelled_timers
+        assert session._cancelled_timers == set()
+
+        await session.close()
+
+    async def test_natural_idle_timeout_no_crash(self) -> None:
+        """Timer fires naturally (not cancelled) — no orphan, no crash.
+
+        When the idle timeout handler calls close(), _cancel_idle_timer
+        detects self-cancel (current_task == timer task) and skips both
+        cancel and tracking. The handler completes on its own.
+        """
+        session, _, _ = _make_session(idle_timeout_seconds=0)
+        # Let the timer fire (it calls close() internally) and complete
+        await asyncio.sleep(0.1)
+        assert session.closed
+        assert session._cancelled_timers == set()
+        # All timer tasks should have completed naturally
+        assert _orphaned_timer_tasks() == []
+
+
+class TestIdleTimerLifecycleStress:
+    """Weird / out-of-bound / stress scenarios."""
+
+    async def test_rapid_reset_storm(self) -> None:
+        """50 rapid _reset_idle_timer() calls without yielding.
+
+        All cancelled tasks pile up in _cancelled_timers. close() must
+        await all of them via gather().
+        """
+        session, _, _ = _make_session()
+        for _ in range(50):
+            session._reset_idle_timer()
+        # Many cancelled tasks now in _cancelled_timers
+        assert len(session._cancelled_timers) <= 51  # at most 1 initial + 50 resets
+        await session.close()
+        assert _orphaned_timer_tasks() == []
+        assert session._cancelled_timers == set()
+
+    async def test_gc_pressure_between_cancel_and_await(self) -> None:
+        """Force GC after cancel but before close() gather — strong ref keeps task alive."""
+        import gc
+
+        session, _, _ = _make_session()
+        # Manually cancel to separate the cancel/gather steps
+        session._cancel_idle_timer()
+        # Strong ref in _cancelled_timers must survive GC
+        gc.collect()
+        assert len(session._cancelled_timers) == 1
+
+        # close() will gather the surviving task cleanly
+        await session.close()
+        assert _orphaned_timer_tasks() == []
+        assert session._cancelled_timers == set()
+
+    async def test_concurrent_close_and_exec(self) -> None:
+        """Race close() against exec() — one wins, no orphans either way."""
+        session, _, _ = _make_session()
+        results = await asyncio.gather(
+            session.close(),
+            session.exec("x = 1"),
+            return_exceptions=True,
+        )
+        # One of the two may raise SessionClosedError
+        errors = [r for r in results if isinstance(r, SessionClosedError)]
+        assert len(errors) <= 1
+        assert session.closed
+        assert _orphaned_timer_tasks() == []
