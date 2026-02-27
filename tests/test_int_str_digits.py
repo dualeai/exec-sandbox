@@ -217,6 +217,7 @@ print(len(s))
 class TestIntStrDigitsOutOfBounds:
     """Stress tests — resource limits (timeout, stdout cap) protect against abuse."""
 
+    @pytest.mark.slow
     async def test_100k_digit_conversion(self, scheduler: Scheduler) -> None:
         """100,000-digit int->str conversion (well above default limit)."""
         code = """
