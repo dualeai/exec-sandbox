@@ -19,6 +19,7 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from tests.conftest import skip_unless_hwaccel
 
 # Code that reads urandom IMMEDIATELY — before any entropy can accumulate
 # from CPU jitter / interrupts / etc.
@@ -46,6 +47,7 @@ async def l1_scheduler(images_dir: Path) -> AsyncGenerator[Scheduler, None]:
         yield sched
 
 
+@skip_unless_hwaccel
 class TestL1SnapshotRNG:
     """Verify RNG uniqueness after L1 memory snapshot restore.
 

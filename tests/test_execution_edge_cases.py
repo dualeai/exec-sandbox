@@ -520,6 +520,7 @@ time.sleep(60)  # Wait to be killed
 class TestOutOfBounds:
     """Tests for resource limits and exhaustion."""
 
+    @skip_unless_hwaccel
     async def test_memory_allocation_large(self, scheduler: Scheduler) -> None:
         """Attempting to allocate lots of memory."""
         # Try to allocate 500MB (should fail or be killed with 256MB VM)
