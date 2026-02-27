@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 #      → Host runs out of threads under parallel test load (EAGAIN)
 #      → Causes SIGABRT (exit code -6). This is a host-side issue, not a test bug.
 #
+# Root cause: With TCG thread=single, each QEMU process uses ~5-8 threads at
+# steady state (main loop, vCPU, call_rcu, iothread, signal handler). However,
+# the I/O worker thread pool (QEMU util/thread-pool.c, aio=threads) can spike
+# to 64 threads *per AioContext* during heavy disk I/O. When many VMs boot
+# simultaneously (pytest -n auto with 4 workers), these transient spikes can
+# exhaust OS thread limits. Measured locally: 5 threads (TCG minimal) to
+# 8 threads (HVF full config); QEMU maintainer docs confirm ~4-7 baseline
+# with unbounded I/O pool spikes.
+#
 # Note: The previous "regime_is_user: code should not be reached" crash (QEMU
 # ARM64 TCG bug in versions < 9.0.4) is now caught early by a version check in
 # qemu_cmd.py, which raises VmDependencyError before QEMU is launched. That
@@ -34,10 +43,19 @@ logger = logging.getLogger(__name__)
 #
 # We detect exact error strings and retry with backoff plus heavy jitter to
 # desynchronize parallel workers on noisy CI hardware.
+#
+# Tuning rationale:
+#   - 5 retries (not 3): thread exhaustion can persist through multiple boot
+#     cycles when all workers retry in lockstep.
+#   - Base 2 (not 3): base 3 grows too fast for 5 retries (3^4=81s, 3^5=243s).
+#     Base 2 gives a gentler ramp: 2s, 4s, 8s, 16s, 32s.
+#   - 10s jitter (not 5s): wider uniform spread better desynchronizes 4 parallel
+#     workers, reducing the chance of simultaneous retry storms.
+#   - Worst-case total: ~112s across 5 retries (acceptable vs 60-min CI timeout).
 
-_QEMU_CRASH_MAX_RETRIES = 3
-_QEMU_CRASH_BACKOFF_BASE_S = 3  # exponential: 3s, 9s, 27s
-_QEMU_CRASH_JITTER_MAX_S = 5.0  # uniform random jitter [0, 5s)
+_QEMU_CRASH_MAX_RETRIES = 5
+_QEMU_CRASH_BACKOFF_BASE_S = 2  # exponential: 2s, 4s, 8s, 16s, 32s
+_QEMU_CRASH_JITTER_MAX_S = 10.0  # uniform random jitter [0, 10s)
 
 # Exact substrings from QEMU's stderr/console that indicate retryable crashes.
 _QEMU_RETRYABLE_SIGNATURES = (
@@ -63,7 +81,7 @@ def _is_retryable_qemu_crash(reports: list[pytest.TestReport]) -> bool:
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
     """Retry tests on QEMU SIGABRT / thread exhaustion (GitHub Actions CI only).
 
-    Uses exponential backoff (3^n) with full jitter ([0, 5s)) between retries
+    Uses exponential backoff (2^n) with full jitter ([0, 10s)) between retries
     to desynchronize parallel workers and avoid thundering herd on noisy CI.
     Properly tears down and re-creates fixtures on each attempt.
     """
