@@ -235,10 +235,14 @@ print(len(s))
         assert result.stdout.strip() == "100000"
 
     async def test_large_output_hits_stdout_cap(self, scheduler: Scheduler) -> None:
-        """Printing a ~1M-digit number exceeds guest-agent 1MB stdout limit."""
+        """Printing >1MB of digit characters exceeds guest-agent 1MB stdout limit.
+
+        Uses string multiplication instead of str(10**N) to avoid the expensive
+        bigint→decimal conversion that can intermittently exceed the execution
+        timeout under load.
+        """
         code = """
-x = 10**999999
-print(x)
+print("9" * 2_000_000)
 """
         with pytest.raises(OutputLimitError):
             await scheduler.run(
