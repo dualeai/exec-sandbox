@@ -64,7 +64,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
 
     # Note: empty-code and null-byte checks live in guest-agent validation.rs.
     # The host translates the guest's code_error response to CodeValidationError
-    # via _guest_error_to_exception. No Pydantic validator here.
+    # via guest_error_to_exception. No Pydantic validator here.
 
     timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
     env_vars: dict[str, str] = Field(

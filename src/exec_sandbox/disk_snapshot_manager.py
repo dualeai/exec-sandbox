@@ -35,7 +35,13 @@ from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
 from exec_sandbox.base_cache_manager import BaseCacheManager
-from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmQemuCrashError, VmTransientError
+from exec_sandbox.exceptions import (
+    GuestAgentError,
+    PackageNotAllowedError,
+    SnapshotError,
+    VmQemuCrashError,
+    VmTransientError,
+)
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     InstallPackagesRequest,
@@ -46,6 +52,7 @@ from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
 from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.qemu_vm import guest_error_to_exception
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 from exec_sandbox.vm_types import VmState
 
@@ -473,6 +480,10 @@ class DiskSnapshotManager(BaseCacheManager):
                     return await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
                 raise
 
+            # Passthrough: caller input errors and cancellation propagate as-is
+            except (PackageNotAllowedError, asyncio.CancelledError):
+                raise
+
             # Handle VM death during snapshot creation
             except VmTransientError as e:
                 # Wrap VM error in SnapshotError
@@ -486,10 +497,6 @@ class DiskSnapshotManager(BaseCacheManager):
                         "tenant_id": tenant_id,
                     },
                 ) from e
-
-            except asyncio.CancelledError:
-                logger.warning("Snapshot creation cancelled", extra={"cache_key": cache_key})
-                raise  # Immediate propagation, cleanup in finally
 
             except Exception as e:
                 # Wrap generic errors in SnapshotError
@@ -688,10 +695,7 @@ class DiskSnapshotManager(BaseCacheManager):
                             "Guest agent install error",
                             extra={"vm_id": vm.vm_id, "error": msg.message, "error_type": msg.error_type},
                         )
-                        raise GuestAgentError(
-                            f"Package installation failed: {msg.message}",
-                            response={"message": msg.message, "error_type": msg.error_type},
-                        )
+                        raise guest_error_to_exception(msg, vm.vm_id, operation="install_packages")
 
                 # Check installation success
                 if exit_code != 0:
@@ -712,8 +716,8 @@ class DiskSnapshotManager(BaseCacheManager):
                 },
             ) from e
 
-        except GuestAgentError:
-            raise  # Re-raise guest agent errors as-is
+        except (GuestAgentError, PackageNotAllowedError):
+            raise  # Re-raise guest errors as-is (not snapshot errors)
 
         except Exception as e:
             # Orchestrator/communication error (connection, protocol, etc)

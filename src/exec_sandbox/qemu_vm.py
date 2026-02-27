@@ -22,6 +22,7 @@ from exec_sandbox.exceptions import (
     CodeValidationError,
     EnvVarValidationError,
     InputValidationError,
+    PackageNotAllowedError,
     SandboxError,
     VmBootTimeoutError,
     VmPermanentError,
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def _guest_error_to_exception(
+def guest_error_to_exception(
     msg: StreamingErrorMessage,
     vm_id: str,
     *,
@@ -89,9 +90,10 @@ def _guest_error_to_exception(
             return EnvVarValidationError(formatted, context=context)
         case constants.GuestErrorType.CODE:
             return CodeValidationError(formatted, context=context)
+        case constants.GuestErrorType.PACKAGE:
+            return PackageNotAllowedError(formatted, context=context)
         case (
             constants.GuestErrorType.PATH
-            | constants.GuestErrorType.PACKAGE
             | constants.GuestErrorType.IO
             | constants.GuestErrorType.EXECUTION
             | constants.GuestErrorType.REQUEST
@@ -449,7 +451,7 @@ class QemuVM:
             else:
                 error_type = constants.GuestErrorType.REQUEST
             msg = StreamingErrorMessage(message=str(e), error_type=error_type.value)
-            exc = _guest_error_to_exception(msg, self.vm_id)
+            exc = guest_error_to_exception(msg, self.vm_id)
             if isinstance(exc, InputValidationError):
                 # Input was invalid but VM is fine — restore READY for session reuse
                 with contextlib.suppress(VmPermanentError):
@@ -518,7 +520,7 @@ class QemuVM:
                     spawn_ms = msg.spawn_ms
                     process_ms = msg.process_ms
                 elif isinstance(msg, StreamingErrorMessage):
-                    exc = _guest_error_to_exception(msg, self.vm_id, operation="execute")
+                    exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
                     # Input validation errors (env vars, code) are caller bugs —
                     # raise immediately so callers get a typed exception.
                     if isinstance(exc, InputValidationError):
@@ -724,7 +726,7 @@ class QemuVM:
             response = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
 
             if isinstance(response, StreamingErrorMessage):
-                raise _guest_error_to_exception(response, self.vm_id, operation=f"write_file '{path}'")
+                raise guest_error_to_exception(response, self.vm_id, operation=f"write_file '{path}'")
 
             if not isinstance(response, FileWriteAckMessage):
                 raise VmPermanentError(
@@ -805,7 +807,7 @@ class QemuVM:
                     elif isinstance(msg, FileReadCompleteMessage):
                         break
                     elif isinstance(msg, StreamingErrorMessage):
-                        raise _guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
+                        raise guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
                     else:
                         raise VmPermanentError(
                             f"read_file unexpected message type: {type(msg).__name__}",
@@ -862,7 +864,7 @@ class QemuVM:
             ) from e
 
         if isinstance(response, StreamingErrorMessage):
-            raise _guest_error_to_exception(response, self.vm_id, operation=f"list_files '{path}'")
+            raise guest_error_to_exception(response, self.vm_id, operation=f"list_files '{path}'")
 
         if not isinstance(response, FileListMessage):
             raise VmPermanentError(
