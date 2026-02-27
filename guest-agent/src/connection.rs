@@ -348,11 +348,15 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            GuestCommand::InstallPackages { language, packages } => {
+            GuestCommand::InstallPackages {
+                language,
+                packages,
+                timeout,
+            } => {
                 // Gate: wait for network setup (ip + gvproxy) before package install
                 crate::init::wait_for_network().await;
                 log_info!(
-                    "Processing: install_packages (language={language}, count={})",
+                    "Processing: install_packages (language={language}, count={}, timeout={timeout}s)",
                     packages.len()
                 );
                 let lang = match Language::parse(&language) {
@@ -374,7 +378,7 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                match install_packages(lang, &packages, &writer).await {
+                match install_packages(lang, &packages, timeout, &writer).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
                         message,

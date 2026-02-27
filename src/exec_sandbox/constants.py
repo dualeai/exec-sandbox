@@ -117,8 +117,25 @@ Accounts for:
 - Safety buffer (~1s)
 Must be >= guest-agent TERM_GRACE_PERIOD_SECONDS (5s) + overhead."""
 
-PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 120
-"""Timeout for package installation in guest VM."""
+PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
+"""Timeout for package installation in guest VM.
+
+Sent to the guest agent via InstallPackagesRequest.timeout field.
+The guest enforces this as the tokio::time::timeout for the package manager process.
+Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS)."""
+
+PACKAGE_INSTALL_MAX_RETRIES: Final[int] = 3
+"""Maximum retry attempts for transient network errors during package install."""
+
+PACKAGE_INSTALL_RETRY_MIN_SECONDS: Final[float] = 1.0
+"""Minimum backoff between package install retries (1s base).
+
+Longer than VM boot retry (0.1s) because network issues persist longer than CPU contention."""
+
+PACKAGE_INSTALL_RETRY_MAX_SECONDS: Final[float] = 8.0
+"""Maximum backoff between package install retries (8s cap with jitter).
+
+Longer than VM boot retry (2s) to allow transient DNS/routing issues to resolve."""
 
 # ============================================================================
 # Code Execution Limits

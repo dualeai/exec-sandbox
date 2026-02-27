@@ -45,7 +45,6 @@ pub(crate) const MAX_ENV_VAR_VALUE_LENGTH: usize = 4096;
 // Package limits
 pub(crate) const MAX_PACKAGES: usize = 50;
 pub(crate) const MAX_PACKAGE_NAME_LENGTH: usize = 214; // PyPI limit
-pub(crate) const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300;
 
 // Streaming configuration
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;

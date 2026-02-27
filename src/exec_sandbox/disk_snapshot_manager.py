@@ -20,7 +20,7 @@ import contextlib
 import errno
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Final
 
 import aiofiles
 import aiofiles.os
@@ -31,12 +31,23 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
+import logging
+
+from tenacity import (
+    AsyncRetrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
 from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import (
     GuestAgentError,
+    PackageInstallTransientError,
     PackageNotAllowedError,
     SnapshotError,
     VmQemuCrashError,
@@ -61,6 +72,29 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
+
+_TRANSIENT_NETWORK_PATTERNS: Final[tuple[str, ...]] = (
+    "client error",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "name resolution",
+    "network unreachable",
+    "temporary failure in name resolution",
+    "timed out",
+    "reset by peer",
+    "request failed after",
+)
+
+
+def _is_transient_network_error(error_output: str) -> bool:
+    """Check if error output indicates a transient network failure.
+
+    Used to distinguish retryable network errors (DNS resolution, connection
+    refused, timeouts) from permanent errors (package not found, invalid version).
+    """
+    lower = error_output.lower()
+    return any(pattern in lower for pattern in _TRANSIENT_NETWORK_PATTERNS)
 
 
 class DiskSnapshotManager(BaseCacheManager):
@@ -480,8 +514,8 @@ class DiskSnapshotManager(BaseCacheManager):
                     return await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
                 raise
 
-            # Passthrough: caller input errors and cancellation propagate as-is
-            except (PackageNotAllowedError, asyncio.CancelledError):
+            # Passthrough: already-wrapped errors, caller input errors, cancellation
+            except (SnapshotError, PackageNotAllowedError, asyncio.CancelledError):
                 raise
 
             # Handle VM death during snapshot creation
@@ -638,6 +672,10 @@ class DiskSnapshotManager(BaseCacheManager):
     ) -> None:
         """Install packages in VM via guest agent.
 
+        Retries transient network errors (DNS, connection refused, timeouts)
+        using exponential backoff. The VM stays running between retries — only
+        the install request is re-sent.
+
         Event-driven architecture:
         - ZERO polling loops
         - Instant crash detection via asyncio.wait(FIRST_COMPLETED) in caller
@@ -650,7 +688,8 @@ class DiskSnapshotManager(BaseCacheManager):
 
         Raises:
             SnapshotError: Package installation failed
-            GuestAgentError: Guest agent returned error
+            GuestAgentError: Guest agent returned error (permanent)
+            PackageInstallTransientError: Transient network error (after all retries exhausted)
         """
         if not packages:
             return
@@ -662,53 +701,76 @@ class DiskSnapshotManager(BaseCacheManager):
             timeout=constants.PACKAGE_INSTALL_TIMEOUT_SECONDS,  # Soft timeout (guest enforcement)
         )
 
+        # Hard timeout = soft timeout (guest) + margin (host watchdog)
+        # stream_messages() uses this internally — no redundant outer timeout per attempt
+        hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
+
+        # Total wall-clock budget: hard_timeout * max_retries + max backoff between retries
+        # Covers all attempts + tenacity sleep between retries
+        total_timeout = (
+            hard_timeout * constants.PACKAGE_INSTALL_MAX_RETRIES
+            + constants.PACKAGE_INSTALL_RETRY_MAX_SECONDS * (constants.PACKAGE_INSTALL_MAX_RETRIES - 1)
+        )
+
         try:
-            # Use asyncio.timeout() context manager (Python 3.14)
-            async with asyncio.timeout(constants.PACKAGE_INSTALL_TIMEOUT_SECONDS):
-                # Connect to guest agent (fixed init timeout)
-                await vm.channel.connect(timeout_seconds=constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            async with asyncio.timeout(total_timeout):
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(constants.PACKAGE_INSTALL_MAX_RETRIES),
+                    wait=wait_random_exponential(
+                        min=constants.PACKAGE_INSTALL_RETRY_MIN_SECONDS,
+                        max=constants.PACKAGE_INSTALL_RETRY_MAX_SECONDS,
+                    ),
+                    retry=retry_if_exception_type(PackageInstallTransientError),
+                    before_sleep=before_sleep_log(logger, logging.WARNING),
+                    reraise=True,
+                ):
+                    with attempt:
+                        # Connect to guest agent (fixed init timeout)
+                        await vm.channel.connect(timeout_seconds=constants.GUEST_CONNECT_TIMEOUT_SECONDS)
 
-                # Stream install output (now uses same streaming protocol as execute_code)
-                # Hard timeout = soft timeout (guest) + margin (host watchdog)
-                hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
+                        exit_code = -1
+                        stderr_chunks: list[str] = []
 
-                exit_code = -1
-                stderr_chunks: list[str] = []
+                        async for msg in vm.channel.stream_messages(request, timeout=hard_timeout):
+                            if isinstance(msg, OutputChunkMessage):
+                                # Log install output for debugging
+                                logger.info(
+                                    "Package install output",
+                                    extra={"vm_id": vm.vm_id, "stream": msg.type, "chunk": msg.chunk[:200]},
+                                )
+                                # Collect stderr for error reporting
+                                if msg.type == "stderr":
+                                    stderr_chunks.append(msg.chunk)
 
-                async for msg in vm.channel.stream_messages(request, timeout=hard_timeout):
-                    if isinstance(msg, OutputChunkMessage):
-                        # Log install output for debugging
-                        logger.info(
-                            "Package install output",
-                            extra={"vm_id": vm.vm_id, "stream": msg.type, "chunk": msg.chunk[:200]},
-                        )
-                        # Collect stderr for error reporting
-                        if msg.type == "stderr":
-                            stderr_chunks.append(msg.chunk)
+                            elif isinstance(msg, ExecutionCompleteMessage):
+                                exit_code = msg.exit_code
+                                # Note: msg.execution_time_ms available but not needed for package install
 
-                    elif isinstance(msg, ExecutionCompleteMessage):
-                        exit_code = msg.exit_code
-                        # Note: msg.execution_time_ms available but not needed for package install
+                            elif isinstance(msg, StreamingErrorMessage):
+                                logger.error(
+                                    "Guest agent install error",
+                                    extra={"vm_id": vm.vm_id, "error": msg.message, "error_type": msg.error_type},
+                                )
+                                raise guest_error_to_exception(msg, vm.vm_id, operation="install_packages")
 
-                    elif isinstance(msg, StreamingErrorMessage):
-                        logger.error(
-                            "Guest agent install error",
-                            extra={"vm_id": vm.vm_id, "error": msg.message, "error_type": msg.error_type},
-                        )
-                        raise guest_error_to_exception(msg, vm.vm_id, operation="install_packages")
-
-                # Check installation success
-                if exit_code != 0:
-                    error_output = "".join(stderr_chunks) if stderr_chunks else "Unknown error"
-                    raise GuestAgentError(
-                        f"Package installation failed with exit code {exit_code}: {error_output[:500]}",
-                        response={"exit_code": exit_code, "stderr": error_output[:500]},
-                    )
+                        # Check installation success
+                        if exit_code != 0:
+                            error_output = "".join(stderr_chunks) if stderr_chunks else "Unknown error"
+                            # Distinguish transient network errors from permanent failures
+                            if _is_transient_network_error(error_output):
+                                raise PackageInstallTransientError(
+                                    f"Package installation failed with transient network error (exit code {exit_code}): {error_output[:500]}",
+                                    context={"exit_code": exit_code, "stderr": error_output[:500]},
+                                )
+                            raise GuestAgentError(
+                                f"Package installation failed with exit code {exit_code}: {error_output[:500]}",
+                                response={"exit_code": exit_code, "stderr": error_output[:500]},
+                            )
 
         except TimeoutError as e:
-            # Timeout → package install took too long
+            # Timeout → total wall-clock budget exhausted across all attempts
             raise SnapshotError(
-                f"Package installation timeout after {constants.PACKAGE_INSTALL_TIMEOUT_SECONDS}s",
+                f"Package installation timeout after {total_timeout}s",
                 context={
                     "vm_id": vm.vm_id,
                     "language": language,
@@ -716,8 +778,8 @@ class DiskSnapshotManager(BaseCacheManager):
                 },
             ) from e
 
-        except (GuestAgentError, PackageNotAllowedError):
-            raise  # Re-raise guest errors as-is (not snapshot errors)
+        except (GuestAgentError, PackageInstallTransientError, PackageNotAllowedError):
+            raise  # Re-raise as-is (not snapshot errors)
 
         except Exception as e:
             # Orchestrator/communication error (connection, protocol, etc)

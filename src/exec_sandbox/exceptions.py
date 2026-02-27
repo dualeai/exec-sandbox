@@ -11,6 +11,7 @@ Hierarchy:
     │   │   ├── VmQemuCrashError       ← QEMU crashed on startup
     │   │   ├── VmGvproxyError         ← gvproxy startup issues
     │   │   └── VmCapacityError        ← pool full (temporary)
+    │   ├── PackageInstallTransientError ← transient network during install
     │   ├── BalloonTransientError      ← balloon operations
     │   ├── MigrationTransientError    ← memory snapshot migration
     │   └── CommunicationTransientError ← socket/network transient issues
@@ -187,6 +188,10 @@ class VmDependencyError(VmPermanentError):
 # =============================================================================
 # Communication Errors
 # =============================================================================
+
+
+class PackageInstallTransientError(TransientError):
+    """Package installation failed due to transient network error — may succeed on retry."""
 
 
 class BalloonTransientError(TransientError):

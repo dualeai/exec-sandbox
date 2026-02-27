@@ -114,6 +114,7 @@ pub(crate) fn validate_package_name(pkg: &str) -> Result<(), String> {
 pub(crate) async fn install_packages(
     language: Language,
     packages: &[String],
+    timeout: u64,
     writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
     use std::time::Instant;
@@ -191,11 +192,7 @@ pub(crate) async fn install_packages(
     let stdout_task = spawn_output_reader(stdout, MAX_PACKAGE_OUTPUT_BYTES);
     let stderr_task = spawn_output_reader(stderr, MAX_PACKAGE_OUTPUT_BYTES);
 
-    let wait_result = tokio::time::timeout(
-        Duration::from_secs(PACKAGE_INSTALL_TIMEOUT_SECONDS),
-        child.wait(),
-    )
-    .await;
+    let wait_result = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
 
     let status = match wait_result {
         Ok(Ok(s)) => s,
@@ -207,7 +204,7 @@ pub(crate) async fn install_packages(
             let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             return Err(CmdError::timeout(format!(
                 "Package installation timeout after {}s",
-                PACKAGE_INSTALL_TIMEOUT_SECONDS
+                timeout
             )));
         }
     };

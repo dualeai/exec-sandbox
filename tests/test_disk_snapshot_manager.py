@@ -113,6 +113,61 @@ class TestSettings:
 
 
 # ============================================================================
+# Unit Tests - Transient Network Error Detection
+# ============================================================================
+
+
+class TestTransientNetworkErrorDetection:
+    """Tests for _is_transient_network_error() helper."""
+
+    @pytest.mark.parametrize(
+        "error_output",
+        [
+            "error: Failed to download: client error (Connect)",
+            "error: connection refused",
+            "error: connection reset by peer",
+            "error: connection timed out",
+            "error: Temporary failure in name resolution",
+            "error: Name resolution failed for files.pythonhosted.org",
+            "error: network unreachable",
+            "error: timed out waiting for response",
+            "error: reset by peer",
+            "error: request failed after 3 retries",
+        ],
+    )
+    def test_matches_transient_patterns(self, error_output: str) -> None:
+        """Known transient network patterns are detected."""
+        from exec_sandbox.disk_snapshot_manager import _is_transient_network_error
+
+        assert _is_transient_network_error(error_output) is True
+
+    @pytest.mark.parametrize(
+        "error_output",
+        [
+            "ERROR: No matching distribution found for nonexistent-package",
+            "ERROR: Invalid version specifier: pandas==",
+            "error: Could not find a version that satisfies the requirement",
+            "error: package 'foo' has no attribute 'bar'",
+            "SyntaxError: invalid syntax",
+            "",
+        ],
+    )
+    def test_does_not_match_permanent_errors(self, error_output: str) -> None:
+        """Permanent errors (bad package name, invalid version) are NOT detected as transient."""
+        from exec_sandbox.disk_snapshot_manager import _is_transient_network_error
+
+        assert _is_transient_network_error(error_output) is False
+
+    def test_case_insensitive(self) -> None:
+        """Pattern matching is case-insensitive."""
+        from exec_sandbox.disk_snapshot_manager import _is_transient_network_error
+
+        assert _is_transient_network_error("CONNECTION REFUSED") is True
+        assert _is_transient_network_error("Client Error (Connect)") is True
+        assert _is_transient_network_error("NETWORK UNREACHABLE") is True
+
+
+# ============================================================================
 # Integration Tests - Require QEMU + Images
 # ============================================================================
 
