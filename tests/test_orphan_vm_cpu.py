@@ -140,7 +140,11 @@ async def kill_vm_processes(vm: QemuVM) -> None:
 @pytest.mark.asyncio
 @skip_unless_hwaccel
 class TestOrphanVmCpu:
-    """Integration tests for orphan VM CPU behavior."""
+    """Integration tests for orphan VM CPU behavior.
+
+    Requires hwaccel: CPU idle measurement is meaningless under TCG — the
+    TCG JIT thread always spins, so the orphan idle invariant cannot hold.
+    """
 
     async def test_orphan_vm_stays_idle(self, vm_manager: VmManager) -> None:
         """Orphan VM (no destroy called) should use minimal CPU.
@@ -311,9 +315,14 @@ class TestOrphanVmCpu:
 
 
 @pytest.mark.asyncio
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestDestroyProcessCleanup:
-    """Tests for QemuVM.destroy() process termination."""
+    """Tests for QemuVM.destroy() process termination.
+
+    Slow under TCG: process kill correctness tests — OS-level, not
+    speed-dependent, but VM boot overhead makes them too slow for
+    the default suite.
+    """
 
     async def test_destroy_kills_qemu_process(self, vm_manager: VmManager) -> None:
         """QemuVM.destroy() should terminate the QEMU process."""

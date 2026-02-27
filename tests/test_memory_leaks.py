@@ -68,7 +68,11 @@ def iterations(request: pytest.FixtureRequest) -> int:
 @skip_unless_hwaccel
 @pytest.mark.slow
 async def test_no_memory_leak_without_network(iterations: int, images_dir: Path) -> None:
-    """Verify host memory returns to baseline after N VM executions."""
+    """Verify host memory returns to baseline after N VM executions.
+
+    Requires hwaccel: 90% success threshold — TCG timeouts cause too many
+    failures, inflating the failure rate below the threshold.
+    """
     process = psutil.Process()
     gc.collect()
     baseline_rss = process.memory_info().rss
@@ -100,7 +104,11 @@ async def test_no_memory_leak_without_network(iterations: int, images_dir: Path)
 @skip_unless_hwaccel
 @pytest.mark.slow
 async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) -> None:
-    """Verify no leak with network enabled (gvproxy) over N executions."""
+    """Verify no leak with network enabled (gvproxy) over N executions.
+
+    Requires hwaccel: same as test_no_memory_leak_without_network, plus
+    gvproxy overhead amplifies TCG timeout failures.
+    """
     process = psutil.Process()
     gc.collect()
     baseline_rss = process.memory_info().rss
@@ -397,7 +405,11 @@ async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path, tmp_path
 @skip_unless_hwaccel
 @pytest.mark.slow
 async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_dir: Path) -> None:
-    """Measure peak RAM overhead per concurrent VM execution."""
+    """Measure peak RAM overhead per concurrent VM execution.
+
+    Requires hwaccel: RSS thresholds are calibrated for KVM/HVF — TCG JIT
+    compilation inflates per-VM RSS, causing false positives.
+    """
     process = psutil.Process()
     gc.collect()
     baseline_rss = process.memory_info().rss
@@ -696,6 +708,9 @@ async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path
 @pytest.mark.parametrize("large_file_mb", [30, 50], ids=["30MB", "50MB"])
 async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_path: Path) -> None:
     """Measure peak RSS for large files — threshold is FLAT, not proportional.
+
+    Requires hwaccel: RSS thresholds are calibrated for KVM/HVF — TCG JIT
+    compilation inflates per-VM RSS, causing false positives.
 
     Uses Path input so _resolve_content opens a file handle (no copy).
     Streaming processes 128 KB chunks — ~500 KB alive at any point.

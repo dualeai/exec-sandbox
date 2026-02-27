@@ -14,7 +14,7 @@ from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_fast_balloon, skip_unless_hwaccel
+from tests.conftest import skip_unless_fast_balloon
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -1297,9 +1297,8 @@ class TestSchedulerWarmPoolTiming:
     async def test_warm_pool_total_approximately_equals_execute(self, warm_pool_scheduler: Scheduler) -> None:
         """For warm pool, total_ms should be close to execute_ms (no boot overhead).
 
-        Note: Balloon deflation uses fire-and-forget mode (wait_for_target=False) to
-        avoid the 5s polling overhead. The skip marker is kept as a safety margin for
-        other potential timing variations on slow/nested virtualization environments.
+        Requires fast_balloon: 100ms timing tolerance on balloon deflation —
+        slow or nested virtualization environments cannot meet this constraint.
         """
         result = await warm_pool_scheduler.run(
             code="print('hello')",
@@ -1490,18 +1489,19 @@ console.log("output=" + result.code.trim());
 ]
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestPackageInstallation:
     """Integration tests for package installation with real QEMU VMs.
+
+    Slow under TCG: package install correctness tests — snapshot VM creation
+    is functional under TCG but boot overhead makes them too slow for the
+    default suite.
 
     These tests verify that packages are correctly installed and persisted
     in snapshots. They catch bugs like:
     - QEMU exit code detection issues (macOS HVF vs Linux KVM)
     - Filesystem sync issues with cache=unsafe
     - Snapshot corruption during package install
-
-    Requires hardware acceleration (KVM/HVF) - snapshot creation spawns
-    extra QEMU VMs that exhaust thread limits under TCG emulation.
     """
 
     @pytest.mark.parametrize("language,packages,code,expected_outputs", PACKAGE_INSTALL_TEST_CASES)

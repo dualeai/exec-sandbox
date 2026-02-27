@@ -290,9 +290,13 @@ class TestHealthCheckPoolUnit:
 # ============================================================================
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestWarmVMPoolIntegration:
-    """Integration tests for WarmVMPool with real QEMU VMs."""
+    """Integration tests for WarmVMPool with real QEMU VMs.
+
+    Slow under TCG: pool start/stop/checkout correctness tests — work under
+    TCG but VM boot overhead (~5-8x) makes them too slow for the default suite.
+    """
 
     async def test_pool_start_stop(self, vm_manager) -> None:
         """Pool starts and stops cleanly."""
@@ -382,9 +386,14 @@ class TestWarmVMPoolIntegration:
 # ============================================================================
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestHealthcheckIntegration:
-    """Integration tests for healthcheck with real QEMU VMs."""
+    """Integration tests for healthcheck with real QEMU VMs.
+
+    Slow under TCG: health check correctness tests with no timing
+    assertions — work under TCG but boot overhead makes them too slow
+    for the default suite.
+    """
 
     async def test_check_vm_health_healthy_vm(self, vm_manager) -> None:
         """_check_vm_health returns True for healthy VM."""
@@ -964,9 +973,9 @@ def _assert_cpu_idle(
 class TestWarmPoolIdleCpu:
     """Integration tests verifying warm pool VMs consume zero CPU when idle.
 
-    Warm pool VMs are pre-booted and sit idle waiting for allocation. If they
-    consume CPU while idle, that's wasted compute cost at scale. These tests
-    enforce the invariant: no execution = no CPU.
+    Requires hwaccel: CPU idle measurement is meaningless under TCG — the
+    TCG JIT thread always spins, so the "no execution = no CPU" invariant
+    cannot hold.
 
     Measurement: sample cpu_percent every 1s over 10-15s.
     Assertions: median < 2%, p95 < 10%.
@@ -1144,9 +1153,8 @@ class TestWarmPoolIdleCpu:
 class TestPostExecutionCpuIdle:
     """Integration tests verifying VMs return to idle CPU after code execution.
 
-    After executing user code, the VM should settle back to near-zero CPU.
-    If it doesn't, that indicates a cpuidle misconfiguration (e.g. haltpoll
-    busy-looping on HVF) or a guest-agent spin-loop.
+    Requires hwaccel: post-execution CPU idle invariant doesn't hold under
+    TCG — the TCG JIT thread always spins, making idle measurement meaningless.
 
     Pattern: get warm VM → execute code → sleep(SETTLE) → sample CPU → assert idle.
     Run with -n 0 for accurate CPU measurement.

@@ -466,6 +466,9 @@ class TestLargePayloadStreaming:
 class TestStreamingThroughput:
     """Benchmark tests to measure raw streaming throughput.
 
+    Requires hwaccel: explicit MiB/s threshold assertions — TCG (~5-8x
+    slower) cannot meet the minimum throughput benchmarks.
+
     Uses sizes under the guest-agent's 1MB stdout limit (MAX_STDOUT_BYTES).
     Tests optimized data generation (/dev/zero, /dev/urandom) to isolate
     streaming performance from Python string manipulation overhead.

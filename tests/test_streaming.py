@@ -59,7 +59,12 @@ for i in range(100):
 
     @skip_unless_hwaccel
     async def test_multi_chunk_via_sleep(self, scheduler: Scheduler) -> None:
-        """Sleeps > 50ms flush interval force multiple chunks arriving at different times."""
+        """Sleeps > 50ms flush interval force multiple chunks arriving at different times.
+
+        Requires hwaccel: chunk count assertion depends on 50ms flush interval
+        vs wall-clock timing — TCG (~5-8x slower) compresses the sleep gaps
+        and batches chunks unpredictably.
+        """
         chunk_times: list[float] = []
 
         def on_stdout(_chunk: str) -> None:
@@ -115,7 +120,12 @@ for i in range(10):
 
     @skip_unless_hwaccel
     async def test_streaming_delivers_before_completion(self, scheduler: Scheduler) -> None:
-        """First callback fires well before execution completes (not batched at end)."""
+        """First callback fires well before execution completes (not batched at end).
+
+        Requires hwaccel: first-chunk-before-completion gap assertion (>300ms)
+        is unreliable under TCG — the 1s in-guest sleep stretches to ~5-8s,
+        compressing the measurable gap below threshold.
+        """
         first_chunk_time: list[float] = []
 
         def on_stdout(_chunk: str) -> None:

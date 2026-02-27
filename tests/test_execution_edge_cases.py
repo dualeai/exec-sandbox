@@ -271,8 +271,8 @@ while True:
     async def test_infinite_output_times_out(self, scheduler: Scheduler) -> None:
         """Infinite output is killed by timeout.
 
-        Note: Requires hardware acceleration because TCG is ~5-8x slower,
-        making the 3s timeout elapse before the VM can produce any output.
+        Requires hwaccel: 3s timeout is too short for TCG (~5-8x slower) —
+        the VM cannot produce any output before the deadline expires.
         """
         code = """
 while True:
@@ -345,7 +345,8 @@ os._exit(42)
     async def test_sigterm_graceful_exit(self, scheduler: Scheduler) -> None:
         """Process catches SIGTERM and exits gracefully.
 
-        Reliability: Verifies signal type via output.
+        Requires hwaccel: 2s timeout is too short for TCG (~5-8x slower) —
+        the signal handler cannot fire before the deadline.
         """
         code = """
 import signal
@@ -393,12 +394,12 @@ os.kill(os.getpid(), signal.SIGSEGV)
         # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
         assert result.exit_code == 139
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_normal_exit_no_termination_needed(self, scheduler: Scheduler) -> None:
-        """Process exits normally before timeout - no termination needed.
+        """Process exits normally before timeout — no termination needed.
 
-        Normal case: verifies baseline behavior when graceful termination
-        is not triggered.
+        Slow under TCG: correctness test with generous 30s timeout,
+        but TCG boot overhead (~5-8x) makes it too slow for the default suite.
         """
         code = """
 print("STARTING", flush=True)
@@ -418,12 +419,8 @@ print("DONE", flush=True)
     async def test_sigterm_ignored_escalates_to_sigkill(self, scheduler: Scheduler) -> None:
         """Process ignoring SIGTERM is killed by SIGKILL after grace period.
 
-        Weird case: verifies SIGTERM→SIGKILL escalation via timing.
-        If SIGTERM worked, execution would be ~2s. Since it's ignored,
-        must wait 5s grace period before SIGKILL, so execution >= 5s.
-
-        Note: Requires hardware acceleration because TCG is ~5-8x slower,
-        making the 2s timeout fail before the process can even print output.
+        Requires hwaccel: 2s timeout + >= 5000ms timing assertion — TCG
+        (~5-8x slower) cannot meet these timing constraints.
         """
         code = """
 import signal
@@ -499,7 +496,8 @@ wait
     async def test_python_subprocess_tree_termination(self, scheduler: Scheduler) -> None:
         """Python subprocesses are terminated via process group.
 
-        Reliability: Same timing strategy as shell test.
+        Requires hwaccel: 15s timeout is marginal for TCG — Python boot
+        under TCG takes ~8-12s, leaving little room for the actual test.
         """
         code = """
 import subprocess
@@ -531,9 +529,14 @@ time.sleep(60)  # Wait to be killed
 class TestOutOfBounds:
     """Tests for resource limits and exhaustion."""
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_memory_allocation_large(self, scheduler: Scheduler) -> None:
-        """Attempting to allocate lots of memory."""
+        """Attempting to allocate lots of memory.
+
+        Slow under TCG: OOM correctness test with generous 30s timeout and
+        no timing assertions, but TCG boot overhead makes it too slow for
+        the default suite.
+        """
         # Try to allocate 500MB (should fail or be killed with 256MB VM)
         code = """
 try:

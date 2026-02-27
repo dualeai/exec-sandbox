@@ -287,9 +287,13 @@ class TestSessionEdgeCases:
                 result = await session.exec(f"print({i})")
                 assert result.exit_code == 0
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_session_with_packages(self, scheduler: Scheduler) -> None:
-        """Session with pre-installed packages works."""
+        """Session with pre-installed packages works.
+
+        Slow under TCG: correctness test — snapshot VM may be slow under
+        TCG but should succeed with sufficient timeout.
+        """
         async with await scheduler.session(
             language=Language.PYTHON,
             packages=["requests==2.32.3"],
@@ -597,9 +601,13 @@ class TestSessionOutOfBounds:
         finally:
             await session.close()
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_sigkill_preserves_session(self, scheduler: Scheduler) -> None:
-        """SIGKILL (same signal OOM killer sends) doesn't destroy session."""
+        """SIGKILL (same signal OOM killer sends) doesn't destroy session.
+
+        Slow under TCG: REPL respawn correctness test with no timing
+        assertions — works under TCG but too slow for the default suite.
+        """
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.exec("x = 42")
             # SIGKILL mirrors what the OOM killer does
@@ -610,9 +618,13 @@ class TestSessionOutOfBounds:
             assert result.exit_code == 0
             assert "state_reset" in result.stdout
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_oom_preserves_session(self, scheduler: Scheduler) -> None:
-        """Actual OOM-killed code doesn't destroy session — REPL respawns."""
+        """Actual OOM-killed code doesn't destroy session — REPL respawns.
+
+        Slow under TCG: OOM + respawn correctness test with 30s timeout —
+        generous but TCG boot overhead makes it too slow for the default suite.
+        """
         async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
             # Allocate and write to memory in a loop. Writing forces page faults,
             # which commits physical memory and triggers the kernel OOM killer.
@@ -628,9 +640,13 @@ class TestSessionOutOfBounds:
             assert result.exit_code == 0
             assert "alive" in result.stdout
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_repeated_repl_death_preserves_session(self, scheduler: Scheduler) -> None:
-        """Session survives multiple consecutive REPL deaths."""
+        """Session survives multiple consecutive REPL deaths.
+
+        Slow under TCG: correctness test — 3x kill+respawn cycles are
+        functional under TCG but too slow for the default suite.
+        """
         async with await scheduler.session(language=Language.PYTHON) as session:
             for i in range(3):
                 # Kill REPL
@@ -643,7 +659,11 @@ class TestSessionOutOfBounds:
 
     @skip_unless_hwaccel
     async def test_exec_timeout_preserves_session(self, scheduler: Scheduler) -> None:
-        """Execution timeout returns error result but session stays alive."""
+        """Execution timeout returns error result but session stays alive.
+
+        Requires hwaccel: 2s timeout — TCG (~5-8x slower) cannot complete
+        REPL boot and timeout semantics within the deadline.
+        """
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Timeout returns result with exit_code=-1 (not an exception)
             result = await session.exec("import time; time.sleep(60)", timeout_seconds=2)
@@ -678,6 +698,9 @@ class TestSessionOutOfBounds:
 @skip_unless_hwaccel
 class TestSessionReconnect:
     """Tests for state persistence across guest agent reconnect cycles.
+
+    Requires hwaccel: 12s real-time idle timeout — TCG (~5-8x slower) makes
+    the reconnect cycle unreliable within test timeouts.
 
     Guest agent drops connection after 12s idle (READ_TIMEOUT_MS=12000).
     REPL subprocess must survive (guest agent process stays alive).
@@ -787,9 +810,13 @@ class TestWorkingDirectory:
 # =============================================================================
 # TestLazyCloudpickle - Deferred cloudpickle import
 # =============================================================================
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestLazyCloudpickle:
     """Tests for lazy cloudpickle import in REPL.
+
+    Slow under TCG: pure correctness tests for cloudpickle/multiprocessing
+    import — no timing assertions, but TCG boot overhead makes them too
+    slow for the default suite.
 
     Change 2: cloudpickle is deferred until multiprocessing.Process.start().
     """

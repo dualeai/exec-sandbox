@@ -51,6 +51,9 @@ async def l1_scheduler(images_dir: Path) -> AsyncGenerator[Scheduler, None]:
 class TestL1SnapshotRNG:
     """Verify RNG uniqueness after L1 memory snapshot restore.
 
+    Requires hwaccel: L1 memory snapshots use QEMU migration which requires
+    hardware-accelerated CPU state save/restore (KVM/HVF).
+
     The L1 snapshot saves full CPU+RAM+device state via QEMU migration.
     On restore, the kernel CRNG resumes from the saved state. The guest-agent
     forces an immediate CRNG reseed (RNDRESEEDCRNG ioctl) before every command

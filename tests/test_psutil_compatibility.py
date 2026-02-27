@@ -31,12 +31,10 @@ from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
-from .conftest import skip_unless_hwaccel
-
-# All psutil tests require hardware acceleration (KVM/HVF).
-# Snapshot creation with packages spawns extra QEMU VMs that exhaust
-# thread limits when running under TCG software emulation.
-pytestmark = skip_unless_hwaccel
+# Slow under TCG: psutil correctness tests inside guest — package install
+# requires snapshot VM (slow under TCG). All assertions are correctness-only
+# (0-100 range, non-None values), no tight timing thresholds.
+pytestmark = pytest.mark.slow
 
 PSUTIL_PACKAGES = ["psutil==7.2.1"]
 

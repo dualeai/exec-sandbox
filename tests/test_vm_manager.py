@@ -1406,8 +1406,11 @@ class TestCheckHwaccelAvailable:
 
     @skip_unless_hwaccel
     async def test_hwaccel_available_when_expected(self) -> None:
-        """Hardware acceleration is available on supported systems."""
-        # This test only runs when hwaccel is expected to be available
+        """Hardware acceleration is available on supported systems.
+
+        Requires hwaccel: self-referential — validates that the hwaccel
+        detection mechanism itself reports True when expected.
+        """
         assert await check_hwaccel_available() is True
 
     async def test_consistent_results(self) -> None:

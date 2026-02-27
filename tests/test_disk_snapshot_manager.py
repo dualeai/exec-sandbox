@@ -18,7 +18,6 @@ else:
 from exec_sandbox import __version__
 from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
-from tests.conftest import skip_unless_hwaccel
 
 
 def _get_major_minor_version() -> str:
@@ -173,9 +172,12 @@ class TestDiskSnapshotManagerIntegration:
         assert len(base_parts[2]) == 8  # img_hash is 8 chars
 
     @pytest.mark.sudo
-    @skip_unless_hwaccel
     async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
-        """Create snapshot with packages (slow, requires VM, uses qemu-vm user on Linux)."""
+        """Create snapshot with packages (requires VM, uses qemu-vm user on Linux).
+
+        Slow under TCG: snapshot creation boots two VMs (install + verify) —
+        functional under TCG but boot overhead makes it too slow for the default suite.
+        """
         from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
         settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")

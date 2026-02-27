@@ -2,8 +2,11 @@
 
 Test philosophy:
 - Unit tests: Pure logic only, no real daemon process, no mocks unless unavoidable
-- Integration tests: Real daemon, real files, real code paths (requires hwaccel)
+- Integration tests: Real daemon, real files, real code paths
 - Error tests: Real daemon, verify error handling works correctly
+
+No hwaccel required: qemu-storage-daemon is a host-side tool (QMP over unix socket)
+that creates qcow2 overlays — it does not boot VMs or use KVM/HVF.
 """
 
 import asyncio
@@ -20,8 +23,6 @@ from exec_sandbox.overlay_pool import OverlayPool
 from exec_sandbox.process_registry import _process_groups
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError, QmpEvent
 from exec_sandbox.vm_manager import VmManager
-
-from .conftest import skip_unless_hwaccel
 
 # ============================================================================
 # Test Helpers & Fixtures
@@ -346,9 +347,12 @@ class TestQemuStorageDaemonUnit:
 # ============================================================================
 
 
-@skip_unless_hwaccel
 class TestQemuStorageDaemonIntegration:
-    """Integration tests with real qemu-storage-daemon - no mocking."""
+    """Integration tests with real qemu-storage-daemon — no mocking.
+
+    No hwaccel required: qemu-storage-daemon is a host-side tool that
+    creates qcow2 overlays via QMP — it does not boot VMs or use KVM/HVF.
+    """
 
     async def test_start_stop_lifecycle(self) -> None:
         """Daemon starts and stops cleanly."""
@@ -613,9 +617,12 @@ class TestQemuStorageDaemonIntegration:
 # ============================================================================
 
 
-@skip_unless_hwaccel
 class TestOverlayPoolWithDaemon:
-    """Integration tests for OverlayPool using QemuStorageDaemon."""
+    """Integration tests for OverlayPool using QemuStorageDaemon.
+
+    No hwaccel required: uses qemu-storage-daemon (host-side QMP tool)
+    for overlay creation — no VMs are booted.
+    """
 
     async def test_pool_uses_daemon_when_enabled(self, base_image: Path, tmp_path: Path) -> None:
         """OverlayPool uses daemon for overlay creation."""
@@ -652,9 +659,12 @@ class TestOverlayPoolWithDaemon:
 # ============================================================================
 
 
-@skip_unless_hwaccel
 class TestQemuStorageDaemonErrors:
-    """Test error handling with real daemon - no mocking."""
+    """Test error handling with real daemon — no mocking.
+
+    No hwaccel required: qemu-storage-daemon is a host-side tool that
+    creates qcow2 overlays via QMP — it does not boot VMs or use KVM/HVF.
+    """
 
     async def test_create_overlay_nonexistent_base_image_fails(
         self, started_daemon: QemuStorageDaemon, tmp_path: Path
@@ -742,9 +752,12 @@ class TestQemuStorageDaemonErrors:
 # ============================================================================
 
 
-@skip_unless_hwaccel
 class TestQemuStorageDaemonStress:
-    """Stress tests for daemon under load."""
+    """Stress tests for daemon under load.
+
+    No hwaccel required: qemu-storage-daemon is a host-side tool that
+    creates qcow2 overlays via QMP — it does not boot VMs or use KVM/HVF.
+    """
 
     async def test_many_overlays_sequential(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
