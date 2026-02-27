@@ -632,8 +632,8 @@ class Scheduler:
                     logger.warning(
                         "L1 restore failed, falling back to cold boot",
                         extra={"language": language, "error": str(e)},
-                        exc_info=True,
                     )
+                    logger.debug("L1 restore traceback", exc_info=True)
                     vm = None
 
         # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
