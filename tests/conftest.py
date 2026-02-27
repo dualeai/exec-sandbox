@@ -57,10 +57,16 @@ _QEMU_CRASH_MAX_RETRIES = 5
 _QEMU_CRASH_BACKOFF_BASE_S = 2  # exponential: 2s, 4s, 8s, 16s, 32s
 _QEMU_CRASH_JITTER_MAX_S = 10.0  # uniform random jitter [0, 10s)
 
-# Exact substrings from QEMU's stderr/console that indicate retryable crashes.
+# Exact substrings from QEMU's stderr/console that indicate retryable failures.
+# Thread exhaustion: "Resource temporarily unavailable" / "SIGABRT"
+# VM timeouts under TCG contention: VmBootTimeoutError (host watchdog) and
+# VmTransientError (guest agent unresponsive). These are classified as
+# "may succeed on retry" by the exception hierarchy (exceptions.py).
 _QEMU_RETRYABLE_SIGNATURES = (
     "Resource temporarily unavailable",
     "SIGABRT",
+    "VmBootTimeoutError",
+    "VmTransientError",
 )
 
 

@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from exec_sandbox.constants import DEFAULT_TIMEOUT_SECONDS
 from exec_sandbox.exceptions import OutputLimitError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
@@ -556,16 +557,17 @@ class TestStreamingOutOfBounds:
         """Output before timeout is captured; rest is absent."""
         stdout_chunks: list[str] = []
 
-        code = """
+        timeout = DEFAULT_TIMEOUT_SECONDS // 2
+        code = f"""
 import time
 print("before-timeout", flush=True)
-time.sleep(60)
+time.sleep({timeout * 4})
 print("after-timeout")
 """
         await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=3,
+            timeout_seconds=timeout,
             on_stdout=stdout_chunks.append,
         )
 
