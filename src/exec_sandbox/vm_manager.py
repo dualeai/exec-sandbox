@@ -739,19 +739,16 @@ class VmManager:
                 initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
 
                 logger.error(
-                    "Guest agent boot timeout",
-                    extra={
-                        "vm_id": infra.vm_id,
-                        "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
-                        "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
-                        "console_log": console_snapshot,
-                        "qemu_running": vm.process.returncode is None,
-                        "qemu_returncode": vm.process.returncode,
-                        "qemu_cmd": qemu_cmd_str[:1000],
-                        "overlay_image": str(infra.workdir.overlay_image),
-                        "kernel_path": str(kernel_path),
-                        "initramfs_path": str(initramfs_path),
-                    },
+                    "Guest agent boot timeout\n"
+                    "  vm_id=%s qemu_running=%s qemu_returncode=%s\n"
+                    "  qemu_cmd: %s\n  stderr: %s\n  stdout: %s\n  console:\n%s",
+                    infra.vm_id,
+                    vm.process.returncode is None,
+                    vm.process.returncode,
+                    qemu_cmd_str[:1000],
+                    stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
+                    stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
+                    console_snapshot,
                 )
 
                 await vm.destroy()
@@ -1304,8 +1301,8 @@ class VmManager:
             host_os = detect_host_os()
             if host_os == HostOS.MACOS and vm.process.returncode == 0:
                 logger.warning(
-                    "QEMU exited with code 0 during boot on macOS (will retry)",
-                    extra={"vm_id": vm.vm_id, "exit_code": 0, "host_os": "macos"},
+                    "QEMU exited with code 0 during boot on macOS (will retry) vm_id=%s",
+                    vm.vm_id,
                 )
                 raise VmQemuCrashError(
                     "QEMU process exited during boot (macOS clean exit)",
@@ -1319,15 +1316,14 @@ class VmManager:
             if accel_type == AccelType.TCG and vm.process.returncode == 0:
                 console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
                 stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
+                stderr_preview = stderr_text[:500] if stderr_text else "(empty)"
                 logger.warning(
-                    "QEMU TCG exited with code 0 during boot (will retry)",
-                    extra={
-                        "vm_id": vm.vm_id,
-                        "exit_code": 0,
-                        "host_os": host_os.value,
-                        "console_log": console_snapshot[-2000:],
-                        "stderr": stderr_text[:500] if stderr_text else "(empty)",
-                    },
+                    "QEMU TCG exited with code 0 during boot (will retry)\n"
+                    "  vm_id=%s host_os=%s\n  stderr: %s\n  console:\n%s",
+                    vm.vm_id,
+                    host_os.value,
+                    stderr_preview,
+                    console_snapshot[-2000:],
                 )
                 raise VmQemuCrashError(
                     "QEMU TCG exited with code 0 during boot (guest reboot/panic)",
@@ -1345,15 +1341,15 @@ class VmManager:
             console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
 
             logger.error(
-                "QEMU process exited unexpectedly",
-                extra={
-                    "vm_id": vm.vm_id,
-                    "exit_code": vm.process.returncode,
-                    "signal": signal_name,
-                    "stdout": stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
-                    "stderr": stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
-                    "console_log": console_snapshot,
-                },
+                "QEMU process exited unexpectedly\n"
+                "  vm_id=%s exit_code=%s signal=%s\n"
+                "  stderr: %s\n  stdout: %s\n  console:\n%s",
+                vm.vm_id,
+                vm.process.returncode,
+                signal_name,
+                stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
+                stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
+                console_snapshot,
             )
             stderr_preview = stderr_text[:200] if stderr_text else "(empty)"
             raise VmQemuCrashError(
