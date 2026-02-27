@@ -201,13 +201,18 @@ _FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 3
 # Read path: op_queue (maxsize=OP_QUEUE_DEPTH) buffers FileChunkResponseMessage
 # models while consumer awaits disk I/O per chunk.
 _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
-# Pipeline overhead for psutil RSS tests (includes C allocators, page cache, etc).
-_FILE_IO_RSS_OVERHEAD_MB = 10
+# Pipeline overhead for psutil RSS tests (includes C allocators, page cache,
+# write queue fill during sustained transfers, and free-threaded Python overhead).
+_FILE_IO_RSS_OVERHEAD_MB = 14
 # Streaming chunk pipeline headroom for RSS tests (~500KB real, padded for jitter).
 _FILE_IO_RSS_STREAMING_OVERHEAD_MB = 2
-# Intra-session leak ceiling: fixed overhead from GC fragmentation + larger
-# write pipeline buffers over 50 cycles.
-_FILE_IO_INTRA_SESSION_LEAK_MB = 20
+# Intra-session accumulation ceiling (tracemalloc current, NOT RSS).
+# RSS is unreliable here: allocators never return pages to the OS after
+# many large alloc/free cycles (allocator hysteresis), inflating RSS by
+# the peak allocation high-water mark (BytesIO copy + queue fill ≈ 22 MB
+# for 10 MB files).  tracemalloc.get_traced_memory()[0] measures live
+# Python objects only — immune to OS allocator behavior.
+_FILE_IO_INTRA_SESSION_LEAK_MB = 5
 
 
 @pytest.fixture(params=_FILE_IO_SIZES_MB, ids=[f"{s}MB" for s in _FILE_IO_SIZES_MB])
@@ -278,12 +283,17 @@ async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_di
 
     Single VM, 50 write+read cycles.  Catches asyncio StreamReader buffer
     inflation, Pydantic model caching, and unreleased base64 temporaries.
-    Threshold: flat _FILE_IO_INTRA_SESSION_LEAK_MB (GC/allocator jitter only).
+
+    Uses tracemalloc (current allocation, not peak) instead of psutil RSS.
+    RSS is unreliable here: OS allocators keep the high-water mark after
+    many large alloc/free cycles (allocator hysteresis), inflating the
+    measurement by the peak allocation (~BytesIO copy + queue fill) even
+    though all objects are freed.  tracemalloc measures live Python objects
+    only, making the test deterministic across platforms and allocators.
+
+    First iteration warms up caches and JIT; measurement starts after.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
 
     config = SchedulerConfig(
         images_dir=images_dir,
@@ -292,25 +302,40 @@ async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_di
 
     async with Scheduler(config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
-            for i in range(50):
-                content = os.urandom(size_bytes)
-                dest = tmp_path / f"intra_test_{i}.bin"
-                # Reuse same guest path to avoid filling disk (50 x 10MB = 500MB)
-                await session.write_file("intra_test.bin", content)
-                await session.read_file("intra_test.bin", destination=dest)
-                assert dest.stat().st_size == len(content)
-                dest.unlink(missing_ok=True)
+            # Warm-up iteration: populates Pydantic caches, zstd contexts, etc.
+            warmup_content = os.urandom(size_bytes)
+            warmup_dest = tmp_path / "warmup.bin"
+            await session.write_file("intra_test.bin", warmup_content)
+            await session.read_file("intra_test.bin", destination=warmup_dest)
+            warmup_dest.unlink(missing_ok=True)
+            del warmup_content
 
-    gc.collect()
-    gc.collect()
+            gc.collect()
+            tracemalloc.start()
+            baseline_traced = tracemalloc.get_traced_memory()[0]
 
-    final_rss = process.memory_info().rss
-    growth_mb = (final_rss - baseline_rss) / 1024 / 1024
+            try:
+                for i in range(50):
+                    content = os.urandom(size_bytes)
+                    dest = tmp_path / f"intra_test_{i}.bin"
+                    # Reuse same guest path to avoid filling disk (50 x 10MB = 500MB)
+                    await session.write_file("intra_test.bin", content)
+                    await session.read_file("intra_test.bin", destination=dest)
+                    assert dest.stat().st_size == len(content)
+                    dest.unlink(missing_ok=True)
+                    del content
+                    gc.collect()
+
+                final_traced = tracemalloc.get_traced_memory()[0]
+            finally:
+                tracemalloc.stop()
+
+    growth_mb = (final_traced - baseline_traced) / 1024 / 1024
 
     assert growth_mb < _FILE_IO_INTRA_SESSION_LEAK_MB, (
-        f"Memory leak: {growth_mb:.1f}MB growth after 50 x {file_io_size_mb}MB "
-        f"intra-session file I/O (flat threshold: {_FILE_IO_INTRA_SESSION_LEAK_MB}MB — "
-        f"streaming buffers are O(chunk_size), growth is GC/allocator jitter only)"
+        f"Memory leak: {growth_mb:.1f}MB tracemalloc growth after 50 x {file_io_size_mb}MB "
+        f"intra-session file I/O (threshold: {_FILE_IO_INTRA_SESSION_LEAK_MB}MB — "
+        f"streaming buffers are O(chunk_size), growth should be near zero)"
     )
 
 
@@ -696,12 +721,16 @@ async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_
 
     peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
 
-    # Flat threshold: VM lifecycle + streaming chunk pipeline (~500 KB)
-    threshold_mb = _PEAK_RAM_PER_VM_MB + _FILE_IO_RSS_STREAMING_OVERHEAD_MB
+    # Flat threshold: VM lifecycle + full pipeline RSS overhead.
+    # During sustained large-file transfers the write queue (64 x ~175 KB)
+    # fills up, and C allocators / kernel buffers add further overhead.
+    # _FILE_IO_RSS_OVERHEAD_MB captures this (vs the minimal per-session
+    # _FILE_IO_RSS_STREAMING_OVERHEAD_MB used in the concurrent test).
+    threshold_mb = _PEAK_RAM_PER_VM_MB + _FILE_IO_RSS_OVERHEAD_MB
     assert peak_growth_mb < threshold_mb, (
         f"Peak RAM too high for {large_file_mb}MB file: {peak_growth_mb:.1f}MB "
         f"(flat threshold: {threshold_mb}MB = {_PEAK_RAM_PER_VM_MB}MB VM + "
-        f"{_FILE_IO_RSS_STREAMING_OVERHEAD_MB}MB streaming headroom). "
+        f"{_FILE_IO_RSS_OVERHEAD_MB}MB pipeline overhead). "
         f"Streaming is O(chunk_size), not O(file_size)."
     )
 
