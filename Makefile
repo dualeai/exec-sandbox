@@ -103,9 +103,9 @@ test-static:
 test-func:
 	uv run pytest tests/ -v -n auto -m "not sudo and not slow"
 
-# Tests requiring sudo privileges (run separately with elevated permissions)
+# Tests requiring sudo privileges (run sequentially on slow CI runners)
 test-sudo:
-	uv run pytest tests/ -v -n auto -m "sudo"
+	uv run pytest tests/ -v -n 0 -m "sudo"
 
 # Unit tests only (fast)
 test-unit:
