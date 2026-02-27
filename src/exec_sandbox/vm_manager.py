@@ -18,13 +18,13 @@ Performance Optimizations (QEMU 10.0+):
 """
 
 import asyncio
-import contextlib
 import logging
 import os
 import re
 import shlex
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -40,7 +40,7 @@ from tenacity import (
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.admission import ResourceAdmissionController
+from exec_sandbox.admission import ResourceAdmissionController, ResourceReservation
 from exec_sandbox.exceptions import (
     VmBootTimeoutError,
     VmConfigError,
@@ -264,6 +264,53 @@ class VmManager:
         """Exit async context manager, stopping the manager."""
         await self.stop()
 
+    @asynccontextmanager
+    async def reservation_context(
+        self,
+        vm_id: str,
+        memory_mb: int,
+    ) -> AsyncGenerator[ResourceReservation]:
+        """Acquire an admission reservation for a restore→create fallback sequence.
+
+        Use when a caller may try restore_vm then fall back to create_vm,
+        to avoid blocking on admission twice. The yielded reservation is
+        passed to create_vm/restore_vm via their ``reservation`` parameter.
+
+        Contract:
+        - On exception: reservation is released automatically.
+        - On normal exit: the caller MUST have created a VM that took
+          ownership (``vm.resource_reservation = reservation``).
+          destroy_vm() releases it later. Exiting normally without
+          creating a VM is a usage error that leaks the reservation.
+
+        Usage::
+
+            async with vm_manager.reservation_context(vm_id, memory_mb) as reservation:
+                try:
+                    vm = await vm_manager.restore_vm(..., reservation=reservation)
+                except Exception:
+                    vm = None
+                if vm is None:
+                    vm = await vm_manager.create_vm(..., reservation=reservation)
+        """
+        accel_type = await self._detect_accel_type()
+        use_tcg = accel_type == AccelType.TCG
+        reservation = await self._admission.acquire(
+            vm_id=vm_id,
+            memory_mb=memory_mb,
+            cpu_cores=constants.DEFAULT_VM_CPU_CORES,
+            timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
+            use_tcg=use_tcg,
+        )
+        try:
+            yield reservation
+        except BaseException:
+            # Neither restore_vm nor create_vm consumed the reservation — release it.
+            # If a VM was successfully created, it owns the reservation and
+            # destroy_vm will release it. The double-release is safe (idempotent).
+            await self._admission.release(reservation)
+            raise
+
     async def create_vm(
         self,
         language: Language,
@@ -276,6 +323,7 @@ class VmManager:
         expose_ports: list[ExposedPort] | None = None,
         on_boot_log: Callable[[str], None] | None = None,
         snapshot_drive: Path | None = None,
+        reservation: ResourceReservation | None = None,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -302,6 +350,9 @@ class VmManager:
             snapshot_drive: Path to ext4 qcow2 snapshot (serial=snap, read-only).
                 When set, tiny-init discovers drives by serial number and mounts
                 EROFS base + ext4 snapshot via overlayfs.
+            reservation: Pre-acquired admission reservation from reservation_context().
+                When provided, skips admission acquire (caller owns the reservation).
+                When None, self-acquires as usual (backward compatible).
 
         Returns:
             QemuVM handle for code execution
@@ -311,18 +362,20 @@ class VmManager:
             VmPermanentError: VM creation failed (not retryable)
             asyncio.TimeoutError: VM boot timeout after all retries
         """
-        # Detect acceleration type to calculate accurate memory overhead
-        accel_type = await self._detect_accel_type()
-        use_tcg = accel_type == AccelType.TCG
+        owns_reservation = reservation is None
+        if owns_reservation:
+            # Detect acceleration type to calculate accurate memory overhead
+            accel_type = await self._detect_accel_type()
+            use_tcg = accel_type == AccelType.TCG
 
-        # Acquire resource reservation - blocks if insufficient resources
-        reservation = await self._admission.acquire(
-            vm_id=f"{tenant_id}-{task_id}",
-            memory_mb=memory_mb,
-            cpu_cores=constants.DEFAULT_VM_CPU_CORES,
-            timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
-            use_tcg=use_tcg,
-        )
+            # Acquire resource reservation - blocks if insufficient resources
+            reservation = await self._admission.acquire(
+                vm_id=f"{tenant_id}-{task_id}",
+                memory_mb=memory_mb,
+                cpu_cores=constants.DEFAULT_VM_CPU_CORES,
+                timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
+                use_tcg=use_tcg,
+            )
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(constants.VM_BOOT_MAX_RETRIES),
@@ -360,7 +413,9 @@ class VmManager:
             raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
         except BaseException:
             # Release reservation on failure - VM was not created successfully
-            await self._admission.release(reservation)
+            # Only release if we own the reservation (self-acquired)
+            if owns_reservation:
+                await self._admission.release(reservation)
             raise
 
     async def _setup_vm_infra(
@@ -417,7 +472,7 @@ class VmManager:
 
         # Socket cleanup + channel
         for socket_path in [workdir.cmd_socket, workdir.event_socket, str(workdir.qmp_socket)]:
-            with contextlib.suppress(OSError):
+            with suppress(OSError):
                 await aiofiles.os.remove(socket_path)
 
         if workdir.use_qemu_vm_user:
@@ -591,7 +646,7 @@ class VmManager:
         """Clean up after failed VM launch: cancel drains, unregister, cleanup resources."""
         if qemu_log_task is not None and not qemu_log_task.done():
             qemu_log_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with suppress(asyncio.CancelledError):
                 await qemu_log_task
 
         async with self._vms_lock:
@@ -786,7 +841,7 @@ class VmManager:
                     cgroup_path=infra.cgroup_path,
                 )
 
-    async def restore_vm(
+    async def restore_vm(  # noqa: PLR0915
         self,
         language: Language,
         tenant_id: str,
@@ -797,6 +852,7 @@ class VmManager:
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
         expose_ports: list[ExposedPort] | None = None,
+        reservation: ResourceReservation | None = None,
     ) -> QemuVM:
         """Restore VM from L1 memory snapshot (full CPU+RAM+device state).
 
@@ -817,6 +873,9 @@ class VmManager:
             allowed_domains: Whitelist of allowed domains for DNS/TLS filtering.
                 None for language defaults, empty list to block all outbound.
             expose_ports: List of ports to expose from guest to host.
+            reservation: Pre-acquired admission reservation from reservation_context().
+                When provided, skips admission acquire (caller owns the reservation).
+                When None, self-acquires as usual (backward compatible).
 
         Returns:
             QemuVM in READY state with l1_restored=True
@@ -835,21 +894,24 @@ class VmManager:
                 context={"vmstate_path": str(vmstate_path)},
             )
 
-        # Acquire resource reservation FIRST (matches create_vm ordering).
-        # Acquiring overlay before admission would hold an overlay slot during
-        # backpressure waits, starving other callers.
-        reservation = await self._admission.acquire(
-            vm_id=f"{tenant_id}-{task_id}",
-            memory_mb=memory_mb,
-            cpu_cores=constants.DEFAULT_VM_CPU_CORES,
-            timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
-        )
+        owns_reservation = reservation is None
+        if owns_reservation:
+            # Acquire resource reservation FIRST (matches create_vm ordering).
+            # Acquiring overlay before admission would hold an overlay slot during
+            # backpressure waits, starving other callers.
+            reservation = await self._admission.acquire(
+                vm_id=f"{tenant_id}-{task_id}",
+                memory_mb=memory_mb,
+                cpu_cores=constants.DEFAULT_VM_CPU_CORES,
+                timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
+            )
 
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
         try:
             infra = await self._setup_vm_infra(language, tenant_id, task_id, memory_mb)
         except BaseException:
-            await self._admission.release(reservation)
+            if owns_reservation:
+                await self._admission.release(reservation)
             raise
 
         # Grant qemu-vm read access to snapshot drive if present
@@ -952,7 +1014,8 @@ class VmManager:
 
         except BaseException:
             if not vm_created:
-                await self._admission.release(reservation)
+                if owns_reservation:
+                    await self._admission.release(reservation)
                 await self._cleanup_failed_launch(
                     infra.vm_id,
                     gvproxy_proc=gvproxy_proc,
@@ -1100,12 +1163,12 @@ class VmManager:
             # Cancel output reader tasks (prevent pipe deadlock during cleanup)
             if vm.qemu_log_task and not vm.qemu_log_task.done():
                 vm.qemu_log_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError):
                     await vm.qemu_log_task
 
             if vm.gvproxy_log_task and not vm.gvproxy_log_task.done():
                 vm.gvproxy_log_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError):
                     await vm.gvproxy_log_task
 
             # Destroy VM (transitions state, closes channel)

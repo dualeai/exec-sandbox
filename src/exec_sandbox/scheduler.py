@@ -607,72 +607,76 @@ class Scheduler:
         if vm is None:
             is_cold_boot = True
 
-            # L1 memory snapshot restore (~100ms)
-            # Cache key includes network topology (needs_network, not just allow_network)
-            # because expose_ports also adds a virtio-net device.
-            # Skip when on_boot_log requested (L1 skips boot, callback would never fire).
-            if self._memory_snapshot_manager and on_boot_log is None:
-                try:
-                    vmstate_path = await self._memory_snapshot_manager.check_cache(
-                        language,
-                        packages,
-                        memory,
-                        allow_network=needs_network,
-                    )
-                    if vmstate_path:
-                        l2_path = await self._memory_snapshot_manager.get_l2_for_l1(language, packages)
-                        vm = await self._vm_manager.restore_vm(
-                            language,
-                            constants.SCHEDULER_TENANT_ID,
-                            task_id,
-                            vmstate_path=vmstate_path,
-                            memory_mb=memory,
-                            snapshot_drive=l2_path,
-                            allow_network=allow_network,
-                            allowed_domains=allowed_domains,
-                            expose_ports=resolved_ports if resolved_ports else None,
-                        )
-                        logger.info(
-                            "VM restored from L1 cache",
-                            extra={"vm_id": vm.vm_id, "language": language},
-                        )
-                except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
-                    logger.warning(
-                        "L1 restore failed, falling back to cold boot",
-                        extra={"language": language, "error": str(e)},
-                    )
-                    logger.debug("L1 restore traceback", exc_info=True)
-                    vm = None
-
-        # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
-        if vm is None:
-            is_cold_boot = True
-
-            # Auto-download base image if needed
-            if self.config.auto_download_assets:
-                await fetch_base_image(language)
-
-            vm = await self._vm_manager.create_vm(
-                language=language,
-                tenant_id=constants.SCHEDULER_TENANT_ID,
-                task_id=task_id,
+            async with self._vm_manager.reservation_context(
+                vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}",
                 memory_mb=memory,
-                allow_network=allow_network,
-                allowed_domains=allowed_domains,
-                expose_ports=resolved_ports if resolved_ports else None,
-                on_boot_log=on_boot_log,
-                snapshot_drive=snapshot_path,
-            )
+            ) as reservation:
+                # L1 memory snapshot restore (~100ms)
+                # Cache key includes network topology (needs_network, not just allow_network)
+                # because expose_ports also adds a virtio-net device.
+                # Skip when on_boot_log requested (L1 skips boot, callback would never fire).
+                if self._memory_snapshot_manager and on_boot_log is None:
+                    try:
+                        vmstate_path = await self._memory_snapshot_manager.check_cache(
+                            language,
+                            packages,
+                            memory,
+                            allow_network=needs_network,
+                        )
+                        if vmstate_path:
+                            l2_path = await self._memory_snapshot_manager.get_l2_for_l1(language, packages)
+                            vm = await self._vm_manager.restore_vm(
+                                language,
+                                constants.SCHEDULER_TENANT_ID,
+                                task_id,
+                                vmstate_path=vmstate_path,
+                                memory_mb=memory,
+                                snapshot_drive=l2_path,
+                                allow_network=allow_network,
+                                allowed_domains=allowed_domains,
+                                expose_ports=resolved_ports if resolved_ports else None,
+                                reservation=reservation,
+                            )
+                            logger.info(
+                                "VM restored from L1 cache",
+                                extra={"vm_id": vm.vm_id, "language": language},
+                            )
+                    except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
+                        logger.warning(
+                            "L1 restore failed, falling back to cold boot",
+                            extra={"language": language, "error": str(e)},
+                        )
+                        logger.debug("L1 restore traceback", exc_info=True)
+                        vm = None
 
-            # Schedule background L1 save for next time
-            if self._memory_snapshot_manager:
-                await self._memory_snapshot_manager.schedule_background_save(
-                    language,
-                    packages,
-                    memory,
-                    snapshot_drive=snapshot_path,
-                    allow_network=needs_network,
-                )
+                # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
+                if vm is None:
+                    # Auto-download base image if needed
+                    if self.config.auto_download_assets:
+                        await fetch_base_image(language)
+
+                    vm = await self._vm_manager.create_vm(
+                        language=language,
+                        tenant_id=constants.SCHEDULER_TENANT_ID,
+                        task_id=task_id,
+                        memory_mb=memory,
+                        allow_network=allow_network,
+                        allowed_domains=allowed_domains,
+                        expose_ports=resolved_ports if resolved_ports else None,
+                        on_boot_log=on_boot_log,
+                        snapshot_drive=snapshot_path,
+                        reservation=reservation,
+                    )
+
+                    # Schedule background L1 save for next time
+                    if self._memory_snapshot_manager:
+                        await self._memory_snapshot_manager.schedule_background_save(
+                            language,
+                            packages,
+                            memory,
+                            snapshot_drive=snapshot_path,
+                            allow_network=needs_network,
+                        )
 
         return vm, resolved_ports, is_cold_boot
 
