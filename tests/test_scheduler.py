@@ -158,6 +158,35 @@ class TestMemoryValidation:
         assert not isinstance(exc_info.value, VmConfigError)
 
 
+class TestCodeSizeValidation:
+    """Tests for code size validation in Scheduler.run()."""
+
+    async def test_code_exceeds_limit_rejected(self) -> None:
+        """Code larger than MAX_CODE_SIZE raises VmConfigError before VM boot."""
+        from exec_sandbox.constants import MAX_CODE_SIZE
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(VmConfigError, match="Code too large"):
+            await scheduler.run(code="x" * (MAX_CODE_SIZE + 1), language=Language.PYTHON)
+
+    async def test_code_at_limit_accepted(self) -> None:
+        """Code exactly at MAX_CODE_SIZE passes size validation."""
+        from exec_sandbox.constants import MAX_CODE_SIZE
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        # Should NOT raise VmConfigError - it will fail later due to missing
+        # VM manager, but the code size validation itself should pass
+        with pytest.raises(Exception) as exc_info:
+            await scheduler.run(code="x" * MAX_CODE_SIZE, language=Language.PYTHON)
+        assert not isinstance(exc_info.value, VmConfigError)
+
+
 class TestPackageValidation:
     """Tests for package validation in Scheduler."""
 

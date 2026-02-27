@@ -14,7 +14,7 @@ pub(crate) const CMD_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.cmd";
 pub(crate) const EVENT_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.event";
 
 // Execution limits
-pub(crate) const MAX_CODE_SIZE_BYTES: usize = 1_000_000; // 1MB max code size
+pub(crate) const MAX_CODE_SIZE_BYTES: usize = 1024 * 1024; // 1 MiB max code size
 pub(crate) const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install output
 pub(crate) const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 

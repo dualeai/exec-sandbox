@@ -103,7 +103,7 @@ PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 120
 # Code Execution Limits
 # ============================================================================
 
-MAX_CODE_SIZE: Final[int] = 1024 * 1024  # 1MB
+MAX_CODE_SIZE: Final[int] = 1024 * 1024  # 1 MiB
 """Maximum size in bytes for code input."""
 
 MAX_PACKAGES: Final[int] = 50

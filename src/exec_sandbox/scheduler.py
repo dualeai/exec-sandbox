@@ -341,6 +341,11 @@ class Scheduler:
             raise ValueError(
                 f"timeout_seconds must be between 1 and {constants.MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
             )
+        if len(code) > constants.MAX_CODE_SIZE:
+            raise VmConfigError(
+                f"Code too large: {len(code)} bytes exceeds {constants.MAX_CODE_SIZE} byte limit",
+                context={"code_size": len(code), "max_code_size": constants.MAX_CODE_SIZE},
+            )
         timeout = timeout_seconds if timeout_seconds is not None else self.config.default_timeout_seconds
 
         vm, resolved_ports, is_cold_boot = await self._prepare_vm(

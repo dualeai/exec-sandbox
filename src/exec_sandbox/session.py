@@ -33,8 +33,8 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.constants import MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
-from exec_sandbox.exceptions import SessionClosedError
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
+from exec_sandbox.exceptions import SessionClosedError, VmConfigError
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 
 if TYPE_CHECKING:
@@ -190,6 +190,11 @@ class Session:
         """
         if timeout_seconds is not None and (timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS):
             raise ValueError(f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}")
+        if len(code) > MAX_CODE_SIZE:
+            raise VmConfigError(
+                f"Code too large: {len(code)} bytes exceeds {MAX_CODE_SIZE} byte limit",
+                context={"code_size": len(code), "max_code_size": MAX_CODE_SIZE},
+            )
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
         async with self._guard():

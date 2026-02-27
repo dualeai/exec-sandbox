@@ -9,7 +9,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis.strategies import characters, integers, sampled_from, text
 from pydantic import ValidationError
 
-from exec_sandbox.constants import MAX_FILE_PATH_LENGTH
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
@@ -172,14 +172,14 @@ class TestExecuteCodeRequest:
             ExecuteCodeRequest(language=Language.PYTHON, code="x", timeout=301)
 
     def test_code_max_length(self) -> None:
-        """ExecuteCodeRequest enforces 1MB code limit."""
-        # Valid: 1MB exactly
-        large_code = "x" * 1_000_000
+        """ExecuteCodeRequest enforces 1 MiB code limit."""
+        # Valid: 1 MiB exactly
+        large_code = "x" * MAX_CODE_SIZE
         req = ExecuteCodeRequest(language=Language.PYTHON, code=large_code)
-        assert len(req.code) == 1_000_000
+        assert len(req.code) == MAX_CODE_SIZE
 
-        # Invalid: > 1MB
-        too_large = "x" * 1_000_001
+        # Invalid: > 1 MiB
+        too_large = "x" * (MAX_CODE_SIZE + 1)
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(language=Language.PYTHON, code=too_large)
 

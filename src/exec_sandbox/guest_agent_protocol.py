@@ -12,7 +12,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from exec_sandbox.constants import MAX_FILE_PATH_LENGTH
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
 from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
 
 # ============================================================================
@@ -50,7 +50,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
     """Execute code in guest VM.
 
     Guest agent enforces:
-    - Code size limit: 1MB
+    - Code size limit: 1 MiB
     - Timeout limit: 300s
     - Env var limits: 100 vars, 256 char names, 4096 char values
     - Blocked env vars: LD_PRELOAD, NODE_OPTIONS, PATH, etc. (security)
@@ -60,7 +60,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
 
     action: Literal["exec"] = Field(default="exec")  # type: ignore[assignment]
     language: Language = Field(description="Programming language for execution")
-    code: str = Field(max_length=1_000_000, description="Code to execute (max 1MB)")
+    code: str = Field(max_length=MAX_CODE_SIZE, description="Code to execute (max 1 MiB)")
 
     @field_validator("code")
     @classmethod
