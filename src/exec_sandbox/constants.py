@@ -45,9 +45,6 @@ Recommended minimums: Python 128MB, JavaScript 160MB+, ideal 192MB+.
 The --smol flag in guest-agent mitigates this but doesn't eliminate it.
 """
 
-TMPFS_SIZE_MB: Final[int] = 128
-"""tmpfs /tmp size limit in MB (half of default VM memory)."""
-
 # ============================================================================
 # Execution Timeouts
 # ============================================================================

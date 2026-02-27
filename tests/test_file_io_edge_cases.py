@@ -306,6 +306,218 @@ class TestListFiles:
 
 
 # ============================================================================
+# list_files Sparse File Defense
+# ============================================================================
+
+
+class TestListFilesSparseDefense:
+    """list_files reports actual disk usage, not apparent size.
+
+    Sparse files (created via ftruncate/truncate) have large apparent size
+    (metadata.len()) but zero allocated blocks. list_files uses
+    min(len, blocks*512) to deflate sparse files while preserving correct
+    reporting for real files.
+    """
+
+    # --- Normal cases: real files report correct size ---
+
+    async def test_regular_file_size_matches_content(self, scheduler: Scheduler) -> None:
+        """Regular file with known content reports exact byte count."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            content = b"hello world"  # 11 bytes
+            await session.write_file("regular.txt", content)
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["regular.txt"].size == len(content)
+
+    async def test_binary_file_size(self, scheduler: Scheduler) -> None:
+        """Binary file reports exact byte count."""
+        import os
+
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            content = os.urandom(4097)  # Just over one page
+            await session.write_file("binary.bin", content)
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["binary.bin"].size == 4097
+
+    async def test_empty_file_size_zero(self, scheduler: Scheduler) -> None:
+        """Empty file reports size 0."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.write_file("empty.txt", b"")
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["empty.txt"].size == 0
+
+    async def test_directory_size_zero(self, scheduler: Scheduler) -> None:
+        """Directories report size 0."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.exec("import os; os.makedirs('/home/user/mydir', exist_ok=True)")
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["mydir"].size == 0
+
+    # --- Edge cases: sparse files are deflated ---
+
+    async def test_sparse_file_reports_zero(self, scheduler: Scheduler) -> None:
+        """Sparse file (truncate, no data written) reports size 0 via list_files.
+
+        os.truncate() sets apparent size (metadata.len()) without allocating
+        pages on tmpfs. min(len, blocks*512) deflates this to 0.
+        """
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.exec("open('/home/user/sparse', 'w').close()")
+            await session.exec("import os; os.truncate('/home/user/sparse', 10 * 1024 * 1024)")
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert "sparse" in file_map
+            assert file_map["sparse"].size == 0
+
+    async def test_partially_written_sparse_file(self, scheduler: Scheduler) -> None:
+        """Partially written sparse file reports actual data size, not apparent size.
+
+        Write 4KB at offset 0, then truncate to 1MB. Only the 4KB should be
+        reflected (blocks*512 >= 4096, apparent size = 1MB, min = 4096).
+        """
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            code = """\
+import os
+with open('/home/user/partial', 'wb') as f:
+    f.write(b'x' * 4096)
+os.truncate('/home/user/partial', 1024 * 1024)
+# Verify apparent size vs actual blocks
+s = os.stat('/home/user/partial')
+print(f'APPARENT:{s.st_size}')
+print(f'BLOCKS:{s.st_blocks}')
+print(f'ACTUAL:{s.st_blocks * 512}')
+"""
+            r = await session.exec(code)
+            assert r.exit_code == 0
+            assert "APPARENT:1048576" in r.stdout  # 1MB apparent
+
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            # Should report actual data (~4KB), NOT apparent (1MB)
+            assert file_map["partial"].size <= 8192  # At most 2 pages
+            assert file_map["partial"].size >= 4096  # At least the written data
+
+    async def test_one_byte_file_reports_one(self, scheduler: Scheduler) -> None:
+        """1-byte file reports size 1 (not inflated to block size).
+
+        min(1, 4096) = 1 — the len() side wins for small real files.
+        """
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.write_file("tiny.txt", b"x")
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["tiny.txt"].size == 1
+
+    async def test_symlink_in_listing(self, scheduler: Scheduler) -> None:
+        """Symlinks appear in listing (size may be 0 on tmpfs due to inline storage)."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.write_file("target.txt", b"data")
+            await session.exec("import os; os.symlink('/home/user/target.txt', '/home/user/link.txt')")
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert "link.txt" in file_map
+            # Symlinks on tmpfs have blocks=0 (inline in inode), so min(len, 0)=0
+            assert file_map["link.txt"].size == 0
+
+    # --- Weird cases: unusual patterns ---
+
+    async def test_multiple_sparse_files_all_deflated(self, scheduler: Scheduler) -> None:
+        """Creating many sparse files — all report 0 in listing."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            code = """\
+import os
+for i in range(10):
+    path = f'/home/user/sparse_{i}'
+    open(path, 'w').close()
+    os.truncate(path, (i + 1) * 1024 * 1024)  # 1MB to 10MB apparent
+"""
+            await session.exec(code)
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            for i in range(10):
+                name = f"sparse_{i}"
+                assert name in file_map, f"{name} missing from listing"
+                assert file_map[name].size == 0, f"{name} should report 0, got {file_map[name].size}"
+
+    async def test_sparse_then_fill_reports_real_size(self, scheduler: Scheduler) -> None:
+        """Create sparse file, then write real data — size should reflect real data."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            code = """\
+import os
+# Create sparse
+open('/home/user/fill_me', 'w').close()
+os.truncate('/home/user/fill_me', 1024 * 1024)
+# Now write real data
+with open('/home/user/fill_me', 'wb') as f:
+    f.write(b'A' * 50000)
+"""
+            await session.exec(code)
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            # After writing 50KB of real data, size should reflect actual usage
+            assert file_map["fill_me"].size >= 50000
+            # But not the 1MB apparent size (file was truncated down by the write)
+            assert file_map["fill_me"].size <= 100000
+
+    # --- Out of bounds: extreme sparse files ---
+
+    async def test_huge_sparse_file_reports_zero(self, scheduler: Scheduler) -> None:
+        """100GB sparse file reports size 0 — the attack vector this defense blocks.
+
+        os.truncate("huge", 100*1024**3) creates 100GB apparent size with 0
+        actual bytes on tmpfs. Without the min(len, blocks*512) fix, list_files
+        would report 107,374,182,400 bytes.
+        """
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            code = """\
+import os
+open('/home/user/huge', 'w').close()
+os.truncate('/home/user/huge', 100 * 1024**3)
+s = os.stat('/home/user/huge')
+print(f'APPARENT:{s.st_size}')
+print(f'BLOCKS:{s.st_blocks}')
+"""
+            r = await session.exec(code)
+            assert r.exit_code == 0
+            assert "APPARENT:107374182400" in r.stdout
+            assert "BLOCKS:0" in r.stdout
+
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["huge"].size == 0
+
+    async def test_sparse_file_still_readable(self, scheduler: Scheduler) -> None:
+        """Sparse file reads back as zeroes despite reporting size 0 in listing.
+
+        read_file uses metadata.len() (apparent size) for transfer — correct
+        because sparse holes expand to zeroes on read. This test verifies listing
+        deflation doesn't break read_file.
+        """
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            code = """\
+import os
+# Create small sparse file (256 bytes apparent)
+open('/home/user/readable_sparse', 'w').close()
+os.truncate('/home/user/readable_sparse', 256)
+"""
+            await session.exec(code)
+
+            # list_files should show 0
+            files = await session.list_files()
+            file_map = {f.name: f for f in files}
+            assert file_map["readable_sparse"].size == 0
+
+            # read_file should still work (returns 256 zero bytes)
+            dest = await session.exec("print(open('/home/user/readable_sparse', 'rb').read().hex())")
+            assert dest.exit_code == 0
+            assert dest.stdout.strip() == "00" * 256
+
+
+# ============================================================================
 # Write Abort / Error Recovery (sentinel mechanism regression tests)
 # ============================================================================
 

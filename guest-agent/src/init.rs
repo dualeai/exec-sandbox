@@ -146,13 +146,19 @@ pub(crate) async fn wait_for_network() {
 }
 
 /// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
+///
+/// Sized to 50% of RAM with per-UID quota enforcement (`usrquota` +
+/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
+/// Quota must be set at initial mount time — cannot be added via remount.
 fn mount_home_tmpfs() {
+    let half_mem_kb = read_mem_total_kb() / 2;
+    let half_mem_bytes = half_mem_kb * 1024;
     let ret = unsafe {
         let source = std::ffi::CString::new("tmpfs").unwrap();
         let target = std::ffi::CString::new("/home/user").unwrap();
         let fstype = std::ffi::CString::new("tmpfs").unwrap();
         let data = std::ffi::CString::new(format!(
-            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},noswap"
+            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
         ))
         .unwrap();
         libc::mount(
@@ -266,14 +272,22 @@ fn setup_dev_symlinks() {
 
 /// B4: Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
+///
+/// Sized to 50% of RAM with per-UID quota enforcement (`usrquota` +
+/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
+/// Quota must be set at initial mount time — cannot be added via remount.
 fn setup_dev_shm() {
-    fn try_mount_shm() -> libc::c_int {
+    let half_mem_kb = read_mem_total_kb() / 2;
+    let half_mem_bytes = half_mem_kb * 1024;
+    let opts =
+        format!("size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap");
+
+    fn try_mount_shm(opts: &str) -> libc::c_int {
         unsafe {
             let source = std::ffi::CString::new("tmpfs").unwrap();
             let target = std::ffi::CString::new("/dev/shm").unwrap();
             let fstype = std::ffi::CString::new("tmpfs").unwrap();
-            // noswap: kernel 6.3+ — prevents /dev/shm pages from being swapped to zram
-            let data = std::ffi::CString::new("size=64M,noswap").unwrap();
+            let data = std::ffi::CString::new(opts).unwrap();
             libc::mount(
                 source.as_ptr(),
                 target.as_ptr(),
@@ -284,10 +298,10 @@ fn setup_dev_shm() {
         }
     }
 
-    if try_mount_shm() != 0 {
+    if try_mount_shm(&opts) != 0 {
         // Non-fatal: only needed for multiprocessing. Retry after mkdir.
         let _ = std::fs::create_dir_all("/dev/shm");
-        if try_mount_shm() != 0 {
+        if try_mount_shm(&opts) != 0 {
             log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
         }
     }
@@ -355,20 +369,7 @@ fn setup_zram_swap() {
     // Kernel 6.16+: algorithm-specific tuning via sysfs
     let _ = std::fs::write("/sys/block/zram0/algorithm_params", "level=1");
 
-    let mem_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or(0);
-
-    if mem_kb == 0 {
-        log_warn!("[zram] failed to read MemTotal, skipping");
-        return;
-    }
+    let mem_kb = read_mem_total_kb();
 
     // disksize = 50% of RAM (in bytes)
     let zram_size = mem_kb * 512;
@@ -502,19 +503,7 @@ fn apply_sysctl_non_critical() {
 /// These values are safe to set even before zram device setup completes:
 /// the kernel uses defaults until swapon, then these take effect.
 fn apply_zram_vm_tuning() {
-    let mem_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or(0);
-
-    if mem_kb == 0 {
-        return;
-    }
+    let mem_kb = read_mem_total_kb();
 
     let _ = std::fs::write("/proc/sys/vm/page-cluster", "0");
     let _ = std::fs::write("/proc/sys/vm/swappiness", "180");
@@ -528,6 +517,22 @@ fn apply_zram_vm_tuning() {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Read MemTotal from /proc/meminfo in kilobytes.
+/// Panics if /proc/meminfo is unreadable or MemTotal is missing — we control the
+/// environment and /proc is always mounted before any tmpfs. A missing MemTotal
+/// means the VM is broken and should not proceed.
+///
+/// NOTE: Mirrored in tiny-init/src/sys.rs — keep both in sync.
+fn read_mem_total_kb() -> u64 {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").expect("/proc/meminfo unreadable");
+    meminfo
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|n| n.parse().ok())
+        .expect("MemTotal not found in /proc/meminfo")
+}
 
 /// Verify gvproxy connectivity with exponential backoff.
 /// Blocks phase 2 completion, so ExecuteCode/InstallPackages wait for network.

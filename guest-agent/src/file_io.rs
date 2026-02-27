@@ -1,5 +1,7 @@
 //! File I/O: read, write, list operations with sandbox path validation.
 
+use std::os::unix::fs::MetadataExt;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::mpsc;
 
@@ -239,7 +241,15 @@ pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Re
         entries.push(FileEntry {
             name: entry.file_name().to_string_lossy().to_string(),
             is_dir: metadata.is_dir(),
-            size: if metadata.is_dir() { 0 } else { metadata.len() },
+            // Report actual disk usage, not apparent size. Sparse files
+            // (e.g. `truncate("huge", 100GB)`) have large apparent size
+            // (metadata.len()) but zero allocated blocks. min(len, blocks*512)
+            // preserves correct size for real files while deflating sparse ones.
+            size: if metadata.is_dir() {
+                0
+            } else {
+                metadata.len().min(metadata.blocks() * 512)
+            },
         });
     }
 

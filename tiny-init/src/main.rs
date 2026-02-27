@@ -57,18 +57,23 @@ fn mount_virtual_filesystems() {
     // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
     // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
     // pnpm (pnpm#9776), PyInstaller, and user temp executables.
-    // Why 128MB: half of default 256MB guest RAM. Balances scratch space for
-    // pip/uv wheel builds (which unpack into /tmp) vs leaving RAM for user code.
+    // Size = 50% of RAM: scales with VM memory instead of fixed cap.
+    // Per-UID quota (usrquota + usrquota_block_hardlimit) prevents sparse file
+    // inflation attacks — must be set at initial mount time, not remount.
     // nr_inodes=16384: fixed cap independent of VM memory (default is
     // totalram_pages/2, which varies 13K–55K+ depending on memory_mb). 16K
     // covers typical `pip install` (measured ~2K-5K files for large packages
     // like pandas).
+    let half_mem_kb = sys::read_mem_total_kb() / 2;
+    let half_mem_bytes = half_mem_kb * 1024;
     sys::mount(
         "tmpfs",
         "/tmp",
         "tmpfs",
         sys::MS_NOSUID | sys::MS_NODEV,
-        "size=128M,nr_inodes=16384,mode=1777,noswap",
+        &format!(
+            "size={half_mem_bytes},nr_inodes=16384,mode=1777,usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
+        ),
     );
 }
 

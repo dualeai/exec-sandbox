@@ -4,8 +4,9 @@ Verifies that dangerous device nodes are removed, block device nodes
 (/dev/vda, /dev/zram0) are removed after use, /dev is bind-remounted
 read-only (preventing mknod with EROFS), /dev/shm is mounted with
 restrictive flags, /tmp has nosuid/nodev flags with an explicit inode
-cap (nr_inodes=16384), /proc/sys is read-only, and /bin + /sbin are
-bind-mounted read-only with nosuid (blocking path hijack attacks).
+cap (nr_inodes=16384), per-UID tmpfs quota enforcement (usrquota),
+/proc/sys is read-only, and /bin + /sbin are bind-mounted read-only
+with nosuid (blocking path hijack attacks).
 These are defense-in-depth measures that apply regardless of UID — even
 root (guest-agent) cannot access /dev/mem or raw-read the root disk
 after these changes.
@@ -147,7 +148,7 @@ print(f'UID:{st.st_uid}')
 # /dev/shm mount hardening
 # =============================================================================
 class TestDevShmHardening:
-    """/dev/shm is mounted with nosuid, nodev, noexec flags."""
+    """/dev/shm is mounted with nosuid, nodev, noexec flags, and usrquota."""
 
     SHM_MOUNT_LINE = """\
 with open('/proc/mounts') as f:
@@ -174,6 +175,32 @@ with open('/proc/mounts') as f:
         result = await dual_scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "nodev" in result.stdout
+
+    async def test_usrquota_flag(self, dual_scheduler: Scheduler) -> None:
+        """/dev/shm has usrquota mount option for per-UID quota enforcement."""
+        result = await dual_scheduler.run(code=self.SHM_MOUNT_LINE, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "usrquota" in result.stdout
+
+    async def test_shm_size_is_half_memtotal(self, dual_scheduler: Scheduler) -> None:
+        """Verify /dev/shm size is ~50% of MemTotal (memory-proportional)."""
+        code = """\
+import os
+with open('/proc/meminfo') as f:
+    for line in f:
+        if line.startswith('MemTotal:'):
+            mem_total_kb = int(line.split()[1])
+            break
+half_mem_bytes = (mem_total_kb // 2) * 1024
+s = os.statvfs('/dev/shm')
+shm_bytes = s.f_blocks * s.f_frsize
+print(f'HALF_MEM_BYTES:{half_mem_bytes}')
+print(f'SHM_BYTES:{shm_bytes}')
+print(f'MATCH:{shm_bytes == half_mem_bytes}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "MATCH:True" in result.stdout
 
     async def test_exec_blocked_on_dev_shm(self, dual_scheduler: Scheduler) -> None:
         """Script execution is blocked on /dev/shm (noexec enforcement)."""
@@ -227,7 +254,7 @@ print(result)
 # /tmp tmpfs hardening
 # =============================================================================
 class TestTmpHardening:
-    """/tmp is mounted with nosuid, nodev, explicit nr_inodes=16384, mode=1777."""
+    """/tmp is mounted with nosuid, nodev, nr_inodes=16384, mode=1777, usrquota."""
 
     TMP_MOUNT_LINE = """\
 with open('/proc/mounts') as f:
@@ -280,17 +307,33 @@ with open('/proc/mounts') as f:
         assert result.exit_code == 0
         assert result.stdout.strip() == "INODES:16384"
 
-    async def test_tmpfs_size_128m(self, dual_scheduler: Scheduler) -> None:
-        """Verify /tmp size is 128MB."""
+    async def test_tmpfs_size_is_half_memtotal(self, dual_scheduler: Scheduler) -> None:
+        """Verify /tmp size is ~50% of MemTotal (memory-proportional, not hardcoded)."""
         code = """\
 import os
+# Read MemTotal from /proc/meminfo
+with open('/proc/meminfo') as f:
+    for line in f:
+        if line.startswith('MemTotal:'):
+            mem_total_kb = int(line.split()[1])
+            break
+half_mem_bytes = (mem_total_kb // 2) * 1024
 s = os.statvfs('/tmp')
-size_mb = (s.f_blocks * s.f_frsize) / (1024 * 1024)
-print(f'SIZE_MB:{size_mb:.0f}')
+tmpfs_bytes = s.f_blocks * s.f_frsize
+print(f'MEMTOTAL_KB:{mem_total_kb}')
+print(f'HALF_MEM_BYTES:{half_mem_bytes}')
+print(f'TMPFS_BYTES:{tmpfs_bytes}')
+print(f'MATCH:{tmpfs_bytes == half_mem_bytes}')
 """
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
-        assert result.stdout.strip() == "SIZE_MB:128"
+        assert "MATCH:True" in result.stdout
+
+    async def test_usrquota_mount_option(self, dual_scheduler: Scheduler) -> None:
+        """/tmp has usrquota mount option for per-UID quota enforcement."""
+        result = await dual_scheduler.run(code=self.TMP_MOUNT_LINE, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "usrquota" in result.stdout
 
     # --- Normal cases: verify functionality is preserved ---
 
@@ -1872,7 +1915,7 @@ print(f'OK:{data}')
 # /home/user tmpfs mount hardening
 # =============================================================================
 class TestHomeUserTmpfs:
-    """/home/user is mounted as tmpfs with nosuid and nodev flags.
+    """/home/user is mounted as tmpfs with nosuid, nodev, and usrquota flags.
 
     Zero-copy scratch space: /home/user on rootfs is empty (cloudpickle
     installed to /usr/lib/python3/site-packages), so the tmpfs mount
@@ -1949,6 +1992,32 @@ with open('/proc/mounts') as f:
         assert result.exit_code == 0
         assert "NOEXEC_PRESENT:False" in result.stdout
 
+    async def test_usrquota_flag(self, dual_scheduler: Scheduler) -> None:
+        """/home/user has usrquota mount option for per-UID quota enforcement."""
+        result = await dual_scheduler.run(code=self.HOME_MOUNT_LINE, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "usrquota" in result.stdout
+
+    async def test_size_is_half_memtotal(self, dual_scheduler: Scheduler) -> None:
+        """Verify /home/user size is ~50% of MemTotal (memory-proportional)."""
+        code = """\
+import os
+with open('/proc/meminfo') as f:
+    for line in f:
+        if line.startswith('MemTotal:'):
+            mem_total_kb = int(line.split()[1])
+            break
+half_mem_bytes = (mem_total_kb // 2) * 1024
+s = os.statvfs('/home/user')
+home_bytes = s.f_blocks * s.f_frsize
+print(f'HALF_MEM_BYTES:{half_mem_bytes}')
+print(f'HOME_BYTES:{home_bytes}')
+print(f'MATCH:{home_bytes == half_mem_bytes}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "MATCH:True" in result.stdout
+
     async def test_cloudpickle_importable(self, dual_scheduler: Scheduler) -> None:
         """cloudpickle is importable (loaded from /usr/lib/python3/site-packages)."""
         code = """\
@@ -1971,6 +2040,173 @@ print(f'GID:{s.st_gid}')
         assert result.exit_code == 0
         assert "UID:1000" in result.stdout
         assert "GID:1000" in result.stdout
+
+
+# =============================================================================
+# Per-UID tmpfs quota enforcement
+# =============================================================================
+class TestTmpfsQuotaEnforcement:
+    """Per-UID quota (usrquota_block_hardlimit) prevents a single user from
+    consuming all tmpfs space. Sparse file inflation via ftruncate() is allowed
+    (metadata-only, no real pages consumed) but real writes are bounded.
+
+    Three-layer defense:
+    - size= caps total tmpfs memory usage (all UIDs combined)
+    - usrquota_block_hardlimit caps per-UID real block usage
+    - list_files min(len, blocks*512) deflates apparent size in API responses
+    """
+
+    # --- Normal: sparse files don't consume quota ---
+
+    async def test_sparse_truncate_succeeds(self, dual_scheduler: Scheduler) -> None:
+        """ftruncate() to huge apparent size succeeds (metadata-only, no quota hit)."""
+        code = """\
+import os
+open('/home/user/sparse', 'w').close()
+os.truncate('/home/user/sparse', 50 * 1024**3)  # 50GB apparent
+s = os.stat('/home/user/sparse')
+print(f'SIZE:{s.st_size}')
+print(f'BLOCKS:{s.st_blocks}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "SIZE:53687091200" in result.stdout
+        assert "BLOCKS:0" in result.stdout
+
+    async def test_sparse_on_tmp(self, dual_scheduler: Scheduler) -> None:
+        """Sparse files on /tmp also succeed (quota applies to real blocks only)."""
+        code = """\
+import os
+open('/tmp/sparse', 'w').close()
+os.truncate('/tmp/sparse', 1024**3)  # 1GB apparent
+print(f'SIZE:{os.stat("/tmp/sparse").st_size}')
+print(f'BLOCKS:{os.stat("/tmp/sparse").st_blocks}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "SIZE:1073741824" in result.stdout
+        assert "BLOCKS:0" in result.stdout
+
+    async def test_sparse_on_dev_shm(self, dual_scheduler: Scheduler) -> None:
+        """Sparse files on /dev/shm also succeed."""
+        code = """\
+import os
+open('/dev/shm/sparse', 'w').close()
+os.truncate('/dev/shm/sparse', 1024**3)
+print(f'SIZE:{os.stat("/dev/shm/sparse").st_size}')
+print(f'BLOCKS:{os.stat("/dev/shm/sparse").st_blocks}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "SIZE:1073741824" in result.stdout
+        assert "BLOCKS:0" in result.stdout
+
+    # --- Edge: real writes hit quota/size limit ---
+
+    async def test_real_write_exceeding_limit_fails(self, dual_scheduler: Scheduler) -> None:
+        """Writing real data beyond tmpfs size limit produces ENOSPC or EDQUOT.
+
+        With default 256MB VM, MemTotal ~236MB, half ~118MB. Writing 200MB
+        of real data should fail. We don't check the exact error code because
+        it could be ENOSPC (size= limit) or EDQUOT (quota limit).
+        """
+        code = """\
+import os, errno
+# Write in 10MB chunks to /home/user until failure
+written = 0
+try:
+    with open('/home/user/bigfile', 'wb') as f:
+        for _ in range(30):  # 300MB attempted
+            f.write(b'A' * (10 * 1024 * 1024))
+            f.flush()
+            written += 10
+    print(f'NO_LIMIT:{written}')
+except OSError as e:
+    print(f'BLOCKED:{written}')
+    print(f'ERRNO:{e.errno}')
+    # ENOSPC=28, EDQUOT=122
+    print(f'IS_DISK_ERROR:{e.errno in (28, 122)}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        assert result.exit_code == 0
+        assert "NO_LIMIT:" not in result.stdout
+        assert "BLOCKED:" in result.stdout
+        assert "IS_DISK_ERROR:True" in result.stdout
+
+    # --- Weird: mix sparse and real ---
+
+    async def test_sparse_then_real_write_still_bounded(self, dual_scheduler: Scheduler) -> None:
+        """Creating huge sparse files doesn't allow bypassing real write limits.
+
+        Sparse inflation is free (no pages), but real writes still hit the
+        size=/quota limit. This verifies the two are independent.
+        """
+        code = """\
+import os
+# Create 10 sparse files with 10GB apparent each (100GB total apparent)
+for i in range(10):
+    path = f'/home/user/sparse_{i}'
+    open(path, 'w').close()
+    os.truncate(path, 10 * 1024**3)
+
+# Now try to write real data — should still hit limit
+written = 0
+try:
+    with open('/home/user/realdata', 'wb') as f:
+        for _ in range(30):
+            f.write(b'B' * (10 * 1024 * 1024))
+            f.flush()
+            written += 10
+    print(f'NO_LIMIT:{written}')
+except OSError:
+    print(f'BOUNDED:{written}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        assert result.exit_code == 0
+        assert "NO_LIMIT:" not in result.stdout
+        assert "BOUNDED:" in result.stdout
+
+    # --- Out of bounds: VM doesn't crash ---
+
+    async def test_quota_exhaustion_doesnt_crash_vm(self, dual_scheduler: Scheduler) -> None:
+        """Exhausting tmpfs quota doesn't crash the VM — exec still works after."""
+        async with await dual_scheduler.session(language=Language.PYTHON) as session:
+            # Step 1: Fill /home/user until failure
+            exhaust = """\
+written = 0
+try:
+    with open('/home/user/fill', 'wb') as f:
+        for _ in range(50):
+            f.write(b'X' * (10 * 1024 * 1024))
+            f.flush()
+            written += 10
+except OSError:
+    pass
+print(f'FILLED:{written}MB')
+"""
+            r1 = await session.exec(exhaust, timeout_seconds=60)
+            assert r1.exit_code == 0
+            assert "FILLED:" in r1.stdout
+
+            # Step 2: Python execution still works (REPL doesn't need /home/user disk)
+            r2 = await session.exec("print(f'MATH:{6 * 7}')", timeout_seconds=30)
+            assert r2.exit_code == 0
+            assert "MATH:42" in r2.stdout
+
+            # Step 3: Clean up and verify writes work again
+            r3 = await session.exec(
+                """\
+import os
+os.unlink('/home/user/fill')
+with open('/home/user/recovered.txt', 'w') as f:
+    f.write('back to normal')
+with open('/home/user/recovered.txt') as f:
+    print(f'RECOVERED:{f.read()}')
+""",
+                timeout_seconds=30,
+            )
+            assert r3.exit_code == 0
+            assert "RECOVERED:back to normal" in r3.stdout
 
 
 # =============================================================================
