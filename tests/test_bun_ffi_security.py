@@ -19,6 +19,8 @@ Test categories:
 - Edge: verify FFI can bind and call libc I/O functions (open/read/close)
 """
 
+import pytest
+
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
@@ -27,6 +29,7 @@ from exec_sandbox.scheduler import Scheduler
 # =============================================================================
 
 
+@pytest.mark.slow
 class TestBunFfiImportable:
     """Bun's FFI gives user code arbitrary dlopen/dlsym access to libc.
 
@@ -98,6 +101,7 @@ console.log('pid_valid=' + (pid > 0));
 # =============================================================================
 
 
+@pytest.mark.slow
 class TestBunFfiLibcIo:
     """FFI enables full libc I/O: open(), read(), write(), close().
 

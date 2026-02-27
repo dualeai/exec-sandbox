@@ -11,6 +11,8 @@ Test categories:
 - Out of bounds: kernel-level operations blocked by missing capabilities
 """
 
+import pytest
+
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
@@ -157,6 +159,7 @@ class TestNonRootFileIO:
 class TestNonRootPackages:
     """Package installation (root) and import (UID 1000) work together."""
 
+    @pytest.mark.slow
     async def test_pip_install_and_import(self, scheduler: Scheduler) -> None:
         """Packages installed by root are importable by non-root REPL."""
         result = await scheduler.run(
