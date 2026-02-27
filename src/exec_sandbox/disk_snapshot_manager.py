@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import errno
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Final
 
@@ -639,46 +640,16 @@ class DiskSnapshotManager(BaseCacheManager):
             ) from e
 
     async def _monitor_vm_death(self, vm: QemuVM, cache_key: str) -> None:
-        """Monitor VM process for unexpected death.
-
-        Event-driven death detection: Waits on process exit (no polling).
-        If process exits → raises VmError → TaskGroup cancels other tasks.
-
-        Args:
-            vm: QemuVM handle
-            cache_key: Snapshot cache key
-
-        Raises:
-            VmQemuCrashError: VM process died unexpectedly
-        """
-        # Wait for QEMU process to exit (blocks until death)
+        """Monitor VM process for unexpected death during snapshot creation."""
         returncode = await vm.process.wait()
-
-        # Capture diagnostics before raising so CI failures are debuggable
-        console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
-        stdout_text, stderr_text = await self.vm_manager.capture_qemu_output(vm.process)
-        stderr_preview = stderr_text[:500] if stderr_text else "(empty)"
-        stdout_preview = stdout_text[:500] if stdout_text else "(empty)"
+        diag = await vm.collect_diagnostics()
         logger.error(
-            "VM died during snapshot creation\n"
-            "  vm_id=%s exit_code=%s cache_key=%s\n"
-            "  stderr: %s\n  stdout: %s\n  console:\n%s",
-            vm.vm_id,
-            returncode,
-            cache_key,
-            stderr_preview,
-            stdout_preview,
-            console_snapshot[-2000:],
+            "VM died during snapshot creation",
+            extra={**asdict(diag), "cache_key": cache_key},
         )
-
-        # Process died → raise error to cancel sibling tasks
         raise VmQemuCrashError(
             f"VM process died during snapshot creation (exit code {returncode})",
-            context={
-                "cache_key": cache_key,
-                "vm_id": vm.vm_id,
-                "exit_code": returncode,
-            },
+            diagnostics=diag,
         )
 
     async def _install_packages(

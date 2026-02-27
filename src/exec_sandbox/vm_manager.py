@@ -19,15 +19,13 @@ Performance Optimizations (QEMU 10.0+):
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import re
 import shlex
-import signal
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -48,10 +46,8 @@ from exec_sandbox.exceptions import (
     VmConfigError,
     VmDependencyError,
     VmOverlayError,
-    VmQemuCrashError,
     VmTransientError,
 )
-from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.gvproxy import start_gvproxy
 from exec_sandbox.migration_client import MigrationClient
@@ -63,7 +59,7 @@ from exec_sandbox.permission_utils import (
     grant_qemu_vm_file_access,
     probe_sudo_as_qemu_vm,
 )
-from exec_sandbox.platform_utils import HostArch, HostOS, ProcessWrapper, detect_host_arch, detect_host_os
+from exec_sandbox.platform_utils import HostArch, ProcessWrapper, detect_host_arch
 from exec_sandbox.process_registry import register_process, unregister_process
 from exec_sandbox.qemu_cmd import build_qemu_cmd
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
@@ -91,10 +87,6 @@ logger = get_logger(__name__)
 # - Socket path manipulation
 _IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _IDENTIFIER_MAX_LENGTH = 128  # Reasonable limit for identifiers
-
-# QEMU binary extraction pattern for error diagnostics
-# Extracts binary name from shell wrapper commands (e.g., "qemu-system-x86_64")
-_QEMU_BINARY_PATTERN = re.compile(r"(qemu-system-[^\s]+)")
 
 
 def _validate_identifier(value: str, name: str) -> None:
@@ -613,7 +605,7 @@ class VmManager:
             cgroup_path=cgroup_path,
         )
 
-    async def _create_vm_impl(  # noqa: PLR0915
+    async def _create_vm_impl(
         self,
         language: Language,
         tenant_id: str,
@@ -714,7 +706,7 @@ class VmManager:
             # Phase 5: Wait for guest agent ready (create-specific)
             guest_wait_start = asyncio.get_running_loop().time()
             try:
-                await self._wait_for_guest(vm, timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
+                await vm.wait_for_guest(timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
                 boot_complete_time = asyncio.get_running_loop().time()
                 guest_wait_ms = round((boot_complete_time - guest_wait_start) * 1000)
 
@@ -730,51 +722,36 @@ class VmManager:
 
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
-                stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
-                console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
+                diag = await vm.collect_diagnostics()
                 qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
-
                 arch_suffix = "aarch64" if self.arch == HostArch.AARCH64 else "x86_64"
                 kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
                 initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
 
                 logger.error(
-                    "Guest agent boot timeout\n"
-                    "  vm_id=%s qemu_running=%s qemu_returncode=%s\n"
-                    "  qemu_cmd: %s\n  stderr: %s\n  stdout: %s\n  console:\n%s",
-                    infra.vm_id,
-                    vm.process.returncode is None,
-                    vm.process.returncode,
-                    qemu_cmd_str[:1000],
-                    stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
-                    stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
-                    console_snapshot,
+                    "Guest agent boot timeout",
+                    extra={
+                        **asdict(diag),
+                        "language": language,
+                        "timeout_seconds": constants.VM_BOOT_TIMEOUT_SECONDS,
+                        "qemu_cmd": qemu_cmd_str[:1000],
+                        "kernel_path": str(kernel_path),
+                        "initramfs_path": str(initramfs_path),
+                        "overlay_image": str(infra.workdir.overlay_image),
+                    },
                 )
 
                 await vm.destroy()
 
-                qemu_binary = "(unknown)"
-                if qemu_cmd:
-                    if qemu_cmd[0] == "bash" and len(qemu_cmd) > 2:  # noqa: PLR2004
-                        shell_cmd_str = qemu_cmd[2]
-                        qemu_match = _QEMU_BINARY_PATTERN.search(shell_cmd_str)
-                        qemu_binary = qemu_match.group(1) if qemu_match else f"bash -c '{shell_cmd_str[:100]}...'"
-                    else:
-                        qemu_binary = qemu_cmd[0]
-
                 raise VmBootTimeoutError(
                     f"Guest agent not ready after {constants.VM_BOOT_TIMEOUT_SECONDS}s: {e}. "
-                    f"qemu_binary={qemu_binary}, qemu_running={vm.process.returncode is None}, "
-                    f"returncode={vm.process.returncode}, "
-                    f"stderr: {stderr_text[:200] if stderr_text else '(empty)'}, "
-                    f"console: {console_snapshot[-4000:]}",
+                    f"qemu_running={diag.exit_code is None}, "
+                    f"stderr: {diag.stderr[:200] if diag.stderr else '(empty)'}, "
+                    f"console: {diag.console_log[-4000:]}",
                     context={
                         "vm_id": infra.vm_id,
                         "language": language,
                         "timeout_seconds": constants.VM_BOOT_TIMEOUT_SECONDS,
-                        "console_log": console_snapshot,
-                        "qemu_running": vm.process.returncode is None,
-                        "qemu_returncode": vm.process.returncode,
                         "qemu_cmd": qemu_cmd_str[:1000],
                         "kernel_path": str(kernel_path),
                         "initramfs_path": str(initramfs_path),
@@ -927,10 +904,15 @@ class VmManager:
                 async with MigrationClient(vm.qmp_socket, infra.expected_uid) as client:
                     await client.restore_snapshot(vmstate_path, qemu_version=qemu_version)
             except Exception as e:
+                diag = await vm.collect_diagnostics()
+                logger.error(
+                    "L1 restore failed",
+                    extra={**asdict(diag), "vmstate_path": str(vmstate_path)},
+                )
                 await vm.destroy()
                 raise VmTransientError(
                     f"L1 restore failed for {infra.vm_id}: {e}",
-                    context={"vm_id": infra.vm_id, "vmstate_path": str(vmstate_path)},
+                    context={**asdict(diag), "vmstate_path": str(vmstate_path)},
                 ) from e
 
             # Connect guest channel with reconnection probe.
@@ -1148,23 +1130,6 @@ class VmManager:
                     await self._admission.release(vm.resource_reservation)
                     vm.resource_reservation = None
 
-    async def capture_qemu_output(self, process: ProcessWrapper) -> tuple[str, str]:
-        """Capture stdout/stderr from QEMU process.
-
-        Args:
-            process: QEMU subprocess
-
-        Returns:
-            Tuple of (stdout, stderr) as strings, empty if process still running
-        """
-        if process.returncode is not None:
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1.0)
-                return (stdout.decode() if stdout else "", stderr.decode() if stderr else "")
-            except TimeoutError:
-                pass
-        return "", ""
-
     def get_base_image(self, language: str) -> Path:
         """Get base image path for language via auto-discovery.
 
@@ -1276,185 +1241,3 @@ class VmManager:
             return False  # Chown failed, QEMU should run as current user
 
         return False  # qemu-vm not available, QEMU should run as current user
-
-    async def _wait_for_guest(self, vm: QemuVM, timeout: float) -> None:  # noqa: PLR0915
-        """Wait for guest agent using event-driven racing.
-
-        Races QEMU process death monitor against guest readiness checks with retry logic.
-
-        Args:
-            vm: QemuVM handle
-            timeout: Maximum wait time in seconds
-
-        Raises:
-            VmQemuCrashError: QEMU process died during boot
-            asyncio.TimeoutError: Guest not ready within timeout
-        """
-
-        async def monitor_process_death() -> None:
-            """Monitor QEMU process death - kernel-notified, instant."""
-            await vm.process.wait()
-
-            # macOS HVF: QEMU exits with code 0 when -no-reboot is set.
-            # This closure is only used during boot (inside _wait_for_guest),
-            # where any QEMU exit is an error — raise to trigger tenacity retry.
-            host_os = detect_host_os()
-            if host_os == HostOS.MACOS and vm.process.returncode == 0:
-                logger.warning(
-                    "QEMU exited with code 0 during boot on macOS (will retry) vm_id=%s",
-                    vm.vm_id,
-                )
-                raise VmQemuCrashError(
-                    "QEMU process exited during boot (macOS clean exit)",
-                    context={"vm_id": vm.vm_id, "exit_code": 0, "host_os": "macos"},
-                )
-
-            # TCG emulation: Exit code 0 during boot means -no-reboot caught a
-            # guest reboot/panic. Capture diagnostics before retrying so CI
-            # failures are debuggable.
-            accel_type = await detect_accel_type()
-            if accel_type == AccelType.TCG and vm.process.returncode == 0:
-                console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
-                stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
-                stderr_preview = stderr_text[:500] if stderr_text else "(empty)"
-                logger.warning(
-                    "QEMU TCG exited with code 0 during boot (will retry)\n"
-                    "  vm_id=%s host_os=%s\n  stderr: %s\n  console:\n%s",
-                    vm.vm_id,
-                    host_os.value,
-                    stderr_preview,
-                    console_snapshot[-2000:],
-                )
-                raise VmQemuCrashError(
-                    "QEMU TCG exited with code 0 during boot (guest reboot/panic)",
-                    context={"vm_id": vm.vm_id, "exit_code": 0, "accel_type": "tcg"},
-                )
-
-            # Process died - capture output
-            stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
-            signal_name = ""
-            if vm.process.returncode and vm.process.returncode < 0:
-                sig = -vm.process.returncode
-                signal_name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else f"signal {sig}"
-
-            # Snapshot console lines from in-memory ring buffer
-            console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
-
-            logger.error(
-                "QEMU process exited unexpectedly\n"
-                "  vm_id=%s exit_code=%s signal=%s\n"
-                "  stderr: %s\n  stdout: %s\n  console:\n%s",
-                vm.vm_id,
-                vm.process.returncode,
-                signal_name,
-                stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stderr_text else "(empty)",
-                stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES] if stdout_text else "(empty)",
-                console_snapshot,
-            )
-            stderr_preview = stderr_text[:200] if stderr_text else "(empty)"
-            raise VmQemuCrashError(
-                f"QEMU process died (exit code {vm.process.returncode}, {signal_name}). "
-                f"stderr: {stderr_preview}, console: {console_snapshot[-4000:]}"
-            )
-
-        async def check_guest_ready() -> None:
-            """Single guest readiness check attempt."""
-            await vm.channel.connect(timeout_seconds=1)
-            response = await vm.channel.send_request(PingRequest())
-
-            # Ping returns PongMessage
-            if not isinstance(response, PongMessage):
-                raise RuntimeError(f"Guest ping returned unexpected type: {type(response)}")
-
-            logger.info("Guest agent ready", extra={"vm_id": vm.vm_id, "version": response.version})
-
-        # Race with retry logic (tenacity exponential backoff with full jitter)
-        death_task: asyncio.Task[None] | None = None
-        guest_task: asyncio.Task[None] | None = None
-        try:
-            async with asyncio.timeout(timeout):
-                death_task = asyncio.create_task(monitor_process_death())
-
-                # Pre-connect to chardev sockets to trigger QEMU's poll registration.
-                # Without this, QEMU may not add sockets to its poll set until after
-                # guest opens virtio-serial ports, causing reads to return EOF.
-                # See: https://bugs.launchpad.net/qemu/+bug/1224444 (virtio-mmio socket race)
-                #
-                # Timeout is short (1s vs previous 2s) because sockets are usually not ready this early.
-                # The retry loop below handles actual connection with proper exponential backoff.
-                # E3: Reduced pre-connect timeout from 0.1s to 0.01s — speculative, enters retry loop faster
-                try:
-                    await vm.channel.connect(timeout_seconds=0.005)
-                    logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": vm.vm_id})
-                except (TimeoutError, OSError) as e:
-                    # Expected - sockets may not be ready yet, retry loop will handle
-                    logger.debug("Pre-connect to sockets deferred", extra={"vm_id": vm.vm_id, "reason": str(e)})
-
-                # Retry with exponential backoff + full jitter
-                async for attempt in AsyncRetrying(
-                    retry=retry_if_exception_type(
-                        (TimeoutError, OSError, json.JSONDecodeError, RuntimeError, asyncio.IncompleteReadError)
-                    ),
-                    # E1: Tighter retry backoff for faster guest detection
-                    # E4: Reduced max from 0.2s to 0.05s — retries cap at 50ms intervals,
-                    # catching guest readiness within ~10ms instead of ~150ms overshoot
-                    wait=wait_random_exponential(multiplier=0.02, min=0.005, max=0.05),
-                ):
-                    with attempt:
-                        guest_task = asyncio.create_task(check_guest_ready())
-
-                        # Race: first one wins
-                        done, _pending = await asyncio.wait(
-                            {death_task, guest_task},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-
-                        # Check which completed
-                        if death_task in done:
-                            # QEMU died - cancel guest and retrieve exception
-                            guest_task.cancel()
-                            # Suppress ALL exceptions - we're about to re-raise VmError from death_task.
-                            # Race condition: guest_task may also have completed with an exception
-                            # (e.g., IncompleteReadError) which we must suppress to avoid masking VmError.
-                            # Use BaseException to also catch CancelledError (not a subclass of Exception in Python 3.8+).
-                            with contextlib.suppress(BaseException):
-                                await guest_task
-                            await death_task  # Re-raise VmError
-                            # Safety net: monitor_process_death should always raise,
-                            # but guard against future code paths that return normally.
-                            raise VmQemuCrashError(
-                                "QEMU process exited during boot (clean exit)",
-                                context={"vm_id": vm.vm_id, "exit_code": vm.process.returncode},
-                            )
-
-                        # Guest task completed - check result (raises if failed, triggering retry)
-                        await guest_task
-
-        except TimeoutError:
-            # Snapshot console lines from in-memory ring buffer
-            console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
-
-            logger.error(
-                "Guest agent timeout",
-                extra={
-                    "vm_id": vm.vm_id,
-                    "timeout": timeout,
-                    "qemu_running": vm.process.returncode is None,
-                    "console_log": console_snapshot,
-                    "overlay_image": str(vm.overlay_image) if vm.overlay_image else "(none)",
-                },
-            )
-
-            raise TimeoutError(f"Guest agent not ready after {timeout}s") from None
-
-        finally:
-            # Always clean up tasks to prevent "Task exception was never retrieved" warnings.
-            # This handles all exit paths: success, TimeoutError, VmError, and any other exception.
-            # Use BaseException to catch CancelledError (which is not a subclass of Exception in Python 3.8+).
-            for task in (death_task, guest_task):
-                if task is not None and not task.done():
-                    task.cancel()
-            for task in (death_task, guest_task):
-                if task is not None:
-                    with contextlib.suppress(BaseException):
-                        await task

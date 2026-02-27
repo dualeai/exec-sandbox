@@ -255,7 +255,7 @@ class UnixSocketChannel:
         """Connect to guest via Unix socket with mandatory peer verification.
 
         Single connection attempt with timeout (no retry).
-        Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
+        Caller handles retry logic (e.g., wait_for_guest exponential backoff).
 
         Verifies the socket server (QEMU) is running as the expected user
         via SO_PEERCRED/LOCAL_PEERCRED before allowing communication.
@@ -547,7 +547,7 @@ class DualPortChannel:
         """Connect both command and event ports.
 
         Connects in parallel for speed. Single connection attempt with timeout (no retry).
-        Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
+        Caller handles retry logic (e.g., wait_for_guest exponential backoff).
 
         On reconnection (after a previous close()), probes the guest agent with a
         PingRequest to ensure the guest has reopened its virtio-serial port.  QEMU

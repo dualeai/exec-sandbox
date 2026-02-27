@@ -6,8 +6,9 @@ Integration tests: Real VM lifecycle (requires QEMU + images).
 
 import asyncio
 import sys
+from collections import deque
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -2716,25 +2717,25 @@ class TestGuestErrorToException:
 
 
 # ============================================================================
-# Unit Tests - _wait_for_guest task racing
+# Unit Tests - wait_for_guest task racing
 # ============================================================================
 
 
 class TestWaitForGuest:
-    """Tests for _wait_for_guest death_task/guest_task racing logic.
+    """Tests for QemuVM.wait_for_guest() death_task/guest_task racing logic.
 
     Verifies correct behavior when QEMU dies, guest becomes ready,
     or timeouts fire during boot wait.
     """
 
     @staticmethod
-    def _make_mock_vm(
+    def _make_vm(
         process_wait_event: asyncio.Event | None = None,
         returncode: int = 0,
         connect_side_effect: object = None,
         send_request_side_effect: object = None,
     ) -> QemuVM:
-        """Build a QemuVM with mocked process and channel.
+        """Build a real QemuVM with mocked process and channel.
 
         Args:
             process_wait_event: If set, process.wait() blocks until event is set.
@@ -2743,8 +2744,6 @@ class TestWaitForGuest:
             connect_side_effect: Side effect for channel.connect().
             send_request_side_effect: Side effect for channel.send_request().
         """
-        from collections import deque
-
         from exec_sandbox.guest_agent_protocol import PongMessage
 
         mock_process = AsyncMock()
@@ -2765,19 +2764,23 @@ class TestWaitForGuest:
         else:
             mock_channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))
 
-        mock_vm = AsyncMock(spec=QemuVM)
-        mock_vm.vm_id = "test-wait-for-guest"
-        mock_vm.process = mock_process
-        mock_vm.channel = mock_channel
-        mock_vm.console_lines = deque(maxlen=100)
-        return mock_vm
+        mock_workdir = MagicMock()
+        mock_workdir.overlay_image = Path("/test/overlay.qcow2")
 
-    async def _wait_with_alive_process(
-        self, unit_test_vm_manager, vm, alive: asyncio.Event, timeout: float = 5
-    ) -> None:
-        """Call _wait_for_guest, ensuring the mock process is unblocked on exit."""
+        return QemuVM(
+            vm_id="test-wait-for-guest",
+            process=mock_process,
+            cgroup_path=None,
+            workdir=mock_workdir,
+            channel=mock_channel,
+            language="python",
+            console_lines=deque(maxlen=100),
+        )
+
+    async def _wait_with_alive_process(self, vm: QemuVM, alive: asyncio.Event, timeout: float = 5) -> None:
+        """Call wait_for_guest, ensuring the mock process is unblocked on exit."""
         try:
-            await unit_test_vm_manager._wait_for_guest(vm, timeout=timeout)  # pyright: ignore[reportPrivateUsage]
+            await vm.wait_for_guest(timeout=timeout)
         finally:
             alive.set()
 
@@ -2785,13 +2788,13 @@ class TestWaitForGuest:
     # Normal: guest becomes ready
     # ------------------------------------------------------------------
 
-    async def test_guest_ready_immediately(self, unit_test_vm_manager) -> None:
+    async def test_guest_ready_immediately(self) -> None:
         """Guest responds to ping on first attempt."""
         alive = asyncio.Event()
-        vm = self._make_mock_vm(process_wait_event=alive)
-        await self._wait_with_alive_process(unit_test_vm_manager, vm, alive)
+        vm = self._make_vm(process_wait_event=alive)
+        await self._wait_with_alive_process(vm, alive)
 
-    async def test_guest_ready_after_retries(self, unit_test_vm_manager) -> None:
+    async def test_guest_ready_after_retries(self) -> None:
         """Guest fails with retryable errors then succeeds."""
         from exec_sandbox.guest_agent_protocol import PongMessage
 
@@ -2810,30 +2813,30 @@ class TestWaitForGuest:
                 raise result
             return result
 
-        vm = self._make_mock_vm(process_wait_event=alive, send_request_side_effect=side_effect)
-        await self._wait_with_alive_process(unit_test_vm_manager, vm, alive)
+        vm = self._make_vm(process_wait_event=alive, send_request_side_effect=side_effect)
+        await self._wait_with_alive_process(vm, alive)
 
     # ------------------------------------------------------------------
     # QEMU crashes — process exits before guest is ready
     # ------------------------------------------------------------------
 
-    async def test_qemu_crash_raises_vm_error(self, unit_test_vm_manager) -> None:
+    async def test_qemu_crash_raises_vm_error(self) -> None:
         """QEMU dies with non-zero exit code during boot."""
         # Guest must not respond instantly, otherwise it wins the race
-        vm = self._make_mock_vm(returncode=1, connect_side_effect=OSError("connection refused"))
+        vm = self._make_vm(returncode=1, connect_side_effect=OSError("connection refused"))
 
         with pytest.raises(VmQemuCrashError):
-            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+            await vm.wait_for_guest(timeout=5)
 
-    async def test_qemu_crash_signal_raises_vm_error(self, unit_test_vm_manager) -> None:
+    async def test_qemu_crash_signal_raises_vm_error(self) -> None:
         """QEMU killed by signal (negative return code)."""
-        vm = self._make_mock_vm(returncode=-9, connect_side_effect=OSError("connection refused"))
+        vm = self._make_vm(returncode=-9, connect_side_effect=OSError("connection refused"))
 
         with pytest.raises(VmQemuCrashError):
-            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+            await vm.wait_for_guest(timeout=5)
 
-    @patch("exec_sandbox.vm_manager.detect_host_os", return_value=HostOS.MACOS)
-    async def test_macos_clean_exit_during_boot_raises_vm_error(self, _mock_os, unit_test_vm_manager) -> None:
+    @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.MACOS)
+    async def test_macos_clean_exit_during_boot_raises_vm_error(self, _mock_os) -> None:
         """macOS QEMU exits cleanly (code 0) during boot → must raise, not CancelledError.
 
         Regression test: monitor_process_death() returned normally on macOS
@@ -2843,50 +2846,239 @@ class TestWaitForGuest:
         - Error message contains "clean exit"
         - Error context includes host_os for diagnostics
         """
-        vm = self._make_mock_vm(returncode=0)
+        vm = self._make_vm(returncode=0)
 
         with pytest.raises(VmQemuCrashError, match="clean exit") as exc_info:
-            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+            await vm.wait_for_guest(timeout=5)
 
         assert exc_info.value.context.get("host_os") == "macos"
 
-    @patch("exec_sandbox.vm_manager.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.TCG)
-    @patch("exec_sandbox.vm_manager.detect_host_os", return_value=HostOS.LINUX)
-    async def test_tcg_clean_exit_during_boot_raises_vm_error(
-        self, _mock_os, _mock_accel, unit_test_vm_manager
-    ) -> None:
+    @patch("exec_sandbox.qemu_vm.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.TCG)
+    @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
+    async def test_tcg_clean_exit_during_boot_raises_vm_error(self, _mock_os, _mock_accel) -> None:
         """TCG exits with code 0 during boot (ARM64 timing race)."""
-        vm = self._make_mock_vm(returncode=0)
+        vm = self._make_vm(returncode=0)
 
         with pytest.raises(VmQemuCrashError):
-            await unit_test_vm_manager._wait_for_guest(vm, timeout=5)  # pyright: ignore[reportPrivateUsage]
+            await vm.wait_for_guest(timeout=5)
 
     # ------------------------------------------------------------------
     # Timeout — guest never becomes ready
     # ------------------------------------------------------------------
 
-    async def test_timeout_when_guest_never_ready(self, unit_test_vm_manager) -> None:
+    async def test_timeout_when_guest_never_ready(self) -> None:
         """Guest never responds, timeout fires."""
         alive = asyncio.Event()
-        vm = self._make_mock_vm(
+        vm = self._make_vm(
             process_wait_event=alive,
             connect_side_effect=OSError("connection refused"),
         )
 
         with pytest.raises(TimeoutError):
-            await self._wait_with_alive_process(unit_test_vm_manager, vm, alive, timeout=0.5)
+            await self._wait_with_alive_process(vm, alive, timeout=0.5)
 
     # ------------------------------------------------------------------
     # Edge: non-retryable guest error
     # ------------------------------------------------------------------
 
-    async def test_non_retryable_guest_error_propagates(self, unit_test_vm_manager) -> None:
+    async def test_non_retryable_guest_error_propagates(self) -> None:
         """Guest check raises non-retryable error (not in tenacity retry list)."""
         alive = asyncio.Event()
-        vm = self._make_mock_vm(
+        vm = self._make_vm(
             process_wait_event=alive,
             send_request_side_effect=ValueError("unexpected protocol error"),
         )
 
         with pytest.raises(ValueError, match="unexpected protocol error"):
-            await self._wait_with_alive_process(unit_test_vm_manager, vm, alive)
+            await self._wait_with_alive_process(vm, alive)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    async def test_capture_process_output_dead_process(self) -> None:
+        """capture_process_output returns stdout/stderr from dead process."""
+        vm = self._make_vm(returncode=1)
+        vm.process.communicate = AsyncMock(return_value=(b"out", b"err"))
+        stdout, stderr = await vm.capture_process_output()
+        assert stdout == "out"
+        assert stderr == "err"
+
+    async def test_capture_process_output_running_process(self) -> None:
+        """capture_process_output returns empty for running process."""
+        alive = asyncio.Event()
+        vm = self._make_vm(process_wait_event=alive)
+        vm.process.returncode = None
+        stdout, stderr = await vm.capture_process_output()
+        assert stdout == ""
+        assert stderr == ""
+
+    @patch("exec_sandbox.qemu_vm.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.KVM)
+    @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
+    async def test_collect_diagnostics_signal(self, _mock_os, _mock_accel) -> None:
+        """collect_diagnostics reports SIGKILL for exit code -9."""
+        vm = self._make_vm(returncode=-9)
+        diag = await vm.collect_diagnostics()
+        assert diag.signal_name == "SIGKILL"
+        assert diag.exit_code == -9
+        assert diag.accel_type == "kvm"
+        assert diag.host_os == "linux"
+
+    @patch("exec_sandbox.qemu_vm.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.HVF)
+    @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.MACOS)
+    async def test_collect_diagnostics_fields(self, _mock_os, _mock_accel) -> None:
+        """collect_diagnostics produces expected fields and truncates output."""
+        from dataclasses import asdict
+
+        vm = self._make_vm(returncode=0)
+        vm.console_lines.append("boot line 1")
+        vm.process.communicate = AsyncMock(return_value=(b"x" * 5000, b"y" * 5000))
+        diag = await vm.collect_diagnostics()
+
+        # Verify truncation
+        from exec_sandbox.constants import QEMU_OUTPUT_MAX_BYTES
+
+        assert len(diag.stdout) == QEMU_OUTPUT_MAX_BYTES
+        assert len(diag.stderr) == QEMU_OUTPUT_MAX_BYTES
+
+        # Verify fields
+        assert diag.vm_id == "test-wait-for-guest"
+        assert diag.exit_code == 0
+        assert diag.signal_name == ""
+        assert "boot line 1" in diag.console_log
+        assert diag.accel_type == "hvf"
+        assert diag.host_os == "macos"
+
+        # Verify asdict works
+        d = asdict(diag)
+        assert "vm_id" in d
+        assert "console_log" in d
+
+    # ------------------------------------------------------------------
+    # CancelledError from guest_task (child task cancellation)
+    # ------------------------------------------------------------------
+
+    async def test_guest_cancelled_error_retried_then_succeeds(self) -> None:
+        """Guest check raises CancelledError (transient), retried, then succeeds.
+
+        Regression test: CancelledError from child tasks (guest_task) escaped
+        asyncio.timeout() because the conversion to TimeoutError only applies
+        to the current task's cancellation. The fix wraps it as RuntimeError
+        so tenacity retries.
+        """
+        from exec_sandbox.guest_agent_protocol import PongMessage
+
+        alive = asyncio.Event()
+        attempts = iter(
+            [
+                asyncio.CancelledError(),
+                PongMessage(version="1.0"),
+            ]
+        )
+
+        def side_effect(*_args, **_kwargs):
+            result = next(attempts)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        vm = self._make_vm(process_wait_event=alive, send_request_side_effect=side_effect)
+        await self._wait_with_alive_process(vm, alive)
+
+    async def test_guest_cancelled_error_persistent_becomes_timeout(self) -> None:
+        """Guest check always raises CancelledError → eventually times out.
+
+        When every attempt raises CancelledError, the inner fix converts each
+        to RuntimeError (retried by tenacity). The outer asyncio.timeout()
+        eventually fires and raises TimeoutError.
+        """
+        alive = asyncio.Event()
+        vm = self._make_vm(
+            process_wait_event=alive,
+            send_request_side_effect=asyncio.CancelledError(),
+        )
+
+        with pytest.raises(TimeoutError):
+            await self._wait_with_alive_process(vm, alive, timeout=0.5)
+
+    async def test_guest_cancelled_error_connect_phase(self) -> None:
+        """CancelledError during connect() inside guest_task is also retried.
+
+        Pre-connect uses a very short timeout and fails with TimeoutError
+        (expected). The retry loop's guest_task then hits CancelledError
+        on connect(), which the fix wraps as RuntimeError for retry.
+        """
+        from exec_sandbox.guest_agent_protocol import PongMessage
+
+        alive = asyncio.Event()
+        # Pre-connect gets TimeoutError (expected/caught), first retry gets
+        # CancelledError (wrapped→retried), subsequent retries succeed (None).
+        responses: list[BaseException | None] = [
+            TimeoutError("pre-connect timeout"),
+            asyncio.CancelledError(),
+        ]
+        call_idx = 0
+
+        def connect_side_effect(*_args, **_kwargs):
+            nonlocal call_idx
+            idx = call_idx
+            call_idx += 1
+            if idx < len(responses):
+                result = responses[idx]
+                if isinstance(result, BaseException):
+                    raise result
+
+        vm = self._make_vm(
+            process_wait_event=alive,
+            connect_side_effect=connect_side_effect,
+            send_request_side_effect=PongMessage(version="1.0"),
+        )
+        await self._wait_with_alive_process(vm, alive)
+
+    async def test_guest_cancelled_mixed_with_other_retryable_errors(self) -> None:
+        """CancelledError interleaved with OSError — both retried, then success."""
+        from exec_sandbox.guest_agent_protocol import PongMessage
+
+        alive = asyncio.Event()
+        attempts = iter(
+            [
+                OSError("connection refused"),
+                asyncio.CancelledError(),
+                OSError("connection refused"),
+                asyncio.CancelledError(),
+                PongMessage(version="1.0"),
+            ]
+        )
+
+        def side_effect(*_args, **_kwargs):
+            result = next(attempts)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        vm = self._make_vm(process_wait_event=alive, send_request_side_effect=side_effect)
+        await self._wait_with_alive_process(vm, alive)
+
+    async def test_external_cancellation_propagates(self) -> None:
+        """Genuine external cancellation (not from guest_task) still propagates.
+
+        When the caller cancels the task (not the timeout, not a child task),
+        CancelledError must not be swallowed.
+        """
+        alive = asyncio.Event()
+        block = asyncio.Event()
+
+        async def blocking_connect(*_args, **_kwargs):
+            await block.wait()  # Block forever until cancelled
+
+        vm = self._make_vm(
+            process_wait_event=alive,
+            connect_side_effect=blocking_connect,
+        )
+
+        task = asyncio.create_task(self._wait_with_alive_process(vm, alive, timeout=30))
+        await asyncio.sleep(0.05)  # Let it enter the retry loop
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task

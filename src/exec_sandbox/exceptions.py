@@ -36,7 +36,12 @@ Backward Compatibility:
     MigrationError = MigrationTransientError
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from exec_sandbox.qemu_vm import QemuDiagnostics
 
 
 class SandboxError(Exception):
@@ -136,7 +141,26 @@ class VmQemuCrashError(VmTransientError):
 
     Raised when QEMU exits unexpectedly during boot. This is often
     caused by resource pressure and may succeed on retry.
+
+    Attributes:
+        diagnostics: Optional QemuDiagnostics with crash context.
+            When provided and no explicit context is given,
+            context is auto-populated via dataclasses.asdict().
     """
+
+    def __init__(
+        self,
+        message: str,
+        context: dict[str, Any] | None = None,
+        *,
+        diagnostics: QemuDiagnostics | None = None,
+    ):
+        if diagnostics is not None and context is None:
+            from dataclasses import asdict  # noqa: PLC0415
+
+            context = asdict(diagnostics)
+        super().__init__(message, context)
+        self.diagnostics = diagnostics
 
 
 class VmGvproxyError(VmTransientError):
