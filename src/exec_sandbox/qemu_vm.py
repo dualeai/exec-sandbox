@@ -382,8 +382,11 @@ class QemuVM:
             code: Code to execute in guest VM
             timeout_seconds: Maximum execution time (enforced by cgroup)
             env_vars: Environment variables for code execution (default: None)
-            on_stdout: Optional callback for real-time stdout streaming
-            on_stderr: Optional callback for real-time stderr streaming
+            on_stdout: Optional callback for real-time stdout streaming.
+                If the callback raises, it is disabled for the remainder of the
+                execution (output collection is unaffected).
+            on_stderr: Optional callback for real-time stderr streaming.
+                Same defensive semantics as on_stdout.
 
         Returns:
             ExecutionResult with stdout, stderr, exit code, and resource usage
@@ -495,14 +498,28 @@ class QemuVM:
                     # Collect chunk for return to user
                     if msg.type == "stdout":
                         stdout_chunks.append(msg.chunk)
-                        # Call streaming callback if provided
-                        if on_stdout:
-                            on_stdout(msg.chunk)
+                        if on_stdout is not None:
+                            try:
+                                on_stdout(msg.chunk)
+                            except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                                logger.warning(
+                                    "on_stdout callback raised, disabling",
+                                    extra={"vm_id": self.vm_id},
+                                    exc_info=True,
+                                )
+                                on_stdout = None
                     else:  # stderr
                         stderr_chunks.append(msg.chunk)
-                        # Call streaming callback if provided
-                        if on_stderr:
-                            on_stderr(msg.chunk)
+                        if on_stderr is not None:
+                            try:
+                                on_stderr(msg.chunk)
+                            except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                                logger.warning(
+                                    "on_stderr callback raised, disabling",
+                                    extra={"vm_id": self.vm_id},
+                                    exc_info=True,
+                                )
+                                on_stderr = None
 
                     # Also log for debugging (truncated)
                     logger.debug(

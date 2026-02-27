@@ -9,8 +9,6 @@ Verifies the streaming contract:
 
 import time
 
-import pytest
-
 from exec_sandbox.constants import MAX_STDERR_SIZE, MAX_STDOUT_SIZE
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
@@ -340,18 +338,64 @@ sys.stderr.flush()
 class TestStreamingWeirdCases:
     """Test unusual inputs that might confuse the streaming protocol."""
 
-    async def test_callback_exception_propagates(self, scheduler: Scheduler) -> None:
-        """Exception in on_stdout callback propagates (not swallowed)."""
+    async def test_callback_exception_disabled_stdout_still_completes(self, scheduler: Scheduler) -> None:
+        """on_stdout that raises is disabled; output still collected in result."""
 
         def exploding_callback(_chunk: str) -> None:
-            raise ValueError("callback boom")
+            raise RuntimeError("callback boom")
 
-        with pytest.raises(ValueError, match="callback boom"):
-            await scheduler.run(
-                code='print("trigger")',
-                language=Language.PYTHON,
-                on_stdout=exploding_callback,
-            )
+        result = await scheduler.run(
+            code='print("hello from stdout")',
+            language=Language.PYTHON,
+            on_stdout=exploding_callback,
+        )
+        assert result.exit_code == 0
+        assert "hello from stdout" in result.stdout
+
+    async def test_callback_exception_disabled_stderr_still_completes(self, scheduler: Scheduler) -> None:
+        """on_stderr that raises is disabled; output still collected in result."""
+
+        def exploding_callback(_chunk: str) -> None:
+            raise RuntimeError("callback boom")
+
+        result = await scheduler.run(
+            code='import sys; print("hello from stderr", file=sys.stderr)',
+            language=Language.PYTHON,
+            on_stderr=exploding_callback,
+        )
+        assert result.exit_code == 0
+        assert "hello from stderr" in result.stderr
+
+    async def test_callback_exception_on_later_chunk(self, scheduler: Scheduler) -> None:
+        """Callback raises on 2nd chunk; all output still collected."""
+        call_count = 0
+
+        def explode_on_second(chunk: str) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise RuntimeError("boom on second chunk")
+
+        code = """
+import sys
+for i in range(5):
+    print(f"line-{i}", flush=True)
+"""
+
+        def collecting_callback(chunk: str) -> None:
+            stdout_chunks.append(chunk)
+            explode_on_second(chunk)
+
+        stdout_chunks: list[str] = []
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            on_stdout=collecting_callback,
+        )
+        assert result.exit_code == 0
+        # All lines collected in result regardless of callback failure
+        for i in range(5):
+            assert f"line-{i}" in result.stdout
 
     async def test_extremely_long_single_line(self, scheduler: Scheduler) -> None:
         """128KB with no newlines splits into >= 2 chunks."""
