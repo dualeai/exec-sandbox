@@ -80,6 +80,7 @@ pub(crate) async fn spawn_repl(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .current_dir(SANDBOX_ROOT)
+        .env("HOME", SANDBOX_ROOT)
         .process_group(0);
 
     // Defense-in-depth: harden the REPL child process before exec.

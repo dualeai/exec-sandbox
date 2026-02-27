@@ -1422,6 +1422,153 @@ class TestRawEdgeCases:
 
 
 # =============================================================================
+# HOME Environment: HOME must equal /home/user (SANDBOX_ROOT) for uid=1000
+# =============================================================================
+
+
+class TestHomeEnvironmentNormal:
+    """HOME=/home/user for all REPL types (uid=1000 runs in /home/user)."""
+
+    async def test_raw_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
+        """Raw shell $HOME equals /home/user."""
+        result = await scheduler.run(code="echo $HOME", language=Language.RAW)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_python_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
+        """Python os.environ['HOME'] equals /home/user."""
+        result = await scheduler.run(
+            code="import os; print(os.environ['HOME'])",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_javascript_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
+        """JavaScript process.env.HOME equals /home/user."""
+        result = await scheduler.run(
+            code="console.log(process.env.HOME)",
+            language=Language.JAVASCRIPT,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_raw_tilde_expansion(self, scheduler: Scheduler) -> None:
+        """Tilde expands to /home/user in raw shell."""
+        result = await scheduler.run(code="echo ~", language=Language.RAW)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_raw_home_writable(self, scheduler: Scheduler) -> None:
+        """Files can be created under $HOME."""
+        result = await scheduler.run(
+            code="echo ok > $HOME/test_home.txt && cat $HOME/test_home.txt",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "ok" in result.stdout
+
+
+class TestHomeEnvironmentEdge:
+    """Edge cases for HOME consistency."""
+
+    async def test_raw_home_persists_across_executions(self, scheduler: Scheduler) -> None:
+        """HOME stays /home/user on second execution in same session."""
+        result = await scheduler.run(
+            code="echo $HOME; echo $HOME",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        lines = [line for line in result.stdout.strip().split("\n") if line.strip()]
+        assert all(line.strip() == "/home/user" for line in lines)
+
+    async def test_raw_subprocess_inherits_home(self, scheduler: Scheduler) -> None:
+        """Child processes inherit correct HOME."""
+        result = await scheduler.run(
+            code="bash -c 'echo $HOME'",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_raw_env_vars_coexist_with_home(self, scheduler: Scheduler) -> None:
+        """Custom env_vars don't clobber HOME."""
+        result = await scheduler.run(
+            code="echo $HOME $MY_VAR",
+            language=Language.RAW,
+            env_vars={"MY_VAR": "hello"},
+        )
+        assert result.exit_code == 0
+        assert "/home/user" in result.stdout
+        assert "hello" in result.stdout
+
+    async def test_python_pathlib_home(self, scheduler: Scheduler) -> None:
+        """pathlib.Path.home() returns /home/user."""
+        result = await scheduler.run(
+            code="from pathlib import Path; print(Path.home())",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+
+class TestHomeEnvironmentWeird:
+    """Weird corner cases for HOME."""
+
+    async def test_raw_home_matches_passwd(self, scheduler: Scheduler) -> None:
+        """$HOME matches the home dir in /etc/passwd for uid=1000."""
+        result = await scheduler.run(
+            code="echo HOME=$HOME; awk -F: '$3==1000{print \"passwd=\"$6}' /etc/passwd",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "HOME=/home/user" in result.stdout
+        assert "passwd=/home/user" in result.stdout
+
+    async def test_raw_cd_tilde_pwd(self, scheduler: Scheduler) -> None:
+        """cd ~ + pwd returns /home/user."""
+        result = await scheduler.run(
+            code="cd ~ && pwd",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_python_expanduser(self, scheduler: Scheduler) -> None:
+        """os.path.expanduser('~') returns /home/user."""
+        result = await scheduler.run(
+            code="import os; print(os.path.expanduser('~'))",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+
+class TestHomeEnvironmentOutOfBounds:
+    """Out-of-bounds / adversarial HOME scenarios."""
+
+    async def test_raw_user_can_override_home(self, scheduler: Scheduler) -> None:
+        """User can override HOME via env_vars (not blocked)."""
+        result = await scheduler.run(
+            code="echo $HOME",
+            language=Language.RAW,
+            env_vars={"HOME": "/tmp"},
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/tmp"
+
+    async def test_python_user_can_override_home(self, scheduler: Scheduler) -> None:
+        """User can override HOME via env_vars in Python."""
+        result = await scheduler.run(
+            code="import os; print(os.environ['HOME'])",
+            language=Language.PYTHON,
+            env_vars={"HOME": "/tmp"},
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/tmp"
+
+
+# =============================================================================
 # Stdin EOF: user code reading stdin gets immediate EOF (not a hang)
 # =============================================================================
 
