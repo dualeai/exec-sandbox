@@ -615,6 +615,7 @@ except Exception as e:
         assert "STATUS:200" in result.stdout
 
 
+@pytest.mark.slow
 class TestPortForwardingConnectivity:
     """Tests that actually verify host can connect to exposed ports."""
 
@@ -678,6 +679,7 @@ finally:
 # =============================================================================
 
 
+@pytest.mark.slow
 class TestSessionExposedPorts:
     """Integration tests for Session.exposed_ports property."""
 
