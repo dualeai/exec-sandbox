@@ -34,7 +34,7 @@ from typing import IO, TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
-from exec_sandbox.exceptions import InputValidationError, SessionClosedError, VmConfigError
+from exec_sandbox.exceptions import InputValidationError, OutputLimitError, SessionClosedError, VmConfigError
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 
 if TYPE_CHECKING:
@@ -180,6 +180,7 @@ class Session:
         Raises:
             CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
             EnvVarValidationError: Invalid env var names/values (control chars, size limits).
+            OutputLimitError: stdout/stderr exceeded guest-enforced limits (session stays alive).
             SessionClosedError: Session has been closed.
             VmPermanentError: VM communication failed (session auto-closed).
             VmTransientError: VM communication failed (session auto-closed).
@@ -212,6 +213,10 @@ class Session:
             except InputValidationError:
                 # Input validation errors are caller bugs, not VM failures.
                 # Session stays alive — caller can retry with valid input.
+                raise
+            except OutputLimitError:
+                # Output limit exceeded — guest-enforced, REPL preserved.
+                # Session stays alive — caller can retry with less output.
                 raise
             except Exception:
                 # VM failure - auto-close session

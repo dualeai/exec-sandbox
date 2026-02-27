@@ -16,15 +16,16 @@ use crate::types::{GuestResponse, Language};
 /// to a distinct wire string so the host can dispatch without parsing messages.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ErrorType {
-    EnvVar,    // "env_var_error"
-    Code,      // "code_error"
-    Path,      // "path_error"
-    Package,   // "package_error"
-    Io,        // "io_error"
-    Timeout,   // "timeout_error"
-    Execution, // "execution_error"
-    Request,   // "request_error"
-    Protocol,  // "protocol_error"
+    EnvVar,      // "env_var_error"
+    Code,        // "code_error"
+    Path,        // "path_error"
+    Package,     // "package_error"
+    Io,          // "io_error"
+    Timeout,     // "timeout_error"
+    Execution,   // "execution_error"
+    Request,     // "request_error"
+    Protocol,    // "protocol_error"
+    OutputLimit, // "output_limit_error"
 }
 
 impl ErrorType {
@@ -39,6 +40,7 @@ impl ErrorType {
             Self::Execution => "execution_error",
             Self::Request => "request_error",
             Self::Protocol => "protocol_error",
+            Self::OutputLimit => "output_limit_error",
         }
     }
 }
@@ -108,6 +110,13 @@ impl CmdError {
         Self::Reply {
             message: msg.into(),
             error_type: ErrorType::Execution.as_str(),
+        }
+    }
+
+    pub(crate) fn output_limit(msg: impl Into<String>) -> Self {
+        Self::Reply {
+            message: msg.into(),
+            error_type: ErrorType::OutputLimit.as_str(),
         }
     }
 }
@@ -427,6 +436,21 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_error_output_limit() {
+        let err = CmdError::output_limit("stdout 1200000 bytes exceeds 1000000 limit");
+        match err {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
+                assert!(message.contains("1200000"));
+                assert_eq!(error_type, "output_limit_error");
+            }
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
     fn test_error_type_as_str() {
         assert_eq!(ErrorType::EnvVar.as_str(), "env_var_error");
         assert_eq!(ErrorType::Code.as_str(), "code_error");
@@ -437,6 +461,7 @@ mod tests {
         assert_eq!(ErrorType::Execution.as_str(), "execution_error");
         assert_eq!(ErrorType::Request.as_str(), "request_error");
         assert_eq!(ErrorType::Protocol.as_str(), "protocol_error");
+        assert_eq!(ErrorType::OutputLimit.as_str(), "output_limit_error");
     }
 
     #[test]

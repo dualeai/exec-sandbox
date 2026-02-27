@@ -22,6 +22,7 @@ from exec_sandbox.exceptions import (
     CodeValidationError,
     EnvVarValidationError,
     InputValidationError,
+    OutputLimitError,
     PackageNotAllowedError,
     SandboxError,
     VmBootTimeoutError,
@@ -92,6 +93,8 @@ def guest_error_to_exception(
             return CodeValidationError(formatted, context=context)
         case constants.GuestErrorType.PACKAGE:
             return PackageNotAllowedError(formatted, context=context)
+        case constants.GuestErrorType.OUTPUT_LIMIT:
+            return OutputLimitError(formatted, context=context)
         case (
             constants.GuestErrorType.PATH
             | constants.GuestErrorType.IO
@@ -394,6 +397,7 @@ class QemuVM:
         Raises:
             CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
             EnvVarValidationError: Invalid env vars (control chars, size limits)
+            OutputLimitError: stdout or stderr exceeded guest-enforced size limits.
             VmPermanentError: VM not in READY state or communication failed
             VmBootTimeoutError: Execution exceeded timeout_seconds
         """
@@ -521,7 +525,7 @@ class QemuVM:
                                 )
                                 on_stderr = None
 
-                    # Also log for debugging (truncated)
+                    # Log first 200 chars only to keep log lines bounded
                     logger.debug(
                         "VM output",
                         extra={
@@ -545,6 +549,11 @@ class QemuVM:
                         with contextlib.suppress(VmPermanentError):
                             await self.transition_state(VmState.READY)
                         raise exc
+                    # Output limit errors — REPL is preserved, raise typed exception
+                    if isinstance(exc, OutputLimitError):
+                        with contextlib.suppress(VmPermanentError):
+                            await self.transition_state(VmState.READY)
+                        raise exc
                     # Other error types are runtime results, not caller bugs
                     logger.error(
                         f"Guest agent error: [{msg.error_type}] {msg.message}",
@@ -561,13 +570,9 @@ class QemuVM:
             # Measure external resources from host (cgroup v2)
             external_cpu_ms, external_mem_mb = await self._read_cgroup_stats()
 
-            # Concatenate collected chunks
+            # Concatenate collected chunks (guest enforces size limits)
             stdout_full = "".join(stdout_chunks)
             stderr_full = "".join(stderr_chunks)
-
-            # Truncate to limits
-            stdout_truncated = stdout_full[: constants.MAX_STDOUT_SIZE]
-            stderr_truncated = stderr_full[: constants.MAX_STDERR_SIZE]
 
             # Debug log final execution output
             logger.debug(
@@ -578,16 +583,16 @@ class QemuVM:
                     "execution_time_ms": execution_time_ms,
                     "stdout_len": len(stdout_full),
                     "stderr_len": len(stderr_full),
-                    "stdout": stdout_truncated[:500],  # First 500 chars for debug
-                    "stderr": stderr_truncated[:500] if stderr_truncated else None,
+                    "stdout": stdout_full[:500],  # First 500 chars for debug
+                    "stderr": stderr_full[:500] if stderr_full else None,
                 },
             )
 
             # Parse result with both internal (guest) and external (host) measurements
             # Note: timing is a placeholder here - scheduler will populate actual values
             exec_result = ExecutionResult(
-                stdout=stdout_truncated,  # Return to user
-                stderr=stderr_truncated,  # Return to user
+                stdout=stdout_full,
+                stderr=stderr_full,
                 exit_code=exit_code,
                 execution_time_ms=execution_time_ms,  # Guest-reported
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured

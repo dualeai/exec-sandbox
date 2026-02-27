@@ -21,6 +21,7 @@ import psutil
 import pytest
 
 from exec_sandbox import Scheduler, SchedulerConfig, constants
+from exec_sandbox.exceptions import OutputLimitError
 from exec_sandbox.guest_channel import OP_QUEUE_DEPTH
 from exec_sandbox.warm_vm_pool import Language
 from tests.conftest import skip_unless_hwaccel
@@ -213,6 +214,15 @@ _FILE_IO_RSS_STREAMING_OVERHEAD_MB = 2
 # for 10 MB files).  tracemalloc.get_traced_memory()[0] measures live
 # Python objects only — immune to OS allocator behavior.
 _FILE_IO_INTRA_SESSION_LEAK_MB = 5
+
+# --- Output cap overhead thresholds ---
+#
+# Guest enforces stdout cap at 1 MB (MAX_STDOUT_BYTES).  On exceed the guest
+# stops transmitting chunks and raises output_limit_error.  Host-side peak
+# allocation is: ~1 MB of accumulated stdout_chunks + per-message Pydantic
+# parsing + channel read buffers.  The threshold must be FLAT — independent
+# of how much the guest process actually wrote.
+_OUTPUT_CAP_TRACEMALLOC_OVERHEAD_MB = 5
 
 
 @pytest.fixture(params=_FILE_IO_SIZES_MB, ids=[f"{s}MB" for s in _FILE_IO_SIZES_MB])
@@ -792,4 +802,67 @@ async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_d
     assert path_peak_mb < _FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB, (
         f"Path input peak ({path_peak_mb:.1f}MB) should be < {_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB}MB — "
         f"bounded by write queue capacity"
+    )
+
+
+# =============================================================================
+# Output Cap Memory Tests — verify guest-side cap bounds host memory
+# =============================================================================
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("output_mb", [2, 100], ids=["2MB", "100MB"])
+async def test_output_cap_bounds_host_memory(output_mb: int, images_dir: Path) -> None:
+    """Guest-side output cap prevents host memory from scaling with output size.
+
+    Generates output_mb of stdout in the guest.  The guest agent caps at 1 MB
+    (MAX_STDOUT_BYTES) and raises output_limit_error.  Host-side tracemalloc
+    peak must be FLAT regardless of output_mb — a 2 MB and 100 MB output must
+    fit under the SAME threshold.  This proves the cap is enforced in the guest
+    and the host never buffers unbounded output.
+
+    Uses tracemalloc for precise Python heap measurement (immune to allocator
+    hysteresis).  A warm-up exec populates Pydantic caches and channel state
+    so only the capped execution's allocations are measured.
+    """
+    target_bytes = output_mb * 1024 * 1024
+
+    # Write in 64KB chunks to avoid a single huge Python string in the guest
+    code = f"""
+import sys
+chunk = "X" * 65536
+remaining = {target_bytes}
+while remaining > 0:
+    n = min(65536, remaining)
+    sys.stdout.write(chunk[:n])
+    remaining -= n
+sys.stdout.flush()
+"""
+
+    config = SchedulerConfig(
+        images_dir=images_dir,
+        warm_pool_size=0,
+    )
+
+    async with Scheduler(config) as scheduler:
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            # Warm-up: populates Pydantic caches, channel state, etc.
+            await session.exec('print("warmup")')
+
+            gc.collect()
+            tracemalloc.start()
+            try:
+                with pytest.raises(OutputLimitError):
+                    await session.exec(code, timeout_seconds=300)
+                _, peak_bytes = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+    peak_mb = peak_bytes / 1024 / 1024
+
+    assert peak_mb < _OUTPUT_CAP_TRACEMALLOC_OVERHEAD_MB, (
+        f"Output cap not enforced on host: {peak_mb:.1f}MB tracemalloc peak "
+        f"for {output_mb}MB guest output (flat threshold: "
+        f"{_OUTPUT_CAP_TRACEMALLOC_OVERHEAD_MB}MB — guest caps stdout at 1 MB, "
+        f"host should never see more)"
     )

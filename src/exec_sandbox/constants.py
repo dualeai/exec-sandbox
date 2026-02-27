@@ -23,6 +23,7 @@ class GuestErrorType(str, enum.Enum):
     EXECUTION = "execution_error"
     REQUEST = "request_error"
     PROTOCOL = "protocol_error"
+    OUTPUT_LIMIT = "output_limit_error"
 
 
 # ============================================================================
@@ -148,11 +149,6 @@ ENV_VAR_FORBIDDEN_CONTROL_CHARS: Final[frozenset[int]] = frozenset(
 )
 """Forbidden control characters in env var names/values (terminal escape injection prevention)."""
 
-MAX_STDOUT_SIZE: Final[int] = 1_000_000  # 1MB
-"""Maximum stdout capture size in bytes."""
-
-MAX_STDERR_SIZE: Final[int] = 100_000  # 100KB
-"""Maximum stderr capture size in bytes."""
 
 # ============================================================================
 # File I/O

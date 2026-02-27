@@ -9,6 +9,9 @@ References:
 - CPython docs: https://docs.python.org/3/using/cmdline.html#envvar-PYTHONINTMAXSTRDIGITS
 """
 
+import pytest
+
+from exec_sandbox.exceptions import OutputLimitError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
@@ -231,20 +234,17 @@ print(len(s))
         assert result.stdout.strip() == "100000"
 
     async def test_large_output_hits_stdout_cap(self, scheduler: Scheduler) -> None:
-        """Printing a ~1M-digit number hits stdout cap but doesn't crash."""
+        """Printing a ~1M-digit number exceeds guest-agent 1MB stdout limit."""
         code = """
 x = 10**999999
 print(x)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=60,
-        )
-
-        # Should succeed (exit_code 0) even if output is truncated
-        assert result.exit_code == 0
-        assert len(result.stdout) > 0
+        with pytest.raises(OutputLimitError):
+            await scheduler.run(
+                code=code,
+                language=Language.PYTHON,
+                timeout_seconds=60,
+            )
 
     async def test_user_env_var_cannot_override_limit(self, scheduler: Scheduler) -> None:
         """User env_vars are injected as Python code (os.environ), too late to affect

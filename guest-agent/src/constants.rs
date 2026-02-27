@@ -52,6 +52,11 @@ pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
 pub(crate) const DRAIN_TIMEOUT_MS: u64 = 5;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
 
+// Output size limits (guest-enforced). Exceeding either raises CmdError::output_limit
+// to the host (maps to OutputLimitError in Python). The REPL is preserved for session reuse.
+pub(crate) const MAX_STDOUT_BYTES: usize = 1_000_000; // 1 MB
+pub(crate) const MAX_STDERR_BYTES: usize = 100_000; // 100 KB
+
 // File I/O limits
 pub(crate) const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024; // 500 MiB
 pub(crate) const MAX_FILE_PATH_LENGTH: usize = 4096; // POSIX PATH_MAX

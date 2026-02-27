@@ -22,6 +22,7 @@ Hierarchy:
     ├── InputValidationError (caller-bug marker base)
     │   ├── CodeValidationError       ← empty/null-byte code
     │   └── EnvVarValidationError     ← control chars, size limits
+    ├── OutputLimitError              ← stdout/stderr exceeded guest limits
     └── ... (other existing exceptions)
 
 Backward Compatibility:
@@ -308,6 +309,23 @@ class EnvVarValidationError(InputValidationError):
 
     Raised when environment variable names or values contain invalid
     characters (control characters, null bytes) or exceed size limits.
+    """
+
+
+class OutputLimitError(PermanentError):
+    """Output size limit exceeded during code execution.
+
+    Raised when stdout or stderr exceeds the guest-enforced size limit
+    (stdout: 1 MB, stderr: 100 KB — see guest-agent/src/constants.rs).
+    The REPL session is preserved and can be reused — only the current
+    execution's output was too large.
+
+    Inherits PermanentError because the output-size exceedance is not
+    retryable by re-sending the same code — the caller must reduce their
+    output volume. The VM session itself remains healthy and READY for reuse.
+
+    The partial output (up to the limit) is still delivered via streaming
+    callbacks before this error is raised.
     """
 
 

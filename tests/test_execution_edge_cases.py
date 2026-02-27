@@ -48,10 +48,10 @@ class TestEdgeCases:
         assert result.stdout == ""
 
     async def test_large_output_1mb(self, scheduler: Scheduler) -> None:
-        """Code producing ~1MB of output."""
-        # Generate ~1MB of output (1000 lines of 1000 chars each)
+        """Code producing ~1MB of output (just under guest-agent 1MB stdout limit)."""
+        # Generate output just under the 1MB limit: 999 lines x 1001 bytes = 999,999 bytes
         code = """
-for i in range(1000):
+for i in range(999):
     print('x' * 1000)
 """
 
@@ -62,7 +62,7 @@ for i in range(1000):
         )
 
         assert result.exit_code == 0
-        # Should have substantial output (may be truncated)
+        # Should have substantial output (just under 1MB limit)
         assert len(result.stdout) > 100000  # At least 100KB
 
     async def test_many_lines_output(self, scheduler: Scheduler) -> None:

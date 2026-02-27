@@ -131,8 +131,8 @@ class TimingBreakdown(BaseModel):
 class ExecutionResult(BaseModel):
     """Result from code execution inside microVM."""
 
-    stdout: str = Field(max_length=1_000_000, description="Standard output (truncated at 1MB)")
-    stderr: str = Field(max_length=100_000, description="Standard error (truncated at 100KB)")
+    stdout: str = Field(description="Standard output (guest-enforced 1MB limit)")
+    stderr: str = Field(description="Standard error (guest-enforced 100KB limit)")
     exit_code: int = Field(description="Process exit code (0=success)")
     execution_time_ms: int | None = Field(default=None, description="Execution time in ms (guest-reported)")
     external_cpu_time_ms: int | None = Field(default=None, description="CPU time in ms (host cgroup)")
