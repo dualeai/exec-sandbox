@@ -695,11 +695,13 @@ with open("/nonexistent/path/to/file.txt") as f:
     async def test_permission_denied(self, scheduler: Scheduler) -> None:
         """Write to read-only filesystem fails.
 
-        Note: /proc is read-only regardless of UID, making it a reliable
-        target for testing write-permission errors.
+        Note: /proc/version is masked (bind-mounted to /dev/null) for
+        security, so writes there silently succeed. Target /etc/passwd
+        instead — it lives on the EROFS rootfs and is bind-remounted
+        read-only, so writes always fail with EROFS (errno 30).
         """
         code = """
-with open("/proc/version", "w") as f:
+with open("/etc/passwd", "w") as f:
     f.write("test")
 """
 
@@ -708,7 +710,7 @@ with open("/proc/version", "w") as f:
             language=Language.PYTHON,
         )
 
-        # Writing to /proc should fail even as root (may be OSError, IOError, or PermissionError)
+        # Writing to EROFS rootfs should fail even as root
         assert result.exit_code != 0
         assert any(
             err in result.stderr

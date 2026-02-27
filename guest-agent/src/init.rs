@@ -202,6 +202,25 @@ fn mount_readonly_paths() {
     ] {
         let _ = mount_readonly(path);
     }
+
+    // Mask sensitive /proc files (bind-mount /dev/null → reads return empty).
+    // Safe to mask here: rw_mode and QUIET_MODE already read /proc/cmdline above.
+    for path in [
+        // Boot params: rootfstype, init flags, console config (reconnaissance)
+        c"/proc/cmdline",
+        // Exact kernel version string (aids CVE matching against guest kernel)
+        c"/proc/version",
+        // Interrupt counters per CPU — thermal side-channel attack vector
+        // (Docker masked this in Mar 2025, GHSA-6fw5-f8r9-fgfm)
+        c"/proc/interrupts",
+        // Kernel keyring — NOT namespaced; mask even though currently empty
+        c"/proc/keys",
+        // High-resolution timer internals — timing side-channel
+        // (already EPERM via dmesg_restrict, mask as defense-in-depth)
+        c"/proc/timer_list",
+    ] {
+        let _ = mount_mask(path);
+    }
 }
 
 /// Configure loopback and eth0 network interfaces.
@@ -574,6 +593,28 @@ fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
         if let Ok(cpath) = std::ffi::CString::new(*path) {
             unsafe { libc::chmod(cpath.as_ptr(), mode) };
         }
+    }
+}
+
+/// Mask a path by bind-mounting /dev/null over it (returns empty on read).
+fn mount_mask(path: &std::ffi::CStr) -> bool {
+    unsafe {
+        let ret = libc::mount(
+            c"/dev/null".as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        );
+        if ret != 0 {
+            log_warn!(
+                "mask mount {} failed: {}",
+                path.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        true
     }
 }
 
