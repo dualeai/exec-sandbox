@@ -1312,18 +1312,25 @@ class VmManager:
                     context={"vm_id": vm.vm_id, "exit_code": 0, "host_os": "macos"},
                 )
 
-            # TCG emulation: Exit code 0 during boot indicates timing race on
-            # ARM64 GIC/virtio-MMIO initialization (translation cache pressure,
-            # single-threaded TCG throughput limits). Log as warning for visibility,
-            # then raise VmQemuCrashError to trigger outer retry with fresh VM.
+            # TCG emulation: Exit code 0 during boot means -no-reboot caught a
+            # guest reboot/panic. Capture diagnostics before retrying so CI
+            # failures are debuggable.
             accel_type = await detect_accel_type()
             if accel_type == AccelType.TCG and vm.process.returncode == 0:
+                console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
+                stdout_text, stderr_text = await self._capture_qemu_output(vm.process)
                 logger.warning(
-                    "QEMU TCG exited with code 0 during boot (timing race, will retry)",
-                    extra={"vm_id": vm.vm_id, "exit_code": 0, "host_os": host_os.value},
+                    "QEMU TCG exited with code 0 during boot (will retry)",
+                    extra={
+                        "vm_id": vm.vm_id,
+                        "exit_code": 0,
+                        "host_os": host_os.value,
+                        "console_log": console_snapshot[-2000:],
+                        "stderr": stderr_text[:500] if stderr_text else "(empty)",
+                    },
                 )
                 raise VmQemuCrashError(
-                    "QEMU TCG exited with code 0 during boot (timing race on virtio-mmio init)",
+                    "QEMU TCG exited with code 0 during boot (guest reboot/panic)",
                     context={"vm_id": vm.vm_id, "exit_code": 0, "accel_type": "tcg"},
                 )
 

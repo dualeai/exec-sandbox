@@ -355,10 +355,15 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # -svm,-vmx: Hide AMD SVM and Intel VMX flags from guest to prevent
             # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
             # These flags are x86-specific — ARM64 HVF uses plain "host".
-            # ARM64 TCG: neoverse-n2 (ARMv9.0) provides PAC, BTI, SVE, MTE,
-            # and SSBS/CSV2 side-channel flags. pauth-impdef=on forces the fast
-            # impdef algorithm (QEMU 10.0+ defaults to this for virt >= 10.0,
-            # but older versions use QARMA5 which costs ~50% of TCG cycles).
+            # ARM64 TCG: "max" exposes every feature the current QEMU TCG
+            # version supports, adapting automatically — on QEMU 8.2 (Ubuntu
+            # 24.04 CI) it enables fewer ARMv9 features than on 10.x, but only
+            # ones that work. A named model like neoverse-n2 demands features
+            # (SVE2, MTE, full PAC) that QEMU 8.x TCG cannot emulate correctly,
+            # causing guest panics during early boot. "max" is what QEMU's own
+            # TCG test suite uses. pauth-impdef=on forces the fast impdef PAC
+            # algorithm (QEMU 10.0+ defaults to this for virt >= 10.0, but
+            # older versions use QARMA5 which costs ~50% of TCG cycles).
             # x86 TCG: SapphireRapids-v2 provides full Spectre/MDS mitigation
             # flags (spec-ctrl, stibp, ssbd, arch-capabilities, md-clear,
             # mds-no, taa-no, gds-no, rfds-no). TCG silently strips AVX-512
@@ -373,7 +378,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 if accel_type in (AccelType.HVF, AccelType.KVM) and arch == HostArch.AARCH64
                 else "host,-svm,-vmx"
                 if accel_type in (AccelType.HVF, AccelType.KVM)
-                else "neoverse-n2,pauth-impdef=on"
+                else "max,pauth-impdef=on"
                 if arch == HostArch.AARCH64
                 else "SapphireRapids-v2"
             ),
