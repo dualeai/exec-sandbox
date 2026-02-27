@@ -462,6 +462,7 @@ class TestLargePayloadStreaming:
 # Measure raw streaming throughput by minimizing generation overhead
 
 
+@pytest.mark.slow  # MiB/s thresholds are sensitive to CI runner I/O load
 @skip_unless_hwaccel
 class TestStreamingThroughput:
     """Benchmark tests to measure raw streaming throughput.

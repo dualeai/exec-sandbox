@@ -1051,6 +1051,7 @@ class TestWarmPoolIdleCpu:
         finally:
             await pool.stop()
 
+    @pytest.mark.slow  # pool_size=2 may not fully boot within SETTLE_SLEEP_S on loaded CI runners
     async def test_multiple_vms_idle_no_interference(self, vm_manager) -> None:
         """Multiple VMs don't interfere with each other's idle CPU (thundering herd)."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -1149,6 +1150,7 @@ class TestWarmPoolIdleCpu:
 # ============================================================================
 
 
+@pytest.mark.slow  # warm pool boot + CPU sampling requires quiet runner; flaky under contention
 @skip_unless_hwaccel
 class TestPostExecutionCpuIdle:
     """Integration tests verifying VMs return to idle CPU after code execution.
