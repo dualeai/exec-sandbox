@@ -22,14 +22,18 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # QEMU Crash Retry (GitHub Actions CI only)
 # ============================================================================
-# GitHub Actions ARM64 runners trigger two transient QEMU SIGABRT crashes:
-#   1. ARM emulation bug: "regime_is_user: code should not be reached"
-#      → QEMU hits unreachable code in ARM CPU regime handling (QEMU bug)
-#   2. Thread exhaustion: "qemu_thread_create: Resource temporarily unavailable"
+# GitHub Actions CI runners can trigger a transient QEMU crash:
+#   Thread exhaustion: "qemu_thread_create: Resource temporarily unavailable"
 #      → Host runs out of threads under parallel test load (EAGAIN)
-# Both cause QEMU to abort (exit code -6). These are host-side issues,
-# not test bugs. We detect the exact error strings and retry with backoff
-# plus heavy jitter to desynchronize parallel workers on noisy CI hardware.
+#      → Causes SIGABRT (exit code -6). This is a host-side issue, not a test bug.
+#
+# Note: The previous "regime_is_user: code should not be reached" crash (QEMU
+# ARM64 TCG bug in versions < 9.0.4) is now caught early by a version check in
+# qemu_cmd.py, which raises VmDependencyError before QEMU is launched. That
+# crash was deterministic (not transient) and exited with code 0, not SIGABRT.
+#
+# We detect exact error strings and retry with backoff plus heavy jitter to
+# desynchronize parallel workers on noisy CI hardware.
 
 _QEMU_CRASH_MAX_RETRIES = 3
 _QEMU_CRASH_BACKOFF_BASE_S = 3  # exponential: 3s, 9s, 27s

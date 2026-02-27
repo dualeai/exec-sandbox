@@ -3,6 +3,7 @@ name ?= exec_sandbox
 python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires-python)
 rust_version ?= 1.93
 alpine_version ?= 3.23
+qemu_version ?= 10.2.1  # For CI build-from-source (Ubuntu 24.04 ships 8.2.2 which has ARM64 TCG bugs)
 
 # Versions
 version_full ?= $(shell $(MAKE) --silent version-full)
@@ -29,6 +30,9 @@ rust-version:
 alpine-version:
 	@echo $(alpine_version)
 
+qemu-version:
+	@echo $(qemu_version)
+
 # ============================================================================
 # Installation
 # ============================================================================
@@ -45,6 +49,11 @@ install:
 
 install-deps:
 	uv sync --extra dev --extra s3
+
+# Build QEMU from source (Linux CI only — Ubuntu 24.04 ships 8.2.2 with ARM64 TCG bugs)
+# Usage: make build-qemu [QEMU_PREFIX=~/qemu-build]
+build-qemu:
+	QEMU_VERSION=$(qemu_version) ./scripts/build-qemu.sh
 
 # ============================================================================
 # Upgrade (auto-called targets for dependency updates)

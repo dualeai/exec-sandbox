@@ -6,6 +6,7 @@ and VM configuration.
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.exceptions import VmDependencyError
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
 from exec_sandbox.settings import Settings
@@ -98,6 +99,24 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "Using TCG software emulation (slow) - KVM/HVF not available",
             extra={"vm_id": vm_id, "accel": accel},
         )
+
+        # ARM64 TCG: QEMU < 9.0.4 has a deterministic crash in regime_is_user()
+        # (target/arm/internals.h). The E10 mmuidx (normal EL1&0 translation regime)
+        # falls through to g_assert_not_reached() after `default: return false`,
+        # crashing every ARM64 kernel↔userspace transition. Fixed upstream in
+        # commit 1505b651fdbd (Peter Maydell). Not backported to Ubuntu 24.04's
+        # QEMU 8.2.2. Retries are pointless — the crash is deterministic.
+        if arch == HostArch.AARCH64:
+            qemu_version_check = await probe_qemu_version()
+            if qemu_version_check is not None and qemu_version_check < (9, 0, 4):
+                version_str = ".".join(str(v) for v in qemu_version_check)
+                raise VmDependencyError(
+                    f"QEMU {version_str} has a deterministic ARM64 TCG crash in "
+                    f"regime_is_user() (target/arm/internals.h). Every kernel↔userspace "
+                    f"transition triggers g_assert_not_reached(). "
+                    f"Upgrade to QEMU >= 9.0.4 to fix this. "
+                    f"See: https://gitlab.com/qemu-project/qemu/-/commit/1505b651fdbd"
+                )
 
     # Track whether to use virtio-console (hvc0) or ISA serial (ttyS0)
     # Determined per-architecture below

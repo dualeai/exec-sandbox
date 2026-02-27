@@ -105,6 +105,54 @@ jobs:
   # Build - Run in parallel, once per architecture
   # ==========================================================================
 
+  build-qemu:
+    name: Build / QEMU (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      # Cache the final build output — skip everything on version match.
+      # Key includes qemu_version from Makefile and build script; bumping either invalidates the cache.
+      # save-always is false (default), so a failed build won't cache corrupt output.
+      - name: Cache QEMU build
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/qemu-build
+          key: qemu-${{ matrix.arch }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+
+      - name: Install build deps
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          # Remove Microsoft repos that can cause 403 errors
+          # See: https://github.com/actions/runner-images/issues/9733
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update
+          # See: https://wiki.qemu.org/Hosts/Linux
+          sudo apt-get install -y ccache ninja-build meson libglib2.0-dev libfdt-dev libpixman-1-dev libseccomp-dev libslirp-dev liburing-dev flex bison
+
+      - name: Cache ccache
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-qemu-${{ matrix.arch }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+          restore-keys: ccache-qemu-${{ matrix.arch }}-
+
+      - name: Build
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: make build-qemu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.arch }}
+          path: ~/qemu-build/
+          retention-days: 1
+
   build-gvproxy-wrapper:
     name: Build / gvproxy-wrapper (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -298,7 +346,7 @@ jobs:
   test-python:
     name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
-    needs: [build-gvproxy-wrapper, build-vm-images]
+    needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
     env:
       # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -353,10 +401,27 @@ jobs:
           # See: https://github.com/actions/runner-images/issues/9733
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
-          # On Ubuntu 24.04+, qemu-system-x86_64-microvm binary is included in qemu-system-x86 package
-          # The microvm binary is optimized for direct kernel boot with microvm machine type
-          # See: https://documentation.ubuntu.com/server/explanation/virtualisation/qemu-microvm/
-          sudo apt-get install -y qemu-utils ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86' || 'qemu-system-arm' }}
+          # Runtime shared libs for our QEMU build (--enable-fdt/linux-io-uring/seccomp/slirp/tools):
+          #   libfdt1 (libfdt.so.1), liburing2 (liburing.so.2), libseccomp2 (libseccomp.so.2),
+          #   libslirp0 (libslirp.so.0), libpixman-1-0
+          # No qemu-utils needed — our build includes qemu-img and qemu-storage-daemon (--enable-tools)
+          sudo apt-get install -y libfdt1 liburing2 libseccomp2 libslirp0 libpixman-1-0
+
+      - name: Download QEMU build (Linux)
+        if: matrix.platform.os == 'linux'
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-${{ matrix.platform.arch }}
+          path: ~/qemu-build/
+
+      - name: Install QEMU to PATH (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Restore executable permissions (stripped by actions/download-artifact)
+          chmod +x ~/qemu-build/bin/*
+          # Copy pre-built QEMU to /usr/local/ (takes precedence over /usr/bin/ in PATH)
+          sudo cp -a ~/qemu-build/bin/* /usr/local/bin/
+          sudo cp -a ~/qemu-build/share/qemu /usr/local/share/qemu 2>/dev/null || true
 
       - name: Install QEMU (macOS)
         if: matrix.platform.os == 'macos'
