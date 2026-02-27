@@ -69,6 +69,81 @@ except (FileNotFoundError, PermissionError, OSError):
 
 
 # =============================================================================
+# Entropy device hardening (least-privilege)
+# =============================================================================
+class TestEntropyDeviceHardening:
+    """Entropy devices are read-only for unprivileged users (UID 1000).
+
+    /dev/urandom and /dev/random are character devices auto-created by devtmpfs
+    with mode 0666. Even though /dev is bind-remounted read-only by guest-agent,
+    Linux VFS allows writes to char devices on RO filesystems (sb_permission()
+    only blocks regular files, dirs, and symlinks). Mode 0644 restricts write
+    access to root (guest-agent needs it for RNDRESEEDCRNG ioctl), while
+    UID 1000 only needs read access (or getrandom() syscall).
+    """
+
+    async def test_urandom_write_blocked(self, dual_scheduler: Scheduler) -> None:
+        """Writing to /dev/urandom blocked for UID 1000 (entropy injection)."""
+        code = """\
+import os
+try:
+    fd = os.open('/dev/urandom', os.O_WRONLY)
+    os.write(fd, b'\\x00' * 8000)
+    os.close(fd)
+    print('unexpected_success')
+except PermissionError:
+    print('blocked')
+except OSError as e:
+    print(f'blocked:{e.errno}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_random_write_blocked(self, dual_scheduler: Scheduler) -> None:
+        """Writing to /dev/random blocked for UID 1000."""
+        code = """\
+import os
+try:
+    fd = os.open('/dev/random', os.O_WRONLY)
+    os.write(fd, b'\\x00' * 8000)
+    os.close(fd)
+    print('unexpected_success')
+except PermissionError:
+    print('blocked')
+except OSError as e:
+    print(f'blocked:{e.errno}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "blocked" in result.stdout
+
+    async def test_urandom_read_still_works(self, dual_scheduler: Scheduler) -> None:
+        """Reading /dev/urandom still works for UID 1000."""
+        code = """\
+data = open('/dev/urandom', 'rb').read(32)
+print(f'READ:{len(data)}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "READ:32" in result.stdout
+
+    async def test_urandom_permissions(self, dual_scheduler: Scheduler) -> None:
+        """/dev/urandom has mode 0644 (owner rw, others read-only)."""
+        code = """\
+import os, stat
+st = os.stat('/dev/urandom')
+mode = stat.S_IMODE(st.st_mode)
+print(f'MODE:{oct(mode)}')
+print(f'UID:{st.st_uid}')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        assert "MODE:0o644" in result.stdout
+        assert "UID:0" in result.stdout
+
+
+# =============================================================================
 # /dev/shm mount hardening
 # =============================================================================
 class TestDevShmHardening:

@@ -111,6 +111,18 @@ pub(crate) fn setup_virtio_ports() {
     }
 }
 
+/// Set file mode on multiple paths using libc::chmod (no fork/exec overhead).
+/// Mirrors guest-agent's `chmod_paths` utility for consistent pattern.
+pub(crate) fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
+    for path in paths {
+        if let Ok(cpath) = CString::new(*path)
+            && unsafe { libc::chmod(cpath.as_ptr(), mode) } != 0
+        {
+            log_warn!("chmod {:o} {} failed", mode, path);
+        }
+    }
+}
+
 pub(crate) fn remove_device_node(path: &str) {
     // Try to remove the device node entirely
     if fs::remove_file(path).is_ok() {
@@ -118,13 +130,8 @@ pub(crate) fn remove_device_node(path: &str) {
     }
     // Fallback: chmod 000 blocks UID 1000 access (CAP_DAC_OVERRIDE can bypass,
     // but user code runs as UID 1000). Effective on devtmpfs.
-    if let Ok(cpath) = CString::new(path)
-        && unsafe { libc::chmod(cpath.as_ptr(), 0) } == 0
-    {
-        log_warn!("could not remove {}, chmod 000 applied", path);
-        return;
-    }
-    log_warn!("could not remove or chmod {}", path);
+    chmod_paths(0, &[path]);
+    log_warn!("could not remove {}, chmod 000 applied", path);
 }
 
 #[cfg(test)]

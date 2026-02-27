@@ -23,6 +23,14 @@ fn mount_virtual_filesystems() {
         device::remove_device_node(path);
     }
 
+    // Security: restrict /dev/urandom and /dev/random to owner-write (0644).
+    // devtmpfs creates these as 0666, allowing any user to inject entropy via
+    // write(). The RO bind-mount of /dev (guest-agent) does NOT block char
+    // device writes (Linux VFS exempts S_ISCHR from sb_permission RO check).
+    // Guest-agent (root) needs write for RNDRESEEDCRNG ioctl; user code
+    // (UID 1000) only needs read or getrandom() syscall.
+    device::chmod_paths(0o644, &["/dev/urandom", "/dev/random"]);
+
     // B4: /dev/shm mount deferred to guest-agent (only needed for Python multiprocessing).
     // Guest-agent mounts it lazily before first use, saving ~2-5ms on critical path.
 
