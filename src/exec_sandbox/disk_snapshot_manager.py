@@ -338,6 +338,8 @@ class DiskSnapshotManager(BaseCacheManager):
         tenant_id: str,
         task_id: str,
         memory_mb: int,
+        *,
+        _enospc_retried: bool = False,
     ) -> Path:
         """Create new qcow2 snapshot with packages installed.
 
@@ -509,10 +511,17 @@ class DiskSnapshotManager(BaseCacheManager):
             # Handle disk full (lazy eviction)
             except OSError as e:
                 if e.errno == errno.ENOSPC:
+                    if _enospc_retried:
+                        raise SnapshotError(
+                            f"Disk full after eviction retry for snapshot {cache_key}",
+                            context={"cache_key": cache_key, "language": language, "packages": packages},
+                        ) from e
                     # Evict oldest snapshot and retry once
                     # Cleanup handled by finally block
                     await self._evict_oldest_snapshot()
-                    return await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
+                    return await self._create_snapshot(
+                        language, packages, cache_key, tenant_id, task_id, memory_mb, _enospc_retried=True
+                    )
                 raise
 
             # Passthrough: already-wrapped errors, caller input errors, cancellation
