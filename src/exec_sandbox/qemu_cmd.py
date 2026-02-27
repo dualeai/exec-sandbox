@@ -300,8 +300,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         qemu_args.extend(["-nodefaults", "-no-user-config"])
     elif arch == HostArch.X86_64:
         # The pc (i440FX) machine includes a built-in ISA Floppy Disk Controller.
-        # Disable its drives so the kernel doesn't create /dev/fd0.
-        qemu_args.extend(["-global", "isa-fdc.driveA=", "-global", "isa-fdc.driveB="])
+        # Set drive types to "none" so the kernel doesn't create /dev/fd0.
+        # Note: "driveA"/"driveB" are NOT valid properties on isa-fdc;
+        # the correct property is "fdtypeA"/"fdtypeB" (see: qemu -device isa-fdc,help).
+        # Using invalid property names causes exit code 1 on QEMU 8.x
+        # (non-existent -global properties are fatal for non-hotplugged devices).
+        qemu_args.extend(["-global", "isa-fdc.fdtypeA=none", "-global", "isa-fdc.fdtypeB=none"])
 
     # Console selection based on machine type and architecture:
     # +--------------------------+-------------+--------------------------------+
