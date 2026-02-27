@@ -1,8 +1,11 @@
 """Shared pytest fixtures for exec-sandbox tests."""
 
 import asyncio
+import logging
 import os
+import random
 import sys
+import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -13,6 +16,86 @@ from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, dete
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available
 from exec_sandbox.vm_manager import VmManager
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# QEMU Crash Retry (GitHub Actions CI only)
+# ============================================================================
+# GitHub Actions ARM64 runners trigger two transient QEMU SIGABRT crashes:
+#   1. ARM emulation bug: "regime_is_user: code should not be reached"
+#      → QEMU hits unreachable code in ARM CPU regime handling (QEMU bug)
+#   2. Thread exhaustion: "qemu_thread_create: Resource temporarily unavailable"
+#      → Host runs out of threads under parallel test load (EAGAIN)
+# Both cause QEMU to abort (exit code -6). These are host-side issues,
+# not test bugs. We detect the exact error strings and retry with backoff
+# plus heavy jitter to desynchronize parallel workers on noisy CI hardware.
+
+_QEMU_CRASH_MAX_RETRIES = 3
+_QEMU_CRASH_BACKOFF_BASE_S = 3  # exponential: 3s, 9s, 27s
+_QEMU_CRASH_JITTER_MAX_S = 5.0  # uniform random jitter [0, 5s)
+
+# Exact substrings from QEMU's stderr/console that indicate retryable crashes.
+_QEMU_RETRYABLE_SIGNATURES = (
+    "Resource temporarily unavailable",
+    "SIGABRT",
+)
+
+
+def _is_retryable_qemu_crash(reports: list[pytest.TestReport]) -> bool:
+    """Check if any test phase failed with a retryable QEMU crash signature."""
+    for report in reports:
+        if not report.failed:
+            continue
+        if not report.longrepr:
+            continue
+        text = str(report.longrepr)
+        if any(sig in text for sig in _QEMU_RETRYABLE_SIGNATURES):
+            return True
+    return False
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
+    """Retry tests on QEMU SIGABRT / thread exhaustion (GitHub Actions CI only).
+
+    Uses exponential backoff (3^n) with full jitter ([0, 5s)) between retries
+    to desynchronize parallel workers and avoid thundering herd on noisy CI.
+    Properly tears down and re-creates fixtures on each attempt.
+    """
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return None  # Use default protocol outside CI
+
+    from _pytest.runner import runtestprotocol
+
+    for attempt in range(_QEMU_CRASH_MAX_RETRIES + 1):
+        reports = runtestprotocol(item, nextitem=nextitem, log=False)
+
+        if not _is_retryable_qemu_crash(reports) or attempt == _QEMU_CRASH_MAX_RETRIES:
+            # Final attempt or non-crash failure — report as-is
+            for report in reports:
+                if attempt > 0:
+                    report.sections.append(
+                        (
+                            "qemu-crash-retry",
+                            f"Retried {attempt} time(s) due to transient QEMU crash",
+                        )
+                    )
+                item.ihook.pytest_runtest_logreport(report=report)
+            return True
+
+        delay = _QEMU_CRASH_BACKOFF_BASE_S ** (attempt + 1) + random.uniform(0, _QEMU_CRASH_JITTER_MAX_S)
+        logger.warning(
+            "Transient QEMU crash on %s, retrying in %.1fs (attempt %d/%d)",
+            item.nodeid,
+            delay,
+            attempt + 1,
+            _QEMU_CRASH_MAX_RETRIES,
+        )
+        time.sleep(delay)
+
+    return True  # pragma: no cover
+
 
 # ============================================================================
 # Shared Skip Markers
