@@ -4,7 +4,7 @@ This module provides port allocation and mapping resolution functions for
 exposing guest VM ports to the host.
 
 Architecture:
-- Mode 1: expose_ports without allow_network -> QEMU user-mode networking with hostfwd
+- Mode 1: expose_ports without allow_network -> gvproxy with BlockAllOutbound
 - Mode 2: expose_ports with allow_network -> gvproxy configuration-based forwarding
 """
 

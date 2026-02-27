@@ -450,6 +450,53 @@ class VmManager:
             channel=channel,
         )
 
+    async def _start_gvproxy_for_vm(
+        self,
+        infra: _VmInfra,
+        language: Language,
+        allow_network: bool,
+        allowed_domains: list[str] | None,
+        expose_ports: list[ExposedPort] | None,
+    ) -> tuple[ProcessWrapper | None, asyncio.Task[None] | None, int]:
+        """Start gvproxy-wrapper for a VM (shared by create and restore paths).
+
+        Computes network mode, starts gvproxy, registers process, and attaches
+        to cgroup.  Returns (None, None, 0) when gvproxy is not needed.
+
+        Returns:
+            (gvproxy_proc, gvproxy_log_task, gvproxy_start_ms)
+        """
+        needs_gvproxy = allow_network or bool(expose_ports)
+        if not needs_gvproxy:
+            return None, None, 0
+
+        gvproxy_start_time = asyncio.get_running_loop().time()
+        is_mode1 = bool(expose_ports) and not allow_network
+        effective_allowed_domains = allowed_domains if allow_network else []
+
+        logger.info(
+            "Starting gvproxy-wrapper",
+            extra={
+                "vm_id": infra.vm_id,
+                "allowed_domains": effective_allowed_domains,
+                "mode": "Mode 1 (port-forward only)" if is_mode1 else "Mode 2/3 (internet)",
+                "block_outbound": is_mode1,
+            },
+        )
+
+        gvproxy_proc, gvproxy_log_task = await start_gvproxy(
+            infra.vm_id,
+            effective_allowed_domains,
+            language,
+            infra.workdir,
+            expose_ports=expose_ports,
+            block_outbound=is_mode1,
+        )
+        register_process(gvproxy_proc)
+        await cgroup.attach_if_available(infra.cgroup_path, gvproxy_proc.pid)
+        gvproxy_start_ms = round((asyncio.get_running_loop().time() - gvproxy_start_time) * 1000)
+        return gvproxy_proc, gvproxy_log_task, gvproxy_start_ms
+
     async def _launch_qemu_vm(
         self,
         infra: _VmInfra,
@@ -644,35 +691,10 @@ class VmManager:
             snapshot_drive=vdb_path,
         )
 
-        # Phase 3: Start gvproxy BEFORE QEMU (create-specific)
-        gvproxy_proc: ProcessWrapper | None = None
-        gvproxy_log_task: asyncio.Task[None] | None = None
-        gvproxy_start_ms = 0
-        needs_gvproxy = allow_network or bool(expose_ports)
-        if needs_gvproxy:
-            gvproxy_start_time = asyncio.get_running_loop().time()
-            is_mode1 = bool(expose_ports) and not allow_network
-            effective_allowed_domains = allowed_domains if allow_network else []
-            logger.info(
-                "Starting gvproxy-wrapper in boot phase (before QEMU)",
-                extra={
-                    "vm_id": infra.vm_id,
-                    "allowed_domains": effective_allowed_domains,
-                    "mode": "Mode 1 (port-forward only)" if is_mode1 else "Mode 2/3 (internet)",
-                    "block_outbound": is_mode1,
-                },
-            )
-            gvproxy_proc, gvproxy_log_task = await start_gvproxy(
-                infra.vm_id,
-                effective_allowed_domains,
-                language,
-                infra.workdir,
-                expose_ports=expose_ports if expose_ports else None,
-                block_outbound=is_mode1,
-            )
-            register_process(gvproxy_proc)
-            await cgroup.attach_if_available(infra.cgroup_path, gvproxy_proc.pid)
-            gvproxy_start_ms = round((asyncio.get_running_loop().time() - gvproxy_start_time) * 1000)
+        # Phase 3: Start gvproxy BEFORE QEMU
+        gvproxy_proc, gvproxy_log_task, gvproxy_start_ms = await self._start_gvproxy_for_vm(
+            infra, language, allow_network, allowed_domains, expose_ports
+        )
 
         # Phase 4: Launch QEMU (shared helper)
         vm_created = False
@@ -790,7 +812,7 @@ class VmManager:
                     cgroup_path=infra.cgroup_path,
                 )
 
-    async def restore_vm(  # noqa: PLR0915
+    async def restore_vm(
         self,
         language: Language,
         tenant_id: str,
@@ -800,6 +822,7 @@ class VmManager:
         snapshot_drive: Path | None = None,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
+        expose_ports: list[ExposedPort] | None = None,
     ) -> QemuVM:
         """Restore VM from L1 memory snapshot (full CPU+RAM+device state).
 
@@ -814,10 +837,12 @@ class VmManager:
             memory_mb: VM memory in MB (must match save-time value)
             snapshot_drive: Optional L2 qcow2 for disk state
             allow_network: Network topology must match save-time config.
-                L1 snapshots with network have virtio-net device in migration
-                stream; restoring without matching topology causes migration failure.
+                L1 snapshots with network (allow_network or expose_ports) have
+                virtio-net device in migration stream; restoring without matching
+                topology causes migration failure.
             allowed_domains: Whitelist of allowed domains for DNS/TLS filtering.
                 None for language defaults, empty list to block all outbound.
+            expose_ports: List of ports to expose from guest to host.
 
         Returns:
             QemuVM in READY state with l1_restored=True
@@ -867,24 +892,15 @@ class VmManager:
             memory_mb,
             constants.DEFAULT_VM_CPU_CORES,
             allow_network=allow_network,
+            expose_ports=expose_ports,
             snapshot_drive=vdb_path,
             defer_incoming=True,  # VM starts paused, waiting for migration stream
         )
 
         # Phase 3: Start gvproxy if network topology requires it
-        gvproxy_proc: ProcessWrapper | None = None
-        gvproxy_log_task: asyncio.Task[None] | None = None
-        if allow_network:
-            # L1 restore with network: gvproxy needed for virtio-net backend.
-            # The guest's network stack resumes from the migration stream.
-            gvproxy_proc, gvproxy_log_task = await start_gvproxy(
-                infra.vm_id,
-                allowed_domains,
-                language,
-                infra.workdir,
-            )
-            register_process(gvproxy_proc)
-            await cgroup.attach_if_available(infra.cgroup_path, gvproxy_proc.pid)
+        gvproxy_proc, gvproxy_log_task, _ = await self._start_gvproxy_for_vm(
+            infra, language, allow_network, allowed_domains, expose_ports
+        )
 
         # Phase 4: Launch QEMU (shared helper) and restore snapshot
         vm_created = False
@@ -935,6 +951,9 @@ class VmManager:
             vm.timing.setup_ms = restore_ms  # L1 restore replaces cold boot + REPL warm
             vm.timing.boot_ms = 0  # No kernel boot on restore
 
+            if expose_ports:
+                vm.exposed_ports = expose_ports
+
             await vm.transition_state(VmState.READY)
 
             logger.info(
@@ -945,6 +964,7 @@ class VmManager:
                     "restore_ms": restore_ms,
                     "vmstate_path": str(vmstate_path),
                     "allow_network": allow_network,
+                    "expose_ports": [(p.internal, p.external) for p in expose_ports] if expose_ports else None,
                 },
             )
 

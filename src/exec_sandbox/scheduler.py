@@ -628,8 +628,9 @@ class Scheduler:
                             vmstate_path=vmstate_path,
                             memory_mb=memory,
                             snapshot_drive=l2_path,
-                            allow_network=needs_network,
+                            allow_network=allow_network,
                             allowed_domains=allowed_domains,
+                            expose_ports=resolved_ports if resolved_ports else None,
                         )
                         logger.info(
                             "VM restored from L1 cache",

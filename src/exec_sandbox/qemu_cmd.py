@@ -47,8 +47,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         cpu_cores: Number of vCPUs for the guest (maps to -smp)
         allow_network: Enable network access via gvproxy (outbound internet)
         expose_ports: List of ports to expose from guest to host.
-            When set without allow_network, uses QEMU user-mode networking
-            with hostfwd (Mode 1). When set with allow_network, port
+            When set without allow_network, uses gvproxy with
+            BlockAllOutbound (Mode 1). When set with allow_network, port
             forwarding is handled by gvproxy API (Mode 2).
         direct_write: Mount rootfs read-write (for snapshot creation).
         debug_boot: Enable verbose kernel/init boot logging. When True,
