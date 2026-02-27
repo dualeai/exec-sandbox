@@ -102,7 +102,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # ============================================================================
 
 # Skip marker for timing-sensitive tests that require hardware acceleration.
-# TCG (software emulation) is 10-50x slower than KVM/HVF, making these tests
+# TCG (software emulation) is ~5-8x slower than KVM/HVF, making these tests
 # unreliable on GitHub Actions macOS runners (no nested virtualization).
 skip_unless_hwaccel = pytest.mark.skipif(
     not asyncio.run(check_hwaccel_available()),

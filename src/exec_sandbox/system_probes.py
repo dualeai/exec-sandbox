@@ -311,7 +311,7 @@ async def check_kvm_available() -> bool:
     TCG (Tiny Code Generator) - Development fallback:
     - Software-based CPU emulation (no hardware virtualization)
     - VM boot time: 2-5s (5-10x slower than KVM)
-    - CPU overhead: 10-50x slower (instruction-level emulation)
+    - CPU overhead: ~5-8x slower (instruction-level emulation)
     - Security: Software-based isolation (weaker than hardware)
     - Requirements: Any platform (Linux, macOS, Windows)
     - Use case: Development/testing only (macOS Docker Desktop)
@@ -436,7 +436,7 @@ async def check_hvf_available() -> bool:
 async def check_hwaccel_available() -> bool:
     """Check if hardware acceleration (KVM or HVF) is available.
 
-    TCG (software emulation) is 10-50x slower than hardware virtualization,
+    TCG (software emulation) is ~5-8x slower than hardware virtualization,
     making timing-sensitive tests unreliable.
 
     Returns:

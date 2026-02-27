@@ -80,7 +80,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     elif accel_type == AccelType.KVM:
         accel = "kvm"
     else:
-        # TCG software emulation fallback (12x slower than KVM/HVF)
+        # TCG software emulation fallback (~5-8x slower than KVM/HVF)
         #
         # thread=single: Disable MTTCG to reduce thread count per VM. Without this,
         # each VM creates multiple threads for parallel translation, exhausting

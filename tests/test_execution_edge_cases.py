@@ -271,7 +271,7 @@ while True:
     async def test_infinite_output_times_out(self, scheduler: Scheduler) -> None:
         """Infinite output is killed by timeout.
 
-        Note: Requires hardware acceleration because TCG is 10-50x slower,
+        Note: Requires hardware acceleration because TCG is ~5-8x slower,
         making the 3s timeout elapse before the VM can produce any output.
         """
         code = """
@@ -422,7 +422,7 @@ print("DONE", flush=True)
         If SIGTERM worked, execution would be ~2s. Since it's ignored,
         must wait 5s grace period before SIGKILL, so execution >= 5s.
 
-        Note: Requires hardware acceleration because TCG is 10-50x slower,
+        Note: Requires hardware acceleration because TCG is ~5-8x slower,
         making the 2s timeout fail before the process can even print output.
         """
         code = """

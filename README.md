@@ -669,7 +669,7 @@ async with await scheduler.session(language="python") as session:
 | Linux | x64, arm64 |
 | macOS | x64, arm64 |
 | QEMU | 8.0+ |
-| Hardware acceleration | KVM (Linux) or HVF (macOS) recommended, 10-50x faster |
+| Hardware acceleration | KVM (Linux) or HVF (macOS) recommended, ~5-8x faster |
 
 Verify hardware acceleration is available:
 
@@ -678,7 +678,7 @@ ls /dev/kvm              # Linux
 sysctl kern.hv_support   # macOS
 ```
 
-Without hardware acceleration, QEMU uses software emulation (TCG), which is 10-50x slower.
+Without hardware acceleration, QEMU uses software emulation (TCG), which is ~5-8x slower.
 
 ### Linux Setup (Optional Security Hardening)
 
