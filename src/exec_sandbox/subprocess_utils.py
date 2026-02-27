@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 from exec_sandbox._logging import get_logger
 
@@ -131,13 +131,36 @@ def log_task_exception(task: asyncio.Task[None]) -> None:
         )
 
 
+@overload
+async def wait_for_socket(
+    path: Path,
+    *,
+    timeout: float,
+    poll_interval: float = ...,
+    abort_check: Callable[[], None] | None = ...,
+    keep_connection: Literal[True],
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]: ...
+
+
+@overload
+async def wait_for_socket(
+    path: Path,
+    *,
+    timeout: float,
+    poll_interval: float = ...,
+    abort_check: Callable[[], None] | None = ...,
+    keep_connection: Literal[False] = ...,
+) -> None: ...
+
+
 async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
     poll_interval: float = 0.002,
     abort_check: Callable[[], None] | None = None,
-) -> None:
+    keep_connection: bool = False,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
     """Wait for a Unix socket to appear and accept connections.
 
     Used after fork+exec of QEMU or QSD to wait for the process to create its
@@ -154,6 +177,13 @@ async def wait_for_socket(
         poll_interval: Seconds between checks (default 2ms).
         abort_check: Optional callable invoked each poll iteration. Should raise
             to abort the wait early (e.g. when the spawning process has died).
+        keep_connection: If True, return the connected (reader, writer) streams
+            instead of closing the probe connection. Eliminates the TOCTOU gap
+            between probe-close and the caller's real connect for single-client
+            chardev sockets (e.g. QMP).
+
+    Returns:
+        ``(reader, writer)`` when *keep_connection* is True, else ``None``.
 
     Raises:
         TimeoutError: Socket did not appear or accept connections within *timeout* seconds.
@@ -170,9 +200,11 @@ async def wait_for_socket(
             if abort_check is not None:
                 abort_check()
             try:
-                _r, w = await asyncio.open_unix_connection(str(path))
+                r, w = await asyncio.open_unix_connection(str(path))
+                if keep_connection:
+                    return r, w
                 w.close()
                 await w.wait_closed()
-                return
+                return None
             except (ConnectionRefusedError, ConnectionResetError):
                 await asyncio.sleep(poll_interval)

@@ -569,12 +569,12 @@ class TestQemuStorageDaemonIntegration:
         """PID is not left in process_registry when start fails."""
         daemon = QemuStorageDaemon()
 
-        # Poison the QMP connection step so start fails after process creation
+        # Poison the QMP wait+connect step so start fails after process creation
         # Monkeypatch at class level since __slots__ prevents instance-level setattr
-        async def _bad_connect_qmp(_self: QemuStorageDaemon) -> None:
+        async def _bad_wait_and_connect_qmp(_self: QemuStorageDaemon) -> None:
             raise ConnectionError("Injected failure")
 
-        monkeypatch.setattr(QemuStorageDaemon, "_connect_qmp", _bad_connect_qmp)
+        monkeypatch.setattr(QemuStorageDaemon, "_wait_and_connect_qmp", _bad_wait_and_connect_qmp)
 
         with pytest.raises(QemuStorageDaemonError, match="Failed to start daemon"):
             await daemon.start()
