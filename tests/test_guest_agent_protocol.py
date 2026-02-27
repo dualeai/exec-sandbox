@@ -400,6 +400,7 @@ class TestEnvVarValidation:
         assert "length" in str(exc_info.value).lower()
 
 
+
 class TestInstallPackagesRequest:
     """Tests for InstallPackagesRequest model."""
 
@@ -596,7 +597,7 @@ class TestStreamingErrorMessage:
         """StreamingErrorMessage with op_id for file operation error routing."""
         msg = StreamingErrorMessage(
             message="Path traversal detected",
-            error_type="validation_error",
+            error_type="path_error",
             op_id="abc123",
             version="1.0.0",
         )
@@ -726,7 +727,7 @@ class TestStreamingMessage:
         from pydantic import TypeAdapter
 
         adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-        json_str = '{"type": "error", "message": "path traversal", "error_type": "validation_error", "op_id": "xyz"}'
+        json_str = '{"type": "error", "message": "path traversal", "error_type": "path_error", "op_id": "xyz"}'
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, StreamingErrorMessage)
         assert msg.op_id == "xyz"

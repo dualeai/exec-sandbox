@@ -1,6 +1,29 @@
 """Constants for exec-sandbox configuration and limits."""
 
+import enum
 from typing import Final
+
+# ============================================================================
+# Guest Agent Error Types (wire format vocabulary)
+# ============================================================================
+
+
+class GuestErrorType(str, enum.Enum):
+    """Domain-specific error types from the guest agent wire protocol.
+
+    Maps 1:1 to Rust ErrorType enum in guest-agent/src/error.rs.
+    """
+
+    ENV_VAR = "env_var_error"
+    CODE = "code_error"
+    PATH = "path_error"
+    PACKAGE = "package_error"
+    IO = "io_error"
+    TIMEOUT = "timeout_error"
+    EXECUTION = "execution_error"
+    REQUEST = "request_error"
+    PROTOCOL = "protocol_error"
+
 
 # ============================================================================
 # VM Memory and Resource Defaults

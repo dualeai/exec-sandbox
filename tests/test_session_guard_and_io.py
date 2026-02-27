@@ -951,7 +951,7 @@ class TestFileOpDispatcherRouting:
         q2 = await dispatcher.register_op("w2")
         q3 = await dispatcher.register_op("w3")
 
-        _feed(reader, {"type": "error", "error_type": "validation_error", "message": "path invalid", "op_id": "w1"})
+        _feed(reader, {"type": "error", "error_type": "path_error", "message": "path invalid", "op_id": "w1"})
         _feed(reader, {"type": "file_write_ack", "op_id": "w2", "path": "ok.txt", "bytes_written": 100})
         _feed(reader, {"type": "error", "error_type": "io_error", "message": "disk full", "op_id": "w3"})
 

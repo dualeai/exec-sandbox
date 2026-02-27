@@ -18,7 +18,14 @@ from pydantic import ValidationError
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import EnvVarValidationError, VmBootTimeoutError, VmPermanentError, VmTransientError
+from exec_sandbox.exceptions import (
+    EnvVarValidationError,
+    SandboxError,
+    VmBootTimeoutError,
+    VmConfigError,
+    VmPermanentError,
+    VmTransientError,
+)
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     FileChunkResponseMessage,
@@ -42,6 +49,54 @@ if TYPE_CHECKING:
     from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
+
+
+def _guest_error_to_exception(
+    msg: StreamingErrorMessage,
+    vm_id: str,
+    *,
+    operation: str = "",
+) -> SandboxError:
+    """Map a guest StreamingErrorMessage to the appropriate SandboxError subclass.
+
+    Args:
+        msg: The error message from the guest agent.
+        vm_id: VM identifier for context.
+        operation: Optional operation name (e.g., "write_file", "read_file").
+
+    Returns:
+        A SandboxError subclass instance (not raised, caller raises).
+    """
+    context: dict[str, object] = {
+        "vm_id": vm_id,
+        "error_type": msg.error_type,
+        "guest_message": msg.message,
+    }
+    if operation:
+        context["operation"] = operation
+
+    prefix = f"{operation}: " if operation else ""
+
+    formatted = f"{prefix}[{msg.error_type}] {msg.message}"
+
+    match msg.error_type:
+        case constants.GuestErrorType.TIMEOUT:
+            return VmTransientError(formatted, context=context)
+        case constants.GuestErrorType.ENV_VAR:
+            return EnvVarValidationError(formatted, context=context)
+        case (
+            constants.GuestErrorType.CODE
+            | constants.GuestErrorType.PATH
+            | constants.GuestErrorType.PACKAGE
+            | constants.GuestErrorType.IO
+            | constants.GuestErrorType.EXECUTION
+            | constants.GuestErrorType.REQUEST
+            | constants.GuestErrorType.PROTOCOL
+        ):
+            return VmPermanentError(formatted, context=context)
+        case _:
+            return VmPermanentError(formatted, context=context)
+
 
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
@@ -379,24 +434,23 @@ class QemuVM:
                 env_vars=env_vars or {},
             )
         except ValidationError as e:
-            # Check if the validation error is on the "code" field (e.g. null bytes).
-            # Code validation errors return ExecutionResult(exit_code=-1) so callers
-            # get a result rather than an exception.
-            code_errors = [err for err in e.errors() if "code" in err.get("loc", ())]
-            if code_errors:
+            error_locs = {field for err in e.errors() for field in err.get("loc", ())}
+            # Code field errors (e.g. null bytes, too large) → result, not exception
+            if "code" in error_locs:
                 return ExecutionResult(
                     exit_code=-1,
                     stdout="",
                     stderr=str(e),
                     timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
                 )
-            # Other validation errors (env vars, timeout, etc.) are domain exceptions.
-            raise EnvVarValidationError(
-                str(e),
-                context={"vm_id": self.vm_id},
-            ) from e
-        except Exception as e:
-            raise EnvVarValidationError(
+            # Env var field errors (control chars, size limits) → EnvVarValidationError
+            if "env_vars" in error_locs:
+                raise EnvVarValidationError(
+                    str(e),
+                    context={"vm_id": self.vm_id},
+                ) from e
+            # Other field errors (timeout out of range, etc.) → VmConfigError
+            raise VmConfigError(
                 str(e),
                 context={"vm_id": self.vm_id},
             ) from e
@@ -470,7 +524,12 @@ class QemuVM:
                     spawn_ms = msg.spawn_ms
                     process_ms = msg.process_ms
                 elif isinstance(msg, StreamingErrorMessage):
-                    # Streaming error from guest - include details in log message
+                    exc = _guest_error_to_exception(msg, self.vm_id, operation="execute")
+                    # Defense-in-depth: if blocked env var bypassed Pydantic
+                    # (e.g. model_construct()), the guest still rejects it.
+                    if isinstance(exc, EnvVarValidationError):
+                        raise exc
+                    # Other error types are runtime results, not caller bugs
                     logger.error(
                         f"Guest agent error: [{msg.error_type}] {msg.message}",
                         extra={
@@ -479,7 +538,6 @@ class QemuVM:
                             "error_type": msg.error_type,
                         },
                     )
-                    # Store error in stderr so callers can see what went wrong
                     stderr_chunks.append(f"[{msg.error_type}] {msg.message}")
                     exit_code = -1
                     break
@@ -669,10 +727,7 @@ class QemuVM:
             response = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
 
             if isinstance(response, StreamingErrorMessage):
-                raise VmPermanentError(
-                    f"write_file failed for '{path}': [{response.error_type}] {response.message}",
-                    context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
-                )
+                raise _guest_error_to_exception(response, self.vm_id, operation=f"write_file '{path}'")
 
             if not isinstance(response, FileWriteAckMessage):
                 raise VmPermanentError(
@@ -753,10 +808,7 @@ class QemuVM:
                     elif isinstance(msg, FileReadCompleteMessage):
                         break
                     elif isinstance(msg, StreamingErrorMessage):
-                        raise VmPermanentError(
-                            f"read_file failed for '{path}': [{msg.error_type}] {msg.message}",
-                            context={"vm_id": self.vm_id, "path": path, "error_type": msg.error_type},
-                        )
+                        raise _guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
                     else:
                         raise VmPermanentError(
                             f"read_file unexpected message type: {type(msg).__name__}",
@@ -813,10 +865,7 @@ class QemuVM:
             ) from e
 
         if isinstance(response, StreamingErrorMessage):
-            raise VmPermanentError(
-                f"list_files failed for '{path}': [{response.error_type}] {response.message}",
-                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
-            )
+            raise _guest_error_to_exception(response, self.vm_id, operation=f"list_files '{path}'")
 
         if not isinstance(response, FileListMessage):
             raise VmPermanentError(

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from exec_sandbox.exceptions import EnvVarValidationError
 from exec_sandbox.guest_agent_protocol import ExecuteCodeRequest
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
@@ -55,83 +56,75 @@ class TestEnvVarSecurityIntegration:
 
     async def test_ld_preload_blocked(self, dual_scheduler: Scheduler) -> None:
         """LD_PRELOAD is blocked (arbitrary code execution via library injection)."""
-        result = await dual_scheduler.run(
-            code="print('should not run')",
-            language=Language.PYTHON,
-            env_vars={"LD_PRELOAD": "/tmp/malicious.so"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower() or "LD_PRELOAD" in result.stderr
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="print('should not run')",
+                language=Language.PYTHON,
+                env_vars={"LD_PRELOAD": "/tmp/malicious.so"},
+            )
 
     async def test_ld_library_path_blocked(self, dual_scheduler: Scheduler) -> None:
         """LD_LIBRARY_PATH is blocked (library search path manipulation)."""
-        result = await dual_scheduler.run(
-            code="print('should not run')",
-            language=Language.PYTHON,
-            env_vars={"LD_LIBRARY_PATH": "/tmp/malicious"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="print('should not run')",
+                language=Language.PYTHON,
+                env_vars={"LD_LIBRARY_PATH": "/tmp/malicious"},
+            )
 
     async def test_node_options_blocked(self, dual_scheduler: Scheduler) -> None:
         """NODE_OPTIONS is blocked (Node.js runtime manipulation)."""
-        result = await dual_scheduler.run(
-            code="console.log('should not run')",
-            language=Language.JAVASCRIPT,
-            env_vars={"NODE_OPTIONS": "--expose-gc --max-old-space-size=8192"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="console.log('should not run')",
+                language=Language.JAVASCRIPT,
+                env_vars={"NODE_OPTIONS": "--expose-gc --max-old-space-size=8192"},
+            )
 
     async def test_pythonstartup_blocked(self, dual_scheduler: Scheduler) -> None:
         """PYTHONSTARTUP is blocked (arbitrary code execution on Python start)."""
-        result = await dual_scheduler.run(
-            code="print('should not run')",
-            language=Language.PYTHON,
-            env_vars={"PYTHONSTARTUP": "/tmp/malicious.py"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="print('should not run')",
+                language=Language.PYTHON,
+                env_vars={"PYTHONSTARTUP": "/tmp/malicious.py"},
+            )
 
     async def test_bash_env_blocked(self, dual_scheduler: Scheduler) -> None:
         """BASH_ENV is blocked (arbitrary code execution on bash start)."""
-        result = await dual_scheduler.run(
-            code="echo 'should not run'",
-            language=Language.RAW,
-            env_vars={"BASH_ENV": "/tmp/malicious.sh"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="echo 'should not run'",
+                language=Language.RAW,
+                env_vars={"BASH_ENV": "/tmp/malicious.sh"},
+            )
 
     async def test_path_blocked(self, dual_scheduler: Scheduler) -> None:
         """PATH is blocked (executable search path manipulation)."""
-        result = await dual_scheduler.run(
-            code="print('should not run')",
-            language=Language.PYTHON,
-            env_vars={"PATH": "/tmp/malicious:/usr/bin"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="print('should not run')",
+                language=Language.PYTHON,
+                env_vars={"PATH": "/tmp/malicious:/usr/bin"},
+            )
 
     async def test_glibc_tunables_blocked(self, dual_scheduler: Scheduler) -> None:
         """GLIBC_TUNABLES is blocked (CVE-2023-4911 mitigation)."""
-        result = await dual_scheduler.run(
-            code="print('should not run')",
-            language=Language.PYTHON,
-            env_vars={"GLIBC_TUNABLES": "glibc.tune.hwcaps=-AVX2"},
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="print('should not run')",
+                language=Language.PYTHON,
+                env_vars={"GLIBC_TUNABLES": "glibc.tune.hwcaps=-AVX2"},
+            )
 
     async def test_blocked_env_var_case_insensitive(self, dual_scheduler: Scheduler) -> None:
         """Blocked env var check is case-insensitive."""
-        result = await dual_scheduler.run(
-            code="print('should not run')",
-            language=Language.PYTHON,
-            env_vars={"ld_preload": "/tmp/malicious.so"},  # lowercase
-        )
-        assert result.exit_code != 0
-        assert "blocked" in result.stderr.lower()
+        with pytest.raises(EnvVarValidationError, match=r"(?i)blocked"):
+            await dual_scheduler.run(
+                code="print('should not run')",
+                language=Language.PYTHON,
+                env_vars={"ld_preload": "/tmp/malicious.so"},  # lowercase
+            )
 
     # =========================================================================
     # Valid Environment Variables (Positive Tests)

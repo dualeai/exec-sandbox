@@ -151,10 +151,10 @@ pub(crate) async fn handle_read_file(
     writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
     let resolved_path = validate_file_path(path)
-        .map_err(|e| CmdError::validation(format!("Invalid path '{path}': {e}")))?;
+        .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
     if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        return Err(CmdError::validation("Cannot read a directory"));
+        return Err(CmdError::path("Cannot read a directory"));
     }
 
     let canonical_path = tokio::fs::canonicalize(&resolved_path)
@@ -165,7 +165,7 @@ pub(crate) async fn handle_read_file(
         .await
         .unwrap_or_else(|_| std::path::PathBuf::from(SANDBOX_ROOT));
     if !canonical_path.starts_with(&sandbox_canonical) {
-        return Err(CmdError::validation(format!(
+        return Err(CmdError::path(format!(
             "Path '{path}' resolves outside sandbox"
         )));
     }
@@ -175,12 +175,12 @@ pub(crate) async fn handle_read_file(
         .map_err(|e| CmdError::io(format!("Cannot read '{path}': {e}")))?;
 
     if metadata.is_dir() {
-        return Err(CmdError::validation(format!(
+        return Err(CmdError::path(format!(
             "'{path}' is a directory, not a file"
         )));
     }
     if metadata.len() as usize > MAX_FILE_SIZE_BYTES {
-        return Err(CmdError::validation(format!(
+        return Err(CmdError::path(format!(
             "File too large: {} bytes (max {})",
             metadata.len(),
             MAX_FILE_SIZE_BYTES
@@ -224,7 +224,7 @@ pub(crate) async fn handle_read_file(
 /// Handle list_files command: read directory entries.
 pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
     let resolved_path = validate_file_path(path)
-        .map_err(|e| CmdError::validation(format!("Invalid path '{path}': {e}")))?;
+        .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
     let mut read_dir = tokio::fs::read_dir(&resolved_path)
         .await
@@ -262,12 +262,10 @@ pub(crate) async fn handle_write_file(
     make_executable: bool,
 ) -> Result<ActiveWriteHandle, CmdError> {
     let resolved_path = validate_file_path(path)
-        .map_err(|e| CmdError::validation(format!("Invalid path '{path}': {e}")))?;
+        .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
     if resolved_path == std::path::Path::new(SANDBOX_ROOT) {
-        return Err(CmdError::validation(
-            "Cannot write to sandbox root directory",
-        ));
+        return Err(CmdError::path("Cannot write to sandbox root directory"));
     }
 
     if let Some(parent) = resolved_path.parent()

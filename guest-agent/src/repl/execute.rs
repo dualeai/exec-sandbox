@@ -14,7 +14,7 @@ use crate::error::{
 };
 use crate::repl::spawn::spawn_repl;
 use crate::types::GuestResponse;
-use crate::validation::{prepend_env_vars, validate_execute_params};
+use crate::validation::{prepend_env_vars, validate_code_params, validate_env_vars};
 
 /// Helper to flush a buffer as a Stdout/Stderr response message.
 async fn flush_output_buffer(
@@ -295,7 +295,8 @@ pub(crate) async fn execute_code_streaming(
 ) -> Result<(), CmdError> {
     let language = parse_language(language_str, "supported: python, javascript, raw")?;
 
-    validate_execute_params(code, timeout, env_vars).map_err(CmdError::validation)?;
+    validate_code_params(code, timeout)?;
+    validate_env_vars(env_vars)?;
 
     let start = Instant::now();
 

@@ -73,7 +73,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
     timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
     env_vars: dict[str, str] = Field(
         default_factory=dict,
-        description="Environment variables (max 100, see BLOCKED_ENV_VARS in guest-agent)",
+        description="Environment variables (max 100, blocked vars enforced by guest agent)",
     )
 
     @field_validator("env_vars")

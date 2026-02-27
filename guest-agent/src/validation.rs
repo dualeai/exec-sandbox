@@ -3,73 +3,75 @@
 use std::collections::HashMap;
 
 use crate::constants::*;
+use crate::error::CmdError;
 use crate::types::Language;
 
-/// Validate execution parameters (code, timeout, env vars).
-pub(crate) fn validate_execute_params(
-    code: &str,
-    timeout: u64,
-    env_vars: &HashMap<String, String>,
-) -> Result<(), String> {
+/// Validate code and timeout parameters.
+pub(crate) fn validate_code_params(code: &str, timeout: u64) -> Result<(), CmdError> {
     if code.trim().is_empty() {
-        return Err("Code cannot be empty".to_string());
+        return Err(CmdError::code("Code cannot be empty"));
     }
     if code.contains('\0') {
-        return Err("Code cannot contain null bytes".to_string());
+        return Err(CmdError::code("Code cannot contain null bytes"));
     }
     if code.len() > MAX_CODE_SIZE_BYTES {
-        return Err(format!(
+        return Err(CmdError::code(format!(
             "Code too large: {} bytes (max {} bytes)",
             code.len(),
             MAX_CODE_SIZE_BYTES
-        ));
+        )));
     }
     if timeout > MAX_TIMEOUT_SECONDS {
-        return Err(format!(
+        return Err(CmdError::code(format!(
             "Timeout too large: {}s (max {}s)",
             timeout, MAX_TIMEOUT_SECONDS
-        ));
+        )));
     }
+    Ok(())
+}
+
+/// Validate environment variables.
+pub(crate) fn validate_env_vars(env_vars: &HashMap<String, String>) -> Result<(), CmdError> {
     if env_vars.len() > MAX_ENV_VARS {
-        return Err(format!(
+        return Err(CmdError::env_var(format!(
             "Too many environment variables: {} (max {})",
             env_vars.len(),
             MAX_ENV_VARS
-        ));
+        )));
     }
 
     for (key, value) in env_vars {
         if BLOCKED_ENV_VARS.contains(&key.to_ascii_uppercase().as_str()) {
-            return Err(format!(
+            return Err(CmdError::env_var(format!(
                 "Blocked environment variable: '{}' (security risk)",
                 key
-            ));
+            )));
         }
         if key.is_empty() || key.len() > MAX_ENV_VAR_NAME_LENGTH {
-            return Err(format!(
+            return Err(CmdError::env_var(format!(
                 "Invalid environment variable name length: {} (max {})",
                 key.len(),
                 MAX_ENV_VAR_NAME_LENGTH
-            ));
+            )));
         }
         if value.len() > MAX_ENV_VAR_VALUE_LENGTH {
-            return Err(format!(
+            return Err(CmdError::env_var(format!(
                 "Environment variable value too large: {} bytes (max {})",
                 value.len(),
                 MAX_ENV_VAR_VALUE_LENGTH
-            ));
+            )));
         }
         if key.chars().any(is_forbidden_control_char) {
-            return Err(format!(
+            return Err(CmdError::env_var(format!(
                 "Environment variable name '{}' contains forbidden control character",
                 key
-            ));
+            )));
         }
         if value.chars().any(is_forbidden_control_char) {
-            return Err(format!(
+            return Err(CmdError::env_var(format!(
                 "Environment variable '{}' value contains forbidden control character",
                 key
-            ));
+            )));
         }
     }
 
@@ -169,46 +171,78 @@ mod tests {
     use super::*;
 
     // -------------------------------------------------------------------------
-    // validate_execute_params
+    // validate_code_params
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_valid_code_no_env() {
-        let env = HashMap::new();
-        assert!(validate_execute_params("print('hello')", 30, &env).is_ok());
-    }
-
-    #[test]
-    fn test_valid_code_with_env() {
-        let env = HashMap::from([("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())]);
-        assert!(validate_execute_params("print('hello')", 30, &env).is_ok());
+    fn test_valid_code() {
+        assert!(validate_code_params("print('hello')", 30).is_ok());
     }
 
     #[test]
     fn test_valid_code_timeout_zero() {
-        assert!(validate_execute_params("x=1", 0, &HashMap::new()).is_ok());
+        assert!(validate_code_params("x=1", 0).is_ok());
     }
 
     #[test]
     fn test_code_exactly_max() {
         let code = "x".repeat(MAX_CODE_SIZE_BYTES);
-        assert!(validate_execute_params(&code, 30, &HashMap::new()).is_ok());
+        assert!(validate_code_params(&code, 30).is_ok());
     }
 
     #[test]
     fn test_code_exceeds_max() {
         let code = "x".repeat(MAX_CODE_SIZE_BYTES + 1);
-        assert!(validate_execute_params(&code, 30, &HashMap::new()).is_err());
+        assert!(validate_code_params(&code, 30).is_err());
     }
 
     #[test]
     fn test_timeout_exactly_max() {
-        assert!(validate_execute_params("x=1", MAX_TIMEOUT_SECONDS, &HashMap::new()).is_ok());
+        assert!(validate_code_params("x=1", MAX_TIMEOUT_SECONDS).is_ok());
     }
 
     #[test]
     fn test_timeout_exceeds_max() {
-        assert!(validate_execute_params("x=1", MAX_TIMEOUT_SECONDS + 1, &HashMap::new()).is_err());
+        assert!(validate_code_params("x=1", MAX_TIMEOUT_SECONDS + 1).is_err());
+    }
+
+    #[test]
+    fn test_null_byte_in_code() {
+        assert!(validate_code_params("print('hi')\0print('bye')", 30).is_err());
+    }
+
+    #[test]
+    fn test_whitespace_only_code() {
+        assert!(validate_code_params("   \n\t  ", 30).is_err());
+    }
+
+    #[test]
+    fn test_newlines_only_code() {
+        assert!(validate_code_params("\n\n\n", 30).is_err());
+    }
+
+    #[test]
+    fn test_code_error_type() {
+        let err = validate_code_params("", 30).unwrap_err();
+        match err {
+            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "code_error"),
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // validate_env_vars
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_valid_env_vars() {
+        let env = HashMap::from([("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())]);
+        assert!(validate_env_vars(&env).is_ok());
+    }
+
+    #[test]
+    fn test_empty_env_vars() {
+        assert!(validate_env_vars(&HashMap::new()).is_ok());
     }
 
     #[test]
@@ -216,7 +250,7 @@ mod tests {
         let env: HashMap<String, String> = (0..MAX_ENV_VARS)
             .map(|i| (format!("VAR_{i}"), "val".into()))
             .collect();
-        assert!(validate_execute_params("x=1", 30, &env).is_ok());
+        assert!(validate_env_vars(&env).is_ok());
     }
 
     #[test]
@@ -224,122 +258,117 @@ mod tests {
         let env: HashMap<String, String> = (0..MAX_ENV_VARS + 1)
             .map(|i| (format!("VAR_{i}"), "val".into()))
             .collect();
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_env_var_name_exactly_max() {
         let key = "A".repeat(MAX_ENV_VAR_NAME_LENGTH);
         let env = HashMap::from([(key, "val".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_ok());
+        assert!(validate_env_vars(&env).is_ok());
     }
 
     #[test]
     fn test_env_var_name_exceeds_max() {
         let key = "A".repeat(MAX_ENV_VAR_NAME_LENGTH + 1);
         let env = HashMap::from([(key, "val".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_env_var_value_exactly_max() {
         let val = "x".repeat(MAX_ENV_VAR_VALUE_LENGTH);
         let env = HashMap::from([("FOO".into(), val)]);
-        assert!(validate_execute_params("x=1", 30, &env).is_ok());
+        assert!(validate_env_vars(&env).is_ok());
     }
 
     #[test]
     fn test_env_var_value_exceeds_max() {
         let val = "x".repeat(MAX_ENV_VAR_VALUE_LENGTH + 1);
         let env = HashMap::from([("FOO".into(), val)]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_tab_in_env_var_value_allowed() {
         let env = HashMap::from([("FOO".into(), "a\tb".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_ok());
-    }
-
-    #[test]
-    fn test_null_byte_in_code() {
-        assert!(validate_execute_params("print('hi')\0print('bye')", 30, &HashMap::new()).is_err());
-    }
-
-    #[test]
-    fn test_whitespace_only_code() {
-        assert!(validate_execute_params("   \n\t  ", 30, &HashMap::new()).is_err());
-    }
-
-    #[test]
-    fn test_newlines_only_code() {
-        assert!(validate_execute_params("\n\n\n", 30, &HashMap::new()).is_err());
+        assert!(validate_env_vars(&env).is_ok());
     }
 
     #[test]
     fn test_blocked_env_ld_preload() {
         let env = HashMap::from([("LD_PRELOAD".into(), "/evil.so".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_blocked_env_ld_preload_lowercase() {
         let env = HashMap::from([("ld_preload".into(), "/evil.so".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_blocked_env_path() {
         let env = HashMap::from([("PATH".into(), "/evil".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_blocked_env_bash_env() {
         let env = HashMap::from([("BASH_ENV".into(), "/evil".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_blocked_env_node_options() {
         let env = HashMap::from([("NODE_OPTIONS".into(), "--require=evil".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_blocked_env_pythonpath() {
         let env = HashMap::from([("PYTHONPATH".into(), "/tmp/evil".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_blocked_env_ifs() {
         let env = HashMap::from([("IFS".into(), " ".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_null_byte_in_env_name() {
         let env = HashMap::from([("FOO\0BAR".into(), "val".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_control_char_in_env_name() {
         let env = HashMap::from([("FOO\x01".into(), "val".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_esc_in_env_value() {
         let env = HashMap::from([("FOO".into(), "val\x1B".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
     }
 
     #[test]
     fn test_del_in_env_name() {
         let env = HashMap::from([("FOO\x7F".into(), "val".into())]);
-        assert!(validate_execute_params("x=1", 30, &env).is_err());
+        assert!(validate_env_vars(&env).is_err());
+    }
+
+    #[test]
+    fn test_env_var_error_type() {
+        let env = HashMap::from([("LD_PRELOAD".into(), "/evil.so".into())]);
+        let err = validate_env_vars(&env).unwrap_err();
+        match err {
+            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "env_var_error"),
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
     }
 
     // -------------------------------------------------------------------------

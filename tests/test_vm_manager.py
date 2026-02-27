@@ -11,7 +11,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from exec_sandbox.exceptions import EnvVarValidationError, SandboxError, VmDependencyError, VmError, VmQemuCrashError
+from exec_sandbox.exceptions import (
+    EnvVarValidationError,
+    SandboxError,
+    VmDependencyError,
+    VmError,
+    VmPermanentError,
+    VmQemuCrashError,
+    VmTransientError,
+)
 from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.qemu_vm import QemuVM
@@ -2569,6 +2577,98 @@ class TestExecuteEnvVarValidation:
     async def test_adversarial_values_raise_env_var_validation_error(self, vm, env_vars: dict[str, str]) -> None:
         with pytest.raises(EnvVarValidationError):
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+
+
+# ============================================================================
+# Unit Tests - _guest_error_to_exception mapping
+# ============================================================================
+
+
+class TestGuestErrorToException:
+    """Unit tests for _guest_error_to_exception() centralized error mapping."""
+
+    @pytest.mark.parametrize(
+        "error_type, expected_cls",
+        [
+            pytest.param("env_var_error", EnvVarValidationError, id="env_var"),
+            pytest.param("code_error", VmPermanentError, id="code"),
+            pytest.param("path_error", VmPermanentError, id="path"),
+            pytest.param("package_error", VmPermanentError, id="package"),
+            pytest.param("io_error", VmPermanentError, id="io"),
+            pytest.param("execution_error", VmPermanentError, id="execution"),
+            pytest.param("timeout_error", VmTransientError, id="timeout"),
+            pytest.param("request_error", VmPermanentError, id="request"),
+            pytest.param("protocol_error", VmPermanentError, id="protocol"),
+            pytest.param("unknown_future_type", VmPermanentError, id="unknown"),
+        ],
+    )
+    def test_error_type_mapping(self, error_type: str, expected_cls: type) -> None:
+        """Each error_type maps to the correct exception class."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="test error", error_type=error_type)
+        exc = _guest_error_to_exception(msg, "vm-123", operation="read_file '/foo'")
+
+        assert isinstance(exc, expected_cls)
+        assert error_type in str(exc)
+        assert "test error" in str(exc)
+
+    def test_operation_in_message(self) -> None:
+        """Operation name appears in the exception message."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="not found", error_type="io_error")
+        exc = _guest_error_to_exception(msg, "vm-456", operation="read_file '/data.txt'")
+
+        assert "read_file '/data.txt'" in str(exc)
+
+    def test_context_fields(self) -> None:
+        """Context dict contains expected fields."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="bad path", error_type="path_error")
+        exc = _guest_error_to_exception(msg, "vm-789", operation="write_file '/evil'")
+
+        assert exc.context["vm_id"] == "vm-789"
+        assert exc.context["error_type"] == "path_error"
+        assert exc.context["guest_message"] == "bad path"
+        assert exc.context["operation"] == "write_file '/evil'"
+
+    def test_no_operation(self) -> None:
+        """Without operation, context has no operation key and message has no prefix."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="oops", error_type="io_error")
+        exc = _guest_error_to_exception(msg, "vm-000")
+
+        assert "operation" not in exc.context
+        assert str(exc).startswith("[io_error]")
+
+    def test_env_var_error_maps_to_env_var_validation_error(self) -> None:
+        """env_var_error maps to EnvVarValidationError (defense-in-depth)."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="blocked env var", error_type="env_var_error")
+        exc = _guest_error_to_exception(msg, "vm-exec", operation="execute")
+
+        assert isinstance(exc, EnvVarValidationError)
+        assert "env_var_error" in str(exc)
+
+    def test_path_error_maps_to_permanent_error(self) -> None:
+        """path_error maps to VmPermanentError (bad path)."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="path traversal", error_type="path_error")
+        exc = _guest_error_to_exception(msg, "vm-file", operation="write_file '/../../etc/passwd'")
+
+        assert isinstance(exc, VmPermanentError)
+        assert not isinstance(exc, EnvVarValidationError)
 
 
 # ============================================================================

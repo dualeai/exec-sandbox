@@ -120,25 +120,23 @@ pub(crate) async fn install_packages(
     use tokio::time::Duration;
 
     if language == Language::Raw {
-        return Err(CmdError::validation(format!(
+        return Err(CmdError::package(format!(
             "Unsupported language '{}' for package installation (supported: python, javascript)",
             language.as_str()
         )));
     }
     if packages.is_empty() {
-        return Err(CmdError::validation(
-            "No packages specified for installation",
-        ));
+        return Err(CmdError::package("No packages specified for installation"));
     }
     if packages.len() > MAX_PACKAGES {
-        return Err(CmdError::validation(format!(
+        return Err(CmdError::package(format!(
             "Too many packages: {} (max {})",
             packages.len(),
             MAX_PACKAGES
         )));
     }
     for pkg in packages {
-        validate_package_name(pkg).map_err(CmdError::validation)?;
+        validate_package_name(pkg).map_err(CmdError::package)?;
     }
 
     let start = Instant::now();
