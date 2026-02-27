@@ -151,8 +151,9 @@ pub(crate) async fn wait_for_network() {
 /// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
 /// Quota must be set at initial mount time — cannot be added via remount.
 fn mount_home_tmpfs() {
-    let half_mem_kb = read_mem_total_kb() / 2;
-    let half_mem_bytes = half_mem_kb * 1024;
+    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
+    let page_mask = !(page_size() - 1);
+    let half_mem_bytes = (read_mem_total_kb() / 2 * 1024) & page_mask;
     let ret = unsafe {
         let source = std::ffi::CString::new("tmpfs").unwrap();
         let target = std::ffi::CString::new("/home/user").unwrap();
@@ -277,8 +278,9 @@ fn setup_dev_symlinks() {
 /// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
 /// Quota must be set at initial mount time — cannot be added via remount.
 fn setup_dev_shm() {
-    let half_mem_kb = read_mem_total_kb() / 2;
-    let half_mem_bytes = half_mem_kb * 1024;
+    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
+    let page_mask = !(page_size() - 1);
+    let half_mem_bytes = (read_mem_total_kb() / 2 * 1024) & page_mask;
     let opts =
         format!("size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap");
 
@@ -427,7 +429,7 @@ fn setup_zram_swap() {
 ///
 /// NOTE: Mirrored in tiny-init/src/zram.rs — keep both in sync.
 fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page_size = page_size();
     let pages = (device_size / page_size).saturating_sub(1) as u32;
     if pages < 10 {
         return None; // kernel rejects tiny swap
@@ -532,6 +534,14 @@ fn read_mem_total_kb() -> u64 {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|n| n.parse().ok())
         .expect("MemTotal not found in /proc/meminfo")
+}
+
+/// Runtime page size from sysconf(_SC_PAGESIZE).
+/// Supports both 4KB (x86_64) and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES).
+///
+/// NOTE: Mirrored in tiny-init/src/sys.rs — keep both in sync.
+fn page_size() -> u64 {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
 }
 
 /// Verify gvproxy connectivity with exponential backoff.

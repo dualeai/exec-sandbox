@@ -135,6 +135,14 @@ pub(crate) fn read_mem_total_kb() -> u64 {
         .expect("MemTotal not found in /proc/meminfo")
 }
 
+/// Runtime page size from sysconf(_SC_PAGESIZE).
+/// Supports both 4KB (x86_64) and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES).
+///
+/// NOTE: Mirrored in guest-agent/src/init.rs — keep both in sync.
+pub(crate) fn page_size() -> u64 {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
 pub(crate) fn fallback_shell() -> ! {
     // exec /bin/sh (or sleep forever if no shell)
     for shell in ["/bin/sh", "/bin/ash"] {

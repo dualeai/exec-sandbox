@@ -64,8 +64,11 @@ fn mount_virtual_filesystems() {
     // totalram_pages/2, which varies 13K–55K+ depending on memory_mb). 16K
     // covers typical `pip install` (measured ~2K-5K files for large packages
     // like pandas).
-    let half_mem_kb = sys::read_mem_total_kb() / 2;
-    let half_mem_bytes = half_mem_kb * 1024;
+    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
+    // Without this, the kernel rounds up non-aligned values, causing statvfs
+    // to report a larger size than the computed half-memory value.
+    let page_mask = !(sys::page_size() - 1);
+    let half_mem_bytes = (sys::read_mem_total_kb() / 2 * 1024) & page_mask;
     sys::mount(
         "tmpfs",
         "/tmp",

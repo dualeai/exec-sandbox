@@ -8,7 +8,7 @@
 /// NOTE: Mirrored in guest-agent/src/init.rs — keep both in sync.
 #[cfg(test)]
 fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page_size = crate::sys::page_size();
     let pages = (device_size / page_size).saturating_sub(1) as u32;
     if pages < 10 {
         return None; // kernel rejects tiny swap
@@ -30,7 +30,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn host_page_size() -> usize {
-        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+        crate::sys::page_size() as usize
     }
 
     #[test]

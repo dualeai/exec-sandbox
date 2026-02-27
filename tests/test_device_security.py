@@ -191,7 +191,8 @@ with open('/proc/meminfo') as f:
         if line.startswith('MemTotal:'):
             mem_total_kb = int(line.split()[1])
             break
-half_mem_bytes = (mem_total_kb // 2) * 1024
+page_size = os.sysconf('SC_PAGESIZE')
+half_mem_bytes = (mem_total_kb // 2) * 1024 // page_size * page_size  # page-align
 s = os.statvfs('/dev/shm')
 shm_bytes = s.f_blocks * s.f_frsize
 print(f'HALF_MEM_BYTES:{half_mem_bytes}')
@@ -317,7 +318,8 @@ with open('/proc/meminfo') as f:
         if line.startswith('MemTotal:'):
             mem_total_kb = int(line.split()[1])
             break
-half_mem_bytes = (mem_total_kb // 2) * 1024
+page_size = os.sysconf('SC_PAGESIZE')
+half_mem_bytes = (mem_total_kb // 2) * 1024 // page_size * page_size  # page-align
 s = os.statvfs('/tmp')
 tmpfs_bytes = s.f_blocks * s.f_frsize
 print(f'MEMTOTAL_KB:{mem_total_kb}')
@@ -2007,7 +2009,8 @@ with open('/proc/meminfo') as f:
         if line.startswith('MemTotal:'):
             mem_total_kb = int(line.split()[1])
             break
-half_mem_bytes = (mem_total_kb // 2) * 1024
+page_size = os.sysconf('SC_PAGESIZE')
+half_mem_bytes = (mem_total_kb // 2) * 1024 // page_size * page_size  # page-align
 s = os.statvfs('/home/user')
 home_bytes = s.f_blocks * s.f_frsize
 print(f'HALF_MEM_BYTES:{half_mem_bytes}')
