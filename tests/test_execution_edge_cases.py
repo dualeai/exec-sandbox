@@ -533,9 +533,9 @@ class TestOutOfBounds:
     async def test_memory_allocation_large(self, scheduler: Scheduler) -> None:
         """Attempting to allocate lots of memory.
 
-        Slow under TCG: OOM correctness test with generous 30s timeout and
+        Slow under TCG: OOM correctness test with generous timeout and
         no timing assertions, but TCG boot overhead makes it too slow for
-        the default suite.
+        the default suite.  60s accommodates TCG boot + OOM handling.
         """
         # Try to allocate 500MB (should fail or be killed with 256MB VM)
         code = """
@@ -550,7 +550,7 @@ except MemoryError:
             code=code,
             language=Language.PYTHON,
             memory_mb=256,
-            timeout_seconds=30,
+            timeout_seconds=60,
         )
 
         # Should either get MemoryError or be OOM-killed
