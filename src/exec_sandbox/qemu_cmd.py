@@ -536,7 +536,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #         is Mach kernel hv_trap (~360µs/exit), not QEMU I/O processing.
     #   TCG:  software-emulated ioeventfd, moderate benefit (I/O off main loop).
     iothread_id = f"iothread0-{vm_id}"
-    qemu_args.extend(["-object", f"iothread,id={iothread_id}"])
+    # Cap I/O thread pool to 16 (QEMU default is 64).  With single-queue
+    # virtio-blk on qcow2, 16 is more than sufficient.  When aio=io_uring
+    # is active the pool is unused (no-op).  When aio=threads, this caps
+    # peak threads from ~72 to ~24, preventing pids.max exhaustion.
+    qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=16"])
 
     # Disk configuration (EROFS base drive, serial=base)
     # Uses qcow2 overlay backed by the EROFS base image

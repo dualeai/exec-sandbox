@@ -33,12 +33,11 @@ CGROUP_V2_BASE_PATH: Final[str] = "/sys/fs/cgroup"
 CGROUP_APP_NAMESPACE: Final[str] = "code-exec"
 """Application cgroup namespace under /sys/fs/cgroup."""
 
-CGROUP_MEMORY_OVERHEAD_MB: Final[int] = 64
-"""QEMU process overhead added to guest memory for cgroup and admission limits.
+CGROUP_MEMORY_OVERHEAD_MB: Final[int] = 128
+"""QEMU + gvproxy process overhead added to guest memory for cgroup and admission limits.
 
-This covers the QEMU *process* memory beyond guest RAM: binary text/data, glib
-event loop, coroutine stacks, virtio-mmio vring buffers, qcow2 L2/refcount
-table caches, and misc allocations.
+This covers host-side process memory beyond guest RAM for both QEMU and gvproxy
+(which share the same per-VM cgroup).
 
 We use the ``microvm`` machine type (x86) and ``virt`` (ARM) — both are
 minimal: no PCI bus, no ACPI, no emulated USB/display/sound.  The device set
@@ -51,11 +50,17 @@ Measured breakdown for microvm/virt with KVM/HVF:
   - virtio-mmio ring buffers             : ~1 MB per device
   - qcow2 block layer (L2 + refcount)    : ~5-10 MB
   - Miscellaneous (serial, monitor, etc.) : ~2-5 MB
-  - Total observed RSS (minus guest RAM)  : ~35-50 MB
+  - QEMU subtotal (minus guest RAM)       : ~35-50 MB
+  - gvproxy (Go binary, network proxy)    : ~15-30 MB
+  - Combined total                        : ~50-80 MB
 
-64 MB provides ~30 % headroom above the observed peak.  If OOM-kills are
-observed, bump this constant — but first verify with:
-  ``ps -o rss= -p <qemu_pid>`` minus guest memory.
+128 MB provides ~60 % headroom above the observed combined peak.  If OOM-kills
+are observed, bump this constant — but first verify with:
+  ``ps -o rss= -p <qemu_pid>`` and ``ps -o rss= -p <gvproxy_pid>``.
+
+Note: The admission controller (``admission.py``) uses this same constant to
+calculate per-VM memory budgets.  Higher overhead means fewer VMs admitted per
+host — an acceptable trade-off for correctness.
 
 References:
   - Firecracker: <5 MiB overhead (5 virtio devices)
@@ -80,9 +85,15 @@ We use 256MB as a balance between cache hit rate and memory usage:
 
 See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache"""
 
-CGROUP_PIDS_LIMIT: Final[int] = 100
+CGROUP_PIDS_LIMIT: Final[int] = 256
 """Maximum PIDs in cgroup (fork bomb prevention).
-Note: pids.max limits both processes AND threads, so this also limits goroutines."""
+
+256 provides ample headroom for QEMU + gvproxy threads in both aio=io_uring
+(~38 peak) and aio=threads (~102 peak) modes, while still preventing fork
+bombs (thousands of processes).  Guest code runs inside the VM and does NOT
+count toward this host cgroup limit.
+
+Note: pids.max limits both processes AND threads (including goroutines)."""
 
 ULIMIT_MEMORY_MULTIPLIER: Final[int] = 14
 """Virtual memory multiplier for ulimit (guest_mb * 14 for TCG overhead)."""
@@ -355,7 +366,7 @@ async def setup_cgroup(
     Limits:
     - memory.max: guest_mb + overhead (+ TCG TB cache if software emulation)
     - cpu.max: quota proportional to cpu_cores (e.g. 2 cores = 200000/100000)
-    - pids.max: 100 (fork bomb prevention, also limits goroutines)
+    - pids.max: 256 (fork bomb prevention, also limits goroutines)
 
     Args:
         vm_id: Unique VM identifier

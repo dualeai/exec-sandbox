@@ -547,6 +547,38 @@ jobs:
           sudo mkdir -p /etc/systemd/system/user-.slice.d
           echo -e "[Slice]\nTasksMax=infinity" | sudo tee /etc/systemd/system/user-.slice.d/90-tasksmax.conf
           sudo systemctl daemon-reload
+          # 5. Diagnostic: dump all thread/pids limits for debugging
+          echo ""
+          echo "=== Cgroup pids limits (current session) ==="
+          CGROUP_PATH=$(cat /proc/self/cgroup | sed 's/0:://')
+          echo "Current cgroup: $CGROUP_PATH"
+          DIR="/sys/fs/cgroup${CGROUP_PATH}"
+          while [ "$DIR" != "/sys/fs/cgroup" ] && [ "$DIR" != "/" ]; do
+            PIDS_MAX=$(cat "$DIR/pids.max" 2>/dev/null || echo "N/A")
+            PIDS_CUR=$(cat "$DIR/pids.current" 2>/dev/null || echo "N/A")
+            echo "  $DIR: pids.max=$PIDS_MAX pids.current=$PIDS_CUR"
+            DIR=$(dirname "$DIR")
+          done
+          echo ""
+          echo "=== RLIMIT_NPROC for runner and qemu-vm ==="
+          cat /proc/self/limits | grep "Max processes"
+          sudo -u qemu-vm cat /proc/self/limits 2>/dev/null | grep "Max processes" || echo "Cannot read qemu-vm limits"
+          echo ""
+          echo "=== systemd TasksMax for user slices ==="
+          systemctl show "user-$(id -u).slice" --property=TasksMax 2>/dev/null || true
+          echo ""
+          echo "=== io_uring availability ==="
+          cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "sysctl not present (io_uring enabled)"
+          # 6. Remove pids.max limits from runner's cgroup hierarchy
+          #    TasksMax=infinity drop-in only affects new sessions; directly write to live cgroup
+          CGROUP_PATH=$(cat /proc/self/cgroup | sed 's/0:://')
+          DIR="/sys/fs/cgroup${CGROUP_PATH}"
+          while [ "$DIR" != "/sys/fs/cgroup" ] && [ "$DIR" != "/" ]; do
+            if [ -f "$DIR/pids.max" ] && [ -w "$DIR/pids.max" ]; then
+              echo max | sudo tee "$DIR/pids.max" > /dev/null 2>&1 || true
+            fi
+            DIR=$(dirname "$DIR")
+          done
 
       - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'
