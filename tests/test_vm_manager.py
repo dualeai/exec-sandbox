@@ -597,7 +597,13 @@ class TestNetdevReconnect:
 
         workdir = await VmWorkingDirectory.create("test-vm-reconnect-8-x")
         try:
-            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(8, 2, 0)):
+            with (
+                patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(8, 2, 0)),
+                # Bypass ARM64 TCG version guard — this test targets netdev reconnect logic,
+                # not acceleration selection. On ARM64 TCG runners, QEMU < 9.0.4 triggers
+                # VmDependencyError before reaching the netdev code path.
+                patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=AccelType.HVF),
+            ):
                 cmd = await build_qemu_cmd(
                     settings=vm_settings,
                     arch=detect_host_arch(),
@@ -692,7 +698,11 @@ class TestNetdevReconnect:
 
         workdir = await VmWorkingDirectory.create("test-vm-reconnect-7")
         try:
-            with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(7, 2, 0)):
+            with (
+                patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(7, 2, 0)),
+                # Bypass ARM64 TCG version guard — same rationale as test_netdev_uses_reconnect_for_qemu_8_x.
+                patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=AccelType.HVF),
+            ):
                 cmd = await build_qemu_cmd(
                     settings=vm_settings,
                     arch=detect_host_arch(),
