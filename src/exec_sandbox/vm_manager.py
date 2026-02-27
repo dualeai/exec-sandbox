@@ -730,7 +730,7 @@ class VmManager:
 
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
-                stdout_text, stderr_text = await self._capture_qemu_output(vm.process)
+                stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
                 console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
                 qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
 
@@ -1151,7 +1151,7 @@ class VmManager:
                     await self._admission.release(vm.resource_reservation)
                     vm.resource_reservation = None
 
-    async def _capture_qemu_output(self, process: ProcessWrapper) -> tuple[str, str]:
+    async def capture_qemu_output(self, process: ProcessWrapper) -> tuple[str, str]:
         """Capture stdout/stderr from QEMU process.
 
         Args:
@@ -1318,7 +1318,7 @@ class VmManager:
             accel_type = await detect_accel_type()
             if accel_type == AccelType.TCG and vm.process.returncode == 0:
                 console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
-                stdout_text, stderr_text = await self._capture_qemu_output(vm.process)
+                stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
                 logger.warning(
                     "QEMU TCG exited with code 0 during boot (will retry)",
                     extra={
@@ -1335,7 +1335,7 @@ class VmManager:
                 )
 
             # Process died - capture output
-            stdout_text, stderr_text = await self._capture_qemu_output(vm.process)
+            stdout_text, stderr_text = await self.capture_qemu_output(vm.process)
             signal_name = ""
             if vm.process.returncode and vm.process.returncode < 0:
                 sig = -vm.process.returncode

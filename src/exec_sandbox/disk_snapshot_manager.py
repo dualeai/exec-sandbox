@@ -654,6 +654,21 @@ class DiskSnapshotManager(BaseCacheManager):
         # Wait for QEMU process to exit (blocks until death)
         returncode = await vm.process.wait()
 
+        # Capture diagnostics before raising so CI failures are debuggable
+        console_snapshot = "\n".join(vm.console_lines) if vm.console_lines else "(empty)"
+        stdout_text, stderr_text = await self.vm_manager.capture_qemu_output(vm.process)
+        logger.error(
+            "VM died during snapshot creation",
+            extra={
+                "vm_id": vm.vm_id,
+                "exit_code": returncode,
+                "cache_key": cache_key,
+                "console_log": console_snapshot[-2000:],
+                "stderr": stderr_text[:500] if stderr_text else "(empty)",
+                "stdout": stdout_text[:500] if stdout_text else "(empty)",
+            },
+        )
+
         # Process died → raise error to cancel sibling tasks
         raise VmQemuCrashError(
             f"VM process died during snapshot creation (exit code {returncode})",
