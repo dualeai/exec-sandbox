@@ -473,6 +473,7 @@ class TestPortForwardingModeSelection:
 # =============================================================================
 
 
+@pytest.mark.slow
 class TestPortForwardingMode1Integration:
     """Integration tests for Mode 1: port forwarding without internet (QEMU hostfwd)."""
 
@@ -572,6 +573,7 @@ except Exception as e:
         assert "BLOCKED" in result.stdout or result.exit_code != 0
 
 
+@pytest.mark.slow
 class TestPortForwardingMode2Integration:
     """Integration tests for Mode 2: port forwarding with internet (gvproxy)."""
 
