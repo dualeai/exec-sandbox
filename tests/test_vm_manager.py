@@ -11,8 +11,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from exec_sandbox.constants import GuestErrorType
 from exec_sandbox.exceptions import (
+    CodeValidationError,
     EnvVarValidationError,
+    InputValidationError,
     SandboxError,
     VmDependencyError,
     VmError,
@@ -2591,7 +2594,7 @@ class TestGuestErrorToException:
         "error_type, expected_cls",
         [
             pytest.param("env_var_error", EnvVarValidationError, id="env_var"),
-            pytest.param("code_error", VmPermanentError, id="code"),
+            pytest.param("code_error", CodeValidationError, id="code"),
             pytest.param("path_error", VmPermanentError, id="path"),
             pytest.param("package_error", VmPermanentError, id="package"),
             pytest.param("io_error", VmPermanentError, id="io"),
@@ -2658,6 +2661,43 @@ class TestGuestErrorToException:
 
         assert isinstance(exc, EnvVarValidationError)
         assert "env_var_error" in str(exc)
+
+    @pytest.mark.parametrize(
+        "error_type_enum, expected_cls",
+        [
+            pytest.param(GuestErrorType.ENV_VAR, EnvVarValidationError, id="env_var"),
+            pytest.param(GuestErrorType.CODE, CodeValidationError, id="code"),
+            pytest.param(GuestErrorType.REQUEST, VmPermanentError, id="request"),
+        ],
+    )
+    def test_enum_value_round_trip(self, error_type_enum: GuestErrorType, expected_cls: type) -> None:
+        """GuestErrorType enum .value round-trips through StreamingErrorMessage.
+
+        Regression: str(GuestErrorType.ENV_VAR) produces 'GuestErrorType.ENV_VAR'
+        which never matches the case branches. Must use .value to get 'env_var_error'.
+        """
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="test", error_type=error_type_enum.value)
+        exc = _guest_error_to_exception(msg, "vm-roundtrip")
+        assert isinstance(exc, expected_cls)
+
+    @pytest.mark.parametrize(
+        "error_type",
+        [
+            pytest.param("env_var_error", id="env_var"),
+            pytest.param("code_error", id="code"),
+        ],
+    )
+    def test_input_validation_errors_are_input_validation(self, error_type: str) -> None:
+        """env_var_error and code_error both produce InputValidationError subclasses."""
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+        from exec_sandbox.qemu_vm import _guest_error_to_exception
+
+        msg = StreamingErrorMessage(type="error", message="test", error_type=error_type)
+        exc = _guest_error_to_exception(msg, "vm-test")
+        assert isinstance(exc, InputValidationError)
 
     def test_path_error_maps_to_permanent_error(self) -> None:
         """path_error maps to VmPermanentError (bad path)."""

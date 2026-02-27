@@ -7,6 +7,9 @@ Tests that the execution system handles unusual inputs gracefully:
 4. Error cases: Syntax errors, import errors, runtime errors
 """
 
+import pytest
+
+from exec_sandbox.exceptions import CodeValidationError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from tests.conftest import skip_unless_hwaccel
@@ -19,26 +22,20 @@ class TestEdgeCases:
     """Edge cases that should work but might break naive implementations."""
 
     async def test_empty_code(self, scheduler: Scheduler) -> None:
-        """Empty code string is rejected by guest-agent validation."""
-        result = await scheduler.run(
-            code="",
-            language=Language.PYTHON,
-        )
-
-        # Empty code is rejected with validation error (exit_code=-1)
-        assert result.exit_code == -1
-        assert "Code cannot be empty" in result.stderr
+        """Empty code string raises CodeValidationError."""
+        with pytest.raises(CodeValidationError, match="Code cannot be empty"):
+            await scheduler.run(
+                code="",
+                language=Language.PYTHON,
+            )
 
     async def test_whitespace_only_code(self, scheduler: Scheduler) -> None:
-        """Whitespace-only code is rejected by guest-agent validation."""
-        result = await scheduler.run(
-            code="   \n\n\t\t\n   ",
-            language=Language.PYTHON,
-        )
-
-        # Whitespace-only code is rejected (trimmed = empty)
-        assert result.exit_code == -1
-        assert "Code cannot be empty" in result.stderr
+        """Whitespace-only code raises CodeValidationError."""
+        with pytest.raises(CodeValidationError, match="Code cannot be empty"):
+            await scheduler.run(
+                code="   \n\n\t\t\n   ",
+                language=Language.PYTHON,
+            )
 
     async def test_comment_only_code(self, scheduler: Scheduler) -> None:
         """Comment-only code executes without error."""
@@ -211,13 +208,27 @@ sys.stdout.buffer.flush()
         assert "before" in result.stdout or "after" in result.stdout
 
     async def test_null_bytes_in_code_rejected(self, scheduler: Scheduler) -> None:
-        """Code containing null bytes is rejected with clear error before reaching runtime."""
+        """Code containing null bytes raises CodeValidationError."""
+        with pytest.raises(CodeValidationError, match="null bytes"):
+            await scheduler.run(
+                code="print('hello')\x00print('world')",
+                language=Language.PYTHON,
+            )
+
+    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
+    async def test_null_bytes_rejected_all_languages(self, scheduler: Scheduler, language: Language) -> None:
+        """Null bytes rejected regardless of language."""
+        with pytest.raises(CodeValidationError, match="null bytes"):
+            await scheduler.run(code="echo hi\x00", language=language)
+
+    async def test_escaped_null_repr_accepted(self, scheduler: Scheduler) -> None:
+        r"""Literal '\\x00' string (no actual null byte) executes fine."""
         result = await scheduler.run(
-            code="print('hello')\x00print('world')",
+            code="print(repr('hello\\x00world'))",
             language=Language.PYTHON,
         )
-        assert result.exit_code == -1
-        assert "null bytes" in result.stderr.lower()
+        assert result.exit_code == 0
+        assert "hello\\x00world" in result.stdout
 
     async def test_binary_data_in_output(self, scheduler: Scheduler) -> None:
         """Code outputting binary data."""

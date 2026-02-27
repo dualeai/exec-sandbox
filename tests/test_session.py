@@ -13,7 +13,7 @@ import asyncio
 
 import pytest
 
-from exec_sandbox.exceptions import SessionClosedError
+from exec_sandbox.exceptions import CodeValidationError, SessionClosedError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from tests.conftest import skip_on_python_312_subprocess_bug, skip_unless_hwaccel
@@ -251,6 +251,17 @@ class TestSessionEdgeCases:
             await session.exec("x = 42")
             result = await session.exec("def broken(")
             assert result.exit_code != 0
+            result = await session.exec("print(x)")
+            assert result.exit_code == 0
+            assert "42" in result.stdout
+
+    async def test_code_validation_error_preserves_session(self, scheduler: Scheduler) -> None:
+        """CodeValidationError doesn't close the session — caller can retry."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            await session.exec("x = 42")
+            with pytest.raises(CodeValidationError):
+                await session.exec("")  # empty code → CodeValidationError
+            # Session still alive and state preserved
             result = await session.exec("print(x)")
             assert result.exit_code == 0
             assert "42" in result.stdout

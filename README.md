@@ -301,11 +301,21 @@ async with Scheduler(config) as scheduler:
 #### Error Handling
 
 ```python
-from exec_sandbox import Scheduler, VmTimeoutError, PackageNotAllowedError, SandboxError
+from exec_sandbox import (
+    Scheduler,
+    InputValidationError,
+    PackageNotAllowedError,
+    SandboxError,
+    VmTimeoutError,
+)
 
 async with Scheduler() as scheduler:
     try:
-        result = await scheduler.run(code="while True: pass", language="python", timeout_seconds=5)
+        result = await scheduler.run(code="print('hello')", language="python", timeout_seconds=5)
+    except InputValidationError as e:
+        # Caller bug — bad code or env vars. Fix input and retry.
+        # (CodeValidationError, EnvVarValidationError inherit from this)
+        print(f"Invalid input: {e}")
     except VmTimeoutError:
         print("Execution timed out")
     except PackageNotAllowedError as e:
@@ -531,6 +541,9 @@ Returned by `Session.list_files()`.
 | `SandboxError` | Base exception for all sandbox errors |
 | `TransientError` | Retryable errors — may succeed on retry |
 | `PermanentError` | Non-retryable errors |
+| `InputValidationError` | Caller-bug errors — bad input, session stays alive |
+| `CodeValidationError` | Empty, whitespace-only, or null-byte code |
+| `EnvVarValidationError` | Invalid env var names/values (control chars, size) |
 | `VmTimeoutError` | VM boot timed out |
 | `VmCapacityError` | VM pool at capacity |
 | `VmConfigError` | Invalid VM configuration |
@@ -539,14 +552,13 @@ Returned by `Session.list_files()`.
 | `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
-| `EnvVarValidationError` | Environment variable validation failed |
 | `SocketAuthError` | Socket peer authentication failed |
 | `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
 | `AssetError` | Asset download/verification failed |
 
 ## Session Resilience
 
-Sessions survive user code failures. Only VM-level communication errors close a session.
+Sessions survive user code failures and input validation errors (`InputValidationError`). Only VM-level communication errors close a session.
 
 | Failure | Exit Code | Session | State | Next `exec()` |
 |---------|-----------|---------|-------|----------------|

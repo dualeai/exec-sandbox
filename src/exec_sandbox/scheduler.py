@@ -301,6 +301,8 @@ class Scheduler:
             ExecutionResult with stdout, stderr, exit_code, timing info, and exposed_ports.
 
         Raises:
+            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
+            EnvVarValidationError: Invalid env var names/values (control chars, size limits).
             SandboxError: Scheduler not started.
             PackageNotAllowedError: Package not in allowlist.
             VmError: VM creation or execution failed.

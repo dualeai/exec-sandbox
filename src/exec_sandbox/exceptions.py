@@ -19,6 +19,9 @@ Hierarchy:
     │   │   ├── VmConfigError          ← invalid configuration
     │   │   └── VmDependencyError      ← missing binary/image
     │   └── SessionClosedError         ← session already closed
+    ├── InputValidationError (caller-bug marker base)
+    │   ├── CodeValidationError       ← empty/null-byte code
+    │   └── EnvVarValidationError     ← control chars, size limits
     └── ... (other existing exceptions)
 
 Backward Compatibility:
@@ -284,7 +287,23 @@ class PackageNotAllowedError(SandboxError):
     """
 
 
-class EnvVarValidationError(SandboxError):
+class InputValidationError(SandboxError):
+    """Base for input validation errors (caller bugs, not VM failures).
+
+    These errors mean the caller passed invalid input. The session/VM is
+    unaffected and can be reused — the caller should fix their input and retry.
+    """
+
+
+class CodeValidationError(InputValidationError):
+    """Code validation failed.
+
+    Raised when the code string is empty, whitespace-only, or contains
+    invalid characters (null bytes).
+    """
+
+
+class EnvVarValidationError(InputValidationError):
     """Environment variable validation failed.
 
     Raised when environment variable names or values contain invalid

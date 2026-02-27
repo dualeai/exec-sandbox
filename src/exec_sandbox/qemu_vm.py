@@ -19,20 +19,23 @@ from pydantic import ValidationError
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import (
+    CodeValidationError,
     EnvVarValidationError,
+    InputValidationError,
     SandboxError,
     VmBootTimeoutError,
-    VmConfigError,
     VmPermanentError,
     VmTransientError,
 )
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
+    ExecutionCompleteMessage,
     FileChunkResponseMessage,
     FileListMessage,
     FileReadCompleteMessage,
     FileWriteAckMessage,
     ListFilesRequest,
+    OutputChunkMessage,
     ReadFileRequest,
     StreamingErrorMessage,
     WriteFileRequest,
@@ -84,9 +87,10 @@ def _guest_error_to_exception(
             return VmTransientError(formatted, context=context)
         case constants.GuestErrorType.ENV_VAR:
             return EnvVarValidationError(formatted, context=context)
+        case constants.GuestErrorType.CODE:
+            return CodeValidationError(formatted, context=context)
         case (
-            constants.GuestErrorType.CODE
-            | constants.GuestErrorType.PATH
+            constants.GuestErrorType.PATH
             | constants.GuestErrorType.PACKAGE
             | constants.GuestErrorType.IO
             | constants.GuestErrorType.EXECUTION
@@ -383,6 +387,7 @@ class QemuVM:
             ExecutionResult with stdout, stderr, exit code, and resource usage
 
         Raises:
+            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
             EnvVarValidationError: Invalid env vars (control chars, size limits)
             VmPermanentError: VM not in READY state or communication failed
             VmBootTimeoutError: Execution exceeded timeout_seconds
@@ -434,26 +439,22 @@ class QemuVM:
                 env_vars=env_vars or {},
             )
         except ValidationError as e:
+            # Translate Pydantic structural errors through the same path as
+            # guest-agent errors so all error mapping lives in one place.
             error_locs = {field for err in e.errors() for field in err.get("loc", ())}
-            # Code field errors (e.g. null bytes, too large) → result, not exception
-            if "code" in error_locs:
-                return ExecutionResult(
-                    exit_code=-1,
-                    stdout="",
-                    stderr=str(e),
-                    timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
-                )
-            # Env var field errors (control chars, size limits) → EnvVarValidationError
             if "env_vars" in error_locs:
-                raise EnvVarValidationError(
-                    str(e),
-                    context={"vm_id": self.vm_id},
-                ) from e
-            # Other field errors (timeout out of range, etc.) → VmConfigError
-            raise VmConfigError(
-                str(e),
-                context={"vm_id": self.vm_id},
-            ) from e
+                error_type = constants.GuestErrorType.ENV_VAR
+            elif "code" in error_locs:
+                error_type = constants.GuestErrorType.CODE
+            else:
+                error_type = constants.GuestErrorType.REQUEST
+            msg = StreamingErrorMessage(message=str(e), error_type=error_type.value)
+            exc = _guest_error_to_exception(msg, self.vm_id)
+            if isinstance(exc, InputValidationError):
+                # Input was invalid but VM is fine — restore READY for session reuse
+                with contextlib.suppress(VmPermanentError):
+                    await self.transition_state(VmState.READY)
+            raise exc from e
 
         try:
             # Re-check state before expensive I/O operations
@@ -488,13 +489,6 @@ class QemuVM:
             stderr_chunks: list[str] = []
 
             async for msg in self.channel.stream_messages(request, timeout=hard_timeout):
-                # Type-safe message handling
-                from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
-                    ExecutionCompleteMessage,
-                    OutputChunkMessage,
-                    StreamingErrorMessage,
-                )
-
                 if isinstance(msg, OutputChunkMessage):
                     # Collect chunk for return to user
                     if msg.type == "stdout":
@@ -525,9 +519,12 @@ class QemuVM:
                     process_ms = msg.process_ms
                 elif isinstance(msg, StreamingErrorMessage):
                     exc = _guest_error_to_exception(msg, self.vm_id, operation="execute")
-                    # Defense-in-depth: if blocked env var bypassed Pydantic
-                    # (e.g. model_construct()), the guest still rejects it.
-                    if isinstance(exc, EnvVarValidationError):
+                    # Input validation errors (env vars, code) are caller bugs —
+                    # raise immediately so callers get a typed exception.
+                    if isinstance(exc, InputValidationError):
+                        # VM processed the request and returned an error — restore READY
+                        with contextlib.suppress(VmPermanentError):
+                            await self.transition_state(VmState.READY)
                         raise exc
                     # Other error types are runtime results, not caller bugs
                     logger.error(
