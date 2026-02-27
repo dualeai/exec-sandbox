@@ -450,12 +450,16 @@ except Exception as e:
     )
 
 
+@pytest.mark.slow
 async def test_outbound_filtering_block_all_outbound(scheduler: Scheduler) -> None:
     """BlockAllOutbound (Mode 1) should block everything including TLS.
 
     When block_outbound=True (Mode 1: port-forward only), no guest-initiated
     connections should succeed, even if allowed_domains would normally match.
     This tests Mode 1 isolation.
+
+    Slow under TCG: VM boot + Python SSL handshake attempt (5s socket timeout)
+    can exceed the 30s default execution timeout on CI runners without HVF.
     """
     code = """
 import socket
