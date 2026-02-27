@@ -478,15 +478,12 @@ class TestStreamingThroughput:
     @pytest.mark.parametrize("size_kb", [100, 500, 900])
     async def test_raw_throughput_devzero(self, scheduler: Scheduler, size_kb: int) -> None:
         """Measure throughput using /dev/zero (fastest possible generation)."""
-        import time
-
         expected_bytes = size_kb * 1000
 
         # Use dd from /dev/zero - zero generation overhead
         code = f"dd if=/dev/zero bs=1000 count={size_kb} 2>/dev/null"
 
         streamed_bytes = 0
-        start_time = time.perf_counter()
 
         def on_stdout(chunk: str) -> None:
             nonlocal streamed_bytes
@@ -499,8 +496,11 @@ class TestStreamingThroughput:
             on_stdout=on_stdout,
         )
 
-        elapsed = time.perf_counter() - start_time
-        throughput_mibps = (streamed_bytes / (1024 * 1024)) / elapsed
+        # Use execute_ms (host-measured execution phase) — excludes VM
+        # preparation (warm pool lookup, L1 restore, cold boot) which is
+        # not part of streaming throughput.
+        elapsed_s = result.timing.execute_ms / 1000
+        throughput_mibps = (streamed_bytes / (1024 * 1024)) / elapsed_s
 
         assert result.exit_code == 0, f"dd failed: {result.stderr}"
         assert streamed_bytes == expected_bytes, f"Size mismatch: {streamed_bytes} vs {expected_bytes}"
@@ -510,14 +510,11 @@ class TestStreamingThroughput:
     @pytest.mark.parametrize("size_kb", [100, 500])
     async def test_raw_throughput_urandom(self, scheduler: Scheduler, size_kb: int) -> None:
         """Measure throughput with random data (tests full pipeline)."""
-        import time
-
         # Use dd from /dev/urandom - realistic random data
         # base64 expands by ~33%, so keep input small enough that output < 1MB
         code = f"dd if=/dev/urandom bs=1000 count={size_kb} 2>/dev/null | base64"
 
         streamed_bytes = 0
-        start_time = time.perf_counter()
 
         def on_stdout(chunk: str) -> None:
             nonlocal streamed_bytes
@@ -530,10 +527,13 @@ class TestStreamingThroughput:
             on_stdout=on_stdout,
         )
 
-        elapsed = time.perf_counter() - start_time
+        # Use execute_ms (host-measured execution phase) — excludes VM
+        # preparation (warm pool lookup, L1 restore, cold boot) which is
+        # not part of streaming throughput.
+        elapsed_s = result.timing.execute_ms / 1000
         # base64 expands by ~33%, so effective raw bytes is 3/4 of output
         effective_mib = (streamed_bytes * 3 // 4) / (1024 * 1024)
-        throughput_mibps = effective_mib / elapsed
+        throughput_mibps = effective_mib / elapsed_s
 
         assert result.exit_code == 0, f"dd failed: {result.stderr}"
         assert throughput_mibps > MIN_THROUGHPUT_URANDOM_MIBPS, f"Throughput too low: {throughput_mibps:.1f} MiB/s"
