@@ -474,20 +474,19 @@ while True:
         )
 
     async def test_gradual_alloc_oom_kills_not_timeout(self, scheduler: Scheduler) -> None:
-        """Gradual allocation (5MB chunks with page touching) should OOM, not thrash.
+        """Gradual allocation (5MB chunks) should OOM, not thrash.
 
-        Slower than bulk allocation because the kernel manages pressure
-        page-by-page. Writes random data per-page so zram can't compress it.
+        Smaller chunks than test_massive_alloc (5MB vs 10MB) so the kernel
+        faces more allocation events before exhaustion. Uses bulk os.urandom()
+        per chunk — the per-page Python loop (range(0, len, 4096)) was too
+        slow under nested KVM and TCG, timing out before memory filled.
         """
         result = await scheduler.run(
             code="""
 import os
 chunks = []
 while True:
-    chunk = bytearray(5 * 1024 * 1024)  # 5MB
-    for i in range(0, len(chunk), 4096):
-        chunk[i:i+4096] = os.urandom(4096)  # Fill every page with random data
-    chunks.append(chunk)
+    chunks.append(os.urandom(5 * 1024 * 1024))  # 5MB random (incompressible)
 """,
             language=Language.PYTHON,
         )
