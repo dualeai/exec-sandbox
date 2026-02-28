@@ -75,12 +75,20 @@ def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT) -> str:
 
     Bun's fetch does not expose TLS version control; _tls_version is
     accepted for signature compatibility but ignored.
+
+    Retries up to 3 times with linear backoff (1s, 2s, 3s) to absorb
+    transient connection resets from real-world domains like github.com
+    on CI runners — matching the curl variant's ``--retry 2`` pattern.
     """
-    return f"""try {{
-    const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout(5000) }});
-    console.log("CONNECTED:" + res.status);
-}} catch (e) {{
-    console.log("BLOCKED:" + e.name);
+    return f"""for (let attempt = 0; attempt < 3; attempt++) {{
+    try {{
+        const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout(5000) }});
+        console.log("CONNECTED:" + res.status);
+        break;
+    }} catch (e) {{
+        if (attempt < 2) {{ await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }}
+        console.log("BLOCKED:" + e.name + ":" + e.message);
+    }}
 }}"""
 
 
