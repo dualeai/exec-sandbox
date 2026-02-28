@@ -175,5 +175,14 @@ while (true) {
         process.stderr.write((r && r.stack ? r.stack : String(r)) + '\n');
         exitCode = 1;
     }
+    // Flush stdout before sentinel — process.stdout.write() is async for pipes,
+    // so large outputs may still be in Bun's internal buffer. Without this,
+    // the sentinel can arrive before stdout fully drains (~100KB+ truncation).
+    // Python's sys.stdout.flush() is synchronous so doesn't need this.
+    // Uses polling instead of the 'drain' event to avoid a race where drain
+    // fires between the writableLength check and the listener registration.
+    while (process.stdout.writableLength > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1));
+    }
     process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
 }

@@ -31,12 +31,15 @@ from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
+from .conftest import skip_unless_hwaccel
+
 DASK_PACKAGES = ["dask==2026.1.2"]
 
 
 # =============================================================================
 # System context detection — dask.system reads /proc/*, /sys/fs/cgroup/*
 # =============================================================================
+@skip_unless_hwaccel  # Snapshot creation (pip install dask + deps) routinely exceeds 940s under TCG
 class TestDaskSystemContext:
     """dask.system CPU/memory detection works inside the hardened VM.
 
