@@ -453,12 +453,17 @@ print(f'PASS: watermark_boost_factor={boost}, watermark_scale_factor={scale}')
         This is the core regression test. Before mem_limit, allocating far
         beyond RAM caused the kernel to thrash zram indefinitely, hitting the
         execution timeout. With mem_limit, the OOM killer fires in seconds.
+
+        Uses os.urandom() (incompressible data) so zram can't compress the
+        pages — zero-filled bytearrays compress to near-nothing with lz4,
+        letting ~8 GB fit in the 41 MB mem_limit before OOM triggers.
         """
         result = await scheduler.run(
             code="""
+import os
 chunks = []
 while True:
-    chunks.append(bytearray(10 * 1024 * 1024))  # 10MB chunks, touched on alloc
+    chunks.append(os.urandom(10 * 1024 * 1024))  # 10MB random (incompressible)
 """,
             language=Language.PYTHON,
         )
@@ -472,15 +477,16 @@ while True:
         """Gradual allocation (5MB chunks with page touching) should OOM, not thrash.
 
         Slower than bulk allocation because the kernel manages pressure
-        page-by-page.
+        page-by-page. Writes random data per-page so zram can't compress it.
         """
         result = await scheduler.run(
             code="""
+import os
 chunks = []
 while True:
     chunk = bytearray(5 * 1024 * 1024)  # 5MB
     for i in range(0, len(chunk), 4096):
-        chunk[i] = 0xFF  # Touch every page
+        chunk[i:i+4096] = os.urandom(4096)  # Fill every page with random data
     chunks.append(chunk)
 """,
             language=Language.PYTHON,
@@ -509,24 +515,22 @@ while True:
         """OOM should still fire after alloc/free cycles (no zram leak).
 
         Alloc/free cycles leave residual zram pages and allocator
-        fragmentation.
+        fragmentation. Uses random data so zram can't compress it.
         """
         result = await scheduler.run(
             code="""
-import gc
+import gc, os
 
-# Warm up: alloc 100MB, free, repeat 3 times
+# Warm up: alloc 100MB random, free, repeat 3 times
 for _ in range(3):
-    chunks = [bytearray(10 * 1024 * 1024) for _ in range(10)]
-    for c in chunks:
-        c[0] = 1  # touch
+    chunks = [os.urandom(10 * 1024 * 1024) for _ in range(10)]
     del chunks
     gc.collect()
 
 # Now exhaust memory — should OOM, not thrash
 chunks = []
 while True:
-    chunks.append(bytearray(10 * 1024 * 1024))
+    chunks.append(os.urandom(10 * 1024 * 1024))
 """,
             language=Language.PYTHON,
         )
