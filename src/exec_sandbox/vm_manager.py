@@ -247,10 +247,19 @@ class VmManager:
         return dict(self._vms)
 
     async def stop(self) -> None:
-        """Stop VmManager and cleanup resources (admission probe, overlay pool).
+        """Stop VmManager and cleanup resources (tracked VMs, admission, overlay pool).
 
-        Should be called when the VmManager is no longer needed.
+        Destroys all tracked VMs (including checked-out ones that were never
+        returned to a pool) before tearing down admission and overlay services.
         """
+        # Snapshot the registry under lock, then destroy outside lock
+        # (destroy_vm acquires _vms_lock internally to remove each entry).
+        async with self._vms_lock:
+            vms_to_destroy = list(self._vms.values())
+        await asyncio.gather(
+            *(self.destroy_vm(vm) for vm in vms_to_destroy),
+            return_exceptions=True,
+        )
         await self._admission.stop()
         await self._overlay_pool.stop()
 
