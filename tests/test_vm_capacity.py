@@ -108,7 +108,7 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
 
 async def test_admission_released_on_destroy(capacity_vm_manager: VmManager) -> None:
     """Resources must be released when VM is destroyed."""
-    snap_before = capacity_vm_manager.admission.snapshot()
+    slots_before = capacity_vm_manager.admission._allocated_vm_slots
 
     # Create VM (acquires resources)
     vm = await capacity_vm_manager.create_vm(
@@ -117,21 +117,19 @@ async def test_admission_released_on_destroy(capacity_vm_manager: VmManager) -> 
         task_id="task-1",
     )
 
-    snap_during = capacity_vm_manager.admission.snapshot()
-    assert snap_during.allocated_vm_slots == snap_before.allocated_vm_slots + 1
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before + 1
     assert vm.holds_semaphore_slot is True
 
     # Destroy VM (releases resources)
     await capacity_vm_manager.destroy_vm(vm)
 
-    snap_after = capacity_vm_manager.admission.snapshot()
-    assert snap_after.allocated_vm_slots == snap_before.allocated_vm_slots
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before
     assert vm.holds_semaphore_slot is False
 
 
 async def test_admission_released_on_create_failure(capacity_vm_manager: VmManager) -> None:
     """Resources must be released when create_vm fails mid-way."""
-    snap_before = capacity_vm_manager.admission.snapshot()
+    slots_before = capacity_vm_manager.admission._allocated_vm_slots
 
     # Mock _create_vm_impl to fail after resources acquired
     with patch.object(capacity_vm_manager, "_create_vm_impl", side_effect=VmOverlayError("mock failure")):
@@ -143,13 +141,12 @@ async def test_admission_released_on_create_failure(capacity_vm_manager: VmManag
             )
 
     # Resources should be restored
-    snap_after = capacity_vm_manager.admission.snapshot()
-    assert snap_after.allocated_vm_slots == snap_before.allocated_vm_slots
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before
 
 
 async def test_double_destroy_does_not_double_release(capacity_vm_manager: VmManager) -> None:
     """Calling destroy_vm twice must not corrupt resource count."""
-    snap_before = capacity_vm_manager.admission.snapshot()
+    slots_before = capacity_vm_manager.admission._allocated_vm_slots
 
     vm = await capacity_vm_manager.create_vm(
         language=Language.PYTHON,
@@ -157,18 +154,15 @@ async def test_double_destroy_does_not_double_release(capacity_vm_manager: VmMan
         task_id="task-1",
     )
 
-    snap_during = capacity_vm_manager.admission.snapshot()
-    assert snap_during.allocated_vm_slots == snap_before.allocated_vm_slots + 1
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before + 1
 
     # First destroy
     await capacity_vm_manager.destroy_vm(vm)
-    snap_after1 = capacity_vm_manager.admission.snapshot()
-    assert snap_after1.allocated_vm_slots == snap_before.allocated_vm_slots
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before
 
     # Second destroy should be safe (no-op for resources)
     await capacity_vm_manager.destroy_vm(vm)
-    snap_after2 = capacity_vm_manager.admission.snapshot()
-    assert snap_after2.allocated_vm_slots == snap_before.allocated_vm_slots, "Double destroy corrupted resource count"
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before, "Double destroy corrupted resource count"
 
 
 async def test_vm_holds_semaphore_flag_set_correctly(capacity_vm_manager: VmManager) -> None:
@@ -222,7 +216,7 @@ async def test_no_capacity_errors_under_load(images_dir: Path) -> None:
 @pytest.mark.slow
 async def test_many_sequential_create_destroy_cycles(capacity_vm_manager: VmManager) -> None:
     """Verify resource count stays consistent after many create/destroy cycles."""
-    snap_initial = capacity_vm_manager.admission.snapshot()
+    slots_initial = capacity_vm_manager.admission._allocated_vm_slots
     cycles = 20
 
     for i in range(cycles):
@@ -233,7 +227,6 @@ async def test_many_sequential_create_destroy_cycles(capacity_vm_manager: VmMana
         )
         await capacity_vm_manager.destroy_vm(vm)
 
-    snap_final = capacity_vm_manager.admission.snapshot()
-    assert snap_final.allocated_vm_slots == snap_initial.allocated_vm_slots, (
+    assert capacity_vm_manager.admission._allocated_vm_slots == slots_initial, (
         f"Resource count drifted after {cycles} cycles"
     )

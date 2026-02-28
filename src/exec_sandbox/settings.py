@@ -56,16 +56,15 @@ class Settings(BaseSettings):
     memory_overcommit_ratio: float = constants.DEFAULT_MEMORY_OVERCOMMIT_RATIO
     cpu_overcommit_ratio: float = constants.DEFAULT_CPU_OVERCOMMIT_RATIO
     host_memory_reserve_ratio: float = constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO
-    resource_monitor_interval_seconds: float = constants.RESOURCE_MONITOR_INTERVAL_SECONDS
-
     # Host resource overrides (None = auto-detect via psutil)
     # Useful for testing or container deployments where psutil reports host resources
     host_memory_mb: float | None = None
     host_cpu_count: float | None = None
 
-    # Runtime available-memory floor (Gate 3)
-    # 0 = disabled (default, backward compat). Set >0 in production to reject
-    # new VMs when system available memory drops below this threshold.
+    # Runtime available-memory floor (Gate 3, always-on)
+    # Gate 3 rejects when system_available - requested_memory < floor.
+    # 0 (default) = reject only when system literally can't fit the VM.
+    # >0 = additionally reserve this much headroom (e.g. 512 for OS safety).
     available_memory_floor_mb: int = 0
 
     # Testing/Debug

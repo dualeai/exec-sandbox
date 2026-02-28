@@ -530,54 +530,6 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
     return (cpu_time_ms, peak_memory_mb)
 
 
-async def read_cgroup_current(cgroup_path: Path | None) -> tuple[int | None, int | None]:
-    """Read live CPU usage and current memory from cgroup v2.
-
-    Unlike read_cgroup_stats() which reads memory.peak (post-execution),
-    this reads memory.current (live bytes) and cpu.stat usage_usec for
-    running VMs. Used by ResourceMonitor for observability.
-
-    Args:
-        cgroup_path: cgroup directory path
-
-    Returns:
-        Tuple of (cpu_time_ms, current_memory_mb)
-        Returns (None, None) if cgroup not available or read fails
-    """
-    if not cgroup_path or not await aiofiles.os.path.exists(cgroup_path):
-        return (None, None)
-
-    cpu_time_ms: int | None = None
-    current_memory_mb: int | None = None
-
-    try:
-        # Read cpu.stat for usage_usec (microseconds)
-        cpu_stat_file = cgroup_path / "cpu.stat"
-        if await aiofiles.os.path.exists(cpu_stat_file):
-            async with aiofiles.open(cpu_stat_file) as f:
-                cpu_stat = await f.read()
-            for line in cpu_stat.splitlines():
-                if line.startswith("usage_usec"):
-                    usage_usec = int(line.split()[1])
-                    cpu_time_ms = usage_usec // 1000
-                    break
-
-        # Read memory.current for live memory usage (bytes)
-        memory_current_file = cgroup_path / "memory.current"
-        if await aiofiles.os.path.exists(memory_current_file):
-            async with aiofiles.open(memory_current_file) as f:
-                current_bytes = int((await f.read()).strip())
-            current_memory_mb = current_bytes // (1024 * 1024)
-
-    except (OSError, ValueError) as e:
-        logger.debug(
-            f"Failed to read cgroup current stats: {e}",
-            extra={"cgroup_path": str(cgroup_path)},
-        )
-
-    return (cpu_time_ms, current_memory_mb)
-
-
 # =============================================================================
 # Cleanup
 # =============================================================================

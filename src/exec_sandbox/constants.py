@@ -432,19 +432,12 @@ DEFAULT_VM_CPU_CORES: Final[int] = 1
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
 
-RESOURCE_MONITOR_INTERVAL_SECONDS: Final[float] = 5.0
-"""Interval between resource monitor ticks (seconds)."""
-
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for
 resources to become available, then raises VmCapacityError."""
 
-MIN_AVAILABLE_MEMORY_FLOOR_MB: Final[int] = 512
-"""Default available-memory floor in MB (Gate 3).
-When system available memory drops below this, new VMs are rejected.
-Equivalent to K8s eviction-threshold. Only used when
-available_memory_floor_mb > 0 in settings."""
-
-AVAILABLE_MEMORY_PROBE_INTERVAL_SECONDS: Final[float] = 5.0
-"""Interval between available-memory probes (seconds).
-Background task refreshes available memory from cgroup or psutil."""
+GATE3_SELF_WAKE_INTERVAL_SECONDS: Final[float] = 10.0
+"""Interval for Gate 3 self-wake timer (seconds). Periodically notifies
+blocked waiters so they re-evaluate _can_admit with a fresh memory probe.
+Closes the wakeup gap when external processes free memory but no local
+release() triggers notify_all()."""

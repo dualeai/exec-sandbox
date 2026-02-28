@@ -56,7 +56,6 @@ from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.package_validator import PackageValidator
 from exec_sandbox.port_forward import resolve_port_mappings
-from exec_sandbox.resource_monitor import ResourceMonitor
 from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_manager import VmManager
@@ -107,7 +106,6 @@ class Scheduler:
         self._snapshot_manager: DiskSnapshotManager | None = None
         self._memory_snapshot_manager: MemorySnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
-        self._resource_monitor: ResourceMonitor | None = None
         self._started = False
 
     async def __aenter__(self) -> Self:
@@ -120,7 +118,6 @@ class Scheduler:
         4. Initialize DiskSnapshotManager (L2 local always; L3 S3 optional)
         5. Initialize MemorySnapshotManager (L1 memory snapshot cache)
         6. Start WarmVMPool (if warm_pool_size > 0)
-        7. Start ResourceMonitor
 
         Returns:
             Self for use in context
@@ -175,14 +172,6 @@ class Scheduler:
             )
             await self._warm_pool.start()
 
-        # Start ResourceMonitor (always-on, core component for observability)
-        self._resource_monitor = ResourceMonitor(
-            vm_manager=self._vm_manager,
-            admission=self._vm_manager.admission,
-            interval_seconds=self.config.resource_monitor_interval_seconds,
-        )
-        await self._resource_monitor.start()
-
         self._started = True
         logger.info("Scheduler started successfully")
         return self
@@ -193,9 +182,8 @@ class Scheduler:
         """Shutdown scheduler and clean up all resources.
 
         Shutdown sequence:
-        1. Stop ResourceMonitor
-        2. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
-        3. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
+        1. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
+        2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
         4. Destroy any remaining active VMs
         5. Stop VmManager (overlay pool cleanup)
 
@@ -209,13 +197,6 @@ class Scheduler:
         Always completes cleanup, even on exceptions.
         """
         logger.info("Shutting down scheduler")
-
-        # Stop ResourceMonitor first
-        if self._resource_monitor:
-            try:
-                await self._resource_monitor.stop()
-            except (OSError, RuntimeError) as e:
-                logger.error("ResourceMonitor stop error", extra={"error": str(e)})
 
         # Stop WarmVMPool (drains VMs, frees resource slots for background saves)
         if self._warm_pool:
@@ -708,7 +689,6 @@ class Scheduler:
             memory_overcommit_ratio=self.config.memory_overcommit_ratio,
             cpu_overcommit_ratio=self.config.cpu_overcommit_ratio,
             host_memory_reserve_ratio=self.config.host_memory_reserve_ratio,
-            resource_monitor_interval_seconds=self.config.resource_monitor_interval_seconds,
         )
 
     async def _validate_packages(self, packages: list[str], language: Language) -> None:

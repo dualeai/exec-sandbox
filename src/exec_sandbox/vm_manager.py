@@ -234,7 +234,7 @@ class VmManager:
 
     @property
     def admission(self) -> ResourceAdmissionController:
-        """Access the resource admission controller (for ResourceMonitor)."""
+        """Access the resource admission controller."""
         return self._admission
 
     def get_active_vms(self) -> dict[str, QemuVM]:

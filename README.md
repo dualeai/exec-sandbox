@@ -400,7 +400,6 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `memory_overcommit_ratio` | 1.5 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
 | `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = host_cpus × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
-| `resource_monitor_interval_seconds` | 5.0 | Interval between resource monitor ticks (1-60s) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 

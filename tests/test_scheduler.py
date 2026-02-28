@@ -295,8 +295,6 @@ class TestSchedulerShutdownOrdering:
         scheduler._warm_pool.stop = AsyncMock()
         scheduler._memory_snapshot_manager = MagicMock()
         scheduler._memory_snapshot_manager.stop = AsyncMock()
-        scheduler._resource_monitor = MagicMock()
-        scheduler._resource_monitor.stop = AsyncMock()
         scheduler._vm_manager = MagicMock()
         scheduler._vm_manager.stop = AsyncMock()
         scheduler._vm_manager.get_active_vms = MagicMock(return_value={})
@@ -332,7 +330,6 @@ class TestSchedulerShutdownOrdering:
 
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._resource_monitor.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         assert scheduler._started is False
 
@@ -375,17 +372,6 @@ class TestSchedulerShutdownOrdering:
         await scheduler.__aexit__(None, None, None)
 
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-
-    async def test_shutdown_no_resource_monitor(self) -> None:
-        """Shutdown works when _resource_monitor is None."""
-        scheduler = self._make_scheduler()
-        scheduler._resource_monitor = None
-
-        await scheduler.__aexit__(None, None, None)
-
-        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
 
     async def test_shutdown_no_vm_manager(self) -> None:
@@ -432,17 +418,6 @@ class TestSchedulerShutdownOrdering:
 
         await scheduler.__aexit__(None, None, None)
 
-        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-
-    async def test_shutdown_resource_monitor_error_continues(self) -> None:
-        """ResourceMonitor.stop() error does not prevent other managers from stopping."""
-        scheduler = self._make_scheduler()
-        scheduler._resource_monitor.stop.side_effect = RuntimeError("monitor failed")  # type: ignore[union-attr]
-
-        await scheduler.__aexit__(None, None, None)
-
-        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
 
     async def test_shutdown_destroy_vm_error_continues(self) -> None:

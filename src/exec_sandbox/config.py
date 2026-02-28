@@ -150,13 +150,6 @@ class SchedulerConfig(BaseModel):
         le=0.5,
         description="Fraction of host memory reserved for OS (e.g. 0.1 = 10%)",
     )
-    resource_monitor_interval_seconds: float = Field(
-        default=constants.RESOURCE_MONITOR_INTERVAL_SECONDS,
-        ge=1.0,
-        le=60.0,
-        description="Interval between resource monitor ticks (seconds)",
-    )
-
     # Features
     enable_package_validation: bool = Field(
         default=True,
