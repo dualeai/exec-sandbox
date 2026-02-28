@@ -1358,6 +1358,7 @@ PACKAGE_INSTALL_TEST_CASES = [
         ["requests==2.31.0"],
         'import requests; print(f"requests={requests.__version__}")',
         ["requests=2.31.0"],
+        None,
         id="python-requests",
     ),
     pytest.param(
@@ -1372,6 +1373,7 @@ print(f"flask={flask.__version__}")
 print(f"httpx={httpx.__version__}")
 """,
         ["requests=2.31.0", "flask=3.0.0", "httpx=0.27.0"],
+        None,
         id="python-multi",
     ),
     # Python - C extension packages (native binaries, musllinux wheels)
@@ -1388,6 +1390,7 @@ print(f"det={det:.1f}")
 print(f"inv_sum={b.sum():.1f}")
 """,
         ["numpy=2.4.2", "det=-2.0", "inv_sum=0.0"],
+        None,
         id="python-numpy",
     ),
     pytest.param(
@@ -1402,6 +1405,10 @@ print(f"shape={filtered.shape}")
 print(f"mean={df['b'].mean():.1f}")
 """,
         ["pandas=3.0.1", "shape=(2, 2)", "mean=5.0"],
+        # pandas ships its test suite inside the wheel (~100MB+ extracted).
+        # uv extracts to /tmp which is tmpfs (50% of RAM). Default 192MB VM
+        # gives only ~96MB /tmp — not enough. 384MB → ~192MB /tmp.
+        384,
         id="python-pandas",
     ),
     pytest.param(
@@ -1417,6 +1424,7 @@ print(f"size={img.size}")
 print(f"pixel={img.getpixel((0, 0))}")
 """,
         ["pillow=12.1.1", "size=(50, 25)", "pixel=(255, 0, 0)"],
+        None,
         id="python-pillow",
     ),
     # JavaScript - pure JS packages
@@ -1433,6 +1441,7 @@ console.log("sorted=" + JSON.stringify(sorted));
 console.log("chunks=" + chunked.length);
 """,
         ["lodash=4.17.21", "sorted=[1,1,3,4,5,9]", "chunks=3"],
+        None,
         id="js-lodash",
     ),
     pytest.param(
@@ -1449,6 +1458,7 @@ console.log("groups=" + Object.keys(grouped).length);
 console.log("date=" + date);
 """,
         ["lodash=4.17.21", "moment=2.30.1", "groups=2", "date=January 15"],
+        None,
         id="js-multi",
     ),
     # JavaScript - native binary packages
@@ -1462,6 +1472,7 @@ console.log("esbuild=" + esbuild.version);
 console.log("output=" + result.code.trim());
 """,
         ["esbuild=0.25.4", "output=const x = 1;"],
+        None,
         id="js-esbuild",
     ),
 ]
@@ -1482,7 +1493,7 @@ class TestPackageInstallation:
     - Snapshot corruption during package install
     """
 
-    @pytest.mark.parametrize("language,packages,code,expected_outputs", PACKAGE_INSTALL_TEST_CASES)
+    @pytest.mark.parametrize("language,packages,code,expected_outputs,memory_mb", PACKAGE_INSTALL_TEST_CASES)
     async def test_package_install_and_import(
         self,
         scheduler: Scheduler,
@@ -1490,12 +1501,14 @@ class TestPackageInstallation:
         packages: list[str],
         code: str,
         expected_outputs: list[str],
+        memory_mb: int | None,
     ) -> None:
         """Packages are installed and importable."""
         result = await scheduler.run(
             code=code,
             language=language,
             packages=packages,
+            memory_mb=memory_mb,
         )
 
         assert result.exit_code == 0, f"Failed: {result.stderr}"
