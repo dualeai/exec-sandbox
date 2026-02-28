@@ -259,6 +259,7 @@ async with Scheduler() as scheduler:
     # Port forwarding without internet (isolated)
     result = await scheduler.run(
         code="print('server ready')",
+        language="python",
         expose_ports=[PortMapping(internal=8080, external=3000)],  # Guest:8080 → Host:3000
         allow_network=False,  # No outbound internet
     )
@@ -267,6 +268,7 @@ async with Scheduler() as scheduler:
     # Dynamic port allocation (OS assigns external port)
     result = await scheduler.run(
         code="print('server ready')",
+        language="python",
         expose_ports=[8080],  # external=None → OS assigns port
     )
     print(result.exposed_ports[0].external)  # e.g., 52341
@@ -274,6 +276,7 @@ async with Scheduler() as scheduler:
     # Long-running server with port forwarding
     result = await scheduler.run(
         code="import http.server; http.server.test(port=8080, bind='0.0.0.0')",
+        language="python",
         expose_ports=[PortMapping(internal=8080)],
         timeout_seconds=60,  # Server runs until timeout
     )
