@@ -46,6 +46,7 @@ from exec_sandbox.exceptions import (
     VmConfigError,
     VmDependencyError,
     VmOverlayError,
+    VmPermanentError,
     VmTransientError,
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
@@ -311,6 +312,57 @@ class VmManager:
             await self._admission.release(reservation)
             raise
 
+    @asynccontextmanager
+    async def ephemeral_vm(
+        self,
+        language: Language,
+        tenant_id: str,
+        task_id: str,
+        memory_mb: int = constants.DEFAULT_MEMORY_MB,
+        allow_network: bool = False,
+        allowed_domains: list[str] | None = None,
+        direct_write_target: Path | None = None,
+        expose_ports: list[ExposedPort] | None = None,
+        snapshot_drive: Path | None = None,
+        retry_profile: constants.RetryProfile = constants.RETRY_USER_FACING,
+    ) -> AsyncGenerator[QemuVM]:
+        """Create a VM, yield it, destroy it on exit.
+
+        Encapsulates the common create→use→destroy lifecycle pattern.
+        The VM is always destroyed on exit (success or failure).
+
+        Args:
+            language: Programming language
+            tenant_id: Tenant identifier
+            task_id: Task identifier
+            memory_mb: Memory limit in MB
+            allow_network: Enable network access
+            allowed_domains: Domain whitelist
+            direct_write_target: Path for snapshot creation
+            expose_ports: Ports to expose
+            snapshot_drive: Path to ext4 qcow2 snapshot
+            retry_profile: Retry parameters for boot
+
+        Yields:
+            QemuVM ready for use
+        """
+        vm = await self.create_vm(
+            language=language,
+            tenant_id=tenant_id,
+            task_id=task_id,
+            memory_mb=memory_mb,
+            allow_network=allow_network,
+            allowed_domains=allowed_domains,
+            direct_write_target=direct_write_target,
+            expose_ports=expose_ports,
+            snapshot_drive=snapshot_drive,
+            retry_profile=retry_profile,
+        )
+        try:
+            yield vm
+        finally:
+            await self.destroy_vm(vm)
+
     async def create_vm(
         self,
         language: Language,
@@ -324,6 +376,7 @@ class VmManager:
         on_boot_log: Callable[[str], None] | None = None,
         snapshot_drive: Path | None = None,
         reservation: ResourceReservation | None = None,
+        retry_profile: constants.RetryProfile = constants.RETRY_USER_FACING,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -353,6 +406,7 @@ class VmManager:
             reservation: Pre-acquired admission reservation from reservation_context().
                 When provided, skips admission acquire (caller owns the reservation).
                 When None, self-acquires as usual (backward compatible).
+            retry_profile: Retry parameters for boot (default: RETRY_USER_FACING).
 
         Returns:
             QemuVM handle for code execution
@@ -362,61 +416,93 @@ class VmManager:
             VmPermanentError: VM creation failed (not retryable)
             asyncio.TimeoutError: VM boot timeout after all retries
         """
-        owns_reservation = reservation is None
-        if owns_reservation:
-            # Detect acceleration type to calculate accurate memory overhead
-            accel_type = await self._detect_accel_type()
-            use_tcg = accel_type == AccelType.TCG
-
-            # Acquire resource reservation - blocks if insufficient resources
-            reservation = await self._admission.acquire(
-                vm_id=f"{tenant_id}-{task_id}",
+        if reservation is not None:
+            return await self._create_vm_with_reservation(
+                reservation,
+                language=language,
+                tenant_id=tenant_id,
+                task_id=task_id,
                 memory_mb=memory_mb,
-                cpu_cores=constants.DEFAULT_VM_CPU_CORES,
-                timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
-                use_tcg=use_tcg,
+                allow_network=allow_network,
+                allowed_domains=allowed_domains,
+                direct_write_target=direct_write_target,
+                expose_ports=expose_ports,
+                on_boot_log=on_boot_log,
+                snapshot_drive=snapshot_drive,
+                retry_profile=retry_profile,
             )
-        try:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(constants.VM_BOOT_MAX_RETRIES),
-                wait=wait_random_exponential(
-                    min=constants.VM_BOOT_RETRY_MIN_SECONDS,
-                    max=constants.VM_BOOT_RETRY_MAX_SECONDS,
-                ),
-                # Only retry transient errors - permanent errors (config, capacity, dependency) should fail immediately
-                retry=retry_if_exception_type((VmTransientError, TimeoutError)),
-                before_sleep=before_sleep_log(logger, logging.WARNING),
-                reraise=True,
-            ):
-                with attempt:
-                    vm = await self._create_vm_impl(
-                        language=language,
-                        tenant_id=tenant_id,
-                        task_id=task_id,
-                        memory_mb=memory_mb,
-                        allow_network=allow_network,
-                        allowed_domains=allowed_domains,
-                        direct_write_target=direct_write_target,
-                        expose_ports=expose_ports,
-                        on_boot_log=on_boot_log,
-                        snapshot_drive=snapshot_drive,
-                    )
-                    # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
-                    vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
-                    # Mark VM as holding semaphore slot (released in destroy_vm)
-                    vm.holds_semaphore_slot = True
-                    # Store resource reservation on VM for release in destroy_vm
-                    vm.resource_reservation = reservation
-                    return vm
 
-            # Unreachable: AsyncRetrying either returns or raises
-            raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
-        except BaseException:
-            # Release reservation on failure - VM was not created successfully
-            # Only release if we own the reservation (self-acquired)
-            if owns_reservation:
-                await self._admission.release(reservation)
-            raise
+        async with self.reservation_context(
+            vm_id=f"{tenant_id}-{task_id}",
+            memory_mb=memory_mb,
+        ) as res:
+            return await self._create_vm_with_reservation(
+                res,
+                language=language,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                memory_mb=memory_mb,
+                allow_network=allow_network,
+                allowed_domains=allowed_domains,
+                direct_write_target=direct_write_target,
+                expose_ports=expose_ports,
+                on_boot_log=on_boot_log,
+                snapshot_drive=snapshot_drive,
+                retry_profile=retry_profile,
+            )
+
+    async def _create_vm_with_reservation(
+        self,
+        reservation: ResourceReservation,
+        *,
+        language: Language,
+        tenant_id: str,
+        task_id: str,
+        memory_mb: int,
+        allow_network: bool,
+        allowed_domains: list[str] | None,
+        direct_write_target: Path | None,
+        expose_ports: list[ExposedPort] | None,
+        on_boot_log: Callable[[str], None] | None,
+        snapshot_drive: Path | None,
+        retry_profile: constants.RetryProfile,
+    ) -> QemuVM:
+        """Boot VM with retries. Reservation ownership transfers to the VM on success."""
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(retry_profile.max_attempts),
+            wait=wait_random_exponential(
+                min=retry_profile.retry_min_seconds,
+                max=retry_profile.retry_max_seconds,
+            ),
+            # Only retry transient errors - permanent errors (config, capacity, dependency) should fail immediately
+            retry=retry_if_exception_type((VmTransientError, TimeoutError)),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                vm = await self._create_vm_impl(
+                    language=language,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    memory_mb=memory_mb,
+                    allow_network=allow_network,
+                    allowed_domains=allowed_domains,
+                    direct_write_target=direct_write_target,
+                    expose_ports=expose_ports,
+                    on_boot_log=on_boot_log,
+                    snapshot_drive=snapshot_drive,
+                    boot_timeout_seconds=retry_profile.boot_timeout_seconds,
+                )
+                # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
+                vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
+                # Mark VM as holding semaphore slot (released in destroy_vm)
+                vm.holds_semaphore_slot = True
+                # Store resource reservation on VM for release in destroy_vm
+                vm.resource_reservation = reservation
+                return vm
+
+        # Unreachable: AsyncRetrying either returns or raises
+        raise AssertionError("Unreachable: AsyncRetrying exhausted without exception")
 
     async def _setup_vm_infra(
         self,
@@ -672,6 +758,7 @@ class VmManager:
         expose_ports: list[ExposedPort] | None = None,
         on_boot_log: Callable[[str], None] | None = None,
         snapshot_drive: Path | None = None,
+        boot_timeout_seconds: int = constants.VM_BOOT_TIMEOUT_SECONDS,
     ) -> QemuVM:
         """Create and boot QEMU microVM (implementation).
 
@@ -761,7 +848,7 @@ class VmManager:
             # Phase 5: Wait for guest agent ready (create-specific)
             guest_wait_start = asyncio.get_running_loop().time()
             try:
-                await vm.wait_for_guest(timeout=constants.VM_BOOT_TIMEOUT_SECONDS)
+                await vm.wait_for_guest(timeout=boot_timeout_seconds)
                 boot_complete_time = asyncio.get_running_loop().time()
                 guest_wait_ms = round((boot_complete_time - guest_wait_start) * 1000)
 
@@ -788,7 +875,7 @@ class VmManager:
                     extra={
                         **asdict(diag),
                         "language": language,
-                        "timeout_seconds": constants.VM_BOOT_TIMEOUT_SECONDS,
+                        "timeout_seconds": boot_timeout_seconds,
                         "qemu_cmd": qemu_cmd_str[:1000],
                         "kernel_path": str(kernel_path),
                         "initramfs_path": str(initramfs_path),
@@ -799,14 +886,14 @@ class VmManager:
                 await vm.destroy()
 
                 raise VmBootTimeoutError(
-                    f"Guest agent not ready after {constants.VM_BOOT_TIMEOUT_SECONDS}s: {e}. "
+                    f"Guest agent not ready after {boot_timeout_seconds}s: {e}. "
                     f"qemu_running={diag.exit_code is None}, "
                     f"stderr: {diag.stderr[:200] if diag.stderr else '(empty)'}, "
                     f"console: {diag.console_log[-4000:]}",
                     context={
                         "vm_id": infra.vm_id,
                         "language": language,
-                        "timeout_seconds": constants.VM_BOOT_TIMEOUT_SECONDS,
+                        "timeout_seconds": boot_timeout_seconds,
                         "qemu_cmd": qemu_cmd_str[:1000],
                         "kernel_path": str(kernel_path),
                         "initramfs_path": str(initramfs_path),
@@ -841,7 +928,7 @@ class VmManager:
                     cgroup_path=infra.cgroup_path,
                 )
 
-    async def restore_vm(  # noqa: PLR0915
+    async def restore_vm(
         self,
         language: Language,
         tenant_id: str,
@@ -894,25 +981,57 @@ class VmManager:
                 context={"vmstate_path": str(vmstate_path)},
             )
 
-        owns_reservation = reservation is None
-        if owns_reservation:
-            # Acquire resource reservation FIRST (matches create_vm ordering).
-            # Acquiring overlay before admission would hold an overlay slot during
-            # backpressure waits, starving other callers.
-            reservation = await self._admission.acquire(
-                vm_id=f"{tenant_id}-{task_id}",
+        if reservation is not None:
+            return await self._restore_vm_with_reservation(
+                reservation,
+                language=language,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                vmstate_path=vmstate_path,
                 memory_mb=memory_mb,
-                cpu_cores=constants.DEFAULT_VM_CPU_CORES,
-                timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
+                snapshot_drive=snapshot_drive,
+                allow_network=allow_network,
+                allowed_domains=allowed_domains,
+                expose_ports=expose_ports,
+                start_time=start_time,
             )
 
+        async with self.reservation_context(
+            vm_id=f"{tenant_id}-{task_id}",
+            memory_mb=memory_mb,
+        ) as res:
+            return await self._restore_vm_with_reservation(
+                res,
+                language=language,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                vmstate_path=vmstate_path,
+                memory_mb=memory_mb,
+                snapshot_drive=snapshot_drive,
+                allow_network=allow_network,
+                allowed_domains=allowed_domains,
+                expose_ports=expose_ports,
+                start_time=start_time,
+            )
+
+    async def _restore_vm_with_reservation(
+        self,
+        reservation: ResourceReservation,
+        *,
+        language: Language,
+        tenant_id: str,
+        task_id: str,
+        vmstate_path: Path,
+        memory_mb: int,
+        snapshot_drive: Path | None,
+        allow_network: bool,
+        allowed_domains: list[str] | None,
+        expose_ports: list[ExposedPort] | None,
+        start_time: float,
+    ) -> QemuVM:
+        """Restore VM with an already-acquired reservation. Ownership transfers to VM on success."""
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
-        try:
-            infra = await self._setup_vm_infra(language, tenant_id, task_id, memory_mb)
-        except BaseException:
-            if owns_reservation:
-                await self._admission.release(reservation)
-            raise
+        infra = await self._setup_vm_infra(language, tenant_id, task_id, memory_mb)
 
         # Grant qemu-vm read access to snapshot drive if present
         if infra.workdir.use_qemu_vm_user and snapshot_drive:
@@ -1014,8 +1133,6 @@ class VmManager:
 
         except BaseException:
             if not vm_created:
-                if owns_reservation:
-                    await self._admission.release(reservation)
                 await self._cleanup_failed_launch(
                     infra.vm_id,
                     gvproxy_proc=gvproxy_proc,
@@ -1172,9 +1289,11 @@ class VmManager:
                     await vm.gvproxy_log_task
 
             # Destroy VM (transitions state, closes channel)
-            await vm.destroy()
+            with suppress(VmPermanentError):
+                await vm.destroy()
 
-            # Comprehensive cleanup using defensive generic functions
+            # Comprehensive cleanup using defensive generic functions —
+            # always runs even if vm.destroy() raised (e.g. invalid state transition)
             await self._force_cleanup_all_resources(
                 vm_id=vm.vm_id,
                 qemu_proc=vm.process,

@@ -1,6 +1,7 @@
 """Constants for exec-sandbox configuration and limits."""
 
 import enum
+from dataclasses import dataclass
 from typing import Final
 
 # ============================================================================
@@ -81,6 +82,39 @@ VM_BOOT_RETRY_MAX_SECONDS: Final[float] = 2.0
 
 Raised from 500ms to 2s to let overlay daemon recover from transient
 connection-refused errors (daemon restart takes ~100-500ms)."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetryProfile:
+    """Bundled retry parameters for VM boot.
+
+    Pre-built profiles tune retry aggressiveness to caller context:
+    - User-facing: generous retries for best success rate
+    - Background: fewer retries, shorter timeouts for sacrificial VMs
+    """
+
+    max_attempts: int
+    boot_timeout_seconds: int
+    retry_min_seconds: float
+    retry_max_seconds: float
+
+
+RETRY_USER_FACING: Final[RetryProfile] = RetryProfile(
+    max_attempts=VM_BOOT_MAX_RETRIES,
+    boot_timeout_seconds=VM_BOOT_TIMEOUT_SECONDS,
+    retry_min_seconds=VM_BOOT_RETRY_MIN_SECONDS,
+    retry_max_seconds=VM_BOOT_RETRY_MAX_SECONDS,
+)
+"""Default retry profile for user-facing VMs (scheduler)."""
+
+RETRY_BACKGROUND: Final[RetryProfile] = RetryProfile(
+    max_attempts=2,
+    boot_timeout_seconds=30,
+    retry_min_seconds=VM_BOOT_RETRY_MIN_SECONDS,
+    retry_max_seconds=VM_BOOT_RETRY_MAX_SECONDS,
+)
+"""Retry profile for background/disposable VMs (warm pool, snapshot creation, L1 saves).
+Fewer retries and shorter timeout — these VMs are sacrificial."""
 
 GUEST_CONNECT_TIMEOUT_SECONDS: Final[int] = 5
 """Timeout for connecting to guest agent."""

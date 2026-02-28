@@ -35,20 +35,18 @@ from exec_sandbox.exceptions import (
 )
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
-    ExecutionCompleteMessage,
     FileChunkResponseMessage,
     FileListMessage,
     FileReadCompleteMessage,
     FileWriteAckMessage,
     ListFilesRequest,
-    OutputChunkMessage,
     PingRequest,
     PongMessage,
     ReadFileRequest,
     StreamingErrorMessage,
     WriteFileRequest,
 )
-from exec_sandbox.guest_channel import GuestChannel
+from exec_sandbox.guest_channel import GuestChannel, consume_stream
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, TimingBreakdown
 from exec_sandbox.platform_utils import detect_host_os
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
@@ -381,7 +379,7 @@ class QemuVM:
                 },
             )
 
-    async def execute(  # noqa: PLR0912, PLR0915
+    async def execute(  # noqa: PLR0915
         self,
         code: str,
         timeout_seconds: int,
@@ -515,117 +513,62 @@ class QemuVM:
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
             hard_timeout = timeout_seconds + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
 
-            # Stream messages and collect output
-            exit_code = -1
-            execution_time_ms: int | None = None
-            spawn_ms: int | None = None
-            process_ms: int | None = None
-            stdout_chunks: list[str] = []
-            stderr_chunks: list[str] = []
+            # Error handler: recoverable errors restore READY and raise.
+            # Other errors fall through to consume_stream's default (append to stderr, break).
+            async def _handle_exec_error(msg: StreamingErrorMessage) -> None:
+                exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
+                if isinstance(exc, (InputValidationError, OutputLimitError, PackageNotAllowedError)):
+                    with contextlib.suppress(VmPermanentError):
+                        await self.transition_state(VmState.READY)
+                    raise exc
+                logger.error(
+                    f"Guest agent error: [{msg.error_type}] {msg.message}",
+                    extra={
+                        "vm_id": self.vm_id,
+                        "error_message": msg.message,
+                        "error_type": msg.error_type,
+                    },
+                )
 
-            async for msg in self.channel.stream_messages(request, timeout=hard_timeout):
-                if isinstance(msg, OutputChunkMessage):
-                    # Collect chunk for return to user
-                    if msg.type == "stdout":
-                        stdout_chunks.append(msg.chunk)
-                        if on_stdout is not None:
-                            try:
-                                on_stdout(msg.chunk)
-                            except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
-                                logger.warning(
-                                    "on_stdout callback raised, disabling",
-                                    extra={"vm_id": self.vm_id},
-                                    exc_info=True,
-                                )
-                                on_stdout = None
-                    else:  # stderr
-                        stderr_chunks.append(msg.chunk)
-                        if on_stderr is not None:
-                            try:
-                                on_stderr(msg.chunk)
-                            except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
-                                logger.warning(
-                                    "on_stderr callback raised, disabling",
-                                    extra={"vm_id": self.vm_id},
-                                    exc_info=True,
-                                )
-                                on_stderr = None
-
-                    # Log first 200 chars only to keep log lines bounded
-                    logger.debug(
-                        "VM output",
-                        extra={
-                            "vm_id": self.vm_id,
-                            "stream": msg.type,
-                            "chunk": msg.chunk[:200],
-                        },
-                    )
-                elif isinstance(msg, ExecutionCompleteMessage):
-                    # Execution complete - capture all timing fields
-                    exit_code = msg.exit_code
-                    execution_time_ms = msg.execution_time_ms
-                    spawn_ms = msg.spawn_ms
-                    process_ms = msg.process_ms
-                elif isinstance(msg, StreamingErrorMessage):
-                    exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
-                    # Input validation errors (env vars, code) are caller bugs —
-                    # raise immediately so callers get a typed exception.
-                    if isinstance(exc, InputValidationError):
-                        # VM processed the request and returned an error — restore READY
-                        with contextlib.suppress(VmPermanentError):
-                            await self.transition_state(VmState.READY)
-                        raise exc
-                    # Output limit errors — REPL is preserved, raise typed exception
-                    if isinstance(exc, OutputLimitError):
-                        with contextlib.suppress(VmPermanentError):
-                            await self.transition_state(VmState.READY)
-                        raise exc
-                    # Other error types are runtime results, not caller bugs
-                    logger.error(
-                        f"Guest agent error: [{msg.error_type}] {msg.message}",
-                        extra={
-                            "vm_id": self.vm_id,
-                            "error_message": msg.message,
-                            "error_type": msg.error_type,
-                        },
-                    )
-                    stderr_chunks.append(f"[{msg.error_type}] {msg.message}")
-                    exit_code = -1
-                    break
+            result = await consume_stream(
+                self.channel,
+                request,
+                timeout=hard_timeout,
+                vm_id=self.vm_id,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+                on_error=_handle_exec_error,
+            )
 
             # Measure external resources from host (cgroup v2)
             external_cpu_ms, external_mem_mb = await self._read_cgroup_stats()
-
-            # Concatenate collected chunks (guest enforces size limits)
-            stdout_full = "".join(stdout_chunks)
-            stderr_full = "".join(stderr_chunks)
 
             # Debug log final execution output
             logger.debug(
                 "Code execution complete",
                 extra={
                     "vm_id": self.vm_id,
-                    "exit_code": exit_code,
-                    "execution_time_ms": execution_time_ms,
-                    "stdout_len": len(stdout_full),
-                    "stderr_len": len(stderr_full),
-                    "stdout": stdout_full[:500],  # First 500 chars for debug
-                    "stderr": stderr_full[:500] if stderr_full else None,
+                    "exit_code": result.exit_code,
+                    "execution_time_ms": result.execution_time_ms,
+                    "stdout_len": len(result.stdout),
+                    "stderr_len": len(result.stderr),
+                    "stdout": result.stdout[:500],
+                    "stderr": result.stderr[:500] if result.stderr else None,
                 },
             )
 
             # Parse result with both internal (guest) and external (host) measurements
             # Note: timing is a placeholder here - scheduler will populate actual values
             exec_result = ExecutionResult(
-                stdout=stdout_full,
-                stderr=stderr_full,
-                exit_code=exit_code,
-                execution_time_ms=execution_time_ms,  # Guest-reported
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code,
+                execution_time_ms=result.execution_time_ms,  # Guest-reported
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured
                 external_memory_peak_mb=external_mem_mb or None,  # Host-measured
                 timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0, connect_ms=connect_ms),
-                spawn_ms=spawn_ms,  # Guest-reported granular timing
-                process_ms=process_ms,  # Guest-reported granular timing
+                spawn_ms=result.spawn_ms,  # Guest-reported granular timing
+                process_ms=result.process_ms,  # Guest-reported granular timing
             )
 
             # Success - transition back to READY for reuse (if not destroyed)

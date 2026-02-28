@@ -13,12 +13,12 @@ Hierarchy:
     │   │   └── VmCapacityError        ← pool full (temporary)
     │   ├── PackageInstallTransientError ← transient network during install
     │   ├── BalloonTransientError      ← balloon operations
-    │   ├── MigrationTransientError    ← memory snapshot migration
-    │   └── CommunicationTransientError ← socket/network transient issues
+    │   └── MigrationTransientError    ← memory snapshot migration
     ├── PermanentError (non-retryable marker base)
     │   ├── VmPermanentError
     │   │   ├── VmConfigError          ← invalid configuration
     │   │   └── VmDependencyError      ← missing binary/image
+    │   ├── PackageInstallPermanentError ← permanent package install failure
     │   └── SessionClosedError         ← session already closed
     ├── InputValidationError (caller-bug marker base)
     │   ├── CodeValidationError       ← empty/null-byte code
@@ -32,9 +32,7 @@ Backward Compatibility:
     VmBootError = VmTransientError
     QemuImgError = VmOverlayError
     QemuStorageDaemonError = VmOverlayError
-    BalloonError = BalloonTransientError
-    MigrationError = MigrationTransientError
-"""
+    BalloonError = BalloonTransientError"""
 
 from __future__ import annotations
 
@@ -218,6 +216,15 @@ class PackageInstallTransientError(TransientError):
     """Package installation failed due to transient network error — may succeed on retry."""
 
 
+class PackageInstallPermanentError(PermanentError):
+    """Package installation failed permanently — retrying won't help.
+
+    Raised for errors like "no matching distribution", "404 not found",
+    "eresolve" (npm dependency conflict). These indicate a genuine problem
+    with the package specifier, not a transient network issue.
+    """
+
+
 class BalloonTransientError(TransientError):
     """Balloon operation failed - may succeed on retry.
 
@@ -249,7 +256,6 @@ VmBootError = VmTransientError
 QemuImgError = VmOverlayError
 QemuStorageDaemonError = VmOverlayError
 BalloonError = BalloonTransientError
-MigrationError = MigrationTransientError
 
 
 class SnapshotError(SandboxError):

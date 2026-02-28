@@ -20,7 +20,6 @@ Format: 'l1-{language}-v{major.minor}-{16char_hash}'
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import errno
 import hashlib
 import json
@@ -384,7 +383,6 @@ class MemorySnapshotManager(BaseCacheManager):
 
         async def _background_save() -> None:
             start_time = asyncio.get_running_loop().time()
-            vm = None
             try:
                 # Acquire file lock for entire save lifecycle (VM boot + warm + save).
                 # Prevents duplicate work: concurrent callers skip on BlockingIOError.
@@ -393,38 +391,39 @@ class MemorySnapshotManager(BaseCacheManager):
                         logger.debug("L1 background save skipped (already exists)", extra={"key": key})
                         return
 
-                    # Boot sacrificial VM with matching network topology
-                    vm = await self.vm_manager.create_vm(
+                    # Boot sacrificial VM — ephemeral_vm handles lifecycle
+                    async with self.vm_manager.ephemeral_vm(
                         language=language,
                         tenant_id=constants.L1_SAVE_TENANT_ID,
                         task_id=f"l1-save-{language.value}",
                         memory_mb=memory_mb,
                         allow_network=allow_network,
                         snapshot_drive=snapshot_drive,
-                    )
+                        retry_profile=constants.RETRY_BACKGROUND,
+                    ) as vm:
+                        # Warm REPL (Python takes 10-15s on HVF, needs dedicated timeout)
+                        response = await vm.channel.send_request(
+                            WarmReplRequest(language=language),
+                            timeout=constants.WARM_REPL_TIMEOUT_SECONDS,
+                        )
+                        if not (isinstance(response, WarmReplAckMessage) and response.status == "ok"):
+                            logger.warning("L1 background save: REPL warm failed", extra={"response": str(response)})
+                            return
 
-                    # Warm REPL (Python takes 10-15s on HVF, needs dedicated timeout)
-                    response = await vm.channel.send_request(
-                        WarmReplRequest(language=language),
-                        timeout=constants.WARM_REPL_TIMEOUT_SECONDS,
-                    )
-                    if not (isinstance(response, WarmReplAckMessage) and response.status == "ok"):
-                        logger.warning("L1 background save: REPL warm failed", extra={"response": str(response)})
-                        return
-
-                    # Save L1 (terminates VM) — call _do_save directly (we already hold the lock)
-                    vmstate_path, meta_path = self._cache_paths(key)
-                    result = await self._do_save(
-                        vm,
-                        key,
-                        vmstate_path,
-                        meta_path,
-                        language,
-                        packages,
-                        memory_mb,
-                        cpu_cores,
-                        allow_network=allow_network,
-                    )
+                        # Save L1 (terminates VM) — call _do_save directly (we already hold the lock)
+                        # After _do_save, QEMU process is dead; ephemeral_vm's destroy_vm cleans up resources.
+                        vmstate_path, meta_path = self._cache_paths(key)
+                        result = await self._do_save(
+                            vm,
+                            key,
+                            vmstate_path,
+                            meta_path,
+                            language,
+                            packages,
+                            memory_mb,
+                            cpu_cores,
+                            allow_network=allow_network,
+                        )
 
                     elapsed_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
                     if result:
@@ -447,10 +446,6 @@ class MemorySnapshotManager(BaseCacheManager):
                     extra={"language": language.value, "error": str(e), "elapsed_ms": elapsed_ms},
                     exc_info=True,
                 )
-            finally:
-                if vm is not None:
-                    with contextlib.suppress(Exception):
-                        await self.vm_manager.destroy_vm(vm)
 
         task = asyncio.create_task(_background_save())
         self._in_flight_saves[key] = task

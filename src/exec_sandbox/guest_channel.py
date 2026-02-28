@@ -8,8 +8,9 @@ single-port building block composed by DualPortChannel.
 
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
+    OutputChunkMessage,
     PingRequest,
     PongMessage,
     StreamingErrorMessage,
@@ -766,6 +768,120 @@ class DualPortChannel:
     ) -> None:
         """Exit async context manager, closing connection."""
         await self.close()
+
+
+@dataclass
+class StreamResult:
+    """Collected output from a guest agent streaming execution.
+
+    Returned by consume_stream() after processing all messages from
+    stream_messages(). Collects stdout/stderr chunks, timing data,
+    and final exit code.
+    """
+
+    exit_code: int = -1
+    stdout: str = ""
+    stderr: str = ""
+    execution_time_ms: int | None = None
+    spawn_ms: int | None = None
+    process_ms: int | None = None
+
+
+async def consume_stream(
+    channel: "GuestChannel",
+    request: GuestAgentRequest,
+    *,
+    timeout: int,
+    vm_id: str,
+    on_stdout: Callable[[str], None] | None = None,
+    on_stderr: Callable[[str], None] | None = None,
+    on_error: Callable[[StreamingErrorMessage], Awaitable[None]] | None = None,
+) -> StreamResult:
+    """Send request via channel, consume the streaming response, return collected result.
+
+    Handles OutputChunkMessage, ExecutionCompleteMessage, and StreamingErrorMessage.
+    Callbacks (on_stdout, on_stderr) are defensively wrapped — exceptions disable them.
+    on_error is awaited for StreamingErrorMessage before the default handling (which
+    appends the error to stderr and sets exit_code=-1). If on_error raises, the
+    exception propagates immediately.
+
+    Args:
+        channel: GuestChannel to stream from.
+        request: Request to send.
+        timeout: Hard timeout for the entire stream (seconds).
+        vm_id: VM identifier for logging.
+        on_stdout: Optional callback for stdout chunks.
+        on_stderr: Optional callback for stderr chunks.
+        on_error: Optional async callback for StreamingErrorMessage.
+            Called before default handling. If it raises, the exception propagates.
+
+    Returns:
+        StreamResult with collected output, exit code, and timing.
+    """
+    exit_code = -1
+    execution_time_ms: int | None = None
+    spawn_ms: int | None = None
+    process_ms: int | None = None
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    async with contextlib.aclosing(channel.stream_messages(request, timeout=timeout)) as stream:
+        async for msg in stream:
+            if isinstance(msg, OutputChunkMessage):
+                if msg.type == "stdout":
+                    stdout_chunks.append(msg.chunk)
+                    if on_stdout is not None:
+                        try:
+                            on_stdout(msg.chunk)
+                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                            logger.warning(
+                                "on_stdout callback raised, disabling",
+                                extra={"vm_id": vm_id},
+                                exc_info=True,
+                            )
+                            on_stdout = None
+                else:  # stderr
+                    stderr_chunks.append(msg.chunk)
+                    if on_stderr is not None:
+                        try:
+                            on_stderr(msg.chunk)
+                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                            logger.warning(
+                                "on_stderr callback raised, disabling",
+                                extra={"vm_id": vm_id},
+                                exc_info=True,
+                            )
+                            on_stderr = None
+
+                logger.debug(
+                    "VM output",
+                    extra={"vm_id": vm_id, "stream": msg.type, "chunk": msg.chunk[:200]},
+                )
+
+            elif isinstance(msg, ExecutionCompleteMessage):
+                exit_code = msg.exit_code
+                execution_time_ms = msg.execution_time_ms
+                spawn_ms = msg.spawn_ms
+                process_ms = msg.process_ms
+                break
+
+            elif isinstance(msg, StreamingErrorMessage):
+                # Let caller handle error first (may raise)
+                if on_error is not None:
+                    await on_error(msg)
+                # Default handling: append error to stderr, set exit_code=-1, break
+                stderr_chunks.append(f"[{msg.error_type}] {msg.message}")
+                exit_code = -1
+                break
+
+    return StreamResult(
+        exit_code=exit_code,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
+        execution_time_ms=execution_time_ms,
+        spawn_ms=spawn_ms,
+        process_ms=process_ms,
+    )
 
 
 @asynccontextmanager

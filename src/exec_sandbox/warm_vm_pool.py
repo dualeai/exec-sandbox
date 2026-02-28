@@ -549,6 +549,7 @@ class WarmVMPool:
                 allowed_domains=None,
                 snapshot_drive=snapshot_path,
                 reservation=reservation,
+                retry_profile=constants.RETRY_BACKGROUND,
             )
 
     async def _replenish_pool(self, language: Language) -> None:
