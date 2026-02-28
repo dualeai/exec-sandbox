@@ -287,7 +287,7 @@ class Scheduler:
             SandboxError: Scheduler not started.
             PackageNotAllowedError: Package not in allowlist.
             VmError: VM creation or execution failed.
-            VmTimeoutError: Execution exceeded timeout.
+            VmTimeoutError: VM boot timed out (guest agent not ready).
             ValueError: Too many exposed ports or invalid port numbers.
 
         Example:

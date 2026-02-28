@@ -695,11 +695,11 @@ async def run_code(
 
     except VmTimeoutError:
         error_msg = format_error(
-            "Execution timed out",
-            f"The code did not complete within {timeout} seconds.",
+            "VM boot timed out",
+            "The VM failed to start before code could run.",
             [
-                "Increase timeout with -t/--timeout",
-                "Check for infinite loops in your code",
+                "Retry — boot timeouts are often transient (CPU contention)",
+                "Check system load and available resources",
             ],
         )
         click.echo(error_msg, err=True)

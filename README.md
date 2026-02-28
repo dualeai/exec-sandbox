@@ -310,17 +310,28 @@ from exec_sandbox import (
     PackageNotAllowedError,
     SandboxError,
     VmTimeoutError,
+    VmTransientError,
 )
 
 async with Scheduler() as scheduler:
     try:
         result = await scheduler.run(code="print('hello')", language="python", timeout_seconds=5)
+
+        # Execution timeouts are NOT exceptions — they return a result with exit_code=-1.
+        if result.exit_code == -1:
+            print(f"Code timed out: {result.stderr}")
+
     except InputValidationError as e:
         # Caller bug — bad code or env vars. Fix input and retry.
         # (CodeValidationError, EnvVarValidationError inherit from this)
         print(f"Invalid input: {e}")
     except VmTimeoutError:
-        print("Execution timed out")
+        # VM failed to boot (guest agent not ready). Often transient (CPU contention).
+        print("VM boot timed out — retry may succeed")
+    except VmTransientError:
+        # Infrastructure failure (QEMU crash, REPL spawn OOM) — code never ran, safe to retry.
+        # VmTimeoutError is a subclass, so this must come after it.
+        print("Transient VM failure, retry may succeed")
     except PackageNotAllowedError as e:
         print(f"Package not in allowlist: {e}")
     except SandboxError as e:
@@ -514,9 +525,10 @@ The critical metric is **time to first code execution** — not just VM boot, bu
 | `warm_pool_hit` | bool | Whether a pre-started VM was used |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
-Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = internal error (could not retrieve status), other non-zero = program error.
+Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures (QEMU crash, REPL spawn failure) raise `VmTransientError` instead of returning a result.
 
 ```python
+# Infrastructure failures raise VmTransientError before reaching here (see Error Handling).
 result = await scheduler.run(code="...", language="python")
 
 if result.exit_code == 0:
@@ -524,7 +536,7 @@ if result.exit_code == 0:
 elif result.exit_code > 128:
     signal_num = result.exit_code - 128  # e.g., 9 for SIGKILL
 elif result.exit_code == -1:
-    pass  # Internal error (see result.stderr)
+    pass  # Execution timeout (code ran too long, see result.stderr)
 else:
     pass  # Program exited with error
 ```
@@ -545,13 +557,15 @@ Returned by `Session.list_files()`.
 |-----------|-------------|
 | `SandboxError` | Base exception for all sandbox errors |
 | `TransientError` | Retryable errors — may succeed on retry |
+| `VmTransientError` | Transport failure or guest infrastructure failure (code never ran) |
+| `VmTimeoutError` | VM boot timed out |
+| `VmCapacityError` | VM pool at capacity |
 | `PermanentError` | Non-retryable errors |
+| `VmPermanentError` | Protocol/request corruption or invalid VM state |
+| `VmConfigError` | Invalid VM configuration |
 | `InputValidationError` | Caller-bug errors — bad input, session stays alive |
 | `CodeValidationError` | Empty, whitespace-only, or null-byte code |
 | `EnvVarValidationError` | Invalid env var names/values (control chars, size) |
-| `VmTimeoutError` | VM boot timed out |
-| `VmCapacityError` | VM pool at capacity |
-| `VmConfigError` | Invalid VM configuration |
 | `SessionClosedError` | Session already closed |
 | `CommunicationError` | Guest communication failed |
 | `GuestAgentError` | Guest agent returned error |

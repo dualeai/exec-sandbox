@@ -102,10 +102,11 @@ def guest_error_to_exception(
             return PackageNotAllowedError(formatted, context=context)
         case constants.GuestErrorType.OUTPUT_LIMIT:
             return OutputLimitError(formatted, context=context)
+        case constants.GuestErrorType.EXECUTION:
+            return VmTransientError(formatted, context=context)  # code never ran, transient
         case (
             constants.GuestErrorType.PATH
             | constants.GuestErrorType.IO
-            | constants.GuestErrorType.EXECUTION
             | constants.GuestErrorType.REQUEST
             | constants.GuestErrorType.PROTOCOL
         ):
@@ -425,8 +426,22 @@ class QemuVM:
             CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
             EnvVarValidationError: Invalid env vars (control chars, size limits)
             OutputLimitError: stdout or stderr exceeded guest-enforced size limits.
-            VmPermanentError: VM not in READY state or communication failed
-            VmBootTimeoutError: Execution exceeded timeout_seconds
+            VmTransientError: Transport failure (socket EOF, QEMU crash), or guest
+                infrastructure failure (REPL spawn failed due to OOM). Code never ran.
+            VmPermanentError: VM not in READY state, or protocol/request corruption.
+            VmBootTimeoutError: Execution exceeded host timeout.
+
+        Failure modes:
+            System/infrastructure errors (raised as exceptions, caller can retry):
+                - VmTransientError: transport failure (socket EOF, QEMU crash),
+                  or guest infrastructure (REPL spawn failed due to OOM)
+                - VmBootTimeoutError: execution exceeded host timeout
+                - VmPermanentError: protocol/request corruption
+            User code results (returned as ExecutionResult, not retryable):
+                - exit_code=0: success
+                - exit_code>0: code error
+                - exit_code>128: killed by signal (128 + signal_number)
+                - exit_code=-1: execution timeout (code ran too long)
         """
         # Validate VM is in READY state before execution (atomic check-and-set)
         async with self._state_lock:
@@ -516,22 +531,31 @@ class QemuVM:
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
             hard_timeout = timeout_seconds + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
 
-            # Error handler: recoverable errors restore READY and raise.
-            # Other errors fall through to consume_stream's default (append to stderr, break).
+            # Error handler: input validation restores READY and raises,
+            # timeout falls through to consume_stream's default (exit_code=-1),
+            # all other errors raise as infrastructure failures.
             async def _handle_exec_error(msg: StreamingErrorMessage) -> None:
                 exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
+                # Recoverable input errors: VM is fine, restore READY for session reuse
                 if isinstance(exc, (InputValidationError, OutputLimitError, PackageNotAllowedError)):
                     with contextlib.suppress(VmPermanentError):
                         await self.transition_state(VmState.READY)
                     raise exc
-                logger.error(
-                    f"Guest agent error: [{msg.error_type}] {msg.message}",
-                    extra={
-                        "vm_id": self.vm_id,
-                        "error_message": msg.message,
-                        "error_type": msg.error_type,
-                    },
-                )
+                # Timeout: code ran too long — this is a user code result, not infrastructure.
+                # Fall through to consume_stream's default handling (exit_code=-1 + stderr message).
+                if msg.error_type == constants.GuestErrorType.TIMEOUT:
+                    logger.warning(
+                        f"Execution timeout: [{msg.error_type}] {msg.message}",
+                        extra={
+                            "vm_id": self.vm_id,
+                            "error_message": msg.message,
+                            "error_type": msg.error_type,
+                        },
+                    )
+                    return
+                # All other guest errors = infrastructure/system failures.
+                # Code never ran or system is broken — raise for caller to handle.
+                raise exc
 
             result = await consume_stream(
                 self.channel,

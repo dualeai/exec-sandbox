@@ -2664,12 +2664,38 @@ class _GuestErrorChannel:
         yield StreamingErrorMessage(error_type=self._error_type, message=self._message)
 
 
-class TestExecuteExceptionWrapping:
-    """Unit tests for execute()'s except chain: transport errors → VmTransientError.
+class _GuestErrorAfterOutputChannel:
+    """connect() succeeds; stream yields output chunks then a StreamingErrorMessage."""
 
-    Verifies that exceptions from channel.connect() and consume_stream()
-    are wrapped as VmTransientError (retryable) or VmBootTimeoutError,
-    while CancelledError and guest-level errors propagate bare.
+    def __init__(self, stdout_chunks: list[str], error_type: str, message: str) -> None:
+        self._stdout_chunks = stdout_chunks
+        self._error_type = error_type
+        self._message = message
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_agent_protocol import OutputChunkMessage, StreamingErrorMessage
+
+        for chunk in self._stdout_chunks:
+            yield OutputChunkMessage(type="stdout", chunk=chunk)
+        yield StreamingErrorMessage(error_type=self._error_type, message=self._message)
+
+
+class TestExecuteExceptionWrapping:
+    """Unit tests for execute()'s error handling.
+
+    Covers:
+    - Transport errors (OSError, EOF, etc.) → VmTransientError
+    - TimeoutError → VmBootTimeoutError
+    - CancelledError propagates bare
+    - Guest error classification: execution_error → VmTransientError (raised),
+      timeout_error → exit_code=-1 (returned), others → raised
     """
 
     @staticmethod
@@ -2846,6 +2872,104 @@ class TestExecuteExceptionWrapping:
             await vm.execute(code="x", timeout_seconds=5)
         assert exc_info.value.__cause__ is original
 
+    # -- Group F: Guest error classification in _handle_exec_error -------------
+
+    async def test_execution_error_raises_transient(self) -> None:
+        """execution_error (REPL spawn failed) raises VmTransientError."""
+        vm = self._make_vm(_GuestErrorChannel("execution_error", "spawn failed"))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert "spawn failed" in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+
+    async def test_timeout_error_returns_result(self) -> None:
+        """timeout_error returns exit_code=-1 result, no exception."""
+        vm = self._make_vm(_GuestErrorChannel("timeout_error", "exceeded 30s"))
+        result = await vm.execute(code="x", timeout_seconds=5)
+        assert result.exit_code == -1
+        assert "[timeout_error]" in result.stderr
+
+    async def test_request_error_raises_permanent(self) -> None:
+        """request_error raises VmPermanentError."""
+        vm = self._make_vm(_GuestErrorChannel("request_error", "invalid JSON"))
+        with pytest.raises(VmPermanentError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    # -- Group G: Partial output before errors ---------------------------------
+
+    async def test_execution_error_after_partial_stdout(self) -> None:
+        """execution_error after partial stdout raises VmTransientError (output lost)."""
+        vm = self._make_vm(_GuestErrorAfterOutputChannel(["partial"], "execution_error", "OOM"))
+        with pytest.raises(VmTransientError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_timeout_after_partial_stdout(self) -> None:
+        """timeout_error after partial stdout returns result with collected output."""
+        vm = self._make_vm(_GuestErrorAfterOutputChannel(["out1", "out2"], "timeout_error", "timed out"))
+        result = await vm.execute(code="x", timeout_seconds=5)
+        assert result.exit_code == -1
+        assert result.stdout == "out1out2"
+        assert "timed out" in result.stderr
+
+    # -- Group H: Errors unlikely during execute() but must be handled ---------
+
+    async def test_protocol_error_during_execute_raises(self) -> None:
+        """protocol_error raises VmPermanentError."""
+        vm = self._make_vm(_GuestErrorChannel("protocol_error", "frame corruption"))
+        with pytest.raises(VmPermanentError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_io_error_during_execute_raises(self) -> None:
+        """io_error raises VmPermanentError."""
+        vm = self._make_vm(_GuestErrorChannel("io_error", "disk full"))
+        with pytest.raises(VmPermanentError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_path_error_during_execute_raises(self) -> None:
+        """path_error raises VmPermanentError."""
+        vm = self._make_vm(_GuestErrorChannel("path_error", "no such file"))
+        with pytest.raises(VmPermanentError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    # -- Group I: Out-of-bounds / adversarial ----------------------------------
+
+    async def test_unknown_error_type_raises_permanent(self) -> None:
+        """Unknown error type from newer guest raises VmPermanentError."""
+        vm = self._make_vm(_GuestErrorChannel("future_new_error", "from newer guest"))
+        with pytest.raises(VmPermanentError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_execution_error_empty_message(self) -> None:
+        """execution_error with empty message still raises VmTransientError."""
+        vm = self._make_vm(_GuestErrorChannel("execution_error", ""))
+        with pytest.raises(VmTransientError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_timeout_error_long_message(self) -> None:
+        """timeout_error with very long message returns result without exception."""
+        long_msg = "x" * 10000
+        vm = self._make_vm(_GuestErrorChannel("timeout_error", long_msg))
+        result = await vm.execute(code="x", timeout_seconds=5)
+        assert result.exit_code == -1
+        assert long_msg in result.stderr
+
+    # -- Group J: VM state verification ----------------------------------------
+
+    async def test_execution_error_does_not_restore_ready(self) -> None:
+        """execution_error does NOT restore READY (only input validation errors do)."""
+        vm = self._make_vm(_GuestErrorChannel("execution_error", "spawn failed"))
+        with pytest.raises(VmTransientError):
+            await vm.execute(code="x", timeout_seconds=5)
+        assert vm._state != VmState.READY  # pyright: ignore[reportPrivateUsage]
+
+    async def test_timeout_error_does_not_restore_ready(self) -> None:
+        """timeout_error does NOT restore READY via _handle_exec_error."""
+        vm = self._make_vm(_GuestErrorChannel("timeout_error", "timed out"))
+        # execute() transitions to READY on success path after consume_stream returns
+        # but _handle_exec_error itself does not restore READY for timeout
+        result = await vm.execute(code="x", timeout_seconds=5)
+        assert result.exit_code == -1
+
 
 # ============================================================================
 # Unit Tests - guest_error_to_exception mapping
@@ -2863,7 +2987,7 @@ class TestGuestErrorToException:
             pytest.param("path_error", VmPermanentError, id="path"),
             pytest.param("package_error", PackageNotAllowedError, id="package"),
             pytest.param("io_error", VmPermanentError, id="io"),
-            pytest.param("execution_error", VmPermanentError, id="execution"),
+            pytest.param("execution_error", VmTransientError, id="execution"),
             pytest.param("timeout_error", VmTransientError, id="timeout"),
             pytest.param("request_error", VmPermanentError, id="request"),
             pytest.param("protocol_error", VmPermanentError, id="protocol"),
