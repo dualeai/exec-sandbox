@@ -228,7 +228,6 @@ print(len(s))
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0
@@ -248,7 +247,6 @@ print("9" * 2_000_000)
             await scheduler.run(
                 code=code,
                 language=Language.PYTHON,
-                timeout_seconds=60,
             )
 
     async def test_user_env_var_cannot_override_limit(self, scheduler: Scheduler) -> None:

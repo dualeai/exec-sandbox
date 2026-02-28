@@ -387,7 +387,7 @@ except OSError as e:
     print(f'FILE_LIMIT:{count}')
     print(f'ERRNO:{e.errno}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "FILE_LIMIT:NONE:" not in result.stdout
         assert "FILE_LIMIT:" in result.stdout
@@ -429,7 +429,7 @@ try:
 except OSError:
     print(f'DIR_LIMIT:{count}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "DIR_LIMIT:" in result.stdout, f"stdout: {result.stdout}"
         count = int(result.stdout.split("DIR_LIMIT:")[1].strip())
@@ -449,7 +449,7 @@ for i in range(50000):
     os.unlink(path)
 print('CYCLE_OK')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "CYCLE_OK" in result.stdout
 
@@ -468,7 +468,7 @@ try:
 except OSError:
     print(f'SYMLINK_LIMIT:{count}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "SYMLINK_LIMIT:" in result.stdout, f"stdout: {result.stdout}"
         count = int(result.stdout.split("SYMLINK_LIMIT:")[1].strip())
@@ -494,7 +494,7 @@ s_after = os.statvfs('/tmp')
 inodes_used = s_before.f_ffree - s_after.f_ffree
 print(f'INODES_USED:{inodes_used}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INODES_USED:" in result.stdout, f"stdout: {result.stdout}"
         inodes_used = int(result.stdout.split("INODES_USED:")[1].strip())
@@ -595,7 +595,7 @@ except OSError:
     pass
 print(f'EXHAUSTED:{count}')
 """
-            r1 = await session.exec(exhaust, timeout_seconds=60)
+            r1 = await session.exec(exhaust)
             assert r1.exit_code == 0, f"stderr: {r1.stderr}"
             assert "EXHAUSTED:" in r1.stdout
 
@@ -2130,7 +2130,7 @@ except OSError as e:
     # ENOSPC=28, EDQUOT=122
     print(f'IS_DISK_ERROR:{e.errno in (28, 122)}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NO_LIMIT:" not in result.stdout
         assert "BLOCKED:" in result.stdout
@@ -2164,7 +2164,7 @@ try:
 except OSError:
     print(f'BOUNDED:{written}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "NO_LIMIT:" not in result.stdout
         assert "BOUNDED:" in result.stdout
@@ -2187,7 +2187,7 @@ except OSError:
     pass
 print(f'FILLED:{written}MB')
 """
-            r1 = await session.exec(exhaust, timeout_seconds=60)
+            r1 = await session.exec(exhaust)
             assert r1.exit_code == 0
             assert "FILLED:" in r1.stdout
 

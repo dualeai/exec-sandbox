@@ -1518,7 +1518,6 @@ class TestPackageInstallation:
             code=code,
             language=language,
             packages=packages,
-            timeout_seconds=120,
         )
 
         assert result.exit_code == 0, f"Failed: {result.stderr}"
@@ -1534,7 +1533,6 @@ class TestPackageInstallation:
             code='import requests; print("first")',
             language=Language.PYTHON,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r1.exit_code == 0, f"First run failed: {r1.stderr}"
 
@@ -1543,7 +1541,6 @@ class TestPackageInstallation:
             code='import requests; print("second")',
             language=Language.PYTHON,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r2.exit_code == 0, f"Second run failed: {r2.stderr}"
         assert "second" in r2.stdout
@@ -1563,7 +1560,6 @@ class TestPackageInstallation:
             code='import requests; print("setup")',
             language=Language.PYTHON,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r1.exit_code == 0, f"Setup run failed: {r1.stderr}"
 
@@ -1573,7 +1569,6 @@ class TestPackageInstallation:
             language=Language.PYTHON,
             packages=packages,
             allow_network=False,  # No internet!
-            timeout_seconds=120,
         )
         assert r2.exit_code == 0, f"Offline run failed: {r2.stderr}"
         assert "offline: 2.31.0" in r2.stdout
@@ -1587,7 +1582,6 @@ class TestPackageInstallation:
             code='const lodash = require("lodash"); console.log("setup")',
             language=Language.JAVASCRIPT,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r1.exit_code == 0, f"Setup run failed: {r1.stderr}"
 
@@ -1597,7 +1591,6 @@ class TestPackageInstallation:
             language=Language.JAVASCRIPT,
             packages=packages,
             allow_network=False,  # No internet!
-            timeout_seconds=120,
         )
         assert r2.exit_code == 0, f"Offline run failed: {r2.stderr}"
         assert "offline: 4.17.21" in r2.stdout

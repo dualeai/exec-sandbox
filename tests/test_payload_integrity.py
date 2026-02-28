@@ -412,7 +412,6 @@ class TestRawPayloadIntegrity:
         result = await scheduler.run(
             code=code,
             language=Language.RAW,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0
@@ -492,7 +491,6 @@ class TestStreamingThroughput:
         result = await scheduler.run(
             code=code,
             language=Language.RAW,
-            timeout_seconds=120,
             on_stdout=on_stdout,
         )
 
@@ -523,7 +521,6 @@ class TestStreamingThroughput:
         result = await scheduler.run(
             code=code,
             language=Language.RAW,
-            timeout_seconds=120,
             on_stdout=on_stdout,
         )
 
@@ -602,7 +599,6 @@ for i in range(1000):
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
             on_stdout=on_stdout,
             on_stderr=on_stderr,
         )

@@ -237,7 +237,6 @@ print('RAPID_SPAWNS:50')
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"

@@ -58,7 +58,6 @@ for i in range(999):
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0
@@ -550,7 +549,6 @@ except MemoryError:
             code=code,
             language=Language.PYTHON,
             memory_mb=256,
-            timeout_seconds=60,
         )
 
         # Should either get MemoryError or be OOM-killed

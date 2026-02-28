@@ -42,6 +42,7 @@ async def l1_scheduler(images_dir: Path) -> AsyncGenerator[Scheduler, None]:
         images_dir=images_dir,
         auto_download_assets=False,
         warm_pool_size=0,  # Disable warm pool — force cold boot / L1 path
+        default_timeout_seconds=120,
     )
     async with Scheduler(config) as sched:
         yield sched

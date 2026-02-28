@@ -216,8 +216,15 @@ def scheduler_config(images_dir: Path) -> SchedulerConfig:
 
     Uses pre-built images from images/dist/ directory.
     Disables auto_download_assets since images are provided locally.
+
+    Timeout is 120s (vs library default 30s) to absorb parallel-load
+    slowdowns: ``pytest -n auto`` runs ~10 QEMU VMs concurrently, and TCG
+    emulation + L1 restore contention can inflate wall-clock times 4-5x.
+    Individual tests should NOT override ``timeout_seconds`` unless they
+    intentionally need a *shorter* deadline (e.g. testing the timeout
+    mechanism itself).
     """
-    return SchedulerConfig(images_dir=images_dir, auto_download_assets=False)
+    return SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
 
 
 @pytest.fixture
@@ -244,6 +251,9 @@ async def dual_scheduler(
     - emulation: Forces QEMU TCG software emulation via EXEC_SANDBOX_FORCE_EMULATION.
 
     This ensures security properties hold regardless of QEMU backend.
+
+    Uses the same 120s default timeout as ``scheduler_config`` — see its
+    docstring for rationale.
     """
     if request.param == "hwaccel":
         if not await check_hwaccel_available():
@@ -252,7 +262,7 @@ async def dual_scheduler(
     else:
         monkeypatch.setenv("EXEC_SANDBOX_FORCE_EMULATION", "true")
 
-    config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False)
+    config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
     async with Scheduler(config) as sched:
         yield sched
 

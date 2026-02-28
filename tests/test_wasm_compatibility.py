@@ -55,7 +55,7 @@ console.log("ADD:" + inst.exports.add(3, 4));
 console.log("ADD_ZERO:" + inst.exports.add(0, 0));
 console.log("ADD_NEG:" + inst.exports.add(-1, 1));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT, timeout_seconds=60)
+        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ADD:7" in result.stdout
         assert "ADD_ZERO:0" in result.stdout

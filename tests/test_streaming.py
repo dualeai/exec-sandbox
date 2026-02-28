@@ -238,7 +238,6 @@ sys.stdout.flush()
             await scheduler.run(
                 code=code,
                 language=Language.PYTHON,
-                timeout_seconds=60,
                 on_stdout=stdout_chunks.append,
             )
 
@@ -260,7 +259,6 @@ sys.stderr.flush()
             await scheduler.run(
                 code=code,
                 language=Language.PYTHON,
-                timeout_seconds=60,
                 on_stderr=stderr_chunks.append,
             )
 
@@ -622,7 +620,6 @@ sys.stdout.flush()
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
             on_stdout=stdout_chunks.append,
         )
 
@@ -677,7 +674,6 @@ sys.stderr.flush()
             await scheduler.run(
                 code=code,
                 language=Language.PYTHON,
-                timeout_seconds=60,
                 on_stdout=stdout_chunks.append,
                 on_stderr=stderr_chunks.append,
             )
@@ -689,7 +685,6 @@ sys.stderr.flush()
             with pytest.raises(OutputLimitError):
                 await session.exec(
                     "import sys; sys.stdout.write('X' * 1_200_000); sys.stdout.flush()",
-                    timeout_seconds=60,
                 )
 
             # Second execution: normal output works (REPL preserved)

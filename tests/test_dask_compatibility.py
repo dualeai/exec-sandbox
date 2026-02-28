@@ -61,7 +61,6 @@ print(f'DASK_CPU:{count}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("DASK_CPU:")[1].strip())
@@ -81,7 +80,6 @@ print(f'MATCH:{cpu_count() == CPU_COUNT}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "MATCH:True" in result.stdout
@@ -111,7 +109,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(100)) = 99*100*199/6 = 328350
@@ -130,7 +127,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RESULT:328350" in result.stdout
@@ -148,7 +144,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x*2 for x in range(1000) if (x*2) % 3 == 0)
@@ -186,7 +181,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RESULT:21" in result.stdout
@@ -210,7 +204,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(10)) = 9*10*19/6 = 285
@@ -250,7 +243,6 @@ print(f'NAMES:{sorted(high_scores)}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "COUNT:4" in result.stdout
@@ -277,7 +269,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         npartitions = int(result.stdout.split("NPARTITIONS:")[1].split("\n")[0])

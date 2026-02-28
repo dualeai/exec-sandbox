@@ -310,7 +310,6 @@ print(f"RAPID_DONE:{len(pids)}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -339,7 +338,6 @@ print(f"FORK_RESULT:forked={len(pids)},limited={hit_limit}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"

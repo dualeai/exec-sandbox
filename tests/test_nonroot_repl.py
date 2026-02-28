@@ -166,7 +166,6 @@ class TestNonRootPackages:
             code="import six; print(six.__version__)",
             language=Language.PYTHON,
             packages=["six==1.17.0"],
-            timeout_seconds=120,
         )
         assert result.exit_code == 0
         assert "1.17.0" in result.stdout

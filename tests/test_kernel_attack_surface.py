@@ -1067,7 +1067,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=60)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PROTECTED_REGULAR:" in stdout and stdout.split(":")[1].isdigit():

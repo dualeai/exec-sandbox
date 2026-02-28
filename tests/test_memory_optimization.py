@@ -209,7 +209,6 @@ else:
     print('PASS: No swap used (data fit in RAM)')
 """,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
@@ -261,7 +260,6 @@ except MemoryError:
     raise
 """,
             language=Language.PYTHON,
-            timeout_seconds=90,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
@@ -323,7 +321,6 @@ assert swap_increase_mb >= 30, f'Swap increase too small: {swap_increase_mb}MB'
 print(f'PASS: Swap increased by {swap_increase_mb}MB')
 """,
             language=Language.PYTHON,
-            timeout_seconds=90,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
@@ -366,7 +363,6 @@ for cycle in range(3):
 print('PASS: All 3 allocation cycles completed without corruption')
 """,
             language=Language.PYTHON,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS: All 3 allocation cycles" in result.stdout
