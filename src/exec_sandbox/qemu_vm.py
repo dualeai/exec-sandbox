@@ -23,6 +23,7 @@ from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import (
     CodeValidationError,
+    CommunicationError,
     EnvVarValidationError,
     InputValidationError,
     OutputLimitError,
@@ -614,7 +615,15 @@ class QemuVM:
                     "language": self.language,
                 },
             ) from e
-        except (OSError, json.JSONDecodeError) as e:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            ValidationError,
+            RuntimeError,
+            CommunicationError,
+        ) as e:
             raise VmTransientError(
                 f"VM {self.vm_id} communication failed: {e}",
                 context={

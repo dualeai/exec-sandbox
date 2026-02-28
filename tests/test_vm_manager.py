@@ -5,20 +5,27 @@ Integration tests: Real VM lifecycle (requires QEMU + images).
 """
 
 import asyncio
+import json
 import sys
 from collections import deque
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from exec_sandbox.constants import GuestErrorType
 from exec_sandbox.exceptions import (
     CodeValidationError,
+    CommunicationError,
     EnvVarValidationError,
     InputValidationError,
+    OutputLimitError,
     PackageNotAllowedError,
     SandboxError,
+    SocketAuthError,
+    VmBootTimeoutError,
     VmDependencyError,
     VmError,
     VmPermanentError,
@@ -2595,6 +2602,249 @@ class TestExecuteEnvVarValidation:
     async def test_adversarial_values_raise_env_var_validation_error(self, vm, env_vars: dict[str, str]) -> None:
         with pytest.raises(EnvVarValidationError):
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+
+
+# ============================================================================
+# Unit Tests - execute() exception wrapping
+# ============================================================================
+
+
+class _ConnectRaisesChannel:
+    """connect() raises immediately; stream_messages() never called."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    async def connect(self, timeout_seconds: float) -> None:
+        raise self._error
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        yield  # type: ignore[unreachable]  # make it an async generator
+
+
+class _ConnectOKStreamRaisesChannel:
+    """connect() succeeds; stream_messages() raises immediately."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        raise self._error
+        yield  # type: ignore[unreachable]  # make it an async generator
+
+
+class _GuestErrorChannel:
+    """connect() succeeds; stream_messages() yields a StreamingErrorMessage."""
+
+    def __init__(self, error_type: str, message: str) -> None:
+        self._error_type = error_type
+        self._message = message
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
+
+        yield StreamingErrorMessage(error_type=self._error_type, message=self._message)
+
+
+class TestExecuteExceptionWrapping:
+    """Unit tests for execute()'s except chain: transport errors → VmTransientError.
+
+    Verifies that exceptions from channel.connect() and consume_stream()
+    are wrapped as VmTransientError (retryable) or VmBootTimeoutError,
+    while CancelledError and guest-level errors propagate bare.
+    """
+
+    @staticmethod
+    def _make_vm(channel: object, state: VmState = VmState.READY) -> QemuVM:
+        """Build a QemuVM with a mock channel for unit testing execute()."""
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.communicate = AsyncMock(return_value=(b"", b""))
+
+        mock_workdir = MagicMock()
+        mock_workdir.overlay_image = Path("/test/overlay.qcow2")
+
+        vm = QemuVM(
+            vm_id="test-exec-wrap",
+            process=mock_process,
+            cgroup_path=None,  # disables _read_cgroup_stats I/O
+            workdir=mock_workdir,
+            channel=channel,  # type: ignore[arg-type]
+            language=Language.PYTHON,
+            console_lines=deque(maxlen=100),
+        )
+        vm._state = state  # pyright: ignore[reportPrivateUsage]
+        return vm
+
+    # -- Group A: Transport errors → VmTransientError --------------------------
+
+    async def test_oserror_from_connect(self) -> None:
+        """OSError from connect() wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectRaisesChannel(OSError("connection refused")))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, OSError)
+
+    async def test_oserror_from_stream(self) -> None:
+        """OSError from stream_messages() wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(OSError("broken pipe")))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, OSError)
+
+    async def test_incomplete_read_error(self) -> None:
+        """IncompleteReadError (EOF) wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(asyncio.IncompleteReadError(b"", 100)))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, asyncio.IncompleteReadError)
+
+    async def test_limit_overrun_error(self) -> None:
+        """LimitOverrunError (oversized message) wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(asyncio.LimitOverrunError("limit", 512)))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, asyncio.LimitOverrunError)
+
+    async def test_json_decode_error(self) -> None:
+        """JSONDecodeError wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(json.JSONDecodeError("bad", "", 0)))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
+
+    async def test_validation_error(self) -> None:
+        """pydantic.ValidationError wrapped as VmTransientError."""
+        try:
+            from exec_sandbox.guest_agent_protocol import ExecutionCompleteMessage
+
+            ExecutionCompleteMessage.model_validate({"bad": "data"})
+            pytest.fail("Expected ValidationError")
+        except ValidationError as e:
+            pydantic_err = e
+
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(pydantic_err))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, ValidationError)
+
+    async def test_runtime_error(self) -> None:
+        """RuntimeError (channel not connected) wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(RuntimeError("Channel not connected")))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+    async def test_communication_error(self) -> None:
+        """CommunicationError wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectRaisesChannel(CommunicationError("agent failed")))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, CommunicationError)
+
+    async def test_socket_auth_error(self) -> None:
+        """SocketAuthError (CommunicationError subclass) wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectRaisesChannel(SocketAuthError("auth failed", expected_uid=1000, actual_uid=0)))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, SocketAuthError)
+
+    # -- Group B: TimeoutError → VmBootTimeoutError ----------------------------
+
+    async def test_timeout_from_connect(self) -> None:
+        """TimeoutError from connect() wrapped as VmBootTimeoutError."""
+        vm = self._make_vm(_ConnectRaisesChannel(TimeoutError("connect timed out")))
+        with pytest.raises(VmBootTimeoutError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+    async def test_timeout_from_stream(self) -> None:
+        """TimeoutError from stream_messages() wrapped as VmBootTimeoutError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(TimeoutError("hard timeout")))
+        with pytest.raises(VmBootTimeoutError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+    async def test_timeout_context_has_seconds(self) -> None:
+        """VmBootTimeoutError context includes timeout_seconds from caller."""
+        vm = self._make_vm(_ConnectRaisesChannel(TimeoutError()))
+        with pytest.raises(VmBootTimeoutError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=17)
+        assert exc_info.value.context["timeout_seconds"] == 17
+
+    # -- Group C: Must NOT be wrapped — propagate bare -------------------------
+
+    async def test_cancelled_error_propagates(self) -> None:
+        """CancelledError propagates bare, not wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectRaisesChannel(asyncio.CancelledError()))
+        with pytest.raises(asyncio.CancelledError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_code_validation_error_propagates(self) -> None:
+        """CodeValidationError from guest error propagates bare."""
+        vm = self._make_vm(_GuestErrorChannel("code_error", "syntax error"))
+        with pytest.raises(CodeValidationError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    async def test_output_limit_error_propagates(self) -> None:
+        """OutputLimitError from guest error propagates bare."""
+        vm = self._make_vm(_GuestErrorChannel("output_limit_error", "output too large"))
+        with pytest.raises(OutputLimitError):
+            await vm.execute(code="x", timeout_seconds=5)
+
+    # -- Group D: OSError subclasses -------------------------------------------
+
+    async def test_connection_reset_wrapped(self) -> None:
+        """ConnectionResetError (OSError subclass) wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(ConnectionResetError("peer reset")))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, ConnectionResetError)
+
+    async def test_broken_pipe_wrapped(self) -> None:
+        """BrokenPipeError (OSError subclass) wrapped as VmTransientError."""
+        vm = self._make_vm(_ConnectOKStreamRaisesChannel(BrokenPipeError()))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert isinstance(exc_info.value.__cause__, BrokenPipeError)
+
+    # -- Group E: Context and cause verification -------------------------------
+
+    async def test_context_has_vm_id_language_error_type(self) -> None:
+        """VmTransientError context includes vm_id, language, and error_type."""
+        vm = self._make_vm(_ConnectRaisesChannel(OSError("refused")))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        ctx = exc_info.value.context
+        assert ctx["vm_id"] == "test-exec-wrap"
+        assert ctx["language"] == Language.PYTHON
+        assert ctx["error_type"] == "OSError"
+
+    async def test_cause_chain_set(self) -> None:
+        """__cause__ is the original exception (identity, not copy)."""
+        original = OSError("the original error")
+        vm = self._make_vm(_ConnectRaisesChannel(original))
+        with pytest.raises(VmTransientError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert exc_info.value.__cause__ is original
 
 
 # ============================================================================
