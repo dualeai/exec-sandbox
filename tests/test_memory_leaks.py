@@ -72,15 +72,26 @@ async def test_no_memory_leak_without_network(iterations: int, images_dir: Path)
 
     Requires hwaccel: 90% success threshold — TCG timeouts cause too many
     failures, inflating the failure rate below the threshold.
-    """
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
 
+    A warmup run absorbs one-time initialization costs (Scheduler startup,
+    Pydantic model compilation, psutil caching, asyncio thread-pool warmup)
+    before taking the RSS baseline.  Without warmup, the first parametrized
+    variant ([50]) absorbs all init overhead into its delta while [200] starts
+    from a warm process and sees near-zero growth — causing false positives on
+    free-threaded Python where mimalloc per-thread arenas inflate the init cost.
+    """
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
     )
+
+    # Warmup: absorb one-time init (Scheduler, Pydantic, psutil, thread pool)
+    async with Scheduler(config) as scheduler:
+        await scheduler.run(code="print('warmup')", language=Language.PYTHON)
+
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
 
     async with Scheduler(config) as scheduler:
         tasks = [scheduler.run(code="print('ok')", language=Language.PYTHON) for _ in range(iterations)]
@@ -108,16 +119,24 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
 
     Requires hwaccel: same as test_no_memory_leak_without_network, plus
     gvproxy overhead amplifies TCG timeout failures.
-    """
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
 
+    Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
+    docstring for rationale.  The network warmup additionally primes gvproxy binary
+    resolution, socket allocation paths, and outbound-allow JSON generation.
+    """
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
         default_timeout_seconds=30,
     )
+
+    # Warmup: absorb one-time init including gvproxy/network path
+    async with Scheduler(config) as scheduler:
+        await scheduler.run(code=_NETWORK_TEST_CODE, language=Language.PYTHON, allow_network=True)
+
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
 
     async with Scheduler(config) as scheduler:
         tasks = [
