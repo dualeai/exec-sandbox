@@ -1219,8 +1219,11 @@ class TestSchedulerWarmPoolTiming:
 
     These tests verify that warm pool hits have:
     1. warm_pool_hit=True
-    2. setup_ms=0, boot_ms=0 (boot happened at startup, not request time)
+    2. boot_ms=0 (boot happened at startup, not request time)
     3. execute_ms and total_ms reflect actual request time
+
+    Note: setup_ms is not asserted because it includes balloon deflation
+    which varies widely under TCG emulation with parallel test workers.
     """
 
     @pytest.fixture
@@ -1254,8 +1257,6 @@ class TestSchedulerWarmPoolTiming:
         assert result.warm_pool_hit is True
         # Boot is "free" for warm pool - it happened at startup
         assert result.timing.boot_ms == 0
-        # Setup reflects pool lookup time (typically <5ms)
-        assert result.timing.setup_ms < 50
 
     async def test_warm_pool_timing_has_execute_time(self, warm_pool_scheduler: Scheduler) -> None:
         """Warm pool hit should have real execute_ms and total_ms."""
@@ -1341,8 +1342,6 @@ class TestSchedulerWarmPoolTiming:
         assert result.warm_pool_hit is True
         # Boot is "free" for warm pool - it happened at startup
         assert result.timing.boot_ms == 0
-        # Setup reflects pool lookup time (typically <5ms)
-        assert result.timing.setup_ms < 50
         assert result.timing.execute_ms >= 0
 
 
