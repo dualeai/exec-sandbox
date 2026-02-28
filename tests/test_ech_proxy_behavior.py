@@ -85,7 +85,18 @@ def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT) -> str:
 
 
 def _curl_tls_code(domain: str, tls_version: str = TLS_DEFAULT, extra_flags: str = "") -> str:
-    """curl connection test with optional TLS version forcing and extra flags."""
+    """curl connection test with optional TLS version forcing and extra flags.
+
+    Uses coreutils ``timeout`` as an outer wall-clock deadline because curl's
+    ``--max-time`` cannot interrupt musl's blocking ``getaddrinfo()``.  Alpine
+    ships curl without c-ares, so DNS resolution is a synchronous libc call.
+    musl's resolver ignores EINTR from SIGALRM (``if (poll(…) <= 0) continue``
+    in ``res_msend.c``), which means curl's internal timer never fires while
+    the process is stuck in DNS.  Under ARM64 TCG with parallel test load the
+    entire operation can be inflated 10-25x by CPU starvation, easily exceeding
+    the 120 s guest-agent timeout.  ``timeout 15`` guarantees the command
+    terminates and the ``|| echo "BLOCKED"`` fallback always runs.
+    """
     parts: list[str] = []
     version_flag = _CURL_VERSION_FLAGS.get(tls_version)
     if version_flag:
@@ -95,7 +106,7 @@ def _curl_tls_code(domain: str, tls_version: str = TLS_DEFAULT, extra_flags: str
     flags = " ".join(parts)
     flags_str = f"{flags} " if flags else ""
     return (
-        f"curl -sf {flags_str}--connect-timeout 5 --max-time 5 "
+        f"timeout 15 curl -sf {flags_str}--connect-timeout 5 --max-time 10 "
         f'https://{domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
     )
 
@@ -341,10 +352,16 @@ async def test_curl_verbose_tls_negotiation(
     expected_version: str,
     expected_cipher: str,
 ) -> None:
-    """curl verbose output confirms TLS version and cipher negotiated."""
+    """curl verbose output confirms TLS version and cipher negotiated.
+
+    ``timeout 15`` wraps the entire pipeline so that even if curl hangs in
+    musl's blocking ``getaddrinfo()`` (see ``_curl_tls_code`` docstring),
+    grep still receives EOF and the ``|| echo "BLOCKED"`` fallback fires
+    instead of the pipeline hanging until the guest-agent timeout.
+    """
     curl_flags = _CURL_VERSION_FLAGS[tls_version]
     code = (
-        f"curl -svf {curl_flags} --connect-timeout 5 --max-time 5 "
+        f"timeout 15 curl -svf {curl_flags} --connect-timeout 5 --max-time 10 "
         f'https://{domain}/ -o /dev/null 2>&1 | grep "SSL connection using" '
         f'&& echo "CONNECTED" || echo "BLOCKED"'
     )

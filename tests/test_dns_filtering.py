@@ -176,8 +176,10 @@ try {{
     console.log("BLOCKED:" + e.name);
 }}
 """
-    # RAW
-    return f'curl -sf --connect-timeout 5 --max-time 10 --retry 2 --retry-connrefused https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
+    # RAW — ``timeout`` wraps curl because curl's ``--max-time`` cannot
+    # interrupt musl's blocking ``getaddrinfo()`` (Alpine ships curl without
+    # c-ares).  See ``_curl_tls_code`` in test_ech_proxy_behavior.py.
+    return f'timeout 15 curl -sf --connect-timeout 5 --max-time 10 --retry 2 --retry-connrefused https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
 
 
 @pytest.mark.parametrize(
@@ -304,7 +306,7 @@ except OSError as e:
 async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
     """Test outbound filtering with RAW language using curl."""
     result = await scheduler.run(
-        code="curl -sf --max-time 10 --retry 2 --retry-connrefused https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
+        code="timeout 15 curl -sf --max-time 10 --retry 2 --retry-connrefused https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
         language=Language.RAW,
         allow_network=True,
         allowed_domains=["httpbin.org"],
@@ -318,7 +320,7 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
 async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails with RAW language."""
     result = await scheduler.run(
-        code="curl -sf --max-time 5 https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
+        code="timeout 15 curl -sf --max-time 10 https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
         language=Language.RAW,
         allow_network=True,
         allowed_domains=["httpbin.org"],  # google.com not allowed
