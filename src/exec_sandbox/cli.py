@@ -4,7 +4,7 @@ Usage:
     sbx 'print("hello")'           # Run inline code
     sbx script.py                  # Run file
     echo "print(1)" | sbx -        # Run from stdin
-    sbx -l python -p pandas 'import pandas; print(pandas.__version__)'
+    sbx -l python -p pandas==3.0.1 'import pandas; print(pandas.__version__)'
 
 Multi-input (V2):
     sbx 'print(1)' 'print(2)'      # Multiple inline codes
@@ -1006,14 +1006,14 @@ def run_command(
     Examples:
 
     \b
-      sbx run 'print("hello")'                    # Simple Python
-      sbx run -l javascript 'console.log("hi")'   # Explicit language
-      sbx run script.py                           # Run file
-      sbx run -p requests 'import requests; ...'  # With package
+      sbx run 'print("hello")'                              # Simple Python
+      sbx run -l javascript 'console.log("hi")'             # Explicit language
+      sbx run script.py                                     # Run file
+      sbx run -p requests==2.32.5 'import requests; ...'    # With package
       sbx run --network --allow-domain api.example.com script.py
-      echo 'print(42)' | sbx run -                # From stdin
-      sbx run --json 'print("test")' | jq .       # JSON output
-      sbx run -c 'print(1)' -c 'print(2)'         # Multiple via -c flag
+      echo 'print(42)' | sbx run -                          # From stdin
+      sbx run --json 'print("test")' | jq .                 # JSON output
+      sbx run -c 'print(1)' -c 'print(2)'                   # Multiple via -c flag
       sbx run --upload ./data.csv:data.csv -c "print(open('data.csv').read())"
       sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
       sbx run --download output.csv -c "open('output.csv','w').write('data')"

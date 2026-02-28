@@ -52,7 +52,7 @@ sbx run app.js
 echo 'print(42)' | sbx run -
 
 # With packages
-sbx run -p requests -p pandas 'import pandas; print(pandas.__version__)'
+sbx run -p requests==2.32.5 -p pandas==3.0.1 'import pandas; print(pandas.__version__)'
 
 # With timeout and memory limits
 sbx run -t 60 -m 512 long_script.py
