@@ -21,6 +21,8 @@ from exec_sandbox.exceptions import PackageInstallPermanentError, PackageInstall
 from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
 
+from .conftest import skip_unless_hwaccel
+
 
 def _get_major_minor_version() -> str:
     """Extract major.minor from __version__ (e.g., '0.1.0' -> '0.1')."""
@@ -247,12 +249,14 @@ class TestDiskSnapshotManagerIntegration:
         assert len(base_parts) == 4  # python, v{version}, {img_hash}, base
         assert len(base_parts[2]) == 8  # img_hash is 8 chars
 
-    @pytest.mark.sudo
+    @skip_unless_hwaccel
     async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
-        """Create snapshot with packages (requires VM, uses qemu-vm user on Linux).
+        """Create snapshot with packages, verify L2 cache hit on second call.
 
-        Slow under TCG: snapshot creation boots two VMs (install + verify) —
-        functional under TCG but boot overhead makes it too slow for the default suite.
+        Requires hwaccel: boots a VM to pip-install packages, then shuts down
+        and commits the overlay to a standalone qcow2.  Under TCG the combined
+        boot + install wall-clock exceeds CI job timeouts (observed 60 min hang
+        on linux/x64 + linux/arm64 sudo runners).
         """
         from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
