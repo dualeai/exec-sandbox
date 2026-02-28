@@ -408,31 +408,3 @@ def setup_test_environment():
     # Cleanup
     os.environ.pop("ENVIRONMENT", None)
     os.environ.pop("LOG_LEVEL", None)
-
-
-@pytest.fixture
-def assert_no_pending_tasks():
-    """Fixture that fails if any tasks are pending after the test.
-
-    Use this fixture in tests that create background tasks to ensure
-    proper cleanup. Python 3.14 has stricter detection of orphaned tasks.
-
-    Usage:
-        async def test_something(assert_no_pending_tasks) -> None:
-            # ... test code that creates tasks ...
-            assert_no_pending_tasks()  # Call at end to verify cleanup
-    """
-
-    def _check() -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop, nothing to check
-            return
-
-        pending = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not asyncio.current_task(loop)]
-        if pending:
-            task_names = [t.get_name() for t in pending]
-            pytest.fail(f"Pending tasks after test: {task_names}")
-
-    return _check

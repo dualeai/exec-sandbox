@@ -311,11 +311,6 @@ class UnixSocketChannel:
             except TimeoutError:
                 continue  # Check shutdown flag
             except RuntimeError as e:
-                if "Event loop is closed" in str(e):
-                    # Expected during pytest-asyncio teardown: the event loop
-                    # closes before all write workers finish.  Queue.get()
-                    # cleanup calls call_soon() which raises on a closed loop.
-                    break
                 logger.error(
                     "UnixSocketChannel write worker error - connection broken",
                     extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
