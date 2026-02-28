@@ -628,8 +628,11 @@ async def test_floor_recovery_wakes_waiters() -> None:
         await asyncio.sleep(0.1)
         assert not acquire_task.done()
 
-        # Simulate memory recovery + notify
+        # Simulate memory recovery + notify (invalidate TTL probe cache so the
+        # woken waiter sees the fresh value — sleep(0.1) ≈ cache TTL, creating
+        # a race on slow runners where the cache hasn't expired yet)
         available_mb[0] = 2048.0
+        _invalidate_probe_caches(ctrl)
         async with ctrl._condition:
             ctrl._condition.notify_all()
 
