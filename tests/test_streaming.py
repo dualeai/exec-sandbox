@@ -319,8 +319,15 @@ print("error line", file=sys.stderr)
         assert len(stdout_chunks) >= 1
         assert len(stderr_chunks) == 0
 
+    @skip_unless_hwaccel
     async def test_stderr_without_trailing_newline(self, scheduler: Scheduler) -> None:
-        """Residual stderr_line_buf is flushed even without trailing newline."""
+        """Residual stderr_line_buf is flushed even without trailing newline.
+
+        Requires hwaccel: the code itself is trivial (~5ms), but under TCG
+        the full VM lifecycle (L1 restore failure → cold boot fallback →
+        REPL warm-up) can consume most of the 120s test timeout, leaving
+        the guest-agent starved and causing spurious execution timeouts.
+        """
         stderr_chunks: list[str] = []
 
         code = """
