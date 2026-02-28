@@ -47,6 +47,20 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _sha256_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file in 1 MB chunks.
+
+    Sync function, meant to be called via ``asyncio.to_thread`` so the
+    event loop stays responsive (~0.1 ms blocked instead of ~60 ms for a
+    typical 100 MB vmstate file).
+    """
+    sha256 = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
 class MemorySnapshotManager(BaseCacheManager):
     """L1 memory snapshot cache. Manages vmstate files + metadata sidecars.
 
@@ -178,12 +192,9 @@ class MemorySnapshotManager(BaseCacheManager):
             if isinstance(val, str):
                 expected_sha256 = val
         if expected_sha256:
-            sha256 = hashlib.sha256()
             try:
-                with vmstate_path.open("rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        sha256.update(chunk)
-                if sha256.hexdigest() != expected_sha256:
+                actual_sha256 = await asyncio.to_thread(_sha256_file, vmstate_path)
+                if actual_sha256 != expected_sha256:
                     logger.warning("L1 cache vmstate integrity check failed, removing", extra={"key": key})
                     vmstate_path.unlink(missing_ok=True)
                     meta_path.unlink(missing_ok=True)
@@ -276,12 +287,7 @@ class MemorySnapshotManager(BaseCacheManager):
                 await client.save_snapshot(tmp_path, qemu_version=qemu_version)
 
             # Compute SHA-256 of vmstate for integrity verification on restore.
-            # Runs at memory bandwidth speed (~GB/s), negligible vs migration I/O.
-            sha256 = hashlib.sha256()
-            with tmp_path.open("rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):  # 1MB chunks
-                    sha256.update(chunk)
-            vmstate_sha256 = sha256.hexdigest()
+            vmstate_sha256 = await asyncio.to_thread(_sha256_file, tmp_path)
 
             # Write metadata sidecar before atomic rename
             arch = detect_host_arch()
