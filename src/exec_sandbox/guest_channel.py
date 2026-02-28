@@ -311,11 +311,12 @@ class UnixSocketChannel:
             except TimeoutError:
                 continue  # Check shutdown flag
             except RuntimeError as e:
-                logger.error(
-                    "UnixSocketChannel write worker error - connection broken",
-                    extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
-                    exc_info=True,
-                )
+                if "event loop is closed" not in str(e).lower():
+                    logger.error(
+                        "UnixSocketChannel write worker error - connection broken",
+                        extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
+                        exc_info=True,
+                    )
                 break
             except Exception as e:
                 # Log error with full traceback
