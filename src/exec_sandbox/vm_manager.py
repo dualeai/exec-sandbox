@@ -398,7 +398,7 @@ class VmManager:
             language: Programming language (python or javascript)
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
-            memory_mb: Memory limit in MB (minimum 128, default 256)
+            memory_mb: Memory limit in MB (minimum 128, default 192)
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, path to ext4 qcow2 for snapshot creation.

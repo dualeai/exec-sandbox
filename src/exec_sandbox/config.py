@@ -41,7 +41,7 @@ class SchedulerConfig(BaseModel):
         warm_pool_size: Number of pre-booted VMs per language (python, javascript).
             0 disables warm pool. Default: 0 (cold boot only).
         default_memory_mb: Default guest VM memory in MB. Can be overridden per-run.
-            Minimum: 128. No upper bound (limited by host resources). Default: 256.
+            Minimum: 128. No upper bound (limited by host resources). Default: 192.
         default_timeout_seconds: Default execution timeout in seconds.
             Can be overridden per-run. Range: 1-300. Default: 30.
         images_dir: Directory containing base VM images (qcow2, kernels).
@@ -80,8 +80,8 @@ class SchedulerConfig(BaseModel):
 
     # Defaults for run()
     default_memory_mb: int = Field(
-        default=256,
-        ge=128,
+        default=constants.DEFAULT_MEMORY_MB,
+        ge=constants.MIN_MEMORY_MB,
         description="Default guest VM memory in MB",
     )
     default_timeout_seconds: int = Field(

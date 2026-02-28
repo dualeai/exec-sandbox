@@ -25,7 +25,7 @@ class TestSchedulerConfigValidation:
         """SchedulerConfig has sensible defaults."""
         config = SchedulerConfig()
         assert config.warm_pool_size == 0
-        assert config.default_memory_mb == 256
+        assert config.default_memory_mb == 192
         assert config.default_timeout_seconds == 30
         assert config.images_dir is None
         assert config.disk_snapshot_cache_dir == get_cache_dir() / "disk-snapshots"

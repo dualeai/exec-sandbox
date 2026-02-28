@@ -391,7 +391,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript, Raw). Set >0 to enable |
-| `default_memory_mb` | 256 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
+| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
@@ -603,7 +603,7 @@ on_stdout=lambda chunk: buffer.append(chunk)  # Fast (same applies to on_boot_lo
 # warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
-default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
+default_memory_mb=192  # Code can actually use ~210-240MB thanks to compression
 # Don't rely on memory limits for security - use timeouts for runaway allocations
 
 # Network without domain restrictions is risky

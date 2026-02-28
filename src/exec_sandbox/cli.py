@@ -42,6 +42,7 @@ from exec_sandbox import (
     SchedulerConfig,
     VmTimeoutError,
     __version__,
+    constants,
 )
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
@@ -935,7 +936,7 @@ def cli(ctx: click.Context) -> None:
 )
 @click.option("-p", "--package", "packages", multiple=True, help="Package to install (repeatable)")
 @click.option("-t", "--timeout", default=30, show_default=True, help="Timeout in seconds")
-@click.option("-m", "--memory", default=256, show_default=True, help="Memory in MB")
+@click.option("-m", "--memory", default=constants.DEFAULT_MEMORY_MB, show_default=True, help="Memory in MB")
 @click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
 @click.option("--network", is_flag=True, help="Enable network access")
 @click.option("--allow-domain", "allowed_domains", multiple=True, help="Allowed domain (repeatable)")
