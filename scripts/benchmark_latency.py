@@ -32,6 +32,7 @@ from pathlib import Path
 from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_MEMORY_MB
+from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 
 # Honor EXEC_SANDBOX_LOG_LEVEL env var (e.g. DEBUG) by wiring up a real handler
@@ -162,21 +163,26 @@ async def benchmark_concurrent(
     """Benchmark VM boot + execution latency with concurrent requests."""
     code = CODE_MAP.get(language, "echo ok")
 
-    async def single_run() -> tuple[ExecutionResult, float]:
+    async def single_run() -> tuple[ExecutionResult, float] | None:
         start = time.perf_counter()
-        result = await scheduler.run(
-            code=code,
-            language=language,
-            timeout_seconds=60,
-            memory_mb=memory_mb,
-            allow_network=allow_network,
-        )
+        try:
+            result = await scheduler.run(
+                code=code,
+                language=language,
+                timeout_seconds=60,
+                memory_mb=memory_mb,
+                allow_network=allow_network,
+            )
+        except SandboxError as e:
+            e2e_ms = (time.perf_counter() - start) * 1000
+            print(f"  Warning: run failed after {e2e_ms:.0f}ms: {type(e).__name__}: {e}")
+            return None
         e2e_ms = (time.perf_counter() - start) * 1000
         return result, e2e_ms
 
     # Launch all requests concurrently
     results = await asyncio.gather(*[single_run() for _ in range(concurrency)])
-    return _collect_results(results)
+    return _collect_results([r for r in results if r is not None])
 
 
 # ============================================================================
