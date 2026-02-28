@@ -380,6 +380,21 @@ fn setup_zram_swap() {
         return;
     }
 
+    // Cap compressed memory at 25% of RAM. Without this, zram accepts pages
+    // indefinitely — the kernel reclaim loop thrashes (compress/decompress)
+    // instead of triggering the OOM killer, making the VM appear hung until
+    // timeout. With mem_limit, once compressed storage is full zram returns
+    // -ENOMEM on write → swap fails → OOM fires within seconds.
+    //
+    // Sizing: 25% of RAM × 2-3x lz4 ratio ≈ 50-75% effective swap capacity.
+    // For a 192 MB VM this means ~48 MB compressed → ~96-144 MB usable swap.
+    //
+    // Refs:
+    //   - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
+    //   - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
+    let mem_limit = mem_kb * 256; // 25% of RAM in bytes (KB * 1024 / 4)
+    let _ = std::fs::write("/sys/block/zram0/mem_limit", mem_limit.to_string());
+
     // Build and write swap header (mkswap equivalent)
     let header = match build_swap_header(zram_size) {
         Some(h) => h,
@@ -504,6 +519,10 @@ fn apply_sysctl_non_critical() {
 /// Pre-apply zram VM tuning sysctls before /proc/sys is made read-only.
 /// These values are safe to set even before zram device setup completes:
 /// the kernel uses defaults until swapon, then these take effect.
+///
+/// Refs:
+///   - https://docs.kernel.org/admin-guide/sysctl/vm.html
+///   - https://wiki.archlinux.org/title/Zram (recommended zram sysctls)
 fn apply_zram_vm_tuning() {
     let mem_kb = read_mem_total_kb();
 
@@ -514,6 +533,20 @@ fn apply_zram_vm_tuning() {
         (mem_kb * 4 / 100).to_string(),
     );
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "0");
+    // Kill the task that triggered OOM immediately instead of scanning the
+    // full task list for the "best" candidate. In a single-user sandbox VM
+    // there is only one meaningful process, so heuristic selection wastes
+    // time. Ref: https://docs.kernel.org/admin-guide/sysctl/vm.html
+    let _ = std::fs::write("/proc/sys/vm/oom_kill_allocating_task", "1");
+    // Disable watermark boosting — designed for spinning-disk fragmentation
+    // avoidance, counterproductive with zram (causes premature reclaim that
+    // wastes CPU on compression). Ref: https://wiki.archlinux.org/title/Zram
+    let _ = std::fs::write("/proc/sys/vm/watermark_boost_factor", "0");
+    // Widen kswapd wake-up range so background reclaim starts earlier and
+    // direct-reclaim stalls are less likely. Default 10 (0.1% of RAM) is
+    // too narrow for small VMs. 125 = 1.25% of RAM.
+    // Ref: https://wiki.archlinux.org/title/Zram
+    let _ = std::fs::write("/proc/sys/vm/watermark_scale_factor", "125");
 }
 
 // ============================================================================

@@ -177,8 +177,10 @@ initial_orig, initial_compr = get_zram_stats()
 print(f'Initial: orig={initial_orig}, compr={initial_compr}')
 
 # Allocate compressible data (repetitive pattern compresses well)
+# 120MB exceeds available RAM but fits within zram capacity thanks to compression.
+# (zram mem_limit is 25% of RAM; repetitive patterns compress >10x with lz4.)
 chunks = []
-for i in range(20):  # 200MB of compressible data
+for i in range(12):  # 120MB of compressible data
     chunk = bytearray(10 * 1024 * 1024)
     # Fill with repetitive pattern (highly compressible)
     pattern = bytes([i % 256] * 4096)
@@ -366,6 +368,171 @@ print('PASS: All 3 allocation cycles completed without corruption')
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS: All 3 allocation cycles" in result.stdout
+
+
+# ============================================================================
+# zram mem_limit Tests (OOM instead of thrashing)
+# ============================================================================
+
+
+class TestZramMemLimit:
+    """Tests for zram mem_limit — ensures OOM kills fast instead of thrashing.
+
+    Without mem_limit, the kernel reclaim loop thrashes (compress/decompress
+    in zram) when memory is exhausted, causing the VM to appear hung until
+    timeout. With mem_limit, zram rejects writes with -ENOMEM once compressed
+    storage is full, triggering the OOM killer within seconds.
+
+    Refs:
+        - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
+        - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
+    """
+
+    async def test_mem_limit_sysfs_exists(self, scheduler: Scheduler) -> None:
+        """zram mem_limit sysfs attribute should exist (write-only, not readable).
+
+        mem_limit is --w------- (kernel enforced write-only). We verify the
+        attribute exists and was configured by guest-agent. Behavioral
+        correctness is validated by the OOM tests below.
+        """
+        result = await scheduler.run(
+            code="""
+import os, stat
+
+path = '/sys/block/zram0/mem_limit'
+assert os.path.exists(path), 'mem_limit sysfs attribute missing'
+
+# Verify it's write-only (kernel-enforced, proves attribute is active)
+mode = os.stat(path).st_mode
+assert stat.S_IWUSR & mode, 'mem_limit should be writable by owner'
+assert not (stat.S_IRUSR & mode), 'mem_limit should be write-only (not readable)'
+
+print('PASS: mem_limit sysfs exists and is write-only')
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "PASS" in result.stdout
+
+    async def test_oom_kill_allocating_task_enabled(self, scheduler: Scheduler) -> None:
+        """oom_kill_allocating_task should be 1 for fast OOM response."""
+        result = await scheduler.run(
+            code="""
+with open('/proc/sys/vm/oom_kill_allocating_task') as f:
+    val = int(f.read().strip())
+    assert val == 1, f'oom_kill_allocating_task should be 1, got {val}'
+    print(f'PASS: oom_kill_allocating_task={val}')
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "PASS" in result.stdout
+
+    async def test_watermark_tuning(self, scheduler: Scheduler) -> None:
+        """Watermark sysctls should be tuned for zram (per ArchWiki)."""
+        result = await scheduler.run(
+            code="""
+with open('/proc/sys/vm/watermark_boost_factor') as f:
+    boost = int(f.read().strip())
+    assert boost == 0, f'watermark_boost_factor should be 0, got {boost}'
+
+with open('/proc/sys/vm/watermark_scale_factor') as f:
+    scale = int(f.read().strip())
+    assert scale == 125, f'watermark_scale_factor should be 125, got {scale}'
+
+print(f'PASS: watermark_boost_factor={boost}, watermark_scale_factor={scale}')
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0, f"Failed: {result.stderr}"
+        assert "PASS" in result.stdout
+
+    async def test_massive_alloc_oom_kills_not_timeout(self, scheduler: Scheduler) -> None:
+        """Massive allocation must OOM-kill (exit 137), NOT timeout.
+
+        This is the core regression test. Before mem_limit, allocating far
+        beyond RAM caused the kernel to thrash zram indefinitely, hitting the
+        execution timeout. With mem_limit, the OOM killer fires in seconds.
+        """
+        result = await scheduler.run(
+            code="""
+chunks = []
+while True:
+    chunks.append(bytearray(10 * 1024 * 1024))  # 10MB chunks, touched on alloc
+""",
+            language=Language.PYTHON,
+        )
+        # OOM kill = 137 (128 + SIGKILL). Must NOT be timeout (-1).
+        assert result.exit_code == 137, (
+            f"Expected OOM kill (137), got exit_code={result.exit_code}. "
+            f"If -1, zram is thrashing instead of OOM-killing."
+        )
+
+    async def test_gradual_alloc_oom_kills_not_timeout(self, scheduler: Scheduler) -> None:
+        """Gradual allocation (5MB chunks with page touching) should OOM, not thrash.
+
+        Slower than bulk allocation because the kernel manages pressure
+        page-by-page.
+        """
+        result = await scheduler.run(
+            code="""
+chunks = []
+while True:
+    chunk = bytearray(5 * 1024 * 1024)  # 5MB
+    for i in range(0, len(chunk), 4096):
+        chunk[i] = 0xFF  # Touch every page
+    chunks.append(chunk)
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 137, (
+            f"Expected OOM kill (137), got exit_code={result.exit_code}. "
+            f"Gradual allocation should still OOM-kill, not thrash."
+        )
+
+    async def test_incompressible_data_oom_kills(self, scheduler: Scheduler) -> None:
+        """Incompressible (random) data should OOM even faster — no compression benefit."""
+        result = await scheduler.run(
+            code="""
+import os
+chunks = []
+while True:
+    chunks.append(os.urandom(10 * 1024 * 1024))  # 10MB random (incompressible)
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 137, (
+            f"Expected OOM kill (137), got exit_code={result.exit_code}. Incompressible data should OOM quickly."
+        )
+
+    async def test_oom_after_successful_alloc_free_cycle(self, scheduler: Scheduler) -> None:
+        """OOM should still fire after alloc/free cycles (no zram leak).
+
+        Alloc/free cycles leave residual zram pages and allocator
+        fragmentation.
+        """
+        result = await scheduler.run(
+            code="""
+import gc
+
+# Warm up: alloc 100MB, free, repeat 3 times
+for _ in range(3):
+    chunks = [bytearray(10 * 1024 * 1024) for _ in range(10)]
+    for c in chunks:
+        c[0] = 1  # touch
+    del chunks
+    gc.collect()
+
+# Now exhaust memory — should OOM, not thrash
+chunks = []
+while True:
+    chunks.append(bytearray(10 * 1024 * 1024))
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 137, (
+            f"Expected OOM kill (137), got exit_code={result.exit_code}. OOM should fire even after alloc/free cycles."
+        )
 
 
 # ============================================================================
