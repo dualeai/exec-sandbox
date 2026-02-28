@@ -30,8 +30,12 @@ from operator import attrgetter
 from pathlib import Path
 
 from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig
+from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_MEMORY_MB
 from exec_sandbox.models import Language
+
+# Honor EXEC_SANDBOX_LOG_LEVEL env var (e.g. DEBUG) by wiring up a real handler
+configure_logging()
 
 # ============================================================================
 # Module Constants
