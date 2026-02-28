@@ -331,7 +331,7 @@ class Scheduler:
             )
         timeout = timeout_seconds if timeout_seconds is not None else self.config.default_timeout_seconds
 
-        vm, resolved_ports, is_cold_boot = await self._prepare_vm(
+        vm, resolved_ports, is_cold_boot, prepare_start_time = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -342,7 +342,8 @@ class Scheduler:
             on_boot_log=on_boot_log,
         )
 
-        run_start_time = asyncio.get_running_loop().time()
+        prepare_end_time = asyncio.get_running_loop().time()
+        result_out: ExecutionResult | None = None
         try:
             # Execute code
             execute_start_time = asyncio.get_running_loop().time()
@@ -357,12 +358,11 @@ class Scheduler:
 
             # Calculate timing
             execute_ms = round((execute_end_time - execute_start_time) * 1000)
-            total_ms = round((execute_end_time - run_start_time) * 1000)
 
-            # For warm pool: setup/boot are "free" (happened at service startup)
-            # For cold boot: use actual setup/boot times from VM
-            setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
+            # boot_ms from VM (0 for warm pool/L1), setup_ms = prepare time minus boot
             boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+            # setup_ms = all pre-boot time (admission + cache + overlay + cgroup)
+            setup_ms = max(0, round((prepare_end_time - prepare_start_time) * 1000) - boot_ms)
             # Granular setup timing
             overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
             # Granular boot timing
@@ -375,7 +375,7 @@ class Scheduler:
             # L1 timing (setup_ms is the L1 restore time when l1_restored)
             l1_restore_ms = vm.setup_ms if vm.l1_restored and vm.setup_ms is not None else None
 
-            return ExecutionResult(
+            result_out = ExecutionResult(
                 stdout=result.stdout,
                 stderr=result.stderr,
                 exit_code=result.exit_code,
@@ -387,7 +387,7 @@ class Scheduler:
                     setup_ms=setup_ms,
                     boot_ms=boot_ms,
                     execute_ms=execute_ms,
-                    total_ms=total_ms,
+                    total_ms=0,  # placeholder — patched after teardown
                     connect_ms=result.timing.connect_ms,
                     overlay_ms=overlay_ms,
                     qemu_cmd_build_ms=qemu_cmd_build_ms,
@@ -407,8 +407,17 @@ class Scheduler:
         finally:
             # Always destroy VM (never reused)
             # _vm_manager guaranteed non-None by _prepare_vm
+            teardown_start = asyncio.get_running_loop().time()
             if self._vm_manager is not None:
                 await self._vm_manager.destroy_vm(vm)
+            teardown_ms = round((asyncio.get_running_loop().time() - teardown_start) * 1000)
+            if result_out is not None:
+                result_out.timing.teardown_ms = teardown_ms
+                result_out.timing.total_ms = round((asyncio.get_running_loop().time() - prepare_start_time) * 1000)
+
+        if result_out is None:
+            raise SandboxError("Execution produced no result")
+        return result_out
 
     async def session(
         self,
@@ -464,7 +473,7 @@ class Scheduler:
         """
         idle_timeout = idle_timeout_seconds or self.config.session_idle_timeout_seconds
 
-        vm, resolved_ports, _is_cold_boot = await self._prepare_vm(
+        vm, resolved_ports, _is_cold_boot, _prepare_start_time = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -509,7 +518,7 @@ class Scheduler:
         expose_ports: list[PortMapping | int] | None,
         task_id: str,
         on_boot_log: Callable[[str], None] | None = None,
-    ) -> tuple[QemuVM, list[ExposedPort], bool]:
+    ) -> tuple[QemuVM, list[ExposedPort], bool, float]:
         """Create and boot a VM with the given configuration.
 
         Shared by run() and session() - handles validation, snapshots,
@@ -526,7 +535,7 @@ class Scheduler:
             on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
-            Tuple of (vm, resolved_ports, is_cold_boot).
+            Tuple of (vm, resolved_ports, is_cold_boot, prepare_start_time).
 
         Raises:
             SandboxError: Scheduler not started.
@@ -546,6 +555,8 @@ class Scheduler:
 
         if self._vm_manager is None or self._settings is None:
             raise SandboxError("Scheduler resources not initialized")
+
+        prepare_start_time = asyncio.get_running_loop().time()
 
         # Ensure language is a Language enum (callers may pass raw strings)
         language = Language(language)
@@ -660,7 +671,7 @@ class Scheduler:
                             allow_network=needs_network,
                         )
 
-        return vm, resolved_ports, is_cold_boot
+        return vm, resolved_ports, is_cold_boot, prepare_start_time
 
     def _create_settings(self) -> Settings:
         """Create Settings from SchedulerConfig.

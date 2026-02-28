@@ -1245,16 +1245,17 @@ class TestSchedulerWarmPoolTiming:
         assert result.warm_pool_hit is True
 
     async def test_warm_pool_timing_zero_setup_boot(self, warm_pool_scheduler: Scheduler) -> None:
-        """Warm pool hit should have setup_ms=0 and boot_ms=0."""
+        """Warm pool hit should have boot_ms=0 and small setup_ms (pool lookup)."""
         result = await warm_pool_scheduler.run(
             code="print('hello')",
             language=Language.PYTHON,
         )
 
         assert result.warm_pool_hit is True
-        # Setup and boot are "free" for warm pool - they happened at startup
-        assert result.timing.setup_ms == 0
+        # Boot is "free" for warm pool - it happened at startup
         assert result.timing.boot_ms == 0
+        # Setup reflects pool lookup time (typically <5ms)
+        assert result.timing.setup_ms < 50
 
     async def test_warm_pool_timing_has_execute_time(self, warm_pool_scheduler: Scheduler) -> None:
         """Warm pool hit should have real execute_ms and total_ms."""
@@ -1338,8 +1339,10 @@ class TestSchedulerWarmPoolTiming:
 
         assert result.exit_code == 0
         assert result.warm_pool_hit is True
-        assert result.timing.setup_ms == 0
+        # Boot is "free" for warm pool - it happened at startup
         assert result.timing.boot_ms == 0
+        # Setup reflects pool lookup time (typically <5ms)
+        assert result.timing.setup_ms < 50
         assert result.timing.execute_ms >= 0
 
 
