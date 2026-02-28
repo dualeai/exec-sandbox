@@ -173,6 +173,7 @@ class VmManager:
             host_memory_mb=settings.host_memory_mb,
             host_cpu_count=settings.host_cpu_count,
             available_memory_floor_mb=settings.available_memory_floor_mb,
+            host_cpu_reserve_cores=settings.host_cpu_reserve_cores,
         )
 
         # Overlay pool for fast VM boot (auto-manages base image discovery and pooling)
@@ -431,7 +432,6 @@ class VmManager:
                 language=language,
                 tenant_id=tenant_id,
                 task_id=task_id,
-                memory_mb=memory_mb,
                 allow_network=allow_network,
                 allowed_domains=allowed_domains,
                 direct_write_target=direct_write_target,
@@ -450,7 +450,6 @@ class VmManager:
                 language=language,
                 tenant_id=tenant_id,
                 task_id=task_id,
-                memory_mb=memory_mb,
                 allow_network=allow_network,
                 allowed_domains=allowed_domains,
                 direct_write_target=direct_write_target,
@@ -467,7 +466,6 @@ class VmManager:
         language: Language,
         tenant_id: str,
         task_id: str,
-        memory_mb: int,
         allow_network: bool,
         allowed_domains: list[str] | None,
         direct_write_target: Path | None,
@@ -493,7 +491,7 @@ class VmManager:
                     language=language,
                     tenant_id=tenant_id,
                     task_id=task_id,
-                    memory_mb=memory_mb,
+                    reservation=reservation,
                     allow_network=allow_network,
                     allowed_domains=allowed_domains,
                     direct_write_target=direct_write_target,
@@ -504,8 +502,8 @@ class VmManager:
                 )
                 # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
                 vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
-                # Mark VM as holding semaphore slot (released in destroy_vm)
-                vm.holds_semaphore_slot = True
+                # Mark VM as holding admission slot (released in destroy_vm)
+                vm.holds_admission_slot = True
                 # Store resource reservation on VM for release in destroy_vm
                 vm.resource_reservation = reservation
                 return vm
@@ -518,7 +516,7 @@ class VmManager:
         language: Language,
         tenant_id: str,
         task_id: str,
-        memory_mb: int,
+        reservation: ResourceReservation,
     ) -> _VmInfra:
         """Common VM infrastructure setup shared by _create_vm_impl and restore_vm.
 
@@ -528,6 +526,12 @@ class VmManager:
         4. Create overlay from base image
         5. Set up cgroup and permissions (parallel)
         6. Prepare guest communication channel
+
+        Args:
+            language: Programming language
+            tenant_id: Tenant identifier
+            task_id: Task identifier
+            reservation: Pre-acquired admission reservation with effective limits
 
         Returns:
             _VmInfra with all pre-launch state. Caller must handle cleanup
@@ -555,7 +559,12 @@ class VmManager:
 
         perm_result, cgroup_result = await asyncio.gather(
             self._apply_overlay_permissions(base_image, workdir.overlay_image),
-            cgroup.setup_cgroup(vm_id, tenant_id, memory_mb, constants.DEFAULT_VM_CPU_CORES, use_tcg),
+            cgroup.setup_cgroup(
+                vm_id,
+                tenant_id,
+                cgroup_memory_mb=int(reservation.memory_mb),
+                cgroup_cpu_cores=reservation.cpu_cores,
+            ),
             return_exceptions=True,
         )
         if isinstance(perm_result, BaseException):
@@ -644,7 +653,7 @@ class VmManager:
         infra: _VmInfra,
         qemu_cmd: list[str],
         language: Language,
-        memory_mb: int,
+        reservation: ResourceReservation,
         on_boot_log: Callable[[str], None] | None = None,
         gvproxy_proc: ProcessWrapper | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
@@ -661,7 +670,7 @@ class VmManager:
             VmDependencyError: QEMU binary not found
         """
         if not cgroup.is_cgroup_available(infra.cgroup_path):
-            qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, memory_mb)
+            qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, int(reservation.memory_mb))
 
         try:
 
@@ -760,7 +769,7 @@ class VmManager:
         language: Language,
         tenant_id: str,
         task_id: str,
-        memory_mb: int = constants.DEFAULT_MEMORY_MB,
+        reservation: ResourceReservation,
         allow_network: bool = False,
         allowed_domains: list[str] | None = None,
         direct_write_target: Path | None = None,
@@ -779,7 +788,7 @@ class VmManager:
             language: Programming language (python or javascript)
             tenant_id: Tenant identifier for isolation
             task_id: Task identifier
-            memory_mb: Memory limit in MB (minimum 128, default 256)
+            reservation: Pre-acquired admission reservation with effective limits
             allow_network: Enable network access (default: False, isolated)
             allowed_domains: Whitelist of allowed domains if allow_network=True
             direct_write_target: If set, path to ext4 qcow2 for snapshot creation.
@@ -806,7 +815,7 @@ class VmManager:
             raise VmConfigError("snapshot_drive and direct_write_target are mutually exclusive")
 
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
-        infra = await self._setup_vm_infra(language, tenant_id, task_id, memory_mb)
+        infra = await self._setup_vm_infra(language, tenant_id, task_id, reservation)
         setup_complete_time = asyncio.get_running_loop().time()
 
         # Grant qemu-vm access to extra drives (snapshot creation target or read-only snapshot).
@@ -816,7 +825,7 @@ class VmManager:
         elif infra.workdir.use_qemu_vm_user and snapshot_drive:
             await grant_qemu_vm_file_access(snapshot_drive, writable=False)
 
-        # Phase 2: Build QEMU command (create-specific params)
+        # Phase 2: Build QEMU command (create-specific params — use guest values for QEMU)
         vdb_path = (
             str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
         )
@@ -825,8 +834,8 @@ class VmManager:
             self.arch,
             infra.vm_id,
             infra.workdir,
-            memory_mb,
-            constants.DEFAULT_VM_CPU_CORES,
+            reservation.guest_memory_mb,
+            reservation.guest_cpu_cores,
             allow_network,
             expose_ports=expose_ports,
             direct_write=direct_write_target is not None,
@@ -847,7 +856,7 @@ class VmManager:
                 infra,
                 qemu_cmd,
                 language,
-                memory_mb,
+                reservation,
                 on_boot_log,
                 gvproxy_proc,
                 gvproxy_log_task,
@@ -997,7 +1006,6 @@ class VmManager:
                 tenant_id=tenant_id,
                 task_id=task_id,
                 vmstate_path=vmstate_path,
-                memory_mb=memory_mb,
                 snapshot_drive=snapshot_drive,
                 allow_network=allow_network,
                 allowed_domains=allowed_domains,
@@ -1015,7 +1023,6 @@ class VmManager:
                 tenant_id=tenant_id,
                 task_id=task_id,
                 vmstate_path=vmstate_path,
-                memory_mb=memory_mb,
                 snapshot_drive=snapshot_drive,
                 allow_network=allow_network,
                 allowed_domains=allowed_domains,
@@ -1031,7 +1038,6 @@ class VmManager:
         tenant_id: str,
         task_id: str,
         vmstate_path: Path,
-        memory_mb: int,
         snapshot_drive: Path | None,
         allow_network: bool,
         allowed_domains: list[str] | None,
@@ -1040,21 +1046,21 @@ class VmManager:
     ) -> QemuVM:
         """Restore VM with an already-acquired reservation. Ownership transfers to VM on success."""
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
-        infra = await self._setup_vm_infra(language, tenant_id, task_id, memory_mb)
+        infra = await self._setup_vm_infra(language, tenant_id, task_id, reservation)
 
         # Grant qemu-vm read access to snapshot drive if present
         if infra.workdir.use_qemu_vm_user and snapshot_drive:
             await grant_qemu_vm_file_access(snapshot_drive, writable=False)
 
-        # Phase 2: Build QEMU command (restore-specific: defer_incoming, matching network topology)
+        # Phase 2: Build QEMU command (restore-specific — use guest values for QEMU)
         vdb_path = str(snapshot_drive) if snapshot_drive else None
         qemu_cmd = await build_qemu_cmd(
             self.settings,
             self.arch,
             infra.vm_id,
             infra.workdir,
-            memory_mb,
-            constants.DEFAULT_VM_CPU_CORES,
+            reservation.guest_memory_mb,
+            reservation.guest_cpu_cores,
             allow_network=allow_network,
             expose_ports=expose_ports,
             snapshot_drive=vdb_path,
@@ -1073,7 +1079,7 @@ class VmManager:
                 infra,
                 qemu_cmd,
                 language,
-                memory_mb,
+                reservation,
                 gvproxy_proc=gvproxy_proc,
                 gvproxy_log_task=gvproxy_log_task,
             )
@@ -1113,7 +1119,7 @@ class VmManager:
 
             # VM is now running with REPL already warm
             vm.l1_restored = True
-            vm.holds_semaphore_slot = True
+            vm.holds_admission_slot = True
             vm.resource_reservation = reservation
 
             restore_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
@@ -1315,8 +1321,8 @@ class VmManager:
             async with self._vms_lock:
                 self._vms.pop(vm.vm_id, None)
             # Release resource reservation only if this VM held one (prevents double-release)
-            if vm.holds_semaphore_slot:
-                vm.holds_semaphore_slot = False
+            if vm.holds_admission_slot:
+                vm.holds_admission_slot = False
                 if vm.resource_reservation is not None:
                     await self._admission.release(vm.resource_reservation)
                     vm.resource_reservation = None

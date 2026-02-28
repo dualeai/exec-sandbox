@@ -18,12 +18,15 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 from exec_sandbox.admission import ResourceAdmissionController
-from exec_sandbox.cgroup import CGROUP_MEMORY_OVERHEAD_MB, TCG_TB_CACHE_SIZE_MB
 from exec_sandbox.constants import (
     DEFAULT_CPU_OVERCOMMIT_RATIO,
+    DEFAULT_HOST_CPU_RESERVE_CORES,
     DEFAULT_HOST_MEMORY_RESERVE_RATIO,
     DEFAULT_MEMORY_OVERCOMMIT_RATIO,
+    DEFAULT_TCG_TB_CACHE_SIZE_MB,
     DEFAULT_VM_CPU_CORES,
+    DEFAULT_VM_CPU_OVERHEAD_CORES,
+    DEFAULT_VM_MEMORY_OVERHEAD_MB,
     RESOURCE_ADMISSION_TIMEOUT_SECONDS,
 )
 from exec_sandbox.exceptions import VmCapacityError
@@ -45,6 +48,7 @@ def _make_controller(
     cpu_overcommit: float = DEFAULT_CPU_OVERCOMMIT_RATIO,
     reserve_ratio: float = DEFAULT_HOST_MEMORY_RESERVE_RATIO,
     available_memory_floor_mb: int = 0,
+    cpu_reserve_cores: float = DEFAULT_HOST_CPU_RESERVE_CORES,
 ) -> ResourceAdmissionController:
     """Create an admission controller with known host resources (no psutil)."""
     return ResourceAdmissionController(
@@ -54,6 +58,7 @@ def _make_controller(
         host_memory_mb=host_memory_mb,
         host_cpu_count=host_cpu_count,
         available_memory_floor_mb=available_memory_floor_mb,
+        host_cpu_reserve_cores=cpu_reserve_cores,
     )
 
 
@@ -71,18 +76,21 @@ def _invalidate_probe_caches(*controllers: ResourceAdmissionController) -> None:
 
 
 def test_budget_calculation() -> None:
-    """Memory budget = host_total * (1 - reserve_ratio) * overcommit."""
+    """Memory budget = host_total * (1 - reserve_ratio) * overcommit.
+    CPU budget = (host_cpus - cpu_reserve) * overcommit.
+    """
     ctrl = _make_controller(
         host_memory_mb=16_000.0,
         reserve_ratio=0.1,
         memory_overcommit=1.5,
         host_cpu_count=8.0,
         cpu_overcommit=4.0,
+        cpu_reserve_cores=0.5,
     )
     # 16000 * 0.9 * 1.5 = 21600
     assert ctrl._memory_budget_mb == pytest.approx(21_600.0)
-    # 8 * 4 = 32
-    assert ctrl._cpu_budget == pytest.approx(32.0)
+    # (8 - 0.5) * 4 = 30
+    assert ctrl._cpu_budget == pytest.approx(30.0)
 
 
 def test_budget_reserve_ratio_scales() -> None:
@@ -104,9 +112,9 @@ def test_budget_reserve_ratio_scales() -> None:
 async def test_memory_gate_blocks_when_budget_exhausted() -> None:
     """Acquire blocks when memory budget would be exceeded."""
     # 4GB host, 10% reserve, 1.0x overcommit → 3600MB budget
-    # Each VM: 256 + CGROUP_MEMORY_OVERHEAD_MB overhead
+    # Each VM: 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB overhead
     # Compute how many VMs fit, then the next one should block
-    total_per_vm = 256 + CGROUP_MEMORY_OVERHEAD_MB
+    total_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
     budget_mb = 3_600  # 4000 * 0.9 * 1.0
     n_fit = budget_mb // total_per_vm  # VMs that fit in budget
 
@@ -143,19 +151,24 @@ async def test_memory_gate_blocks_when_budget_exhausted() -> None:
 
 
 async def test_cpu_gate_blocks_when_budget_exhausted() -> None:
-    """Acquire blocks when CPU budget would be exceeded."""
-    # 2 host CPUs, 1.0x overcommit → 2.0 CPU budget
-    # Each VM: 1.0 CPU → 2 fit
+    """Acquire blocks when CPU budget would be exceeded.
+
+    Each VM uses cpu_cores + DEFAULT_VM_CPU_OVERHEAD_CORES effective CPU.
+    Budget = (host_cpus - reserve) * overcommit.
+    With 3.0 host CPUs, 0 reserve, 1.0x overcommit → 3.0 budget.
+    Each VM: 1.0 + DEFAULT_VM_CPU_OVERHEAD_CORES effective → 2 fit, 3rd blocks.
+    """
     ctrl = _make_controller(
         host_memory_mb=100_000.0,
-        host_cpu_count=2.0,
+        host_cpu_count=3.0,
         cpu_overcommit=1.0,
+        cpu_reserve_cores=0.0,
     )
 
     r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
     r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
 
-    # 3rd should block
+    # 3rd should block (2.5 + 1.25 = 3.75 > 3.0)
     acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, timeout=1.0))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
@@ -174,17 +187,23 @@ async def test_cpu_gate_blocks_when_budget_exhausted() -> None:
 
 
 async def test_multi_core_vms_consume_proportional_budget() -> None:
-    """2-core VMs consume 2x budget, so only 2 fit in a 4-core budget."""
+    """2-core VMs consume proportional budget including overhead.
+
+    Each 2-core VM uses 2.0 + 0.25 = 2.25 effective CPU.
+    With 5.0 host CPUs, 0 reserve, 1.0x overcommit → 5.0 budget.
+    2 VMs use 4.5, 3rd would need 6.75 → blocks.
+    """
     ctrl = _make_controller(
         host_memory_mb=100_000.0,
-        host_cpu_count=4.0,
+        host_cpu_count=5.0,
         cpu_overcommit=1.0,
+        cpu_reserve_cores=0.0,
     )
 
     r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=2.0, timeout=_TIMEOUT)
     r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, timeout=_TIMEOUT)
 
-    # 3rd 2-core VM should block (4.0 budget fully used)
+    # 3rd 2-core VM should block (4.5 + 2.25 = 6.75 > 5.0)
     acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, timeout=0.3))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
@@ -199,22 +218,27 @@ async def test_multi_core_vms_consume_proportional_budget() -> None:
 
 
 async def test_mixed_core_vms_share_budget() -> None:
-    """Mix of 1-core and 2-core VMs shares the same budget correctly."""
-    # 3 host CPUs, 1.0x overcommit → 3.0 CPU budget
+    """Mix of 1-core and 2-core VMs shares the same budget correctly.
+
+    Each VM gets DEFAULT_VM_CPU_OVERHEAD_CORES added to its guest cores.
+    1-core VM effective: 1+overhead, 2-core VM effective: 2+overhead.
+    With 4.0 host CPUs, 0 reserve, 1.0x overcommit → 4.0 budget.
+    """
     ctrl = _make_controller(
         host_memory_mb=100_000.0,
-        host_cpu_count=3.0,
+        host_cpu_count=4.0,
         cpu_overcommit=1.0,
+        cpu_reserve_cores=0.0,
     )
 
-    # 1-core + 2-core = 3.0 (fits exactly)
+    # 1-core (1.25 eff) + 2-core (2.25 eff) = 3.50 (fits in 4.0 budget)
     r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, timeout=_TIMEOUT)
     r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, timeout=_TIMEOUT)
 
-    assert ctrl._allocated_cpu == pytest.approx(3.0)
-    assert ctrl._cpu_budget - ctrl._allocated_cpu == pytest.approx(0.0)
+    assert ctrl._allocated_cpu == pytest.approx(3.5)
+    assert ctrl._cpu_budget - ctrl._allocated_cpu == pytest.approx(0.5)
 
-    # Even a 1-core VM should block now
+    # Even a 1-core VM should block now (1.25 > 0.50 remaining)
     acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, timeout=0.3))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
@@ -227,11 +251,14 @@ async def test_mixed_core_vms_share_budget() -> None:
 
 
 async def test_overcommit_allows_more_cpu_than_physical() -> None:
-    """CPU overcommit ratio allows admitting more cores than physical host has."""
-    # 2 physical CPUs, 4.0x overcommit → 8.0 CPU budget
+    """CPU overcommit ratio allows admitting more cores than physical host has.
+
+    3 physical CPUs, 0.5 reserve, 4.0x overcommit → (3-0.5)*4 = 10.0 CPU budget.
+    Each 1-core VM effective: 1.25. 8 VMs * 1.25 = 10.0 (exact fit).
+    """
     ctrl = _make_controller(
         host_memory_mb=100_000.0,
-        host_cpu_count=2.0,
+        host_cpu_count=3.0,
         cpu_overcommit=4.0,
     )
 
@@ -240,7 +267,7 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
         r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=1.0, timeout=_TIMEOUT)
         reservations.append(r)
 
-    assert ctrl._allocated_cpu == pytest.approx(8.0)
+    assert ctrl._allocated_cpu == pytest.approx(10.0)
     assert ctrl._cpu_budget - ctrl._allocated_cpu == pytest.approx(0.0)
 
     # 9th should block
@@ -263,8 +290,8 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
 
 async def test_acquire_timeout_raises_capacity_error() -> None:
     """VmCapacityError raised when timeout expires waiting for resources."""
-    # Tight CPU budget: only 1 VM fits
-    ctrl = _make_controller(host_cpu_count=1.0, cpu_overcommit=1.0)
+    # Tight CPU budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
+    ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
     r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
 
     with pytest.raises(VmCapacityError, match="Resource admission timeout"):
@@ -279,14 +306,14 @@ async def test_acquire_timeout_raises_capacity_error() -> None:
 
 
 async def test_tcg_adds_extra_memory_overhead() -> None:
-    """use_tcg=True adds TCG_TB_CACHE_SIZE_MB to the reservation."""
+    """use_tcg=True adds DEFAULT_TCG_TB_CACHE_SIZE_MB to the reservation."""
     ctrl = _make_controller()
 
     r_kvm = await ctrl.acquire("vm-kvm", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT, use_tcg=False)
-    assert r_kvm.memory_mb == 256 + CGROUP_MEMORY_OVERHEAD_MB
+    assert r_kvm.memory_mb == 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
 
     r_tcg = await ctrl.acquire("vm-tcg", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT, use_tcg=True)
-    assert r_tcg.memory_mb == 256 + CGROUP_MEMORY_OVERHEAD_MB + TCG_TB_CACHE_SIZE_MB
+    assert r_tcg.memory_mb == 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
 
     await ctrl.release(r_kvm)
     await ctrl.release(r_tcg)
@@ -1184,8 +1211,8 @@ async def test_probe_failure_removes_cross_process_protection() -> None:
 
 async def test_stop_unblocks_waiting_acquires() -> None:
     """stop() immediately unblocks blocked acquire() callers with VmCapacityError."""
-    # Tight budget: only 1 VM fits
-    ctrl = _make_controller(host_cpu_count=1.0, cpu_overcommit=1.0)
+    # Tight budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
+    ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
 
     r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, timeout=_TIMEOUT)
 
@@ -1214,10 +1241,12 @@ def test_effective_max_vms_basic() -> None:
     """effective_max_vms returns correct value for standard config."""
     ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=8.0)
     result = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
-    # Memory: 16000 * 0.9 * 1.5 = 21600, per-VM = 256+128=384, max_mem = 56
-    # CPU: 8 * 4.0 = 32, per-VM = 1.0, max_cpu = 32
-    # min(56, 32) = 32
-    assert result == 32
+    mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
+    mem_budget = 16_000 * (1 - DEFAULT_HOST_MEMORY_RESERVE_RATIO) * DEFAULT_MEMORY_OVERCOMMIT_RATIO
+    cpu_per_vm = 1.0 + DEFAULT_VM_CPU_OVERHEAD_CORES
+    cpu_budget = (8.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO
+    expected = min(int(mem_budget // mem_per_vm), int(cpu_budget // cpu_per_vm))
+    assert result == expected
 
 
 def test_effective_max_vms_with_tcg() -> None:
@@ -1226,11 +1255,16 @@ def test_effective_max_vms_with_tcg() -> None:
     ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=100.0)
     result_kvm = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=False)
     result_tcg = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=True)
-    # KVM: per-VM = 256+128=384, budget=21600, max_mem=56, max_cpu=400 → 56
-    # TCG: per-VM = 256+128+256=640, budget=21600, max_mem=33, max_cpu=400 → 33
+    mem_budget = 16_000 * (1 - DEFAULT_HOST_MEMORY_RESERVE_RATIO) * DEFAULT_MEMORY_OVERCOMMIT_RATIO
+    cpu_budget = (100.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO
+    cpu_per_vm = 1.0 + DEFAULT_VM_CPU_OVERHEAD_CORES
+    kvm_mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
+    tcg_mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
+    expected_kvm = min(int(mem_budget // kvm_mem_per_vm), int(cpu_budget // cpu_per_vm))
+    expected_tcg = min(int(mem_budget // tcg_mem_per_vm), int(cpu_budget // cpu_per_vm))
     assert result_tcg < result_kvm
-    assert result_kvm == 56
-    assert result_tcg == 33
+    assert result_kvm == expected_kvm
+    assert result_tcg == expected_tcg
 
 
 def test_effective_max_vms_one_dimension_unlimited() -> None:
@@ -1239,8 +1273,8 @@ def test_effective_max_vms_one_dimension_unlimited() -> None:
     # Manually set memory unlimited, CPU finite
     ctrl._memory_budget_mb = float("inf")
     result = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
-    # CPU: 8 * 4.0 = 32
-    assert result == 32
+    # CPU: (8-0.5) * 4.0 = 30.0, per-VM = 1.25, max_cpu = 24
+    assert result == 24
 
     # Manually set CPU unlimited, memory finite
     ctrl._memory_budget_mb = 21600.0

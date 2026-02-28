@@ -398,8 +398,9 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
 | `memory_overcommit_ratio` | 1.5 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
-| `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = host_cpus × ratio |
+| `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
+| `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
@@ -501,6 +502,7 @@ The critical metric is **time to first code execution** — not just VM boot, bu
 | `execution_time_ms` | int | Duration reported by VM |
 | `external_cpu_time_ms` | int | CPU time measured by host |
 | `external_memory_peak_mb` | int | Peak memory measured by host |
+| `external_cpu_nr_throttled` | int | CFS bandwidth throttle events (host cgroup) |
 | `timing.setup_ms` | int | Resource setup (filesystem, limits, network) |
 | `timing.boot_ms` | int | VM boot time |
 | `timing.execute_ms` | int | Code execution |

@@ -4,7 +4,7 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
-from exec_sandbox import cgroup, constants
+from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import VmDependencyError
 from exec_sandbox.models import ExposedPort
@@ -28,8 +28,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     arch: HostArch,
     vm_id: str,
     workdir: VmWorkingDirectory,
-    memory_mb: int,
-    cpu_cores: int,
+    memory_mb: float,
+    cpu_cores: float,
     allow_network: bool,
     expose_ports: list[ExposedPort] | None = None,
     direct_write: bool = False,
@@ -92,9 +92,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         #
         # tb-size: Translation block cache size in MB. QEMU 5.0+ defaults to 1GB
         # which causes OOM on CI runners with multiple VMs. Must match
-        # cgroup.TCG_TB_CACHE_SIZE_MB for correct cgroup memory limits.
-        # See cgroup.py for size rationale and benchmarks.
-        accel = f"tcg,thread=single,tb-size={cgroup.TCG_TB_CACHE_SIZE_MB}"
+        # constants.DEFAULT_TCG_TB_CACHE_SIZE_MB for correct cgroup memory limits.
+        # See constants.py for size rationale and benchmarks.
+        accel = f"tcg,thread=single,tb-size={constants.DEFAULT_TCG_TB_CACHE_SIZE_MB}"
         logger.warning(
             "Using TCG software emulation (slow) - KVM/HVF not available",
             extra={"vm_id": vm_id, "accel": accel},
@@ -405,9 +405,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             machine_type,
             "-no-reboot",
             "-m",
-            f"{memory_mb}M",
+            f"{int(memory_mb)}M",  # QEMU -m requires integer MB
             "-smp",
-            str(cpu_cores),
+            str(int(cpu_cores)),  # QEMU -smp requires integer vCPU count
             "-kernel",
             str(kernel_path),
             "-initrd",

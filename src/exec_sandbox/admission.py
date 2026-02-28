@@ -2,7 +2,7 @@
 
 Four admission gates (all must pass):
 1. Memory budget - host_total * (1 - reserve_ratio) * overcommit_ratio
-2. CPU budget - host_cpu_count * cpu_overcommit_ratio
+2. CPU budget - (host_cpu_count - host_cpu_reserve) * cpu_overcommit_ratio
 3a. Available-memory floor - reject when system available memory is insufficient
 3b. Memory pressure - reject when system is thrashing
     - Linux 4.20+: PSI full avg10 >= 10% from /proc/pressure/memory
@@ -31,22 +31,29 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
 from uuid import uuid4
 
 import psutil
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.cgroup import (
-    CGROUP_MEMORY_OVERHEAD_MB,
-    TCG_TB_CACHE_SIZE_MB,
     detect_cgroup_cpu_limit,
     detect_cgroup_memory_limit_mb,
     read_container_available_memory_mb,
 )
-from exec_sandbox.constants import GATE3_SELF_WAKE_INTERVAL_SECONDS
+from exec_sandbox.constants import (
+    DEFAULT_HOST_CPU_RESERVE_CORES,
+    DEFAULT_TCG_TB_CACHE_SIZE_MB,
+    DEFAULT_VM_CPU_OVERHEAD_CORES,
+    DEFAULT_VM_MEMORY_OVERHEAD_MB,
+    GATE3_SELF_WAKE_INTERVAL_SECONDS,
+)
 from exec_sandbox.exceptions import VmCapacityError
 from exec_sandbox.platform_utils import HostOS, detect_host_os
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = get_logger(__name__)
 
@@ -55,11 +62,19 @@ CapacitySource = Literal["manual", "cgroup", "psutil", "none", "unknown"]
 
 @dataclass(frozen=True)
 class ResourceReservation:
-    """Tracks resources reserved by a single VM admission."""
+    """Tracks resources reserved by a single VM admission.
+
+    Carries both effective limits (used by cgroup/ulimit enforcers and budget
+    tracking) and guest values (used by QEMU -m/-smp).
+    """
 
     vm_id: str
+    # Effective limits (guest + overhead) — used by cgroup/ulimit enforcers and budget tracking
     memory_mb: float
     cpu_cores: float
+    # Guest values — used by QEMU (-m, -smp)
+    guest_memory_mb: float
+    guest_cpu_cores: float
     # Unique key in _reservations dict — prevents collision when
     # multiple VMs share the same vm_id string (e.g. concurrent requests
     # with the same tenant_id + task_id).
@@ -120,20 +135,23 @@ def _read_macos_memory_pressure_level() -> int | None:
     return val.value
 
 
-def _ttl_cache(ttl_seconds: float):
+_R = TypeVar("_R")
+
+
+def _ttl_cache(ttl_seconds: float) -> Callable[[Callable[[Any], _R]], Callable[[Any], _R]]:
     """Per-instance TTL cache for zero-arg methods.
 
     Stores ``(monotonic_timestamp, value)`` on the instance.
     *ttl_seconds* < 0 means infinite (never expires).
     """
 
-    def decorator(func):
+    def decorator(func: Callable[[Any], _R]) -> Callable[[Any], _R]:
         attr = f"_ttl_{func.__name__}"
 
         @functools.wraps(func)
-        def wrapper(self):
+        def wrapper(self: Any) -> _R:
             now = time.monotonic()
-            cached = getattr(self, attr, None)
+            cached: tuple[float, _R] | None = getattr(self, attr, None)
             if cached is not None:
                 ts, val = cached
                 if ttl_seconds < 0 or now - ts < ttl_seconds:
@@ -142,17 +160,17 @@ def _ttl_cache(ttl_seconds: float):
             setattr(self, attr, (now, result))
             return result
 
-        return wrapper
+        return cast("Callable[[Any], _R]", wrapper)
 
     return decorator
 
 
 class ResourceAdmissionController:
-    """Resource-aware admission controller replacing asyncio.Semaphore.
+    """Resource-aware admission controller for VM lifecycle.
 
     Four gates (all must pass):
     1. Memory budget: host_total * (1 - reserve_ratio) * overcommit_ratio
-    2. CPU budget: host_cpus * overcommit_ratio
+    2. CPU budget: (host_cpus - cpu_reserve) * overcommit_ratio
     3a. Available-memory floor: system_available - requested >= floor
     3b. Memory pressure: reject when system is thrashing
         (Linux: PSI full avg10 >= 10% / macOS: sysctl level == CRITICAL)
@@ -173,11 +191,13 @@ class ResourceAdmissionController:
         host_memory_mb: float | None = None,
         host_cpu_count: float | None = None,
         available_memory_floor_mb: int = 0,
+        host_cpu_reserve_cores: float = DEFAULT_HOST_CPU_RESERVE_CORES,
     ) -> None:
         self._memory_overcommit_ratio = memory_overcommit_ratio
         self._cpu_overcommit_ratio = cpu_overcommit_ratio
         self._host_memory_reserve_ratio = host_memory_reserve_ratio
         self._available_memory_floor_mb = available_memory_floor_mb
+        self._host_cpu_reserve_cores = host_cpu_reserve_cores
 
         # Set by start() or constructor override (for testing)
         self._host_memory_mb: float = host_memory_mb if host_memory_mb is not None else 0.0
@@ -439,11 +459,12 @@ class ResourceAdmissionController:
         """Compute effective budgets from host resources and overcommit ratios.
 
         Memory: host_total * (1 - reserve_ratio) * overcommit_ratio
-        CPU:    host_cpu_count * overcommit_ratio
+        CPU:    (host_cpu_count - host_cpu_reserve) * overcommit_ratio
         """
         available_mb = self._host_memory_mb * (1.0 - self._host_memory_reserve_ratio)
         self._memory_budget_mb = max(0.0, available_mb) * self._memory_overcommit_ratio
-        self._cpu_budget = self._host_cpu_count * self._cpu_overcommit_ratio
+        available_cpus = max(0.0, self._host_cpu_count - self._host_cpu_reserve_cores)
+        self._cpu_budget = available_cpus * self._cpu_overcommit_ratio
 
     async def acquire(
         self,
@@ -471,15 +492,18 @@ class ResourceAdmissionController:
         Raises:
             VmCapacityError: Resources not available within timeout
         """
-        # Calculate total memory needed: guest + QEMU overhead (+TCG if applicable)
-        total_memory_mb = memory_mb + CGROUP_MEMORY_OVERHEAD_MB
+        # Calculate effective limits: guest + overhead (single source of truth)
+        total_memory_mb = memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
         if use_tcg:
-            total_memory_mb += TCG_TB_CACHE_SIZE_MB
+            total_memory_mb += DEFAULT_TCG_TB_CACHE_SIZE_MB
+        total_cpu = cpu_cores + DEFAULT_VM_CPU_OVERHEAD_CORES
 
         reservation = ResourceReservation(
             vm_id=vm_id,
             memory_mb=total_memory_mb,
-            cpu_cores=cpu_cores,
+            cpu_cores=total_cpu,
+            guest_memory_mb=memory_mb,
+            guest_cpu_cores=cpu_cores,
         )
 
         logger.debug(
@@ -487,7 +511,7 @@ class ResourceAdmissionController:
             extra={
                 "vm_id": vm_id,
                 "requested_memory_mb": round(total_memory_mb),
-                "requested_cpu": cpu_cores,
+                "requested_cpu": round(total_cpu, 2),
                 "timeout": timeout,
                 "allocated_memory_mb": round(self._allocated_memory_mb),
                 "allocated_cpu": round(self._allocated_cpu, 1),
@@ -498,7 +522,7 @@ class ResourceAdmissionController:
         try:
             async with asyncio.timeout(timeout):
                 async with self._condition:
-                    await self._condition.wait_for(lambda: self._stopped or self._can_admit(total_memory_mb, cpu_cores))
+                    await self._condition.wait_for(lambda: self._stopped or self._can_admit(total_memory_mb, total_cpu))
                     if self._stopped:
                         raise VmCapacityError(
                             f"Admission controller stopped while waiting for VM {vm_id}",
@@ -506,7 +530,7 @@ class ResourceAdmissionController:
                         )
                     # Resources available - commit reservation
                     self._allocated_memory_mb += total_memory_mb
-                    self._allocated_cpu += cpu_cores
+                    self._allocated_cpu += total_cpu
                     self._allocated_vm_slots += 1
                     self._reservations[reservation.reservation_id] = reservation
 
@@ -516,7 +540,7 @@ class ResourceAdmissionController:
                             "vm_id": vm_id,
                             "reservation_id": reservation.reservation_id,
                             "reserved_memory_mb": round(total_memory_mb),
-                            "reserved_cpu": cpu_cores,
+                            "reserved_cpu": round(total_cpu, 2),
                             "total_allocated_memory_mb": round(self._allocated_memory_mb),
                             "total_allocated_cpu": round(self._allocated_cpu, 1),
                             "vm_slots": self._allocated_vm_slots,
@@ -533,7 +557,7 @@ class ResourceAdmissionController:
                 floor_info = f" System available: {round(system_avail)}MB (floor: {self._available_memory_floor_mb}MB)."
             raise VmCapacityError(
                 f"Resource admission timeout after {timeout}s for VM {vm_id}. "
-                f"Requested: {round(total_memory_mb)}MB memory, {cpu_cores} CPU. "
+                f"Requested: {round(total_memory_mb)}MB memory, {round(total_cpu, 2)} CPU. "
                 f"Budget: {mem_budget_str}MB memory "
                 f"({round(self._allocated_memory_mb)}/{mem_budget_str} allocated), "
                 f"{cpu_budget_str} CPU "
@@ -542,7 +566,7 @@ class ResourceAdmissionController:
                 context={
                     "vm_id": vm_id,
                     "requested_memory_mb": round(total_memory_mb),
-                    "requested_cpu": cpu_cores,
+                    "requested_cpu": round(total_cpu, 2),
                     "allocated_memory_mb": round(self._allocated_memory_mb),
                     "memory_budget_mb": mem_budget_str,
                     "allocated_cpu": round(self._allocated_cpu, 1),
@@ -604,20 +628,22 @@ class ResourceAdmissionController:
         Uses total budget (not available), i.e. ignores current allocations.
         Useful for sizing pools at startup before any VMs are running.
 
-        Memory per VM is computed as guest_memory_mb + CGROUP_MEMORY_OVERHEAD_MB
-        (+ TCG_TB_CACHE_SIZE_MB when use_tcg=True), same formula used by acquire().
+        Memory per VM is computed as guest_memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
+        (+ DEFAULT_TCG_TB_CACHE_SIZE_MB when use_tcg=True), same formula used by acquire().
+        CPU per VM includes DEFAULT_VM_CPU_OVERHEAD_CORES, same as acquire().
 
         Args:
             guest_memory_mb: Guest memory per VM (without cgroup overhead)
-            cpu_per_vm: CPU cores per VM
+            cpu_per_vm: Guest CPU cores per VM (without overhead)
             use_tcg: Whether TCG emulation is used (adds extra memory overhead)
 
         Returns:
             Effective max VMs, or -1 if both budgets are unlimited (psutil unavailable)
         """
-        total_memory_per_vm = guest_memory_mb + CGROUP_MEMORY_OVERHEAD_MB
+        total_memory_per_vm = guest_memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
         if use_tcg:
-            total_memory_per_vm += TCG_TB_CACHE_SIZE_MB
+            total_memory_per_vm += DEFAULT_TCG_TB_CACHE_SIZE_MB
+        total_cpu_per_vm = cpu_per_vm + DEFAULT_VM_CPU_OVERHEAD_CORES
 
         # Compute per-dimension max, treating infinite budget as unbounded
         max_by_memory: int | None = None
@@ -626,7 +652,7 @@ class ResourceAdmissionController:
 
         max_by_cpu: int | None = None
         if not math.isinf(self._cpu_budget):
-            max_by_cpu = int(self._cpu_budget / cpu_per_vm) if cpu_per_vm > 0 else 0
+            max_by_cpu = int(self._cpu_budget / total_cpu_per_vm) if total_cpu_per_vm > 0 else 0
 
         if max_by_memory is None and max_by_cpu is None:
             return -1  # Both unlimited

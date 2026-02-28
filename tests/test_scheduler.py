@@ -462,13 +462,13 @@ class TestSchedulerShutdownOrdering:
 
         Uses a tight memory budget so two pool VMs fully exhaust capacity,
         then a third acquire (background save) blocks until slots are freed.
-        Budget must account for CGROUP_MEMORY_OVERHEAD_MB added by acquire().
+        Budget must account for DEFAULT_VM_MEMORY_OVERHEAD_MB added by acquire().
         """
         from exec_sandbox.admission import ResourceAdmissionController
-        from exec_sandbox.cgroup import CGROUP_MEMORY_OVERHEAD_MB
+        from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB
 
         guest_mb = 512
-        total_per_vm = guest_mb + CGROUP_MEMORY_OVERHEAD_MB
+        total_per_vm = guest_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
         # Budget fits exactly 2 VMs — third is blocked until one is released
         budget_mb = total_per_vm * 2
 

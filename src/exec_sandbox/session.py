@@ -239,6 +239,7 @@ class Session:
                 execution_time_ms=result.execution_time_ms,
                 external_cpu_time_ms=result.external_cpu_time_ms,
                 external_memory_peak_mb=result.external_memory_peak_mb,
+                external_cpu_nr_throttled=result.external_cpu_nr_throttled,
                 timing=TimingBreakdown(
                     setup_ms=0,
                     boot_ms=0,

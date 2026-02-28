@@ -456,7 +456,7 @@ class WarmVMPool:
                 },
             )
         except Exception as e:
-            # CRITICAL: destroy VM to release semaphore slot if creation succeeded
+            # CRITICAL: destroy VM to release admission slot if creation succeeded
             if vm is not None:
                 with contextlib.suppress(Exception):
                     await self.vm_manager.destroy_vm(vm)
@@ -594,7 +594,7 @@ class WarmVMPool:
                 raise  # Re-raise cancellation to propagate shutdown
 
             except Exception as e:
-                # CRITICAL: destroy VM to release semaphore slot if creation succeeded
+                # CRITICAL: destroy VM to release admission slot if creation succeeded
                 if vm is not None:
                     with contextlib.suppress(Exception):
                         await self.vm_manager.destroy_vm(vm)

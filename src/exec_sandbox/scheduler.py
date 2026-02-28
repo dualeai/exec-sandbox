@@ -148,7 +148,7 @@ class Scheduler:
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
 
-        # Initialize VmManager (handles backpressure internally via semaphore)
+        # Initialize VmManager (handles backpressure internally via admission controller)
         self._vm_manager = VmManager(self._settings)
         await self._vm_manager.start()  # Pre-warms all system probe caches
 
@@ -382,6 +382,7 @@ class Scheduler:
                 execution_time_ms=result.execution_time_ms,
                 external_cpu_time_ms=result.external_cpu_time_ms,
                 external_memory_peak_mb=result.external_memory_peak_mb,
+                external_cpu_nr_throttled=result.external_cpu_nr_throttled,
                 timing=TimingBreakdown(
                     setup_ms=setup_ms,
                     boot_ms=boot_ms,
@@ -689,6 +690,7 @@ class Scheduler:
             memory_overcommit_ratio=self.config.memory_overcommit_ratio,
             cpu_overcommit_ratio=self.config.cpu_overcommit_ratio,
             host_memory_reserve_ratio=self.config.host_memory_reserve_ratio,
+            host_cpu_reserve_cores=self.config.host_cpu_reserve_cores,
         )
 
     async def _validate_packages(self, packages: list[str], language: Language) -> None:

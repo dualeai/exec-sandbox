@@ -142,13 +142,19 @@ class SchedulerConfig(BaseModel):
         default=constants.DEFAULT_CPU_OVERCOMMIT_RATIO,
         ge=1.0,
         le=20.0,
-        description="CPU overcommit ratio. Effective budget = host_cpus * ratio",
+        description="CPU overcommit ratio. Effective budget = (host_cpus - reserve) * ratio",
     )
     host_memory_reserve_ratio: float = Field(
         default=constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO,
         ge=0.01,
         le=0.5,
         description="Fraction of host memory reserved for OS (e.g. 0.1 = 10%)",
+    )
+    host_cpu_reserve_cores: float = Field(
+        default=constants.DEFAULT_HOST_CPU_RESERVE_CORES,
+        ge=0.0,
+        le=16.0,
+        description="CPU cores reserved for host processes (fixed, not a ratio)",
     )
     # Features
     enable_package_validation: bool = Field(

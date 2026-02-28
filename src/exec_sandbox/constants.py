@@ -444,14 +444,23 @@ FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
 # ============================================================================
 
 DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 1.5
-"""Default memory overcommit ratio. Effective memory budget =
-host_total * (1 - host_reserve_ratio) * overcommit_ratio.
-AI agent workloads are bursty and mostly idle (avg memory 18-22%),
-making overcommit safe."""
+"""Host-level memory overcommit multiplier applied to the total VM pool budget.
+
+budget = host_total * (1 - reserve_ratio) * overcommit_ratio
+
+This stretches the pool beyond physical capacity — safe because AI agent workloads
+are bursty and mostly idle (avg memory utilization 18-22%).
+Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
+constant for QEMU/gvproxy process memory."""
 
 DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 4.0
-"""Default CPU overcommit ratio. Effective CPU budget =
-host_cpu_count * ratio. AI workloads average 11-17% CPU utilization."""
+"""Host-level CPU overcommit multiplier applied to the total VM pool budget.
+
+budget = (host_cpus - reserve_cores) * overcommit_ratio
+
+AI workloads average 11-17% CPU utilization, so 4x overcommit is safe.
+Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
+constant for QEMU/gvproxy process CPU."""
 
 DEFAULT_HOST_MEMORY_RESERVE_RATIO: Final[float] = 0.1
 """Fraction of host memory reserved for OS and non-VM processes.
@@ -460,11 +469,60 @@ Scales with host size:
 - 16GB host → 1.6GB reserved  → 14.4GB for VMs
 - 64GB host → 6.4GB reserved  → 57.6GB for VMs"""
 
+DEFAULT_HOST_CPU_RESERVE_CORES: Final[float] = 0.5
+"""CPU cores reserved for host processes (OS, Python scheduler, qemu-storage-daemon).
+Fixed value, not a ratio — host infrastructure has roughly constant CPU consumption
+regardless of host size. 0.5 cores covers typical observed usage with headroom."""
+
 DEFAULT_VM_CPU_CORES: Final[int] = 1
 """CPU cores allocated per VM. Flows to three places:
 - QEMU -smp (guest-visible vCPU count)
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
+
+DEFAULT_VM_MEMORY_OVERHEAD_MB: Final[int] = 128
+"""QEMU + gvproxy process memory overhead added to guest memory for admission and cgroup limits.
+
+Covers host-side process memory beyond guest RAM (QEMU VMM + gvproxy share a
+per-VM cgroup). Uses ``microvm`` (x86) / ``virt`` (ARM) machine types — minimal
+device set (virtio-mmio only), comparable to Firecracker (<5 MiB VMM overhead).
+
+Measured breakdown:
+  - QEMU binary + heap + glib event loop : ~20-30 MB
+  - virtio-mmio ring buffers             : ~1 MB per device
+  - qcow2 block layer (L2 + refcount)    : ~5-10 MB
+  - Miscellaneous (serial, monitor, etc.) : ~2-5 MB
+  - QEMU subtotal (minus guest RAM)       : ~35-50 MB
+  - gvproxy (Go binary, network proxy)    : ~15-30 MB
+  - Combined total                        : ~50-80 MB
+
+128 MB provides ~60% headroom above observed combined peak. If OOM-kills
+are observed, bump this — but first verify with:
+  ``ps -o rss= -p <qemu_pid>`` and ``ps -o rss= -p <gvproxy_pid>``."""
+
+DEFAULT_VM_CPU_OVERHEAD_CORES: Final[float] = 0.25
+"""QEMU + gvproxy CPU overhead added to guest CPU for admission and cgroup limits.
+
+Measured breakdown:
+  - QEMU main loop + event processing      : ~2-5% of a core
+  - IOThread (block I/O completion)         : ~1-3% of a core
+  - gvproxy (TLS termination, DNS filter)   : ~5-15% of a core under network load
+  - Haltpoll idle overhead (KVM)            : ~5-10% of a core
+  - Combined total                          : ~13-33% of a core
+
+0.25 provides ~60% headroom above observed peak (matching memory margin philosophy).
+Only applies when gvproxy is in the cgroup (networking enabled). Without gvproxy,
+overhead is ~5-10%, but we use 0.25 uniformly for simplicity."""
+
+DEFAULT_TCG_TB_CACHE_SIZE_MB: Final[int] = 256
+"""TCG translation block cache size in MB (must match tb-size in qemu_cmd.py).
+
+QEMU 5.0+ defaults to 1GB which causes OOM on CI runners with multiple VMs.
+256MB balances cache hit rate and memory usage:
+- 32MB (old default): ~15 TB flushes, slower but minimal memory
+- 256MB (our choice): ~5 TB flushes, good balance for CI workloads
+- 512MB: ~3 TB flushes, better perf but higher memory pressure
+- 1GB (QEMU default): ~1 TB flush, best perf but OOM risk"""
 
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for

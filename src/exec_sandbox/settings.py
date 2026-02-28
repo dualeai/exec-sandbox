@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     memory_overcommit_ratio: float = constants.DEFAULT_MEMORY_OVERCOMMIT_RATIO
     cpu_overcommit_ratio: float = constants.DEFAULT_CPU_OVERCOMMIT_RATIO
     host_memory_reserve_ratio: float = constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO
+    host_cpu_reserve_cores: float = constants.DEFAULT_HOST_CPU_RESERVE_CORES
     # Host resource overrides (None = auto-detect via psutil)
     # Useful for testing or container deployments where psutil reports host resources
     host_memory_mb: float | None = None

@@ -208,8 +208,8 @@ class QemuVM:
         self._state_lock = asyncio.Lock()
         # Timing instrumentation (set by VmManager.create_vm)
         self.timing = VmTiming()
-        # Tracks if this VM owns a semaphore permit (prevents double-release in destroy)
-        self.holds_semaphore_slot = False
+        # Tracks if this VM holds an admission reservation (prevents double-release in destroy_vm)
+        self.holds_admission_slot = False
         # Resource reservation from admission controller (set by VmManager.create_vm)
         self.resource_reservation: ResourceReservation | None = None
         # Port forwarding - set by VmManager after boot
@@ -217,6 +217,8 @@ class QemuVM:
         self.exposed_ports: list[ExposedPort] = []
         # L1 memory snapshot restore flag
         self.l1_restored: bool = False
+        # Previous nr_throttled from cgroup cpu.stat (for delta-based warning)
+        self._prev_nr_throttled: int = 0
 
     # -------------------------------------------------------------------------
     # Timing properties (backwards-compatible accessors to VmTiming)
@@ -379,7 +381,7 @@ class QemuVM:
                 },
             )
 
-    async def execute(  # noqa: PLR0915
+    async def execute(  # noqa: PLR0912, PLR0915
         self,
         code: str,
         timeout_seconds: int,
@@ -541,7 +543,20 @@ class QemuVM:
             )
 
             # Measure external resources from host (cgroup v2)
-            external_cpu_ms, external_mem_mb = await self._read_cgroup_stats()
+            external_cpu_ms, external_mem_mb, external_nr_throttled = await self._read_cgroup_stats()
+
+            if external_nr_throttled is not None and external_nr_throttled > self._prev_nr_throttled:
+                new_throttles = external_nr_throttled - self._prev_nr_throttled
+                logger.warning(
+                    "VM CPU throttled by cgroup — consider increasing cpu_cores or DEFAULT_VM_CPU_OVERHEAD_CORES",
+                    extra={
+                        "vm_id": self.vm_id,
+                        "nr_throttled_delta": new_throttles,
+                        "nr_throttled_total": external_nr_throttled,
+                    },
+                )
+            if external_nr_throttled is not None:
+                self._prev_nr_throttled = external_nr_throttled
 
             # Debug log final execution output
             logger.debug(
@@ -566,6 +581,7 @@ class QemuVM:
                 execution_time_ms=result.execution_time_ms,  # Guest-reported
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured
                 external_memory_peak_mb=external_mem_mb or None,  # Host-measured
+                external_cpu_nr_throttled=external_nr_throttled,  # Host-measured
                 timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0, connect_ms=connect_ms),
                 spawn_ms=result.spawn_ms,  # Guest-reported granular timing
                 process_ms=result.process_ms,  # Guest-reported granular timing
@@ -865,12 +881,12 @@ class QemuVM:
 
         return [FileInfo(name=e.name, is_dir=e.is_dir, size=e.size) for e in response.entries]
 
-    async def _read_cgroup_stats(self) -> tuple[int | None, int | None]:
-        """Read external CPU time and peak memory from cgroup v2.
+    async def _read_cgroup_stats(self) -> tuple[int | None, int | None, int | None]:
+        """Read external CPU time, peak memory, and CPU throttle count from cgroup v2.
 
         Returns:
-            Tuple of (cpu_time_ms, peak_memory_mb)
-            Returns (None, None) if cgroup not available or read fails
+            Tuple of (cpu_time_ms, peak_memory_mb, nr_throttled)
+            Returns (None, None, None) if cgroup not available or read fails
         """
         return await cgroup.read_cgroup_stats(self.cgroup_path)
 
