@@ -78,7 +78,8 @@ fn process_stderr_chunk(
 }
 
 /// Drain stdout with a cumulative deadline after sentinel detection or SIGTERM.
-/// Uses DRAIN_TIMEOUT_MS per-read to keep latency low while the deadline bounds total time.
+/// Uses up to DRAIN_TIMEOUT_MS per read attempt (clamped to remaining deadline),
+/// keeping per-read latency low while `deadline_ms` bounds total drain time.
 ///
 /// Tolerates up to `MAX_CONSECUTIVE_DRAIN_TIMEOUTS` successive read timeouts before
 /// concluding the pipe is empty. Under QEMU TCG software emulation (~8× slower than
@@ -86,7 +87,7 @@ fn process_stderr_chunk(
 /// service a kernel pipe read — the event-loop overhead (timer wheel + epoll_wait
 /// jiffies rounding at HZ=250) can itself consume the budget, causing a false timeout
 /// even when data is sitting in the pipe buffer.
-const MAX_CONSECUTIVE_DRAIN_TIMEOUTS: u32 = 4; // 4 × 5 ms = 20 ms idle tolerance
+const MAX_CONSECUTIVE_DRAIN_TIMEOUTS: u32 = 8; // up to 8 × 5 ms = 40 ms idle tolerance
 
 async fn drain_stdout(
     stdout: &mut tokio::process::ChildStdout,
@@ -293,8 +294,10 @@ pub(crate) async fn warm_exercise_repl(
 
     match result {
         Ok(Ok(())) => {
-            // Drain any stdout the no-op may have produced
-            drain_stdout(&mut repl.stdout, &mut String::new(), 50).await;
+            // Drain any stdout the no-op may have produced.
+            // 250 ms: warm-up is trivial so output here is not user-visible,
+            // but TCG needs slack beyond the idle-tolerance window (40 ms).
+            drain_stdout(&mut repl.stdout, &mut String::new(), 250).await;
             log_info!("[warm] {} REPL ready", language.as_str());
             Ok(())
         }
@@ -494,7 +497,10 @@ pub(crate) async fn execute_code_streaming(
             }
 
             if sentinel_exit_code.is_some() {
-                drain_stdout(&mut repl.stdout, &mut stdout_buffer, 100).await;
+                // 500 ms: post-sentinel stdout flush. The JS REPL yields 50 ms
+                // for back-pressure before the sentinel, but under TCG (~8× slower)
+                // data may still be in the kernel pipe buffer.
+                drain_stdout(&mut repl.stdout, &mut stdout_buffer, 500).await;
                 break;
             }
             if stdout_done && stderr_done {
