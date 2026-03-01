@@ -153,7 +153,7 @@ class TestWriteFileAfterIdleTimeout:
             await asyncio.sleep(wait_time)
 
             # write_file with small content — the exact failing case from CI
-            await vm.write_file("/home/user/test.txt", BytesIO(b"x"))
+            await vm.write_file("test.txt", BytesIO(b"x"))
 
             # Verify via execute
             result2 = await vm.execute(
@@ -199,13 +199,13 @@ class TestWriteFileAfterIdleTimeout:
                 await asyncio.sleep(wait_time)
 
                 # write_file after timeout
-                path = f"/home/user/file_{i}.txt"
+                rel_path = f"file_{i}.txt"
                 content = f"data_{i}".encode()
-                await vm.write_file(path, BytesIO(content))
+                await vm.write_file(rel_path, BytesIO(content))
 
-                # Verify via execute
+                # Verify via execute (absolute path inside VM)
                 verify = await vm.execute(
-                    code=f"print(open('{path}').read())",
+                    code=f"print(open('/home/user/{rel_path}').read())",
                     timeout_seconds=30,
                     env_vars=None,
                     on_stdout=None,
