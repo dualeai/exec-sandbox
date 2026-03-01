@@ -37,7 +37,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     snapshot_drive: str | None = None,
     defer_incoming: bool = False,
 ) -> list[str]:
-    """Build QEMU command for Linux (KVM + unshare + namespaces).
+    """Build QEMU command for microVM execution.
 
     Args:
         settings: Service configuration (paths, limits, etc.)
@@ -118,10 +118,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                     f"See: https://gitlab.com/qemu-project/qemu/-/commit/1505b651fdbd"
                 )
 
-    # Track whether to use virtio-console (hvc0) or ISA serial (ttyS0)
-    # Determined per-architecture below
-    use_virtio_console = False
-
     if arch == HostArch.AARCH64:
         arch_suffix = "aarch64"
         qemu_bin = "qemu-system-aarch64"
@@ -137,125 +133,42 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             if is_macos
             else "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,dump-guest-core=off"
         )
-        # ARM64 always uses virtio-console (no ISA serial on virt machine)
-        use_virtio_console = True
     else:
         arch_suffix = "x86_64"
         qemu_bin = "qemu-system-x86_64"
-        # Machine type selection based on acceleration:
-        # - microvm: Optimized for KVM/HVF, requires hardware virtualization
-        # - q35: Standard machine type that works with TCG (software emulation)
-        # microvm is designed specifically for hardware virtualization and doesn't work correctly with TCG
+        # Machine type: microvm for all acceleration modes (KVM, HVF, TCG).
+        # microvm provides direct kernel boot via qboot (acpi=off), skipping
+        # SeaBIOS/iPXE. Under TCG this means ~2s boot vs 30+s with pc (i440FX).
         # See: https://www.qemu.org/docs/master/system/i386/microvm.html
-        #
-        # CRITICAL: acpi=off forces qboot instead of SeaBIOS
-        # With ACPI enabled (default), microvm uses SeaBIOS which has issues with direct kernel boot
-        # on QEMU 8.2. With acpi=off, it uses qboot which is specifically designed for direct kernel boot.
         # See: https://www.kraxel.org/blog/2020/10/qemu-microvm-acpi/
-        if accel_type == AccelType.KVM:
-            # =============================================================
-            # Console Device Timing: ISA Serial vs Virtio-Console
-            # =============================================================
-            # ISA serial (ttyS0) is available IMMEDIATELY at boot because:
-            #   - It's a simple I/O port at 0x3F8 emulated by QEMU
-            #   - No driver initialization required
-            #   - Kernel can write to it from first instruction
-            #
-            # Virtio-console (hvc0) is available LATER (~30-50ms) because:
-            #   - Requires virtio-mmio bus discovery during kernel init
-            #   - Requires virtio-serial driver initialization
-            #   - Not available during early boot
-            #
-            # If kernel uses console=hvc0 but hvc0 doesn't exist yet -> HANG
-            # See: https://gist.github.com/mcastelino/aa118275991d4f561ee22dc915b9345f
-            #
-            # =============================================================
-            # TSC_DEADLINE Requirement for Non-Legacy Mode
-            # =============================================================
-            # pit=off, pic=off, and isa-serial=off require TSC_DEADLINE CPU feature
-            # See: https://www.qemu.org/docs/master/system/i386/microvm.html
-            #
-            # In nested VMs (e.g., GitHub Actions on Azure/Hyper-V), TSC_DEADLINE
-            # may not be exposed to the guest. Without it:
-            #   - PIT/PIC disabled -> no timer/interrupt source -> kernel hang
-            #   - ISA serial disabled -> must use hvc0 -> early boot hang
-            #
-            # =============================================================
-            # Nested VM Fallback: microvm with Legacy Devices Enabled
-            # =============================================================
-            # When TSC_DEADLINE is unavailable (nested VMs on Azure/Hyper-V),
-            # we keep microvm but enable ALL legacy devices:
-            #
-            # QEMU microvm legacy devices (enabled by default unless disabled):
-            #   - i8259 PIC: Interrupt controller for legacy interrupt routing
-            #   - i8254 PIT: Timer for scheduling and interrupt generation
-            #   - MC146818 RTC: Real-time clock for timekeeping
-            #   - ISA serial: Console output at ttyS0 (available at T=0)
-            #
-            # Why NOT fall back to 'pc' machine type:
-            #   - microvm with virtio-mmio is simpler and faster to boot
-            #   - Maintains consistent configuration between nested/bare-metal
-            #   - virtio-mmio works fine in nested VMs when legacy devices present
-            #   - 'pc' would require virtio-pci which needs different initramfs
-            #
-            # The key insight: without TSC_DEADLINE, kvmclock timing may be
-            # unreliable in nested VMs. The PIT provides fallback timer source.
-            #
-            # See: https://www.qemu.org/docs/master/system/i386/microvm.html
-            # =============================================================
+
+        # Determine if legacy timer devices (PIT/PIC/RTC) can be disabled.
+        # pit=off and pic=off require TSC_DEADLINE CPU feature (LAPIC timer
+        # replaces PIT as the timer source). Without TSC_DEADLINE, PIT/PIC
+        # must remain enabled or the kernel hangs (no timer/interrupt source).
+        # TCG never provides TSC_DEADLINE; KVM/HVF may lack it in nested VMs.
+        tsc_available = False
+        if accel_type in (AccelType.KVM, AccelType.HVF):
             tsc_available = await check_tsc_deadline()
-            if tsc_available:
-                # Full optimization: TSC_DEADLINE available, use non-legacy mode
-                machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
-                use_virtio_console = True
-            else:
-                # Nested VM compatibility: use microvm with timer legacy devices
-                # Without TSC_DEADLINE, we need:
-                #   - PIT (i8254) for timer interrupts
-                #   - PIC (i8259) for interrupt handling
-                #   - RTC for timekeeping (kvmclock may not work in nested VMs)
-                # We disable ISA serial to avoid conflicts with virtio-serial.
-                # Console output goes via virtio-console (hvc0) instead of ttyS0.
-                # See: https://bugs.launchpad.net/qemu/+bug/1224444 (virtio-mmio issues)
+            if not tsc_available:
                 logger.info(
-                    "TSC_DEADLINE not available, using microvm with legacy timers but virtio-console for nested VM compatibility",
+                    "TSC_DEADLINE not available, keeping legacy timer devices (PIT/PIC/RTC)",
                     extra={"vm_id": vm_id},
                 )
-                machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off"
-                use_virtio_console = True
-        elif accel_type == AccelType.HVF:
-            # macOS with HVF - configuration depends on architecture
-            # Note: dump-guest-core=off not included - may not be supported on macOS QEMU
-            if arch == HostArch.X86_64:
-                # Intel Mac: check TSC_DEADLINE availability
-                tsc_available = await check_tsc_deadline()
-                if tsc_available:
-                    # Full optimization: TSC_DEADLINE available, disable legacy devices
-                    machine_type = (
-                        "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
-                    )
-                else:
-                    # Conservative: keep legacy timers for older Intel Macs
-                    logger.info(
-                        "TSC_DEADLINE not available on Intel Mac, using microvm with legacy timers",
-                        extra={"vm_id": vm_id},
-                    )
-                    machine_type = "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off"
-            else:
-                # ARM64 Mac: no x86 legacy devices needed
-                # ARM uses different timer mechanism (CNTVCT_EL0), no TSC concept
-                machine_type = "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off"
-            use_virtio_console = True
         else:
-            # TCG emulation: use 'pc' (i440FX) which is simpler and more proven with direct kernel boot
-            # q35 uses PCIe which can have issues with PCI device enumeration on some QEMU versions
-            # See: https://wiki.qemu.org/Features/Q35
-            machine_type = "pc,mem-merge=off,dump-guest-core=off"
-            use_virtio_console = False
             logger.info(
-                "Using pc machine type (TCG emulation, hardware virtualization not available)",
+                "Using microvm with TCG emulation (hardware virtualization not available)",
                 extra={"vm_id": vm_id, "accel": accel},
             )
+
+        # Build machine_type from components
+        parts = ["microvm", "acpi=off", "x-option-roms=off"]
+        if tsc_available:
+            parts.extend(["pit=off", "pic=off", "rtc=off"])
+        parts.extend(["isa-serial=off", "mem-merge=off"])
+        if not is_macos:
+            parts.append("dump-guest-core=off")
+        machine_type = ",".join(parts)
 
     # Auto-discover kernel and initramfs based on architecture
     # Note: existence validated in create_vm() before calling this method
@@ -280,31 +193,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Determine if we're using microvm (requires -nodefaults to avoid BIOS fallback)
     is_microvm = "microvm" in machine_type
 
-    # =============================================================
-    # Virtio Transport Selection: MMIO vs PCI
-    # =============================================================
-    # Virtio devices can use two transport mechanisms:
-    #
-    # virtio-mmio (suffix: -device):
-    #   - Memory-mapped I/O, no PCI bus required
-    #   - Simpler, smaller footprint, faster boot (~13%)
-    #   - Used by: microvm (x86 - both nested and bare-metal), virt (ARM64)
-    #   - Works in nested VMs when legacy devices (PIT/PIC/RTC) are enabled
-    #
-    # virtio-pci (suffix: -pci):
-    #   - Standard PCI bus with MSI-X interrupts
-    #   - Used by: pc/q35 (x86 TCG emulation)
-    #   - Requires different initramfs with virtio_pci.ko
-    #
-    # Selection criteria:
-    #   microvm (x86)        -> virtio-mmio (all KVM modes, nested or bare-metal)
-    #   pc (x86 TCG)         -> virtio-pci (software emulation fallback)
-    #   virt (ARM64)         -> virtio-mmio (initramfs loads virtio_mmio.ko)
-    #
-    # CRITICAL: ARM64 initramfs loads virtio_mmio.ko, NOT virtio_pci.ko
-    # Using PCI devices on ARM64 causes boot hang (kernel can't find root device)
-    # =============================================================
-    virtio_suffix = "device" if (is_microvm or arch == HostArch.AARCH64) else "pci"
+    # Virtio transport: always MMIO (-device suffix). Both microvm (x86) and
+    # virt (ARM64) use virtio-mmio. The kernel has CONFIG_VIRTIO_MMIO=y built-in
+    # and CONFIG_MODULES is not set — PCI devices would cause boot hang.
+    virtio_suffix = "device"
 
     qemu_args = [qemu_bin]
 
@@ -314,55 +206,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # CRITICAL: -nodefaults -no-user-config are required for microvm to avoid BIOS fallback
     # See: https://www.qemu.org/docs/master/system/i386/microvm.html
-    # For q35, we don't use these flags as the machine expects standard PC components
     if is_microvm:
         qemu_args.extend(["-nodefaults", "-no-user-config"])
-    elif arch == HostArch.X86_64:
-        # The pc (i440FX) machine includes a built-in ISA Floppy Disk Controller.
-        # Set drive types to "none" so the kernel doesn't create /dev/fd0.
-        # Note: "driveA"/"driveB" are NOT valid properties on isa-fdc;
-        # the correct property is "fdtypeA"/"fdtypeB" (see: qemu -device isa-fdc,help).
-        # Using invalid property names causes exit code 1 on QEMU 8.x
-        # (non-existent -global properties are fatal for non-hotplugged devices).
-        qemu_args.extend(["-global", "isa-fdc.fdtypeA=none", "-global", "isa-fdc.fdtypeB=none"])
 
-    # Console selection based on machine type and architecture:
-    # +--------------------------+-------------+--------------------------------+
-    # | Configuration            | Console     | Reason                         |
-    # +--------------------------+-------------+--------------------------------+
-    # | x86 microvm + TSC        | hvc0        | Non-legacy, virtio-console     |
-    # | x86 microvm - TSC        | hvc0        | ISA serial off, virtio-console |
-    # | x86 pc (TCG only)        | ttyS0       | Software emulation fallback    |
-    # | ARM64 virt               | ttyAMA0     | PL011 UART (always available)  |
-    # +--------------------------+-------------+--------------------------------+
-    # ttyS0 (ISA serial) is used when we need reliable early boot console (x86)
-    # ttyAMA0 (PL011 UART) is used for ARM64 virt machine
-    # hvc0 (virtio-console) is NOT reliable for kernel console on ARM64 because
-    # it requires virtio-serial driver initialization (not available at early boot)
+    # Console: ARM64 uses PL011 UART (ttyAMA0), x86 uses virtio-console (hvc0).
+    # hvc0 is NOT reliable on ARM64 — virtio-serial isn't ready when the kernel
+    # opens /dev/console, causing init to crash.
     # See: https://blog.memzero.de/toying-with-virtio/
-    if arch == HostArch.AARCH64:
-        # ARM64 virt machine has PL011 UART (ttyAMA0) - reliable at early boot
-        # Note: hvc0 doesn't work for console because virtio-serial isn't ready
-        # when kernel tries to open /dev/console, causing init to crash
-        # loglevel=1 (KERN_ALERT): suppress kernel printk below ALERT during boot.
-        # DEBUG (7) emits hundreds of messages, each requiring MMIO writes through
-        # PL011 UART. Panics still print (console_flush_on_panic). tiny-init
-        # messages are unaffected (direct libc::write to fd 2, not printk).
-        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
-        console_params = "console=ttyAMA0 loglevel=1"
-    elif use_virtio_console:
-        # x86 non-legacy mode: ISA serial disabled, use virtio-console
-        # loglevel=1: suppress kernel printk noise. Each message triggers a
-        # virtqueue notification (MMIO doorbell + vCPU exit) on virtio-console.
-        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
-        console_params = "console=hvc0 loglevel=1"
-    else:
-        # x86 legacy mode or TCG: ISA serial available at T=0, reliable boot
-        # loglevel=1: suppress kernel printk noise. ISA serial (ttyS0) transmits
-        # byte-by-byte through I/O port 0x3F8 -- extremely expensive under TCG
-        # software emulation. Biggest win for TCG boot latency.
-        # Ref: https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
-        console_params = "console=ttyS0 loglevel=1"
+    console_params = "console=ttyAMA0 loglevel=1" if arch == HostArch.AARCH64 else "console=hvc0 loglevel=1"
 
     qemu_args.extend(
         [
@@ -441,7 +292,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # /dev/kmsg access: on for debug, off for production
             + (" printk.devkmsg=on" if debug_boot else " printk.devkmsg=off")
             # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
-            + (" 8250.nr_uarts=0" if use_virtio_console and arch == HostArch.X86_64 else "")
+            + (" 8250.nr_uarts=0" if arch == HostArch.X86_64 else "")
             # =============================================================
             # Haltpoll cpuidle governor — KVM only
             # =============================================================
@@ -473,13 +324,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #    wakeups keep landing inside the poll window.
             #
             # 4. On HVF/TCG we disable cpuidle entirely (cpuidle.off=1).
-            #    QEMU's virt machine generates no idle-states DT nodes, so the
-            #    guest has only two cpuidle states: poll (busy-loop) and WFI.
-            #    Any governor (menu, TEO) would always pick WFI — the prediction
-            #    algorithm is wasted overhead.  cpuidle.off=1 bypasses the
-            #    framework and calls cpu_do_idle() (WFI) directly.  HVF properly
-            #    blocks the vCPU thread on WFI via qemu_wait_io_event() →
-            #    halt_cond, yielding <5% idle CPU.
+            #    ARM64 virt: no idle-states DT nodes, so only poll + WFI.
+            #    x86 microvm: no ACPI, so no C-state tables, only poll + HLT.
+            #    Any governor (menu, TEO) would always pick the idle instruction
+            #    — the prediction algorithm is wasted overhead.  cpuidle.off=1
+            #    bypasses the framework and calls the idle instruction (WFI on
+            #    ARM64, HLT on x86) directly.  HVF properly blocks the vCPU
+            #    thread via qemu_wait_io_event() → halt_cond, yielding <5%
+            #    idle CPU.  TCG suspends TB execution on HLT.
             #
             # References:
             #   - LWN: cpuidle haltpoll driver & governor
@@ -624,10 +476,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # virtio-serial device for guest agent communication AND kernel console (hvc0)
-    # With microvm + -nodefaults, we must explicitly configure:
-    # 1. virtconsole for kernel console=hvc0 (required for boot output)
-    # 2. virtserialport for guest agent cmd/event channels
+    # Chardevs for guest agent communication AND kernel console (hvc0).
+    # All machine types need explicit chardev setup:
+    #   microvm: -nodefaults suppresses everything, so all devices must be declared
+    #   ARM64 virt: no -nodefaults, but we still need named ports for guest-agent
     qemu_args.extend(
         [
             # Chardevs for communication channels
@@ -645,74 +497,37 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # Serial port configuration:
-    # - virtio-console mode (hvc0): Disable serial to avoid stdio conflict
-    # - ISA serial mode (ttyS0): Connect serial to chardev for console output
-    if use_virtio_console:
-        # Disable default serial to prevent "cannot use stdio by multiple character devices"
-        # ARM64 virt has a default PL011 UART, x86 microvm has ISA serial
-        qemu_args.extend(["-serial", "none"])
-    else:
-        # x86 legacy mode: connect ISA serial to chardev for ttyS0
-        qemu_args.extend(["-serial", "chardev:virtiocon0"])
+    # Disable default serial to prevent "cannot use stdio by multiple character devices"
+    # ARM64 virt (without -nodefaults) has a default PL011 UART that would grab stdio.
+    # x86 microvm already suppresses ISA serial via isa-serial=off + -nodefaults,
+    # so -serial none is redundant there but harmless.
+    qemu_args.extend(["-serial", "none"])
 
     # =============================================================
     # Virtio-Serial Device Configuration
     # =============================================================
     # Virtio-serial provides guest agent communication channels (cmd/event ports).
-    # Console output handling depends on use_virtio_console flag:
-    #
-    # NON-LEGACY MODE (use_virtio_console=True):
+    # All paths use virtio-console (hvc0) with ISA serial disabled:
     #   - virtconsole device created for hvc0 (kernel console)
     #   - 3 ports: virtconsole (nr=0) + cmd (nr=1) + event (nr=2)
     #   - ISA serial disabled via isa-serial=off in machine type
-    #   - Requires TSC_DEADLINE for reliable boot timing
-    #
-    # LEGACY MODE (use_virtio_console=False):
-    #   - Still uses microvm with virtio-mmio (for nested VMs)
-    #   - Or uses 'pc' with virtio-pci (for TCG emulation only)
-    #   - NO virtconsole device (would conflict with ISA serial chardev)
-    #   - 3 ports but only 2 used: cmd (nr=1) + event (nr=2)
-    #   - Port 0 reserved for virtconsole (QEMU backward compat requirement)
-    #   - ISA serial enabled, connected to stdio chardev for ttyS0
-    #   - Used when TSC_DEADLINE unavailable (nested VMs) or TCG emulation
-    #
-    # Why not always create virtconsole?
-    #   - Both virtconsole and ISA serial would use same chardev (virtiocon0)
-    #   - QEMU allows mux=on sharing, but causes output interleaving issues
-    #   - Cleaner to use one console device exclusively
     #
     # See: https://bugs.launchpad.net/qemu/+bug/1639791 (early virtio console lost)
     # See: https://gist.github.com/mcastelino/aa118275991d4f561ee22dc915b9345f
     # =============================================================
-    if use_virtio_console:
-        qemu_args.extend(
-            [
-                "-device",
-                f"virtio-serial-{virtio_suffix},max_ports=3",
-                # hvc0 console device - must be nr=0 to be hvc0
-                "-device",
-                "virtconsole,chardev=virtiocon0,nr=0",
-                "-device",
-                "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
-                "-device",
-                "virtserialport,chardev=event0,name=org.dualeai.event,nr=2",
-            ]
-        )
-    else:
-        # Legacy mode: no virtconsole, ISA serial handles console output
-        # Port 0 is reserved for virtconsole (backward compat), so start at nr=1
-        # See: QEMU error "Port number 0 on virtio-serial devices reserved for virtconsole"
-        qemu_args.extend(
-            [
-                "-device",
-                f"virtio-serial-{virtio_suffix},max_ports=3",
-                "-device",
-                "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
-                "-device",
-                "virtserialport,chardev=event0,name=org.dualeai.event,nr=2",
-            ]
-        )
+    qemu_args.extend(
+        [
+            "-device",
+            f"virtio-serial-{virtio_suffix},max_ports=3",
+            # hvc0 console device - must be nr=0 to be hvc0
+            "-device",
+            "virtconsole,chardev=virtiocon0,nr=0",
+            "-device",
+            "virtserialport,chardev=cmd0,name=org.dualeai.cmd,nr=1",
+            "-device",
+            "virtserialport,chardev=event0,name=org.dualeai.event,nr=2",
+        ]
+    )
 
     # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
     # - deflate-on-oom: guest returns memory under OOM pressure
@@ -747,8 +562,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #
     # Mode 0: No network (default)
     #   - Explicit "-nic none" suppresses QEMU's default NIC
-    #   - Without this, machine types without -nodefaults (ARM64 virt,
-    #     x86 pc/q35) create a default NIC, causing the guest-agent's
+    #   - Without this, machine types without -nodefaults (ARM64 virt)
+    #     create a default NIC, causing the guest-agent's
     #     verify_gvproxy() to burn ~4s in exponential-backoff retries
     #   - microvm already uses -nodefaults so -nic none is redundant
     #     but harmless there
@@ -808,7 +623,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
     else:
         # Suppress QEMU's default NIC.  Without this, machine types that don't
-        # use -nodefaults (ARM64 virt, x86 pc/q35) create a default virtio-net
+        # use -nodefaults (ARM64 virt) create a default virtio-net
         # device, causing the guest-agent to detect eth0 and run verify_gvproxy()
         # with exponential-backoff retries (~4s) before marking NETWORK_READY.
         # ExecuteCode/InstallPackages gate on NETWORK_READY, so the default NIC

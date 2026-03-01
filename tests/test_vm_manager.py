@@ -9,12 +9,14 @@ import json
 import sys
 from collections import deque
 from collections.abc import AsyncGenerator
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
+from exec_sandbox import constants
 from exec_sandbox.constants import GuestErrorType
 from exec_sandbox.exceptions import (
     CodeValidationError,
@@ -991,36 +993,45 @@ class TestSmpCpuCores:
 
 
 # ============================================================================
-# Unit Tests - cpuidle Governor Per Accel Type
+# Shared base class for build_qemu_cmd() unit tests
 # ============================================================================
 
 
-class TestCpuidleGovernor:
-    """Verify cpuidle kernel cmdline is set correctly per acceleration type.
+class _QemuCmdTestBase:
+    """Base class for build_qemu_cmd() unit tests with shared fixtures.
 
-    KVM → cpuidle.governor=haltpoll (in-guest polling avoids VM-exit cost).
-    HVF/TCG → cpuidle.off=1 (bypass cpuidle, call WFI directly).
+    Provides:
+    - clear_caches: autouse fixture that resets probe caches between tests
+    - workdir: async fixture providing a temporary VmWorkingDirectory
     """
 
     @pytest.fixture(autouse=True)
-    def clear_version_cache(self) -> None:
-        """Clear QEMU version cache before each test."""
+    def clear_caches(self) -> None:
         probe_cache.reset("qemu_version")
+        probe_cache.reset("tsc_deadline")
 
     @pytest.fixture
     async def workdir(self):
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        wd = await VmWorkingDirectory.create("test-vm-cpuidle")
+        wd = await VmWorkingDirectory.create("test-vm")
         try:
             yield wd
         finally:
             await wd.cleanup()
 
-    def _extract_kernel_cmdline(self, cmd: list[str]) -> str:
-        """Extract the -append value from a QEMU command list."""
-        idx = cmd.index("-append")
-        return cmd[idx + 1]
+
+# ============================================================================
+# Unit Tests - cpuidle Governor Per Accel Type
+# ============================================================================
+
+
+class TestCpuidleGovernor(_QemuCmdTestBase):
+    """Verify cpuidle kernel cmdline is set correctly per acceleration type.
+
+    KVM → cpuidle.governor=haltpoll (in-guest polling avoids VM-exit cost).
+    HVF/TCG → cpuidle.off=1 (bypass cpuidle, call WFI directly).
+    """
 
     @pytest.mark.parametrize(
         "accel_type, expected_fragment",
@@ -1036,14 +1047,7 @@ class TestCpuidleGovernor:
         """Each accel type gets the correct cpuidle directive."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with (
-            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
-            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
-            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
-            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
-            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
-            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
-        ):
+        with _qemu_cmd_mocks(accel_type=accel_type):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=HostArch.X86_64,
@@ -1054,7 +1058,7 @@ class TestCpuidleGovernor:
                 allow_network=False,
             )
 
-        cmdline = self._extract_kernel_cmdline(cmd)
+        cmdline = _extract_kernel_cmdline(cmd)
         assert expected_fragment in cmdline, (
             f"Expected '{expected_fragment}' in kernel cmdline for {accel_type.value}, got: {cmdline}"
         )
@@ -1073,14 +1077,7 @@ class TestCpuidleGovernor:
         """Only one cpuidle strategy is present; the other is absent."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with (
-            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
-            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
-            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
-            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
-            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
-            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
-        ):
+        with _qemu_cmd_mocks(accel_type=accel_type):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=HostArch.X86_64,
@@ -1091,7 +1088,7 @@ class TestCpuidleGovernor:
                 allow_network=False,
             )
 
-        cmdline = self._extract_kernel_cmdline(cmd)
+        cmdline = _extract_kernel_cmdline(cmd)
         assert present in cmdline, f"Expected '{present}' in cmdline for {accel_type.value}"
         assert absent not in cmdline, f"'{absent}' should NOT be in cmdline for {accel_type.value}"
 
@@ -1107,14 +1104,7 @@ class TestCpuidleGovernor:
         """Exactly one cpuidle.* directive appears in the kernel cmdline."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with (
-            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
-            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
-            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
-            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=True),
-            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
-            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
-        ):
+        with _qemu_cmd_mocks(accel_type=accel_type):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=HostArch.X86_64,
@@ -1125,11 +1115,836 @@ class TestCpuidleGovernor:
                 allow_network=False,
             )
 
-        cmdline = self._extract_kernel_cmdline(cmd)
+        cmdline = _extract_kernel_cmdline(cmd)
         cpuidle_count = cmdline.count("cpuidle.")
         assert cpuidle_count == 1, (
             f"Expected exactly 1 cpuidle.* directive for {accel_type.value}, found {cpuidle_count} in: {cmdline}"
         )
+
+
+# ============================================================================
+# Shared helpers for build_qemu_cmd() unit tests
+# ============================================================================
+
+
+def _qemu_cmd_mocks(
+    *,
+    qemu_version: tuple[int, int, int] | None = (9, 2, 0),
+    host_os: HostOS = HostOS.LINUX,
+    accel_type: AccelType = AccelType.KVM,
+    tsc_deadline: bool = True,
+    unshare: bool = False,
+    io_uring: bool = False,
+):
+    """Return a combined context manager that patches all build_qemu_cmd() probes."""
+    stack = ExitStack()
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=qemu_version))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=host_os))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=tsc_deadline))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=unshare))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=io_uring))
+    return stack
+
+
+def _extract_machine_type(cmd: list[str]) -> str:
+    """Extract the -M value from a QEMU command list."""
+    idx = cmd.index("-M")
+    return cmd[idx + 1]
+
+
+def _extract_kernel_cmdline(cmd: list[str]) -> str:
+    """Extract the -append value from a QEMU command list."""
+    idx = cmd.index("-append")
+    return cmd[idx + 1]
+
+
+def _extract_cpu_model(cmd: list[str]) -> str:
+    """Extract the -cpu value from a QEMU command list."""
+    idx = cmd.index("-cpu")
+    return cmd[idx + 1]
+
+
+def _extract_accel(cmd: list[str]) -> str:
+    """Extract the -accel value from a QEMU command list."""
+    idx = cmd.index("-accel")
+    return cmd[idx + 1]
+
+
+# ============================================================================
+# Unit Tests - Machine Type Selection
+# ============================================================================
+
+
+class TestMachineTypeSelection(_QemuCmdTestBase):
+    """Verify -M flag matches arch/accel/platform combinations.
+
+    The core of the microvm refactoring: all x86_64 paths use microvm,
+    machine_type is built from parts, KVM/HVF TSC logic is unified.
+    """
+
+    @pytest.mark.parametrize(
+        "arch, accel_type, tsc, host_os, expected_machine_type",
+        [
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.KVM,
+                True,
+                HostOS.LINUX,
+                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,dump-guest-core=off",
+                id="x86-kvm-tsc-linux",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.KVM,
+                False,
+                HostOS.LINUX,
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off",
+                id="x86-kvm-notsc-linux",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.HVF,
+                True,
+                HostOS.MACOS,
+                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off",
+                id="x86-hvf-tsc-macos",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.TCG,
+                False,
+                HostOS.LINUX,
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off",
+                id="x86-tcg-linux",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.TCG,
+                False,
+                HostOS.MACOS,
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off",
+                id="x86-tcg-macos",
+            ),
+            pytest.param(
+                HostArch.AARCH64,
+                AccelType.KVM,
+                False,
+                HostOS.LINUX,
+                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,dump-guest-core=off",
+                id="arm64-kvm-linux",
+            ),
+            pytest.param(
+                HostArch.AARCH64,
+                AccelType.HVF,
+                False,
+                HostOS.MACOS,
+                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off",
+                id="arm64-hvf-macos",
+            ),
+        ],
+    )
+    async def test_machine_type(
+        self,
+        vm_settings,
+        workdir,
+        arch: HostArch,
+        accel_type: AccelType,
+        tsc: bool,
+        host_os: HostOS,
+        expected_machine_type: str,
+    ) -> None:
+        """Machine type string matches expected value for arch/accel/platform."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=host_os, accel_type=accel_type, tsc_deadline=tsc):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-machine-type",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert _extract_machine_type(cmd) == expected_machine_type
+
+    async def test_tsc_probe_not_called_for_tcg(self, vm_settings, workdir) -> None:
+        """check_tsc_deadline is NOT awaited when accel is TCG."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        tsc_mock = AsyncMock(return_value=False)
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=AccelType.TCG),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", tsc_mock),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-machine-type",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        tsc_mock.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "accel_type",
+        [
+            pytest.param(AccelType.KVM, id="kvm"),
+            pytest.param(AccelType.HVF, id="hvf"),
+        ],
+    )
+    async def test_tsc_probe_called_for_hwaccel(self, vm_settings, workdir, accel_type: AccelType) -> None:
+        """check_tsc_deadline IS awaited for KVM and HVF."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        tsc_mock = AsyncMock(return_value=True)
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=accel_type),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", tsc_mock),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-machine-type",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        tsc_mock.assert_awaited_once()
+
+    async def test_tsc_probe_not_called_for_arm64(self, vm_settings, workdir) -> None:
+        """check_tsc_deadline is NOT awaited for ARM64 (TSC is x86-only)."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        tsc_mock = AsyncMock(return_value=True)
+        with (
+            patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)),
+            patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=AccelType.KVM),
+            patch("exec_sandbox.qemu_cmd.check_tsc_deadline", tsc_mock),
+            patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=False),
+            patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=False),
+        ):
+            await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.AARCH64,
+                vm_id="test-vm-machine-type",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        tsc_mock.assert_not_awaited()
+
+
+# ============================================================================
+# Unit Tests - Console Selection
+# ============================================================================
+
+
+class TestConsoleSelection(_QemuCmdTestBase):
+    """Verify kernel console= parameter matches architecture.
+
+    ARM64 uses PL011 UART (ttyAMA0), x86 uses virtio-console (hvc0).
+    """
+
+    @pytest.mark.parametrize(
+        "arch, expected_console, absent_console",
+        [
+            pytest.param(HostArch.X86_64, "console=hvc0", "console=ttyAMA0", id="x86"),
+            pytest.param(HostArch.AARCH64, "console=ttyAMA0", "console=hvc0", id="arm64"),
+        ],
+    )
+    async def test_console_per_arch(
+        self,
+        vm_settings,
+        workdir,
+        arch: HostArch,
+        expected_console: str,
+        absent_console: str,
+    ) -> None:
+        """Each architecture gets its correct console device."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-console",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert expected_console in cmdline
+        assert absent_console not in cmdline
+
+
+# ============================================================================
+# Unit Tests - CPU Model Selection
+# ============================================================================
+
+
+class TestCpuModelSelection(_QemuCmdTestBase):
+    """Verify -cpu flag matches arch/accel combinations.
+
+    ARM64 HVF/KVM → host, ARM64 TCG → max,pauth-impdef=on,
+    x86 HVF/KVM → host,-svm,-vmx, x86 TCG → SapphireRapids-v2.
+    """
+
+    @pytest.mark.parametrize(
+        "arch, accel_type, expected_cpu",
+        [
+            pytest.param(HostArch.AARCH64, AccelType.HVF, "host", id="arm64-hvf"),
+            pytest.param(HostArch.AARCH64, AccelType.KVM, "host", id="arm64-kvm"),
+            pytest.param(HostArch.AARCH64, AccelType.TCG, "max,pauth-impdef=on", id="arm64-tcg"),
+            pytest.param(HostArch.X86_64, AccelType.KVM, "host,-svm,-vmx", id="x86-kvm"),
+            pytest.param(HostArch.X86_64, AccelType.HVF, "host,-svm,-vmx", id="x86-hvf"),
+            pytest.param(HostArch.X86_64, AccelType.TCG, "SapphireRapids-v2", id="x86-tcg"),
+        ],
+    )
+    async def test_cpu_model(
+        self,
+        vm_settings,
+        workdir,
+        arch: HostArch,
+        accel_type: AccelType,
+        expected_cpu: str,
+    ) -> None:
+        """CPU model string matches expected value."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(accel_type=accel_type):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-cpu-model",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert _extract_cpu_model(cmd) == expected_cpu
+
+
+# ============================================================================
+# Unit Tests - Accel String
+# ============================================================================
+
+
+class TestAccelString(_QemuCmdTestBase):
+    """Verify -accel flag matches acceleration type."""
+
+    @pytest.mark.parametrize(
+        "accel_type, expected_accel",
+        [
+            pytest.param(AccelType.HVF, "hvf", id="hvf"),
+            pytest.param(AccelType.KVM, "kvm", id="kvm"),
+            pytest.param(
+                AccelType.TCG,
+                f"tcg,thread=single,tb-size={constants.DEFAULT_TCG_TB_CACHE_SIZE_MB}",
+                id="tcg",
+            ),
+        ],
+    )
+    async def test_accel_string(
+        self,
+        vm_settings,
+        workdir,
+        accel_type: AccelType,
+        expected_accel: str,
+    ) -> None:
+        """Accel string matches expected value."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(accel_type=accel_type):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-accel",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert _extract_accel(cmd) == expected_accel
+
+
+# ============================================================================
+# Unit Tests - ARM64 TCG Version Guard
+# ============================================================================
+
+
+class TestArm64TcgVersionGuard(_QemuCmdTestBase):
+    """Verify QEMU version guard for ARM64 TCG (regime_is_user crash).
+
+    QEMU < 9.0.4 has a deterministic crash on ARM64 TCG.
+    """
+
+    @pytest.mark.parametrize(
+        "qemu_version, should_raise",
+        [
+            pytest.param((8, 2, 0), True, id="8.2.0-raises"),
+            pytest.param((9, 0, 3), True, id="9.0.3-raises"),
+            pytest.param((9, 0, 4), False, id="9.0.4-ok"),
+            pytest.param((10, 0, 0), False, id="10.0.0-ok"),
+            pytest.param(None, False, id="unknown-version-ok"),
+        ],
+    )
+    async def test_arm64_tcg_version_guard(
+        self,
+        vm_settings,
+        workdir,
+        qemu_version: tuple[int, int, int] | None,
+        should_raise: bool,
+    ) -> None:
+        """ARM64 TCG raises VmDependencyError for QEMU < 9.0.4."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(qemu_version=qemu_version, accel_type=AccelType.TCG):
+            if should_raise:
+                with pytest.raises(VmDependencyError):
+                    await build_qemu_cmd(
+                        settings=vm_settings,
+                        arch=HostArch.AARCH64,
+                        vm_id="test-vm-arm64-tcg",
+                        workdir=workdir,
+                        memory_mb=256,
+                        cpu_cores=1,
+                        allow_network=False,
+                    )
+            else:
+                cmd = await build_qemu_cmd(
+                    settings=vm_settings,
+                    arch=HostArch.AARCH64,
+                    vm_id="test-vm-arm64-tcg",
+                    workdir=workdir,
+                    memory_mb=256,
+                    cpu_cores=1,
+                    allow_network=False,
+                )
+                assert isinstance(cmd, list)
+
+
+# ============================================================================
+# Unit Tests - Platform Conditional Flags
+# ============================================================================
+
+
+class TestPlatformConditionalFlags(_QemuCmdTestBase):
+    """Verify platform-specific flags in QEMU command line.
+
+    Tests -sandbox (Linux-only), 8250.nr_uarts=0 (x86-only),
+    tsc=reliable (x86-only), -nodefaults (microvm-only),
+    dump-guest-core=off (Linux-only).
+    """
+
+    @pytest.mark.parametrize(
+        "host_os, expect_sandbox",
+        [
+            pytest.param(HostOS.LINUX, True, id="linux-has-sandbox"),
+            pytest.param(HostOS.MACOS, False, id="macos-no-sandbox"),
+        ],
+    )
+    async def test_sandbox_flag(self, vm_settings, workdir, host_os: HostOS, expect_sandbox: bool) -> None:
+        """-sandbox present on Linux, absent on macOS."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=host_os):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-platform-flags",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert ("-sandbox" in cmd) == expect_sandbox
+
+    @pytest.mark.parametrize(
+        "arch, expect_uarts",
+        [
+            pytest.param(HostArch.X86_64, True, id="x86-has-uarts"),
+            pytest.param(HostArch.AARCH64, False, id="arm64-no-uarts"),
+        ],
+    )
+    async def test_8250_nr_uarts(self, vm_settings, workdir, arch: HostArch, expect_uarts: bool) -> None:
+        """8250.nr_uarts=0 in cmdline on x86, absent on arm64."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-platform-flags",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert ("8250.nr_uarts=0" in cmdline) == expect_uarts
+
+    @pytest.mark.parametrize(
+        "arch, expect_tsc",
+        [
+            pytest.param(HostArch.X86_64, True, id="x86-has-tsc"),
+            pytest.param(HostArch.AARCH64, False, id="arm64-no-tsc"),
+        ],
+    )
+    async def test_tsc_clocksource(self, vm_settings, workdir, arch: HostArch, expect_tsc: bool) -> None:
+        """tsc=reliable clocksource=tsc in cmdline on x86, absent on arm64."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-platform-flags",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert ("tsc=reliable" in cmdline) == expect_tsc
+        assert ("clocksource=tsc" in cmdline) == expect_tsc
+
+    @pytest.mark.parametrize(
+        "arch, expect_nodefaults",
+        [
+            pytest.param(HostArch.X86_64, True, id="x86-microvm-has-nodefaults"),
+            pytest.param(HostArch.AARCH64, False, id="arm64-virt-no-nodefaults"),
+        ],
+    )
+    async def test_nodefaults(self, vm_settings, workdir, arch: HostArch, expect_nodefaults: bool) -> None:
+        """-nodefaults -no-user-config present on x86 (microvm), absent on arm64 (virt)."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-platform-flags",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert ("-nodefaults" in cmd) == expect_nodefaults
+        assert ("-no-user-config" in cmd) == expect_nodefaults
+
+    @pytest.mark.parametrize(
+        "arch, host_os, expect_dump_guest_core",
+        [
+            pytest.param(HostArch.X86_64, HostOS.LINUX, True, id="x86-linux"),
+            pytest.param(HostArch.X86_64, HostOS.MACOS, False, id="x86-macos"),
+            pytest.param(HostArch.AARCH64, HostOS.LINUX, True, id="arm64-linux"),
+            pytest.param(HostArch.AARCH64, HostOS.MACOS, False, id="arm64-macos"),
+        ],
+    )
+    async def test_dump_guest_core(
+        self,
+        vm_settings,
+        workdir,
+        arch: HostArch,
+        host_os: HostOS,
+        expect_dump_guest_core: bool,
+    ) -> None:
+        """dump-guest-core=off in -M on Linux, absent on macOS."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=host_os):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-platform-flags",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        machine = _extract_machine_type(cmd)
+        assert ("dump-guest-core=off" in machine) == expect_dump_guest_core
+
+
+# ============================================================================
+# Unit Tests - Optional Features (snapshot, defer, debug, direct_write)
+# ============================================================================
+
+
+class TestOptionalFeatures(_QemuCmdTestBase):
+    """Verify optional build_qemu_cmd() parameters affect the command line."""
+
+    async def test_snapshot_drive_adds_second_drive(self, vm_settings, workdir) -> None:
+        """snapshot_drive adds a second virtio-blk device with serial=snap."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                snapshot_drive="/tmp/snap.qcow2",
+            )
+
+        # Second drive present
+        assert any("serial=snap" in arg for arg in cmd)
+        # init.snap=1 in cmdline
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert "init.snap=1" in cmdline
+
+    async def test_no_snapshot_drive(self, vm_settings, workdir) -> None:
+        """Without snapshot_drive, no second drive or init.snap."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert not any("serial=snap" in arg for arg in cmd)
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert "init.snap=1" not in cmdline
+
+    async def test_defer_incoming(self, vm_settings, workdir) -> None:
+        """defer_incoming=True adds -incoming defer."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                defer_incoming=True,
+            )
+
+        idx = cmd.index("-incoming")
+        assert cmd[idx + 1] == "defer"
+
+    async def test_no_defer_incoming(self, vm_settings, workdir) -> None:
+        """defer_incoming=False (default) omits -incoming."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert "-incoming" not in cmd
+
+    async def test_debug_boot_verbose(self, vm_settings, workdir) -> None:
+        """debug_boot=True enables verbose kernel/init logging."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                debug_boot=True,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert "loglevel=7" in cmdline
+        assert "printk.devkmsg=on" in cmdline
+        assert "init.quiet=0" in cmdline
+
+    async def test_debug_boot_quiet(self, vm_settings, workdir) -> None:
+        """debug_boot=False (default) uses quiet logging."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                debug_boot=False,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert "quiet loglevel=0" in cmdline
+        assert "printk.devkmsg=off" in cmdline
+        assert "init.quiet=1" in cmdline
+
+    async def test_direct_write(self, vm_settings, workdir) -> None:
+        """direct_write=True adds init.rw=1."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                direct_write=True,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert "init.rw=1" in cmdline
+
+    async def test_no_direct_write(self, vm_settings, workdir) -> None:
+        """direct_write=False (default) omits init.rw=1."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                direct_write=False,
+            )
+
+        cmdline = _extract_kernel_cmdline(cmd)
+        assert "init.rw=1" not in cmdline
+
+
+# ============================================================================
+# Unit Tests - Unshare Namespaces
+# ============================================================================
+
+
+class TestUnshareNamespaces(_QemuCmdTestBase):
+    """Verify Linux namespace isolation (unshare) prefix in QEMU command."""
+
+    async def test_unshare_no_network(self, vm_settings, workdir) -> None:
+        """Linux + unshare + no network → full namespace isolation including --net."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=True):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-unshare",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert cmd[0] == "unshare"
+        assert "--net" in cmd
+        assert "--pid" in cmd
+        assert "--fork" in cmd
+        # "--" separates unshare args from qemu binary
+        separator_idx = cmd.index("--")
+        assert "qemu-system-x86_64" in cmd[separator_idx + 1]
+
+    async def test_unshare_with_network(self, vm_settings, workdir) -> None:
+        """Linux + unshare + network → namespace isolation without --net."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=True):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-unshare",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=True,
+            )
+
+        assert cmd[0] == "unshare"
+        assert "--net" not in cmd
+        assert "--pid" in cmd
+        assert "--fork" in cmd
+
+    async def test_no_unshare_support(self, vm_settings, workdir) -> None:
+        """Linux without unshare support → no unshare prefix."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=False):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-unshare",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert cmd[0] != "unshare"
+        assert "qemu-system-x86_64" in cmd[0]
+
+    async def test_macos_no_unshare(self, vm_settings, workdir) -> None:
+        """macOS never uses unshare regardless of probe result."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=HostOS.MACOS, unshare=True):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-unshare",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert cmd[0] != "unshare"
 
 
 # ============================================================================
