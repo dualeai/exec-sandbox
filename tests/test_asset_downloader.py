@@ -357,14 +357,11 @@ class TestRetrieve:
 
         assert result is True
 
-        # Peak memory should be bounded by:
-        # - 64KB chunk buffer
-        # - ~200KB aiofiles I/O overhead (buffering layers)
-        # - IncrementalHasher internal state
-        # - Free-threaded Python (3.14t+) has ~400KB additional overhead (biased ref counting)
-        # - ARM64 has ~300KB additional overhead (16KB page size vs 4KB on x86_64)
-        # Empirically after warmup: ~142KB baseline, ~842KB worst-case (3.14t+ARM64)
-        max_allowed = 1024 * 1024  # 1MB - proves streaming works for 4MB file
+        # If streaming is broken, peak memory ≈ file_size (entire file in RAM).
+        # With streaming, peak stays well below half the file size even under
+        # worst-case allocator overhead (3.14t free-threaded + Linux ARM64 64KB
+        # pages ≈ 1.2MB for a 4MB file).
+        max_allowed = file_size // 2
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "
             f"for {file_size / 1024 / 1024:.0f}MB file. Streaming may be broken."
