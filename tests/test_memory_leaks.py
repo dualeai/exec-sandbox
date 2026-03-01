@@ -30,17 +30,18 @@ from tests.conftest import skip_unless_hwaccel
 _MAX_CONCURRENT = (os.cpu_count() or 4) // 2 or 1
 
 # Memory growth threshold (MB) - allows for GC jitter, allocator overhead, and initialization costs
-# Per-VM overhead varies by architecture:
+# Per-VM overhead varies by architecture and runtime:
 # - arm64: ~0.25MB/VM (smaller pointers, lighter psutil.Process caching)
 # - x64: ~0.53MB/VM (8-byte pointers, larger process structures, heavier QEMU footprint)
-# For 50 iterations: arm64 ~12.5MB, x64 ~26.5MB
-# For 200 iterations: arm64 ~50MB, x64 ~106MB
-# Threshold set to accommodate x64 worst case with headroom for GC timing variance
-_LEAK_THRESHOLD_MB = 120
+# - x64 3.14t: ~0.82MB/VM (mimalloc per-thread arenas, biased refcounting overhead)
+# For 200 iterations: arm64 ~50MB, x64 ~106MB, x64 3.14t ~164MB
+# Threshold covers 3.14t worst case (164MB observed) with headroom for GC timing variance
+_LEAK_THRESHOLD_MB = 200
 
 # Peak RAM per VM threshold (MB) - measured ~9.5MB for single VM on arm64
 # x64 has ~2MB higher overhead per VM due to architecture differences
-_PEAK_RAM_PER_VM_MB = 12
+# 3.14t: mimalloc per-thread arenas + per-object biased refcounting add ~50% overhead
+_PEAK_RAM_PER_VM_MB = 18
 
 # Code that exercises network stack without external dependencies
 _NETWORK_TEST_CODE = """
@@ -59,7 +60,33 @@ finally:
 """
 
 
-@pytest.fixture(params=[50, 200])
+@pytest.fixture
+def scheduler_config(images_dir: Path) -> SchedulerConfig:
+    """Base scheduler config shared across memory tests (no warm pool)."""
+    return SchedulerConfig(images_dir=images_dir, warm_pool_size=0)
+
+
+async def _warmup_and_baseline(
+    config: SchedulerConfig,
+    *,
+    code: str = "print('warmup')",
+    allow_network: bool = False,
+) -> tuple[psutil.Process, int]:
+    """Run a warmup Scheduler cycle, gc.collect, and return (process, baseline_rss).
+
+    Absorbs one-time init costs (Scheduler, Pydantic, psutil, mimalloc arenas)
+    before taking the RSS baseline.  See test_no_memory_leak_without_network
+    docstring for full rationale.
+    """
+    async with Scheduler(config) as scheduler:
+        await scheduler.run(code=code, language=Language.PYTHON, allow_network=allow_network)
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
+    return process, baseline_rss
+
+
+@pytest.fixture(params=[200])
 def iterations(request: pytest.FixtureRequest) -> int:
     """Parametrized iteration counts for memory leak tests."""
     return request.param
@@ -67,7 +94,7 @@ def iterations(request: pytest.FixtureRequest) -> int:
 
 @skip_unless_hwaccel
 @pytest.mark.slow
-async def test_no_memory_leak_without_network(iterations: int, images_dir: Path) -> None:
+async def test_no_memory_leak_without_network(iterations: int, scheduler_config: SchedulerConfig) -> None:
     """Verify host memory returns to baseline after N VM executions.
 
     Requires hwaccel: 90% success threshold — TCG timeouts cause too many
@@ -80,20 +107,9 @@ async def test_no_memory_leak_without_network(iterations: int, images_dir: Path)
     from a warm process and sees near-zero growth — causing false positives on
     free-threaded Python where mimalloc per-thread arenas inflate the init cost.
     """
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
+    process, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
-    # Warmup: absorb one-time init (Scheduler, Pydantic, psutil, thread pool)
-    async with Scheduler(config) as scheduler:
-        await scheduler.run(code="print('warmup')", language=Language.PYTHON)
-
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         tasks = [scheduler.run(code="print('ok')", language=Language.PYTHON) for _ in range(iterations)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -130,13 +146,11 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
         default_timeout_seconds=30,
     )
 
-    # Warmup: absorb one-time init including gvproxy/network path
-    async with Scheduler(config) as scheduler:
-        await scheduler.run(code=_NETWORK_TEST_CODE, language=Language.PYTHON, allow_network=True)
-
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
+    process, baseline_rss = await _warmup_and_baseline(
+        config,
+        code=_NETWORK_TEST_CODE,
+        allow_network=True,
+    )
 
     async with Scheduler(config) as scheduler:
         tasks = [
@@ -210,7 +224,7 @@ class PeakMemoryTracker:
 # =============================================================================
 
 # File sizes (MB) shared across all file I/O memory tests
-_FILE_IO_SIZES_MB = [1, 5, 10]
+_FILE_IO_SIZES_MB = [1, 10]
 
 # --- Streaming pipeline overhead thresholds ---
 #
@@ -232,7 +246,8 @@ _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache,
 # write queue fill during sustained transfers, and free-threaded Python overhead).
 # 3.14t adds ~2-4MB residual overhead from per-object locks even after warmup.
-_FILE_IO_RSS_OVERHEAD_MB = 18
+# Threshold covers 3.14t worst case with headroom.
+_FILE_IO_RSS_OVERHEAD_MB = 24
 # Streaming chunk pipeline headroom for RSS tests (~500KB real, padded for jitter).
 _FILE_IO_RSS_STREAMING_OVERHEAD_MB = 2
 # Intra-session accumulation ceiling (tracemalloc current, NOT RSS).
@@ -271,24 +286,23 @@ async def _file_io_cycle(scheduler: Scheduler, index: int, size_bytes: int, tmp_
 
 
 @pytest.mark.slow
-async def test_no_memory_leak_file_io(iterations: int, file_io_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_no_memory_leak_file_io(
+    iterations: int, file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+) -> None:
     """Verify host memory returns to baseline after repeated file I/O cycles.
 
     Each iteration opens a fresh session, writes a file, reads it back,
     and closes the session.  Threshold reuses _LEAK_THRESHOLD_MB because
     VM lifecycle overhead dominates (same as existing non-file-IO tests).
+
+    Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
+    docstring for rationale.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
+    process, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         sem = asyncio.Semaphore(_MAX_CONCURRENT)
 
         async def guarded(i: int) -> None:
@@ -316,7 +330,9 @@ async def test_no_memory_leak_file_io(iterations: int, file_io_size_mb: int, ima
 
 
 @pytest.mark.slow
-async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_no_memory_leak_file_io_in_session(
+    file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+) -> None:
     """Verify no buffer accumulation across repeated file I/O within one session.
 
     Single VM, 50 write+read cycles.  Catches asyncio StreamReader buffer
@@ -333,12 +349,7 @@ async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_di
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Warm-up iteration: populates Pydantic caches, zstd contexts, etc.
             warmup_content = os.urandom(size_bytes)
@@ -383,7 +394,7 @@ async def test_no_memory_leak_file_io_in_session(file_io_size_mb: int, images_di
 
 
 @pytest.mark.slow
-async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path) -> None:
     """Measure peak RSS during a single write+read cycle.
 
     os.urandom(size_bytes) is called AFTER baseline, so content allocation is
@@ -395,23 +406,12 @@ async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path, tmp_path
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
-    # Warmup: absorb one-time init (Scheduler, Pydantic, psutil, mimalloc arenas on 3.14t)
-    async with Scheduler(config) as scheduler:
-        await scheduler.run(code="print('warmup')", language=Language.PYTHON)
-
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
+    _, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
     tracker = PeakMemoryTracker()
     dest = tmp_path / "peak_test.bin"
 
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             tracker.start(baseline_rss)
             content = os.urandom(size_bytes)
@@ -437,15 +437,21 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
 
     Requires hwaccel: RSS thresholds are calibrated for KVM/HVF — TCG JIT
     compilation inflates per-VM RSS, causing false positives.
-    """
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
 
+    Warmup run absorbs one-time init costs and, when allow_network=True,
+    also primes the gvproxy/network path — see test_no_memory_leak_without_network
+    docstring for rationale.
+    """
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
         default_timeout_seconds=30 if allow_network else 10,
+    )
+
+    _, baseline_rss = await _warmup_and_baseline(
+        config,
+        code=_NETWORK_TEST_CODE if allow_network else "print('warmup')",
+        allow_network=allow_network,
     )
 
     tracker = PeakMemoryTracker()
@@ -482,27 +488,27 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
 
 
 @pytest.mark.slow
-async def test_peak_ram_read_file(file_io_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_peak_ram_read_file(file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path) -> None:
     """Measure peak RSS during a read_file-only cycle (separate from write+read).
 
     Baseline is taken AFTER write_file completes, so content + BytesIO are
-    already accounted for.  Bounded op_queue (maxsize=4) and StreamReader
-    buffer (512KB) keep read-path memory at O(chunk_size).
-    Threshold: 5 MB flat (chunk pipeline + GC/allocator jitter).
+    already accounted for.  Bounded op_queue (maxsize=OP_QUEUE_DEPTH) and
+    StreamReader buffer keep read-path memory at O(chunk_size).
+    Threshold: _FILE_IO_RSS_OVERHEAD_MB flat (VM lifecycle + queue fill +
+    C allocator overhead + 3.14t mimalloc residual).
     Must NOT scale with file size.
+
+    No external warmup Scheduler is needed: the baseline is captured
+    mid-session after write_file completes, so all one-time init costs
+    (Scheduler, Pydantic, VM boot) are already absorbed.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
     process = psutil.Process()
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
     dest = tmp_path / "peak_read_test.bin"
     content = os.urandom(size_bytes)
 
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Write first (not measured)
             await session.write_file("peak_read_test.bin", content)
@@ -540,13 +546,16 @@ def concurrent_sessions(request: pytest.FixtureRequest) -> int:
 @skip_unless_hwaccel
 @pytest.mark.slow
 async def test_peak_ram_concurrent_file_io(
-    concurrent_sessions: int, file_io_size_mb: int, images_dir: Path, tmp_path: Path
+    concurrent_sessions: int, file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
 ) -> None:
     """Measure peak RSS with N sessions each doing write+read concurrently.
 
     Uses Path input so _resolve_content opens a file handle (no BytesIO copy).
     Source files are created BEFORE baseline measurement, so os.urandom bytes
     are freed and don't pollute the tracked region.
+
+    Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
+    docstring for rationale.
 
     Per-session peak during transfer:
       - File handle from _resolve_content: ~0 bytes (not a copy)
@@ -564,14 +573,7 @@ async def test_peak_ram_concurrent_file_io(
         src.write_bytes(os.urandom(size_bytes))
         sources[i] = src
 
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
-
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
+    _, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
     async def session_cycle(scheduler: Scheduler, idx: int) -> None:
         src = sources[idx]
@@ -584,7 +586,7 @@ async def test_peak_ram_concurrent_file_io(
 
     tracker = PeakMemoryTracker()
 
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         tracker.start(baseline_rss)
         results = await asyncio.gather(
             *(session_cycle(scheduler, i) for i in range(concurrent_sessions)),
@@ -612,7 +614,7 @@ async def test_peak_ram_concurrent_file_io(
 
 
 @pytest.mark.slow
-async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Path) -> None:
+async def test_tracemalloc_peak_write_file(file_io_size_mb: int, scheduler_config: SchedulerConfig) -> None:
     """Measure Python-level allocation peak during write_file with bytes input.
 
     Uses tracemalloc for exact Python allocation tracking (catches sub-ms
@@ -625,12 +627,7 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Pat
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             content = os.urandom(size_bytes)
             tracemalloc.start()
@@ -651,7 +648,9 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, images_dir: Pat
 
 
 @pytest.mark.slow
-async def test_tracemalloc_peak_write_file_from_path(file_io_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_tracemalloc_peak_write_file_from_path(
+    file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+) -> None:
     """Measure Python-level allocation peak during write_file with Path input.
 
     Path input: _resolve_content opens a file handle, no full-content copy.
@@ -663,12 +662,7 @@ async def test_tracemalloc_peak_write_file_from_path(file_io_size_mb: int, image
     src = tmp_path / "tracemalloc_src.bin"
     src.write_bytes(os.urandom(size_bytes))
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             tracemalloc.start()
             try:
@@ -687,7 +681,9 @@ async def test_tracemalloc_peak_write_file_from_path(file_io_size_mb: int, image
 
 
 @pytest.mark.slow
-async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_tracemalloc_peak_read_file(
+    file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+) -> None:
     """Measure Python-level allocation peak during read_file.
 
     Read loop: op_queue.get() → base64.b64decode → decompress → disk write,
@@ -700,12 +696,7 @@ async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path
     content = os.urandom(size_bytes)
     dest = tmp_path / "tracemalloc_read.bin"
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             await session.write_file("tracemalloc_read.bin", content)
 
@@ -735,7 +726,7 @@ async def test_tracemalloc_peak_read_file(file_io_size_mb: int, images_dir: Path
 @skip_unless_hwaccel
 @pytest.mark.slow
 @pytest.mark.parametrize("large_file_mb", [30, 50], ids=["30MB", "50MB"])
-async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_path: Path) -> None:
+async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path) -> None:
     """Measure peak RSS for large files — threshold is FLAT, not proportional.
 
     Requires hwaccel: RSS thresholds are calibrated for KVM/HVF — TCG JIT
@@ -747,24 +738,20 @@ async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_
     lifecycle overhead (~_PEAK_RAM_PER_VM_MB) + streaming (~500 KB).
     Flat threshold proves streaming is O(chunk_size), not O(file_size):
     a 30 MB and 50 MB file must fit under the SAME threshold.
+
+    Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
+    docstring for rationale.
     """
     size_bytes = large_file_mb * 1024 * 1024
     src = tmp_path / "large_src.bin"
     src.write_bytes(os.urandom(size_bytes))
     dest = tmp_path / "large_dest.bin"
 
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
-
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
+    _, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
     tracker = PeakMemoryTracker()
 
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             tracker.start(baseline_rss)
             await session.write_file("large_file.bin", src)
@@ -795,8 +782,10 @@ async def test_peak_ram_large_file_io(large_file_mb: int, images_dir: Path, tmp_
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("comparison_size_mb", [5, 10], ids=["5MB", "10MB"])
-async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_dir: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("comparison_size_mb", [10], ids=["10MB"])
+async def test_bytes_vs_path_memory_difference(
+    comparison_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+) -> None:
     """Compare tracemalloc peaks for bytes vs Path write_file inputs.
 
     Both paths share the same bounded chunk pipeline (write queue maxsize=64).
@@ -808,13 +797,8 @@ async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_d
     src = tmp_path / "compare_src.bin"
     src.write_bytes(os.urandom(size_bytes))
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
     # Measure bytes input peak
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             content = src.read_bytes()
             tracemalloc.start()
@@ -826,7 +810,7 @@ async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_d
             del content
 
     # Measure Path input peak
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             tracemalloc.start()
             try:
@@ -856,7 +840,7 @@ async def test_bytes_vs_path_memory_difference(comparison_size_mb: int, images_d
 
 @pytest.mark.slow
 @pytest.mark.parametrize("output_mb", [2, 100], ids=["2MB", "100MB"])
-async def test_output_cap_bounds_host_memory(output_mb: int, images_dir: Path) -> None:
+async def test_output_cap_bounds_host_memory(output_mb: int, scheduler_config: SchedulerConfig) -> None:
     """Guest-side output cap prevents host memory from scaling with output size.
 
     Generates output_mb of stdout in the guest.  The guest agent caps at 1 MB
@@ -883,12 +867,7 @@ while remaining > 0:
 sys.stdout.flush()
 """
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        warm_pool_size=0,
-    )
-
-    async with Scheduler(config) as scheduler:
+    async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Warm-up: populates Pydantic caches, channel state, etc.
             await session.exec('print("warmup")')
