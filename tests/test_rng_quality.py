@@ -95,35 +95,38 @@ class TestEntStatistics:
         """Chi-square test for uniform byte distribution.
 
         Chi-square is extremely sensitive to RNG errors.
-        For 255 DOF: values 200-310 are normal (p=0.01 to p=0.99)
+        For 255 DOF: values 200-310 are normal (p=0.01 to p=0.99).
+
+        Uses 3 attempts to reduce false positive rate from ~1.5% to ~0.0003%.
+        A truly broken RNG would fail all attempts consistently.
         """
         code = """
 import os
 
-# Generate 256KB (matches ENT default)
-data = os.urandom(256 * 1024)
+for attempt in range(3):
+    # Generate 256KB (matches ENT default)
+    data = os.urandom(256 * 1024)
 
-# Count byte frequencies
-freq = [0] * 256
-for b in data:
-    freq[b] += 1
+    # Count byte frequencies
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
 
-# Chi-square statistic
-expected = len(data) / 256
-chi_sq = sum((f - expected) ** 2 / expected for f in freq)
+    # Chi-square statistic
+    expected = len(data) / 256
+    chi_sq = sum((f - expected) ** 2 / expected for f in freq)
 
-# For 255 DOF:
-# - < 200: suspiciously uniform (may indicate weak RNG)
-# - > 310: non-uniform distribution (definitely broken)
-# - 200-310: normal range
-print(f"CHI_SQ:{chi_sq:.2f}")
+    # For 255 DOF:
+    # - < 200: suspiciously uniform (may indicate weak RNG)
+    # - > 310: non-uniform distribution (definitely broken)
+    # - 200-310: normal range
+    print(f"ATTEMPT:{attempt + 1} CHI_SQ:{chi_sq:.2f}")
 
-if chi_sq < 200:
-    print("SUSPECT_TOO_UNIFORM")
-elif chi_sq > 310:
-    print("FAIL_NON_UNIFORM")
+    if 200 <= chi_sq <= 310:
+        print("PASS")
+        break
 else:
-    print("PASS")
+    print("FAIL")
 """
         result = await scheduler.run(code=code, language=Language.PYTHON)
 

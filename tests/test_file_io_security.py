@@ -35,8 +35,13 @@ WEB_ENCODING_VECTORS = [
 ]
 
 
+@pytest.mark.slow
 class TestPathTraversalWrite:
-    """Path traversal attacks on write_file."""
+    """Path traversal attacks on write_file.
+
+    Slow under TCG: guest agent path validation round-trip can exceed
+    FILE_IO_TIMEOUT_SECONDS under CI CPU contention.
+    """
 
     @pytest.mark.parametrize("path", FILESYSTEM_TRAVERSAL_VECTORS)
     async def test_write_traversal_rejected(self, dual_scheduler: Scheduler, path: str) -> None:

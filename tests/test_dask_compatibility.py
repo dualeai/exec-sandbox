@@ -31,12 +31,15 @@ from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
+from .conftest import skip_unless_hwaccel
+
 DASK_PACKAGES = ["dask==2026.1.2"]
 
 
 # =============================================================================
 # System context detection — dask.system reads /proc/*, /sys/fs/cgroup/*
 # =============================================================================
+@skip_unless_hwaccel  # Snapshot creation (pip install dask + deps) routinely exceeds 940s under TCG
 class TestDaskSystemContext:
     """dask.system CPU/memory detection works inside the hardened VM.
 
@@ -61,7 +64,6 @@ print(f'DASK_CPU:{count}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("DASK_CPU:")[1].strip())
@@ -81,7 +83,6 @@ print(f'MATCH:{cpu_count() == CPU_COUNT}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "MATCH:True" in result.stdout
@@ -90,6 +91,7 @@ print(f'MATCH:{cpu_count() == CPU_COUNT}')
 # =============================================================================
 # Scheduler backends — synchronous, threaded
 # =============================================================================
+@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
 class TestDaskSchedulers:
     """Dask scheduler backends produce correct results.
 
@@ -111,7 +113,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(100)) = 99*100*199/6 = 328350
@@ -130,7 +131,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RESULT:328350" in result.stdout
@@ -148,7 +148,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x*2 for x in range(1000) if (x*2) % 3 == 0)
@@ -162,6 +161,7 @@ print(f'RESULT:{result}')
 # =============================================================================
 # Dask.delayed — task graph API
 # =============================================================================
+@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
 class TestDaskDelayed:
     """dask.delayed builds and executes task graphs."""
 
@@ -186,7 +186,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RESULT:21" in result.stdout
@@ -210,7 +209,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(10)) = 9*10*19/6 = 285
@@ -220,6 +218,7 @@ print(f'RESULT:{result}')
 # =============================================================================
 # Realistic application patterns
 # =============================================================================
+@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
 class TestDaskRealisticUsage:
     """Simulate how real applications use Dask for parallel computing."""
 
@@ -250,7 +249,6 @@ print(f'NAMES:{sorted(high_scores)}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "COUNT:4" in result.stdout
@@ -277,7 +275,6 @@ print(f'RESULT:{result}')
             code=code,
             language=Language.PYTHON,
             packages=DASK_PACKAGES,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         npartitions = int(result.stdout.split("NPARTITIONS:")[1].split("\n")[0])

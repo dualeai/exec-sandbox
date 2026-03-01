@@ -14,7 +14,7 @@ pub(crate) const CMD_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.cmd";
 pub(crate) const EVENT_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.event";
 
 // Execution limits
-pub(crate) const MAX_CODE_SIZE_BYTES: usize = 1_000_000; // 1MB max code size
+pub(crate) const MAX_CODE_SIZE_BYTES: usize = 1024 * 1024; // 1 MiB max code size
 pub(crate) const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install output
 pub(crate) const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 
@@ -45,12 +45,16 @@ pub(crate) const MAX_ENV_VAR_VALUE_LENGTH: usize = 4096;
 // Package limits
 pub(crate) const MAX_PACKAGES: usize = 50;
 pub(crate) const MAX_PACKAGE_NAME_LENGTH: usize = 214; // PyPI limit
-pub(crate) const PACKAGE_INSTALL_TIMEOUT_SECONDS: u64 = 300;
 
 // Streaming configuration
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
 pub(crate) const DRAIN_TIMEOUT_MS: u64 = 5;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
+
+// Output size limits (guest-enforced). Exceeding either raises CmdError::output_limit
+// to the host (maps to OutputLimitError in Python). The REPL is preserved for session reuse.
+pub(crate) const MAX_STDOUT_BYTES: usize = 1_000_000; // 1 MB
+pub(crate) const MAX_STDERR_BYTES: usize = 100_000; // 100 KB
 
 // File I/O limits
 pub(crate) const MAX_FILE_SIZE_BYTES: usize = 500 * 1024 * 1024; // 500 MiB
@@ -85,6 +89,16 @@ pub(crate) static QUIET_MODE: LazyLock<bool> = LazyLock::new(|| {
 });
 
 /// Blocked dangerous environment variables (case-insensitive check at validation time).
+///
+/// SECURITY NOTE: These names are visible via `strings(1)` on the compiled binary.
+/// This is an accepted risk because:
+///   1. The list contains well-known dangerous vars documented in every Linux
+///      hardening guide — no information advantage is gained by reading the binary.
+///   2. The rootfs is read-only EROFS; the binary cannot be patched in-guest.
+///   3. The VM itself is the primary isolation boundary; this blocklist is
+///      defense-in-depth, not the sole security control.
+///   4. Obfuscation (e.g. compile-time hashing) would add complexity and a
+///      normalization step (case-insensitive matching) for negligible benefit.
 pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
     // Dynamic linker (arbitrary code execution)
     "LD_PRELOAD",

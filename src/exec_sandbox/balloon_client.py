@@ -13,7 +13,7 @@ Usage:
     async with BalloonClient(qmp_socket_path, expected_uid) as client:
         await client.inflate(target_mb=128)  # Reduce guest memory to 128MB
         # ... VM waits in pool ...
-        await client.deflate(target_mb=256)  # Restore memory before execution
+        await client.deflate(target_mb=192)  # Restore memory before execution
 """
 
 from __future__ import annotations

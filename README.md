@@ -52,7 +52,7 @@ sbx run app.js
 echo 'print(42)' | sbx run -
 
 # With packages
-sbx run -p requests -p pandas 'import pandas; print(pandas.__version__)'
+sbx run -p requests==2.32.5 -p pandas==3.0.1 'import pandas; print(pandas.__version__)'
 
 # With timeout and memory limits
 sbx run -t 60 -m 512 long_script.py
@@ -259,6 +259,7 @@ async with Scheduler() as scheduler:
     # Port forwarding without internet (isolated)
     result = await scheduler.run(
         code="print('server ready')",
+        language="python",
         expose_ports=[PortMapping(internal=8080, external=3000)],  # Guest:8080 → Host:3000
         allow_network=False,  # No outbound internet
     )
@@ -267,6 +268,7 @@ async with Scheduler() as scheduler:
     # Dynamic port allocation (OS assigns external port)
     result = await scheduler.run(
         code="print('server ready')",
+        language="python",
         expose_ports=[8080],  # external=None → OS assigns port
     )
     print(result.exposed_ports[0].external)  # e.g., 52341
@@ -274,6 +276,7 @@ async with Scheduler() as scheduler:
     # Long-running server with port forwarding
     result = await scheduler.run(
         code="import http.server; http.server.test(port=8080, bind='0.0.0.0')",
+        language="python",
         expose_ports=[PortMapping(internal=8080)],
         timeout_seconds=60,  # Server runs until timeout
     )
@@ -301,13 +304,34 @@ async with Scheduler(config) as scheduler:
 #### Error Handling
 
 ```python
-from exec_sandbox import Scheduler, VmTimeoutError, PackageNotAllowedError, SandboxError
+from exec_sandbox import (
+    Scheduler,
+    InputValidationError,
+    PackageNotAllowedError,
+    SandboxError,
+    VmTimeoutError,
+    VmTransientError,
+)
 
 async with Scheduler() as scheduler:
     try:
-        result = await scheduler.run(code="while True: pass", language="python", timeout_seconds=5)
+        result = await scheduler.run(code="print('hello')", language="python", timeout_seconds=5)
+
+        # Execution timeouts are NOT exceptions — they return a result with exit_code=-1.
+        if result.exit_code == -1:
+            print(f"Code timed out: {result.stderr}")
+
+    except InputValidationError as e:
+        # Caller bug — bad code or env vars. Fix input and retry.
+        # (CodeValidationError, EnvVarValidationError inherit from this)
+        print(f"Invalid input: {e}")
     except VmTimeoutError:
-        print("Execution timed out")
+        # VM failed to boot (guest agent not ready). Often transient (CPU contention).
+        print("VM boot timed out — retry may succeed")
+    except VmTransientError:
+        # Infrastructure failure (QEMU crash, REPL spawn OOM) — code never ran, safe to retry.
+        # VmTimeoutError is a subclass, so this must come after it.
+        print("Transient VM failure, retry may succeed")
     except PackageNotAllowedError as e:
         print(f"Package not in allowlist: {e}")
     except SandboxError as e:
@@ -378,19 +402,20 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript, Raw). Set >0 to enable |
-| `default_memory_mb` | 256 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
+| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
-| `snapshot_cache_dir` | OS cache dir (see below) | Local snapshot cache (macOS: ~/Library/Caches/exec-sandbox/, Linux: ~/.cache/exec-sandbox/) |
+| `disk_snapshot_cache_dir` | OS cache dir | Local disk snapshot cache (macOS: `~/Library/Caches/exec-sandbox/disk-snapshots/`, Linux: `~/.cache/exec-sandbox/disk-snapshots/`) |
+| `memory_snapshot_cache_dir` | OS cache dir | Local memory snapshot cache (macOS: `~/Library/Caches/exec-sandbox/memory-snapshots/`, Linux: `~/.cache/exec-sandbox/memory-snapshots/`) |
 | `s3_bucket` | None | S3 bucket for remote snapshot cache |
 | `s3_region` | us-east-1 | AWS region |
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
 | `memory_overcommit_ratio` | 1.5 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
-| `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = host_cpus × ratio |
+| `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
-| `resource_monitor_interval_seconds` | 5.0 | Interval between resource monitor ticks (1-60s) |
+| `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
@@ -405,24 +430,24 @@ VMs include automatic memory optimization (no configuration required):
 
 ### Memory Architecture
 
-Guest RAM is a fixed budget shared between the kernel, userspace processes, and tmpfs mounts. tmpfs is demand-allocated — writing 10 MB of files consumes ~10 MB of the VM's memory budget.
+Guest RAM is a fixed budget shared between the kernel, userspace processes, and tmpfs mounts. tmpfs is demand-allocated — writing 10 MB of files consumes ~10 MB of the VM's memory budget. All tmpfs mounts enforce per-UID quota (`usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
 
 ```
 Guest RAM (default 192 MB)
 ├── Kernel + slab caches     (~20 MB fixed)
 ├── Userspace (code execution) (variable)
-├── tmpfs mounts (on demand)
-│   ├── /home/user           50% of RAM (no fixed cap) — user files, packages
-│   ├── /tmp                 128 MB cap — pip/uv wheel builds, temp files
-│   └── /dev/shm              64 MB cap — POSIX shared memory
+├── tmpfs mounts (on demand, per-UID quota)
+│   ├── /home/user           50% of RAM — user files, packages
+│   ├── /tmp                 50% of RAM — pip/uv wheel builds, temp files
+│   └── /dev/shm             50% of RAM — POSIX shared memory
 └── zram compressed swap     (~25% effective bonus)
 ```
 
 | Mount | Size | Purpose |
 |---|---|---|
 | `/home/user` | 50% of RAM | Writable home dir — installed packages, user scripts, data files |
-| `/tmp` | 128 MB | Scratch space for package managers (wheel builds), temp files |
-| `/dev/shm` | 64 MB | POSIX shared memory segments (Python multiprocessing semaphores) |
+| `/tmp` | 50% of RAM | Scratch space for package managers (wheel builds), temp files |
+| `/dev/shm` | 50% of RAM | POSIX shared memory segments (Python multiprocessing semaphores) |
 
 ## Snapshot Caching Architecture
 
@@ -492,6 +517,7 @@ The critical metric is **time to first code execution** — not just VM boot, bu
 | `execution_time_ms` | int | Duration reported by VM |
 | `external_cpu_time_ms` | int | CPU time measured by host |
 | `external_memory_peak_mb` | int | Peak memory measured by host |
+| `external_cpu_nr_throttled` | int | CFS bandwidth throttle events (host cgroup) |
 | `timing.setup_ms` | int | Resource setup (filesystem, limits, network) |
 | `timing.boot_ms` | int | VM boot time |
 | `timing.execute_ms` | int | Code execution |
@@ -499,9 +525,10 @@ The critical metric is **time to first code execution** — not just VM boot, bu
 | `warm_pool_hit` | bool | Whether a pre-started VM was used |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
-Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = internal error (could not retrieve status), other non-zero = program error.
+Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures (QEMU crash, REPL spawn failure) raise `VmTransientError` instead of returning a result.
 
 ```python
+# Infrastructure failures raise VmTransientError before reaching here (see Error Handling).
 result = await scheduler.run(code="...", language="python")
 
 if result.exit_code == 0:
@@ -509,7 +536,7 @@ if result.exit_code == 0:
 elif result.exit_code > 128:
     signal_num = result.exit_code - 128  # e.g., 9 for SIGKILL
 elif result.exit_code == -1:
-    pass  # Internal error (see result.stderr)
+    pass  # Execution timeout (code ran too long, see result.stderr)
 else:
     pass  # Program exited with error
 ```
@@ -530,23 +557,27 @@ Returned by `Session.list_files()`.
 |-----------|-------------|
 | `SandboxError` | Base exception for all sandbox errors |
 | `TransientError` | Retryable errors — may succeed on retry |
-| `PermanentError` | Non-retryable errors |
+| `VmTransientError` | Transport failure or guest infrastructure failure (code never ran) |
 | `VmTimeoutError` | VM boot timed out |
 | `VmCapacityError` | VM pool at capacity |
+| `PermanentError` | Non-retryable errors |
+| `VmPermanentError` | Protocol/request corruption or invalid VM state |
 | `VmConfigError` | Invalid VM configuration |
+| `InputValidationError` | Caller-bug errors — bad input, session stays alive |
+| `CodeValidationError` | Empty, whitespace-only, or null-byte code |
+| `EnvVarValidationError` | Invalid env var names/values (control chars, size) |
 | `SessionClosedError` | Session already closed |
 | `CommunicationError` | Guest communication failed |
 | `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
-| `EnvVarValidationError` | Environment variable validation failed |
 | `SocketAuthError` | Socket peer authentication failed |
 | `SandboxDependencyError` | Optional dependency missing (e.g., aioboto3) |
 | `AssetError` | Asset download/verification failed |
 
 ## Session Resilience
 
-Sessions survive user code failures. Only VM-level communication errors close a session.
+Sessions survive user code failures and input validation errors (`InputValidationError`). Only VM-level communication errors close a session.
 
 | Failure | Exit Code | Session | State | Next `exec()` |
 |---------|-----------|---------|-------|----------------|
@@ -587,7 +618,7 @@ on_stdout=lambda chunk: buffer.append(chunk)  # Fast (same applies to on_boot_lo
 # warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
-default_memory_mb=256  # Code can actually use ~280-320MB thanks to compression
+default_memory_mb=192  # Code can actually use ~210-240MB thanks to compression
 # Don't rely on memory limits for security - use timeouts for runaway allocations
 
 # Network without domain restrictions is risky
@@ -657,7 +688,7 @@ async with await scheduler.session(language="python") as session:
 | Linux | x64, arm64 |
 | macOS | x64, arm64 |
 | QEMU | 8.0+ |
-| Hardware acceleration | KVM (Linux) or HVF (macOS) recommended, 10-50x faster |
+| Hardware acceleration | KVM (Linux) or HVF (macOS) recommended, ~5-8x faster |
 
 Verify hardware acceleration is available:
 
@@ -666,7 +697,7 @@ ls /dev/kvm              # Linux
 sysctl kern.hv_support   # macOS
 ```
 
-Without hardware acceleration, QEMU uses software emulation (TCG), which is 10-50x slower.
+Without hardware acceleration, QEMU uses software emulation (TCG), which is ~5-8x slower.
 
 ### Linux Setup (Optional Security Hardening)
 

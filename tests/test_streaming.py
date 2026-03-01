@@ -2,8 +2,8 @@
 
 Verifies the streaming contract:
 - Callbacks fire in real-time as chunks arrive from the guest agent
-- "".join(chunks) == result.stdout/stderr (before truncation)
-- Truncation applies to result.stdout/stderr but NOT to callbacks
+- "".join(chunks) == result.stdout/stderr (within guest-enforced limits)
+- Output exceeding limits raises OutputLimitError (guest-enforced)
 - Buffer boundaries (64KB flush), timing (50ms flush interval), and edge cases
 """
 
@@ -11,7 +11,8 @@ import time
 
 import pytest
 
-from exec_sandbox.constants import MAX_STDERR_SIZE, MAX_STDOUT_SIZE
+from exec_sandbox.constants import DEFAULT_TIMEOUT_SECONDS
+from exec_sandbox.exceptions import OutputLimitError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from tests.conftest import skip_unless_hwaccel
@@ -59,7 +60,12 @@ for i in range(100):
 
     @skip_unless_hwaccel
     async def test_multi_chunk_via_sleep(self, scheduler: Scheduler) -> None:
-        """Sleeps > 50ms flush interval force multiple chunks arriving at different times."""
+        """Sleeps > 50ms flush interval force multiple chunks arriving at different times.
+
+        Requires hwaccel: chunk count assertion depends on 50ms flush interval
+        vs wall-clock timing — TCG (~5-8x slower) compresses the sleep gaps
+        and batches chunks unpredictably.
+        """
         chunk_times: list[float] = []
 
         def on_stdout(_chunk: str) -> None:
@@ -115,7 +121,12 @@ for i in range(10):
 
     @skip_unless_hwaccel
     async def test_streaming_delivers_before_completion(self, scheduler: Scheduler) -> None:
-        """First callback fires well before execution completes (not batched at end)."""
+        """First callback fires well before execution completes (not batched at end).
+
+        Requires hwaccel: first-chunk-before-completion gap assertion (>300ms)
+        is unreliable under TCG — the 1s in-guest sleep stretches to ~5-8s,
+        compressing the measurable gap below threshold.
+        """
         first_chunk_time: list[float] = []
 
         def on_stdout(_chunk: str) -> None:
@@ -150,10 +161,10 @@ print("late")
 
 
 # =============================================================================
-# Streaming Boundaries: Edge cases around buffer sizes and truncation
+# Streaming Boundaries: Edge cases around buffer sizes and output limits
 # =============================================================================
 class TestStreamingBoundaries:
-    """Test buffer boundary conditions and truncation semantics."""
+    """Test buffer boundary conditions and output limit enforcement."""
 
     async def test_output_just_under_64kb(self, scheduler: Scheduler) -> None:
         """65535 bytes fits in a single buffer flush."""
@@ -213,53 +224,47 @@ sys.stdout.flush()
         assert len(joined) == 65537
         assert len(stdout_chunks) >= 2
 
-    async def test_stdout_exceeds_max_truncated(self, scheduler: Scheduler) -> None:
-        """Callbacks see all 1.2MB; result.stdout truncated to MAX_STDOUT_SIZE."""
+    async def test_stdout_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
+        """1.2MB stdout raises OutputLimitError; partial output delivered via callbacks."""
         stdout_chunks: list[str] = []
-        target_size = int(MAX_STDOUT_SIZE * 1.2)  # 1.2MB
+        target_size = 1_200_000  # 1.2MB — over 1MB limit
 
         code = f"""
 import sys
 sys.stdout.write("X" * {target_size})
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=60,
-            on_stdout=stdout_chunks.append,
-        )
+        with pytest.raises(OutputLimitError, match="output_limit_error"):
+            await scheduler.run(
+                code=code,
+                language=Language.PYTHON,
+                on_stdout=stdout_chunks.append,
+            )
 
-        assert result.exit_code == 0
+        # Callbacks received partial output up to the limit
         joined = "".join(stdout_chunks)
-        # Callbacks see everything
-        assert len(joined) == target_size
-        # Result is truncated
-        assert len(result.stdout) == MAX_STDOUT_SIZE
+        assert len(joined) <= 1_000_000 + 8192  # limit + one read buffer margin
 
-    async def test_stderr_exceeds_max_truncated(self, scheduler: Scheduler) -> None:
-        """Callbacks see all 120KB; result.stderr truncated to MAX_STDERR_SIZE."""
+    async def test_stderr_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
+        """120KB stderr raises OutputLimitError; partial output delivered via callbacks."""
         stderr_chunks: list[str] = []
-        target_size = int(MAX_STDERR_SIZE * 1.2)  # 120KB
+        target_size = 120_000  # 120KB — over 100KB limit
 
         code = f"""
 import sys
 sys.stderr.write("E" * {target_size})
 sys.stderr.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=60,
-            on_stderr=stderr_chunks.append,
-        )
+        with pytest.raises(OutputLimitError, match="output_limit_error"):
+            await scheduler.run(
+                code=code,
+                language=Language.PYTHON,
+                on_stderr=stderr_chunks.append,
+            )
 
-        assert result.exit_code == 0
+        # Callbacks received partial output up to the limit
         joined = "".join(stderr_chunks)
-        # Callbacks see everything
-        assert len(joined) == target_size
-        # Result is truncated
-        assert len(result.stderr) == MAX_STDERR_SIZE
+        assert len(joined) <= 100_000 + 8192  # limit + one read buffer margin
 
     async def test_no_output_callbacks_never_fire(self, scheduler: Scheduler) -> None:
         """Silent code produces no callback invocations."""
@@ -314,8 +319,15 @@ print("error line", file=sys.stderr)
         assert len(stdout_chunks) >= 1
         assert len(stderr_chunks) == 0
 
+    @skip_unless_hwaccel
     async def test_stderr_without_trailing_newline(self, scheduler: Scheduler) -> None:
-        """Residual stderr_line_buf is flushed even without trailing newline."""
+        """Residual stderr_line_buf is flushed even without trailing newline.
+
+        Requires hwaccel: the code itself is trivial (~5ms), but under TCG
+        the full VM lifecycle (L1 restore failure → cold boot fallback →
+        REPL warm-up) can consume most of the 120s test timeout, leaving
+        the guest-agent starved and causing spurious execution timeouts.
+        """
         stderr_chunks: list[str] = []
 
         code = """
@@ -340,18 +352,64 @@ sys.stderr.flush()
 class TestStreamingWeirdCases:
     """Test unusual inputs that might confuse the streaming protocol."""
 
-    async def test_callback_exception_propagates(self, scheduler: Scheduler) -> None:
-        """Exception in on_stdout callback propagates (not swallowed)."""
+    async def test_callback_exception_disabled_stdout_still_completes(self, scheduler: Scheduler) -> None:
+        """on_stdout that raises is disabled; output still collected in result."""
 
         def exploding_callback(_chunk: str) -> None:
-            raise ValueError("callback boom")
+            raise RuntimeError("callback boom")
 
-        with pytest.raises(ValueError, match="callback boom"):
-            await scheduler.run(
-                code='print("trigger")',
-                language=Language.PYTHON,
-                on_stdout=exploding_callback,
-            )
+        result = await scheduler.run(
+            code='print("hello from stdout")',
+            language=Language.PYTHON,
+            on_stdout=exploding_callback,
+        )
+        assert result.exit_code == 0
+        assert "hello from stdout" in result.stdout
+
+    async def test_callback_exception_disabled_stderr_still_completes(self, scheduler: Scheduler) -> None:
+        """on_stderr that raises is disabled; output still collected in result."""
+
+        def exploding_callback(_chunk: str) -> None:
+            raise RuntimeError("callback boom")
+
+        result = await scheduler.run(
+            code='import sys; print("hello from stderr", file=sys.stderr)',
+            language=Language.PYTHON,
+            on_stderr=exploding_callback,
+        )
+        assert result.exit_code == 0
+        assert "hello from stderr" in result.stderr
+
+    async def test_callback_exception_on_later_chunk(self, scheduler: Scheduler) -> None:
+        """Callback raises on 2nd chunk; all output still collected."""
+        call_count = 0
+
+        def explode_on_second(chunk: str) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise RuntimeError("boom on second chunk")
+
+        code = """
+import sys
+for i in range(5):
+    print(f"line-{i}", flush=True)
+"""
+
+        def collecting_callback(chunk: str) -> None:
+            stdout_chunks.append(chunk)
+            explode_on_second(chunk)
+
+        stdout_chunks: list[str] = []
+        result = await scheduler.run(
+            code=code,
+            language=Language.PYTHON,
+            on_stdout=collecting_callback,
+        )
+        assert result.exit_code == 0
+        # All lines collected in result regardless of callback failure
+        for i in range(5):
+            assert f"line-{i}" in result.stdout
 
     async def test_extremely_long_single_line(self, scheduler: Scheduler) -> None:
         """128KB with no newlines splits into >= 2 chunks."""
@@ -504,16 +562,17 @@ class TestStreamingOutOfBounds:
         """Output before timeout is captured; rest is absent."""
         stdout_chunks: list[str] = []
 
-        code = """
+        timeout = DEFAULT_TIMEOUT_SECONDS // 2
+        code = f"""
 import time
 print("before-timeout", flush=True)
-time.sleep(60)
+time.sleep({timeout * 4})
 print("after-timeout")
 """
         await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=3,
+            timeout_seconds=timeout,
             on_stdout=stdout_chunks.append,
         )
 
@@ -568,7 +627,6 @@ sys.stdout.flush()
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
             on_stdout=stdout_chunks.append,
         )
 
@@ -604,13 +662,13 @@ sys.stdout.flush()
             assert "exec-two" in joined_2
             assert "exec-one" not in joined_2
 
-    async def test_mixed_truncation_stdout_over_stderr_under(self, scheduler: Scheduler) -> None:
-        """Only stdout truncated when over limit; stderr stays intact."""
+    async def test_mixed_stdout_over_stderr_under_raises_output_limit(self, scheduler: Scheduler) -> None:
+        """stdout over limit raises OutputLimitError; stderr under limit is fine."""
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
-        stdout_size = int(MAX_STDOUT_SIZE * 1.2)  # 1.2MB — over limit
-        stderr_size = MAX_STDERR_SIZE // 2  # 50KB — well under limit
+        stdout_size = 1_200_000  # 1.2MB — over 1MB limit
+        stderr_size = 50_000  # 50KB — well under 100KB limit
 
         code = f"""
 import sys
@@ -619,22 +677,24 @@ sys.stdout.flush()
 sys.stderr.write("E" * {stderr_size})
 sys.stderr.flush()
 """
-        res = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=60,
-            on_stdout=stdout_chunks.append,
-            on_stderr=stderr_chunks.append,
-        )
+        with pytest.raises(OutputLimitError, match="output_limit_error"):
+            await scheduler.run(
+                code=code,
+                language=Language.PYTHON,
+                on_stdout=stdout_chunks.append,
+                on_stderr=stderr_chunks.append,
+            )
 
-        assert res.exit_code == 0
-        stdout_joined = "".join(stdout_chunks)
-        stderr_joined = "".join(stderr_chunks)
+    async def test_session_reuse_after_output_limit_error(self, scheduler: Scheduler) -> None:
+        """REPL session survives OutputLimitError — next exec works normally."""
+        async with await scheduler.session(language=Language.PYTHON) as session:
+            # First execution: exceed stdout limit
+            with pytest.raises(OutputLimitError):
+                await session.exec(
+                    "import sys; sys.stdout.write('X' * 1_200_000); sys.stdout.flush()",
+                )
 
-        # Callbacks see everything
-        assert len(stdout_joined) == stdout_size
-        assert len(stderr_joined) == stderr_size
-
-        # stdout truncated, stderr intact
-        assert len(res.stdout) == MAX_STDOUT_SIZE
-        assert len(res.stderr) == stderr_size
+            # Second execution: normal output works (REPL preserved)
+            result = await session.exec('print("after-limit")')
+            assert result.exit_code == 0
+            assert "after-limit" in result.stdout

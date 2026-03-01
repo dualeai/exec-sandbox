@@ -73,12 +73,15 @@ class TimingBreakdown(BaseModel):
     All times are in milliseconds, measured from the host side.
     Follows Firecracker/AWS Lambda SnapStart conventions for phase separation.
 
-    Note: total_ms is independently measured end-to-end and may be slightly
-    larger than setup_ms + boot_ms + execute_ms due to orchestration overhead
-    (warm pool checks, semaphore acquisition, etc.).
+    Phase coverage:
+    - setup_ms: All pre-boot time (admission acquire, cache lookup, overlay, cgroup)
+    - boot_ms: VM boot (QEMU start + kernel + initramfs + guest-agent ready)
+    - execute_ms: Code execution (connect + run + response)
+    - teardown_ms: Post-execute cleanup (VM destroy, workdir cleanup, admission release)
+    - total_ms = setup + boot + execute + teardown (true end-to-end)
 
-    For warm pool hits, setup_ms and boot_ms are 0 since those costs were
-    pre-paid at pool startup time.
+    For warm pool hits, boot_ms is 0 (pre-paid at pool startup). setup_ms
+    reflects the pool lookup time (typically <1ms).
 
     Granular boot timing note: The sum of (qemu_cmd_build_ms + gvproxy_start_ms +
     qemu_fork_ms + guest_wait_ms) will be ~20-30ms less than boot_ms due to
@@ -86,10 +89,10 @@ class TimingBreakdown(BaseModel):
     console log setup, VM registration, state transitions).
     """
 
-    setup_ms: int = Field(description="Resource setup time (overlay, cgroup, gvproxy - parallel)")
+    setup_ms: int = Field(description="Resource setup time (admission acquire, cache lookup, overlay, cgroup)")
     boot_ms: int = Field(description="VM boot time (QEMU start + kernel + initramfs + guest-agent ready)")
     execute_ms: int = Field(description="Code execution time (connect + run + response)")
-    total_ms: int = Field(description="Total end-to-end time (setup + boot + execute)")
+    total_ms: int = Field(description="Total end-to-end time (setup + boot + execute + teardown)")
     connect_ms: int | None = Field(
         default=None,
         description="Time for channel.connect() in milliseconds (host-measured)",
@@ -121,6 +124,11 @@ class TimingBreakdown(BaseModel):
         default=None,
         description="L1 memory snapshot restore time in milliseconds",
     )
+    # Post-execute teardown
+    teardown_ms: int | None = Field(
+        default=None,
+        description="VM teardown time (process shutdown, workdir cleanup, admission release)",
+    )
     # Retry tracking (for CPU contention resilience)
     boot_retries: int = Field(
         default=0,
@@ -131,12 +139,16 @@ class TimingBreakdown(BaseModel):
 class ExecutionResult(BaseModel):
     """Result from code execution inside microVM."""
 
-    stdout: str = Field(max_length=1_000_000, description="Standard output (truncated at 1MB)")
-    stderr: str = Field(max_length=100_000, description="Standard error (truncated at 100KB)")
+    stdout: str = Field(description="Standard output (guest-enforced 1MB limit)")
+    stderr: str = Field(description="Standard error (guest-enforced 100KB limit)")
     exit_code: int = Field(description="Process exit code (0=success)")
     execution_time_ms: int | None = Field(default=None, description="Execution time in ms (guest-reported)")
     external_cpu_time_ms: int | None = Field(default=None, description="CPU time in ms (host cgroup)")
     external_memory_peak_mb: int | None = Field(default=None, description="Peak memory in MB (host cgroup)")
+    external_cpu_nr_throttled: int | None = Field(
+        default=None,
+        description="Number of CFS bandwidth throttle events (host cgroup cpu.stat nr_throttled)",
+    )
     timing: TimingBreakdown = Field(description="Detailed timing breakdown (setup, boot, execute, total)")
     warm_pool_hit: bool = Field(default=False, description="True if VM was allocated from warm pool (instant start)")
     l1_cache_hit: bool = Field(default=False, description="VM restored from L1 memory snapshot")

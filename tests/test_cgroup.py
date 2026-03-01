@@ -17,12 +17,11 @@ import pytest
 
 from exec_sandbox.cgroup import (
     CGROUP_APP_NAMESPACE,
-    CGROUP_MEMORY_OVERHEAD_MB,
+    CGROUP_CPU_PERIOD_US,
     CGROUP_PIDS_LIMIT,
     CGROUP_V2_BASE_PATH,
     ERRNO_PERMISSION_DENIED,
     ERRNO_READ_ONLY_FILESYSTEM,
-    TCG_TB_CACHE_SIZE_MB,
     ULIMIT_CPU_TIME_SECONDS,
     ULIMIT_MEMORY_MULTIPLIER,
     detect_cgroup_cpu_limit,
@@ -30,6 +29,10 @@ from exec_sandbox.cgroup import (
     is_cgroup_available,
     read_container_available_memory_mb,
     wrap_with_ulimit,
+)
+from exec_sandbox.constants import (
+    DEFAULT_TCG_TB_CACHE_SIZE_MB,
+    DEFAULT_VM_MEMORY_OVERHEAD_MB,
 )
 from exec_sandbox.platform_utils import HostOS
 
@@ -204,7 +207,7 @@ class TestWrapWithUlimit:
             mock_os.return_value = HostOS.LINUX
 
             cmd = ["qemu-system-x86_64", "-m", "256"]
-            wrapped = wrap_with_ulimit(cmd, memory_mb=256)
+            wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=256)
 
             assert wrapped[0] == "bash"
             assert wrapped[1] == "-c"
@@ -220,7 +223,7 @@ class TestWrapWithUlimit:
             mock_os.return_value = HostOS.MACOS
 
             cmd = ["qemu-system-aarch64", "-m", "512"]
-            wrapped = wrap_with_ulimit(cmd, memory_mb=512)
+            wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=512)
 
             # macOS should have ulimit with -u (processes) only
             assert "ulimit" in wrapped[2]
@@ -238,7 +241,7 @@ class TestWrapWithUlimit:
 
             # Use x86_64 QEMU binary (Intel Mac)
             cmd = ["qemu-system-x86_64", "-m", "512"]
-            wrapped = wrap_with_ulimit(cmd, memory_mb=512)
+            wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=512)
 
             # macOS should have ulimit with -u (processes) only
             assert "ulimit" in wrapped[2]
@@ -255,7 +258,7 @@ class TestWrapWithUlimit:
             mock_os.return_value = HostOS.LINUX
 
             memory_mb = 256
-            wrapped = wrap_with_ulimit(["test"], memory_mb=memory_mb)
+            wrapped = wrap_with_ulimit(["test"], cgroup_memory_mb=memory_mb)
 
             expected_kb = memory_mb * 1024 * ULIMIT_MEMORY_MULTIPLIER
             assert f"ulimit -v {expected_kb}" in wrapped[2]
@@ -266,7 +269,7 @@ class TestWrapWithUlimit:
         with patch("exec_sandbox.cgroup.detect_host_os") as mock_os:
             mock_os.return_value = HostOS.LINUX
 
-            wrapped = wrap_with_ulimit([], memory_mb=256)
+            wrapped = wrap_with_ulimit([], cgroup_memory_mb=256)
             assert wrapped[0] == "bash"
             assert wrapped[1] == "-c"
             # Should have ulimit but empty exec
@@ -277,7 +280,7 @@ class TestWrapWithUlimit:
         with patch("exec_sandbox.cgroup.detect_host_os") as mock_os:
             mock_os.return_value = HostOS.LINUX
 
-            wrapped = wrap_with_ulimit(["test"], memory_mb=0)
+            wrapped = wrap_with_ulimit(["test"], cgroup_memory_mb=0)
             assert "ulimit -v 0" in wrapped[2]
 
     # --- Weird cases ---
@@ -287,7 +290,7 @@ class TestWrapWithUlimit:
             mock_os.return_value = HostOS.LINUX
 
             cmd = ["binary", "--arg", "$(whoami)", "; rm -rf /", "| cat"]
-            wrapped = wrap_with_ulimit(cmd, memory_mb=128)
+            wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=128)
 
             # shlex.quote should escape these
             assert "$(whoami)" not in wrapped[2] or "'$(whoami)'" in wrapped[2]
@@ -299,7 +302,7 @@ class TestWrapWithUlimit:
             mock_os.return_value = HostOS.LINUX
 
             cmd = ["binary", "--arg", "value with spaces"]
-            wrapped = wrap_with_ulimit(cmd, memory_mb=128)
+            wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=128)
 
             assert "'value with spaces'" in wrapped[2]
 
@@ -310,7 +313,7 @@ class TestWrapWithUlimit:
 
             # 1TB in MB
             memory_mb = 1024 * 1024
-            wrapped = wrap_with_ulimit(["test"], memory_mb=memory_mb)
+            wrapped = wrap_with_ulimit(["test"], cgroup_memory_mb=memory_mb)
 
             expected_kb = memory_mb * 1024 * ULIMIT_MEMORY_MULTIPLIER
             assert str(expected_kb) in wrapped[2]
@@ -508,13 +511,13 @@ class TestSetupCgroup:
             mock_file.write = AsyncMock()
 
             with patch("aiofiles.open", return_value=mock_file):
-                result = await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1, use_tcg=False)
+                result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
                 assert result == Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/tenant1/vm123")
                 assert mock_makedirs.call_count == 2  # tenant + vm directories
 
-    async def test_setup_tcg_mode_adds_extra_memory(self):
-        """TCG mode adds TB cache size to memory limit."""
+    async def test_setup_applies_precomputed_memory_limit(self):
+        """setup_cgroup applies pre-computed memory limit (no internal overhead calc)."""
         from exec_sandbox.cgroup import setup_cgroup
 
         written_values: list[str] = []
@@ -529,22 +532,25 @@ class TestSetupCgroup:
             mock_file.write = AsyncMock(side_effect=capture_write)
 
             with patch("aiofiles.open", return_value=mock_file):
-                await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1, use_tcg=True)
+                # Pass effective memory (admission already added overhead + TCG)
+                effective_memory = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
+                await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=effective_memory, cgroup_cpu_cores=1.0)
 
-                # Find memory.max value (in bytes)
-                expected_memory = (256 + CGROUP_MEMORY_OVERHEAD_MB + TCG_TB_CACHE_SIZE_MB) * 1024 * 1024
-                assert str(expected_memory) in written_values
+                # cgroup should apply exactly what was passed (in bytes)
+                expected_memory_bytes = effective_memory * 1024 * 1024
+                assert str(expected_memory_bytes) in written_values
 
     @pytest.mark.parametrize(
-        ("cpu_cores", "expected_cpu_max"),
+        ("cgroup_cpu_cores", "expected_cpu_max"),
         [
-            (1, "100000 100000"),
-            (2, "200000 100000"),
-            (4, "400000 100000"),
+            (1.0, f"{int(CGROUP_CPU_PERIOD_US * 1.0)} {CGROUP_CPU_PERIOD_US}"),
+            (1.25, f"{int(CGROUP_CPU_PERIOD_US * 1.25)} {CGROUP_CPU_PERIOD_US}"),
+            (2.0, f"{int(CGROUP_CPU_PERIOD_US * 2.0)} {CGROUP_CPU_PERIOD_US}"),
+            (4.0, f"{int(CGROUP_CPU_PERIOD_US * 4.0)} {CGROUP_CPU_PERIOD_US}"),
         ],
     )
-    async def test_setup_cpu_max_scales_with_cores(self, cpu_cores: int, expected_cpu_max: str):
-        """cpu.max quota scales proportionally with cpu_cores."""
+    async def test_setup_cpu_max_scales_with_cores(self, cgroup_cpu_cores: float, expected_cpu_max: str):
+        """cpu.max quota scales proportionally with cgroup_cpu_cores (effective, including overhead)."""
         from exec_sandbox.cgroup import setup_cgroup
 
         written_values: list[str] = []
@@ -559,7 +565,7 @@ class TestSetupCgroup:
             mock_file.write = AsyncMock(side_effect=capture_write)
 
             with patch("aiofiles.open", return_value=mock_file):
-                await setup_cgroup("vm123", "tenant1", 256, cpu_cores=cpu_cores)
+                await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=cgroup_cpu_cores)
                 assert expected_cpu_max in written_values
 
     # --- Error cases ---
@@ -571,7 +577,7 @@ class TestSetupCgroup:
         error.errno = ERRNO_READ_ONLY_FILESYSTEM
 
         with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
-            result = await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1)
+            result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
             assert result == Path("/tmp/cgroup-vm123")
 
@@ -583,7 +589,7 @@ class TestSetupCgroup:
         error.errno = ERRNO_PERMISSION_DENIED
 
         with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
-            result = await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1)
+            result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
             assert result == Path("/tmp/cgroup-vm123")
 
@@ -597,7 +603,7 @@ class TestSetupCgroup:
 
         with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
             with pytest.raises(VmError, match="Failed to setup cgroup"):
-                await setup_cgroup("vm123", "tenant1", 256, cpu_cores=1)
+                await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
 
 # =============================================================================
@@ -719,26 +725,27 @@ class TestReadCgroupStats:
 
     # --- Edge cases (None/missing) ---
     async def test_returns_none_for_none_path(self):
-        """Returns (None, None) for None path."""
+        """Returns (None, None, None) for None path."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        cpu_ms, mem_mb = await read_cgroup_stats(None)
+        cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(None)
         assert cpu_ms is None
         assert mem_mb is None
+        assert nr_throttled is None
 
     async def test_returns_none_for_nonexistent_path(self):
-        """Returns (None, None) for non-existent path."""
+        """Returns (None, None, None) for non-existent path."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
         result = await read_cgroup_stats(Path("/nonexistent/cgroup"))
-        assert result == (None, None)
+        assert result == (None, None, None)
 
     # --- Normal cases ---
     async def test_reads_cpu_and_memory_stats(self):
         """Reads and parses cpu.stat and memory.peak correctly."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        cpu_stat_content = "usage_usec 5000000\nuser_usec 3000000\nsystem_usec 2000000"
+        cpu_stat_content = "usage_usec 5000000\nuser_usec 3000000\nsystem_usec 2000000\nnr_throttled 42"
         memory_peak_content = "104857600"  # 100MB in bytes
 
         async def mock_exists(path: Any) -> bool:
@@ -760,10 +767,11 @@ class TestReadCgroupStats:
             patch("aiofiles.os.path.exists", side_effect=mock_exists),
             patch("aiofiles.open", side_effect=mock_open_file),
         ):
-            cpu_ms, mem_mb = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
+            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
 
             assert cpu_ms == 5000  # 5000000 usec = 5000 ms
             assert mem_mb == 100  # 104857600 bytes = 100 MB
+            assert nr_throttled == 42
 
     # --- Error cases ---
     async def test_handles_malformed_cpu_stat(self):
@@ -784,11 +792,12 @@ class TestReadCgroupStats:
             patch("aiofiles.os.path.exists", side_effect=mock_exists),
             patch("aiofiles.open", side_effect=mock_open_file),
         ):
-            cpu_ms, mem_mb = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
+            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
 
             # Should return None on parse error, not crash
             assert cpu_ms is None
             assert mem_mb is None
+            assert nr_throttled is None
 
     async def test_handles_oserror_during_read(self):
         """Handles OSError during file read gracefully."""
@@ -804,10 +813,11 @@ class TestReadCgroupStats:
             patch("aiofiles.os.path.exists", side_effect=mock_exists),
             patch("aiofiles.open", side_effect=mock_open_file),
         ):
-            cpu_ms, mem_mb = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
+            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
 
             assert cpu_ms is None
             assert mem_mb is None
+            assert nr_throttled is None
 
 
 # =============================================================================
@@ -1007,11 +1017,11 @@ class TestCgroupConstants:
 
     def test_memory_overhead_is_reasonable(self):
         """Memory overhead is reasonable for microvm/virt machine types (32-128MB)."""
-        assert 32 <= CGROUP_MEMORY_OVERHEAD_MB <= 128
+        assert 32 <= DEFAULT_VM_MEMORY_OVERHEAD_MB <= 128
 
     def test_tcg_cache_size_is_reasonable(self):
         """TCG TB cache size is reasonable (256MB-1GB)."""
-        assert 256 <= TCG_TB_CACHE_SIZE_MB <= 1024
+        assert 256 <= DEFAULT_TCG_TB_CACHE_SIZE_MB <= 1024
 
     def test_pids_limit_is_reasonable(self):
         """PIDs limit is reasonable (50-500)."""
@@ -1147,12 +1157,13 @@ class TestCgroupIntegration:
         tenant_id = "integration-test"
 
         # Create real cgroup
+        # Effective memory: guest (256) + overhead, pre-computed by admission
+        effective_memory_mb = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
         cgroup_path = await setup_cgroup(
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
-            memory_mb=256,
-            cpu_cores=1,
-            use_tcg=False,
+            cgroup_memory_mb=effective_memory_mb,
+            cgroup_cpu_cores=1.0,
         )
 
         try:
@@ -1163,9 +1174,9 @@ class TestCgroupIntegration:
             assert (cgroup_path / "cpu.max").exists()
             assert (cgroup_path / "pids.max").exists()
 
-            # Verify memory limit was set
+            # Verify memory limit was set (cgroup applies exactly what was passed)
             memory_max = (cgroup_path / "memory.max").read_text().strip()
-            expected_bytes = (256 + CGROUP_MEMORY_OVERHEAD_MB) * 1024 * 1024
+            expected_bytes = effective_memory_mb * 1024 * 1024
             assert int(memory_max) == expected_bytes
 
             # Verify pids limit was set
@@ -1186,8 +1197,8 @@ class TestCgroupIntegration:
         cgroup_path = await setup_cgroup(
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
-            memory_mb=256,
-            cpu_cores=1,
+            cgroup_memory_mb=256,
+            cgroup_cpu_cores=1.0,
         )
 
         # Start a real process (sleep)
@@ -1230,8 +1241,8 @@ class TestCgroupIntegration:
         cgroup_path = await setup_cgroup(
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
-            memory_mb=256,
-            cpu_cores=1,
+            cgroup_memory_mb=256,
+            cgroup_cpu_cores=1.0,
         )
 
         # Start a process that does some work
@@ -1251,7 +1262,7 @@ class TestCgroupIntegration:
             await proc.wait()
 
             # Read stats
-            cpu_ms, mem_mb = await read_cgroup_stats(cgroup_path)
+            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(cgroup_path)
 
             # Stats should have values (process did work)
             assert cpu_ms is not None, "CPU stats not available"
@@ -1260,6 +1271,10 @@ class TestCgroupIntegration:
             # Memory peak might not be available on all systems
             if mem_mb is not None:
                 assert mem_mb >= 0, f"Memory should be non-negative: {mem_mb}"
+
+            # nr_throttled should be non-negative if available
+            if nr_throttled is not None:
+                assert nr_throttled >= 0, f"nr_throttled should be non-negative: {nr_throttled}"
 
         finally:
             if proc.returncode is None:
@@ -1277,8 +1292,8 @@ class TestCgroupIntegration:
         cgroup_path = await setup_cgroup(
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
-            memory_mb=256,
-            cpu_cores=1,
+            cgroup_memory_mb=256,
+            cgroup_cpu_cores=1.0,
         )
 
         assert cgroup_path.exists(), "Cgroup should exist after setup"
@@ -1299,8 +1314,8 @@ class TestCgroupIntegration:
         cgroup_path = await setup_cgroup(
             vm_id=unique_vm_id,
             tenant_id=tenant_id,
-            memory_mb=256,
-            cpu_cores=1,
+            cgroup_memory_mb=256,
+            cgroup_cpu_cores=1.0,
         )
 
         # Override pids.max to a very low value for testing

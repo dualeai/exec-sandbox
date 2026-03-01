@@ -19,6 +19,7 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from tests.conftest import skip_unless_hwaccel
 
 # Code that reads urandom IMMEDIATELY — before any entropy can accumulate
 # from CPU jitter / interrupts / etc.
@@ -41,13 +42,18 @@ async def l1_scheduler(images_dir: Path) -> AsyncGenerator[Scheduler, None]:
         images_dir=images_dir,
         auto_download_assets=False,
         warm_pool_size=0,  # Disable warm pool — force cold boot / L1 path
+        default_timeout_seconds=120,
     )
     async with Scheduler(config) as sched:
         yield sched
 
 
+@skip_unless_hwaccel
 class TestL1SnapshotRNG:
     """Verify RNG uniqueness after L1 memory snapshot restore.
+
+    Requires hwaccel: L1 memory snapshots use QEMU migration which requires
+    hardware-accelerated CPU state save/restore (KVM/HVF).
 
     The L1 snapshot saves full CPU+RAM+device state via QEMU migration.
     On restore, the kernel CRNG resumes from the saved state. The guest-agent

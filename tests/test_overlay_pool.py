@@ -16,8 +16,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from .conftest import skip_unless_hwaccel
-
 # ============================================================================
 # Unit Tests - Pure Logic (no I/O, no mocks)
 # ============================================================================
@@ -707,9 +705,12 @@ class TestOverlayPoolErrorHandling:
 # ============================================================================
 
 
-@skip_unless_hwaccel
 class TestOverlayPoolIntegration:
-    """Integration tests with real qemu-img - no mocking."""
+    """Integration tests with real qemu-img — no mocking.
+
+    No hwaccel required: uses qemu-img and qemu-storage-daemon on the host
+    to create/acquire qcow2 overlays — no VMs are booted.
+    """
 
     async def test_full_lifecycle(self, vm_settings, tmp_path: Path) -> None:
         """Test complete lifecycle: start → acquire → stop."""

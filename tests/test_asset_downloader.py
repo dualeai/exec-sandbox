@@ -342,6 +342,13 @@ class TestRetrieve:
                 hasher.update(chunk)
         expected_hash = hasher.hexdigest()
 
+        # Warmup: absorb one-time allocations from tracemalloc internals,
+        # aiofiles thread-pool startup, and hashlib module init so they
+        # don't inflate the peak measurement.
+        tracemalloc.start()
+        await _verify_hash(large_file, f"sha256:{expected_hash}")
+        tracemalloc.stop()
+
         # Measure peak memory during hash verification
         tracemalloc.start()
         result = await _verify_hash(large_file, f"sha256:{expected_hash}")
@@ -350,14 +357,11 @@ class TestRetrieve:
 
         assert result is True
 
-        # Peak memory should be bounded by:
-        # - 64KB chunk buffer
-        # - ~200KB aiofiles I/O overhead (buffering layers)
-        # - IncrementalHasher internal state
-        # - Free-threaded Python (3.14t+) has ~400KB additional overhead (biased ref counting)
-        # - ARM64 has ~300KB additional overhead (16KB page size vs 4KB on x86_64)
-        # Empirically: ~220KB baseline, ~900KB on ARM64, ~1400KB on 3.14t+ARM64
-        max_allowed = 1536 * 1024  # 1.5MB - proves streaming works for 4MB file
+        # If streaming is broken, peak memory ≈ file_size (entire file in RAM).
+        # With streaming, peak stays well below half the file size even under
+        # worst-case allocator overhead (3.14t free-threaded + Linux ARM64 64KB
+        # pages ≈ 1.2MB for a 4MB file).
+        max_allowed = file_size // 2
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "
             f"for {file_size / 1024 / 1024:.0f}MB file. Streaming may be broken."

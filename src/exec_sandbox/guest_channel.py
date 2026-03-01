@@ -8,8 +8,9 @@ single-port building block composed by DualPortChannel.
 
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
+    OutputChunkMessage,
     PingRequest,
     PongMessage,
     StreamingErrorMessage,
@@ -78,6 +80,10 @@ class FileOpDispatcher:
                 await self._task
             self._task = None
 
+    def is_alive(self) -> bool:
+        """Check if the dispatch loop task is still running."""
+        return self._task is not None and not self._task.done()
+
     async def register_op(self, op_id: str) -> asyncio.Queue[StreamingMessage]:
         """Register an op_id and return its dedicated bounded queue."""
         async with self._lock:
@@ -101,7 +107,7 @@ class FileOpDispatcher:
         while True:
             try:
                 data = await self._reader.readuntil(b"\n")
-            except asyncio.IncompleteReadError:
+            except (asyncio.IncompleteReadError, OSError):
                 break
             try:
                 msg = _STREAMING_MESSAGE_ADAPTER.validate_json(data.rstrip(b"\n"))
@@ -255,7 +261,7 @@ class UnixSocketChannel:
         """Connect to guest via Unix socket with mandatory peer verification.
 
         Single connection attempt with timeout (no retry).
-        Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
+        Caller handles retry logic (e.g., wait_for_guest exponential backoff).
 
         Verifies the socket server (QEMU) is running as the expected user
         via SO_PEERCRED/LOCAL_PEERCRED before allowing communication.
@@ -308,6 +314,14 @@ class UnixSocketChannel:
 
             except TimeoutError:
                 continue  # Check shutdown flag
+            except RuntimeError as e:
+                if "event loop is closed" not in str(e).lower():
+                    logger.error(
+                        "UnixSocketChannel write worker error - connection broken",
+                        extra={"socket_path": self.socket_path, "error": str(e), "error_type": type(e).__name__},
+                        exc_info=True,
+                    )
+                break
             except Exception as e:
                 # Log error with full traceback
                 logger.error(
@@ -455,8 +469,18 @@ class UnixSocketChannel:
             raise RuntimeError("Write queue full - guest agent not draining") from e
 
     def is_connected(self) -> bool:
-        """Check if channel is connected."""
-        return self._reader is not None and self._writer is not None
+        """Check if channel is connected and the write path is still alive.
+
+        Without these checks, the host holds a stale connection after the
+        guest agent's 18s read timeout triggers a reconnect cycle: connect()
+        sees is_connected()=True, skips reconnection, and the next write_file
+        header is sent into a dead socket.
+        """
+        if self._reader is None or self._writer is None:
+            return False
+        if self._writer.is_closing():
+            return False
+        return not (self._write_task is not None and self._write_task.done())
 
     def get_reader(self) -> asyncio.StreamReader | None:
         """Get the stream reader (for direct access when needed)."""
@@ -535,21 +559,24 @@ class DualPortChannel:
         """Connect both command and event ports.
 
         Connects in parallel for speed. Single connection attempt with timeout (no retry).
-        Caller handles retry logic (e.g., _wait_for_guest exponential backoff).
+        Caller handles retry logic (e.g., wait_for_guest exponential backoff).
 
         On reconnection (after a previous close()), probes the guest agent with a
         PingRequest to ensure the guest has reopened its virtio-serial port.  QEMU
         accepts the host socket before the guest agent is ready; data sent in that
         window is silently dropped, causing 30s timeouts downstream.
         """
-        # Already connected — nothing to do
-        if self._cmd_channel.is_connected() and self._event_channel.is_connected():
+        # Already connected and dispatcher healthy — nothing to do.
+        # Dispatcher EOF is the earliest signal that the guest has disconnected.
+        if (
+            self._cmd_channel.is_connected()
+            and self._event_channel.is_connected()
+            and (self._dispatcher is None or self._dispatcher.is_alive())
+        ):
             return
 
         await self._raw_connect(timeout_seconds)
 
-        # On reconnection, probe the guest to confirm the virtio-serial path
-        # is end-to-end ready.  Skipped on first boot (zero overhead).
         if self._has_been_connected:
             await self._probe_guest_ready(timeout_seconds)
 
@@ -557,13 +584,23 @@ class DualPortChannel:
 
     async def _raw_connect(self, timeout_seconds: float) -> None:
         """Low-level connect: open sockets and start dispatcher."""
+        # Close stale sockets: without this, connect() is a no-op (objects still exist)
+        # and the new dispatcher gets a reader that immediately EOFs.
+        if self._dispatcher and not self._dispatcher.is_alive():
+            await self._dispatcher.stop()
+            self._dispatcher = None
+            await asyncio.gather(
+                self._cmd_channel.close(),
+                self._event_channel.close(),
+            )
+
         # Connect both ports in parallel for speed
         await asyncio.gather(
             self._cmd_channel.connect(timeout_seconds),
             self._event_channel.connect(timeout_seconds),
         )
 
-        # Start the file operation dispatcher on the event channel (once)
+        # Start the file operation dispatcher on the event channel
         if not self._dispatcher:
             reader = self._event_channel.get_reader()
             if reader:
@@ -733,8 +770,10 @@ class DualPortChannel:
         """
         # Stop dispatcher first
         if self._dispatcher:
-            await self._dispatcher.stop()
-            self._dispatcher = None
+            try:
+                await self._dispatcher.stop()
+            finally:
+                self._dispatcher = None
 
         # Close both ports in parallel
         await asyncio.gather(
@@ -752,6 +791,120 @@ class DualPortChannel:
     ) -> None:
         """Exit async context manager, closing connection."""
         await self.close()
+
+
+@dataclass
+class StreamResult:
+    """Collected output from a guest agent streaming execution.
+
+    Returned by consume_stream() after processing all messages from
+    stream_messages(). Collects stdout/stderr chunks, timing data,
+    and final exit code.
+    """
+
+    exit_code: int = -1
+    stdout: str = ""
+    stderr: str = ""
+    execution_time_ms: int | None = None
+    spawn_ms: int | None = None
+    process_ms: int | None = None
+
+
+async def consume_stream(
+    channel: "GuestChannel",
+    request: GuestAgentRequest,
+    *,
+    timeout: int,
+    vm_id: str,
+    on_stdout: Callable[[str], None] | None = None,
+    on_stderr: Callable[[str], None] | None = None,
+    on_error: Callable[[StreamingErrorMessage], Awaitable[None]] | None = None,
+) -> StreamResult:
+    """Send request via channel, consume the streaming response, return collected result.
+
+    Handles OutputChunkMessage, ExecutionCompleteMessage, and StreamingErrorMessage.
+    Callbacks (on_stdout, on_stderr) are defensively wrapped — exceptions disable them.
+    on_error is awaited for StreamingErrorMessage before the default handling (which
+    appends the error to stderr and sets exit_code=-1). If on_error raises, the
+    exception propagates immediately.
+
+    Args:
+        channel: GuestChannel to stream from.
+        request: Request to send.
+        timeout: Hard timeout for the entire stream (seconds).
+        vm_id: VM identifier for logging.
+        on_stdout: Optional callback for stdout chunks.
+        on_stderr: Optional callback for stderr chunks.
+        on_error: Optional async callback for StreamingErrorMessage.
+            Called before default handling. If it raises, the exception propagates.
+
+    Returns:
+        StreamResult with collected output, exit code, and timing.
+    """
+    exit_code = -1
+    execution_time_ms: int | None = None
+    spawn_ms: int | None = None
+    process_ms: int | None = None
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    async with contextlib.aclosing(channel.stream_messages(request, timeout=timeout)) as stream:
+        async for msg in stream:
+            if isinstance(msg, OutputChunkMessage):
+                if msg.type == "stdout":
+                    stdout_chunks.append(msg.chunk)
+                    if on_stdout is not None:
+                        try:
+                            on_stdout(msg.chunk)
+                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                            logger.warning(
+                                "on_stdout callback raised, disabling",
+                                extra={"vm_id": vm_id},
+                                exc_info=True,
+                            )
+                            on_stdout = None
+                else:  # stderr
+                    stderr_chunks.append(msg.chunk)
+                    if on_stderr is not None:
+                        try:
+                            on_stderr(msg.chunk)
+                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                            logger.warning(
+                                "on_stderr callback raised, disabling",
+                                extra={"vm_id": vm_id},
+                                exc_info=True,
+                            )
+                            on_stderr = None
+
+                logger.debug(
+                    "VM output",
+                    extra={"vm_id": vm_id, "stream": msg.type, "chunk": msg.chunk[:200]},
+                )
+
+            elif isinstance(msg, ExecutionCompleteMessage):
+                exit_code = msg.exit_code
+                execution_time_ms = msg.execution_time_ms
+                spawn_ms = msg.spawn_ms
+                process_ms = msg.process_ms
+                break
+
+            elif isinstance(msg, StreamingErrorMessage):
+                # Let caller handle error first (may raise)
+                if on_error is not None:
+                    await on_error(msg)
+                # Default handling: append error to stderr, set exit_code=-1, break
+                stderr_chunks.append(f"[{msg.error_type}] {msg.message}")
+                exit_code = -1
+                break
+
+    return StreamResult(
+        exit_code=exit_code,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
+        execution_time_ms=execution_time_ms,
+        spawn_ms=spawn_ms,
+        process_ms=process_ms,
+    )
 
 
 @asynccontextmanager

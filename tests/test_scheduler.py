@@ -158,6 +158,35 @@ class TestMemoryValidation:
         assert not isinstance(exc_info.value, VmConfigError)
 
 
+class TestCodeSizeValidation:
+    """Tests for code size validation in Scheduler.run()."""
+
+    async def test_code_exceeds_limit_rejected(self) -> None:
+        """Code larger than MAX_CODE_SIZE raises VmConfigError before VM boot."""
+        from exec_sandbox.constants import MAX_CODE_SIZE
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        with pytest.raises(VmConfigError, match="Code too large"):
+            await scheduler.run(code="x" * (MAX_CODE_SIZE + 1), language=Language.PYTHON)
+
+    async def test_code_at_limit_accepted(self) -> None:
+        """Code exactly at MAX_CODE_SIZE passes size validation."""
+        from exec_sandbox.constants import MAX_CODE_SIZE
+        from exec_sandbox.exceptions import VmConfigError
+
+        scheduler = Scheduler()
+        scheduler._started = True
+
+        # Should NOT raise VmConfigError - it will fail later due to missing
+        # VM manager, but the code size validation itself should pass
+        with pytest.raises(Exception) as exc_info:
+            await scheduler.run(code="x" * MAX_CODE_SIZE, language=Language.PYTHON)
+        assert not isinstance(exc_info.value, VmConfigError)
+
+
 class TestPackageValidation:
     """Tests for package validation in Scheduler."""
 
@@ -266,8 +295,6 @@ class TestSchedulerShutdownOrdering:
         scheduler._warm_pool.stop = AsyncMock()
         scheduler._memory_snapshot_manager = MagicMock()
         scheduler._memory_snapshot_manager.stop = AsyncMock()
-        scheduler._resource_monitor = MagicMock()
-        scheduler._resource_monitor.stop = AsyncMock()
         scheduler._vm_manager = MagicMock()
         scheduler._vm_manager.stop = AsyncMock()
         scheduler._vm_manager.get_active_vms = MagicMock(return_value={})
@@ -303,7 +330,6 @@ class TestSchedulerShutdownOrdering:
 
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._resource_monitor.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         assert scheduler._started is False
 
@@ -346,17 +372,6 @@ class TestSchedulerShutdownOrdering:
         await scheduler.__aexit__(None, None, None)
 
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-
-    async def test_shutdown_no_resource_monitor(self) -> None:
-        """Shutdown works when _resource_monitor is None."""
-        scheduler = self._make_scheduler()
-        scheduler._resource_monitor = None
-
-        await scheduler.__aexit__(None, None, None)
-
-        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
 
     async def test_shutdown_no_vm_manager(self) -> None:
@@ -405,17 +420,6 @@ class TestSchedulerShutdownOrdering:
 
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
 
-    async def test_shutdown_resource_monitor_error_continues(self) -> None:
-        """ResourceMonitor.stop() error does not prevent other managers from stopping."""
-        scheduler = self._make_scheduler()
-        scheduler._resource_monitor.stop.side_effect = RuntimeError("monitor failed")  # type: ignore[union-attr]
-
-        await scheduler.__aexit__(None, None, None)
-
-        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-
     async def test_shutdown_destroy_vm_error_continues(self) -> None:
         """One VM destroy failure does not prevent others from being destroyed."""
         scheduler = self._make_scheduler()
@@ -458,13 +462,13 @@ class TestSchedulerShutdownOrdering:
 
         Uses a tight memory budget so two pool VMs fully exhaust capacity,
         then a third acquire (background save) blocks until slots are freed.
-        Budget must account for CGROUP_MEMORY_OVERHEAD_MB added by acquire().
+        Budget must account for DEFAULT_VM_MEMORY_OVERHEAD_MB added by acquire().
         """
         from exec_sandbox.admission import ResourceAdmissionController
-        from exec_sandbox.cgroup import CGROUP_MEMORY_OVERHEAD_MB
+        from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB
 
         guest_mb = 512
-        total_per_vm = guest_mb + CGROUP_MEMORY_OVERHEAD_MB
+        total_per_vm = guest_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
         # Budget fits exactly 2 VMs — third is blocked until one is released
         budget_mb = total_per_vm * 2
 
@@ -1215,8 +1219,11 @@ class TestSchedulerWarmPoolTiming:
 
     These tests verify that warm pool hits have:
     1. warm_pool_hit=True
-    2. setup_ms=0, boot_ms=0 (boot happened at startup, not request time)
+    2. boot_ms=0 (boot happened at startup, not request time)
     3. execute_ms and total_ms reflect actual request time
+
+    Note: setup_ms is not asserted because it includes balloon deflation
+    which varies widely under TCG emulation with parallel test workers.
     """
 
     @pytest.fixture
@@ -1241,15 +1248,14 @@ class TestSchedulerWarmPoolTiming:
         assert result.warm_pool_hit is True
 
     async def test_warm_pool_timing_zero_setup_boot(self, warm_pool_scheduler: Scheduler) -> None:
-        """Warm pool hit should have setup_ms=0 and boot_ms=0."""
+        """Warm pool hit should have boot_ms=0 and small setup_ms (pool lookup)."""
         result = await warm_pool_scheduler.run(
             code="print('hello')",
             language=Language.PYTHON,
         )
 
         assert result.warm_pool_hit is True
-        # Setup and boot are "free" for warm pool - they happened at startup
-        assert result.timing.setup_ms == 0
+        # Boot is "free" for warm pool - it happened at startup
         assert result.timing.boot_ms == 0
 
     async def test_warm_pool_timing_has_execute_time(self, warm_pool_scheduler: Scheduler) -> None:
@@ -1268,9 +1274,8 @@ class TestSchedulerWarmPoolTiming:
     async def test_warm_pool_total_approximately_equals_execute(self, warm_pool_scheduler: Scheduler) -> None:
         """For warm pool, total_ms should be close to execute_ms (no boot overhead).
 
-        Note: Balloon deflation uses fire-and-forget mode (wait_for_target=False) to
-        avoid the 5s polling overhead. The skip marker is kept as a safety margin for
-        other potential timing variations on slow/nested virtualization environments.
+        Requires fast_balloon: 100ms timing tolerance on balloon deflation —
+        slow or nested virtualization environments cannot meet this constraint.
         """
         result = await warm_pool_scheduler.run(
             code="print('hello')",
@@ -1335,7 +1340,7 @@ class TestSchedulerWarmPoolTiming:
 
         assert result.exit_code == 0
         assert result.warm_pool_hit is True
-        assert result.timing.setup_ms == 0
+        # Boot is "free" for warm pool - it happened at startup
         assert result.timing.boot_ms == 0
         assert result.timing.execute_ms >= 0
 
@@ -1352,6 +1357,7 @@ PACKAGE_INSTALL_TEST_CASES = [
         ["requests==2.31.0"],
         'import requests; print(f"requests={requests.__version__}")',
         ["requests=2.31.0"],
+        None,
         id="python-requests",
     ),
     pytest.param(
@@ -1366,6 +1372,7 @@ print(f"flask={flask.__version__}")
 print(f"httpx={httpx.__version__}")
 """,
         ["requests=2.31.0", "flask=3.0.0", "httpx=0.27.0"],
+        None,
         id="python-multi",
     ),
     # Python - C extension packages (native binaries, musllinux wheels)
@@ -1382,6 +1389,7 @@ print(f"det={det:.1f}")
 print(f"inv_sum={b.sum():.1f}")
 """,
         ["numpy=2.4.2", "det=-2.0", "inv_sum=0.0"],
+        None,
         id="python-numpy",
     ),
     pytest.param(
@@ -1396,7 +1404,9 @@ print(f"shape={filtered.shape}")
 print(f"mean={df['b'].mean():.1f}")
 """,
         ["pandas=3.0.1", "shape=(2, 2)", "mean=5.0"],
+        None,
         id="python-pandas",
+        marks=skip_unless_hwaccel,  # pip install routinely exceeds 940s under TCG
     ),
     pytest.param(
         Language.PYTHON,
@@ -1411,7 +1421,9 @@ print(f"size={img.size}")
 print(f"pixel={img.getpixel((0, 0))}")
 """,
         ["pillow=12.1.1", "size=(50, 25)", "pixel=(255, 0, 0)"],
+        None,
         id="python-pillow",
+        marks=skip_unless_hwaccel,  # pip install routinely exceeds 940s under TCG
     ),
     # JavaScript - pure JS packages
     pytest.param(
@@ -1427,6 +1439,7 @@ console.log("sorted=" + JSON.stringify(sorted));
 console.log("chunks=" + chunked.length);
 """,
         ["lodash=4.17.21", "sorted=[1,1,3,4,5,9]", "chunks=3"],
+        None,
         id="js-lodash",
     ),
     pytest.param(
@@ -1443,6 +1456,7 @@ console.log("groups=" + Object.keys(grouped).length);
 console.log("date=" + date);
 """,
         ["lodash=4.17.21", "moment=2.30.1", "groups=2", "date=January 15"],
+        None,
         id="js-multi",
     ),
     # JavaScript - native binary packages
@@ -1456,26 +1470,28 @@ console.log("esbuild=" + esbuild.version);
 console.log("output=" + result.code.trim());
 """,
         ["esbuild=0.25.4", "output=const x = 1;"],
+        None,
         id="js-esbuild",
     ),
 ]
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestPackageInstallation:
     """Integration tests for package installation with real QEMU VMs.
+
+    Slow under TCG: package install correctness tests — snapshot VM creation
+    is functional under TCG but boot overhead makes them too slow for the
+    default suite.
 
     These tests verify that packages are correctly installed and persisted
     in snapshots. They catch bugs like:
     - QEMU exit code detection issues (macOS HVF vs Linux KVM)
     - Filesystem sync issues with cache=unsafe
     - Snapshot corruption during package install
-
-    Requires hardware acceleration (KVM/HVF) - snapshot creation spawns
-    extra QEMU VMs that exhaust thread limits under TCG emulation.
     """
 
-    @pytest.mark.parametrize("language,packages,code,expected_outputs", PACKAGE_INSTALL_TEST_CASES)
+    @pytest.mark.parametrize("language,packages,code,expected_outputs,memory_mb", PACKAGE_INSTALL_TEST_CASES)
     async def test_package_install_and_import(
         self,
         scheduler: Scheduler,
@@ -1483,13 +1499,14 @@ class TestPackageInstallation:
         packages: list[str],
         code: str,
         expected_outputs: list[str],
+        memory_mb: int | None,
     ) -> None:
         """Packages are installed and importable."""
         result = await scheduler.run(
             code=code,
             language=language,
             packages=packages,
-            timeout_seconds=120,
+            memory_mb=memory_mb,
         )
 
         assert result.exit_code == 0, f"Failed: {result.stderr}"
@@ -1505,7 +1522,6 @@ class TestPackageInstallation:
             code='import requests; print("first")',
             language=Language.PYTHON,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r1.exit_code == 0, f"First run failed: {r1.stderr}"
 
@@ -1514,7 +1530,6 @@ class TestPackageInstallation:
             code='import requests; print("second")',
             language=Language.PYTHON,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r2.exit_code == 0, f"Second run failed: {r2.stderr}"
         assert "second" in r2.stdout
@@ -1534,7 +1549,6 @@ class TestPackageInstallation:
             code='import requests; print("setup")',
             language=Language.PYTHON,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r1.exit_code == 0, f"Setup run failed: {r1.stderr}"
 
@@ -1544,7 +1558,6 @@ class TestPackageInstallation:
             language=Language.PYTHON,
             packages=packages,
             allow_network=False,  # No internet!
-            timeout_seconds=120,
         )
         assert r2.exit_code == 0, f"Offline run failed: {r2.stderr}"
         assert "offline: 2.31.0" in r2.stdout
@@ -1558,7 +1571,6 @@ class TestPackageInstallation:
             code='const lodash = require("lodash"); console.log("setup")',
             language=Language.JAVASCRIPT,
             packages=packages,
-            timeout_seconds=120,
         )
         assert r1.exit_code == 0, f"Setup run failed: {r1.stderr}"
 
@@ -1568,7 +1580,6 @@ class TestPackageInstallation:
             language=Language.JAVASCRIPT,
             packages=packages,
             allow_network=False,  # No internet!
-            timeout_seconds=120,
         )
         assert r2.exit_code == 0, f"Offline run failed: {r2.stderr}"
         assert "offline: 4.17.21" in r2.stdout

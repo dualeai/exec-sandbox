@@ -6,6 +6,46 @@ use crate::constants::VERSION;
 use crate::types::{GuestResponse, Language};
 
 // ============================================================================
+// ErrorType — domain-specific error classification
+// ============================================================================
+
+/// Domain-specific error types sent to the host as the `error_type` wire field.
+///
+/// Replaces the previous ad-hoc `&'static str` approach where `"validation_error"`
+/// was overloaded across env vars, code, paths, and packages. Each variant maps
+/// to a distinct wire string so the host can dispatch without parsing messages.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ErrorType {
+    EnvVar,      // "env_var_error"
+    Code,        // "code_error"
+    Path,        // "path_error"
+    Package,     // "package_error"
+    Io,          // "io_error"
+    Timeout,     // "timeout_error"
+    Execution,   // "execution_error"
+    Request,     // "request_error"
+    Protocol,    // "protocol_error"
+    OutputLimit, // "output_limit_error"
+}
+
+impl ErrorType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvVar => "env_var_error",
+            Self::Code => "code_error",
+            Self::Path => "path_error",
+            Self::Package => "package_error",
+            Self::Io => "io_error",
+            Self::Timeout => "timeout_error",
+            Self::Execution => "execution_error",
+            Self::Request => "request_error",
+            Self::Protocol => "protocol_error",
+            Self::OutputLimit => "output_limit_error",
+        }
+    }
+}
+
+// ============================================================================
 // CmdError — the unified error type for command handlers
 // ============================================================================
 
@@ -24,31 +64,59 @@ pub(crate) enum CmdError {
 }
 
 impl CmdError {
-    pub(crate) fn validation(msg: impl Into<String>) -> Self {
+    pub(crate) fn env_var(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
-            error_type: "validation_error",
+            error_type: ErrorType::EnvVar.as_str(),
+        }
+    }
+
+    pub(crate) fn code(msg: impl Into<String>) -> Self {
+        Self::Reply {
+            message: msg.into(),
+            error_type: ErrorType::Code.as_str(),
+        }
+    }
+
+    pub(crate) fn path(msg: impl Into<String>) -> Self {
+        Self::Reply {
+            message: msg.into(),
+            error_type: ErrorType::Path.as_str(),
+        }
+    }
+
+    pub(crate) fn package(msg: impl Into<String>) -> Self {
+        Self::Reply {
+            message: msg.into(),
+            error_type: ErrorType::Package.as_str(),
         }
     }
 
     pub(crate) fn io(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
-            error_type: "io_error",
+            error_type: ErrorType::Io.as_str(),
         }
     }
 
     pub(crate) fn timeout(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
-            error_type: "timeout_error",
+            error_type: ErrorType::Timeout.as_str(),
         }
     }
 
     pub(crate) fn execution(msg: impl Into<String>) -> Self {
         Self::Reply {
             message: msg.into(),
-            error_type: "execution_error",
+            error_type: ErrorType::Execution.as_str(),
+        }
+    }
+
+    pub(crate) fn output_limit(msg: impl Into<String>) -> Self {
+        Self::Reply {
+            message: msg.into(),
+            error_type: ErrorType::OutputLimit.as_str(),
         }
     }
 }
@@ -179,9 +247,8 @@ pub(crate) fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 
 /// Parse a language string, returning CmdError::Reply on failure.
 pub(crate) fn parse_language(language_str: &str, context: &str) -> Result<Language, CmdError> {
-    Language::parse(language_str).ok_or_else(|| {
-        CmdError::validation(format!("Unsupported language '{language_str}' ({context})"))
-    })
+    Language::parse(language_str)
+        .ok_or_else(|| CmdError::code(format!("Unsupported language '{language_str}' ({context})")))
 }
 
 /// Gracefully terminate a process group: SIGTERM → wait → SIGKILL.
@@ -276,15 +343,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cmd_error_validation() {
-        let err = CmdError::validation("bad input");
+    fn test_cmd_error_env_var() {
+        let err = CmdError::env_var("blocked env var");
         match err {
             CmdError::Reply {
                 message,
                 error_type,
             } => {
-                assert_eq!(message, "bad input");
-                assert_eq!(error_type, "validation_error");
+                assert_eq!(message, "blocked env var");
+                assert_eq!(error_type, "env_var_error");
+            }
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_error_code() {
+        let err = CmdError::code("code too large");
+        match err {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
+                assert_eq!(message, "code too large");
+                assert_eq!(error_type, "code_error");
+            }
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_error_path() {
+        let err = CmdError::path("path traversal");
+        match err {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
+                assert_eq!(message, "path traversal");
+                assert_eq!(error_type, "path_error");
+            }
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_error_package() {
+        let err = CmdError::package("invalid package name");
+        match err {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
+                assert_eq!(message, "invalid package name");
+                assert_eq!(error_type, "package_error");
             }
             CmdError::Fatal(_) => panic!("expected Reply"),
         }
@@ -315,6 +427,44 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_error_execution() {
+        let err = CmdError::execution("spawn failed");
+        match err {
+            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "execution_error"),
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_error_output_limit() {
+        let err = CmdError::output_limit("stdout 1200000 bytes exceeds 1000000 limit");
+        match err {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
+                assert!(message.contains("1200000"));
+                assert_eq!(error_type, "output_limit_error");
+            }
+            CmdError::Fatal(_) => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn test_error_type_as_str() {
+        assert_eq!(ErrorType::EnvVar.as_str(), "env_var_error");
+        assert_eq!(ErrorType::Code.as_str(), "code_error");
+        assert_eq!(ErrorType::Path.as_str(), "path_error");
+        assert_eq!(ErrorType::Package.as_str(), "package_error");
+        assert_eq!(ErrorType::Io.as_str(), "io_error");
+        assert_eq!(ErrorType::Timeout.as_str(), "timeout_error");
+        assert_eq!(ErrorType::Execution.as_str(), "execution_error");
+        assert_eq!(ErrorType::Request.as_str(), "request_error");
+        assert_eq!(ErrorType::Protocol.as_str(), "protocol_error");
+        assert_eq!(ErrorType::OutputLimit.as_str(), "output_limit_error");
+    }
+
+    #[test]
     fn test_cmd_error_from_send_error() {
         let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
         drop(_rx);
@@ -326,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_cmd_error_display_reply() {
-        let err = CmdError::validation("bad input");
+        let err = CmdError::code("bad input");
         assert_eq!(format!("{err}"), "bad input");
     }
 
@@ -347,8 +497,12 @@ mod tests {
     fn test_parse_language_invalid() {
         let err = parse_language("cobol", "test").unwrap_err();
         match err {
-            CmdError::Reply { message, .. } => {
+            CmdError::Reply {
+                message,
+                error_type,
+            } => {
                 assert!(message.contains("cobol"));
+                assert_eq!(error_type, "code_error");
             }
             CmdError::Fatal(_) => panic!("expected Reply"),
         }

@@ -11,14 +11,19 @@ Hierarchy:
     │   │   ├── VmQemuCrashError       ← QEMU crashed on startup
     │   │   ├── VmGvproxyError         ← gvproxy startup issues
     │   │   └── VmCapacityError        ← pool full (temporary)
+    │   ├── PackageInstallTransientError ← transient network during install
     │   ├── BalloonTransientError      ← balloon operations
-    │   ├── MigrationTransientError    ← memory snapshot migration
-    │   └── CommunicationTransientError ← socket/network transient issues
+    │   └── MigrationTransientError    ← memory snapshot migration
     ├── PermanentError (non-retryable marker base)
     │   ├── VmPermanentError
     │   │   ├── VmConfigError          ← invalid configuration
     │   │   └── VmDependencyError      ← missing binary/image
+    │   ├── PackageInstallPermanentError ← permanent package install failure
     │   └── SessionClosedError         ← session already closed
+    ├── InputValidationError (caller-bug marker base)
+    │   ├── CodeValidationError       ← empty/null-byte code
+    │   └── EnvVarValidationError     ← control chars, size limits
+    ├── OutputLimitError              ← stdout/stderr exceeded guest limits
     └── ... (other existing exceptions)
 
 Backward Compatibility:
@@ -27,11 +32,14 @@ Backward Compatibility:
     VmBootError = VmTransientError
     QemuImgError = VmOverlayError
     QemuStorageDaemonError = VmOverlayError
-    BalloonError = BalloonTransientError
-    MigrationError = MigrationTransientError
-"""
+    BalloonError = BalloonTransientError"""
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from exec_sandbox.qemu_vm import QemuDiagnostics
 
 
 class SandboxError(Exception):
@@ -131,7 +139,26 @@ class VmQemuCrashError(VmTransientError):
 
     Raised when QEMU exits unexpectedly during boot. This is often
     caused by resource pressure and may succeed on retry.
+
+    Attributes:
+        diagnostics: Optional QemuDiagnostics with crash context.
+            When provided and no explicit context is given,
+            context is auto-populated via dataclasses.asdict().
     """
+
+    def __init__(
+        self,
+        message: str,
+        context: dict[str, Any] | None = None,
+        *,
+        diagnostics: QemuDiagnostics | None = None,
+    ):
+        if diagnostics is not None and context is None:
+            from dataclasses import asdict  # noqa: PLC0415
+
+            context = asdict(diagnostics)
+        super().__init__(message, context)
+        self.diagnostics = diagnostics
 
 
 class VmGvproxyError(VmTransientError):
@@ -185,6 +212,19 @@ class VmDependencyError(VmPermanentError):
 # =============================================================================
 
 
+class PackageInstallTransientError(TransientError):
+    """Package installation failed due to transient network error — may succeed on retry."""
+
+
+class PackageInstallPermanentError(PermanentError):
+    """Package installation failed permanently — retrying won't help.
+
+    Raised for errors like "no matching distribution", "404 not found",
+    "eresolve" (npm dependency conflict). These indicate a genuine problem
+    with the package specifier, not a transient network issue.
+    """
+
+
 class BalloonTransientError(TransientError):
     """Balloon operation failed - may succeed on retry.
 
@@ -216,7 +256,6 @@ VmBootError = VmTransientError
 QemuImgError = VmOverlayError
 QemuStorageDaemonError = VmOverlayError
 BalloonError = BalloonTransientError
-MigrationError = MigrationTransientError
 
 
 class SnapshotError(SandboxError):
@@ -284,11 +323,44 @@ class PackageNotAllowedError(SandboxError):
     """
 
 
-class EnvVarValidationError(SandboxError):
+class InputValidationError(SandboxError):
+    """Base for input validation errors (caller bugs, not VM failures).
+
+    These errors mean the caller passed invalid input. The session/VM is
+    unaffected and can be reused — the caller should fix their input and retry.
+    """
+
+
+class CodeValidationError(InputValidationError):
+    """Code validation failed.
+
+    Raised when the code string is empty, whitespace-only, or contains
+    invalid characters (null bytes).
+    """
+
+
+class EnvVarValidationError(InputValidationError):
     """Environment variable validation failed.
 
     Raised when environment variable names or values contain invalid
     characters (control characters, null bytes) or exceed size limits.
+    """
+
+
+class OutputLimitError(PermanentError):
+    """Output size limit exceeded during code execution.
+
+    Raised when stdout or stderr exceeds the guest-enforced size limit
+    (stdout: 1 MB, stderr: 100 KB — see guest-agent/src/constants.rs).
+    The REPL session is preserved and can be reused — only the current
+    execution's output was too large.
+
+    Inherits PermanentError because the output-size exceedance is not
+    retryable by re-sending the same code — the caller must reduce their
+    output volume. The VM session itself remains healthy and READY for reuse.
+
+    The partial output (up to the limit) is still delivered via streaming
+    callbacks before this error is raised.
     """
 
 

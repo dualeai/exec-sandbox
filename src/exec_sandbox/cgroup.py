@@ -33,56 +33,18 @@ CGROUP_V2_BASE_PATH: Final[str] = "/sys/fs/cgroup"
 CGROUP_APP_NAMESPACE: Final[str] = "code-exec"
 """Application cgroup namespace under /sys/fs/cgroup."""
 
-CGROUP_MEMORY_OVERHEAD_MB: Final[int] = 64
-"""QEMU process overhead added to guest memory for cgroup and admission limits.
-
-This covers the QEMU *process* memory beyond guest RAM: binary text/data, glib
-event loop, coroutine stacks, virtio-mmio vring buffers, qcow2 L2/refcount
-table caches, and misc allocations.
-
-We use the ``microvm`` machine type (x86) and ``virt`` (ARM) — both are
-minimal: no PCI bus, no ACPI, no emulated USB/display/sound.  The device set
-is limited to virtio-mmio (blk, serial, net, balloon), which is comparable to
-Firecracker's model (<5 MiB VMM overhead) rather than a full ``q35`` machine
-(150-350 MB overhead measured by KubeVirt and libvirt).
-
-Measured breakdown for microvm/virt with KVM/HVF:
-  - QEMU binary + heap + glib event loop : ~20-30 MB
-  - virtio-mmio ring buffers             : ~1 MB per device
-  - qcow2 block layer (L2 + refcount)    : ~5-10 MB
-  - Miscellaneous (serial, monitor, etc.) : ~2-5 MB
-  - Total observed RSS (minus guest RAM)  : ~35-50 MB
-
-64 MB provides ~30 % headroom above the observed peak.  If OOM-kills are
-observed, bump this constant — but first verify with:
-  ``ps -o rss= -p <qemu_pid>`` minus guest memory.
-
-References:
-  - Firecracker: <5 MiB overhead (5 virtio devices)
-    https://firecracker-microvm.github.io/
-  - QEMU microvm docs (minimal footprint goal)
-    https://www.qemu.org/docs/master/system/i386/microvm.html
-  - Richard Jones QEMU overhead measurements (~150 MB for full q35)
-    https://rwmj.wordpress.com/2013/02/13/what-is-the-overhead-of-qemukvm/
-  - KubeVirt overhead discussion (46 MB RSS for virt-launcher)
-    https://github.com/kubevirt/kubevirt/issues/2109
-"""
-
-TCG_TB_CACHE_SIZE_MB: Final[int] = 256
-"""TCG translation block cache size in MB (must match tb-size in vm_manager.py).
-
-QEMU 5.0+ defaults to 1GB which causes OOM on CI runners with multiple VMs.
-We use 256MB as a balance between cache hit rate and memory usage:
-- 32MB (old default): ~15 TB flushes, slower but minimal memory
-- 256MB (our choice): ~5 TB flushes, good balance for CI workloads
-- 512MB: ~3 TB flushes, better perf but higher memory pressure
-- 1GB (QEMU default): ~1 TB flush, best perf but OOM risk
-
-See: https://blueprints.launchpad.net/nova/+spec/control-qemu-tb-cache"""
-
-CGROUP_PIDS_LIMIT: Final[int] = 100
+CGROUP_PIDS_LIMIT: Final[int] = 256
 """Maximum PIDs in cgroup (fork bomb prevention).
-Note: pids.max limits both processes AND threads, so this also limits goroutines."""
+
+256 provides ample headroom for QEMU + gvproxy threads in both aio=io_uring
+(~38 peak) and aio=threads (~102 peak) modes, while still preventing fork
+bombs (thousands of processes).  Guest code runs inside the VM and does NOT
+count toward this host cgroup limit.
+
+Note: pids.max limits both processes AND threads (including goroutines)."""
+
+CGROUP_CPU_PERIOD_US: Final[int] = 100_000
+"""CFS bandwidth period in microseconds (100ms). Standard Linux CFS period."""
 
 ULIMIT_MEMORY_MULTIPLIER: Final[int] = 14
 """Virtual memory multiplier for ulimit (guest_mb * 14 for TCG overhead)."""
@@ -346,23 +308,25 @@ def is_cgroup_available(cgroup_path: Path | None) -> bool:
 async def setup_cgroup(
     vm_id: str,
     tenant_id: str,
-    memory_mb: int,
-    cpu_cores: int,
-    use_tcg: bool = False,
+    cgroup_memory_mb: int,
+    cgroup_cpu_cores: float,
 ) -> Path:
     """Set up cgroup v2 resource limits for a VM.
 
+    Applies pre-computed effective limits from the admission controller.
+    The admission controller is the single source of truth for overhead
+    calculations (memory overhead, TCG TB cache, CPU overhead).
+
     Limits:
-    - memory.max: guest_mb + overhead (+ TCG TB cache if software emulation)
-    - cpu.max: quota proportional to cpu_cores (e.g. 2 cores = 200000/100000)
-    - pids.max: 100 (fork bomb prevention, also limits goroutines)
+    - memory.max: cgroup_memory_mb (effective limit, pre-computed by admission)
+    - cpu.max: quota proportional to cgroup_cpu_cores (effective, includes overhead)
+    - pids.max: 256 (fork bomb prevention, also limits goroutines)
 
     Args:
         vm_id: Unique VM identifier
         tenant_id: Tenant identifier
-        memory_mb: Guest VM memory in MB
-        cpu_cores: Number of CPU cores allocated (controls cpu.max quota)
-        use_tcg: True if using TCG software emulation (needs extra memory for TB cache)
+        cgroup_memory_mb: Effective memory limit in MB (guest + overhead, pre-computed by admission)
+        cgroup_cpu_cores: Effective CPU limit (guest + overhead, pre-computed by admission)
 
     Returns:
         Path to cgroup directory (dummy path if cgroups unavailable)
@@ -370,10 +334,6 @@ async def setup_cgroup(
     Note:
         Gracefully degrades to no resource limits on Docker Desktop (read-only /sys/fs/cgroup)
         or environments without cgroup v2 support.
-
-        TCG mode requires significantly more memory due to the translation block (TB) cache.
-        QEMU 5.0+ defaults to 1GB TB cache; we use 256MB (tb-size=256) as a balance between
-        cache hit rate and memory pressure. See TCG_TB_CACHE_SIZE_MB for details.
     """
     tenant_cgroup = Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/{tenant_id}")
     cgroup_path = tenant_cgroup / vm_id
@@ -389,22 +349,14 @@ async def setup_cgroup(
         # Create VM cgroup
         await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
 
-        # Calculate memory limit based on virtualization mode:
-        # - KVM/HVF: guest_mb + process overhead (CGROUP_MEMORY_OVERHEAD_MB)
-        # - TCG: guest_mb + TB cache (TCG_TB_CACHE_SIZE_MB) + process overhead
-        # TCG needs the TB cache for JIT-compiled code translation blocks
-        cgroup_memory_mb = memory_mb + CGROUP_MEMORY_OVERHEAD_MB
-        if use_tcg:
-            cgroup_memory_mb += TCG_TB_CACHE_SIZE_MB
-
+        # Apply effective memory limit (pre-computed by admission controller)
         async with aiofiles.open(cgroup_path / "memory.max", "w") as f:
             await f.write(str(cgroup_memory_mb * 1024 * 1024))
 
-        # Set CPU limit (quota proportional to cpu_cores, period=100000us)
-        # e.g. 1 core = "100000 100000", 2 cores = "200000 100000"
-        cpu_quota = 100_000 * cpu_cores
+        # Apply effective CPU limit (pre-computed by admission controller)
+        cpu_quota = int(CGROUP_CPU_PERIOD_US * cgroup_cpu_cores)
         async with aiofiles.open(cgroup_path / "cpu.max", "w") as f:
-            await f.write(f"{cpu_quota} 100000")
+            await f.write(f"{cpu_quota} {CGROUP_CPU_PERIOD_US}")
 
         # Set PID limit (fork bomb prevention)
         async with aiofiles.open(cgroup_path / "pids.max", "w") as f:
@@ -475,24 +427,25 @@ async def attach_if_available(cgroup_path: Path | None, pid: int | None) -> bool
 # =============================================================================
 
 
-async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int | None]:
-    """Read external CPU time and peak memory from cgroup v2.
+async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int | None, int | None]:
+    """Read external CPU time, peak memory, and CPU throttle count from cgroup v2.
 
     Args:
         cgroup_path: cgroup directory path
 
     Returns:
-        Tuple of (cpu_time_ms, peak_memory_mb)
-        Returns (None, None) if cgroup not available or read fails
+        Tuple of (cpu_time_ms, peak_memory_mb, nr_throttled)
+        Returns (None, None, None) if cgroup not available or read fails
     """
     if not cgroup_path or not await aiofiles.os.path.exists(cgroup_path):
-        return (None, None)
+        return (None, None, None)
 
     cpu_time_ms: int | None = None
     peak_memory_mb: int | None = None
+    nr_throttled: int | None = None
 
     try:
-        # Read cpu.stat for usage_usec (microseconds)
+        # Read cpu.stat for usage_usec (microseconds) and nr_throttled
         cpu_stat_file = cgroup_path / "cpu.stat"
         if await aiofiles.os.path.exists(cpu_stat_file):
             async with aiofiles.open(cpu_stat_file) as f:
@@ -501,7 +454,8 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
                 if line.startswith("usage_usec"):
                     usage_usec = int(line.split()[1])
                     cpu_time_ms = usage_usec // 1000  # Convert to milliseconds
-                    break
+                elif line.startswith("nr_throttled "):
+                    nr_throttled = int(line.split()[1])
 
         # Read memory.peak for peak memory usage (bytes)
         memory_peak_file = cgroup_path / "memory.peak"
@@ -516,55 +470,7 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
             extra={"cgroup_path": str(cgroup_path)},
         )
 
-    return (cpu_time_ms, peak_memory_mb)
-
-
-async def read_cgroup_current(cgroup_path: Path | None) -> tuple[int | None, int | None]:
-    """Read live CPU usage and current memory from cgroup v2.
-
-    Unlike read_cgroup_stats() which reads memory.peak (post-execution),
-    this reads memory.current (live bytes) and cpu.stat usage_usec for
-    running VMs. Used by ResourceMonitor for observability.
-
-    Args:
-        cgroup_path: cgroup directory path
-
-    Returns:
-        Tuple of (cpu_time_ms, current_memory_mb)
-        Returns (None, None) if cgroup not available or read fails
-    """
-    if not cgroup_path or not await aiofiles.os.path.exists(cgroup_path):
-        return (None, None)
-
-    cpu_time_ms: int | None = None
-    current_memory_mb: int | None = None
-
-    try:
-        # Read cpu.stat for usage_usec (microseconds)
-        cpu_stat_file = cgroup_path / "cpu.stat"
-        if await aiofiles.os.path.exists(cpu_stat_file):
-            async with aiofiles.open(cpu_stat_file) as f:
-                cpu_stat = await f.read()
-            for line in cpu_stat.splitlines():
-                if line.startswith("usage_usec"):
-                    usage_usec = int(line.split()[1])
-                    cpu_time_ms = usage_usec // 1000
-                    break
-
-        # Read memory.current for live memory usage (bytes)
-        memory_current_file = cgroup_path / "memory.current"
-        if await aiofiles.os.path.exists(memory_current_file):
-            async with aiofiles.open(memory_current_file) as f:
-                current_bytes = int((await f.read()).strip())
-            current_memory_mb = current_bytes // (1024 * 1024)
-
-    except (OSError, ValueError) as e:
-        logger.debug(
-            f"Failed to read cgroup current stats: {e}",
-            extra={"cgroup_path": str(cgroup_path)},
-        )
-
-    return (cpu_time_ms, current_memory_mb)
+    return (cpu_time_ms, peak_memory_mb, nr_throttled)
 
 
 # =============================================================================
@@ -649,7 +555,7 @@ ULIMIT_CPU_TIME_SECONDS: Final[int] = 3600
 """CPU time limit for ulimit fallback (1 hour safety net for long-running VMs)."""
 
 
-def wrap_with_ulimit(cmd: list[str], memory_mb: int) -> list[str]:
+def wrap_with_ulimit(cmd: list[str], cgroup_memory_mb: int) -> list[str]:
     """Wrap command with ulimit for resource control (cgroups alternative).
 
     Used as fallback when cgroups are unavailable (Docker Desktop, macOS).
@@ -661,7 +567,7 @@ def wrap_with_ulimit(cmd: list[str], memory_mb: int) -> list[str]:
 
     Args:
         cmd: Original command
-        memory_mb: Memory limit in MB
+        cgroup_memory_mb: Effective memory limit in MB (guest + overhead, pre-computed by admission)
 
     Returns:
         Command wrapped with ulimit via bash -c (bash required for -u support)
@@ -670,8 +576,10 @@ def wrap_with_ulimit(cmd: list[str], memory_mb: int) -> list[str]:
 
     cmd_str = " ".join(shlex.quote(arg) for arg in cmd)
 
-    # Memory overhead: ~14x guest memory for TCG worst case
-    virtual_mem_kb = memory_mb * 1024 * ULIMIT_MEMORY_MULTIPLIER
+    # Memory overhead: ~14x effective memory for TCG worst case
+    # ULIMIT_MEMORY_MULTIPLIER accounts for TCG virtual address space expansion
+    # (separate from cgroup overhead which is already included in cgroup_memory_mb)
+    virtual_mem_kb = cgroup_memory_mb * 1024 * ULIMIT_MEMORY_MULTIPLIER
 
     # Platform-specific limits based on kernel support
     if detect_host_os() == HostOS.MACOS:

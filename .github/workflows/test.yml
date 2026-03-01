@@ -105,6 +105,54 @@ jobs:
   # Build - Run in parallel, once per architecture
   # ==========================================================================
 
+  build-qemu:
+    name: Build / QEMU (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v6.0.1
+
+      # Cache the final build output — skip everything on version match.
+      # Key includes qemu_version from Makefile and build script; bumping either invalidates the cache.
+      # save-always is false (default), so a failed build won't cache corrupt output.
+      - name: Cache QEMU build
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/qemu-build
+          key: qemu-${{ matrix.arch }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+
+      - name: Install build deps
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          # Remove Microsoft repos that can cause 403 errors
+          # See: https://github.com/actions/runner-images/issues/9733
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update
+          # See: https://wiki.qemu.org/Hosts/Linux
+          sudo apt-get install -y ccache ninja-build meson libglib2.0-dev libfdt-dev libpixman-1-dev libseccomp-dev libslirp-dev liburing-dev flex bison
+
+      - name: Cache ccache
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-qemu-${{ matrix.arch }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+          restore-keys: ccache-qemu-${{ matrix.arch }}-
+
+      - name: Build
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: make build-qemu
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.arch }}
+          path: ~/qemu-build/
+          retention-days: 1
+
   build-gvproxy-wrapper:
     name: Build / gvproxy-wrapper (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -298,7 +346,7 @@ jobs:
   test-python:
     name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
-    needs: [build-gvproxy-wrapper, build-vm-images]
+    needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
     env:
       # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -353,10 +401,27 @@ jobs:
           # See: https://github.com/actions/runner-images/issues/9733
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
-          # On Ubuntu 24.04+, qemu-system-x86_64-microvm binary is included in qemu-system-x86 package
-          # The microvm binary is optimized for direct kernel boot with microvm machine type
-          # See: https://documentation.ubuntu.com/server/explanation/virtualisation/qemu-microvm/
-          sudo apt-get install -y qemu-utils ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86' || 'qemu-system-arm' }}
+          # Runtime shared libs for our QEMU build (--enable-fdt/linux-io-uring/seccomp/slirp/tools):
+          #   libfdt1 (libfdt.so.1), liburing2 (liburing.so.2), libseccomp2 (libseccomp.so.2),
+          #   libslirp0 (libslirp.so.0), libpixman-1-0
+          # No qemu-utils needed — our build includes qemu-img and qemu-storage-daemon (--enable-tools)
+          sudo apt-get install -y libfdt1 liburing2 libseccomp2 libslirp0 libpixman-1-0
+
+      - name: Download QEMU build (Linux)
+        if: matrix.platform.os == 'linux'
+        uses: actions/download-artifact@v4
+        with:
+          name: qemu-${{ matrix.platform.arch }}
+          path: ~/qemu-build/
+
+      - name: Install QEMU to PATH (Linux)
+        if: matrix.platform.os == 'linux'
+        run: |
+          # Restore executable permissions (stripped by actions/download-artifact)
+          chmod +x ~/qemu-build/bin/*
+          # Copy pre-built QEMU to /usr/local/ (takes precedence over /usr/bin/ in PATH)
+          sudo cp -a ~/qemu-build/bin/* /usr/local/bin/
+          sudo cp -a ~/qemu-build/share/qemu /usr/local/share/qemu 2>/dev/null || true
 
       - name: Install QEMU (macOS)
         if: matrix.platform.os == 'macos'
@@ -482,6 +547,38 @@ jobs:
           sudo mkdir -p /etc/systemd/system/user-.slice.d
           echo -e "[Slice]\nTasksMax=infinity" | sudo tee /etc/systemd/system/user-.slice.d/90-tasksmax.conf
           sudo systemctl daemon-reload
+          # 5. Diagnostic: dump all thread/pids limits for debugging
+          echo ""
+          echo "=== Cgroup pids limits (current session) ==="
+          CGROUP_PATH=$(cat /proc/self/cgroup | sed 's/0:://')
+          echo "Current cgroup: $CGROUP_PATH"
+          DIR="/sys/fs/cgroup${CGROUP_PATH}"
+          while [ "$DIR" != "/sys/fs/cgroup" ] && [ "$DIR" != "/" ]; do
+            PIDS_MAX=$(cat "$DIR/pids.max" 2>/dev/null || echo "N/A")
+            PIDS_CUR=$(cat "$DIR/pids.current" 2>/dev/null || echo "N/A")
+            echo "  $DIR: pids.max=$PIDS_MAX pids.current=$PIDS_CUR"
+            DIR=$(dirname "$DIR")
+          done
+          echo ""
+          echo "=== RLIMIT_NPROC for runner and qemu-vm ==="
+          cat /proc/self/limits | grep "Max processes"
+          sudo -u qemu-vm cat /proc/self/limits 2>/dev/null | grep "Max processes" || echo "Cannot read qemu-vm limits"
+          echo ""
+          echo "=== systemd TasksMax for user slices ==="
+          systemctl show "user-$(id -u).slice" --property=TasksMax 2>/dev/null || true
+          echo ""
+          echo "=== io_uring availability ==="
+          cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "sysctl not present (io_uring enabled)"
+          # 6. Remove pids.max limits from runner's cgroup hierarchy
+          #    TasksMax=infinity drop-in only affects new sessions; directly write to live cgroup
+          CGROUP_PATH=$(cat /proc/self/cgroup | sed 's/0:://')
+          DIR="/sys/fs/cgroup${CGROUP_PATH}"
+          while [ "$DIR" != "/sys/fs/cgroup" ] && [ "$DIR" != "/" ]; do
+            if [ -f "$DIR/pids.max" ] && [ -w "$DIR/pids.max" ]; then
+              echo max | sudo tee "$DIR/pids.max" > /dev/null 2>&1 || true
+            fi
+            DIR=$(dirname "$DIR")
+          done
 
       - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'

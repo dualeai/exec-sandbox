@@ -10,9 +10,10 @@ Measures:
 - Warm pool latency: Time with pre-warmed VMs (sequential and concurrent)
 
 Uses TimingBreakdown from exec-sandbox for detailed phase timings:
-- setup_ms: Resource setup (overlay, cgroup, gvproxy)
+- setup_ms: Resource setup (admission, cache, overlay, cgroup)
 - boot_ms: VM boot (QEMU + kernel + initramfs + guest-agent)
 - execute_ms: Code execution (connect + run + response)
+- teardown_ms: VM teardown (destroy + cleanup)
 
 Usage:
     uv run python scripts/benchmark_latency.py           # Quick benchmark
@@ -30,8 +31,13 @@ from operator import attrgetter
 from pathlib import Path
 
 from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig
+from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_MEMORY_MB
+from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
+
+# Honor EXEC_SANDBOX_LOG_LEVEL env var (e.g. DEBUG) by wiring up a real handler
+configure_logging()
 
 # ============================================================================
 # Module Constants
@@ -67,6 +73,7 @@ _ALWAYS_FIELDS: tuple[tuple[str, str], ...] = (
 
 _OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
     ("execution_time_ms", "guest_exec"),
+    ("timing.teardown_ms", "teardown"),
     ("timing.overlay_ms", "overlay"),
     ("timing.connect_ms", "connect"),
     ("timing.l1_restore_ms", "l1_restore"),
@@ -88,6 +95,7 @@ class TimingStats:
     setup: list[float] = field(default_factory=list[float])
     boot: list[float] = field(default_factory=list[float])
     execute: list[float] = field(default_factory=list[float])
+    teardown: list[float] = field(default_factory=list[float])
     guest_exec: list[float] = field(default_factory=list[float])
     # Granular setup timing
     overlay: list[float] = field(default_factory=list[float])  # Overlay acquisition (pool or on-demand)
@@ -158,21 +166,26 @@ async def benchmark_concurrent(
     """Benchmark VM boot + execution latency with concurrent requests."""
     code = CODE_MAP.get(language, "echo ok")
 
-    async def single_run() -> tuple[ExecutionResult, float]:
+    async def single_run() -> tuple[ExecutionResult, float] | None:
         start = time.perf_counter()
-        result = await scheduler.run(
-            code=code,
-            language=language,
-            timeout_seconds=60,
-            memory_mb=memory_mb,
-            allow_network=allow_network,
-        )
+        try:
+            result = await scheduler.run(
+                code=code,
+                language=language,
+                timeout_seconds=60,
+                memory_mb=memory_mb,
+                allow_network=allow_network,
+            )
+        except SandboxError as e:
+            e2e_ms = (time.perf_counter() - start) * 1000
+            print(f"  Warning: run failed after {e2e_ms:.0f}ms: {type(e).__name__}: {e}")
+            return None
         e2e_ms = (time.perf_counter() - start) * 1000
         return result, e2e_ms
 
     # Launch all requests concurrently
     results = await asyncio.gather(*[single_run() for _ in range(concurrency)])
-    return _collect_results(results)
+    return _collect_results([r for r in results if r is not None])
 
 
 # ============================================================================
@@ -200,9 +213,10 @@ def fmt_stats(values: list[float]) -> str:
 
 # Tree breakdown tables: (label, stats_attr, annotation | None)
 _MAIN_TREE: list[tuple[str, str, str | None]] = [
-    ("Setup", "setup", None),
+    ("Setup", "setup", "admission + cache + overlay + cgroup"),
     ("Boot", "boot", None),
     ("Execute", "execute", None),
+    ("Teardown", "teardown", "destroy + cleanup"),
 ]
 
 _SETUP_BREAKDOWN: list[tuple[str, str, str | None]] = [

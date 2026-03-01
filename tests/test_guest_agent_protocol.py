@@ -9,7 +9,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis.strategies import characters, integers, sampled_from, text
 from pydantic import ValidationError
 
-from exec_sandbox.constants import MAX_FILE_PATH_LENGTH
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
@@ -172,14 +172,14 @@ class TestExecuteCodeRequest:
             ExecuteCodeRequest(language=Language.PYTHON, code="x", timeout=301)
 
     def test_code_max_length(self) -> None:
-        """ExecuteCodeRequest enforces 1MB code limit."""
-        # Valid: 1MB exactly
-        large_code = "x" * 1_000_000
+        """ExecuteCodeRequest enforces 1 MiB code limit."""
+        # Valid: 1 MiB exactly
+        large_code = "x" * MAX_CODE_SIZE
         req = ExecuteCodeRequest(language=Language.PYTHON, code=large_code)
-        assert len(req.code) == 1_000_000
+        assert len(req.code) == MAX_CODE_SIZE
 
-        # Invalid: > 1MB
-        too_large = "x" * 1_000_001
+        # Invalid: > 1 MiB
+        too_large = "x" * (MAX_CODE_SIZE + 1)
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(language=Language.PYTHON, code=too_large)
 
@@ -197,72 +197,6 @@ class TestExecuteCodeRequest:
         assert data["code"] == "print(1)"
         assert data["timeout"] == 30
         assert data["env_vars"] == {"KEY": "value"}
-
-
-class TestCodeNullByteValidation:
-    """Tests for null byte rejection in code field."""
-
-    # --- Normal cases ---
-    def test_null_byte_in_middle_rejected(self) -> None:
-        """Null byte between valid statements is rejected."""
-        with pytest.raises(ValidationError) as exc_info:
-            ExecuteCodeRequest(language=Language.PYTHON, code="print('hi')\x00print('bye')")
-        assert "null bytes" in str(exc_info.value).lower()
-
-    def test_single_null_byte_rejected(self) -> None:
-        """Lone null byte is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="\x00")
-
-    # --- Edge cases ---
-    def test_null_byte_at_start_rejected(self) -> None:
-        """Null byte at start of code is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="\x00print('hi')")
-
-    def test_null_byte_at_end_rejected(self) -> None:
-        """Null byte at end of code is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="print('hi')\x00")
-
-    def test_all_null_bytes_rejected(self) -> None:
-        """Code that is entirely null bytes is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="\x00\x00\x00")
-
-    def test_escaped_null_repr_accepted(self) -> None:
-        r"""Code containing literal '\\x00' string (no actual null byte) is accepted."""
-        req = ExecuteCodeRequest(language=Language.PYTHON, code=r"x = 'hello\x00world'")
-        assert req.code == r"x = 'hello\x00world'"
-
-    # --- Weird cases ---
-    def test_null_byte_in_comment_rejected(self) -> None:
-        """Null byte inside a comment is still rejected (can't safely parse)."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="# comment\x00\nprint(1)")
-
-    def test_null_byte_between_multibyte_utf8_rejected(self) -> None:
-        """Null byte between multi-byte UTF-8 chars is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="print('\u4e16\x00\u754c')")
-
-    def test_null_byte_after_newline_rejected(self) -> None:
-        """Null byte on its own line between valid code is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="x = 1\n\x00\ny = 2")
-
-    # --- Out of bounds ---
-    def test_null_byte_at_end_of_large_code_rejected(self) -> None:
-        """Near max-length code with null byte at very end is rejected."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=Language.PYTHON, code="x" * 999_999 + "\x00")
-
-    # --- All languages ---
-    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
-    def test_null_byte_rejected_all_languages(self, language: Language) -> None:
-        """Null bytes rejected regardless of language."""
-        with pytest.raises(ValidationError):
-            ExecuteCodeRequest(language=language, code="echo hi\x00")
 
 
 class TestEnvVarValidation:
@@ -596,7 +530,7 @@ class TestStreamingErrorMessage:
         """StreamingErrorMessage with op_id for file operation error routing."""
         msg = StreamingErrorMessage(
             message="Path traversal detected",
-            error_type="validation_error",
+            error_type="path_error",
             op_id="abc123",
             version="1.0.0",
         )
@@ -726,7 +660,7 @@ class TestStreamingMessage:
         from pydantic import TypeAdapter
 
         adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-        json_str = '{"type": "error", "message": "path traversal", "error_type": "validation_error", "op_id": "xyz"}'
+        json_str = '{"type": "error", "message": "path traversal", "error_type": "path_error", "op_id": "xyz"}'
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, StreamingErrorMessage)
         assert msg.op_id == "xyz"

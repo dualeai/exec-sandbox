@@ -119,6 +119,30 @@ pub(crate) fn cmdline_has(flag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read MemTotal from /proc/meminfo in kilobytes.
+/// Panics if /proc/meminfo is unreadable or MemTotal is missing — /proc is
+/// always mounted before this is called, and a missing MemTotal means the VM
+/// is broken and should not proceed.
+///
+/// NOTE: Mirrored in guest-agent/src/init.rs — keep both in sync.
+pub(crate) fn read_mem_total_kb() -> u64 {
+    let meminfo = fs::read_to_string("/proc/meminfo").expect("/proc/meminfo unreadable");
+    meminfo
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|n| n.parse().ok())
+        .expect("MemTotal not found in /proc/meminfo")
+}
+
+/// Runtime page size from sysconf(_SC_PAGESIZE).
+/// Supports both 4KB (x86_64) and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES).
+///
+/// NOTE: Mirrored in guest-agent/src/init.rs — keep both in sync.
+pub(crate) fn page_size() -> u64 {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
 pub(crate) fn fallback_shell() -> ! {
     // exec /bin/sh (or sleep forever if no shell)
     for shell in ["/bin/sh", "/bin/ash"] {

@@ -7,6 +7,9 @@ Tests that the execution system handles unusual inputs gracefully:
 4. Error cases: Syntax errors, import errors, runtime errors
 """
 
+import pytest
+
+from exec_sandbox.exceptions import CodeValidationError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from tests.conftest import skip_unless_hwaccel
@@ -19,26 +22,20 @@ class TestEdgeCases:
     """Edge cases that should work but might break naive implementations."""
 
     async def test_empty_code(self, scheduler: Scheduler) -> None:
-        """Empty code string is rejected by guest-agent validation."""
-        result = await scheduler.run(
-            code="",
-            language=Language.PYTHON,
-        )
-
-        # Empty code is rejected with validation error (exit_code=-1)
-        assert result.exit_code == -1
-        assert "Code cannot be empty" in result.stderr
+        """Empty code string raises CodeValidationError."""
+        with pytest.raises(CodeValidationError, match="Code cannot be empty"):
+            await scheduler.run(
+                code="",
+                language=Language.PYTHON,
+            )
 
     async def test_whitespace_only_code(self, scheduler: Scheduler) -> None:
-        """Whitespace-only code is rejected by guest-agent validation."""
-        result = await scheduler.run(
-            code="   \n\n\t\t\n   ",
-            language=Language.PYTHON,
-        )
-
-        # Whitespace-only code is rejected (trimmed = empty)
-        assert result.exit_code == -1
-        assert "Code cannot be empty" in result.stderr
+        """Whitespace-only code raises CodeValidationError."""
+        with pytest.raises(CodeValidationError, match="Code cannot be empty"):
+            await scheduler.run(
+                code="   \n\n\t\t\n   ",
+                language=Language.PYTHON,
+            )
 
     async def test_comment_only_code(self, scheduler: Scheduler) -> None:
         """Comment-only code executes without error."""
@@ -51,21 +48,20 @@ class TestEdgeCases:
         assert result.stdout == ""
 
     async def test_large_output_1mb(self, scheduler: Scheduler) -> None:
-        """Code producing ~1MB of output."""
-        # Generate ~1MB of output (1000 lines of 1000 chars each)
+        """Code producing ~1MB of output (just under guest-agent 1MB stdout limit)."""
+        # Generate output just under the 1MB limit: 999 lines x 1001 bytes = 999,999 bytes
         code = """
-for i in range(1000):
+for i in range(999):
     print('x' * 1000)
 """
 
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0
-        # Should have substantial output (may be truncated)
+        # Should have substantial output (just under 1MB limit)
         assert len(result.stdout) > 100000  # At least 100KB
 
     async def test_many_lines_output(self, scheduler: Scheduler) -> None:
@@ -211,13 +207,27 @@ sys.stdout.buffer.flush()
         assert "before" in result.stdout or "after" in result.stdout
 
     async def test_null_bytes_in_code_rejected(self, scheduler: Scheduler) -> None:
-        """Code containing null bytes is rejected with clear error before reaching runtime."""
+        """Code containing null bytes raises CodeValidationError."""
+        with pytest.raises(CodeValidationError, match="null bytes"):
+            await scheduler.run(
+                code="print('hello')\x00print('world')",
+                language=Language.PYTHON,
+            )
+
+    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
+    async def test_null_bytes_rejected_all_languages(self, scheduler: Scheduler, language: Language) -> None:
+        """Null bytes rejected regardless of language."""
+        with pytest.raises(CodeValidationError, match="null bytes"):
+            await scheduler.run(code="echo hi\x00", language=language)
+
+    async def test_escaped_null_repr_accepted(self, scheduler: Scheduler) -> None:
+        r"""Literal '\\x00' string (no actual null byte) executes fine."""
         result = await scheduler.run(
-            code="print('hello')\x00print('world')",
+            code="print(repr('hello\\x00world'))",
             language=Language.PYTHON,
         )
-        assert result.exit_code == -1
-        assert "null bytes" in result.stderr.lower()
+        assert result.exit_code == 0
+        assert "hello\\x00world" in result.stdout
 
     async def test_binary_data_in_output(self, scheduler: Scheduler) -> None:
         """Code outputting binary data."""
@@ -260,8 +270,8 @@ while True:
     async def test_infinite_output_times_out(self, scheduler: Scheduler) -> None:
         """Infinite output is killed by timeout.
 
-        Note: Requires hardware acceleration because TCG is 10-50x slower,
-        making the 3s timeout elapse before the VM can produce any output.
+        Requires hwaccel: 3s timeout is too short for TCG (~5-8x slower) —
+        the VM cannot produce any output before the deadline expires.
         """
         code = """
 while True:
@@ -334,7 +344,8 @@ os._exit(42)
     async def test_sigterm_graceful_exit(self, scheduler: Scheduler) -> None:
         """Process catches SIGTERM and exits gracefully.
 
-        Reliability: Verifies signal type via output.
+        Requires hwaccel: 2s timeout is too short for TCG (~5-8x slower) —
+        the signal handler cannot fire before the deadline.
         """
         code = """
 import signal
@@ -382,12 +393,12 @@ os.kill(os.getpid(), signal.SIGSEGV)
         # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
         assert result.exit_code == 139
 
-    @skip_unless_hwaccel
+    @pytest.mark.slow
     async def test_normal_exit_no_termination_needed(self, scheduler: Scheduler) -> None:
-        """Process exits normally before timeout - no termination needed.
+        """Process exits normally before timeout — no termination needed.
 
-        Normal case: verifies baseline behavior when graceful termination
-        is not triggered.
+        Slow under TCG: correctness test with generous 30s timeout,
+        but TCG boot overhead (~5-8x) makes it too slow for the default suite.
         """
         code = """
 print("STARTING", flush=True)
@@ -407,12 +418,8 @@ print("DONE", flush=True)
     async def test_sigterm_ignored_escalates_to_sigkill(self, scheduler: Scheduler) -> None:
         """Process ignoring SIGTERM is killed by SIGKILL after grace period.
 
-        Weird case: verifies SIGTERM→SIGKILL escalation via timing.
-        If SIGTERM worked, execution would be ~2s. Since it's ignored,
-        must wait 5s grace period before SIGKILL, so execution >= 5s.
-
-        Note: Requires hardware acceleration because TCG is 10-50x slower,
-        making the 2s timeout fail before the process can even print output.
+        Requires hwaccel: 2s timeout + >= 5000ms timing assertion — TCG
+        (~5-8x slower) cannot meet these timing constraints.
         """
         code = """
 import signal
@@ -488,7 +495,8 @@ wait
     async def test_python_subprocess_tree_termination(self, scheduler: Scheduler) -> None:
         """Python subprocesses are terminated via process group.
 
-        Reliability: Same timing strategy as shell test.
+        Requires hwaccel: 15s timeout is marginal for TCG — Python boot
+        under TCG takes ~8-12s, leaving little room for the actual test.
         """
         code = """
 import subprocess
@@ -520,8 +528,14 @@ time.sleep(60)  # Wait to be killed
 class TestOutOfBounds:
     """Tests for resource limits and exhaustion."""
 
+    @pytest.mark.slow
     async def test_memory_allocation_large(self, scheduler: Scheduler) -> None:
-        """Attempting to allocate lots of memory."""
+        """Attempting to allocate lots of memory.
+
+        Slow under TCG: OOM correctness test with generous timeout and
+        no timing assertions, but TCG boot overhead makes it too slow for
+        the default suite.  60s accommodates TCG boot + OOM handling.
+        """
         # Try to allocate 500MB (should fail or be killed with 256MB VM)
         code = """
 try:
@@ -535,7 +549,6 @@ except MemoryError:
             code=code,
             language=Language.PYTHON,
             memory_mb=256,
-            timeout_seconds=30,
         )
 
         # Should either get MemoryError or be OOM-killed
@@ -695,11 +708,13 @@ with open("/nonexistent/path/to/file.txt") as f:
     async def test_permission_denied(self, scheduler: Scheduler) -> None:
         """Write to read-only filesystem fails.
 
-        Note: /proc is read-only regardless of UID, making it a reliable
-        target for testing write-permission errors.
+        Note: /proc/version is masked (bind-mounted to /dev/null) for
+        security, so writes there silently succeed. Target /etc/passwd
+        instead — it lives on the EROFS rootfs and is bind-remounted
+        read-only, so writes always fail with EROFS (errno 30).
         """
         code = """
-with open("/proc/version", "w") as f:
+with open("/etc/passwd", "w") as f:
     f.write("test")
 """
 
@@ -708,7 +723,7 @@ with open("/proc/version", "w") as f:
             language=Language.PYTHON,
         )
 
-        # Writing to /proc should fail even as root (may be OSError, IOError, or PermissionError)
+        # Writing to EROFS rootfs should fail even as root
         assert result.exit_code != 0
         assert any(
             err in result.stderr
@@ -812,6 +827,22 @@ Promise.reject(new Error("test rejection"));
         # Should handle rejection gracefully
         # Exit code depends on Bun's behavior
         assert result.exit_code != 0 or "rejection" in result.stderr.lower()
+
+    # --- Web API globals ---
+
+    async def test_performance_global_available(self, scheduler: Scheduler) -> None:
+        """performance Web API is available in JS sandbox context."""
+        code = """\
+console.log('type=' + typeof performance);
+console.log('now_type=' + typeof performance.now);
+const t = performance.now();
+console.log('is_number=' + (typeof t === 'number' && t > 0));
+"""
+        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        assert result.exit_code == 0, f"stderr: {result.stderr}"
+        assert "type=object" in result.stdout
+        assert "now_type=function" in result.stdout
+        assert "is_number=true" in result.stdout
 
 
 # =============================================================================
@@ -1389,6 +1420,153 @@ class TestRawEdgeCases:
         assert "matched:line1" in result.stdout
         assert "matched:line2" in result.stdout
         assert "end" in result.stdout
+
+
+# =============================================================================
+# HOME Environment: HOME must equal /home/user (SANDBOX_ROOT) for uid=1000
+# =============================================================================
+
+
+class TestHomeEnvironmentNormal:
+    """HOME=/home/user for all REPL types (uid=1000 runs in /home/user)."""
+
+    async def test_raw_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
+        """Raw shell $HOME equals /home/user."""
+        result = await scheduler.run(code="echo $HOME", language=Language.RAW)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_python_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
+        """Python os.environ['HOME'] equals /home/user."""
+        result = await scheduler.run(
+            code="import os; print(os.environ['HOME'])",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_javascript_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
+        """JavaScript process.env.HOME equals /home/user."""
+        result = await scheduler.run(
+            code="console.log(process.env.HOME)",
+            language=Language.JAVASCRIPT,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_raw_tilde_expansion(self, scheduler: Scheduler) -> None:
+        """Tilde expands to /home/user in raw shell."""
+        result = await scheduler.run(code="echo ~", language=Language.RAW)
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_raw_home_writable(self, scheduler: Scheduler) -> None:
+        """Files can be created under $HOME."""
+        result = await scheduler.run(
+            code="echo ok > $HOME/test_home.txt && cat $HOME/test_home.txt",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "ok" in result.stdout
+
+
+class TestHomeEnvironmentEdge:
+    """Edge cases for HOME consistency."""
+
+    async def test_raw_home_persists_across_executions(self, scheduler: Scheduler) -> None:
+        """HOME stays /home/user on second execution in same session."""
+        result = await scheduler.run(
+            code="echo $HOME; echo $HOME",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        lines = [line for line in result.stdout.strip().split("\n") if line.strip()]
+        assert all(line.strip() == "/home/user" for line in lines)
+
+    async def test_raw_subprocess_inherits_home(self, scheduler: Scheduler) -> None:
+        """Child processes inherit correct HOME."""
+        result = await scheduler.run(
+            code="bash -c 'echo $HOME'",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_raw_env_vars_coexist_with_home(self, scheduler: Scheduler) -> None:
+        """Custom env_vars don't clobber HOME."""
+        result = await scheduler.run(
+            code="echo $HOME $MY_VAR",
+            language=Language.RAW,
+            env_vars={"MY_VAR": "hello"},
+        )
+        assert result.exit_code == 0
+        assert "/home/user" in result.stdout
+        assert "hello" in result.stdout
+
+    async def test_python_pathlib_home(self, scheduler: Scheduler) -> None:
+        """pathlib.Path.home() returns /home/user."""
+        result = await scheduler.run(
+            code="from pathlib import Path; print(Path.home())",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+
+class TestHomeEnvironmentWeird:
+    """Weird corner cases for HOME."""
+
+    async def test_raw_home_matches_passwd(self, scheduler: Scheduler) -> None:
+        """$HOME matches the home dir in /etc/passwd for uid=1000."""
+        result = await scheduler.run(
+            code="echo HOME=$HOME; awk -F: '$3==1000{print \"passwd=\"$6}' /etc/passwd",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert "HOME=/home/user" in result.stdout
+        assert "passwd=/home/user" in result.stdout
+
+    async def test_raw_cd_tilde_pwd(self, scheduler: Scheduler) -> None:
+        """cd ~ + pwd returns /home/user."""
+        result = await scheduler.run(
+            code="cd ~ && pwd",
+            language=Language.RAW,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+    async def test_python_expanduser(self, scheduler: Scheduler) -> None:
+        """os.path.expanduser('~') returns /home/user."""
+        result = await scheduler.run(
+            code="import os; print(os.path.expanduser('~'))",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/home/user"
+
+
+class TestHomeEnvironmentOutOfBounds:
+    """Out-of-bounds / adversarial HOME scenarios."""
+
+    async def test_raw_user_can_override_home(self, scheduler: Scheduler) -> None:
+        """User can override HOME via env_vars (not blocked)."""
+        result = await scheduler.run(
+            code="echo $HOME",
+            language=Language.RAW,
+            env_vars={"HOME": "/tmp"},
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/tmp"
+
+    async def test_python_user_can_override_home(self, scheduler: Scheduler) -> None:
+        """User can override HOME via env_vars in Python."""
+        result = await scheduler.run(
+            code="import os; print(os.environ['HOME'])",
+            language=Language.PYTHON,
+            env_vars={"HOME": "/tmp"},
+        )
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "/tmp"
 
 
 # =============================================================================

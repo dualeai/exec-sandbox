@@ -14,7 +14,7 @@ use crate::error::{
 };
 use crate::repl::spawn::spawn_repl;
 use crate::types::GuestResponse;
-use crate::validation::{prepend_env_vars, validate_execute_params};
+use crate::validation::{prepend_env_vars, validate_code_params, validate_env_vars};
 
 /// Helper to flush a buffer as a Stdout/Stderr response message.
 async fn flush_output_buffer(
@@ -78,7 +78,17 @@ fn process_stderr_chunk(
 }
 
 /// Drain stdout with a cumulative deadline after sentinel detection or SIGTERM.
-/// Uses DRAIN_TIMEOUT_MS per-read to keep latency low while the deadline bounds total time.
+/// Uses up to DRAIN_TIMEOUT_MS per read attempt (clamped to remaining deadline),
+/// keeping per-read latency low while `deadline_ms` bounds total drain time.
+///
+/// Tolerates up to `MAX_CONSECUTIVE_DRAIN_TIMEOUTS` successive read timeouts before
+/// concluding the pipe is empty. Under QEMU TCG software emulation (~8× slower than
+/// KVM/HVF), a single DRAIN_TIMEOUT_MS window (5 ms) can be too tight for tokio to
+/// service a kernel pipe read — the event-loop overhead (timer wheel + epoll_wait
+/// jiffies rounding at HZ=250) can itself consume the budget, causing a false timeout
+/// even when data is sitting in the pipe buffer.
+const MAX_CONSECUTIVE_DRAIN_TIMEOUTS: u32 = 8; // up to 8 × 5 ms = 40 ms idle tolerance
+
 async fn drain_stdout(
     stdout: &mut tokio::process::ChildStdout,
     stdout_buffer: &mut String,
@@ -86,6 +96,7 @@ async fn drain_stdout(
 ) {
     let drain_deadline = Instant::now() + Duration::from_millis(deadline_ms);
     let mut buf = [0u8; 8192];
+    let mut consecutive_timeouts: u32 = 0;
     loop {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -93,8 +104,16 @@ async fn drain_stdout(
         }
         let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
         match tokio::time::timeout(per_read, stdout.read(&mut buf)).await {
-            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Err(_) => {
+                // Timeout — retry until idle threshold or deadline.
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= MAX_CONSECUTIVE_DRAIN_TIMEOUTS {
+                    break;
+                }
+            }
             Ok(Ok(n)) => {
+                consecutive_timeouts = 0;
                 stdout_buffer.push_str(&String::from_utf8_lossy(&buf[..n]));
             }
         }
@@ -275,8 +294,10 @@ pub(crate) async fn warm_exercise_repl(
 
     match result {
         Ok(Ok(())) => {
-            // Drain any stdout the no-op may have produced
-            drain_stdout(&mut repl.stdout, &mut String::new(), 50).await;
+            // Drain any stdout the no-op may have produced.
+            // 250 ms: warm-up is trivial so output here is not user-visible,
+            // but TCG needs slack beyond the idle-tolerance window (40 ms).
+            drain_stdout(&mut repl.stdout, &mut String::new(), 250).await;
             log_info!("[warm] {} REPL ready", language.as_str());
             Ok(())
         }
@@ -295,7 +316,8 @@ pub(crate) async fn execute_code_streaming(
 ) -> Result<(), CmdError> {
     let language = parse_language(language_str, "supported: python, javascript, raw")?;
 
-    validate_execute_params(code, timeout, env_vars).map_err(CmdError::validation)?;
+    validate_code_params(code, timeout)?;
+    validate_env_vars(env_vars)?;
 
     let start = Instant::now();
 
@@ -375,6 +397,15 @@ pub(crate) async fn execute_code_streaming(
     let mut stderr_done = false;
     let mut sentinel_exit_code: Option<i32> = None;
 
+    // Output size cap counters (guest-enforced limits).
+    // These count raw pipe bytes, not UTF-8 decoded string length.
+    // When a read crosses the limit boundary, the entire chunk is discarded
+    // (up to 8192 bytes fewer than the limit may be delivered to the host).
+    let mut stdout_total: usize = 0;
+    let mut stderr_total: usize = 0;
+    let mut stdout_capped = false;
+    let mut stderr_capped = false;
+
     let effective_timeout = if timeout > 0 {
         timeout
     } else {
@@ -386,8 +417,12 @@ pub(crate) async fn execute_code_streaming(
         loop {
             tokio::select! {
                 _ = flush_timer.tick() => {
-                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-                    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                    if !stdout_capped {
+                        let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                    }
+                    if !stderr_capped {
+                        let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                    }
                 }
 
                 result = repl.stdout.read(&mut stdout_bytes), if !stdout_done => {
@@ -403,9 +438,18 @@ pub(crate) async fn execute_code_streaming(
                                     n
                                 );
                             }
-                            stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
-                            if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
-                                let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                            stdout_total += n;
+                            if stdout_total > MAX_STDOUT_BYTES {
+                                if !stdout_capped {
+                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                    stdout_capped = true;
+                                }
+                                // Keep reading pipe (prevent child blocking) but discard
+                            } else {
+                                stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
+                                if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                }
                             }
                         }
                         Err(_) => stdout_done = true,
@@ -425,6 +469,9 @@ pub(crate) async fn execute_code_streaming(
                                     n
                                 );
                             }
+                            // Asymmetry with stdout: stderr must be parsed for the sentinel
+                            // BEFORE the cap check, so process_stderr_chunk runs unconditionally.
+                            // This writes into stderr_buffer even when over-limit; we clear it below.
                             if let Some(code) = process_stderr_chunk(
                                 &stderr_bytes[..n],
                                 &mut stderr_line_buf,
@@ -433,7 +480,14 @@ pub(crate) async fn execute_code_streaming(
                             ) {
                                 sentinel_exit_code = Some(code);
                             }
-                            if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                            stderr_total += n;
+                            if stderr_total > MAX_STDERR_BYTES {
+                                if !stderr_capped {
+                                    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                                    stderr_capped = true;
+                                }
+                                stderr_buffer.clear(); // discard parsed-but-over-limit data
+                            } else if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
                                 let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
                             }
                         }
@@ -443,7 +497,10 @@ pub(crate) async fn execute_code_streaming(
             }
 
             if sentinel_exit_code.is_some() {
-                drain_stdout(&mut repl.stdout, &mut stdout_buffer, 100).await;
+                // 500 ms: post-sentinel stdout flush. The JS REPL yields 50 ms
+                // for back-pressure before the sentinel, but under TCG (~8× slower)
+                // data may still be in the kernel pipe buffer.
+                drain_stdout(&mut repl.stdout, &mut stdout_buffer, 500).await;
                 break;
             }
             if stdout_done && stderr_done {
@@ -453,12 +510,16 @@ pub(crate) async fn execute_code_streaming(
     })
     .await;
 
-    // Flush residual buffers
-    if !stderr_line_buf.is_empty() {
+    // Flush residual buffers (skip capped streams)
+    if !stderr_line_buf.is_empty() && !stderr_capped {
         stderr_buffer.push_str(&stderr_line_buf);
     }
-    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+    if !stdout_capped {
+        let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+    }
+    if !stderr_capped {
+        let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+    }
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let process_ms = Some(process_start.elapsed().as_millis() as u64);
@@ -467,6 +528,23 @@ pub(crate) async fn execute_code_streaming(
         Ok(()) if sentinel_exit_code.is_some() => {
             let exit_code = sentinel_exit_code.unwrap();
             REPL_STATES.lock().await.insert(language, repl);
+
+            if stdout_capped || stderr_capped {
+                let mut parts = Vec::new();
+                if stdout_capped {
+                    parts.push(format!(
+                        "stdout {} bytes exceeds {} limit",
+                        stdout_total, MAX_STDOUT_BYTES
+                    ));
+                }
+                if stderr_capped {
+                    parts.push(format!(
+                        "stderr {} bytes exceeds {} limit",
+                        stderr_total, MAX_STDERR_BYTES
+                    ));
+                }
+                return Err(CmdError::output_limit(parts.join(", ")));
+            }
 
             writer
                 .send(&GuestResponse::Complete {
@@ -518,11 +596,16 @@ pub(crate) async fn execute_code_streaming(
 
             // If sentinel was found during post-SIGTERM drain, treat as graceful exit
             if let Some(exit_code) = sigterm_exit_code {
-                if !stderr_line_buf.is_empty() {
+                if !stderr_line_buf.is_empty() && !stderr_capped {
                     stderr_buffer.push_str(&stderr_line_buf);
                 }
-                let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
-                let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                if !stdout_capped {
+                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                }
+                if !stderr_capped {
+                    let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                }
+                // Timeout takes precedence over output limit — REPL is dead (SIGTERM'd)
                 writer
                     .send(&GuestResponse::Complete {
                         exit_code,

@@ -209,7 +209,7 @@ pub(crate) async fn handle_connection(
                     "Request too large: {} bytes (max {} bytes)",
                     bytes_read, MAX_REQUEST_SIZE_BYTES
                 ),
-                "request_error",
+                ErrorType::Request.as_str(),
                 None,
             )
             .await;
@@ -228,7 +228,7 @@ pub(crate) async fn handle_connection(
                 let _ = send_streaming_error(
                     &write_tx,
                     format!("Invalid JSON: {e}"),
-                    "request_error",
+                    ErrorType::Request.as_str(),
                     None,
                 )
                 .await;
@@ -243,7 +243,7 @@ pub(crate) async fn handle_connection(
                 let _ = send_streaming_error(
                     &write_tx,
                     format!("Invalid command: {e}"),
-                    "request_error",
+                    ErrorType::Request.as_str(),
                     op_id.as_deref(),
                 )
                 .await;
@@ -348,11 +348,15 @@ pub(crate) async fn handle_connection(
                     }
                 }
             }
-            GuestCommand::InstallPackages { language, packages } => {
+            GuestCommand::InstallPackages {
+                language,
+                packages,
+                timeout,
+            } => {
                 // Gate: wait for network setup (ip + gvproxy) before package install
                 crate::init::wait_for_network().await;
                 log_info!(
-                    "Processing: install_packages (language={language}, count={})",
+                    "Processing: install_packages (language={language}, count={}, timeout={timeout}s)",
                     packages.len()
                 );
                 let lang = match Language::parse(&language) {
@@ -364,7 +368,7 @@ pub(crate) async fn handle_connection(
                                     "Unsupported language '{}' for package installation (supported: python, javascript)",
                                     language
                                 ),
-                                "validation_error",
+                                ErrorType::Package.as_str(),
                             )
                             .await
                             .is_err()
@@ -374,7 +378,7 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                match install_packages(lang, &packages, &writer).await {
+                match install_packages(lang, &packages, timeout, &writer).await {
                     Ok(()) => {}
                     Err(CmdError::Reply {
                         message,
@@ -439,7 +443,7 @@ pub(crate) async fn handle_connection(
                     let _ = writer
                         .send_error(
                             format!("Duplicate op_id '{op_id}' for write_file"),
-                            "validation_error",
+                            ErrorType::Protocol.as_str(),
                         )
                         .await;
                 } else {
@@ -465,7 +469,7 @@ pub(crate) async fn handle_connection(
                     let _ = writer
                         .send_error(
                             format!("No active write for op_id '{op_id}'"),
-                            "protocol_error",
+                            ErrorType::Protocol.as_str(),
                         )
                         .await;
                     continue;
@@ -481,7 +485,7 @@ pub(crate) async fn handle_connection(
                                     "Invalid base64 in chunk for '{}': {}",
                                     handle.path_display, e
                                 ),
-                                "validation_error",
+                                ErrorType::Protocol.as_str(),
                             )
                             .await;
                         continue;
@@ -513,7 +517,7 @@ pub(crate) async fn handle_connection(
                                         "Write pipeline unexpectedly closed for '{}'",
                                         handle.path_display
                                     ),
-                                    "io_error",
+                                    ErrorType::Io.as_str(),
                                 )
                                 .await;
                         }
@@ -524,7 +528,7 @@ pub(crate) async fn handle_connection(
                                         "Internal error writing '{}': {}",
                                         handle.path_display, join_err
                                     ),
-                                    "io_error",
+                                    ErrorType::Io.as_str(),
                                 )
                                 .await;
                         }
@@ -544,7 +548,7 @@ pub(crate) async fn handle_connection(
                         let _ = writer
                             .send_error(
                                 format!("No active write for op_id '{op_id}'"),
-                                "protocol_error",
+                                ErrorType::Protocol.as_str(),
                             )
                             .await;
                         continue;
@@ -581,7 +585,7 @@ pub(crate) async fn handle_connection(
                         let _ = writer
                             .send_error(
                                 format!("Internal error writing '{}': {}", path_display, join_err),
-                                "io_error",
+                                ErrorType::Io.as_str(),
                             )
                             .await;
                     }

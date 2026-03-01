@@ -146,13 +146,20 @@ pub(crate) async fn wait_for_network() {
 }
 
 /// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
+///
+/// Sized to 50% of RAM with per-UID quota enforcement (`usrquota` +
+/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
+/// Quota must be set at initial mount time — cannot be added via remount.
 fn mount_home_tmpfs() {
+    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
+    let page_mask = !(page_size() - 1);
+    let half_mem_bytes = (read_mem_total_kb() / 2 * 1024) & page_mask;
     let ret = unsafe {
         let source = std::ffi::CString::new("tmpfs").unwrap();
         let target = std::ffi::CString::new("/home/user").unwrap();
         let fstype = std::ffi::CString::new("tmpfs").unwrap();
         let data = std::ffi::CString::new(format!(
-            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},noswap"
+            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
         ))
         .unwrap();
         libc::mount(
@@ -202,6 +209,25 @@ fn mount_readonly_paths() {
     ] {
         let _ = mount_readonly(path);
     }
+
+    // Mask sensitive /proc files (bind-mount /dev/null → reads return empty).
+    // Safe to mask here: rw_mode and QUIET_MODE already read /proc/cmdline above.
+    for path in [
+        // Boot params: rootfstype, init flags, console config (reconnaissance)
+        c"/proc/cmdline",
+        // Exact kernel version string (aids CVE matching against guest kernel)
+        c"/proc/version",
+        // Interrupt counters per CPU — thermal side-channel attack vector
+        // (Docker masked this in Mar 2025, GHSA-6fw5-f8r9-fgfm)
+        c"/proc/interrupts",
+        // Kernel keyring — NOT namespaced; mask even though currently empty
+        c"/proc/keys",
+        // High-resolution timer internals — timing side-channel
+        // (already EPERM via dmesg_restrict, mask as defense-in-depth)
+        c"/proc/timer_list",
+    ] {
+        let _ = mount_mask(path);
+    }
 }
 
 /// Configure loopback and eth0 network interfaces.
@@ -247,14 +273,23 @@ fn setup_dev_symlinks() {
 
 /// B4: Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
+///
+/// Sized to 50% of RAM with per-UID quota enforcement (`usrquota` +
+/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
+/// Quota must be set at initial mount time — cannot be added via remount.
 fn setup_dev_shm() {
-    fn try_mount_shm() -> libc::c_int {
+    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
+    let page_mask = !(page_size() - 1);
+    let half_mem_bytes = (read_mem_total_kb() / 2 * 1024) & page_mask;
+    let opts =
+        format!("size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap");
+
+    fn try_mount_shm(opts: &str) -> libc::c_int {
         unsafe {
             let source = std::ffi::CString::new("tmpfs").unwrap();
             let target = std::ffi::CString::new("/dev/shm").unwrap();
             let fstype = std::ffi::CString::new("tmpfs").unwrap();
-            // noswap: kernel 6.3+ — prevents /dev/shm pages from being swapped to zram
-            let data = std::ffi::CString::new("size=64M,noswap").unwrap();
+            let data = std::ffi::CString::new(opts).unwrap();
             libc::mount(
                 source.as_ptr(),
                 target.as_ptr(),
@@ -265,10 +300,10 @@ fn setup_dev_shm() {
         }
     }
 
-    if try_mount_shm() != 0 {
+    if try_mount_shm(&opts) != 0 {
         // Non-fatal: only needed for multiprocessing. Retry after mkdir.
         let _ = std::fs::create_dir_all("/dev/shm");
-        if try_mount_shm() != 0 {
+        if try_mount_shm(&opts) != 0 {
             log_warn!("/dev/shm mount failed: {}", std::io::Error::last_os_error());
         }
     }
@@ -336,20 +371,7 @@ fn setup_zram_swap() {
     // Kernel 6.16+: algorithm-specific tuning via sysfs
     let _ = std::fs::write("/sys/block/zram0/algorithm_params", "level=1");
 
-    let mem_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or(0);
-
-    if mem_kb == 0 {
-        log_warn!("[zram] failed to read MemTotal, skipping");
-        return;
-    }
+    let mem_kb = read_mem_total_kb();
 
     // disksize = 50% of RAM (in bytes)
     let zram_size = mem_kb * 512;
@@ -357,6 +379,21 @@ fn setup_zram_swap() {
         log_warn!("[zram] failed to set disksize, skipping");
         return;
     }
+
+    // Cap compressed memory at 25% of RAM. Without this, zram accepts pages
+    // indefinitely — the kernel reclaim loop thrashes (compress/decompress)
+    // instead of triggering the OOM killer, making the VM appear hung until
+    // timeout. With mem_limit, once compressed storage is full zram returns
+    // -ENOMEM on write → swap fails → OOM fires within seconds.
+    //
+    // Sizing: 25% of RAM × 2-3x lz4 ratio ≈ 50-75% effective swap capacity.
+    // For a 192 MB VM this means ~48 MB compressed → ~96-144 MB usable swap.
+    //
+    // Refs:
+    //   - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
+    //   - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
+    let mem_limit = mem_kb * 256; // 25% of RAM in bytes (KB * 1024 / 4)
+    let _ = std::fs::write("/sys/block/zram0/mem_limit", mem_limit.to_string());
 
     // Build and write swap header (mkswap equivalent)
     let header = match build_swap_header(zram_size) {
@@ -407,7 +444,7 @@ fn setup_zram_swap() {
 ///
 /// NOTE: Mirrored in tiny-init/src/zram.rs — keep both in sync.
 fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page_size = page_size();
     let pages = (device_size / page_size).saturating_sub(1) as u32;
     if pages < 10 {
         return None; // kernel rejects tiny swap
@@ -482,20 +519,12 @@ fn apply_sysctl_non_critical() {
 /// Pre-apply zram VM tuning sysctls before /proc/sys is made read-only.
 /// These values are safe to set even before zram device setup completes:
 /// the kernel uses defaults until swapon, then these take effect.
+///
+/// Refs:
+///   - https://docs.kernel.org/admin-guide/sysctl/vm.html
+///   - https://wiki.archlinux.org/title/Zram (recommended zram sysctls)
 fn apply_zram_vm_tuning() {
-    let mem_kb: u64 = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or(0);
-
-    if mem_kb == 0 {
-        return;
-    }
+    let mem_kb = read_mem_total_kb();
 
     let _ = std::fs::write("/proc/sys/vm/page-cluster", "0");
     let _ = std::fs::write("/proc/sys/vm/swappiness", "180");
@@ -504,11 +533,49 @@ fn apply_zram_vm_tuning() {
         (mem_kb * 4 / 100).to_string(),
     );
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "0");
+    // Kill the task that triggered OOM immediately instead of scanning the
+    // full task list for the "best" candidate. In a single-user sandbox VM
+    // there is only one meaningful process, so heuristic selection wastes
+    // time. Ref: https://docs.kernel.org/admin-guide/sysctl/vm.html
+    let _ = std::fs::write("/proc/sys/vm/oom_kill_allocating_task", "1");
+    // Disable watermark boosting — designed for spinning-disk fragmentation
+    // avoidance, counterproductive with zram (causes premature reclaim that
+    // wastes CPU on compression). Ref: https://wiki.archlinux.org/title/Zram
+    let _ = std::fs::write("/proc/sys/vm/watermark_boost_factor", "0");
+    // Widen kswapd wake-up range so background reclaim starts earlier and
+    // direct-reclaim stalls are less likely. Default 10 (0.1% of RAM) is
+    // too narrow for small VMs. 125 = 1.25% of RAM.
+    // Ref: https://wiki.archlinux.org/title/Zram
+    let _ = std::fs::write("/proc/sys/vm/watermark_scale_factor", "125");
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Read MemTotal from /proc/meminfo in kilobytes.
+/// Panics if /proc/meminfo is unreadable or MemTotal is missing — we control the
+/// environment and /proc is always mounted before any tmpfs. A missing MemTotal
+/// means the VM is broken and should not proceed.
+///
+/// NOTE: Mirrored in tiny-init/src/sys.rs — keep both in sync.
+fn read_mem_total_kb() -> u64 {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").expect("/proc/meminfo unreadable");
+    meminfo
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|n| n.parse().ok())
+        .expect("MemTotal not found in /proc/meminfo")
+}
+
+/// Runtime page size from sysconf(_SC_PAGESIZE).
+/// Supports both 4KB (x86_64) and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES).
+///
+/// NOTE: Mirrored in tiny-init/src/sys.rs — keep both in sync.
+fn page_size() -> u64 {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
 
 /// Verify gvproxy connectivity with exponential backoff.
 /// Blocks phase 2 completion, so ExecuteCode/InstallPackages wait for network.
@@ -574,6 +641,28 @@ fn chmod_paths(mode: libc::mode_t, paths: &[&str]) {
         if let Ok(cpath) = std::ffi::CString::new(*path) {
             unsafe { libc::chmod(cpath.as_ptr(), mode) };
         }
+    }
+}
+
+/// Mask a path by bind-mounting /dev/null over it (returns empty on read).
+fn mount_mask(path: &std::ffi::CStr) -> bool {
+    unsafe {
+        let ret = libc::mount(
+            c"/dev/null".as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        );
+        if ret != 0 {
+            log_warn!(
+                "mask mount {} failed: {}",
+                path.to_string_lossy(),
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        true
     }
 }
 

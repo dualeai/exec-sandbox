@@ -4,7 +4,7 @@ Usage:
     sbx 'print("hello")'           # Run inline code
     sbx script.py                  # Run file
     echo "print(1)" | sbx -        # Run from stdin
-    sbx -l python -p pandas 'import pandas; print(pandas.__version__)'
+    sbx -l python -p pandas==3.0.1 'import pandas; print(pandas.__version__)'
 
 Multi-input (V2):
     sbx 'print(1)' 'print(2)'      # Multiple inline codes
@@ -42,6 +42,7 @@ from exec_sandbox import (
     SchedulerConfig,
     VmTimeoutError,
     __version__,
+    constants,
 )
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
@@ -694,11 +695,11 @@ async def run_code(
 
     except VmTimeoutError:
         error_msg = format_error(
-            "Execution timed out",
-            f"The code did not complete within {timeout} seconds.",
+            "VM boot timed out",
+            "The VM failed to start before code could run.",
             [
-                "Increase timeout with -t/--timeout",
-                "Check for infinite loops in your code",
+                "Retry — boot timeouts are often transient (CPU contention)",
+                "Check system load and available resources",
             ],
         )
         click.echo(error_msg, err=True)
@@ -935,7 +936,7 @@ def cli(ctx: click.Context) -> None:
 )
 @click.option("-p", "--package", "packages", multiple=True, help="Package to install (repeatable)")
 @click.option("-t", "--timeout", default=30, show_default=True, help="Timeout in seconds")
-@click.option("-m", "--memory", default=256, show_default=True, help="Memory in MB")
+@click.option("-m", "--memory", default=constants.DEFAULT_MEMORY_MB, show_default=True, help="Memory in MB")
 @click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
 @click.option("--network", is_flag=True, help="Enable network access")
 @click.option("--allow-domain", "allowed_domains", multiple=True, help="Allowed domain (repeatable)")
@@ -1006,14 +1007,14 @@ def run_command(
     Examples:
 
     \b
-      sbx run 'print("hello")'                    # Simple Python
-      sbx run -l javascript 'console.log("hi")'   # Explicit language
-      sbx run script.py                           # Run file
-      sbx run -p requests 'import requests; ...'  # With package
+      sbx run 'print("hello")'                              # Simple Python
+      sbx run -l javascript 'console.log("hi")'             # Explicit language
+      sbx run script.py                                     # Run file
+      sbx run -p requests==2.32.5 'import requests; ...'    # With package
       sbx run --network --allow-domain api.example.com script.py
-      echo 'print(42)' | sbx run -                # From stdin
-      sbx run --json 'print("test")' | jq .       # JSON output
-      sbx run -c 'print(1)' -c 'print(2)'         # Multiple via -c flag
+      echo 'print(42)' | sbx run -                          # From stdin
+      sbx run --json 'print("test")' | jq .                 # JSON output
+      sbx run -c 'print(1)' -c 'print(2)'                   # Multiple via -c flag
       sbx run --upload ./data.csv:data.csv -c "print(open('data.csv').read())"
       sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
       sbx run --download output.csv -c "open('output.csv','w').write('data')"

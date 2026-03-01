@@ -31,12 +31,10 @@ from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
-from .conftest import skip_unless_hwaccel
-
-# All psutil tests require hardware acceleration (KVM/HVF).
-# Snapshot creation with packages spawns extra QEMU VMs that exhaust
-# thread limits when running under TCG software emulation.
-pytestmark = skip_unless_hwaccel
+# Slow under TCG: psutil correctness tests inside guest — package install
+# requires snapshot VM (slow under TCG). All assertions are correctness-only
+# (0-100 range, non-None values), no tight timing thresholds.
+pytestmark = pytest.mark.slow
 
 PSUTIL_PACKAGES = ["psutil==7.2.1"]
 
@@ -386,10 +384,14 @@ print(f'FREE:{usage.free}')
         assert total > 0
 
     async def test_disk_partitions(self, scheduler: Scheduler) -> None:
-        """psutil.disk_partitions() returns at least the root partition."""
+        """psutil.disk_partitions() returns at least the root partition.
+
+        Uses all=True because the VM's EROFS/overlayfs root is marked
+        "nodev" in /proc/filesystems, so all=False filters it out.
+        """
         code = """\
 import psutil
-parts = psutil.disk_partitions(all=False)
+parts = psutil.disk_partitions(all=True)
 mountpoints = [p.mountpoint for p in parts]
 print(f'COUNT:{len(parts)}')
 print(f'HAS_ROOT:{"/" in mountpoints}')
@@ -781,18 +783,27 @@ with open(fname) as fh:
         assert "FOUND_FILE:True" in result.stdout, "Temp file not found in open_files()"
 
     async def test_process_io_counters(self, scheduler: Scheduler) -> None:
-        """Process.io_counters() returns read/write byte counts."""
+        """Process.io_counters() returns read/write byte counts.
+
+        The method may not exist when the guest kernel lacks
+        CONFIG_TASK_IO_ACCOUNTING (/proc/[pid]/io absent), in which
+        case psutil never defines it on the Process class.
+        """
         code = """\
 import psutil
 proc = psutil.Process()
-try:
-    io = proc.io_counters()
-    print(f'READ_BYTES:{io.read_bytes}')
-    print(f'WRITE_BYTES:{io.write_bytes}')
-    print(f'IO_OK:True')
-except psutil.AccessDenied:
-    # Acceptable if /proc/[pid]/io is restricted
-    print('IO_OK:ACCESS_DENIED')
+if not hasattr(proc, 'io_counters'):
+    # Kernel lacks /proc/[pid]/io — psutil omits the method entirely
+    print('IO_OK:NOT_AVAILABLE')
+else:
+    try:
+        io = proc.io_counters()
+        print(f'READ_BYTES:{io.read_bytes}')
+        print(f'WRITE_BYTES:{io.write_bytes}')
+        print(f'IO_OK:True')
+    except psutil.AccessDenied:
+        # Acceptable if /proc/[pid]/io is restricted
+        print('IO_OK:ACCESS_DENIED')
 """
         result = await scheduler.run(
             code=code,

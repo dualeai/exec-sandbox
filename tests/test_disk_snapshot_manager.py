@@ -16,9 +16,12 @@ else:
     from backports import zstd
 
 from exec_sandbox import __version__
+from exec_sandbox.disk_snapshot_manager import _classify_install_error
+from exec_sandbox.exceptions import PackageInstallPermanentError, PackageInstallTransientError
 from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
-from tests.conftest import skip_unless_hwaccel
+
+from .conftest import skip_unless_hwaccel
 
 
 def _get_major_minor_version() -> str:
@@ -114,6 +117,80 @@ class TestSettings:
 
 
 # ============================================================================
+# Unit Tests - Install Error Classification
+# ============================================================================
+
+
+class TestClassifyInstallError:
+    """Tests for _classify_install_error() two-phase classifier."""
+
+    @pytest.mark.parametrize(
+        "error_output",
+        [
+            "error: Failed to download: client error (Connect)",
+            "error: connection refused",
+            "error: connection reset by peer",
+            "error: connection timed out",
+            "error: Temporary failure in name resolution",
+            "error: Name resolution failed for files.pythonhosted.org",
+            "error: network unreachable",
+            "error: timed out waiting for response",
+            "error: reset by peer",
+            "error: request failed after 3 retries",
+        ],
+    )
+    def test_transient_patterns(self, error_output: str) -> None:
+        """Known transient network patterns classify as PackageInstallTransientError."""
+        assert _classify_install_error(error_output) is PackageInstallTransientError
+
+    @pytest.mark.parametrize(
+        "error_output",
+        [
+            "ERROR: No matching distribution found for nonexistent-package",
+            "ERROR: Could not find a version that satisfies the requirement foo",
+            "error: 404 Not Found - GET https://registry.npmjs.org/nonexistent",
+            "error: 404 Client Error: Not Found for url: https://pypi.org/simple/nonexistent/",
+            "npm ERR! ERESOLVE could not resolve dependency tree",
+            "npm ERR! could not resolve dependency lodash@^99.0.0",
+            "ERROR: Invalid version specifier: pandas==",
+            "npm ERR! 404 Not Found - not found in registry",
+            "npm ERR! No matching version found for foo@^99.0.0",
+            "pip ERROR: version not found for package foo==99.99.99",
+        ],
+    )
+    def test_permanent_patterns(self, error_output: str) -> None:
+        """Known permanent patterns classify as PackageInstallPermanentError."""
+        assert _classify_install_error(error_output) is PackageInstallPermanentError
+
+    def test_permanent_takes_priority_over_transient(self) -> None:
+        """When both permanent and transient patterns match, permanent wins."""
+        # "404 client error" contains both "404 client error" (permanent) and "client error" (transient)
+        result = _classify_install_error("HTTP 404 Client Error for url: https://pypi.org/simple/foo/")
+        assert result is PackageInstallPermanentError
+
+    @pytest.mark.parametrize(
+        "error_output",
+        [
+            "error: package 'foo' has no attribute 'bar'",
+            "SyntaxError: invalid syntax",
+            "",
+            "some unknown error occurred",
+        ],
+    )
+    def test_no_match_returns_none(self, error_output: str) -> None:
+        """Errors matching neither permanent nor transient return None."""
+        assert _classify_install_error(error_output) is None
+
+    def test_case_insensitive(self) -> None:
+        """Pattern matching is case-insensitive."""
+        assert _classify_install_error("CONNECTION REFUSED") is PackageInstallTransientError
+        assert _classify_install_error("Client Error (Connect)") is PackageInstallTransientError
+        assert _classify_install_error("NETWORK UNREACHABLE") is PackageInstallTransientError
+        assert _classify_install_error("NO MATCHING DISTRIBUTION found") is PackageInstallPermanentError
+        assert _classify_install_error("ERESOLVE could not resolve") is PackageInstallPermanentError
+
+
+# ============================================================================
 # Integration Tests - Require QEMU + Images
 # ============================================================================
 
@@ -172,10 +249,15 @@ class TestDiskSnapshotManagerIntegration:
         assert len(base_parts) == 4  # python, v{version}, {img_hash}, base
         assert len(base_parts[2]) == 8  # img_hash is 8 chars
 
-    @pytest.mark.sudo
     @skip_unless_hwaccel
     async def test_create_snapshot(self, make_vm_manager, make_vm_settings, tmp_path: Path) -> None:
-        """Create snapshot with packages (slow, requires VM, uses qemu-vm user on Linux)."""
+        """Create snapshot with packages, verify L2 cache hit on second call.
+
+        Requires hwaccel: boots a VM to pip-install packages, then shuts down
+        and commits the overlay to a standalone qcow2.  Under TCG the combined
+        boot + install wall-clock exceeds CI job timeouts (observed 60 min hang
+        on linux/x64 + linux/arm64 sudo runners).
+        """
         from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 
         settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")

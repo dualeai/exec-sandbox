@@ -7,18 +7,33 @@ code execution, state management, and resource cleanup.
 import asyncio
 import contextlib
 import json
+import signal
 import sys
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 from uuid import uuid4
 
 from pydantic import ValidationError
+from tenacity import AsyncRetrying, retry_if_exception_type, wait_random_exponential
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import EnvVarValidationError, VmBootTimeoutError, VmPermanentError, VmTransientError
+from exec_sandbox.exceptions import (
+    CodeValidationError,
+    CommunicationError,
+    EnvVarValidationError,
+    InputValidationError,
+    OutputLimitError,
+    PackageNotAllowedError,
+    SandboxError,
+    VmBootTimeoutError,
+    VmPermanentError,
+    VmQemuCrashError,
+    VmTransientError,
+)
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     FileChunkResponseMessage,
@@ -26,13 +41,17 @@ from exec_sandbox.guest_agent_protocol import (
     FileReadCompleteMessage,
     FileWriteAckMessage,
     ListFilesRequest,
+    PingRequest,
+    PongMessage,
     ReadFileRequest,
     StreamingErrorMessage,
     WriteFileRequest,
 )
-from exec_sandbox.guest_channel import GuestChannel
+from exec_sandbox.guest_channel import GuestChannel, consume_stream
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, TimingBreakdown
+from exec_sandbox.platform_utils import detect_host_os
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
+from exec_sandbox.system_probes import detect_accel_type
 from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
@@ -43,11 +62,82 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
+def guest_error_to_exception(
+    msg: StreamingErrorMessage,
+    vm_id: str,
+    *,
+    operation: str = "",
+) -> SandboxError:
+    """Map a guest StreamingErrorMessage to the appropriate SandboxError subclass.
+
+    Args:
+        msg: The error message from the guest agent.
+        vm_id: VM identifier for context.
+        operation: Optional operation name (e.g., "write_file", "read_file").
+
+    Returns:
+        A SandboxError subclass instance (not raised, caller raises).
+    """
+    context: dict[str, object] = {
+        "vm_id": vm_id,
+        "error_type": msg.error_type,
+        "guest_message": msg.message,
+    }
+    if operation:
+        context["operation"] = operation
+
+    prefix = f"{operation}: " if operation else ""
+
+    formatted = f"{prefix}[{msg.error_type}] {msg.message}"
+
+    match msg.error_type:
+        case constants.GuestErrorType.TIMEOUT:
+            return VmTransientError(formatted, context=context)
+        case constants.GuestErrorType.ENV_VAR:
+            return EnvVarValidationError(formatted, context=context)
+        case constants.GuestErrorType.CODE:
+            return CodeValidationError(formatted, context=context)
+        case constants.GuestErrorType.PACKAGE:
+            return PackageNotAllowedError(formatted, context=context)
+        case constants.GuestErrorType.OUTPUT_LIMIT:
+            return OutputLimitError(formatted, context=context)
+        case constants.GuestErrorType.EXECUTION:
+            return VmTransientError(formatted, context=context)  # code never ran, transient
+        case (
+            constants.GuestErrorType.PATH
+            | constants.GuestErrorType.IO
+            | constants.GuestErrorType.REQUEST
+            | constants.GuestErrorType.PROTOCOL
+        ):
+            return VmPermanentError(formatted, context=context)
+        case _:
+            return VmPermanentError(formatted, context=context)
+
+
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
     from compression import zstd  # type: ignore[import-not-found]
 else:
     from backports import zstd  # type: ignore[import-untyped,no-redef]
+
+
+@dataclass(frozen=True, slots=True)
+class QemuDiagnostics:
+    """Crash diagnostics snapshot from a QEMU VM process.
+
+    Captures console ring buffer, process stdout/stderr, signal info,
+    and host environment for structured logging and error context.
+    """
+
+    vm_id: str
+    exit_code: int | None
+    signal_name: str  # "" if not signal-killed
+    stdout: str  # truncated to QEMU_OUTPUT_MAX_BYTES
+    stderr: str  # truncated to QEMU_OUTPUT_MAX_BYTES
+    console_log: str  # full ring buffer join (already bounded by CONSOLE_RING_LINES)
+    accel_type: str  # "hvf" | "tcg" | "kvm"
+    host_os: str  # "macos" | "linux" | "unknown"
 
 
 class QemuVM:
@@ -120,8 +210,8 @@ class QemuVM:
         self._state_lock = asyncio.Lock()
         # Timing instrumentation (set by VmManager.create_vm)
         self.timing = VmTiming()
-        # Tracks if this VM owns a semaphore permit (prevents double-release in destroy)
-        self.holds_semaphore_slot = False
+        # Tracks if this VM holds an admission reservation (prevents double-release in destroy_vm)
+        self.holds_admission_slot = False
         # Resource reservation from admission controller (set by VmManager.create_vm)
         self.resource_reservation: ResourceReservation | None = None
         # Port forwarding - set by VmManager after boot
@@ -129,6 +219,8 @@ class QemuVM:
         self.exposed_ports: list[ExposedPort] = []
         # L1 memory snapshot restore flag
         self.l1_restored: bool = False
+        # Previous nr_throttled from cgroup cpu.stat (for delta-based warning)
+        self._prev_nr_throttled: int = 0
 
     # -------------------------------------------------------------------------
     # Timing properties (backwards-compatible accessors to VmTiming)
@@ -321,16 +413,35 @@ class QemuVM:
             code: Code to execute in guest VM
             timeout_seconds: Maximum execution time (enforced by cgroup)
             env_vars: Environment variables for code execution (default: None)
-            on_stdout: Optional callback for real-time stdout streaming
-            on_stderr: Optional callback for real-time stderr streaming
+            on_stdout: Optional callback for real-time stdout streaming.
+                If the callback raises, it is disabled for the remainder of the
+                execution (output collection is unaffected).
+            on_stderr: Optional callback for real-time stderr streaming.
+                Same defensive semantics as on_stdout.
 
         Returns:
             ExecutionResult with stdout, stderr, exit code, and resource usage
 
         Raises:
+            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
             EnvVarValidationError: Invalid env vars (control chars, size limits)
-            VmPermanentError: VM not in READY state or communication failed
-            VmBootTimeoutError: Execution exceeded timeout_seconds
+            OutputLimitError: stdout or stderr exceeded guest-enforced size limits.
+            VmTransientError: Transport failure (socket EOF, QEMU crash), or guest
+                infrastructure failure (REPL spawn failed due to OOM). Code never ran.
+            VmPermanentError: VM not in READY state, or protocol/request corruption.
+            VmBootTimeoutError: Execution exceeded host timeout.
+
+        Failure modes:
+            System/infrastructure errors (raised as exceptions, caller can retry):
+                - VmTransientError: transport failure (socket EOF, QEMU crash),
+                  or guest infrastructure (REPL spawn failed due to OOM)
+                - VmBootTimeoutError: execution exceeded host timeout
+                - VmPermanentError: protocol/request corruption
+            User code results (returned as ExecutionResult, not retryable):
+                - exit_code=0: success
+                - exit_code>0: code error
+                - exit_code>128: killed by signal (128 + signal_number)
+                - exit_code=-1: execution timeout (code ran too long)
         """
         # Validate VM is in READY state before execution (atomic check-and-set)
         async with self._state_lock:
@@ -379,27 +490,22 @@ class QemuVM:
                 env_vars=env_vars or {},
             )
         except ValidationError as e:
-            # Check if the validation error is on the "code" field (e.g. null bytes).
-            # Code validation errors return ExecutionResult(exit_code=-1) so callers
-            # get a result rather than an exception.
-            code_errors = [err for err in e.errors() if "code" in err.get("loc", ())]
-            if code_errors:
-                return ExecutionResult(
-                    exit_code=-1,
-                    stdout="",
-                    stderr=str(e),
-                    timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0),
-                )
-            # Other validation errors (env vars, timeout, etc.) are domain exceptions.
-            raise EnvVarValidationError(
-                str(e),
-                context={"vm_id": self.vm_id},
-            ) from e
-        except Exception as e:
-            raise EnvVarValidationError(
-                str(e),
-                context={"vm_id": self.vm_id},
-            ) from e
+            # Translate Pydantic structural errors through the same path as
+            # guest-agent errors so all error mapping lives in one place.
+            error_locs = {field for err in e.errors() for field in err.get("loc", ())}
+            if "env_vars" in error_locs:
+                error_type = constants.GuestErrorType.ENV_VAR
+            elif "code" in error_locs:
+                error_type = constants.GuestErrorType.CODE
+            else:
+                error_type = constants.GuestErrorType.REQUEST
+            msg = StreamingErrorMessage(message=str(e), error_type=error_type.value)
+            exc = guest_error_to_exception(msg, self.vm_id)
+            if isinstance(exc, InputValidationError):
+                # Input was invalid but VM is fine — restore READY for session reuse
+                with contextlib.suppress(VmPermanentError):
+                    await self.transition_state(VmState.READY)
+            raise exc from e
 
         try:
             # Re-check state before expensive I/O operations
@@ -425,102 +531,85 @@ class QemuVM:
             # Hard timeout = soft timeout (guest enforcement) + margin (host watchdog)
             hard_timeout = timeout_seconds + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
 
-            # Stream messages and collect output
-            exit_code = -1
-            execution_time_ms: int | None = None
-            spawn_ms: int | None = None
-            process_ms: int | None = None
-            stdout_chunks: list[str] = []
-            stderr_chunks: list[str] = []
-
-            async for msg in self.channel.stream_messages(request, timeout=hard_timeout):
-                # Type-safe message handling
-                from exec_sandbox.guest_agent_protocol import (  # noqa: PLC0415
-                    ExecutionCompleteMessage,
-                    OutputChunkMessage,
-                    StreamingErrorMessage,
-                )
-
-                if isinstance(msg, OutputChunkMessage):
-                    # Collect chunk for return to user
-                    if msg.type == "stdout":
-                        stdout_chunks.append(msg.chunk)
-                        # Call streaming callback if provided
-                        if on_stdout:
-                            on_stdout(msg.chunk)
-                    else:  # stderr
-                        stderr_chunks.append(msg.chunk)
-                        # Call streaming callback if provided
-                        if on_stderr:
-                            on_stderr(msg.chunk)
-
-                    # Also log for debugging (truncated)
-                    logger.debug(
-                        "VM output",
-                        extra={
-                            "vm_id": self.vm_id,
-                            "stream": msg.type,
-                            "chunk": msg.chunk[:200],
-                        },
-                    )
-                elif isinstance(msg, ExecutionCompleteMessage):
-                    # Execution complete - capture all timing fields
-                    exit_code = msg.exit_code
-                    execution_time_ms = msg.execution_time_ms
-                    spawn_ms = msg.spawn_ms
-                    process_ms = msg.process_ms
-                elif isinstance(msg, StreamingErrorMessage):
-                    # Streaming error from guest - include details in log message
-                    logger.error(
-                        f"Guest agent error: [{msg.error_type}] {msg.message}",
+            # Error handler: input validation restores READY and raises,
+            # timeout falls through to consume_stream's default (exit_code=-1),
+            # all other errors raise as infrastructure failures.
+            async def _handle_exec_error(msg: StreamingErrorMessage) -> None:
+                exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
+                # Recoverable input errors: VM is fine, restore READY for session reuse
+                if isinstance(exc, (InputValidationError, OutputLimitError, PackageNotAllowedError)):
+                    with contextlib.suppress(VmPermanentError):
+                        await self.transition_state(VmState.READY)
+                    raise exc
+                # Timeout: code ran too long — this is a user code result, not infrastructure.
+                # Fall through to consume_stream's default handling (exit_code=-1 + stderr message).
+                if msg.error_type == constants.GuestErrorType.TIMEOUT:
+                    logger.warning(
+                        f"Execution timeout: [{msg.error_type}] {msg.message}",
                         extra={
                             "vm_id": self.vm_id,
                             "error_message": msg.message,
                             "error_type": msg.error_type,
                         },
                     )
-                    # Store error in stderr so callers can see what went wrong
-                    stderr_chunks.append(f"[{msg.error_type}] {msg.message}")
-                    exit_code = -1
-                    break
+                    return
+                # All other guest errors = infrastructure/system failures.
+                # Code never ran or system is broken — raise for caller to handle.
+                raise exc
+
+            result = await consume_stream(
+                self.channel,
+                request,
+                timeout=hard_timeout,
+                vm_id=self.vm_id,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+                on_error=_handle_exec_error,
+            )
 
             # Measure external resources from host (cgroup v2)
-            external_cpu_ms, external_mem_mb = await self._read_cgroup_stats()
+            external_cpu_ms, external_mem_mb, external_nr_throttled = await self._read_cgroup_stats()
 
-            # Concatenate collected chunks
-            stdout_full = "".join(stdout_chunks)
-            stderr_full = "".join(stderr_chunks)
-
-            # Truncate to limits
-            stdout_truncated = stdout_full[: constants.MAX_STDOUT_SIZE]
-            stderr_truncated = stderr_full[: constants.MAX_STDERR_SIZE]
+            if external_nr_throttled is not None and external_nr_throttled > self._prev_nr_throttled:
+                new_throttles = external_nr_throttled - self._prev_nr_throttled
+                logger.warning(
+                    "VM CPU throttled by cgroup — consider increasing cpu_cores or DEFAULT_VM_CPU_OVERHEAD_CORES",
+                    extra={
+                        "vm_id": self.vm_id,
+                        "nr_throttled_delta": new_throttles,
+                        "nr_throttled_total": external_nr_throttled,
+                    },
+                )
+            if external_nr_throttled is not None:
+                self._prev_nr_throttled = external_nr_throttled
 
             # Debug log final execution output
             logger.debug(
                 "Code execution complete",
                 extra={
                     "vm_id": self.vm_id,
-                    "exit_code": exit_code,
-                    "execution_time_ms": execution_time_ms,
-                    "stdout_len": len(stdout_full),
-                    "stderr_len": len(stderr_full),
-                    "stdout": stdout_truncated[:500],  # First 500 chars for debug
-                    "stderr": stderr_truncated[:500] if stderr_truncated else None,
+                    "exit_code": result.exit_code,
+                    "execution_time_ms": result.execution_time_ms,
+                    "stdout_len": len(result.stdout),
+                    "stderr_len": len(result.stderr),
+                    "stdout": result.stdout[:500],
+                    "stderr": result.stderr[:500] if result.stderr else None,
                 },
             )
 
             # Parse result with both internal (guest) and external (host) measurements
             # Note: timing is a placeholder here - scheduler will populate actual values
             exec_result = ExecutionResult(
-                stdout=stdout_truncated,  # Return to user
-                stderr=stderr_truncated,  # Return to user
-                exit_code=exit_code,
-                execution_time_ms=execution_time_ms,  # Guest-reported
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code,
+                execution_time_ms=result.execution_time_ms,  # Guest-reported
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured
                 external_memory_peak_mb=external_mem_mb or None,  # Host-measured
+                external_cpu_nr_throttled=external_nr_throttled,  # Host-measured
                 timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0, connect_ms=connect_ms),
-                spawn_ms=spawn_ms,  # Guest-reported granular timing
-                process_ms=process_ms,  # Guest-reported granular timing
+                spawn_ms=result.spawn_ms,  # Guest-reported granular timing
+                process_ms=result.process_ms,  # Guest-reported granular timing
             )
 
             # Success - transition back to READY for reuse (if not destroyed)
@@ -550,7 +639,15 @@ class QemuVM:
                     "language": self.language,
                 },
             ) from e
-        except (OSError, json.JSONDecodeError) as e:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            ValidationError,
+            RuntimeError,
+            CommunicationError,
+        ) as e:
             raise VmTransientError(
                 f"VM {self.vm_id} communication failed: {e}",
                 context={
@@ -669,10 +766,7 @@ class QemuVM:
             response = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
 
             if isinstance(response, StreamingErrorMessage):
-                raise VmPermanentError(
-                    f"write_file failed for '{path}': [{response.error_type}] {response.message}",
-                    context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
-                )
+                raise guest_error_to_exception(response, self.vm_id, operation=f"write_file '{path}'")
 
             if not isinstance(response, FileWriteAckMessage):
                 raise VmPermanentError(
@@ -753,10 +847,7 @@ class QemuVM:
                     elif isinstance(msg, FileReadCompleteMessage):
                         break
                     elif isinstance(msg, StreamingErrorMessage):
-                        raise VmPermanentError(
-                            f"read_file failed for '{path}': [{msg.error_type}] {msg.message}",
-                            context={"vm_id": self.vm_id, "path": path, "error_type": msg.error_type},
-                        )
+                        raise guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
                     else:
                         raise VmPermanentError(
                             f"read_file unexpected message type: {type(msg).__name__}",
@@ -813,10 +904,7 @@ class QemuVM:
             ) from e
 
         if isinstance(response, StreamingErrorMessage):
-            raise VmPermanentError(
-                f"list_files failed for '{path}': [{response.error_type}] {response.message}",
-                context={"vm_id": self.vm_id, "path": path, "error_type": response.error_type},
-            )
+            raise guest_error_to_exception(response, self.vm_id, operation=f"list_files '{path}'")
 
         if not isinstance(response, FileListMessage):
             raise VmPermanentError(
@@ -826,12 +914,12 @@ class QemuVM:
 
         return [FileInfo(name=e.name, is_dir=e.is_dir, size=e.size) for e in response.entries]
 
-    async def _read_cgroup_stats(self) -> tuple[int | None, int | None]:
-        """Read external CPU time and peak memory from cgroup v2.
+    async def _read_cgroup_stats(self) -> tuple[int | None, int | None, int | None]:
+        """Read external CPU time, peak memory, and CPU throttle count from cgroup v2.
 
         Returns:
-            Tuple of (cpu_time_ms, peak_memory_mb)
-            Returns (None, None) if cgroup not available or read fails
+            Tuple of (cpu_time_ms, peak_memory_mb, nr_throttled)
+            Returns (None, None, None) if cgroup not available or read fails
         """
         return await cgroup.read_cgroup_stats(self.cgroup_path)
 
@@ -905,3 +993,220 @@ class QemuVM:
 
         # Final state transition (acquires lock again - safe for same task)
         await self.transition_state(VmState.DESTROYED)
+
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
+
+    async def capture_process_output(self) -> tuple[str, str]:
+        """Capture stdout/stderr from QEMU process.
+
+        Returns (stdout, stderr) as strings, empty if process still running.
+        Must be called BEFORE destroy() — pipes are gone after cleanup.
+        """
+        if self.process.returncode is not None:
+            try:
+                stdout, stderr = await asyncio.wait_for(self.process.communicate(), timeout=1.0)
+                return (stdout.decode() if stdout else "", stderr.decode() if stderr else "")
+            except TimeoutError:
+                pass
+        return "", ""
+
+    async def collect_diagnostics(self) -> QemuDiagnostics:
+        """Collect crash diagnostics from this VM.
+
+        Captures console ring buffer, process stdout/stderr, signal info,
+        and host environment. Safe to call whether process is alive or dead:
+        - Dead process: captures stdout/stderr via communicate(1s timeout)
+        - Alive process: stdout/stderr will be empty (drain task owns the pipes)
+        """
+        stdout_text, stderr_text = await self.capture_process_output()
+
+        console_log = "\n".join(self.console_lines) if self.console_lines else "(empty)"
+
+        signal_name = ""
+        rc = self.process.returncode
+        if rc is not None and rc < 0:
+            try:
+                signal_name = signal.Signals(-rc).name
+            except ValueError:
+                signal_name = f"signal {-rc}"
+
+        accel_type = await detect_accel_type()
+        host_os = detect_host_os()
+
+        return QemuDiagnostics(
+            vm_id=self.vm_id,
+            exit_code=rc,
+            signal_name=signal_name,
+            stdout=stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES],
+            stderr=stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES],
+            console_log=console_log,
+            accel_type=accel_type.value,
+            host_os=host_os.name.lower(),
+        )
+
+    # -------------------------------------------------------------------------
+    # Guest readiness
+    # -------------------------------------------------------------------------
+
+    async def wait_for_guest(self, timeout: float) -> None:  # noqa: PLR0915
+        """Wait for guest agent using event-driven racing.
+
+        Races QEMU process death monitor against guest readiness checks with retry logic.
+
+        Args:
+            timeout: Maximum wait time in seconds
+
+        Raises:
+            VmQemuCrashError: QEMU process died during boot
+            TimeoutError: Guest not ready within timeout
+        """
+
+        async def monitor_process_death() -> None:
+            """Monitor QEMU process death - kernel-notified, instant."""
+            await self.process.wait()
+            diag = await self.collect_diagnostics()
+
+            # macOS HVF: exit code 0 during boot = error (retry)
+            if diag.host_os == "macos" and diag.exit_code == 0:
+                logger.warning(
+                    "QEMU exited with code 0 during boot on macOS (will retry)\n  vm_id=%s",
+                    diag.vm_id,
+                )
+                raise VmQemuCrashError("QEMU process exited during boot (macOS clean exit)", diagnostics=diag)
+
+            # TCG: exit code 0 during boot = guest reboot/panic
+            if diag.accel_type == "tcg" and diag.exit_code == 0:
+                logger.warning(
+                    "QEMU TCG exited with code 0 during boot (will retry)\n"
+                    "  vm_id=%s host_os=%s\n  stderr: %s\n  console:\n%s",
+                    diag.vm_id,
+                    diag.host_os,
+                    diag.stderr[:500] if diag.stderr else "(empty)",
+                    diag.console_log[-2000:],
+                )
+                raise VmQemuCrashError("QEMU TCG exited with code 0 during boot (guest reboot/panic)", diagnostics=diag)
+
+            # General crash
+            logger.error(
+                "QEMU process exited unexpectedly\n"
+                "  vm_id=%s exit_code=%s signal=%s\n"
+                "  stderr: %s\n  stdout: %s\n  console:\n%s",
+                diag.vm_id,
+                diag.exit_code,
+                diag.signal_name,
+                diag.stderr if diag.stderr else "(empty)",
+                diag.stdout if diag.stdout else "(empty)",
+                diag.console_log,
+            )
+            raise VmQemuCrashError(
+                f"QEMU process died (exit code {diag.exit_code}, {diag.signal_name}). "
+                f"stderr: {diag.stderr[:200] if diag.stderr else '(empty)'}, "
+                f"console: {diag.console_log[-4000:]}",
+                diagnostics=diag,
+            )
+
+        async def check_guest_ready() -> None:
+            """Single guest readiness check attempt."""
+            await self.channel.connect(timeout_seconds=1)
+            response = await self.channel.send_request(PingRequest())
+
+            # Ping returns PongMessage
+            if not isinstance(response, PongMessage):
+                raise RuntimeError(f"Guest ping returned unexpected type: {type(response)}")
+
+            logger.info("Guest agent ready", extra={"vm_id": self.vm_id, "version": response.version})
+
+        # Race with retry logic (tenacity exponential backoff with full jitter)
+        death_task: asyncio.Task[None] | None = None
+        guest_task: asyncio.Task[None] | None = None
+        # Store CM reference to check .expired() — CancelledError from child
+        # tasks (guest_task) escapes asyncio.timeout() because the conversion
+        # to TimeoutError only applies to the current task's cancellation.
+        timeout_cm = asyncio.timeout(timeout)
+        try:
+            async with timeout_cm:
+                death_task = asyncio.create_task(monitor_process_death())
+
+                # Pre-connect to chardev sockets to trigger QEMU's poll registration.
+                # Without this, QEMU may not add sockets to its poll set until after
+                # guest opens virtio-serial ports, causing reads to return EOF.
+                # See: https://bugs.launchpad.net/qemu/+bug/1224444 (virtio-mmio socket race)
+                #
+                # Timeout is short (1s vs previous 2s) because sockets are usually not ready this early.
+                # The retry loop below handles actual connection with proper exponential backoff.
+                # E3: Reduced pre-connect timeout from 0.1s to 0.01s — speculative, enters retry loop faster
+                try:
+                    await self.channel.connect(timeout_seconds=0.005)
+                    logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": self.vm_id})
+                except (TimeoutError, OSError) as e:
+                    # Expected - sockets may not be ready yet, retry loop will handle
+                    logger.debug("Pre-connect to sockets deferred", extra={"vm_id": self.vm_id, "reason": str(e)})
+
+                # Retry with exponential backoff + full jitter
+                async for attempt in AsyncRetrying(
+                    retry=retry_if_exception_type(
+                        (TimeoutError, OSError, json.JSONDecodeError, RuntimeError, asyncio.IncompleteReadError)
+                    ),
+                    # E1: Tighter retry backoff for faster guest detection
+                    # E4: Reduced max from 0.2s to 0.05s — retries cap at 50ms intervals,
+                    # catching guest readiness within ~10ms instead of ~150ms overshoot
+                    wait=wait_random_exponential(multiplier=0.02, min=0.005, max=0.05),
+                ):
+                    with attempt:
+                        guest_task = asyncio.create_task(check_guest_ready())
+
+                        # Race: first one wins
+                        done, _pending = await asyncio.wait(
+                            {death_task, guest_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+
+                        # Check which completed
+                        if death_task in done:
+                            # QEMU died - cancel guest and retrieve exception
+                            guest_task.cancel()
+                            # Suppress ALL exceptions - we're about to re-raise VmError from death_task.
+                            with contextlib.suppress(BaseException):
+                                await guest_task
+                            await death_task  # Re-raise VmError
+                            # Safety net: monitor_process_death should always raise,
+                            # but guard against future code paths that return normally.
+                            diag = await self.collect_diagnostics()
+                            raise VmQemuCrashError(
+                                "QEMU process exited during boot (clean exit)",
+                                diagnostics=diag,
+                            )
+
+                        # Guest task completed - check result (raises if failed, triggering retry)
+                        # Wrap CancelledError from guest_task: the child task can be
+                        # cancelled by gvproxy/socket failures or Python 3.14 asyncio
+                        # internals. Convert to RuntimeError so tenacity retries it
+                        # instead of letting it escape asyncio.timeout() uncaught
+                        try:
+                            await guest_task
+                        except asyncio.CancelledError:
+                            raise RuntimeError("Guest readiness check cancelled") from None
+
+        except asyncio.CancelledError:
+            # CancelledError from child tasks (guest_task) escapes asyncio.timeout()
+            # because the CancelledError→TimeoutError conversion only applies to
+            # the current task's cancellation, not child task cancellations.
+            # Check if the timeout expired to distinguish from external cancellation.
+            if timeout_cm.expired():
+                raise TimeoutError(f"Guest agent not ready after {timeout}s") from None
+            raise  # Genuine external cancellation — propagate as-is
+
+        except TimeoutError:
+            raise TimeoutError(f"Guest agent not ready after {timeout}s") from None
+
+        finally:
+            # Always clean up tasks to prevent "Task exception was never retrieved" warnings.
+            for task in (death_task, guest_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (death_task, guest_task):
+                if task is not None:
+                    with contextlib.suppress(BaseException):
+                        await task

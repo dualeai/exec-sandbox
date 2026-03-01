@@ -14,6 +14,16 @@ import pytest
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
+from .conftest import (
+    JS_SAFETY,
+    NET_CONNECT_TIMEOUT_S,
+    NET_OP_TIMEOUT_S,
+    NET_RETRY_BACKOFF_S,
+    NET_RETRY_COUNT,
+    NET_SAFETY_TIMEOUT_S,
+    PY_SAFETY,
+)
+
 # =============================================================================
 # Normal cases: Basic allow/block behavior
 # =============================================================================
@@ -37,8 +47,8 @@ OUTBOUND_FILTER_NORMAL_CASES = [
     # Multiple allowed domains
     pytest.param(
         Language.PYTHON,
-        ["httpbin.org", "google.com", "github.com"],
-        "github.com",
+        ["google.com", "pypi.org", "httpbin.org"],
+        "httpbin.org",
         True,
         id="normal-multiple-domains-third-connects",
     ),
@@ -147,37 +157,85 @@ OUTBOUND_FILTER_TEST_CASES = (
 )
 
 
-def get_connection_test_code(language: Language, test_domain: str) -> str:
+def get_connection_test_code(language: Language, test_domain: str, *, retries: bool = False) -> str:
     """Generate language-appropriate TLS connection test code.
 
     Tests whether a TLS connection to port 443 can be established.
     OutboundAllow filters at both DNS and TLS levels — blocked domains
     fail DNS resolution, allowed domains resolve and connect via TLS.
+
+    When *retries* is True the generated code retries transient failures
+    (matching curl's ``--retry 2`` pattern) — used for allowed-domain tests.
     """
     if language == Language.PYTHON:
-        return f"""
-import socket
-import ssl
+        if retries:
+            return (
+                PY_SAFETY
+                + f"""
+import socket, ssl, time
+for attempt in range({NET_RETRY_COUNT + 1}):
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection(("{test_domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
+            with ctx.wrap_socket(sock, server_hostname="{test_domain}") as ssock:
+                print("CONNECTED")
+                break
+    except Exception as e:
+        if attempt < {NET_RETRY_COUNT}:
+            time.sleep({NET_RETRY_BACKOFF_S} * (attempt + 1))
+            continue
+        print(f"BLOCKED:{{type(e).__name__}}")
+"""
+            )
+        return (
+            PY_SAFETY
+            + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("{test_domain}", 443), timeout=5) as sock:
+    with socket.create_connection(("{test_domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="{test_domain}") as ssock:
             print("CONNECTED")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
 """
+        )
     if language == Language.JAVASCRIPT:
-        # Use Bun's fetch (does TLS with SNI)
-        return f"""
+        if retries:
+            return (
+                JS_SAFETY
+                + f"""for (let attempt = 0; attempt < {NET_RETRY_COUNT + 1}; attempt++) {{
+    try {{
+        const res = await fetch("https://{test_domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
+        console.log("CONNECTED:" + res.status);
+        break;
+    }} catch (e) {{
+        if (attempt < {NET_RETRY_COUNT}) {{ await new Promise(r => setTimeout(r, {NET_RETRY_BACKOFF_S * 1000} * (attempt + 1))); continue; }}
+        console.log("BLOCKED:" + e.name);
+    }}
+}}"""
+            )
+        return (
+            JS_SAFETY
+            + f"""
 try {{
-    const res = await fetch("https://{test_domain}/", {{ signal: AbortSignal.timeout(5000) }});
+    const res = await fetch("https://{test_domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
     console.log("CONNECTED:" + res.status);
 }} catch (e) {{
     console.log("BLOCKED:" + e.name);
 }}
 """
-    # RAW
-    return f'curl -sf --connect-timeout 5 --max-time 10 --retry 2 --retry-connrefused https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
+        )
+    # RAW — ``timeout`` wraps curl because curl's ``--max-time`` cannot
+    # interrupt musl's blocking ``getaddrinfo()`` (Alpine ships curl without
+    # c-ares).  See ``_curl_tls_code`` in test_ech_proxy_behavior.py.
+    retry_flags = f" --retry {NET_RETRY_COUNT} --retry-connrefused" if retries else ""
+    return (
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf"
+        f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
+        f"{retry_flags}"
+        f' https://{test_domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
+    )
 
 
 @pytest.mark.parametrize(
@@ -197,7 +255,7 @@ async def test_outbound_filtering(
     - Allowed domains: DNS resolves, TLS connections succeed
     - Blocked domains: DNS resolution fails (gaierror)
     """
-    code = get_connection_test_code(language, test_domain)
+    code = get_connection_test_code(language, test_domain, retries=should_connect)
 
     result = await scheduler.run(
         code=code,
@@ -227,14 +285,17 @@ async def test_outbound_filtering(
 # =============================================================================
 async def test_outbound_filtering_http_allowed(scheduler: Scheduler) -> None:
     """Test that allowed domain is accessible via HTTPS."""
-    code = """
+    code = (
+        PY_SAFETY
+        + f"""
 import urllib.request
 try:
-    with urllib.request.urlopen("https://pypi.org/simple/", timeout=10) as r:
-        print(f"STATUS:{r.status}")
+    with urllib.request.urlopen("https://pypi.org/simple/", timeout={NET_OP_TIMEOUT_S}) as r:
+        print(f"STATUS:{{r.status}}")
 except Exception as e:
-    print(f"ERROR:{e}")
+    print(f"ERROR:{{e}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -250,14 +311,17 @@ except Exception as e:
 
 async def test_outbound_filtering_http_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails via HTTPS."""
-    code = """
+    code = (
+        PY_SAFETY
+        + f"""
 import urllib.request
 try:
-    with urllib.request.urlopen("https://google.com/", timeout=5) as r:
-        print(f"STATUS:{r.status}")
+    with urllib.request.urlopen("https://google.com/", timeout={NET_OP_TIMEOUT_S}) as r:
+        print(f"STATUS:{{r.status}}")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -276,7 +340,9 @@ except Exception as e:
 # =============================================================================
 async def test_network_disabled_no_resolution(scheduler: Scheduler) -> None:
     """Test that allow_network=False prevents all network access."""
-    code = """
+    code = (
+        PY_SAFETY
+        + """
 import socket
 try:
     ip = socket.gethostbyname("google.com")
@@ -286,6 +352,7 @@ except socket.gaierror as e:
 except OSError as e:
     print(f"NO_NETWORK:{e}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -304,7 +371,7 @@ except OSError as e:
 async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
     """Test outbound filtering with RAW language using curl."""
     result = await scheduler.run(
-        code="curl -sf --max-time 10 --retry 2 --retry-connrefused https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
+        code=f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} --retry {NET_RETRY_COUNT} --retry-connrefused https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
         language=Language.RAW,
         allow_network=True,
         allowed_domains=["httpbin.org"],
@@ -318,7 +385,7 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
 async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails with RAW language."""
     result = await scheduler.run(
-        code="curl -sf --max-time 5 https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
+        code=f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
         language=Language.RAW,
         allow_network=True,
         allowed_domains=["httpbin.org"],  # google.com not allowed
@@ -334,14 +401,17 @@ async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
 # =============================================================================
 async def test_outbound_filtering_javascript_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails with JavaScript."""
-    code = """
-try {
-    const res = await fetch("https://google.com/", { signal: AbortSignal.timeout(5000) });
+    code = (
+        JS_SAFETY
+        + f"""
+try {{
+    const res = await fetch("https://google.com/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
     console.log("STATUS:" + res.status);
-} catch (e) {
+}} catch (e) {{
     console.log("BLOCKED:" + e.name);
-}
+}}
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -364,14 +434,17 @@ async def test_outbound_filtering_plain_http_blocked(scheduler: Scheduler) -> No
     OutboundAllow only allows TLS connections whose SNI matches a pattern.
     Plain HTTP has no TLS/SNI, so it must be blocked even for allowed domains.
     """
-    code = """
+    code = (
+        PY_SAFETY
+        + f"""
 import urllib.request
 try:
-    with urllib.request.urlopen("http://httpbin.org/", timeout=5) as r:
-        print(f"STATUS:{r.status}")
+    with urllib.request.urlopen("http://httpbin.org/", timeout={NET_OP_TIMEOUT_S}) as r:
+        print(f"STATUS:{{r.status}}")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -393,7 +466,9 @@ async def test_outbound_filtering_dns_blocked_for_non_allowed(
     OutboundAllow filters at both DNS and TLS levels — blocked domains
     fail to resolve (gaierror), not just fail at TLS handshake.
     """
-    code = """
+    code = (
+        PY_SAFETY
+        + """
 import socket
 try:
     ip = socket.gethostbyname("google.com")
@@ -403,6 +478,7 @@ except socket.gaierror as e:
 except Exception as e:
     print(f"OTHER_ERROR:{type(e).__name__}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -424,7 +500,9 @@ async def test_outbound_filtering_dns_works_for_allowed(
 
     Allowed domains should resolve normally (to real IPs, not sinkholed).
     """
-    code = """
+    code = (
+        PY_SAFETY
+        + """
 import socket
 try:
     ip = socket.gethostbyname("httpbin.org")
@@ -432,6 +510,7 @@ try:
 except Exception as e:
     print(f"DNS_FAILED:{type(e).__name__}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -450,24 +529,30 @@ except Exception as e:
     )
 
 
+@pytest.mark.slow
 async def test_outbound_filtering_block_all_outbound(scheduler: Scheduler) -> None:
     """BlockAllOutbound (Mode 1) should block everything including TLS.
 
     When block_outbound=True (Mode 1: port-forward only), no guest-initiated
     connections should succeed, even if allowed_domains would normally match.
     This tests Mode 1 isolation.
+
+    Slow under TCG: VM boot + Python SSL handshake attempt (5s socket timeout)
+    can exceed the 30s default execution timeout on CI runners without HVF.
     """
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("httpbin.org", 443), timeout=5) as sock:
+    with socket.create_connection(("httpbin.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -497,18 +582,21 @@ async def test_outbound_filtering_raw_tcp_blocked(scheduler: Scheduler) -> None:
     OutboundAllow only permits TLS on port 443 with matching SNI.
     Raw TCP to other ports has no SNI to match, so it must be blocked.
     """
-    code = """
+    code = (
+        PY_SAFETY
+        + f"""
 import socket
 try:
     # Try raw TCP to port 80 (HTTP, no TLS/SNI)
-    sock = socket.create_connection(("httpbin.org", 80), timeout=5)
+    sock = socket.create_connection(("httpbin.org", 80), timeout={NET_CONNECT_TIMEOUT_S})
     sock.sendall(b"GET / HTTP/1.1\\r\\nHost: httpbin.org\\r\\n\\r\\n")
     data = sock.recv(1024)
     sock.close()
-    print(f"TCP_CONNECTED:{len(data)}")
+    print(f"TCP_CONNECTED:{{len(data)}}")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -530,19 +618,21 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_with_sni(
     The proxy caches DNS resolutions and cross-checks TLS SNI against them.
     Resolve allowed domain → get IP → TLS to that IP with matching SNI should work.
     """
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ip = socket.gethostbyname("httpbin.org")
-    print(f"RESOLVED:{ip}")
+    print(f"RESOLVED:{{ip}}")
     ctx = ssl.create_default_context()
-    with socket.create_connection((ip, 443), timeout=5) as sock:
+    with socket.create_connection((ip, 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -568,20 +658,23 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_no_sni(
     no SNI) to the resulting IP should be blocked. The proxy requires TLS
     with matching SNI on port 443.
     """
-    code = """
+    code = (
+        PY_SAFETY
+        + f"""
 import socket
 try:
     ip = socket.gethostbyname("httpbin.org")
-    print(f"RESOLVED:{ip}")
+    print(f"RESOLVED:{{ip}}")
     # Raw TCP to resolved IP on port 80 — no TLS, no SNI
-    sock = socket.create_connection((ip, 80), timeout=5)
+    sock = socket.create_connection((ip, 80), timeout={NET_CONNECT_TIMEOUT_S})
     sock.sendall(b"GET / HTTP/1.1\\r\\nHost: httpbin.org\\r\\n\\r\\n")
     data = sock.recv(1024)
     sock.close()
-    print(f"TCP_CONNECTED:{len(data)}")
+    print(f"TCP_CONNECTED:{{len(data)}}")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -607,20 +700,22 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_wrong_sni(
     but claim to be pypi.org in the TLS SNI. The proxy cross-checks SNI
     against DNS — pypi.org doesn't resolve to httpbin.org's IP, so it's blocked.
     """
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ip = socket.gethostbyname("httpbin.org")
-    print(f"RESOLVED:{ip}")
+    print(f"RESOLVED:{{ip}}")
     ctx = ssl.create_default_context()
     # Connect to httpbin.org's IP but set SNI to pypi.org (not allowed domain)
-    with socket.create_connection((ip, 443), timeout=5) as sock:
+    with socket.create_connection((ip, 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="pypi.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -643,18 +738,20 @@ async def test_outbound_filtering_sni_spoof_allowed_domain_wrong_ip(
     The proxy's DNS cross-check should catch this: the SNI says "httpbin.org"
     but the destination IP (1.1.1.1) doesn't match httpbin.org's DNS records.
     """
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
     # Connect to Cloudflare DNS IP but claim to be httpbin.org
-    with socket.create_connection(("1.1.1.1", 443), timeout=5) as sock:
+    with socket.create_connection(("1.1.1.1", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -678,17 +775,19 @@ async def test_outbound_filtering_many_domains(scheduler: Scheduler) -> None:
     many_domains = [f"domain{i}.com" for i in range(50)]
     many_domains.append("httpbin.org")  # Add a real one
 
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("httpbin.org", 443), timeout=5) as sock:
+    with socket.create_connection(("httpbin.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -702,17 +801,19 @@ except Exception as e:
 
 async def test_outbound_filtering_unicode_domain(scheduler: Scheduler) -> None:
     """Test with internationalized domain name (IDN in punycode)."""
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("xn--nxasmq5b.com", 443), timeout=5) as sock:
+    with socket.create_connection(("xn--nxasmq5b.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="xn--nxasmq5b.com") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -729,17 +830,19 @@ except Exception as e:
 
 async def test_outbound_filtering_special_tld(scheduler: Scheduler) -> None:
     """Test with special TLDs (.local) — should fail since not in allowlist."""
-    code = """
-import socket
-import ssl
+    code = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("test.local", 443), timeout=5) as sock:
+    with socket.create_connection(("test.local", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="test.local") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
     result = await scheduler.run(
         code=code,
@@ -757,17 +860,19 @@ except Exception as e:
 async def test_outbound_filtering_single_domain_only(scheduler: Scheduler) -> None:
     """Single domain allowlist: allowed domain works, everything else blocked."""
     # First: allowed domain connects
-    code_allowed = """
-import socket
-import ssl
+    code_allowed = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("httpbin.org", 443), timeout=5) as sock:
+    with socket.create_connection(("httpbin.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
     result = await scheduler.run(
         code=code_allowed,
         language=Language.PYTHON,
@@ -779,17 +884,19 @@ except Exception as e:
     )
 
     # Second: blocked domain in same config
-    code_blocked = """
-import socket
-import ssl
+    code_blocked = (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("pypi.org", 443), timeout=5) as sock:
+    with socket.create_connection(("pypi.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="pypi.org") as ssock:
             print("CONNECTED")
 except Exception as e:
-    print(f"BLOCKED:{type(e).__name__}")
+    print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
     result = await scheduler.run(
         code=code_blocked,
         language=Language.PYTHON,

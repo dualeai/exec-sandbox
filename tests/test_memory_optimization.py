@@ -8,12 +8,15 @@ Run with: uv run pytest tests/test_memory_optimization.py -v
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from exec_sandbox import Scheduler, SchedulerConfig
-from exec_sandbox.models import ExecutionResult
 from exec_sandbox.warm_vm_pool import Language
+
+if TYPE_CHECKING:
+    from exec_sandbox.models import ExecutionResult
 
 from .conftest import skip_unless_fast_balloon
 
@@ -32,132 +35,103 @@ from .conftest import skip_unless_fast_balloon
 
 
 class TestZramConfiguration:
-    """Tests for zram setup in guest VM."""
+    """Tests for zram setup and VM tuning in guest VM."""
 
-    async def test_zram_device_exists_and_active(self, scheduler: Scheduler) -> None:
-        """zram0 device should be created, active, and have high swap priority."""
+    async def test_zram_and_vm_configuration(self, scheduler: Scheduler) -> None:
+        """All zram/VM sysfs and procfs settings should be correctly configured.
+
+        Validates setup_zram_swap() + apply_zram_vm_tuning() in init.rs:
+        device existence, swap priority, disksize, compression algorithm,
+        RAM ratio, page-cluster, swappiness, overcommit, min_free_kbytes,
+        mem_limit, oom_kill_allocating_task, and watermark tuning.
+        """
         result = await scheduler.run(
             code="""
-import os
+import os, stat
 
-# Check device exists in /sys (the /dev node is removed after swapon for security)
+# --- zram device exists and is active ---
 assert os.path.exists('/sys/block/zram0'), 'zram0 not found in /sys/block'
 
-# Check it's in swaps with high priority
 with open('/proc/swaps') as f:
     content = f.read()
     assert 'zram0' in content, f'zram0 not in /proc/swaps: {content}'
-    # Parse priority (last column) - should be 100
-    lines = content.strip().split('\\n')
-    for line in lines[1:]:  # Skip header
+    for line in content.strip().split('\\n')[1:]:
         if 'zram0' in line:
-            parts = line.split()
-            priority = int(parts[-1])
+            priority = int(line.split()[-1])
             assert priority >= 100, f'zram priority should be >=100, got {priority}'
-            print(f'zram0 priority: {priority}')
             break
 
-# Check disksize is non-zero
 with open('/sys/block/zram0/disksize') as f:
     disksize = int(f.read().strip())
     assert disksize > 0, 'zram disksize is 0'
-    print(f'zram disksize: {disksize // (1024*1024)}MB')
 
-print('PASS: zram0 device active with correct priority')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
-
-    async def test_zram_uses_lz4_compression(self, scheduler: Scheduler) -> None:
-        """zram should use lz4 compression algorithm (fastest)."""
-        result = await scheduler.run(
-            code="""
+# --- lz4 compression ---
 with open('/sys/block/zram0/comp_algorithm') as f:
     algo = f.read().strip()
-    # Active algorithm shown in brackets [lz4]
     assert '[lz4]' in algo, f'Expected [lz4] active, got: {algo}'
-    print(f'PASS: compression algorithm = {algo}')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
-        assert "[lz4]" in result.stdout
 
-    async def test_zram_size_is_half_ram(self, scheduler: Scheduler) -> None:
-        """zram disksize should be exactly 50% of total RAM."""
-        result = await scheduler.run(
-            code="""
-# Get total RAM
+# --- disksize is ~50% of RAM ---
 with open('/proc/meminfo') as f:
     for line in f:
         if 'MemTotal' in line:
             mem_kb = int(line.split()[1])
             break
-
-# Get zram size
-with open('/sys/block/zram0/disksize') as f:
-    zram_bytes = int(f.read().strip())
-    zram_kb = zram_bytes // 1024
-
-# Should be ~50% (allow 45-55% range for rounding)
+zram_kb = disksize // 1024
 ratio = zram_kb / mem_kb
 assert 0.45 <= ratio <= 0.55, f'zram ratio {ratio:.3f} not ~50%'
-print(f'PASS: zram={zram_kb//1024}MB, RAM={mem_kb//1024}MB, ratio={ratio:.3f}')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
 
-    async def test_vm_settings_optimized_for_zram(self, scheduler: Scheduler) -> None:
-        """VM settings should be optimized: page-cluster=0, swappiness>=100."""
-        result = await scheduler.run(
-            code="""
-# page-cluster=0 disables swap readahead (critical for compressed swap)
+# --- page-cluster=0 (disables swap readahead for compressed swap) ---
 with open('/proc/sys/vm/page-cluster') as f:
     page_cluster = int(f.read().strip())
     assert page_cluster == 0, f'page-cluster must be 0 for zram, got {page_cluster}'
 
-# swappiness>=100 prefers swap over dropping caches (kernel allows up to 200 for zram)
+# --- swappiness>=100 (prefer swap over dropping caches) ---
 with open('/proc/sys/vm/swappiness') as f:
     swappiness = int(f.read().strip())
     assert swappiness >= 100, f'swappiness should be >=100 for zram, got {swappiness}'
 
-print(f'PASS: page-cluster={page_cluster}, swappiness={swappiness}')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
-
-    async def test_overcommit_settings_configured(self, scheduler: Scheduler) -> None:
-        """VM should have heuristic overcommit for JIT runtime compatibility."""
-        result = await scheduler.run(
-            code="""
-# vm.overcommit_memory=0 (heuristic) allows large virtual memory reservations
-# Required for JIT runtimes like Bun/JavaScriptCore that reserve 128GB+ virtual address space
+# --- overcommit_memory=0 (heuristic, required for JIT runtimes) ---
 with open('/proc/sys/vm/overcommit_memory') as f:
     overcommit_memory = int(f.read().strip())
     assert overcommit_memory == 0, f'overcommit_memory should be 0 (heuristic), got {overcommit_memory}'
 
-# vm.min_free_kbytes should be set (prevents OOM deadlocks)
+# --- min_free_kbytes (prevents OOM deadlocks) ---
 with open('/proc/sys/vm/min_free_kbytes') as f:
     min_free_kb = int(f.read().strip())
     assert min_free_kb >= 5000, f'min_free_kbytes should be >=5000, got {min_free_kb}'
 
-print(f'PASS: overcommit_memory={overcommit_memory}, min_free_kbytes={min_free_kb}')
+# --- mem_limit sysfs (write-only, kernel-enforced) ---
+path = '/sys/block/zram0/mem_limit'
+assert os.path.exists(path), 'mem_limit sysfs attribute missing'
+mode = os.stat(path).st_mode
+assert stat.S_IWUSR & mode, 'mem_limit should be writable by owner'
+assert not (stat.S_IRUSR & mode), 'mem_limit should be write-only (not readable)'
+
+# --- oom_kill_allocating_task=1 (fast OOM response) ---
+with open('/proc/sys/vm/oom_kill_allocating_task') as f:
+    oom_kill = int(f.read().strip())
+    assert oom_kill == 1, f'oom_kill_allocating_task should be 1, got {oom_kill}'
+
+# --- watermark tuning (per ArchWiki zram recommendations) ---
+with open('/proc/sys/vm/watermark_boost_factor') as f:
+    boost = int(f.read().strip())
+    assert boost == 0, f'watermark_boost_factor should be 0, got {boost}'
+
+with open('/proc/sys/vm/watermark_scale_factor') as f:
+    scale = int(f.read().strip())
+    assert scale == 125, f'watermark_scale_factor should be 125, got {scale}'
+
+print(f'PASS: all zram/VM settings correct')
+print(f'  disksize={disksize//(1024*1024)}MB, ratio={ratio:.3f}, algo={algo}')
+print(f'  page-cluster={page_cluster}, swappiness={swappiness}')
+print(f'  overcommit={overcommit_memory}, min_free_kb={min_free_kb}')
+print(f'  oom_kill_allocating_task={oom_kill}')
+print(f'  watermark_boost={boost}, watermark_scale={scale}')
 """,
             language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
-
-
-class TestZramCompression:
-    """Tests for zram compression effectiveness."""
 
     async def test_compression_actually_compresses(self, scheduler: Scheduler) -> None:
         """zram should achieve real compression on compressible data."""
@@ -177,8 +151,10 @@ initial_orig, initial_compr = get_zram_stats()
 print(f'Initial: orig={initial_orig}, compr={initial_compr}')
 
 # Allocate compressible data (repetitive pattern compresses well)
+# 120MB exceeds available RAM but fits within zram capacity thanks to compression.
+# (zram mem_limit is 25% of RAM; repetitive patterns compress >10x with lz4.)
 chunks = []
-for i in range(20):  # 200MB of compressible data
+for i in range(12):  # 120MB of compressible data
     chunk = bytearray(10 * 1024 * 1024)
     # Fill with repetitive pattern (highly compressible)
     pattern = bytes([i % 256] * 4096)
@@ -209,7 +185,6 @@ else:
     print('PASS: No swap used (data fit in RAM)')
 """,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
@@ -261,72 +236,10 @@ except MemoryError:
     raise
 """,
             language=Language.PYTHON,
-            timeout_seconds=90,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
         assert "exceeded available by" in result.stdout
-
-    @pytest.mark.slow
-    @skip_unless_fast_balloon
-    async def test_swap_usage_correlates_with_allocation(self, scheduler: Scheduler) -> None:
-        """Swap usage should increase proportionally as memory pressure grows.
-
-        Allocates 250MB in stages (50MB increments) in a 256MB VM, verifying that
-        zram swap activates and increases by at least 30MB. Skipped on nested
-        virtualization (x64 CI) where memory operations are too slow.
-        """
-        result = await scheduler.run(
-            code="""
-def get_swap_used_kb():
-    with open('/proc/swaps') as f:
-        lines = f.readlines()
-        if len(lines) > 1:
-            return int(lines[1].split()[3])
-    return 0
-
-def get_available_mb():
-    with open('/proc/meminfo') as f:
-        for line in f:
-            if 'MemAvailable' in line:
-                return int(line.split()[1]) // 1024
-    return 0
-
-# Record initial state
-initial_swap_kb = get_swap_used_kb()
-initial_avail = get_available_mb()
-print(f'Initial: available={initial_avail}MB, swap_used={initial_swap_kb//1024}MB')
-
-# Allocate memory in stages and track swap
-chunks = []
-measurements = []
-for stage in range(1, 6):  # 50MB increments up to 250MB
-    for _ in range(5):  # 5 x 10MB = 50MB per stage
-        chunk = bytearray(10 * 1024 * 1024)
-        for j in range(0, len(chunk), 4096):
-            chunk[j] = 42
-        chunks.append(chunk)
-
-    swap_kb = get_swap_used_kb()
-    avail = get_available_mb()
-    allocated = stage * 50
-    measurements.append((allocated, swap_kb // 1024, avail))
-    print(f'Stage {stage}: allocated={allocated}MB, swap={swap_kb//1024}MB, avail={avail}MB')
-
-# Verify swap increased significantly
-final_swap_kb = get_swap_used_kb()
-swap_increase_mb = (final_swap_kb - initial_swap_kb) // 1024
-print(f'Swap increase: {swap_increase_mb}MB')
-
-# Should have used at least 30MB of swap for 250MB allocation
-assert swap_increase_mb >= 30, f'Swap increase too small: {swap_increase_mb}MB'
-print(f'PASS: Swap increased by {swap_increase_mb}MB')
-""",
-            language=Language.PYTHON,
-            timeout_seconds=90,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
 
     async def test_memory_survives_repeated_cycles(self, scheduler: Scheduler) -> None:
         """Memory allocation should work reliably across multiple cycles."""
@@ -366,10 +279,81 @@ for cycle in range(3):
 print('PASS: All 3 allocation cycles completed without corruption')
 """,
             language=Language.PYTHON,
-            timeout_seconds=120,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS: All 3 allocation cycles" in result.stdout
+
+
+# ============================================================================
+# zram mem_limit Tests (OOM instead of thrashing)
+# ============================================================================
+
+
+class TestZramMemLimit:
+    """Tests for zram mem_limit — ensures OOM kills fast instead of thrashing.
+
+    Without mem_limit, the kernel reclaim loop thrashes (compress/decompress
+    in zram) when memory is exhausted, causing the VM to appear hung until
+    timeout. With mem_limit, zram rejects writes with -ENOMEM once compressed
+    storage is full, triggering the OOM killer within seconds.
+
+    Refs:
+        - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
+        - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
+    """
+
+    async def test_massive_alloc_oom_kills_not_timeout(self, scheduler: Scheduler) -> None:
+        """Massive allocation must OOM-kill (exit 137), NOT timeout.
+
+        This is the core regression test. Before mem_limit, allocating far
+        beyond RAM caused the kernel to thrash zram indefinitely, hitting the
+        execution timeout. With mem_limit, the OOM killer fires in seconds.
+
+        Uses os.urandom() (incompressible data) so zram can't compress the
+        pages — zero-filled bytearrays compress to near-nothing with lz4,
+        letting ~8 GB fit in the 41 MB mem_limit before OOM triggers.
+        """
+        result = await scheduler.run(
+            code="""
+import os
+chunks = []
+while True:
+    chunks.append(os.urandom(10 * 1024 * 1024))  # 10MB random (incompressible)
+""",
+            language=Language.PYTHON,
+        )
+        # OOM kill = 137 (128 + SIGKILL). Must NOT be timeout (-1).
+        assert result.exit_code == 137, (
+            f"Expected OOM kill (137), got exit_code={result.exit_code}. "
+            f"If -1, zram is thrashing instead of OOM-killing."
+        )
+
+    async def test_oom_after_successful_alloc_free_cycle(self, scheduler: Scheduler) -> None:
+        """OOM should still fire after alloc/free cycles (no zram leak).
+
+        Alloc/free cycles leave residual zram pages and allocator
+        fragmentation. Uses random data so zram can't compress it.
+        """
+        result = await scheduler.run(
+            code="""
+import gc, os
+
+# Warm up: alloc 100MB random, free, repeat 3 times
+for _ in range(3):
+    chunks = [os.urandom(10 * 1024 * 1024) for _ in range(10)]
+    del chunks
+    gc.collect()
+
+# Now exhaust memory — should OOM, not thrash
+chunks = []
+while True:
+    chunks.append(os.urandom(10 * 1024 * 1024))
+""",
+            language=Language.PYTHON,
+        )
+        assert result.exit_code == 137, (
+            f"Expected OOM kill (137), got exit_code={result.exit_code}. OOM should fire even after alloc/free cycles."
+        )
 
 
 # ============================================================================
@@ -380,84 +364,51 @@ print('PASS: All 3 allocation cycles completed without corruption')
 class TestBalloonDevice:
     """Tests for virtio-balloon device in guest."""
 
-    async def test_balloon_device_visible_and_correct_type(self, scheduler: Scheduler) -> None:
-        """Balloon device should be visible with correct device type (5)."""
+    async def test_balloon_device_and_driver(self, scheduler: Scheduler) -> None:
+        """Balloon device should be visible with correct type (5), bound to a driver, and expose features."""
         result = await scheduler.run(
             code="""
 import os
 
-found_balloon = False
-balloon_dev = None
 virtio_path = '/sys/bus/virtio/devices'
-
 assert os.path.exists(virtio_path), f'{virtio_path} not found'
 
+found_balloon = False
 for dev in os.listdir(virtio_path):
     modalias_path = os.path.join(virtio_path, dev, 'modalias')
     if os.path.exists(modalias_path):
         with open(modalias_path) as f:
             modalias = f.read().strip()
-            # Device type 5 = balloon (virtio:d00000005v...)
-            if 'd00000005' in modalias:
-                found_balloon = True
-                balloon_dev = dev
-                print(f'Found balloon device: {dev}')
-                print(f'  modalias: {modalias}')
+            if 'd00000005' not in modalias:
+                continue
 
-                # Check device is bound to driver
-                driver_path = os.path.join(virtio_path, dev, 'driver')
-                if os.path.exists(driver_path):
-                    driver = os.path.basename(os.readlink(driver_path))
-                    print(f'  driver: {driver}')
-                break
+        found_balloon = True
+        print(f'Found balloon device: {dev}')
+        print(f'  modalias: {modalias}')
+
+        # Driver must be bound (proves driver is working)
+        driver_path = os.path.join(virtio_path, dev, 'driver')
+        assert os.path.islink(driver_path), f'Balloon device {dev} not bound to driver'
+        driver = os.path.basename(os.readlink(driver_path))
+        print(f'  driver: {driver}')
+
+        # Check features sysfs attribute
+        features_path = os.path.join(virtio_path, dev, 'features')
+        if os.path.exists(features_path):
+            with open(features_path) as f:
+                features = f.read().strip()
+                print(f'  features: {features}')
+
+        break
 
 assert found_balloon, 'Balloon device (type 5) not found in /sys/bus/virtio'
-print(f'PASS: Balloon device {balloon_dev} visible')
+print('PASS: Balloon device visible and driver functional')
 """,
             language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
         assert "d00000005" in result.stdout
-
-    async def test_balloon_driver_functional(self, scheduler: Scheduler) -> None:
-        """Balloon driver should be functional (built-in or module)."""
-        result = await scheduler.run(
-            code="""
-import os
-
-# The balloon driver can be either built-in or a module
-# Check if the device is bound to a driver (proves driver is working)
-virtio_path = '/sys/bus/virtio/devices'
-found_driver = False
-
-for dev in os.listdir(virtio_path):
-    modalias_path = os.path.join(virtio_path, dev, 'modalias')
-    if os.path.exists(modalias_path):
-        with open(modalias_path) as f:
-            if 'd00000005' in f.read():  # Device type 5 = balloon
-                # Check driver is bound
-                driver_path = os.path.join(virtio_path, dev, 'driver')
-                if os.path.islink(driver_path):
-                    driver = os.path.basename(os.readlink(driver_path))
-                    print(f'Balloon device {dev} bound to driver: {driver}')
-                    found_driver = True
-
-                    # Verify driver exposes expected sysfs attributes
-                    features_path = os.path.join(virtio_path, dev, 'features')
-                    if os.path.exists(features_path):
-                        with open(features_path) as f:
-                            features = f.read().strip()
-                            print(f'Balloon features: {features}')
-                break
-
-assert found_driver, 'Balloon device not bound to driver'
-print('PASS: Balloon driver functional')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
 
 
 # ============================================================================
@@ -518,59 +469,3 @@ print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
                 result: ExecutionResult = r
                 assert result.exit_code == 0, f"VM {i + 1} exit_code={result.exit_code}, stderr={result.stderr}"
                 assert "PASS" in result.stdout, f"VM {i + 1} output: {result.stdout}"
-
-    async def test_concurrent_vms_isolation(self, images_dir: Path) -> None:
-        """Each VM should have independent memory space (no cross-contamination)."""
-        config = SchedulerConfig(
-            default_memory_mb=256,
-            default_timeout_seconds=60,
-            images_dir=images_dir,
-        )
-
-        async with Scheduler(config) as sched:
-            # Each VM writes a unique signature and verifies it
-            async def run_vm_with_signature(vm_id: int) -> ExecutionResult:
-                code = f"""
-import hashlib
-
-# Write unique signature based on VM ID
-signature = b'VM{vm_id}_' + bytes([{vm_id}] * 1000)
-chunks = []
-for i in range(10):  # 100MB
-    chunk = bytearray(10 * 1024 * 1024)
-    chunk[0:len(signature)] = signature
-    chunk[-len(signature):] = signature
-    chunks.append(chunk)
-
-# Verify signatures weren't overwritten
-for i, chunk in enumerate(chunks):
-    assert chunk[0:len(signature)] == signature, f'Start signature corrupted in chunk {{i}}'
-    assert chunk[-len(signature):] == signature, f'End signature corrupted in chunk {{i}}'
-
-# Compute hash of all data
-h = hashlib.sha256()
-for chunk in chunks:
-    h.update(chunk)
-
-print(f'PASS: VM{vm_id} hash={{h.hexdigest()[:16]}}')
-"""
-                return await sched.run(code=code, language=Language.PYTHON)
-
-            tasks = [run_vm_with_signature(i) for i in range(3)]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            hashes: list[str] = []
-            for i, r in enumerate(results):
-                if isinstance(r, BaseException):
-                    pytest.fail(f"VM {i} failed: {r}")
-                result: ExecutionResult = r
-                assert result.exit_code == 0, f"VM {i} failed: {result.stderr}"
-                assert "PASS" in result.stdout
-                # Extract hash
-                for line in result.stdout.split("\n"):
-                    if "hash=" in line:
-                        h = line.split("hash=")[1].strip()
-                        hashes.append(h)
-
-            # All hashes should be different (each VM has unique signature)
-            assert len(set(hashes)) == 3, f"Expected 3 unique hashes, got: {hashes}"

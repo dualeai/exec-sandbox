@@ -7,9 +7,10 @@
 // when idle. Blocking libc.read() lets the thread sleep in the kernel (0% CPU).
 // See: oven-sh/bun#10080, #21081, #27365
 import { dlopen, FFIType } from 'bun:ffi';
+import { releaseWeakRefs } from 'bun:jsc';
+import { Console } from 'node:console';
 import { createContext, runInContext } from 'node:vm';
 import { Readable } from 'node:stream';
-import { releaseWeakRefs } from 'bun:jsc';
 const libc = dlopen('libc.so.6', {
     prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 },
     read:  { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
@@ -35,6 +36,30 @@ const __import = (specifier) => import(specifier);
 const nullStdin = new Readable({ read() { this.push(null); } });
 nullStdin.fd = -1;
 nullStdin.isTTY = false;
+// Back-pressure tracking for stdout flush.
+// Bun 1.x bug (oven-sh/bun#20562): writableLength reads 0 immediately after
+// write() returns false, so the writableLength polling loop is ineffective.
+// Track write() return value directly and yield before sentinel when needed.
+let _stdoutBackPressure = false;
+const _origStdoutWrite = process.stdout.write;
+process.stdout.write = function(chunk, enc, cb) {
+    const ok = _origStdoutWrite.call(this, chunk, enc, cb);
+    if (!ok) _stdoutBackPressure = true;
+    return ok;
+};
+// Bun.write(Bun.stdout, data) also bypasses process.stdout.write entirely
+// (native I/O), so we wrap it to flag back-pressure detection.
+const _origBunWrite = Bun.write.bind(Bun);
+const _bunWriteWrapper = function(dest, ...args) {
+    const result = _origBunWrite(dest, ...args);
+    if (dest === Bun.stdout) _stdoutBackPressure = true;
+    return result;
+};
+// Route console through process.stdout so back-pressure is tracked for ALL
+// console methods (log, info, dir, table, etc.). Bun's native console writes
+// directly to fd 1 via syscall, completely bypassing the Node.js stream layer —
+// console.log() would NOT trigger our back-pressure detection without this.
+const sandboxConsole = new Console({ stdout: process.stdout, stderr: process.stderr });
 // Proxy intercepts stdin access on process, forwarding everything else.
 // set trap prevents user code from corrupting the real process object.
 const sandboxProcess = new Proxy(process, {
@@ -54,6 +79,7 @@ const sandboxProcess = new Proxy(process, {
 const sandboxBun = new Proxy(Bun, {
     get(target, prop) {
         if (prop === 'stdin') return nullStdin;
+        if (prop === 'write') return _bunWriteWrapper;
         const val = target[prop];
         return typeof val === 'function' ? val.bind(target) : val;
     },
@@ -63,16 +89,20 @@ const sandboxBun = new Proxy(Bun, {
         return true;
     }
 });
+// VM context globals: createContext() only provides ECMAScript built-ins
+// (Object, Array, Math, Promise, etc.). All Web API and Node/Bun globals
+// must be passed explicitly — they are NOT auto-injected.
+// See: https://bun.sh/docs/runtime/globals
 const ctx = createContext({
     Bun: sandboxBun,
-    console, process: sandboxProcess, setTimeout, setInterval, clearTimeout, clearInterval,
+    console: sandboxConsole, process: sandboxProcess, setTimeout, setInterval, clearTimeout, clearInterval,
     Buffer, URL, URLSearchParams, TextEncoder, TextDecoder, fetch,
     Request, Response, Headers, Blob, FormData,
     ReadableStream, WritableStream, TransformStream,
     AbortController, AbortSignal, Event, EventTarget,
     WebAssembly,
     atob, btoa, structuredClone, queueMicrotask,
-    crypto,
+    crypto, performance,
     require,
     __import,
     module: { exports: {} },
@@ -137,6 +167,7 @@ while (true) {
     if (code === null) break;
     let exitCode = 0;
     unhandledRejection = null;
+    _stdoutBackPressure = false;
     try {
         // Bun.Transpiler with replMode transforms code for REPL semantics:
         // - Wraps in async IIFE for top-level await support
@@ -170,6 +201,21 @@ while (true) {
         const r = unhandledRejection;
         process.stderr.write((r && r.stack ? r.stack : String(r)) + '\n');
         exitCode = 1;
+    }
+    // Flush stdout before sentinel — process.stdout.write() is async for pipes,
+    // so large outputs may still be in Bun's internal buffer. Without this,
+    // the sentinel can arrive before stdout fully drains (~100KB+ truncation).
+    //
+    // Two-phase flush:
+    // 1. writableLength polling: catches data Bun tracks in its stream buffer.
+    // 2. Back-pressure yield: if any write() returned false, Bun has data in
+    //    its native I/O pipeline that writableLength doesn't reflect
+    //    (oven-sh/bun#20562). Yielding 50ms lets the kernel pipe write complete.
+    while (process.stdout.writableLength > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    if (_stdoutBackPressure) {
+        await new Promise(resolve => setTimeout(resolve, 50));
     }
     process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
 }

@@ -20,6 +20,7 @@ pub(crate) enum GuestCommand {
     InstallPackages {
         language: String,
         packages: Vec<String>,
+        timeout: u64,
     },
 
     #[serde(rename = "exec")]

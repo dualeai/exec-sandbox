@@ -23,6 +23,14 @@ fn mount_virtual_filesystems() {
         device::remove_device_node(path);
     }
 
+    // Security: restrict /dev/urandom and /dev/random to owner-write (0644).
+    // devtmpfs creates these as 0666, allowing any user to inject entropy via
+    // write(). The RO bind-mount of /dev (guest-agent) does NOT block char
+    // device writes (Linux VFS exempts S_ISCHR from sb_permission RO check).
+    // Guest-agent (root) needs write for RNDRESEEDCRNG ioctl; user code
+    // (UID 1000) only needs read or getrandom() syscall.
+    device::chmod_paths(0o644, &["/dev/urandom", "/dev/random"]);
+
     // B4: /dev/shm mount deferred to guest-agent (only needed for Python multiprocessing).
     // Guest-agent mounts it lazily before first use, saving ~2-5ms on critical path.
 
@@ -49,18 +57,26 @@ fn mount_virtual_filesystems() {
     // nosuid|nodev: CIS Benchmark 1.1.3–1.1.4 hardening.
     // noexec intentionally omitted: breaks uv wheel unpacking (pypa/pip#6364),
     // pnpm (pnpm#9776), PyInstaller, and user temp executables.
-    // Why 128MB: half of default 256MB guest RAM. Balances scratch space for
-    // pip/uv wheel builds (which unpack into /tmp) vs leaving RAM for user code.
+    // Size = 50% of RAM: scales with VM memory instead of fixed cap.
+    // Per-UID quota (usrquota + usrquota_block_hardlimit) prevents sparse file
+    // inflation attacks — must be set at initial mount time, not remount.
     // nr_inodes=16384: fixed cap independent of VM memory (default is
     // totalram_pages/2, which varies 13K–55K+ depending on memory_mb). 16K
     // covers typical `pip install` (measured ~2K-5K files for large packages
     // like pandas).
+    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
+    // Without this, the kernel rounds up non-aligned values, causing statvfs
+    // to report a larger size than the computed half-memory value.
+    let page_mask = !(sys::page_size() - 1);
+    let half_mem_bytes = (sys::read_mem_total_kb() / 2 * 1024) & page_mask;
     sys::mount(
         "tmpfs",
         "/tmp",
         "tmpfs",
         sys::MS_NOSUID | sys::MS_NODEV,
-        "size=128M,nr_inodes=16384,mode=1777,noswap",
+        &format!(
+            "size={half_mem_bytes},nr_inodes=16384,mode=1777,usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
+        ),
     );
 }
 

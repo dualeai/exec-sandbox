@@ -10,7 +10,7 @@ import pytest
 
 from exec_sandbox.models import ExposedPort, Language, PortMapping
 from exec_sandbox.port_forward import (
-    allocate_ephemeral_port,
+    allocate_ephemeral_ports,
     normalize_port_mappings,
     resolve_port_mappings,
 )
@@ -94,12 +94,12 @@ class TestAllocateEphemeralPort:
 
     def test_allocate_ephemeral_port_returns_valid_port(self) -> None:
         """Test that allocated port is in valid range."""
-        port = allocate_ephemeral_port()
+        (port,) = allocate_ephemeral_ports(1)
         assert 1024 <= port <= 65535
 
     def test_allocate_ephemeral_port_is_available(self) -> None:
         """Test that allocated port can be bound."""
-        port = allocate_ephemeral_port()
+        (port,) = allocate_ephemeral_ports(1)
 
         # Try to bind to the allocated port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -109,9 +109,7 @@ class TestAllocateEphemeralPort:
 
     def test_allocate_multiple_ports_are_different(self) -> None:
         """Test that multiple allocations return different ports."""
-        # Allocate several ports
-        ports = [allocate_ephemeral_port() for _ in range(5)]
-        # All should be unique
+        ports = allocate_ephemeral_ports(5)
         assert len(set(ports)) == len(ports)
 
 
@@ -473,6 +471,7 @@ class TestPortForwardingModeSelection:
 # =============================================================================
 
 
+@pytest.mark.slow
 class TestPortForwardingMode1Integration:
     """Integration tests for Mode 1: port forwarding without internet (QEMU hostfwd)."""
 
@@ -502,7 +501,6 @@ print("server_started")
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         # Verify the result has exposed ports
@@ -514,14 +512,13 @@ print("server_started")
     async def test_mode1_explicit_external_port(self, scheduler: Scheduler) -> None:
         """Test Mode 1 with explicit external port mapping."""
         # Use a specific external port
-        external_port = allocate_ephemeral_port()
+        (external_port,) = allocate_ephemeral_ports(1)
 
         result = await scheduler.run(
             code="print('hello')",
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080, external=external_port)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         assert len(result.exposed_ports) == 1
@@ -539,7 +536,6 @@ print("server_started")
                 PortMapping(internal=9000),
             ],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         assert len(result.exposed_ports) == 3
@@ -565,13 +561,13 @@ except Exception as e:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080)],
             allow_network=False,  # No internet!
-            timeout_seconds=30,
         )
 
         # Should be blocked - no internet in Mode 1
         assert "BLOCKED" in result.stdout or result.exit_code != 0
 
 
+@pytest.mark.slow
 class TestPortForwardingMode2Integration:
     """Integration tests for Mode 2: port forwarding with internet (gvproxy)."""
 
@@ -583,7 +579,6 @@ class TestPortForwardingMode2Integration:
             expose_ports=[PortMapping(internal=5000)],
             allow_network=True,
             allowed_domains=["example.com"],
-            timeout_seconds=30,
         )
 
         # Should have exposed port
@@ -606,13 +601,13 @@ except Exception as e:
             expose_ports=[PortMapping(internal=8080)],
             allow_network=True,
             allowed_domains=["httpbin.org"],
-            timeout_seconds=30,
         )
 
         # Should be able to reach httpbin.org
         assert "STATUS:200" in result.stdout
 
 
+@pytest.mark.slow
 class TestPortForwardingConnectivity:
     """Tests that actually verify host can connect to exposed ports."""
 
@@ -647,7 +642,6 @@ finally:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=9999)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         # The server started and listened
@@ -663,7 +657,6 @@ finally:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=3000)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         assert len(result.exposed_ports) == 1
@@ -676,6 +669,7 @@ finally:
 # =============================================================================
 
 
+@pytest.mark.slow
 class TestSessionExposedPorts:
     """Integration tests for Session.exposed_ports property."""
 
@@ -712,7 +706,7 @@ class TestSessionExposedPorts:
 
     async def test_session_explicit_external_port(self, scheduler: Scheduler) -> None:
         """Session with explicit external port preserves it."""
-        external_port = allocate_ephemeral_port()
+        (external_port,) = allocate_ephemeral_ports(1)
         async with await scheduler.session(
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080, external=external_port)],

@@ -21,6 +21,16 @@ import pytest
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 
+from .conftest import (
+    JS_SAFETY,
+    NET_CONNECT_TIMEOUT_S,
+    NET_OP_TIMEOUT_S,
+    NET_RETRY_BACKOFF_S,
+    NET_RETRY_COUNT,
+    NET_SAFETY_TIMEOUT_S,
+    PY_SAFETY,
+)
+
 # =============================================================================
 # Domains
 # =============================================================================
@@ -57,35 +67,78 @@ def _python_tls_code(domain: str, tls_version: str = TLS_DEFAULT) -> str:
     elif tls_version == TLS_13:
         version_lines.append("    ctx.minimum_version = ssl.TLSVersion.TLSv1_3")
     ctx_setup = "\n".join(version_lines)
-    return f"""
-import socket
-import ssl
+    return (
+        PY_SAFETY
+        + f"""
+import socket, ssl
 try:
 {ctx_setup}
-    with socket.create_connection(("{domain}", 443), timeout=5) as sock:
+    with socket.create_connection(("{domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="{domain}") as ssock:
             print(f"CONNECTED:{{ssock.version()}}")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
 """
+    )
 
 
-def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT) -> str:
+def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT, *, retries: bool = True) -> str:
     """Bun/BoringSSL fetch test with top-level await.
 
     Bun's fetch does not expose TLS version control; _tls_version is
     accepted for signature compatibility but ignored.
+
+    When *retries* is True (default for allowed-domain tests), retries up
+    to 3 times with linear backoff to absorb transient connection resets
+    from real-world domains like github.com on CI runners — matching the
+    curl variant's ``--retry 2`` pattern.
     """
-    return f"""try {{
-    const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout(5000) }});
+    if retries:
+        return (
+            JS_SAFETY
+            + f"""for (let attempt = 0; attempt < {NET_RETRY_COUNT + 1}; attempt++) {{
+    try {{
+        const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
+        console.log("CONNECTED:" + res.status);
+        break;
+    }} catch (e) {{
+        if (attempt < {NET_RETRY_COUNT}) {{ await new Promise(r => setTimeout(r, {NET_RETRY_BACKOFF_S * 1000} * (attempt + 1))); continue; }}
+        console.log("BLOCKED:" + e.name + ":" + e.message);
+    }}
+}}"""
+        )
+    return (
+        JS_SAFETY
+        + f"""
+try {{
+    const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
     console.log("CONNECTED:" + res.status);
 }} catch (e) {{
-    console.log("BLOCKED:" + e.name);
-}}"""
+    console.log("BLOCKED:" + e.name + ":" + e.message);
+}}
+"""
+    )
 
 
-def _curl_tls_code(domain: str, tls_version: str = TLS_DEFAULT, extra_flags: str = "") -> str:
-    """curl connection test with optional TLS version forcing and extra flags."""
+def _curl_tls_code(
+    domain: str,
+    tls_version: str = TLS_DEFAULT,
+    extra_flags: str = "",
+    *,
+    retries: bool = True,
+) -> str:
+    """curl connection test with optional TLS version forcing and extra flags.
+
+    Uses coreutils ``timeout`` as an outer wall-clock deadline because curl's
+    ``--max-time`` cannot interrupt musl's blocking ``getaddrinfo()``.  Alpine
+    ships curl without c-ares, so DNS resolution is a synchronous libc call.
+    musl's resolver ignores EINTR from SIGALRM (``if (poll(…) <= 0) continue``
+    in ``res_msend.c``), which means curl's internal timer never fires while
+    the process is stuck in DNS.  Under ARM64 TCG with parallel test load the
+    entire operation can be inflated 10-25x by CPU starvation, easily exceeding
+    the 120 s guest-agent timeout.  ``timeout {NET_SAFETY_TIMEOUT_S}`` guarantees
+    the command terminates and the ``|| echo "BLOCKED"`` fallback always runs.
+    """
     parts: list[str] = []
     version_flag = _CURL_VERSION_FLAGS.get(tls_version)
     if version_flag:
@@ -94,19 +147,28 @@ def _curl_tls_code(domain: str, tls_version: str = TLS_DEFAULT, extra_flags: str
         parts.append(extra_flags)
     flags = " ".join(parts)
     flags_str = f"{flags} " if flags else ""
+    retry_str = f" --retry {NET_RETRY_COUNT} --retry-connrefused" if retries else ""
     return (
-        f"curl -sf {flags_str}--connect-timeout 5 --max-time 5 "
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf {flags_str}"
+        f"--connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
+        f"{retry_str} "
         f'https://{domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
     )
 
 
-def _get_connection_code(language: Language, domain: str, tls_version: str = TLS_DEFAULT) -> str:
+def _get_connection_code(
+    language: Language,
+    domain: str,
+    tls_version: str = TLS_DEFAULT,
+    *,
+    retries: bool = True,
+) -> str:
     """Dispatch to the right code generator."""
     if language == Language.PYTHON:
         return _python_tls_code(domain, tls_version)
     if language == Language.JAVASCRIPT:
-        return _js_tls_code(domain, tls_version)
-    return _curl_tls_code(domain, tls_version)
+        return _js_tls_code(domain, tls_version, retries=retries)
+    return _curl_tls_code(domain, tls_version, retries=retries)
 
 
 # =============================================================================
@@ -214,7 +276,7 @@ async def test_ech_blocked(
     allowed_domains: list[str],
 ) -> None:
     """TLS connection to non-allowed domain is blocked."""
-    code = _get_connection_code(language, domain, tls_version)
+    code = _get_connection_code(language, domain, tls_version, retries=False)
     result = await scheduler.run(
         code=code,
         language=language,
@@ -341,10 +403,17 @@ async def test_curl_verbose_tls_negotiation(
     expected_version: str,
     expected_cipher: str,
 ) -> None:
-    """curl verbose output confirms TLS version and cipher negotiated."""
+    """curl verbose output confirms TLS version and cipher negotiated.
+
+    ``timeout 15`` wraps the entire pipeline so that even if curl hangs in
+    musl's blocking ``getaddrinfo()`` (see ``_curl_tls_code`` docstring),
+    grep still receives EOF and the ``|| echo "BLOCKED"`` fallback fires
+    instead of the pipeline hanging until the guest-agent timeout.
+    """
     curl_flags = _CURL_VERSION_FLAGS[tls_version]
     code = (
-        f"curl -svf {curl_flags} --connect-timeout 5 --max-time 5 "
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -svf {curl_flags}"
+        f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} "
         f'https://{domain}/ -o /dev/null 2>&1 | grep "SSL connection using" '
         f'&& echo "CONNECTED" || echo "BLOCKED"'
     )
@@ -370,18 +439,21 @@ async def test_ech_javascript_multiple_ech_domains(
     scheduler: Scheduler,
 ) -> None:
     """Bun connects to multiple ECH-supporting domains sequentially."""
-    code = f"""try {{
-    const r1 = await fetch("https://{ECH_DOMAIN_CLOUDFLARE}/", {{ signal: AbortSignal.timeout(5000) }});
+    code = (
+        JS_SAFETY
+        + f"""try {{
+    const r1 = await fetch("https://{ECH_DOMAIN_CLOUDFLARE}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
     console.log("CONNECTED:cloudflare:" + r1.status);
 }} catch (e) {{
     console.log("BLOCKED:cloudflare:" + e.name);
 }}
 try {{
-    const r2 = await fetch("https://{ECH_DOMAIN_ONE}/", {{ signal: AbortSignal.timeout(5000) }});
+    const r2 = await fetch("https://{ECH_DOMAIN_ONE}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
     console.log("CONNECTED:one:" + r2.status);
 }} catch (e) {{
     console.log("BLOCKED:one:" + e.name);
 }}"""
+    )
     result = await scheduler.run(
         code=code,
         language=Language.JAVASCRIPT,

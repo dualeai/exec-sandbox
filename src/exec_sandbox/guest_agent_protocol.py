@@ -12,7 +12,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from exec_sandbox.constants import MAX_FILE_PATH_LENGTH
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
 from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
 
 # ============================================================================
@@ -50,7 +50,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
     """Execute code in guest VM.
 
     Guest agent enforces:
-    - Code size limit: 1MB
+    - Code size limit: 1 MiB
     - Timeout limit: 300s
     - Env var limits: 100 vars, 256 char names, 4096 char values
     - Blocked env vars: LD_PRELOAD, NODE_OPTIONS, PATH, etc. (security)
@@ -60,20 +60,16 @@ class ExecuteCodeRequest(GuestAgentRequest):
 
     action: Literal["exec"] = Field(default="exec")  # type: ignore[assignment]
     language: Language = Field(description="Programming language for execution")
-    code: str = Field(max_length=1_000_000, description="Code to execute (max 1MB)")
+    code: str = Field(max_length=MAX_CODE_SIZE, description="Code to execute (max 1 MiB)")
 
-    @field_validator("code")
-    @classmethod
-    def validate_code(cls, v: str) -> str:
-        """Reject null bytes in code (causes silent failures in runtimes)."""
-        if "\x00" in v:
-            raise ValueError("Code cannot contain null bytes")
-        return v
+    # Note: empty-code and null-byte checks live in guest-agent validation.rs.
+    # The host translates the guest's code_error response to CodeValidationError
+    # via guest_error_to_exception. No Pydantic validator here.
 
     timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
     env_vars: dict[str, str] = Field(
         default_factory=dict,
-        description="Environment variables (max 100, see BLOCKED_ENV_VARS in guest-agent)",
+        description="Environment variables (max 100, blocked vars enforced by guest agent)",
     )
 
     @field_validator("env_vars")

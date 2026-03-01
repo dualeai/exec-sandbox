@@ -813,6 +813,42 @@ print(f'OWN_PID_STATUS:{"Name:" in status}')
         assert "SELF_STATUS:True" in result.stdout
         assert "OWN_PID_STATUS:True" in result.stdout
 
+    async def test_proc_sensitive_files_masked(self, dual_scheduler: Scheduler) -> None:
+        """Sensitive /proc files must be masked (empty) to block reconnaissance.
+
+        /proc/cmdline — boot params (rootfstype, init flags, console config)
+        /proc/version — exact kernel version (aids CVE matching)
+        /proc/interrupts — interrupt counters (thermal side-channel, GHSA-6fw5-f8r9-fgfm)
+        /proc/keys — kernel keyring (not namespaced)
+        /proc/timer_list — high-resolution timers (timing side-channel)
+        """
+        code = """\
+import os
+paths = [
+    '/proc/cmdline',
+    '/proc/version',
+    '/proc/interrupts',
+    '/proc/keys',
+    '/proc/timer_list',
+]
+for p in paths:
+    try:
+        with open(p) as f:
+            data = f.read().strip()
+        print(f'{p}:len={len(data)}:content={data[:80]}')
+    except PermissionError:
+        print(f'{p}:EPERM')
+    except FileNotFoundError:
+        print(f'{p}:ENOENT')
+"""
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        assert result.exit_code == 0
+        for line in result.stdout.strip().splitlines():
+            path = line.split(":")[0]
+            assert ":len=0:" in line or ":EPERM" in line or ":ENOENT" in line, (
+                f"{path} should be masked (empty/blocked), got: {line}"
+            )
+
 
 # =============================================================================
 # Out of bounds: Direct kernel exploitation primitives
@@ -1171,7 +1207,6 @@ finally:
         result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
         assert result.exit_code == 0
         stdout = result.stdout.strip()

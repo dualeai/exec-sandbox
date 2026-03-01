@@ -19,8 +19,9 @@ import asyncio
 import contextlib
 import errno
 import sys
+from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Final
 
 import aiofiles
 import aiofiles.os
@@ -31,29 +32,97 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
+import logging
+
+from tenacity import (
+    AsyncRetrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
 from exec_sandbox.base_cache_manager import BaseCacheManager
-from exec_sandbox.exceptions import GuestAgentError, SnapshotError, VmQemuCrashError, VmTransientError
+from exec_sandbox.exceptions import (
+    GuestAgentError,
+    PackageInstallPermanentError,
+    PackageInstallTransientError,
+    PackageNotAllowedError,
+    SnapshotError,
+    VmQemuCrashError,
+    VmTransientError,
+)
 from exec_sandbox.guest_agent_protocol import (
-    ExecutionCompleteMessage,
     InstallPackagesRequest,
-    OutputChunkMessage,
     StreamingErrorMessage,
 )
+from exec_sandbox.guest_channel import consume_stream
 from exec_sandbox.hash_utils import crc64
 from exec_sandbox.models import Language
 from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.qemu_vm import guest_error_to_exception
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
-from exec_sandbox.vm_types import VmState
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
+
+_PERMANENT_PACKAGE_PATTERNS: Final[tuple[str, ...]] = (
+    "no matching distribution",
+    "could not find a version",
+    "404 not found",
+    "404 client error",
+    "403 forbidden",
+    "eresolve",
+    "could not resolve dependency",
+    "invalid version",
+    "not found in registry",
+    "no matching version",
+    "version not found",
+)
+"""Patterns that indicate a permanent package install failure (won't succeed on retry)."""
+
+_TRANSIENT_NETWORK_PATTERNS: Final[tuple[str, ...]] = (
+    "client error",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "etimedout",
+    "name resolution",
+    "network unreachable",
+    "server error",
+    "ssl",
+    "temporary failure in name resolution",
+    "timed out",
+    "reset by peer",
+    "request failed after",
+)
+"""Patterns that indicate a transient network error (may succeed on retry)."""
+
+
+def _classify_install_error(
+    error_output: str,
+) -> type[PackageInstallPermanentError | PackageInstallTransientError] | None:
+    """Two-phase error classification for package install failures.
+
+    Phase 1: Check permanent patterns first (no matching distribution, 404).
+    Phase 2: Check transient patterns (connection reset, timed out).
+    Returns None if neither matches (falls through to generic GuestAgentError).
+    """
+    lower = error_output.lower()
+    # Phase 1: Permanent errors take priority — stop retrying immediately
+    if any(pattern in lower for pattern in _PERMANENT_PACKAGE_PATTERNS):
+        return PackageInstallPermanentError
+    # Phase 2: Transient errors — retry with backoff
+    if any(pattern in lower for pattern in _TRANSIENT_NETWORK_PATTERNS):
+        return PackageInstallTransientError
+    return None
 
 
 class DiskSnapshotManager(BaseCacheManager):
@@ -296,6 +365,8 @@ class DiskSnapshotManager(BaseCacheManager):
         tenant_id: str,
         task_id: str,
         memory_mb: int,
+        *,
+        _enospc_retried: bool = False,
     ) -> Path:
         """Create new qcow2 snapshot with packages installed.
 
@@ -303,7 +374,7 @@ class DiskSnapshotManager(BaseCacheManager):
 
         Workflow:
         1. Create qcow2 with backing file (base image)
-        2. Boot VM with snapshot image
+        2. Boot VM with snapshot image (ephemeral_vm handles lifecycle)
         3. Install packages via guest agent (with death monitoring)
         4. Shutdown VM (writes committed to snapshot)
         5. Return snapshot path
@@ -325,11 +396,20 @@ class DiskSnapshotManager(BaseCacheManager):
         """
         start_time = asyncio.get_running_loop().time()
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
+        success = False
+
+        # Ensure snapshot VMs have enough memory for package managers (uv/bun).
+        # Under TCG, uv cold-start JIT + TLS crypto pushes RSS above 192MB,
+        # triggering zram compression in emulated code (catastrophically slow).
+        effective_memory_mb = max(memory_mb, constants.SNAPSHOT_CREATION_MIN_MEMORY_MB)
+        if effective_memory_mb != memory_mb:
+            logger.debug(
+                "Snapshot VM memory raised to minimum",
+                extra={"requested_mb": memory_mb, "effective_mb": effective_memory_mb},
+            )
 
         # Acquire semaphore to limit concurrent snapshot creation
         async with self._creation_semaphore:
-            vm = None  # Track VM for cleanup
-
             try:
                 # Step 1: Create standalone ext4 qcow2 for overlay (vdb)
                 await self._create_snapshot_image(snapshot_path, cache_key, language, packages, tenant_id)
@@ -347,103 +427,72 @@ class DiskSnapshotManager(BaseCacheManager):
                 else:
                     package_domains = None
 
-                # Step 3: Create VM with config that matches cache key
-                # NOTE: memory_mb should match for consistency
-                # NOTE: Snapshot always created with allow_network=True (for pip/npm)
-                vm = await self.vm_manager.create_vm(
+                # Step 3-5: Boot VM, install packages, shutdown — ephemeral_vm handles lifecycle
+                async with self.vm_manager.ephemeral_vm(
                     language,
                     tenant_id,
                     task_id,
-                    memory_mb=memory_mb,
-                    allow_network=True,  # Always need network for package install
+                    memory_mb=effective_memory_mb,
+                    allow_network=True,
                     allowed_domains=package_domains,
-                    direct_write_target=snapshot_path,  # Write directly to snapshot (no overlay)
-                )
+                    direct_write_target=snapshot_path,
+                    retry_profile=constants.RETRY_BACKGROUND,
+                ) as vm:
+                    # Install packages with death monitoring (asyncio.wait)
+                    death_task = asyncio.create_task(self._monitor_vm_death(vm, cache_key))
+                    install_task = asyncio.create_task(self._install_packages(vm, Language(language), packages))
 
-                # Step 4: Install packages with death monitoring (asyncio.wait)
-                # Race: Install vs VM death - if VM crashes, instant detection
-                # Use FIRST_COMPLETED to exit immediately when either task finishes
-                death_task = asyncio.create_task(self._monitor_vm_death(vm, cache_key))
-                install_task = asyncio.create_task(self._install_packages(vm, Language(language), packages))
+                    try:
+                        done, pending = await asyncio.wait(
+                            {death_task, install_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
 
-                try:
-                    done, pending = await asyncio.wait(
-                        {death_task, install_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    # Cancel pending task
-                    for task in pending:
-                        task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await task
-
-                    # Check which task completed
-                    completed_task = done.pop()
-                    if completed_task == death_task:
-                        # VM died during installation - re-raise VmError
-                        await completed_task  # Propagate exception
-                    else:
-                        # Install succeeded - check for errors
-                        await completed_task  # Propagate any exception from install
-
-                except Exception:
-                    # Cleanup: Cancel both tasks on any failure
-                    for task in [death_task, install_task]:
-                        if not task.done():
+                        for task in pending:
                             task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await task
-                    raise
 
-                # Step 4: Shutdown QEMU process cleanly
-                # Track if we initiated the shutdown (vs QEMU dying unexpectedly)
-                we_initiated_shutdown = False
-                if vm.process.returncode is None:
-                    # QEMU still running - we'll terminate it
-                    we_initiated_shutdown = True
-                    await vm.process.terminate()
-                    try:
-                        await asyncio.wait_for(vm.process.wait(), timeout=5.0)
-                    except TimeoutError:
-                        await vm.process.kill()
+                        completed_task = done.pop()
+                        if completed_task == death_task:
+                            await completed_task  # Propagate VM death exception
+                        else:
+                            await completed_task  # Propagate install exception if any
+
+                    except Exception:
+                        for task in [death_task, install_task]:
+                            if not task.done():
+                                task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await task
+                        raise
+
+                    # Shutdown QEMU process cleanly
+                    we_initiated_shutdown = False
+                    if vm.process.returncode is None:
+                        we_initiated_shutdown = True
+                        await vm.process.terminate()
+                        try:
+                            await asyncio.wait_for(vm.process.wait(), timeout=5.0)
+                        except TimeoutError:
+                            await vm.process.kill()
+                            await vm.process.wait()
+                    else:
                         await vm.process.wait()
-                else:
-                    # QEMU already dead - wait to get the exit code
-                    await vm.process.wait()
 
-                # Verify QEMU exited cleanly after package installation
-                # Expected exit codes when WE initiated shutdown:
-                #   -15: SIGTERM (our terminate() call)
-                #   -9: SIGKILL (our kill() call after timeout)
-                # If QEMU exited on its own (we_initiated_shutdown=False), ANY exit code
-                # is suspicious because it means QEMU died during package installation
-                # before we could properly shut it down. This can cause corrupt snapshots
-                # if filesystem data wasn't synced to disk.
-                if we_initiated_shutdown:
-                    # We terminated QEMU - expect clean exit codes
-                    # Note: QEMU with -no-reboot exits with code 0 on SIGTERM (not -15)
-                    # because it handles the signal gracefully and performs cleanup.
-                    # This is expected behavior on macOS with HVF.
-                    if vm.process.returncode not in {0, -9, -15}:
-                        raise VmQemuCrashError(
-                            f"QEMU exited unexpectedly after terminate (exit code {vm.process.returncode})",
-                            context={
-                                "cache_key": cache_key,
-                                "exit_code": vm.process.returncode,
-                                "language": language,
-                                "packages": packages,
-                            },
-                        )
-                else:
-                    # QEMU died on its own before we could terminate it
-                    # Exit code 0 is acceptable if install completed successfully (we reached here)
-                    # because the guest may have shut down cleanly after:
-                    # 1. Package installation completed
-                    # 2. Guest called sync() to persist filesystem changes
-                    # 3. Guest decided to halt (idle timeout, clean shutdown, etc.)
-                    # Non-zero exit codes still indicate a problem (crash, signal, etc.)
-                    if vm.process.returncode != 0:
+                    # Verify QEMU exited cleanly
+                    if we_initiated_shutdown:
+                        if vm.process.returncode not in {0, -9, -15}:
+                            raise VmQemuCrashError(
+                                f"QEMU exited unexpectedly after terminate (exit code {vm.process.returncode})",
+                                context={
+                                    "cache_key": cache_key,
+                                    "exit_code": vm.process.returncode,
+                                    "language": language,
+                                    "packages": packages,
+                                },
+                            )
+                    elif vm.process.returncode != 0:
                         raise VmQemuCrashError(
                             f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
                             context={
@@ -453,30 +502,33 @@ class DiskSnapshotManager(BaseCacheManager):
                                 "packages": packages,
                             },
                         )
-                    logger.info(
-                        "QEMU exited cleanly (code 0) after install completed",
-                        extra={"cache_key": cache_key, "language": language},
-                    )
+                    else:
+                        logger.info(
+                            "QEMU exited cleanly (code 0) after install completed",
+                            extra={"cache_key": cache_key, "language": language},
+                        )
 
-                # Step 5: Clean up resources
-                # With direct_write_target, we wrote directly to snapshot_path
-                # No commit needed - just destroy VM (which cleans up cgroup, sockets, etc.)
-                await self.vm_manager.destroy_vm(vm)
-                vm = None
+                    success = True
+                # ephemeral_vm's finally calls destroy_vm (idempotent)
 
             # Handle disk full (lazy eviction)
             except OSError as e:
                 if e.errno == errno.ENOSPC:
-                    # Evict oldest snapshot and retry once
-                    # Cleanup handled by finally block
+                    if _enospc_retried:
+                        raise SnapshotError(
+                            f"Disk full after eviction retry for snapshot {cache_key}",
+                            context={"cache_key": cache_key, "language": language, "packages": packages},
+                        ) from e
                     await self._evict_oldest_snapshot()
-                    return await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
+                    return await self._create_snapshot(
+                        language, packages, cache_key, tenant_id, task_id, memory_mb, _enospc_retried=True
+                    )
                 raise
 
-            # Handle VM death during snapshot creation
+            except (SnapshotError, PackageNotAllowedError, PackageInstallPermanentError, asyncio.CancelledError):
+                raise
+
             except VmTransientError as e:
-                # Wrap VM error in SnapshotError
-                # Cleanup handled by finally block
                 raise SnapshotError(
                     f"VM crashed during snapshot creation: {e}",
                     context={
@@ -487,12 +539,7 @@ class DiskSnapshotManager(BaseCacheManager):
                     },
                 ) from e
 
-            except asyncio.CancelledError:
-                logger.warning("Snapshot creation cancelled", extra={"cache_key": cache_key})
-                raise  # Immediate propagation, cleanup in finally
-
             except Exception as e:
-                # Wrap generic errors in SnapshotError
                 raise SnapshotError(
                     f"Failed to create snapshot: {e}",
                     context={
@@ -504,26 +551,11 @@ class DiskSnapshotManager(BaseCacheManager):
                 ) from e
 
             finally:
-                # Cleanup always runs (success, error, or cancellation)
-                # Step 1: Cleanup VM if still running
-                if vm and vm.state != VmState.DESTROYED:
-                    try:
-                        await self.vm_manager.destroy_vm(vm)
-                        logger.info("VM cleaned up in finally block", extra={"cache_key": cache_key})
-                    except Exception as cleanup_error:
-                        logger.error(
-                            "VM cleanup failed in finally block",
-                            extra={"cache_key": cache_key, "error": str(cleanup_error)},
-                            exc_info=True,
-                        )
-
-                # Step 2: Cleanup snapshot file on failure
-                # vm=None means success (VM shutdown completed), keep snapshot
-                # vm!=None means failure, cleanup snapshot
-                if vm is not None and snapshot_path.exists():
+                # Cleanup snapshot file on failure
+                if not success and snapshot_path.exists():
                     try:
                         snapshot_path.unlink()
-                        logger.debug("Snapshot file cleaned up in finally block", extra={"cache_key": cache_key})
+                        logger.debug("Snapshot file cleaned up on failure", extra={"cache_key": cache_key})
                     except OSError as e:
                         logger.warning(
                             "Failed to cleanup snapshot file",
@@ -598,29 +630,16 @@ class DiskSnapshotManager(BaseCacheManager):
             ) from e
 
     async def _monitor_vm_death(self, vm: QemuVM, cache_key: str) -> None:
-        """Monitor VM process for unexpected death.
-
-        Event-driven death detection: Waits on process exit (no polling).
-        If process exits → raises VmError → TaskGroup cancels other tasks.
-
-        Args:
-            vm: QemuVM handle
-            cache_key: Snapshot cache key
-
-        Raises:
-            VmQemuCrashError: VM process died unexpectedly
-        """
-        # Wait for QEMU process to exit (blocks until death)
+        """Monitor VM process for unexpected death during snapshot creation."""
         returncode = await vm.process.wait()
-
-        # Process died → raise error to cancel sibling tasks
+        diag = await vm.collect_diagnostics()
+        logger.error(
+            "VM died during snapshot creation",
+            extra={**asdict(diag), "cache_key": cache_key},
+        )
         raise VmQemuCrashError(
             f"VM process died during snapshot creation (exit code {returncode})",
-            context={
-                "cache_key": cache_key,
-                "vm_id": vm.vm_id,
-                "exit_code": returncode,
-            },
+            diagnostics=diag,
         )
 
     async def _install_packages(
@@ -631,10 +650,9 @@ class DiskSnapshotManager(BaseCacheManager):
     ) -> None:
         """Install packages in VM via guest agent.
 
-        Event-driven architecture:
-        - ZERO polling loops
-        - Instant crash detection via asyncio.wait(FIRST_COMPLETED) in caller
-        - Timeout via asyncio.timeout() context manager
+        Retries transient network errors (DNS, connection refused, timeouts)
+        using exponential backoff. The VM stays running between retries — only
+        the install request is re-sent.
 
         Args:
             vm: QemuVM handle
@@ -643,87 +661,90 @@ class DiskSnapshotManager(BaseCacheManager):
 
         Raises:
             SnapshotError: Package installation failed
-            GuestAgentError: Guest agent returned error
+            GuestAgentError: Guest agent returned error (permanent)
+            PackageInstallTransientError: Transient network error (after all retries exhausted)
+            PackageInstallPermanentError: Permanent package error (no retry)
         """
         if not packages:
             return
 
-        # Send install_packages command via guest agent channel
         request = InstallPackagesRequest(
             language=language,
             packages=packages,
-            timeout=constants.PACKAGE_INSTALL_TIMEOUT_SECONDS,  # Soft timeout (guest enforcement)
+            timeout=constants.PACKAGE_INSTALL_TIMEOUT_SECONDS,
         )
 
+        hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
+        total_timeout = (
+            hard_timeout * constants.PACKAGE_INSTALL_MAX_RETRIES
+            + constants.PACKAGE_INSTALL_RETRY_MAX_SECONDS * (constants.PACKAGE_INSTALL_MAX_RETRIES - 1)
+        )
+
+        async def _handle_install_error(msg: StreamingErrorMessage) -> None:
+            logger.error(
+                "Guest agent install error",
+                extra={"vm_id": vm.vm_id, "error": msg.message, "error_type": msg.error_type},
+            )
+            exc = guest_error_to_exception(msg, vm.vm_id, operation="install_packages")
+            # Guest timeouts during install are transient — wrap so tenacity retries
+            if isinstance(exc, VmTransientError):
+                raise PackageInstallTransientError(str(exc), context={"vm_id": vm.vm_id}) from exc
+            raise exc
+
         try:
-            # Use asyncio.timeout() context manager (Python 3.14)
-            async with asyncio.timeout(constants.PACKAGE_INSTALL_TIMEOUT_SECONDS):
-                # Connect to guest agent (fixed init timeout)
-                await vm.channel.connect(timeout_seconds=constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            async with asyncio.timeout(total_timeout):
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(constants.PACKAGE_INSTALL_MAX_RETRIES),
+                    wait=wait_random_exponential(
+                        min=constants.PACKAGE_INSTALL_RETRY_MIN_SECONDS,
+                        max=constants.PACKAGE_INSTALL_RETRY_MAX_SECONDS,
+                    ),
+                    retry=retry_if_exception_type(PackageInstallTransientError),
+                    before_sleep=before_sleep_log(logger, logging.WARNING),
+                    reraise=True,
+                ):
+                    with attempt:
+                        await vm.channel.connect(timeout_seconds=constants.GUEST_CONNECT_TIMEOUT_SECONDS)
 
-                # Stream install output (now uses same streaming protocol as execute_code)
-                # Hard timeout = soft timeout (guest) + margin (host watchdog)
-                hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
-
-                exit_code = -1
-                stderr_chunks: list[str] = []
-
-                async for msg in vm.channel.stream_messages(request, timeout=hard_timeout):
-                    if isinstance(msg, OutputChunkMessage):
-                        # Log install output for debugging
-                        logger.info(
-                            "Package install output",
-                            extra={"vm_id": vm.vm_id, "stream": msg.type, "chunk": msg.chunk[:200]},
-                        )
-                        # Collect stderr for error reporting
-                        if msg.type == "stderr":
-                            stderr_chunks.append(msg.chunk)
-
-                    elif isinstance(msg, ExecutionCompleteMessage):
-                        exit_code = msg.exit_code
-                        # Note: msg.execution_time_ms available but not needed for package install
-
-                    elif isinstance(msg, StreamingErrorMessage):
-                        logger.error(
-                            "Guest agent install error",
-                            extra={"vm_id": vm.vm_id, "error": msg.message, "error_type": msg.error_type},
-                        )
-                        raise GuestAgentError(
-                            f"Package installation failed: {msg.message}",
-                            response={"message": msg.message, "error_type": msg.error_type},
+                        result = await consume_stream(
+                            vm.channel,
+                            request,
+                            timeout=hard_timeout,
+                            vm_id=vm.vm_id,
+                            on_error=_handle_install_error,
                         )
 
-                # Check installation success
-                if exit_code != 0:
-                    error_output = "".join(stderr_chunks) if stderr_chunks else "Unknown error"
-                    raise GuestAgentError(
-                        f"Package installation failed with exit code {exit_code}: {error_output[:500]}",
-                        response={"exit_code": exit_code, "stderr": error_output[:500]},
-                    )
+                        if result.exit_code != 0:
+                            error_output = result.stderr or "Unknown error"
+                            error_class = _classify_install_error(error_output)
+                            if error_class is PackageInstallPermanentError:
+                                raise PackageInstallPermanentError(
+                                    f"Package installation failed permanently (exit code {result.exit_code}): {error_output[:500]}",
+                                    context={"exit_code": result.exit_code, "stderr": error_output[:500]},
+                                )
+                            if error_class is PackageInstallTransientError:
+                                raise PackageInstallTransientError(
+                                    f"Package installation failed with transient network error (exit code {result.exit_code}): {error_output[:500]}",
+                                    context={"exit_code": result.exit_code, "stderr": error_output[:500]},
+                                )
+                            raise GuestAgentError(
+                                f"Package installation failed with exit code {result.exit_code}: {error_output[:500]}",
+                                response={"exit_code": result.exit_code, "stderr": error_output[:500]},
+                            )
 
         except TimeoutError as e:
-            # Timeout → package install took too long
             raise SnapshotError(
-                f"Package installation timeout after {constants.PACKAGE_INSTALL_TIMEOUT_SECONDS}s",
-                context={
-                    "vm_id": vm.vm_id,
-                    "language": language,
-                    "packages": packages,
-                },
+                f"Package installation timeout after {total_timeout}s",
+                context={"vm_id": vm.vm_id, "language": language, "packages": packages},
             ) from e
 
-        except GuestAgentError:
-            raise  # Re-raise guest agent errors as-is
+        except (GuestAgentError, PackageInstallTransientError, PackageInstallPermanentError, PackageNotAllowedError):
+            raise
 
         except Exception as e:
-            # Orchestrator/communication error (connection, protocol, etc)
             raise SnapshotError(
                 f"Package installation failed (communication error): {e}",
-                context={
-                    "vm_id": vm.vm_id,
-                    "language": language,
-                    "packages": packages,
-                },
+                context={"vm_id": vm.vm_id, "language": language, "packages": packages},
             ) from e
 
     async def _download_from_s3(self, cache_key: str) -> Path:

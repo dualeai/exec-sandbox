@@ -456,7 +456,7 @@ class WarmVMPool:
                 },
             )
         except Exception as e:
-            # CRITICAL: destroy VM to release semaphore slot if creation succeeded
+            # CRITICAL: destroy VM to release admission slot if creation succeeded
             if vm is not None:
                 with contextlib.suppress(Exception):
                     await self.vm_manager.destroy_vm(vm)
@@ -475,6 +475,9 @@ class WarmVMPool:
         """Boot single warm VM with placeholder IDs.
 
         Tries L1 restore first (REPL already warm), falls back to L2/cold boot.
+        Uses reservation_context() to acquire admission once for both paths,
+        avoiding double admission wait when L1 restore fails and cold boot is
+        the fallback.
 
         Args:
             language: Programming language enum
@@ -486,61 +489,68 @@ class WarmVMPool:
         tenant_id = constants.WARM_POOL_TENANT_ID
         task_id = f"warm-{language.value}-{index}"
 
-        # Try L1 restore first (REPL already warm — skip _warm_repl)
-        if self.memory_snapshot_manager:
-            try:
-                vmstate = await self.memory_snapshot_manager.check_cache(
-                    language,
-                    [],
-                    constants.DEFAULT_MEMORY_MB,
-                )
-                if vmstate:
-                    vm = await self.vm_manager.restore_vm(
-                        language,
-                        tenant_id,
-                        task_id,
-                        vmstate_path=vmstate,
-                        memory_mb=constants.DEFAULT_MEMORY_MB,
-                    )
-                    logger.debug(
-                        "L1 cache hit for warm pool VM",
-                        extra={"language": language.value, "vm_id": vm.vm_id},
-                    )
-                    return vm
-            except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
-                logger.warning(
-                    "L1 restore failed for warm pool, falling back to cold boot",
-                    extra={"language": language.value, "error": str(e)},
-                )
-
-        # Fall back to L2/cold boot
-        snapshot_path = None
-        if self.snapshot_manager:
-            try:
-                snapshot_path = await self.snapshot_manager.check_cache(
-                    language=language,
-                    packages=[],
-                )
-                if snapshot_path:
-                    logger.debug(
-                        "L2 cache hit for warm pool VM",
-                        extra={"language": language.value, "snapshot_path": str(snapshot_path)},
-                    )
-            except (OSError, RuntimeError) as e:
-                logger.warning(
-                    "L2 cache check failed for warm pool, falling back to cold boot",
-                    extra={"language": language.value, "error": str(e)},
-                )
-
-        return await self.vm_manager.create_vm(
-            language=language,
-            tenant_id=tenant_id,
-            task_id=task_id,
+        async with self.vm_manager.reservation_context(
+            vm_id=f"{tenant_id}-{task_id}",
             memory_mb=constants.DEFAULT_MEMORY_MB,
-            allow_network=False,
-            allowed_domains=None,
-            snapshot_drive=snapshot_path,
-        )
+        ) as reservation:
+            # Try L1 restore first (REPL already warm — skip _warm_repl)
+            if self.memory_snapshot_manager:
+                try:
+                    vmstate = await self.memory_snapshot_manager.check_cache(
+                        language,
+                        [],
+                        constants.DEFAULT_MEMORY_MB,
+                    )
+                    if vmstate:
+                        vm = await self.vm_manager.restore_vm(
+                            language,
+                            tenant_id,
+                            task_id,
+                            vmstate_path=vmstate,
+                            memory_mb=constants.DEFAULT_MEMORY_MB,
+                            reservation=reservation,
+                        )
+                        logger.debug(
+                            "L1 cache hit for warm pool VM",
+                            extra={"language": language.value, "vm_id": vm.vm_id},
+                        )
+                        return vm
+                except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
+                    logger.warning(
+                        "L1 restore failed for warm pool, falling back to cold boot",
+                        extra={"language": language.value, "error": str(e)},
+                    )
+
+            # Fall back to L2/cold boot
+            snapshot_path = None
+            if self.snapshot_manager:
+                try:
+                    snapshot_path = await self.snapshot_manager.check_cache(
+                        language=language,
+                        packages=[],
+                    )
+                    if snapshot_path:
+                        logger.debug(
+                            "L2 cache hit for warm pool VM",
+                            extra={"language": language.value, "snapshot_path": str(snapshot_path)},
+                        )
+                except (OSError, RuntimeError) as e:
+                    logger.warning(
+                        "L2 cache check failed for warm pool, falling back to cold boot",
+                        extra={"language": language.value, "error": str(e)},
+                    )
+
+            return await self.vm_manager.create_vm(
+                language=language,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                memory_mb=constants.DEFAULT_MEMORY_MB,
+                allow_network=False,
+                allowed_domains=None,
+                snapshot_drive=snapshot_path,
+                reservation=reservation,
+                retry_profile=constants.RETRY_BACKGROUND,
+            )
 
     async def _replenish_pool(self, language: Language) -> None:
         """Replenish pool in background (non-blocking).
@@ -584,7 +594,7 @@ class WarmVMPool:
                 raise  # Re-raise cancellation to propagate shutdown
 
             except Exception as e:
-                # CRITICAL: destroy VM to release semaphore slot if creation succeeded
+                # CRITICAL: destroy VM to release admission slot if creation succeeded
                 if vm is not None:
                     with contextlib.suppress(Exception):
                         await self.vm_manager.destroy_vm(vm)

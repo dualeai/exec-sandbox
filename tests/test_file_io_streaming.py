@@ -39,9 +39,13 @@ _GUEST_MEM_AVAILABLE_MIN_PCT = 15
 # =============================================================================
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestStreamingLargeFiles:
-    """Prove streaming works for files that would OOM with the old buffered approach."""
+    """Prove streaming works for files that would OOM with the old buffered approach.
+
+    Slow under TCG: data integrity (SHA256 round-trip) correctness tests —
+    work under TCG but large file transfers are too slow for the default suite.
+    """
 
     async def test_write_read_30mb_in_128mb_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write 30 MB and read it back with SHA256 verification.
@@ -94,9 +98,13 @@ class TestStreamingLargeFiles:
 # =============================================================================
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestConcurrentFileTransfers:
-    """Prove multiple concurrent file transfers work correctly."""
+    """Prove multiple concurrent file transfers work correctly.
+
+    Slow under TCG: concurrent SHA256 correctness tests — work under TCG
+    but concurrent file I/O overhead makes them too slow for the default suite.
+    """
 
     async def test_concurrent_write_5_files(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write 5 different 5 MB files concurrently, verify all round-trip."""
@@ -183,9 +191,13 @@ class TestConcurrentFileTransfers:
 # =============================================================================
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestStreamingMemoryEfficiency:
-    """Verify streaming doesn't spike guest memory."""
+    """Verify streaming doesn't spike guest memory.
+
+    Slow under TCG: memory threshold (15%) documented to pass on arm64 TCG
+    (~17-25%), but overall VM overhead makes it too slow for the default suite.
+    """
 
     async def test_guest_memory_stays_low_during_large_transfer(self, scheduler: Scheduler) -> None:
         """Write 30 MB, then check guest MemAvailable didn't drop catastrophically.
@@ -454,9 +466,12 @@ class TestStreamingMemoryEfficiency:
 # =============================================================================
 
 
-@skip_unless_hwaccel
+@pytest.mark.slow
 class TestInterleavedSuccessFailure:
     """Concurrent file ops where some succeed and some fail.
+
+    Slow under TCG: FileOpDispatcher multiplexing correctness tests with
+    no timing assertions — work under TCG but too slow for the default suite.
 
     Stress-tests the FileOpDispatcher multiplexing: each op gets its own
     op_id queue, and errors for one op must not corrupt other ops.
@@ -638,6 +653,9 @@ class TestInterleavedSuccessFailure:
 @skip_unless_hwaccel
 class TestFileTransferThroughput:
     """Benchmark upload (write_file) and download (read_file) throughput.
+
+    Requires hwaccel: explicit MiB/s threshold assertions — TCG (~5-8x
+    slower) cannot meet the minimum throughput benchmarks.
 
     Run with -s to see throughput output:
         uv run pytest tests/test_file_io_streaming.py::TestFileTransferThroughput -v -s -n 0

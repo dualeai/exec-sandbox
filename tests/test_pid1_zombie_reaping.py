@@ -65,7 +65,6 @@ print(f'ORPHAN_PPID:{orphan_ppid}')
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
@@ -122,7 +121,6 @@ print(f'ZOMBIE_COUNT:{zombie_count}')
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
@@ -182,7 +180,6 @@ print('ORPHANS_CREATED:10')
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
@@ -237,7 +234,6 @@ print('RAPID_SPAWNS:50')
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=60,
         )
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
@@ -289,7 +285,6 @@ echo "ZOMBIE_COUNT:$zombie_count"
         result = await scheduler.run(
             code=code,
             language=Language.RAW,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"

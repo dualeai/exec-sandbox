@@ -56,7 +56,6 @@ from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.package_validator import PackageValidator
 from exec_sandbox.port_forward import resolve_port_mappings
-from exec_sandbox.resource_monitor import ResourceMonitor
 from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_manager import VmManager
@@ -107,7 +106,6 @@ class Scheduler:
         self._snapshot_manager: DiskSnapshotManager | None = None
         self._memory_snapshot_manager: MemorySnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
-        self._resource_monitor: ResourceMonitor | None = None
         self._started = False
 
     async def __aenter__(self) -> Self:
@@ -120,7 +118,6 @@ class Scheduler:
         4. Initialize DiskSnapshotManager (L2 local always; L3 S3 optional)
         5. Initialize MemorySnapshotManager (L1 memory snapshot cache)
         6. Start WarmVMPool (if warm_pool_size > 0)
-        7. Start ResourceMonitor
 
         Returns:
             Self for use in context
@@ -151,7 +148,7 @@ class Scheduler:
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
 
-        # Initialize VmManager (handles backpressure internally via semaphore)
+        # Initialize VmManager (handles backpressure internally via admission controller)
         self._vm_manager = VmManager(self._settings)
         await self._vm_manager.start()  # Pre-warms all system probe caches
 
@@ -175,14 +172,6 @@ class Scheduler:
             )
             await self._warm_pool.start()
 
-        # Start ResourceMonitor (always-on, core component for observability)
-        self._resource_monitor = ResourceMonitor(
-            vm_manager=self._vm_manager,
-            admission=self._vm_manager.admission,
-            interval_seconds=self.config.resource_monitor_interval_seconds,
-        )
-        await self._resource_monitor.start()
-
         self._started = True
         logger.info("Scheduler started successfully")
         return self
@@ -193,9 +182,8 @@ class Scheduler:
         """Shutdown scheduler and clean up all resources.
 
         Shutdown sequence:
-        1. Stop ResourceMonitor
-        2. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
-        3. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
+        1. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
+        2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
         4. Destroy any remaining active VMs
         5. Stop VmManager (overlay pool cleanup)
 
@@ -209,13 +197,6 @@ class Scheduler:
         Always completes cleanup, even on exceptions.
         """
         logger.info("Shutting down scheduler")
-
-        # Stop ResourceMonitor first
-        if self._resource_monitor:
-            try:
-                await self._resource_monitor.stop()
-            except (OSError, RuntimeError) as e:
-                logger.error("ResourceMonitor stop error", extra={"error": str(e)})
 
         # Stop WarmVMPool (drains VMs, frees resource slots for background saves)
         if self._warm_pool:
@@ -301,10 +282,12 @@ class Scheduler:
             ExecutionResult with stdout, stderr, exit_code, timing info, and exposed_ports.
 
         Raises:
+            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
+            EnvVarValidationError: Invalid env var names/values (control chars, size limits).
             SandboxError: Scheduler not started.
             PackageNotAllowedError: Package not in allowlist.
             VmError: VM creation or execution failed.
-            VmTimeoutError: Execution exceeded timeout.
+            VmTimeoutError: VM boot timed out (guest agent not ready).
             ValueError: Too many exposed ports or invalid port numbers.
 
         Example:
@@ -341,9 +324,14 @@ class Scheduler:
             raise ValueError(
                 f"timeout_seconds must be between 1 and {constants.MAX_TIMEOUT_SECONDS}, got {timeout_seconds}"
             )
+        if len(code) > constants.MAX_CODE_SIZE:
+            raise VmConfigError(
+                f"Code too large: {len(code)} bytes exceeds {constants.MAX_CODE_SIZE} byte limit",
+                context={"code_size": len(code), "max_code_size": constants.MAX_CODE_SIZE},
+            )
         timeout = timeout_seconds if timeout_seconds is not None else self.config.default_timeout_seconds
 
-        vm, resolved_ports, is_cold_boot = await self._prepare_vm(
+        vm, resolved_ports, is_cold_boot, prepare_start_time = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -354,7 +342,8 @@ class Scheduler:
             on_boot_log=on_boot_log,
         )
 
-        run_start_time = asyncio.get_running_loop().time()
+        prepare_end_time = asyncio.get_running_loop().time()
+        result_out: ExecutionResult | None = None
         try:
             # Execute code
             execute_start_time = asyncio.get_running_loop().time()
@@ -369,12 +358,11 @@ class Scheduler:
 
             # Calculate timing
             execute_ms = round((execute_end_time - execute_start_time) * 1000)
-            total_ms = round((execute_end_time - run_start_time) * 1000)
 
-            # For warm pool: setup/boot are "free" (happened at service startup)
-            # For cold boot: use actual setup/boot times from VM
-            setup_ms = vm.setup_ms if is_cold_boot and vm.setup_ms is not None else 0
+            # boot_ms from VM (0 for warm pool/L1), setup_ms = prepare time minus boot
             boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
+            # setup_ms = all pre-boot time (admission + cache + overlay + cgroup)
+            setup_ms = max(0, round((prepare_end_time - prepare_start_time) * 1000) - boot_ms)
             # Granular setup timing
             overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
             # Granular boot timing
@@ -387,18 +375,19 @@ class Scheduler:
             # L1 timing (setup_ms is the L1 restore time when l1_restored)
             l1_restore_ms = vm.setup_ms if vm.l1_restored and vm.setup_ms is not None else None
 
-            return ExecutionResult(
+            result_out = ExecutionResult(
                 stdout=result.stdout,
                 stderr=result.stderr,
                 exit_code=result.exit_code,
                 execution_time_ms=result.execution_time_ms,
                 external_cpu_time_ms=result.external_cpu_time_ms,
                 external_memory_peak_mb=result.external_memory_peak_mb,
+                external_cpu_nr_throttled=result.external_cpu_nr_throttled,
                 timing=TimingBreakdown(
                     setup_ms=setup_ms,
                     boot_ms=boot_ms,
                     execute_ms=execute_ms,
-                    total_ms=total_ms,
+                    total_ms=0,  # placeholder — patched after teardown
                     connect_ms=result.timing.connect_ms,
                     overlay_ms=overlay_ms,
                     qemu_cmd_build_ms=qemu_cmd_build_ms,
@@ -418,8 +407,17 @@ class Scheduler:
         finally:
             # Always destroy VM (never reused)
             # _vm_manager guaranteed non-None by _prepare_vm
+            teardown_start = asyncio.get_running_loop().time()
             if self._vm_manager is not None:
                 await self._vm_manager.destroy_vm(vm)
+            teardown_ms = round((asyncio.get_running_loop().time() - teardown_start) * 1000)
+            if result_out is not None:
+                result_out.timing.teardown_ms = teardown_ms
+                result_out.timing.total_ms = round((asyncio.get_running_loop().time() - prepare_start_time) * 1000)
+
+        if result_out is None:
+            raise SandboxError("Execution produced no result")
+        return result_out
 
     async def session(
         self,
@@ -475,7 +473,7 @@ class Scheduler:
         """
         idle_timeout = idle_timeout_seconds or self.config.session_idle_timeout_seconds
 
-        vm, resolved_ports, _is_cold_boot = await self._prepare_vm(
+        vm, resolved_ports, _is_cold_boot, _prepare_start_time = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -520,7 +518,7 @@ class Scheduler:
         expose_ports: list[PortMapping | int] | None,
         task_id: str,
         on_boot_log: Callable[[str], None] | None = None,
-    ) -> tuple[QemuVM, list[ExposedPort], bool]:
+    ) -> tuple[QemuVM, list[ExposedPort], bool, float]:
         """Create and boot a VM with the given configuration.
 
         Shared by run() and session() - handles validation, snapshots,
@@ -537,7 +535,7 @@ class Scheduler:
             on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
-            Tuple of (vm, resolved_ports, is_cold_boot).
+            Tuple of (vm, resolved_ports, is_cold_boot, prepare_start_time).
 
         Raises:
             SandboxError: Scheduler not started.
@@ -557,6 +555,8 @@ class Scheduler:
 
         if self._vm_manager is None or self._settings is None:
             raise SandboxError("Scheduler resources not initialized")
+
+        prepare_start_time = asyncio.get_running_loop().time()
 
         # Ensure language is a Language enum (callers may pass raw strings)
         language = Language(language)
@@ -600,73 +600,78 @@ class Scheduler:
         if vm is None:
             is_cold_boot = True
 
-            # L1 memory snapshot restore (~100ms)
-            # Cache key includes network topology (needs_network, not just allow_network)
-            # because expose_ports also adds a virtio-net device.
-            # Skip when on_boot_log requested (L1 skips boot, callback would never fire).
-            if self._memory_snapshot_manager and on_boot_log is None:
-                try:
-                    vmstate_path = await self._memory_snapshot_manager.check_cache(
-                        language,
-                        packages,
-                        memory,
-                        allow_network=needs_network,
-                    )
-                    if vmstate_path:
-                        l2_path = await self._memory_snapshot_manager.get_l2_for_l1(language, packages)
-                        vm = await self._vm_manager.restore_vm(
-                            language,
-                            constants.SCHEDULER_TENANT_ID,
-                            task_id,
-                            vmstate_path=vmstate_path,
-                            memory_mb=memory,
-                            snapshot_drive=l2_path,
-                            allow_network=needs_network,
-                            allowed_domains=allowed_domains,
-                        )
-                        logger.info(
-                            "VM restored from L1 cache",
-                            extra={"vm_id": vm.vm_id, "language": language},
-                        )
-                except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
-                    logger.warning(
-                        "L1 restore failed, falling back to cold boot",
-                        extra={"language": language, "error": str(e)},
-                        exc_info=True,
-                    )
-                    vm = None
-
-        # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
-        if vm is None:
-            is_cold_boot = True
-
-            # Auto-download base image if needed
-            if self.config.auto_download_assets:
-                await fetch_base_image(language)
-
-            vm = await self._vm_manager.create_vm(
-                language=language,
-                tenant_id=constants.SCHEDULER_TENANT_ID,
-                task_id=task_id,
+            async with self._vm_manager.reservation_context(
+                vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}",
                 memory_mb=memory,
-                allow_network=allow_network,
-                allowed_domains=allowed_domains,
-                expose_ports=resolved_ports if resolved_ports else None,
-                on_boot_log=on_boot_log,
-                snapshot_drive=snapshot_path,
-            )
+            ) as reservation:
+                # L1 memory snapshot restore (~100ms)
+                # Cache key includes network topology (needs_network, not just allow_network)
+                # because expose_ports also adds a virtio-net device.
+                # Skip when on_boot_log requested (L1 skips boot, callback would never fire).
+                if self._memory_snapshot_manager and on_boot_log is None:
+                    try:
+                        vmstate_path = await self._memory_snapshot_manager.check_cache(
+                            language,
+                            packages,
+                            memory,
+                            allow_network=needs_network,
+                        )
+                        if vmstate_path:
+                            l2_path = await self._memory_snapshot_manager.get_l2_for_l1(language, packages)
+                            vm = await self._vm_manager.restore_vm(
+                                language,
+                                constants.SCHEDULER_TENANT_ID,
+                                task_id,
+                                vmstate_path=vmstate_path,
+                                memory_mb=memory,
+                                snapshot_drive=l2_path,
+                                allow_network=allow_network,
+                                allowed_domains=allowed_domains,
+                                expose_ports=resolved_ports if resolved_ports else None,
+                                reservation=reservation,
+                            )
+                            logger.info(
+                                "VM restored from L1 cache",
+                                extra={"vm_id": vm.vm_id, "language": language},
+                            )
+                    except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
+                        logger.warning(
+                            "L1 restore failed, falling back to cold boot",
+                            extra={"language": language, "error": str(e)},
+                        )
+                        logger.debug("L1 restore traceback", exc_info=True)
+                        vm = None
 
-            # Schedule background L1 save for next time
-            if self._memory_snapshot_manager:
-                await self._memory_snapshot_manager.schedule_background_save(
-                    language,
-                    packages,
-                    memory,
-                    snapshot_drive=snapshot_path,
-                    allow_network=needs_network,
-                )
+                # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
+                if vm is None:
+                    # Auto-download base image if needed
+                    if self.config.auto_download_assets:
+                        await fetch_base_image(language)
 
-        return vm, resolved_ports, is_cold_boot
+                    vm = await self._vm_manager.create_vm(
+                        language=language,
+                        tenant_id=constants.SCHEDULER_TENANT_ID,
+                        task_id=task_id,
+                        memory_mb=memory,
+                        allow_network=allow_network,
+                        allowed_domains=allowed_domains,
+                        expose_ports=resolved_ports if resolved_ports else None,
+                        on_boot_log=on_boot_log,
+                        snapshot_drive=snapshot_path,
+                        reservation=reservation,
+                    )
+
+                    # Schedule background L1 save for next time
+                    if self._memory_snapshot_manager:
+                        await self._memory_snapshot_manager.schedule_background_save(
+                            language,
+                            packages,
+                            memory,
+                            snapshot_drive=snapshot_path,
+                            allow_network=needs_network,
+                        )
+
+        return vm, resolved_ports, is_cold_boot, prepare_start_time
 
     def _create_settings(self) -> Settings:
         """Create Settings from SchedulerConfig.
@@ -696,7 +701,7 @@ class Scheduler:
             memory_overcommit_ratio=self.config.memory_overcommit_ratio,
             cpu_overcommit_ratio=self.config.cpu_overcommit_ratio,
             host_memory_reserve_ratio=self.config.host_memory_reserve_ratio,
-            resource_monitor_interval_seconds=self.config.resource_monitor_interval_seconds,
+            host_cpu_reserve_cores=self.config.host_cpu_reserve_cores,
         )
 
     async def _validate_packages(self, packages: list[str], language: Language) -> None:

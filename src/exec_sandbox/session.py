@@ -33,8 +33,8 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.constants import MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
-from exec_sandbox.exceptions import SessionClosedError
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
+from exec_sandbox.exceptions import InputValidationError, OutputLimitError, SessionClosedError, VmConfigError
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 
 if TYPE_CHECKING:
@@ -76,6 +76,9 @@ class Session:
         self._exec_count = 0
         self._exec_lock = asyncio.Lock()
         self._idle_timer_task: asyncio.Task[None] | None = None
+        # Strong refs to cancelled timer tasks awaiting CancelledError processing.
+        # done_callback auto-removes; close() gathers any remaining.
+        self._cancelled_timers: set[asyncio.Task[None]] = set()
         self._reset_idle_timer()
 
     # -------------------------------------------------------------------------
@@ -178,6 +181,9 @@ class Session:
             ExecutionResult with stdout, stderr, exit_code, timing info.
 
         Raises:
+            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
+            EnvVarValidationError: Invalid env var names/values (control chars, size limits).
+            OutputLimitError: stdout/stderr exceeded guest-enforced limits (session stays alive).
             SessionClosedError: Session has been closed.
             VmPermanentError: VM communication failed (session auto-closed).
             VmTransientError: VM communication failed (session auto-closed).
@@ -190,6 +196,11 @@ class Session:
         """
         if timeout_seconds is not None and (timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS):
             raise ValueError(f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}")
+        if len(code) > MAX_CODE_SIZE:
+            raise VmConfigError(
+                f"Code too large: {len(code)} bytes exceeds {MAX_CODE_SIZE} byte limit",
+                context={"code_size": len(code), "max_code_size": MAX_CODE_SIZE},
+            )
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
         async with self._guard():
@@ -202,6 +213,14 @@ class Session:
                     on_stdout=on_stdout,
                     on_stderr=on_stderr,
                 )
+            except InputValidationError:
+                # Input validation errors are caller bugs, not VM failures.
+                # Session stays alive — caller can retry with valid input.
+                raise
+            except OutputLimitError:
+                # Output limit exceeded — guest-enforced, REPL preserved.
+                # Session stays alive — caller can retry with less output.
+                raise
             except Exception:
                 # VM failure - auto-close session
                 await self.close()
@@ -220,6 +239,7 @@ class Session:
                 execution_time_ms=result.execution_time_ms,
                 external_cpu_time_ms=result.external_cpu_time_ms,
                 external_memory_peak_mb=result.external_memory_peak_mb,
+                external_cpu_nr_throttled=result.external_cpu_nr_throttled,
                 timing=TimingBreakdown(
                     setup_ms=0,
                     boot_ms=0,
@@ -309,6 +329,13 @@ class Session:
         self._closed = True
         self._cancel_idle_timer()
 
+        # Await cancelled timer tasks so they process CancelledError before
+        # the event loop shuts down. Without this, GC'd coroutines trigger
+        # "Event loop is closed" on Python 3.14t.
+        if self._cancelled_timers:
+            await asyncio.gather(*self._cancelled_timers, return_exceptions=True)
+            self._cancelled_timers.clear()
+
         logger.info(
             "Closing session",
             extra={
@@ -352,10 +379,22 @@ class Session:
         self._idle_timer_task = asyncio.create_task(self._idle_timeout_handler())
 
     def _cancel_idle_timer(self) -> None:
-        """Cancel the idle timeout timer."""
+        """Cancel the idle timeout timer.
+
+        Adds the cancelled task to _cancelled_timers with a done callback
+        for auto-removal. This holds a strong reference, preventing GC
+        before the event loop processes CancelledError.
+
+        When the idle timeout fires naturally, the handler calls close()
+        which calls us. In that case current_task IS the timer task — skip
+        both cancel and tracking since it will complete on its own.
+        """
         if self._idle_timer_task is not None:
-            if not self._idle_timer_task.done():
+            if not self._idle_timer_task.done() and self._idle_timer_task is not asyncio.current_task():
                 self._idle_timer_task.cancel()
+                task = self._idle_timer_task
+                self._cancelled_timers.add(task)
+                task.add_done_callback(self._cancelled_timers.discard)
             self._idle_timer_task = None
 
     async def _idle_timeout_handler(self) -> None:

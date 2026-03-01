@@ -157,9 +157,8 @@ class QemuStorageDaemon:
             )
             register_process(self._process)
 
-            # Wait for socket and connect
-            await self._wait_for_socket()
-            await self._connect_qmp()
+            # Wait for socket and connect (single step to avoid TOCTOU)
+            await self._wait_and_connect_qmp()
             self._started = True
 
             logger.info(
@@ -168,8 +167,9 @@ class QemuStorageDaemon:
             )
 
         except Exception as e:
-            # Cleanup on failure
+            # Cleanup on failure (connection may have been established before handshake failed)
             unregister_process(self._process)
+            await self._cleanup_connection()
             await self._cleanup_process()
             raise QemuStorageDaemonError(f"Failed to start daemon: {e}") from e
 
@@ -296,17 +296,16 @@ class QemuStorageDaemon:
             with contextlib.suppress(QemuStorageDaemonError):
                 await self._execute("blockdev-del", {"node-name": node_name})
 
-    async def _wait_for_socket(
-        self,
-        timeout: float = constants.QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS,
-    ) -> None:
-        """Wait for daemon socket to become available.
+    async def _wait_and_connect_qmp(self) -> None:
+        """Wait for daemon socket and establish QMP connection in one step.
 
-        Args:
-            timeout: Maximum time to wait for socket
+        Uses keep_connection=True to reuse the socket from the readiness probe,
+        eliminating the TOCTOU gap between probe-close and real connect that
+        caused ConnectionRefusedError on single-client QMP chardev sockets
+        under CI load.
 
         Raises:
-            QemuStorageDaemonError: If socket doesn't appear within timeout
+            QemuStorageDaemonError: If socket doesn't appear or handshake fails
         """
         if not self._socket_path:
             raise QemuStorageDaemonError("No socket path configured")
@@ -315,29 +314,21 @@ class QemuStorageDaemon:
             if self._process and self._process.returncode is not None:
                 raise QemuStorageDaemonError(f"Daemon process exited with code {self._process.returncode}")
 
+        startup_timeout = constants.QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS
+        socket_timeout = constants.QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS
+
         try:
-            await wait_for_socket(self._socket_path, timeout=timeout, abort_check=_check_process_alive)
+            self._reader, self._writer = await wait_for_socket(
+                self._socket_path,
+                timeout=startup_timeout,
+                abort_check=_check_process_alive,
+                keep_connection=True,
+            )
         except TimeoutError as e:
-            raise QemuStorageDaemonError(f"Daemon socket not ready after {timeout}s") from e
-
-    async def _connect_qmp(self) -> None:
-        """Establish QMP connection and complete handshake.
-
-        Raises:
-            QemuStorageDaemonError: If connection or handshake fails
-        """
-        if not self._socket_path:
-            raise QemuStorageDaemonError("Socket path not set")
-
-        timeout = constants.QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS
-
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(self._socket_path)),
-            timeout=timeout,
-        )
+            raise QemuStorageDaemonError(f"Daemon socket not ready after {startup_timeout}s") from e
 
         # Read greeting
-        greeting = await asyncio.wait_for(self._reader.readline(), timeout=timeout)
+        greeting = await asyncio.wait_for(self._reader.readline(), timeout=socket_timeout)
         greeting_data = json.loads(greeting)
         if "QMP" not in greeting_data:
             raise QemuStorageDaemonError(f"Invalid QMP greeting: {greeting.decode()}")

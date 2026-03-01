@@ -41,7 +41,7 @@ class SchedulerConfig(BaseModel):
         warm_pool_size: Number of pre-booted VMs per language (python, javascript).
             0 disables warm pool. Default: 0 (cold boot only).
         default_memory_mb: Default guest VM memory in MB. Can be overridden per-run.
-            Minimum: 128. No upper bound (limited by host resources). Default: 256.
+            Minimum: 128. No upper bound (limited by host resources). Default: 192.
         default_timeout_seconds: Default execution timeout in seconds.
             Can be overridden per-run. Range: 1-300. Default: 30.
         images_dir: Directory containing base VM images (qcow2, kernels).
@@ -80,8 +80,8 @@ class SchedulerConfig(BaseModel):
 
     # Defaults for run()
     default_memory_mb: int = Field(
-        default=256,
-        ge=128,
+        default=constants.DEFAULT_MEMORY_MB,
+        ge=constants.MIN_MEMORY_MB,
         description="Default guest VM memory in MB",
     )
     default_timeout_seconds: int = Field(
@@ -142,7 +142,7 @@ class SchedulerConfig(BaseModel):
         default=constants.DEFAULT_CPU_OVERCOMMIT_RATIO,
         ge=1.0,
         le=20.0,
-        description="CPU overcommit ratio. Effective budget = host_cpus * ratio",
+        description="CPU overcommit ratio. Effective budget = (host_cpus - reserve) * ratio",
     )
     host_memory_reserve_ratio: float = Field(
         default=constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO,
@@ -150,13 +150,12 @@ class SchedulerConfig(BaseModel):
         le=0.5,
         description="Fraction of host memory reserved for OS (e.g. 0.1 = 10%)",
     )
-    resource_monitor_interval_seconds: float = Field(
-        default=constants.RESOURCE_MONITOR_INTERVAL_SECONDS,
-        ge=1.0,
-        le=60.0,
-        description="Interval between resource monitor ticks (seconds)",
+    host_cpu_reserve_cores: float = Field(
+        default=constants.DEFAULT_HOST_CPU_RESERVE_CORES,
+        ge=0.0,
+        le=16.0,
+        description="CPU cores reserved for host processes (fixed, not a ratio)",
     )
-
     # Features
     enable_package_validation: bool = Field(
         default=True,
