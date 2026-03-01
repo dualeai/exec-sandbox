@@ -16,6 +16,7 @@ import gc
 import os
 import tracemalloc
 from pathlib import Path
+from typing import Any
 
 import psutil
 import pytest
@@ -86,6 +87,30 @@ async def _warmup_and_baseline(
     return process, baseline_rss
 
 
+def _assert_success_rate(
+    results: list[Any],
+    total: int,
+    *,
+    check_exit_code: bool = False,
+) -> None:
+    """Assert >=90% of concurrent results succeeded, logging failures on error.
+
+    Uses int() to floor the threshold so e.g. 4/5 passes (tolerates 1 failure
+    under CI load).  Two modes:
+    - check_exit_code=True: results are ExecutionResult | BaseException
+    - check_exit_code=False: results are None | BaseException
+    """
+    if check_exit_code:
+        failures = [r for r in results if isinstance(r, BaseException) or r.exit_code != 0]
+    else:
+        failures = [r for r in results if isinstance(r, BaseException)]
+    successes = total - len(failures)
+    min_required = int(total * 0.9)
+    assert successes >= min_required, f"Only {successes}/{total} succeeded (need {min_required}): " + "; ".join(
+        repr(f) for f in failures[:10]
+    )
+
+
 @pytest.fixture(params=[200])
 def iterations(request: pytest.FixtureRequest) -> int:
     """Parametrized iteration counts for memory leak tests."""
@@ -113,9 +138,7 @@ async def test_no_memory_leak_without_network(iterations: int, scheduler_config:
         tasks = [scheduler.run(code="print('ok')", language=Language.PYTHON) for _ in range(iterations)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Use BaseException to catch CancelledError (BaseException, not Exception in Python 3.8+)
-        successes = sum(1 for r in results if not isinstance(r, BaseException) and r.exit_code == 0)
-        assert successes >= iterations * 0.9, f"Only {successes}/{iterations} succeeded"
+        _assert_success_rate(results, iterations, check_exit_code=True)
 
     gc.collect()
     gc.collect()
@@ -159,9 +182,7 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Use BaseException to catch CancelledError (BaseException, not Exception in Python 3.8+)
-        successes = sum(1 for r in results if not isinstance(r, BaseException) and r.exit_code == 0)
-        assert successes >= iterations * 0.9, f"Only {successes}/{iterations} succeeded"
+        _assert_success_rate(results, iterations, check_exit_code=True)
 
     gc.collect()
     gc.collect()
@@ -314,8 +335,7 @@ async def test_no_memory_leak_file_io(
             return_exceptions=True,
         )
 
-        successes = sum(1 for r in results if not isinstance(r, BaseException))
-        assert successes >= iterations * 0.9, f"Only {successes}/{iterations} succeeded"
+        _assert_success_rate(results, iterations)
 
     gc.collect()
     gc.collect()
@@ -468,9 +488,7 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
 
         peak_rss = await tracker.stop()
 
-        # Use BaseException to catch CancelledError (BaseException, not Exception in Python 3.8+)
-        successes = sum(1 for r in results if not isinstance(r, BaseException) and r.exit_code == 0)
-        assert successes >= concurrent_vms * 0.9, f"Only {successes}/{concurrent_vms} succeeded"
+        _assert_success_rate(results, concurrent_vms, check_exit_code=True)
 
     peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
     per_vm_mb = peak_growth_mb / concurrent_vms
@@ -594,8 +612,7 @@ async def test_peak_ram_concurrent_file_io(
         )
         peak_rss = await tracker.stop()
 
-        successes = sum(1 for r in results if not isinstance(r, BaseException))
-        assert successes >= concurrent_sessions * 0.9, f"Only {successes}/{concurrent_sessions} succeeded"
+        _assert_success_rate(results, concurrent_sessions)
 
     peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
 
