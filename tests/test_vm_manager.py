@@ -1997,13 +1997,22 @@ class TestNetdevReconnectIntegration:
         )
 
         try:
-            # Step 1: Verify initial network connectivity
-            result1 = await vm.execute(
-                code=tls_connect_code + "print('INITIAL_OK')",
-                timeout_seconds=30,
-            )
-            assert result1.exit_code == 0, f"Initial connection failed: {result1.stderr}"
-            assert "INITIAL_OK" in result1.stdout
+            # Step 1: Verify initial network connectivity (retry for transient
+            # TLS failures under TCG emulation where the external handshake
+            # can hit SSLEOFError intermittently).
+            last_err = ""
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2)
+                result1 = await vm.execute(
+                    code=tls_connect_code + "print('INITIAL_OK')",
+                    timeout_seconds=30,
+                )
+                if result1.exit_code == 0 and "INITIAL_OK" in result1.stdout:
+                    break
+                last_err = result1.stderr
+            else:
+                pytest.fail(f"Initial connection failed after 3 attempts: {last_err}")
 
             # Step 2: Kill gvproxy (simulates socket EOF / crash)
             assert vm.gvproxy_proc is not None, "VM should have gvproxy process"
@@ -2067,13 +2076,21 @@ class TestNetdevReconnectIntegration:
         )
 
         try:
-            # Verify initial DNS resolution
-            result1 = await vm.execute(
-                code=("import socket\nip = socket.gethostbyname('example.com')\nprint(f'INITIAL_DNS_OK:{ip}')"),
-                timeout_seconds=30,
-            )
-            assert result1.exit_code == 0, f"Initial DNS failed: {result1.stderr}"
-            assert "INITIAL_DNS_OK:" in result1.stdout
+            # Verify initial DNS resolution (retry for transient failures
+            # under TCG emulation).
+            last_err = ""
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2)
+                result1 = await vm.execute(
+                    code=("import socket\nip = socket.gethostbyname('example.com')\nprint(f'INITIAL_DNS_OK:{ip}')"),
+                    timeout_seconds=30,
+                )
+                if result1.exit_code == 0 and "INITIAL_DNS_OK:" in result1.stdout:
+                    break
+                last_err = result1.stderr
+            else:
+                pytest.fail(f"Initial DNS failed after 3 attempts: {last_err}")
 
             # Kill and restart gvproxy
             assert vm.gvproxy_proc is not None
