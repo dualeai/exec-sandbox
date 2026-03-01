@@ -91,6 +91,7 @@ print(f'MATCH:{cpu_count() == CPU_COUNT}')
 # =============================================================================
 # Scheduler backends — synchronous, threaded
 # =============================================================================
+@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
 class TestDaskSchedulers:
     """Dask scheduler backends produce correct results.
 
@@ -160,6 +161,7 @@ print(f'RESULT:{result}')
 # =============================================================================
 # Dask.delayed — task graph API
 # =============================================================================
+@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
 class TestDaskDelayed:
     """dask.delayed builds and executes task graphs."""
 
@@ -216,6 +218,7 @@ print(f'RESULT:{result}')
 # =============================================================================
 # Realistic application patterns
 # =============================================================================
+@skip_unless_hwaccel  # pip install dask + 29 deps exceeds 308s per-attempt timeout under TCG
 class TestDaskRealisticUsage:
     """Simulate how real applications use Dask for parallel computing."""
 
