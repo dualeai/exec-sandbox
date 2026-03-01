@@ -524,20 +524,30 @@ def _mock_vmem(available_mb: float) -> object:
 
 @contextmanager
 def _mock_system_memory(available_mb: float) -> Generator[None]:
-    """Mock Gate 3 inline probe to report given available MB (no cgroup)."""
+    """Mock Gate 3a inline probe to report given available MB (no cgroup).
+
+    Also neutralizes Gate 3b (memory pressure) so that real host pressure
+    on CI runners doesn't interfere with Gate 3a-specific tests.
+    Callers that need to control Gate 3b explicitly (e.g. TestMemoryPressureGate)
+    can stack an outer ``patch.object(type(ctrl), ...)`` which overrides this.
+    """
     with (
         patch("exec_sandbox.admission.read_container_available_memory_mb", return_value=None),
         patch("exec_sandbox.admission.psutil.virtual_memory", return_value=_mock_vmem(available_mb)),
+        patch.object(ResourceAdmissionController, "_probe_memory_pressure", return_value=None),
     ):
         yield
 
 
 @contextmanager
 def _mock_dynamic_system_memory(initial_mb: float) -> Generator[list[float]]:
-    """Mock Gate 3 probe with mutable available memory.
+    """Mock Gate 3a probe with mutable available memory.
 
     Returns a single-element list ``[mb]`` — mutate ``ref[0]`` to simulate
     system memory changing between acquire/release calls.
+
+    Also neutralizes Gate 3b (memory pressure) so that real host pressure
+    on CI runners doesn't interfere with Gate 3a-specific tests.
     """
     ref = [initial_mb]
 
@@ -547,6 +557,7 @@ def _mock_dynamic_system_memory(initial_mb: float) -> Generator[list[float]]:
     with (
         patch("exec_sandbox.admission.read_container_available_memory_mb", return_value=None),
         patch("exec_sandbox.admission.psutil.virtual_memory", side_effect=_fake_vmem),
+        patch.object(ResourceAdmissionController, "_probe_memory_pressure", return_value=None),
     ):
         yield ref
 
