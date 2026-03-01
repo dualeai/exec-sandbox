@@ -108,13 +108,24 @@ test-static:
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
 
+# CI resource monitor — wraps a command with background metrics collection.
+# Runs in a single shell: start monitor, run command, kill monitor, propagate exit code.
+# Usage: $(call ci-monitor-run,<command>)
+define ci-monitor-run
+@./scripts/ci-resource-monitor.sh & _monitor_pid=$$!; \
+	$(1); _rc=$$?; \
+	kill $$_monitor_pid 2>/dev/null || true; \
+	wait $$_monitor_pid 2>/dev/null || true; \
+	exit $$_rc
+endef
+
 # All tests together for accurate coverage measurement (excludes sudo and slow tests)
 test-func:
-	uv run pytest tests/ -v -n auto -m "not sudo and not slow"
+	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "not sudo and not slow")
 
 # Tests requiring sudo privileges (run sequentially on slow CI runners)
 test-sudo:
-	uv run pytest tests/ -v -n 0 -m "sudo"
+	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m "sudo")
 
 # Unit tests only (fast)
 test-unit:
@@ -125,7 +136,7 @@ test-unit:
 
 # Memory leak detection tests (slow, run sequentially for accurate measurement)
 test-slow:
-	uv run pytest tests/ -v -n 0 -m slow
+	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m slow)
 
 # ============================================================================
 # Linting
