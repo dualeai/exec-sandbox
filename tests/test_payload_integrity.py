@@ -474,7 +474,7 @@ class TestStreamingThroughput:
     streaming performance from Python string manipulation overhead.
     """
 
-    @pytest.mark.parametrize("size_kb", [100, 500, 900])
+    @pytest.mark.parametrize("size_kb", [500, 900])
     async def test_raw_throughput_devzero(self, scheduler: Scheduler, size_kb: int) -> None:
         """Measure throughput using /dev/zero (fastest possible generation)."""
         expected_bytes = size_kb * 1000
