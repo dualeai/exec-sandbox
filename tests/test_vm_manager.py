@@ -2027,18 +2027,23 @@ class TestNetdevReconnectIntegration:
             # Note: We don't cancel old log task here since gvproxy is dead,
             # the task will complete naturally when pipes close
 
-            # Step 5: Wait for QEMU to reconnect
-            # reconnect-ms=250 (QEMU 9.2+) or reconnect=1 (QEMU 8.x)
-            # Use 3s to be safe across all versions
-            await asyncio.sleep(3)
-
-            # Step 6: Verify network connectivity is restored
-            result2 = await vm.execute(
-                code=tls_connect_code + "print('RECONNECT_OK')",
-                timeout_seconds=30,
-            )
-            assert result2.exit_code == 0, f"Reconnect failed: {result2.stderr}"
-            assert "RECONNECT_OK" in result2.stdout
+            # Step 5+6: Wait for QEMU to reconnect and verify connectivity.
+            # QEMU reconnect-ms=250 triggers automatic reconnection attempts,
+            # but under CI CPU contention the full path (QEMU socket reconnect
+            # → gvproxy TLS proxy ready → upstream handshake) can take longer
+            # than the fixed 3s. Retry with backoff instead.
+            last_err = ""
+            for attempt in range(5):
+                await asyncio.sleep(2 + attempt)  # 2s, 3s, 4s, 5s, 6s
+                result2 = await vm.execute(
+                    code=tls_connect_code + "print('RECONNECT_OK')",
+                    timeout_seconds=30,
+                )
+                if result2.exit_code == 0 and "RECONNECT_OK" in result2.stdout:
+                    break
+                last_err = result2.stderr
+            else:
+                pytest.fail(f"Reconnect failed after 5 attempts: {last_err}")
 
         finally:
             await vm_manager.destroy_vm(vm)
@@ -2087,15 +2092,20 @@ class TestNetdevReconnectIntegration:
             )
             vm.gvproxy_proc = new_proc
 
-            await asyncio.sleep(3)
-
-            # Verify DNS still works after reconnect
-            result2 = await vm.execute(
-                code=("import socket\nip = socket.gethostbyname('example.com')\nprint(f'RECONNECT_DNS_OK:{ip}')"),
-                timeout_seconds=30,
-            )
-            assert result2.exit_code == 0, f"DNS after reconnect failed: {result2.stderr}"
-            assert "RECONNECT_DNS_OK:" in result2.stdout
+            # Verify DNS still works after reconnect (retry with backoff
+            # for CI CPU contention, same rationale as TLS reconnect test).
+            last_err = ""
+            for attempt in range(5):
+                await asyncio.sleep(2 + attempt)
+                result2 = await vm.execute(
+                    code=("import socket\nip = socket.gethostbyname('example.com')\nprint(f'RECONNECT_DNS_OK:{ip}')"),
+                    timeout_seconds=30,
+                )
+                if result2.exit_code == 0 and "RECONNECT_DNS_OK:" in result2.stdout:
+                    break
+                last_err = result2.stderr
+            else:
+                pytest.fail(f"DNS after reconnect failed after 5 attempts: {last_err}")
 
         finally:
             await vm_manager.destroy_vm(vm)
