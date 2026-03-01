@@ -1,12 +1,13 @@
 """Tests for UnixSocketChannel._write_worker error handling."""
 
 import asyncio
+import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from exec_sandbox.guest_channel import UnixSocketChannel
+from exec_sandbox.guest_channel import FileOpDispatcher, UnixSocketChannel
 
 
 @pytest.fixture
@@ -232,3 +233,95 @@ class TestWriteWorkerEdgeCases:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ============================================================================
+# TestIsConnected - truth table for is_connected()
+# ============================================================================
+
+
+async def _make_done_task() -> asyncio.Task[None]:
+    """Create a genuine Task that has already completed."""
+
+    async def _noop() -> None:
+        pass
+
+    task = asyncio.create_task(_noop())
+    await task  # Let it finish
+    return task
+
+
+def _make_running_task() -> asyncio.Task[None]:
+    """Create a task that never finishes (running)."""
+    return asyncio.create_task(asyncio.sleep(3600))
+
+
+_IS_CONNECTED_CASES = [
+    pytest.param(True, True, False, "running", True, id="all-healthy"),
+    pytest.param(False, True, False, "running", False, id="no-reader"),
+    pytest.param(True, False, False, "running", False, id="no-writer"),
+    pytest.param(True, True, True, "running", False, id="writer-closing"),
+    pytest.param(True, True, False, "done", False, id="write-task-done"),
+]
+
+
+class TestIsConnected:
+    @pytest.mark.parametrize("has_reader,has_writer,is_closing,task_state,expected", _IS_CONNECTED_CASES)
+    @pytest.mark.asyncio
+    async def test_is_connected_truth_table(
+        self,
+        channel: UnixSocketChannel,
+        has_reader: bool,
+        has_writer: bool,
+        is_closing: bool,
+        task_state: str,
+        expected: bool,
+    ):
+        """Parametrized truth table for is_connected()."""
+        if not has_reader:
+            channel._reader = None
+        if not has_writer:
+            channel._writer = None
+        else:
+            assert channel._writer is not None
+            channel._writer.is_closing = MagicMock(return_value=is_closing)
+
+        if task_state == "done":
+            channel._write_task = await _make_done_task()
+        else:
+            channel._write_task = _make_running_task()
+
+        try:
+            assert channel.is_connected() is expected
+        finally:
+            # Cleanup running tasks
+            if channel._write_task and not channel._write_task.done():
+                channel._write_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await channel._write_task
+
+
+# ============================================================================
+# TestFileOpDispatcherIsAlive - dispatch loop lifecycle
+# ============================================================================
+
+
+class TestFileOpDispatcherIsAlive:
+    @pytest.mark.asyncio
+    async def test_alive_then_dead_on_eof(self):
+        """Dispatcher is_alive() returns True while running, False after EOF."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+
+        assert not dispatcher.is_alive(), "Not alive before start"
+
+        dispatcher.start()
+        await asyncio.sleep(0.05)
+        assert dispatcher.is_alive(), "Alive after start"
+
+        # Feed EOF to make dispatch loop exit
+        reader.feed_eof()
+        await asyncio.sleep(0.1)
+        assert not dispatcher.is_alive(), "Dead after EOF"
+
+        await dispatcher.stop()

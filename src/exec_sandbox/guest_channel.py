@@ -80,6 +80,10 @@ class FileOpDispatcher:
                 await self._task
             self._task = None
 
+    def is_alive(self) -> bool:
+        """Check if the dispatch loop task is still running."""
+        return self._task is not None and not self._task.done()
+
     async def register_op(self, op_id: str) -> asyncio.Queue[StreamingMessage]:
         """Register an op_id and return its dedicated bounded queue."""
         async with self._lock:
@@ -465,8 +469,18 @@ class UnixSocketChannel:
             raise RuntimeError("Write queue full - guest agent not draining") from e
 
     def is_connected(self) -> bool:
-        """Check if channel is connected."""
-        return self._reader is not None and self._writer is not None
+        """Check if channel is connected and the write path is still alive.
+
+        Without these checks, the host holds a stale connection after the
+        guest agent's 18s read timeout triggers a reconnect cycle: connect()
+        sees is_connected()=True, skips reconnection, and the next write_file
+        header is sent into a dead socket.
+        """
+        if self._reader is None or self._writer is None:
+            return False
+        if self._writer.is_closing():
+            return False
+        return not (self._write_task is not None and self._write_task.done())
 
     def get_reader(self) -> asyncio.StreamReader | None:
         """Get the stream reader (for direct access when needed)."""
@@ -552,14 +566,17 @@ class DualPortChannel:
         accepts the host socket before the guest agent is ready; data sent in that
         window is silently dropped, causing 30s timeouts downstream.
         """
-        # Already connected — nothing to do
-        if self._cmd_channel.is_connected() and self._event_channel.is_connected():
+        # Already connected and dispatcher healthy — nothing to do.
+        # Dispatcher EOF is the earliest signal that the guest has disconnected.
+        if (
+            self._cmd_channel.is_connected()
+            and self._event_channel.is_connected()
+            and (self._dispatcher is None or self._dispatcher.is_alive())
+        ):
             return
 
         await self._raw_connect(timeout_seconds)
 
-        # On reconnection, probe the guest to confirm the virtio-serial path
-        # is end-to-end ready.  Skipped on first boot (zero overhead).
         if self._has_been_connected:
             await self._probe_guest_ready(timeout_seconds)
 
@@ -567,13 +584,23 @@ class DualPortChannel:
 
     async def _raw_connect(self, timeout_seconds: float) -> None:
         """Low-level connect: open sockets and start dispatcher."""
+        # Close stale sockets: without this, connect() is a no-op (objects still exist)
+        # and the new dispatcher gets a reader that immediately EOFs.
+        if self._dispatcher and not self._dispatcher.is_alive():
+            await self._dispatcher.stop()
+            self._dispatcher = None
+            await asyncio.gather(
+                self._cmd_channel.close(),
+                self._event_channel.close(),
+            )
+
         # Connect both ports in parallel for speed
         await asyncio.gather(
             self._cmd_channel.connect(timeout_seconds),
             self._event_channel.connect(timeout_seconds),
         )
 
-        # Start the file operation dispatcher on the event channel (once)
+        # Start the file operation dispatcher on the event channel
         if not self._dispatcher:
             reader = self._event_channel.get_reader()
             if reader:
