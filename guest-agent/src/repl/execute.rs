@@ -79,6 +79,15 @@ fn process_stderr_chunk(
 
 /// Drain stdout with a cumulative deadline after sentinel detection or SIGTERM.
 /// Uses DRAIN_TIMEOUT_MS per-read to keep latency low while the deadline bounds total time.
+///
+/// Tolerates up to `MAX_CONSECUTIVE_DRAIN_TIMEOUTS` successive read timeouts before
+/// concluding the pipe is empty. Under QEMU TCG software emulation (~8× slower than
+/// KVM/HVF), a single DRAIN_TIMEOUT_MS window (5 ms) can be too tight for tokio to
+/// service a kernel pipe read — the event-loop overhead (timer wheel + epoll_wait
+/// jiffies rounding at HZ=250) can itself consume the budget, causing a false timeout
+/// even when data is sitting in the pipe buffer.
+const MAX_CONSECUTIVE_DRAIN_TIMEOUTS: u32 = 4; // 4 × 5 ms = 20 ms idle tolerance
+
 async fn drain_stdout(
     stdout: &mut tokio::process::ChildStdout,
     stdout_buffer: &mut String,
@@ -86,6 +95,7 @@ async fn drain_stdout(
 ) {
     let drain_deadline = Instant::now() + Duration::from_millis(deadline_ms);
     let mut buf = [0u8; 8192];
+    let mut consecutive_timeouts: u32 = 0;
     loop {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -93,8 +103,16 @@ async fn drain_stdout(
         }
         let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
         match tokio::time::timeout(per_read, stdout.read(&mut buf)).await {
-            Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Err(_) => {
+                // Timeout — retry until idle threshold or deadline.
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= MAX_CONSECUTIVE_DRAIN_TIMEOUTS {
+                    break;
+                }
+            }
             Ok(Ok(n)) => {
+                consecutive_timeouts = 0;
                 stdout_buffer.push_str(&String::from_utf8_lossy(&buf[..n]));
             }
         }
