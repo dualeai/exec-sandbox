@@ -252,17 +252,22 @@ async def dual_scheduler(
 
     This ensures security properties hold regardless of QEMU backend.
 
-    Uses the same 120s default timeout as ``scheduler_config`` — see its
-    docstring for rationale.
+    Uses the same 120s default timeout as ``scheduler_config`` for hwaccel.
+    Emulation gets 240s because parallel TCG VMs on CI runners can starve
+    each other — trivial code that takes <1s locally consumed the full 120s
+    execution budget on a loaded macOS arm64 runner (cold-boot fallback +
+    TCG + ``pytest -n auto`` contention).
     """
     if request.param == "hwaccel":
         if not await check_hwaccel_available():
             pytest.skip("Hardware acceleration not available")
         monkeypatch.delenv("EXEC_SANDBOX_FORCE_EMULATION", raising=False)
+        timeout = 120
     else:
         monkeypatch.setenv("EXEC_SANDBOX_FORCE_EMULATION", "true")
+        timeout = 240
 
-    config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
+    config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=timeout)
     async with Scheduler(config) as sched:
         yield sched
 
