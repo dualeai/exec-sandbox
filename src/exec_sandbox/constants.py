@@ -151,6 +151,14 @@ Accounts for:
 - Safety buffer (~1s)
 Must be >= guest-agent TERM_GRACE_PERIOD_SECONDS (5s) + overhead."""
 
+SNAPSHOT_CREATION_MIN_MEMORY_MB: Final[int] = 384
+"""Minimum guest memory for snapshot creation VMs (package installation).
+
+Snapshot creation runs uv/bun (large binaries) inside the guest. Under TCG,
+the cold-start JIT translation of uv (~30MB Rust binary) plus TLS crypto drives
+RSS above 192MB, triggering zram compression which runs in emulated code (5-8x
+slower). 384MB provides headroom to avoid zram thrashing during pip/npm install."""
+
 PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
 """Timeout for package installation in guest VM.
 

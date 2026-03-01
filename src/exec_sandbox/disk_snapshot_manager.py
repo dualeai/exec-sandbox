@@ -398,6 +398,16 @@ class DiskSnapshotManager(BaseCacheManager):
         snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
         success = False
 
+        # Ensure snapshot VMs have enough memory for package managers (uv/bun).
+        # Under TCG, uv cold-start JIT + TLS crypto pushes RSS above 192MB,
+        # triggering zram compression in emulated code (catastrophically slow).
+        effective_memory_mb = max(memory_mb, constants.SNAPSHOT_CREATION_MIN_MEMORY_MB)
+        if effective_memory_mb != memory_mb:
+            logger.debug(
+                "Snapshot VM memory raised to minimum",
+                extra={"requested_mb": memory_mb, "effective_mb": effective_memory_mb},
+            )
+
         # Acquire semaphore to limit concurrent snapshot creation
         async with self._creation_semaphore:
             try:
@@ -422,7 +432,7 @@ class DiskSnapshotManager(BaseCacheManager):
                     language,
                     tenant_id,
                     task_id,
-                    memory_mb=memory_mb,
+                    memory_mb=effective_memory_mb,
                     allow_network=True,
                     allowed_domains=package_domains,
                     direct_write_target=snapshot_path,

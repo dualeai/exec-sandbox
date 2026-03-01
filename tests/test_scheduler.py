@@ -1404,10 +1404,7 @@ print(f"shape={filtered.shape}")
 print(f"mean={df['b'].mean():.1f}")
 """,
         ["pandas=3.0.1", "shape=(2, 2)", "mean=5.0"],
-        # pandas ships its test suite inside the wheel (~100MB+ extracted).
-        # uv extracts to /tmp which is tmpfs (50% of RAM). Default 192MB VM
-        # gives only ~96MB /tmp — not enough. 384MB → ~192MB /tmp.
-        384,
+        None,
         id="python-pandas",
         marks=skip_unless_hwaccel,  # pip install routinely exceeds 940s under TCG
     ),
