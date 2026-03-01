@@ -33,7 +33,6 @@ print(result)
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -51,7 +50,6 @@ print(result)
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"

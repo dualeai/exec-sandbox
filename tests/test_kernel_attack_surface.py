@@ -1207,7 +1207,6 @@ finally:
         result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
         assert result.exit_code == 0
         stdout = result.stdout.strip()

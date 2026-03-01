@@ -245,7 +245,6 @@ print(result)
         result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert result.stdout.strip() == "[1, 4, 9, 16, 25]"
@@ -409,7 +408,7 @@ with open('/tmp/data_999.txt') as f:
     print(f'CONTENT:{f.read()}')
 print(f'COUNT:{len(os.listdir("/tmp"))}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "CONTENT:content_999" in result.stdout
         assert "COUNT:" in result.stdout, f"stdout: {result.stdout}"
@@ -518,7 +517,7 @@ s_after = os.statvfs('/tmp')
 inodes_used = s_before.f_ffree - s_after.f_ffree
 print(f'INODES_USED:{inodes_used}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INODES_USED:" in result.stdout, f"stdout: {result.stdout}"
         inodes_used = int(result.stdout.split("INODES_USED:")[1].strip())
@@ -574,7 +573,7 @@ print(f'OUTPUT:{r.stdout.strip()}')
 # id(1) prints "euid=0(root)" only when effective UID differs from real UID.
 print(f'NO_ROOT_EUID:{"euid=0" not in r.stdout}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "SUID_BIT_SET:True" in result.stdout
         assert "NO_ROOT_EUID:True" in result.stdout
@@ -609,7 +608,6 @@ try:
 except OSError:
     print('CORRECTLY_BLOCKED')
 """,
-                timeout_seconds=30,
             )
             assert r2.exit_code == 0, f"stderr: {r2.stderr}"
             assert "CORRECTLY_BLOCKED" in r2.stdout
@@ -622,13 +620,12 @@ with open('/home/user/still_works.txt', 'w') as f:
 with open('/home/user/still_works.txt') as f:
     print(f'ROOTFS:{f.read()}')
 """,
-                timeout_seconds=30,
             )
             assert r3.exit_code == 0, f"stderr: {r3.stderr}"
             assert "ROOTFS:alive" in r3.stdout
 
             # Step 4: Verify Python execution still works (REPL uses rootfs, not /tmp)
-            r4 = await session.exec("print(f'MATH:{2 + 2}')", timeout_seconds=30)
+            r4 = await session.exec("print(f'MATH:{2 + 2}')")
             assert r4.exit_code == 0, f"stderr: {r4.stderr}"
             assert "MATH:4" in r4.stdout
 
@@ -880,7 +877,7 @@ r = subprocess.run(
 )
 print(f'LOSETUP_RC:{r.returncode}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         assert "LOSETUP_RC:0" not in result.stdout, f"Expected losetup associate to fail.\nstdout: {result.stdout}"
 
@@ -957,7 +954,6 @@ for line in results:
         result = await dual_scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
         assert result.exit_code == 0
         # dd may succeed (just creates a regular file), but losetup and mount must fail
@@ -2192,7 +2188,7 @@ print(f'FILLED:{written}MB')
             assert "FILLED:" in r1.stdout
 
             # Step 2: Python execution still works (REPL doesn't need /home/user disk)
-            r2 = await session.exec("print(f'MATH:{6 * 7}')", timeout_seconds=30)
+            r2 = await session.exec("print(f'MATH:{6 * 7}')")
             assert r2.exit_code == 0
             assert "MATH:42" in r2.stdout
 
@@ -2206,7 +2202,6 @@ with open('/home/user/recovered.txt', 'w') as f:
 with open('/home/user/recovered.txt') as f:
     print(f'RECOVERED:{f.read()}')
 """,
-                timeout_seconds=30,
             )
             assert r3.exit_code == 0
             assert "RECOVERED:back to normal" in r3.stdout
@@ -2572,7 +2567,7 @@ except RuntimeError:
 
 print(f'THREAD_COUNT:{len(threads)}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         count_line = [line for line in result.stdout.splitlines() if line.startswith("THREAD_COUNT:")]
         assert count_line, f"Expected THREAD_COUNT in output.\nstdout: {result.stdout}"
@@ -2620,7 +2615,7 @@ while True:
 
 print(f'FORK_COUNT:{count}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON, timeout_seconds=30)
+        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         count_line = [line for line in result.stdout.splitlines() if line.startswith("FORK_COUNT:")]
         assert count_line, f"Expected FORK_COUNT in output.\nstdout: {result.stdout}"

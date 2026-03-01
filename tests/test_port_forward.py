@@ -501,7 +501,6 @@ print("server_started")
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         # Verify the result has exposed ports
@@ -520,7 +519,6 @@ print("server_started")
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080, external=external_port)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         assert len(result.exposed_ports) == 1
@@ -538,7 +536,6 @@ print("server_started")
                 PortMapping(internal=9000),
             ],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         assert len(result.exposed_ports) == 3
@@ -564,7 +561,6 @@ except Exception as e:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080)],
             allow_network=False,  # No internet!
-            timeout_seconds=30,
         )
 
         # Should be blocked - no internet in Mode 1
@@ -583,7 +579,6 @@ class TestPortForwardingMode2Integration:
             expose_ports=[PortMapping(internal=5000)],
             allow_network=True,
             allowed_domains=["example.com"],
-            timeout_seconds=30,
         )
 
         # Should have exposed port
@@ -606,7 +601,6 @@ except Exception as e:
             expose_ports=[PortMapping(internal=8080)],
             allow_network=True,
             allowed_domains=["httpbin.org"],
-            timeout_seconds=30,
         )
 
         # Should be able to reach httpbin.org
@@ -648,7 +642,6 @@ finally:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=9999)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         # The server started and listened
@@ -664,7 +657,6 @@ finally:
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=3000)],
             allow_network=False,
-            timeout_seconds=30,
         )
 
         assert len(result.exposed_ports) == 1

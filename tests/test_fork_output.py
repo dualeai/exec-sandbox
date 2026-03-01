@@ -48,7 +48,6 @@ print(f"PARENT_DONE:{len(pids)}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -72,7 +71,6 @@ print(f"PARENT_DONE:{len(pids)}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -92,7 +90,6 @@ print("PARENT_COMPUTED")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -119,7 +116,6 @@ print("PARENT_OUTPUT")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -138,7 +134,6 @@ for _ in range(5):
     os.waitpid(pid, 0)
 print("FORK_DONE")
 """,
-                timeout_seconds=30,
             )
             assert r1.exit_code == 0, f"stderr: {r1.stderr}"
             assert "FORK_DONE" in r1.stdout
@@ -160,7 +155,6 @@ print("PARENT_OK")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -179,7 +173,6 @@ for _ in range(3):
         sys.exit(0)
 print("FORK_DONE")
 """,
-                timeout_seconds=30,
             )
             assert r1.exit_code == 0, f"stderr: {r1.stderr}"
             assert "FORK_DONE" in r1.stdout
@@ -215,7 +208,6 @@ print("NESTED_OK")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -235,7 +227,6 @@ print("STDERR_OK")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -256,7 +247,6 @@ print(f"CHILD_EXIT:{child_code}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -279,7 +269,6 @@ print(f"IPC:{data}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
@@ -358,7 +347,6 @@ print("INJECTION_SAFE")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"

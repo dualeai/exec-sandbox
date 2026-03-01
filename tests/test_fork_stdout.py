@@ -53,7 +53,6 @@ print("PARENT_OK")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -82,7 +81,6 @@ else:
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -109,7 +107,6 @@ print("PARENT_BASELINE")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -144,7 +141,6 @@ print("PARENT_PRESENT")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -176,7 +172,6 @@ print("PARENT_OK")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -217,7 +212,6 @@ print(f"EXIT_NOARG:{exit_noarg}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -246,7 +240,6 @@ print("PARENT_CONTINUES")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -276,7 +269,6 @@ print("PARENT_ALL_DONE")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -320,7 +312,6 @@ print("PARENT_OK")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -353,7 +344,6 @@ print("PARENT_AFTER_CHILD")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -385,7 +375,6 @@ print("PARENT_STDOUT")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
@@ -419,7 +408,6 @@ print("PARENT_DONE")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, (
@@ -451,7 +439,6 @@ print(f"x:{x}")
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=30,
         )
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
