@@ -21,7 +21,6 @@ scenarios including:
 """
 
 import asyncio
-from typing import TypedDict
 
 import psutil
 import pytest
@@ -32,32 +31,11 @@ from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
 from exec_sandbox.vm_manager import VmManager
 from tests.conftest import skip_unless_hwaccel
-
-
-class ProcessInfo(TypedDict):
-    """Process information from psutil."""
-
-    status: str
-    cpu: float
-
-
-def get_process_info(proc: ProcessWrapper | None) -> ProcessInfo | None:
-    """Get process status and CPU usage from ProcessWrapper (cross-platform).
-
-    Uses the ProcessWrapper's internal psutil_proc for PID-safe monitoring.
-
-    Returns:
-        Dict with 'status' and 'cpu' keys, or None if process doesn't exist.
-    """
-    if proc is None or proc.psutil_proc is None:
-        return None
-    try:
-        # cpu_percent needs a small interval for accurate reading
-        cpu = proc.psutil_proc.cpu_percent(interval=0.1)
-        status = proc.psutil_proc.status()
-        return ProcessInfo(status=status, cpu=cpu)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return None
+from tests.cpu_helpers import (
+    assert_cpu_idle,
+    collect_cpu_samples,
+    collect_cpu_samples_bulk,
+)
 
 
 def is_process_alive(proc: ProcessWrapper | None) -> bool:
@@ -68,60 +46,6 @@ def is_process_alive(proc: ProcessWrapper | None) -> bool:
         return proc.psutil_proc.is_running()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
-
-
-def is_process_idle(status: str) -> bool:
-    """Check if process status indicates idle/sleeping (not busy-looping).
-
-    Idle states (psutil cross-platform):
-    - sleeping: Interruptible sleep (Linux S, macOS S)
-    - idle: Idle (macOS specific)
-    - stopped: Stopped by signal (Linux/macOS T)
-    - disk-sleep: Uninterruptible disk sleep (Linux D)
-
-    Running states (bad for orphan VMs):
-    - running: Running or runnable (Linux/macOS R)
-    """
-    return status in (
-        psutil.STATUS_SLEEPING,  # "sleeping"
-        psutil.STATUS_IDLE,  # "idle" (macOS)
-        psutil.STATUS_STOPPED,  # "stopped"
-        psutil.STATUS_DISK_SLEEP,  # "disk-sleep"
-    )
-
-
-async def wait_for_process_idle(proc: ProcessWrapper, timeout: float = 10.0, threshold_cpu: float = 5.0) -> bool:
-    """Wait for a process to settle into idle state.
-
-    Args:
-        proc: ProcessWrapper to monitor
-        timeout: Maximum time to wait in seconds
-        threshold_cpu: CPU percentage threshold for "idle"
-
-    Returns:
-        True if process is idle (sleeping with low CPU), False otherwise
-    """
-    start = asyncio.get_event_loop().time()
-    samples: list[ProcessInfo] = []
-
-    while asyncio.get_event_loop().time() - start < timeout:
-        info = get_process_info(proc)
-        if info is None:
-            return False  # Process died
-
-        samples.append(info)
-
-        # Need at least 3 samples showing idle behavior
-        if len(samples) >= 3:
-            recent: list[ProcessInfo] = samples[-3:]
-            all_idle = all(is_process_idle(s["status"]) for s in recent)
-            all_low_cpu = all(s["cpu"] < threshold_cpu for s in recent)
-            if all_idle and all_low_cpu:
-                return True
-
-        await asyncio.sleep(0.5)
-
-    return False
 
 
 async def kill_vm_processes(vm: QemuVM) -> None:
@@ -154,7 +78,6 @@ class TestOrphanVmCpu:
         the virtio-serial connection. The guest-agent should detect
         POLLHUP and back off, keeping CPU usage minimal.
         """
-        # Create VM
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test-orphan",
@@ -167,27 +90,17 @@ class TestOrphanVmCpu:
         assert vm.process.pid is not None, "QEMU process should have a PID"
 
         try:
-            # Let the host connection close (simulate orphan)
-            # Close the channel but don't call destroy
+            # Close the channel but don't call destroy (simulate orphan)
             await vm.channel.close()
 
-            # Wait a bit for guest-agent to detect disconnect
+            # Wait for guest-agent to detect disconnect and back off
             await asyncio.sleep(2)
 
-            # Monitor CPU for several seconds
-            idle = await wait_for_process_idle(vm.process, timeout=10.0, threshold_cpu=5.0)
-
-            # Get final state
-            info = get_process_info(vm.process)
-            assert info is not None, "QEMU process died unexpectedly"
-
-            # Verify idle behavior
-            assert idle, f"Orphan VM should be idle, got status={info['status']}, cpu={info['cpu']}%"
-            assert is_process_idle(info["status"]), f"Expected idle status, got {info['status']}"
-            assert info["cpu"] < 5.0, f"Expected <5% CPU, got {info['cpu']}%"
+            # Percentile-based CPU measurement (absorbs CI noise)
+            samples = await collect_cpu_samples(vm.process, n_samples=10)
+            assert_cpu_idle(samples, label="orphan QEMU")
 
         finally:
-            # Clean up - kill the orphan
             await kill_vm_processes(vm)
 
     async def test_orphan_vm_with_network_stays_idle(self, vm_manager: VmManager) -> None:
@@ -195,7 +108,6 @@ class TestOrphanVmCpu:
 
         Tests that both QEMU and gvproxy processes stay idle when orphaned.
         """
-        # Create VM with network
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
             tenant_id="test-orphan-net",
@@ -214,26 +126,21 @@ class TestOrphanVmCpu:
             await vm.channel.close()
             await asyncio.sleep(2)
 
-            # Check QEMU
-            qemu_idle = await wait_for_process_idle(vm.process, timeout=10.0, threshold_cpu=5.0)
-            qemu_info = get_process_info(vm.process)
-            assert qemu_info is not None, "QEMU process died unexpectedly"
-            assert qemu_idle, f"QEMU should be idle, got status={qemu_info['status']}, cpu={qemu_info['cpu']}%"
+            # Percentile-based CPU measurement for both processes
+            qemu_samples = await collect_cpu_samples(vm.process, n_samples=10)
+            assert_cpu_idle(qemu_samples, label="orphan QEMU")
 
-            # Check gvproxy
-            gvproxy_info = get_process_info(vm.gvproxy_proc)
-            assert gvproxy_info is not None, "gvproxy process died unexpectedly"
-            assert gvproxy_info["cpu"] < 5.0, f"gvproxy should use <5% CPU, got {gvproxy_info['cpu']}%"
+            gvproxy_samples = await collect_cpu_samples(vm.gvproxy_proc, n_samples=10)
+            assert_cpu_idle(gvproxy_samples, label="orphan gvproxy")
 
         finally:
-            # Clean up
             await kill_vm_processes(vm)
 
     async def test_multiple_orphan_vms_stay_idle(self, vm_manager: VmManager) -> None:
         """Multiple orphan VMs should all stay idle.
 
         Creates several VMs concurrently, orphans them, and verifies
-        all stay at low CPU usage.
+        all stay at low CPU usage using bulk percentile measurement.
         """
         num_vms = 3
         vms: list[QemuVM] = []
@@ -260,24 +167,21 @@ class TestOrphanVmCpu:
             # Wait for guest-agents to detect disconnect
             await asyncio.sleep(3)
 
-            # Verify all are idle
-            # Threshold at 12% to tolerate psutil rounding on noisy CI runners
-            for i, vm in enumerate(vms):
-                assert vm.process.pid is not None, f"VM {i} should have a PID"
-                info = get_process_info(vm.process)
-                assert info is not None, f"VM {i} process died unexpectedly"
-                assert is_process_idle(info["status"]), f"VM {i} should be idle, got {info['status']}"
-                assert info["cpu"] < 12.0, f"VM {i} should use <12% CPU, got {info['cpu']}%"
+            # Bulk percentile-based CPU measurement (same time window)
+            procs = [vm.process for vm in vms]
+            all_samples = await collect_cpu_samples_bulk(procs, n_samples=10)
+
+            for i, samples in enumerate(all_samples):
+                assert_cpu_idle(samples, label=f"orphan VM {i}")
 
         finally:
-            # Clean up all VMs
             for vm in vms:
                 await kill_vm_processes(vm)
 
     async def test_orphan_vm_cpu_over_time(self, vm_manager: VmManager) -> None:
         """Orphan VM CPU should remain low over extended period.
 
-        This test monitors CPU usage over 10 seconds to ensure
+        This test monitors CPU usage over ~15 seconds to ensure
         the backoff mechanism prevents CPU spikes.
         """
         vm = await vm_manager.create_vm(
@@ -296,21 +200,9 @@ class TestOrphanVmCpu:
             await vm.channel.close()
             await asyncio.sleep(2)
 
-            # Collect CPU samples over 10 seconds
-            samples: list[float] = []
-            for _ in range(10):
-                info = get_process_info(vm.process)
-                if info:
-                    samples.append(info["cpu"])
-                await asyncio.sleep(1)
-
-            # Verify no sample exceeds threshold
-            # Threshold at 12% to tolerate psutil rounding on noisy CI runners
-            max_cpu = max(samples) if samples else 0.0
-            avg_cpu = sum(samples) / len(samples) if samples else 0.0
-
-            assert max_cpu < 12.0, f"Max CPU spike was {max_cpu}%, expected <12%"
-            assert avg_cpu < 3.0, f"Average CPU was {avg_cpu:.1f}%, expected <3%"
+            # Extended percentile-based CPU measurement
+            samples = await collect_cpu_samples(vm.process, n_samples=15)
+            assert_cpu_idle(samples, label="orphan QEMU over time")
 
         finally:
             await kill_vm_processes(vm)
