@@ -400,6 +400,27 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
 
 
 # ============================================================================
+# Network test constants — shared by test_dns_filtering / test_ech_proxy_behavior
+# ============================================================================
+# These are NOT fixtures because they are used at module-level (f-string
+# interpolation into code-generation helpers), not inside test functions.
+
+NET_CONNECT_TIMEOUT_S = 5  # TCP connect timeout (socket, curl --connect-timeout)
+NET_OP_TIMEOUT_S = 10  # Full operation timeout (AbortSignal, urllib, curl --max-time)
+NET_SAFETY_TIMEOUT_S = 15  # Process-level kill — catches musl DNS hang under TCG
+NET_RETRY_COUNT = 2  # Retries for allowed-domain tests (3 total attempts)
+NET_RETRY_BACKOFF_S = 1  # Linear backoff base (1s, 2s between retries)
+
+# Safety preambles — kill the process if musl DNS blocks beyond the safety timeout.
+# threading.Timer fires even when the main thread is stuck in getaddrinfo().
+PY_SAFETY = f"""\nimport threading, os\nthreading.Timer({NET_SAFETY_TIMEOUT_S}, lambda: (print("BLOCKED:Timeout", flush=True), os._exit(1))).start()\n"""
+# setTimeout fires even when Bun's main thread is waiting on DNS (thread-pool).
+JS_SAFETY = (
+    f'setTimeout(() => {{ console.log("BLOCKED:Timeout"); process.exit(1); }}, {NET_SAFETY_TIMEOUT_S * 1000});\n'
+)
+
+
+# ============================================================================
 # Test Utilities
 # ============================================================================
 
