@@ -251,19 +251,21 @@ _FILE_IO_SIZES_MB = [1, 10]
 #
 # Both write and read paths use bounded queues (maxsize=OP_QUEUE_DEPTH).
 # Per queued item: FILE_TRANSFER_CHUNK_SIZE bytes compressed → base64 (4/3 expansion).
-# Queue capacity dominates; +2MB covers decode/decompress temporaries + StreamReader.
+# Queue capacity dominates the peak; 25% headroom covers look-ahead pipelining
+# frames (up to 2 in-flight beyond the queue), executor transients, compressor
+# state, and tracemalloc measurement jitter.
 # Memory is O(queue_capacity) — bounded, must NOT scale with file size.
 _QUEUE_CAPACITY_MB = OP_QUEUE_DEPTH * constants.FILE_TRANSFER_CHUNK_SIZE * 4 / 3 / (1024 * 1024)
-_PIPELINE_JITTER_MB = 2
+_PIPELINE_HEADROOM = 1.25
 # Write path: look-ahead pipelining fills the bounded write queue before
 # backpressure kicks in.
-_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
+_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = _QUEUE_CAPACITY_MB * _PIPELINE_HEADROOM
 # Tracemalloc overhead for bytes-input write: BytesIO copy is tracked at ~file_size,
 # plus ~3MB from in-flight queue frames and compressor state.
 _FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 3
 # Read path: op_queue (maxsize=OP_QUEUE_DEPTH) buffers FileChunkResponseMessage
 # models while consumer awaits disk I/O per chunk.
-_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
+_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB * _PIPELINE_HEADROOM
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache,
 # write queue fill during sustained transfers, and free-threaded Python overhead).
 # 3.14t adds ~2-4MB residual overhead from per-object locks even after warmup.
