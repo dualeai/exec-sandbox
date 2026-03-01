@@ -231,7 +231,8 @@ _FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 3
 _FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB + _PIPELINE_JITTER_MB
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache,
 # write queue fill during sustained transfers, and free-threaded Python overhead).
-_FILE_IO_RSS_OVERHEAD_MB = 14
+# 3.14t adds ~2-4MB residual overhead from per-object locks even after warmup.
+_FILE_IO_RSS_OVERHEAD_MB = 18
 # Streaming chunk pipeline headroom for RSS tests (~500KB real, padded for jitter).
 _FILE_IO_RSS_STREAMING_OVERHEAD_MB = 2
 # Intra-session accumulation ceiling (tracemalloc current, NOT RSS).
@@ -388,16 +389,24 @@ async def test_peak_ram_file_io(file_io_size_mb: int, images_dir: Path, tmp_path
     os.urandom(size_bytes) is called AFTER baseline, so content allocation is
     counted in RSS growth (~1x file_size).  Chunk pipeline is O(chunk_size)
     with bounded queues.  Threshold: file_size + flat pipeline overhead.
+
+    Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
+    docstring for rationale.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
-    process = psutil.Process()
-    gc.collect()
-    baseline_rss = process.memory_info().rss
 
     config = SchedulerConfig(
         images_dir=images_dir,
         warm_pool_size=0,
     )
+
+    # Warmup: absorb one-time init (Scheduler, Pydantic, psutil, mimalloc arenas on 3.14t)
+    async with Scheduler(config) as scheduler:
+        await scheduler.run(code="print('warmup')", language=Language.PYTHON)
+
+    process = psutil.Process()
+    gc.collect()
+    baseline_rss = process.memory_info().rss
 
     tracker = PeakMemoryTracker()
     dest = tmp_path / "peak_test.bin"
