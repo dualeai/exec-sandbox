@@ -14,7 +14,7 @@ from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import SandboxError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_fast_balloon
+from tests.conftest import skip_unless_fast_balloon, skip_unless_hwaccel
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -1409,6 +1409,7 @@ print(f"mean={df['b'].mean():.1f}")
         # gives only ~96MB /tmp — not enough. 384MB → ~192MB /tmp.
         384,
         id="python-pandas",
+        marks=skip_unless_hwaccel,  # pip install routinely exceeds 940s under TCG
     ),
     pytest.param(
         Language.PYTHON,
@@ -1425,6 +1426,7 @@ print(f"pixel={img.getpixel((0, 0))}")
         ["pillow=12.1.1", "size=(50, 25)", "pixel=(255, 0, 0)"],
         None,
         id="python-pillow",
+        marks=skip_unless_hwaccel,  # pip install routinely exceeds 940s under TCG
     ),
     # JavaScript - pure JS packages
     pytest.param(
