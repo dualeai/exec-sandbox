@@ -157,10 +157,10 @@ lint:
 run_id ?=
 
 ci-status:
-	@./scripts/ci-diagnose.sh status $(run_id)
+	@uv run scripts/ci_diagnose.py status $(run_id)
 
 ci-diagnose:
-	@./scripts/ci-diagnose.sh diagnose $(run_id)
+	@uv run scripts/ci_diagnose.py diagnose $(run_id)
 
 # ============================================================================
 # Benchmarking (concurrent VM latency)
