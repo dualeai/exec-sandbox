@@ -308,11 +308,16 @@ async def _file_io_cycle(scheduler: Scheduler, index: int, size_bytes: int, tmp_
     dest.unlink(missing_ok=True)
 
 
+@skip_unless_hwaccel
 @pytest.mark.slow
 async def test_no_memory_leak_file_io(
     iterations: int, file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
 ) -> None:
     """Verify host memory returns to baseline after repeated file I/O cycles.
+
+    Requires hwaccel: TCG JIT inflates per-VM RSS and L1 restore always
+    fails under software emulation, forcing cold boots every iteration
+    which adds ~50MB overhead across 200 cycles on free-threaded Python.
 
     Each iteration opens a fresh session, writes a file, reads it back,
     and closes the session.  Threshold reuses _LEAK_THRESHOLD_MB because
