@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 from typing import TYPE_CHECKING, ClassVar, Self
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.hash_utils import crc32
+from exec_sandbox.lock_utils import file_lock
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -86,6 +86,10 @@ class BaseCacheManager:
 
         task.add_done_callback(_on_done)
 
+    def _cache_path(self, key: str) -> Path:
+        """Return the primary cache file path for *key*."""
+        return self.cache_dir / f"{key}{self._cache_ext}"
+
     @contextlib.asynccontextmanager
     async def _save_lock(self, key: str) -> AsyncIterator[bool]:
         """File-based exclusive lock for snapshot save. Cross-process safe.
@@ -98,19 +102,8 @@ class BaseCacheManager:
         Yields False if another process completed the save first.
         Raises BlockingIOError if lock is held by another process/task.
         """
-        lock_path = self.cache_dir / f"{key}{self._cache_ext}.lock"
-        target_path = self.cache_dir / f"{key}{self._cache_ext}"
-        fd = lock_path.open("w")
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            yield not (target_path.exists() and target_path.stat().st_size > 0)
-        finally:
-            fd.close()  # Closing fd releases the flock
-            # Lock files are intentionally NOT deleted. Deleting after close creates
-            # a race: another process can acquire a flock on the old inode, then a
-            # third process creates a NEW file on a different inode — both hold
-            # exclusive flocks simultaneously. Persistent lock files are tiny and
-            # eliminate this POSIX flock race entirely.
+        async with file_lock(self._cache_path(key), blocking=False) as should_proceed:
+            yield should_proceed
 
     async def _evict_oldest_snapshot(self) -> None:
         """Evict oldest cache entry by atime (lazy, on ENOSPC).
@@ -127,17 +120,12 @@ class BaseCacheManager:
             # Skip entries with an active save lock (flock held by another process).
             # Try non-blocking flock: if it succeeds, no save is in progress.
             stem = candidate.name[: -len(self._cache_ext)]
-            lock_path = candidate.parent / f"{stem}{self._cache_ext}.lock"
-            if lock_path.exists():
-                try:
-                    fd = lock_path.open("w")
-                    try:
-                        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    finally:
-                        fd.close()
-                except BlockingIOError:
-                    logger.debug("Skipping locked cache entry for eviction", extra={"path": str(candidate)})
-                    continue
+            try:
+                async with file_lock(candidate, blocking=False):
+                    pass  # Lock acquired and released — no save in progress
+            except BlockingIOError:
+                logger.debug("Skipping locked cache entry for eviction", extra={"path": str(candidate)})
+                continue
 
             logger.info("Evicting oldest snapshot", extra={"path": str(candidate)})
             candidate.unlink(missing_ok=True)

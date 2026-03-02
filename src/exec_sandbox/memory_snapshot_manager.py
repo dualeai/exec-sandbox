@@ -88,10 +88,8 @@ class MemorySnapshotManager(BaseCacheManager):
 
     def _cache_paths(self, key: str) -> tuple[Path, Path]:
         """Return (vmstate_path, meta_path) for a given cache key."""
-        return (
-            self.cache_dir / f"{key}.vmstate",
-            self.cache_dir / f"{key}.vmstate.meta",
-        )
+        vmstate_path = self._cache_path(key)
+        return (vmstate_path, vmstate_path.with_suffix(".vmstate.meta"))
 
     async def compute_cache_key(
         self,

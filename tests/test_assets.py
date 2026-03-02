@@ -372,56 +372,6 @@ class TestVersionedCacheDir:
             assert result == Path("/custom/cache")
 
 
-class TestConcurrentDecompression:
-    """Tests for concurrent decompression safety."""
-
-    async def test_concurrent_calls_to_decompress_are_safe(self, tmp_path: Path) -> None:
-        """Multiple concurrent calls to decompress the same file don't corrupt it."""
-        import asyncio
-
-        # Import the private lock function for testing concurrent access
-        from exec_sandbox.asset_downloader import (
-            _get_decompression_lock,  # pyright: ignore[reportPrivateUsage]
-        )
-
-        # Create source file
-        source = tmp_path / "test.zst"
-        source.write_bytes(b"compressed data")
-
-        dest = tmp_path / "test"
-        expected_content = b"decompressed content"
-
-        # Track how many times actual decompression runs
-        decompression_count = 0
-
-        async def mock_decompress(fname: Path) -> Path:
-            nonlocal decompression_count
-            # Simulate the locking behavior
-            lock = await _get_decompression_lock(dest)
-            async with lock:
-                if dest.exists():
-                    return dest
-                decompression_count += 1
-                # Simulate some work
-                await asyncio.sleep(0.01)
-                dest.write_bytes(expected_content)
-                fname.unlink(missing_ok=True)
-            return dest
-
-        # Launch multiple concurrent decompressions
-        tasks = [mock_decompress(source) for _ in range(5)]
-        results = await asyncio.gather(*tasks)
-
-        # All should return the same path
-        assert all(r == dest for r in results)
-
-        # Content should be correct (not corrupted)
-        assert dest.read_bytes() == expected_content
-
-        # Only one decompression should have actually run
-        assert decompression_count == 1
-
-
 # =============================================================================
 # Fetch Functions Tests
 # =============================================================================
@@ -1193,27 +1143,18 @@ class TestDecompressZstdErrorHandling:
         with pytest.raises(FileNotFoundError):
             await decompress_zstd(nonexistent)
 
-    async def test_returns_dest_if_already_decompressed(self, tmp_path: Path) -> None:
-        """Returns existing decompressed file without needing source."""
+    async def test_invalid_zstd_raises_error(self, tmp_path: Path) -> None:
+        """Raises ZstdError when source is not valid zstd data."""
         from exec_sandbox.asset_downloader import decompress_zstd
 
-        # Create source .zst file and already-decompressed destination
         source = tmp_path / "file.zst"
-        source.write_bytes(b"fake compressed data")  # Would fail if actually decompressed
-        dest = tmp_path / "file"
-        dest.write_text("already decompressed content")
+        source.write_bytes(b"not valid zstd data")
 
-        # decompress_zstd should return the existing dest without touching source
-        result = await decompress_zstd(source)
-        assert result == dest
-        assert dest.read_text() == "already decompressed content"  # Not corrupted
-        assert source.exists()  # Source not deleted since we didn't decompress
+        with pytest.raises(Exception, match=r"[Uu]nable to decompress|[Uu]nknown frame"):
+            await decompress_zstd(source)
 
-    async def test_cleans_up_temp_file_on_failure(self) -> None:
-        """Temp file is cleaned up if decompression fails."""
-        # Skip this test - it requires actual zstd decompression to fail
-        # which would need a corrupted .zst file
-        pytest.skip("Requires actual zstd library to test decompression failure")
+        # Temp file should be cleaned up on failure
+        assert not (tmp_path / "file.tmp").exists()
 
 
 # =============================================================================

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import tracemalloc
 from pathlib import Path
@@ -23,6 +24,7 @@ from exec_sandbox.asset_downloader import (
 )
 from exec_sandbox.exceptions import AssetDownloadError, AssetNotFoundError
 from exec_sandbox.hash_utils import IncrementalHasher, bytes_hash
+from exec_sandbox.lock_utils import file_lock
 from exec_sandbox.platform_utils import HostOS
 
 
@@ -739,3 +741,200 @@ class TestUntar:
         assert result_dir.exists()
         assert (result_dir / "file.txt").read_text() == "gzip content"
         assert not tar_path.exists()  # Original should be deleted
+
+
+# ============================================================================
+# file_lock unit tests
+# ============================================================================
+
+
+class TestFileLock:
+    """Tests for file_lock utility."""
+
+    async def test_yields_true_when_target_missing(self, tmp_path: Path):
+        """Should yield True when target file does not exist."""
+        target = tmp_path / "missing.txt"
+        async with file_lock(target) as should_proceed:
+            assert should_proceed is True
+
+    async def test_yields_false_when_target_exists(self, tmp_path: Path):
+        """Should yield False when target file already exists with content."""
+        target = tmp_path / "existing.txt"
+        target.write_text("content")
+        async with file_lock(target) as should_proceed:
+            assert should_proceed is False
+
+    async def test_nonblocking_raises_when_held(self, tmp_path: Path):
+        """Should raise BlockingIOError in non-blocking mode when lock is held."""
+        target = tmp_path / "locked.txt"
+        async with file_lock(target):
+            with pytest.raises(BlockingIOError):
+                async with file_lock(target, blocking=False):
+                    pass  # Should not reach here
+
+    async def test_blocking_waits_then_proceeds(self, tmp_path: Path):
+        """Blocking caller should wait for first holder, then see the produced file."""
+        target = tmp_path / "produced.txt"
+        order: list[str] = []
+
+        async def holder() -> None:
+            async with file_lock(target) as should_proceed:
+                assert should_proceed is True
+                order.append("holder-acquired")
+                await asyncio.sleep(0.1)  # Simulate work
+                target.write_text("done")
+                order.append("holder-released")
+
+        async def waiter() -> None:
+            # Small delay so holder acquires first
+            await asyncio.sleep(0.02)
+            async with file_lock(target) as should_proceed:
+                order.append("waiter-acquired")
+                # File was produced by holder, so should_proceed is False
+                assert should_proceed is False
+
+        await asyncio.gather(holder(), waiter())
+        assert order == ["holder-acquired", "holder-released", "waiter-acquired"]
+
+
+# ============================================================================
+# Concurrent retrieve tests — regression for EC2 race condition
+# ============================================================================
+
+
+class TestConcurrentRetrieve:
+    """Tests for concurrent retrieve() calls.
+
+    These tests reproduce the race condition found on EC2 where two concurrent
+    fetch_base_image calls would race: one's retry cleanup (dest.unlink) deleted
+    the .zst file while the other coroutine was decompressing it.
+    """
+
+    async def test_concurrent_same_url_with_decompress(self, tmp_path: Path):
+        """Two concurrent retrieve() with decompress_zstd should not race.
+
+        Regression: on EC2, two fetch_base_image calls raced — one's retry
+        cleanup deleted .zst while the other was decompressing it.
+        The file lock on the final output serializes the full pipeline.
+        """
+        if sys.version_info >= (3, 14):
+            from compression import zstd
+        else:
+            from backports import zstd
+
+        original = b"concurrent decompression test content"
+        compressed = zstd.compress(original)
+        compressed_hash = bytes_hash(compressed)
+        url = "https://example.com/concurrent.txt.zst"
+
+        with aioresponses() as m:
+            # Only one download should happen (second caller finds cached result)
+            # Register two responses in case of timing; only one should be consumed
+            for _ in range(2):
+                m.get(url, body=compressed)
+
+            results = await asyncio.gather(
+                retrieve(
+                    url=url,
+                    known_hash=f"sha256:{compressed_hash}",
+                    path=tmp_path,
+                    processor=decompress_zstd,
+                    progressbar=False,
+                ),
+                retrieve(
+                    url=url,
+                    known_hash=f"sha256:{compressed_hash}",
+                    path=tmp_path,
+                    processor=decompress_zstd,
+                    progressbar=False,
+                ),
+            )
+
+            # Both should return the same decompressed path
+            assert results[0] == results[1]
+            assert results[0].name == "concurrent.txt"
+            assert results[0].read_bytes() == original
+
+    async def test_concurrent_same_url_no_processor(self, tmp_path: Path):
+        """Two concurrent retrieve() without processor should not corrupt the file."""
+        content = b"concurrent download no processor"
+        content_hash = bytes_hash(content)
+        url = "https://example.com/concurrent-plain.txt"
+
+        with aioresponses() as m:
+            for _ in range(2):
+                m.get(url, body=content)
+
+            results = await asyncio.gather(
+                retrieve(
+                    url=url,
+                    known_hash=f"sha256:{content_hash}",
+                    path=tmp_path,
+                    progressbar=False,
+                ),
+                retrieve(
+                    url=url,
+                    known_hash=f"sha256:{content_hash}",
+                    path=tmp_path,
+                    progressbar=False,
+                ),
+            )
+
+            assert results[0] == results[1]
+            assert results[0].read_bytes() == content
+
+    async def test_concurrent_different_urls_not_serialized(self, tmp_path: Path):
+        """Concurrent retrieves of different URLs should run in parallel."""
+        content_a = b"file A content"
+        content_b = b"file B content"
+        hash_a = bytes_hash(content_a)
+        hash_b = bytes_hash(content_b)
+
+        with aioresponses() as m:
+            m.get("https://example.com/a.txt", body=content_a)
+            m.get("https://example.com/b.txt", body=content_b)
+
+            results = await asyncio.gather(
+                retrieve(
+                    url="https://example.com/a.txt",
+                    known_hash=f"sha256:{hash_a}",
+                    path=tmp_path,
+                    progressbar=False,
+                ),
+                retrieve(
+                    url="https://example.com/b.txt",
+                    known_hash=f"sha256:{hash_b}",
+                    path=tmp_path,
+                    progressbar=False,
+                ),
+            )
+
+            assert results[0].name == "a.txt"
+            assert results[1].name == "b.txt"
+            assert results[0].read_bytes() == content_a
+            assert results[1].read_bytes() == content_b
+
+    async def test_concurrent_first_fails_second_succeeds(self, tmp_path: Path):
+        """When one concurrent retrieve fails, the other should still succeed."""
+        content = b"success content"
+        content_hash = bytes_hash(content)
+        url_fail = "https://example.com/fail.txt"
+        url_ok = "https://example.com/ok.txt"
+
+        with aioresponses() as m:
+            # fail.txt always returns 500 (all 3 retry attempts)
+            for _ in range(3):
+                m.get(url_fail, status=500)
+            m.get(url_ok, body=content)
+
+            results = await asyncio.gather(
+                retrieve(url=url_fail, known_hash="sha256:abc123", path=tmp_path, progressbar=False),
+                retrieve(url=url_ok, known_hash=f"sha256:{content_hash}", path=tmp_path, progressbar=False),
+                return_exceptions=True,
+            )
+
+            # First should fail with AssetDownloadError
+            assert isinstance(results[0], AssetDownloadError)
+            # Second should succeed
+            assert isinstance(results[1], Path)
+            assert results[1].read_bytes() == content
