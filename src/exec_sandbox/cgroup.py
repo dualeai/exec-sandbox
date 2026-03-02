@@ -561,9 +561,16 @@ def wrap_with_ulimit(cmd: list[str], cgroup_memory_mb: int) -> list[str]:
     Used as fallback when cgroups are unavailable (Docker Desktop, macOS).
 
     Platform-specific limits:
-    - Linux: -v (virtual memory), -t (CPU time), -u (max processes)
-    - macOS: -u (max processes) only - virtual memory not supported by kernel,
-             and -t (CPU time) breaks subprocess stdout pipe
+    - Linux: -v (virtual memory), -t (CPU time)
+    - macOS: no limits (virtual memory not supported, CPU time breaks pipes)
+
+    Note: ``ulimit -u`` (RLIMIT_NPROC) is intentionally NOT set here.
+    Unlike cgroup ``pids.max`` (which is per-cgroup, per-VM), RLIMIT_NPROC is
+    per-UID: ALL processes under the same UID share a single counter.  Setting
+    it to 256 (the per-VM cgroup pids limit) caused ``qemu_thread_create:
+    Resource temporarily unavailable`` at ~23 concurrent VMs because
+    23 QEMUs x 12 threads = 276 > 256.  The system's default RLIMIT_NPROC
+    (typically 126K+ on Linux, 2784 on macOS) already prevents fork bombs.
 
     Args:
         cmd: Original command
@@ -583,15 +590,17 @@ def wrap_with_ulimit(cmd: list[str], cgroup_memory_mb: int) -> list[str]:
 
     # Platform-specific limits based on kernel support
     if detect_host_os() == HostOS.MACOS:
-        # macOS: Use process limit (-u) only
+        # macOS: No ulimit controls available
         # - Virtual memory (-v) not supported by macOS kernel (setrlimit fails)
         # - CPU time (-t) breaks subprocess stdout pipe on macOS (QEMU output lost)
-        # Note: -u requires bash (POSIX sh doesn't support it)
-        shell_cmd = f"ulimit -u {CGROUP_PIDS_LIMIT} && exec {cmd_str}"
+        # - Process limit (-u / RLIMIT_NPROC) is per-UID, not per-process — cannot
+        #   provide per-VM isolation. Rely on system default.
+        shell_cmd = f"exec {cmd_str}"
     else:
-        # Linux: Full resource limits
+        # Linux: Virtual memory and CPU time limits only
         # - Virtual memory (-v) is the primary memory control
-        # - CPU time (-t) and processes (-u) as safety nets
-        shell_cmd = f"ulimit -v {virtual_mem_kb} && ulimit -t {ULIMIT_CPU_TIME_SECONDS} && ulimit -u {CGROUP_PIDS_LIMIT} && exec {cmd_str}"
+        # - CPU time (-t) as safety net for runaway VMs
+        # - No -u (RLIMIT_NPROC): per-UID, not per-process — see docstring
+        shell_cmd = f"ulimit -v {virtual_mem_kb} && ulimit -t {ULIMIT_CPU_TIME_SECONDS} && exec {cmd_str}"
 
     return ["bash", "-c", shell_cmd]

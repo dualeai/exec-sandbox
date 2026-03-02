@@ -58,6 +58,7 @@ from exec_sandbox.package_validator import PackageValidator
 from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
+from exec_sandbox.system_probes import raise_fd_limit, warn_overcommit
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.warm_vm_pool import WarmVMPool
 
@@ -129,6 +130,12 @@ class Scheduler:
         """
         if self._started:
             raise SandboxError("Scheduler already started")
+
+        # Raise fd soft limit before creating any VMs. Each VM needs ~7-10 fds
+        # from the orchestrator (subprocess pipes, sockets, lock files). The
+        # default soft limit of 1024 causes SIGABRT at ~85 concurrent VMs.
+        raise_fd_limit()
+        warn_overcommit()
 
         logger.info(
             "Starting scheduler",

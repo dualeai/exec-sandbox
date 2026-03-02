@@ -11,6 +11,7 @@ import re
 import sys
 from collections.abc import Callable, Coroutine
 from functools import wraps
+from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
 import aiofiles
@@ -40,7 +41,111 @@ __all__ = [
     "probe_qemu_accelerators",
     "probe_qemu_version",
     "probe_unshare_support",
+    "raise_fd_limit",
+    "warn_overcommit",
 ]
+
+# ============================================================================
+# File Descriptor Limit Tuning
+# ============================================================================
+
+# Minimum recommended fd limit for running many concurrent VMs.
+# Each VM needs ~7-10 fds from the orchestrator process (QEMU subprocess pipes,
+# gvproxy subprocess pipes, vsock, lock files). With 100 VMs, the default
+# soft limit of 1024 is exhausted at ~85 VMs, causing QEMU SIGABRT with
+# "qemu_thread_create: Resource temporarily unavailable".
+_MIN_RECOMMENDED_FD_LIMIT = 8192
+
+
+def raise_fd_limit() -> None:
+    """Raise the soft file descriptor limit to the hard limit (no privileges needed).
+
+    On most Linux/macOS systems, the default soft limit is 1024 (inherited from
+    ancient ``select()`` compat) while the hard limit is much higher (e.g., 524288
+    on Debian, 1048576 on Ubuntu). Each QEMU VM consumes ~7-10 fds from the
+    orchestrator process for subprocess pipes, sockets, and lock files.
+
+    At 100 concurrent VMs the default 1024 soft limit is exhausted, causing QEMU
+    to die with SIGABRT ("qemu_thread_create: Resource temporarily unavailable").
+
+    This follows the same pattern as Go 1.19+ which automatically raises
+    ``RLIMIT_NOFILE`` soft to hard at runtime startup (go#46279).
+
+    POSIX guarantees that any unprivileged process can raise its soft limit up to
+    the hard limit — no root/``CAP_SYS_RESOURCE`` needed. Only raising the hard
+    limit requires privileges.
+
+    Called once during Scheduler startup, before any VMs are created.
+    """
+    import resource  # noqa: PLC0415
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft >= hard:
+            logger.debug("fd limit already at maximum", extra={"soft": soft, "hard": hard})
+            return
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        logger.info(
+            "Raised fd soft limit to hard limit",
+            extra={"old_soft": soft, "new_soft": hard, "hard": hard},
+        )
+
+        if hard < _MIN_RECOMMENDED_FD_LIMIT:
+            logger.warning(
+                "Hard fd limit is low — high-concurrency workloads (>50 VMs) may hit fd exhaustion. "
+                "Raise with: ulimit -n 65536 (or set in /etc/security/limits.conf)",
+                extra={"hard": hard, "recommended_min": _MIN_RECOMMENDED_FD_LIMIT},
+            )
+    except (ValueError, OSError) as e:
+        # Not fatal — log and continue. Worst case: QEMU dies under high concurrency
+        # and the existing retry logic handles it.
+        logger.warning("Failed to raise fd limit", extra={"error": str(e)})
+
+
+# ============================================================================
+# Virtual Memory Overcommit Check
+# ============================================================================
+
+
+def warn_overcommit() -> None:
+    """Warn if Linux ``vm.overcommit_memory=0`` (heuristic mode) is active.
+
+    With heuristic overcommit (mode 0, the default), the kernel may reject
+    ``mmap`` calls for QEMU thread stacks during burst VM startup, even when
+    the system has ample free RAM.  glibc converts the resulting ``ENOMEM``
+    to ``EAGAIN``, which QEMU treats as fatal (``abort()`` with zero retry).
+    This manifests as ``qemu_thread_create: Resource temporarily unavailable``.
+
+    Setting ``vm.overcommit_memory=1`` ("always allow") eliminates the
+    heuristic check.  The OOM killer remains as the backstop, which is
+    appropriate for ephemeral VM workloads.
+
+    Empirically, switching from mode 0 to 1 reduced 100-VM burst failures
+    from 14 % to 1 % on a 16-core / 32 GB EC2 instance.
+
+    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    """
+    if sys.platform != "linux":
+        return
+
+    try:
+        overcommit = int(Path("/proc/sys/vm/overcommit_memory").read_text().strip())
+    except (OSError, ValueError):
+        return  # /proc not available or unreadable — skip silently
+
+    if overcommit == 0:
+        logger.warning(
+            "vm.overcommit_memory=0 (heuristic) — QEMU thread creation may fail under "
+            "burst VM startup. Set to 1 for reliable high-concurrency operation: "
+            "sudo sysctl -w vm.overcommit_memory=1",
+            extra={"current": overcommit, "recommended": 1},
+        )
+
+
+# ============================================================================
+# Probe Cache
+# ============================================================================
 
 # Sentinel value for "not yet cached" (distinguishes from None results)
 _NOT_CACHED: Any = object()
