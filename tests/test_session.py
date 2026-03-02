@@ -41,7 +41,10 @@ class TestSessionNormal:
     async def test_python_variable_persistence(self, scheduler: Scheduler) -> None:
         """Python variables persist across exec calls."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("print(x)")
             assert result.exit_code == 0
             assert "42" in result.stdout
@@ -49,7 +52,10 @@ class TestSessionNormal:
     async def test_python_import_persistence(self, scheduler: Scheduler) -> None:
         """Python imports persist across exec calls."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("import json")
+            setup = await session.exec("import json")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec('print(json.dumps({"a": 1}))')
             assert result.exit_code == 0
             assert '{"a": 1}' in result.stdout
@@ -57,7 +63,10 @@ class TestSessionNormal:
     async def test_python_function_persistence(self, scheduler: Scheduler) -> None:
         """Python function definitions persist across exec calls."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec('def greet(n): return f"hi {n}"')
+            setup = await session.exec('def greet(n): return f"hi {n}"')
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec('print(greet("alice"))')
             assert result.exit_code == 0
             assert "hi alice" in result.stdout
@@ -65,7 +74,10 @@ class TestSessionNormal:
     async def test_python_class_persistence(self, scheduler: Scheduler) -> None:
         """Python class definitions persist across exec calls."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec('class Dog:\n  sound="woof"')
+            setup = await session.exec('class Dog:\n  sound="woof"')
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("print(Dog.sound)")
             assert result.exit_code == 0
             assert "woof" in result.stdout
@@ -73,10 +85,15 @@ class TestSessionNormal:
     async def test_python_accumulate_state(self, scheduler: Scheduler) -> None:
         """Python state accumulates across multiple exec calls."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("items = []")
-            await session.exec("items.append(1)")
-            await session.exec("items.append(1)")
-            await session.exec("items.append(1)")
+            setup = await session.exec("items = []")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
+            for _ in range(3):
+                r = await session.exec("items.append(1)")
+                assert r.exit_code == 0, (
+                    f"append exec timed out or failed: exit_code={r.exit_code}, stderr={r.stderr!r}"
+                )
             result = await session.exec("print(len(items))")
             assert result.exit_code == 0
             assert "3" in result.stdout
@@ -84,7 +101,10 @@ class TestSessionNormal:
     async def test_js_variable_persistence(self, scheduler: Scheduler) -> None:
         """JavaScript variables persist across exec calls."""
         async with await scheduler.session(language=Language.JAVASCRIPT) as session:
-            await session.exec("var x = 42;")
+            setup = await session.exec("var x = 42;")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("console.log(x);")
             assert result.exit_code == 0
             assert "42" in result.stdout
@@ -92,7 +112,10 @@ class TestSessionNormal:
     async def test_js_function_persistence(self, scheduler: Scheduler) -> None:
         """JavaScript function definitions persist across exec calls."""
         async with await scheduler.session(language=Language.JAVASCRIPT) as session:
-            await session.exec("function greet(n) { return 'hi ' + n; }")
+            setup = await session.exec("function greet(n) { return 'hi ' + n; }")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("console.log(greet('bob'));")
             assert result.exit_code == 0
             assert "hi bob" in result.stdout
@@ -100,7 +123,10 @@ class TestSessionNormal:
     async def test_ts_typed_variable_persistence(self, scheduler: Scheduler) -> None:
         """TypeScript typed variables persist across exec calls."""
         async with await scheduler.session(language=Language.JAVASCRIPT) as session:
-            await session.exec("let x: number = 10;")
+            setup = await session.exec("let x: number = 10;")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("console.log(x + 1);")
             assert result.exit_code == 0
             assert "11" in result.stdout
@@ -108,8 +134,14 @@ class TestSessionNormal:
     async def test_ts_interface_reuse_across_execs(self, scheduler: Scheduler) -> None:
         """TypeScript interface defined in one exec is usable in the next."""
         async with await scheduler.session(language=Language.JAVASCRIPT) as session:
-            await session.exec("interface Item { name: string; qty: number }")
-            await session.exec("function describe(i: Item): string { return `${i.name}:${i.qty}`; }")
+            s1 = await session.exec("interface Item { name: string; qty: number }")
+            assert s1.exit_code == 0, (
+                f"interface exec timed out or failed: exit_code={s1.exit_code}, stderr={s1.stderr!r}"
+            )
+            s2 = await session.exec("function describe(i: Item): string { return `${i.name}:${i.qty}`; }")
+            assert s2.exit_code == 0, (
+                f"function exec timed out or failed: exit_code={s2.exit_code}, stderr={s2.stderr!r}"
+            )
             result = await session.exec('console.log(describe({ name: "apple", qty: 3 }));')
             assert result.exit_code == 0
             assert "apple:3" in result.stdout
@@ -117,7 +149,10 @@ class TestSessionNormal:
     async def test_shell_env_var_persistence(self, scheduler: Scheduler) -> None:
         """Shell environment variables persist across exec calls."""
         async with await scheduler.session(language=Language.RAW) as session:
-            await session.exec("export FOO=bar")
+            setup = await session.exec("export FOO=bar")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("echo $FOO")
             assert result.exit_code == 0
             assert "bar" in result.stdout
@@ -125,7 +160,10 @@ class TestSessionNormal:
     async def test_shell_cwd_persistence(self, scheduler: Scheduler) -> None:
         """Shell working directory persists across exec calls."""
         async with await scheduler.session(language=Language.RAW) as session:
-            await session.exec("cd /tmp")
+            setup = await session.exec("cd /tmp")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("pwd")
             assert result.exit_code == 0
             assert "/tmp" in result.stdout
@@ -133,7 +171,10 @@ class TestSessionNormal:
     async def test_shell_function_persistence(self, scheduler: Scheduler) -> None:
         """Shell function definitions persist across exec calls."""
         async with await scheduler.session(language=Language.RAW) as session:
-            await session.exec('greet() { echo "hi $1"; }')
+            setup = await session.exec('greet() { echo "hi $1"; }')
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("greet alice")
             assert result.exit_code == 0
             assert "hi alice" in result.stdout
@@ -151,11 +192,14 @@ class TestSessionNormal:
         """exec_count tracks successful executions."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             assert session.exec_count == 0
-            await session.exec("print(1)")
+            r1 = await session.exec("print(1)")
+            assert r1.exit_code == 0, f"exec timed out or failed: exit_code={r1.exit_code}, stderr={r1.stderr!r}"
             assert session.exec_count == 1
-            await session.exec("print(2)")
+            r2 = await session.exec("print(2)")
+            assert r2.exit_code == 0, f"exec timed out or failed: exit_code={r2.exit_code}, stderr={r2.stderr!r}"
             assert session.exec_count == 2
-            await session.exec("print(3)")
+            r3 = await session.exec("print(3)")
+            assert r3.exit_code == 0, f"exec timed out or failed: exit_code={r3.exit_code}, stderr={r3.stderr!r}"
             assert session.exec_count == 3
 
     async def test_streaming_callbacks(self, scheduler: Scheduler) -> None:
@@ -219,7 +263,10 @@ class TestSessionEdgeCases:
         """Non-zero exit code doesn't close the session."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             result = await session.exec("raise ValueError('test')")
-            assert result.exit_code != 0
+            assert result.exit_code == 1, (
+                f"expected ValueError (exit_code=1), got exit_code={result.exit_code}, stderr={result.stderr!r}"
+            )
+            assert "ValueError" in result.stderr
             # Session still alive
             result = await session.exec('print("alive")')
             assert result.exit_code == 0
@@ -228,9 +275,15 @@ class TestSessionEdgeCases:
     async def test_nonzero_exit_preserves_state(self, scheduler: Scheduler) -> None:
         """State survives across an error."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("raise ValueError('boom')")
-            assert result.exit_code != 0
+            assert result.exit_code == 1, (
+                f"expected ValueError (exit_code=1), got exit_code={result.exit_code}, stderr={result.stderr!r}"
+            )
+            assert "ValueError" in result.stderr
             result = await session.exec("print(x)")
             assert result.exit_code == 0
             assert "42" in result.stdout
@@ -238,7 +291,10 @@ class TestSessionEdgeCases:
     async def test_sys_exit_preserves_state(self, scheduler: Scheduler) -> None:
         """sys.exit() is caught by wrapper, state preserved."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 99")
+            setup = await session.exec("x = 99")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("import sys; sys.exit(0)")
             # SystemExit caught by wrapper
             result = await session.exec("print(x)")
@@ -248,9 +304,15 @@ class TestSessionEdgeCases:
     async def test_syntax_error_preserves_state(self, scheduler: Scheduler) -> None:
         """SyntaxError doesn't destroy state."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("def broken(")
-            assert result.exit_code != 0
+            assert result.exit_code == 1, (
+                f"expected SyntaxError (exit_code=1), got exit_code={result.exit_code}, stderr={result.stderr!r}"
+            )
+            assert "SyntaxError" in result.stderr
             result = await session.exec("print(x)")
             assert result.exit_code == 0
             assert "42" in result.stdout
@@ -258,7 +320,10 @@ class TestSessionEdgeCases:
     async def test_code_validation_error_preserves_session(self, scheduler: Scheduler) -> None:
         """CodeValidationError doesn't close the session — caller can retry."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             with pytest.raises(CodeValidationError):
                 await session.exec("")  # empty code → CodeValidationError
             # Session still alive and state preserved
@@ -269,7 +334,10 @@ class TestSessionEdgeCases:
     async def test_overwrite_variable(self, scheduler: Scheduler) -> None:
         """Variables can be overwritten."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 1")
+            setup = await session.exec("x = 1")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("x = 2; print(x)")
             assert result.exit_code == 0
             assert "2" in result.stdout
@@ -322,7 +390,10 @@ class TestSessionWeirdCases:
         """Unicode variable names and multi-byte UTF-8 code work."""
         async with await scheduler.session(language=Language.PYTHON) as session:
             # Use actual multi-byte UTF-8 (café has 2-byte é) to test byte-count protocol
-            await session.exec("café = 42")
+            setup = await session.exec("café = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             result = await session.exec("print(café)")
             assert result.exit_code == 0
             assert "42" in result.stdout
@@ -330,7 +401,10 @@ class TestSessionWeirdCases:
     async def test_os_exit_kills_repl(self, scheduler: Scheduler) -> None:
         """os._exit() kills REPL, next exec works with fresh state."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             # os._exit() kills the REPL process immediately
             result = await session.exec("import os; os._exit(1)")
             # REPL respawned, x is gone
@@ -341,11 +415,14 @@ class TestSessionWeirdCases:
     async def test_background_thread_survives(self, scheduler: Scheduler) -> None:
         """Background daemon thread doesn't interfere with session."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec(
+            setup = await session.exec(
                 "import threading, time\n"
                 "def bg(): time.sleep(60)\n"
                 "t = threading.Thread(target=bg, daemon=True)\n"
                 "t.start()"
+            )
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
             )
             result = await session.exec('print("ok")')
             assert result.exit_code == 0
@@ -609,7 +686,10 @@ class TestSessionOutOfBounds:
         assertions — works under TCG but too slow for the default suite.
         """
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             # SIGKILL mirrors what the OOM killer does
             result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
             assert result.exit_code == 137  # 128 + 9 (SIGKILL)
@@ -710,7 +790,10 @@ class TestSessionReconnect:
     async def test_state_survives_reconnect(self, scheduler: Scheduler) -> None:
         """State persists across guest agent reconnect (~13s idle)."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 42")
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             # Wait for guest agent reconnect cycle
             await asyncio.sleep(13)
             result = await session.exec("print(x)")
@@ -721,9 +804,13 @@ class TestSessionReconnect:
     async def test_multiple_reconnects_preserve_state(self, scheduler: Scheduler) -> None:
         """State persists across multiple reconnect cycles."""
         async with await scheduler.session(language=Language.PYTHON) as session:
-            await session.exec("x = 1")
+            setup = await session.exec("x = 1")
+            assert setup.exit_code == 0, (
+                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
+            )
             await asyncio.sleep(13)
-            await session.exec("x += 1")
+            r = await session.exec("x += 1")
+            assert r.exit_code == 0, f"increment exec timed out or failed: exit_code={r.exit_code}, stderr={r.stderr!r}"
             await asyncio.sleep(13)
             result = await session.exec("print(x)")
             assert result.exit_code == 0
