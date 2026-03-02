@@ -1473,6 +1473,7 @@ console.log("output=" + result.code.trim());
         ["esbuild=0.25.4", "output=const x = 1;"],
         None,
         id="js-esbuild",
+        marks=skip_unless_hwaccel,  # npm install with native binary exceeds 940s under TCG
     ),
 ]
 
