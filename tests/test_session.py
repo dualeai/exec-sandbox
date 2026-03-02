@@ -355,12 +355,13 @@ class TestSessionEdgeCases:
                 result = await session.exec(f"print({i})")
                 assert result.exit_code == 0
 
-    @pytest.mark.slow
+    @skip_unless_hwaccel  # pip install routinely exceeds 940s under TCG
     async def test_session_with_packages(self, scheduler: Scheduler) -> None:
         """Session with pre-installed packages works.
 
-        Slow under TCG: correctness test — snapshot VM may be slow under
-        TCG but should succeed with sufficient timeout.
+        Requires hwaccel: pip install in a snapshot VM routinely exceeds the
+        940s total timeout (3 x 308s attempts) under TCG software emulation,
+        especially with concurrent load on CI runners.
         """
         async with await scheduler.session(
             language=Language.PYTHON,
