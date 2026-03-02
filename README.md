@@ -412,7 +412,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `s3_region` | us-east-1 | AWS region |
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
-| `memory_overcommit_ratio` | 1.5 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
+| `memory_overcommit_ratio` | 3.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
 | `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
 | `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
@@ -420,6 +420,43 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
 Environment variables: `EXEC_SANDBOX_IMAGES_DIR`, `EXEC_SANDBOX_CACHE_DIR`, `EXEC_SANDBOX_OFFLINE`, etc.
+
+## Performance
+
+Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) using a mixed workload of Python, JavaScript, and shell commands.
+
+### Concurrent Throughput
+
+200 VMs fired simultaneously per configuration, 16 overcommit combinations swept. Latency is split into **setup** (admission queue + overlay) and **exec** (VM boot + code execution):
+
+| Config | VMs/s | Setup p50/p95 | Exec p50/p95 | Total p50/p95 | Peak RSS | Efficiency |
+|--------|-------|---------------|--------------|---------------|----------|------------|
+| CPU=4x MEM=3x (default) | **36.6** | 2.7s / 4.3s | 61ms / 117ms | **2.9s / 4.4s** | 5.3 GB (17%) | 212 |
+| CPU=2x MEM=8x | 39.1 | 2.5s / 4.6s | 57ms / 71ms | 2.7s / 4.7s | 2.1 GB (7%) | 581 |
+| CPU=8x MEM=3x | 32.9 | 2.6s / 4.9s | 88ms / 571ms | 3.7s / 5.0s | 9.7 GB (32%) | 105 |
+| CPU=12x MEM=3x | 23.0 | 5.6s / 7.1s | 145ms / 595ms | 6.5s / 7.2s | 16.8 GB (55%) | 42 |
+
+**Exec latency** (boot + execute) is only 56-145ms p50 — the admission queue dominates total latency under burst load. **Efficiency** = throughput / RSS fraction (higher is better). The defaults (CPU=4x, MEM=3x) balance throughput and exec latency; CPU=2x MEM=8x is the most memory-efficient. Beyond 4x CPU, exec p95 spikes (117ms → 571ms) and throughput degrades.
+
+All 16 configurations achieved **100% success rate** (3,200/3,200 VMs).
+
+### Single VM Latency
+
+| Path | Time to First Exec |
+|------|--------------------|
+| Warm pool hit | 1-2ms |
+| L1 memory snapshot | ~100ms |
+| Cold boot (KVM) | ~400ms boot + 4-5s REPL |
+| Cold boot (HVF/macOS) | ~400ms boot + 4-11s REPL |
+
+### Tuning
+
+The defaults were determined by a Pareto-optimal sweep (`scripts/benchmark_burst.py`). Re-run after changing VM sizing, admission logic, or target hardware:
+
+```bash
+make bench-sweep              # 200 VMs per combo (4x4 grid = 16 combos)
+make bench-sweep N_VMS=500    # heavier load
+```
 
 ## Memory Optimization
 
@@ -764,6 +801,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 | cloudpickle | 3.1.2 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
 
 **Usage notes:**
+
 - Use `uv pip install` instead of `pip install` (pip not included)
 - Python 3.14 includes t-strings, deferred annotations, free-threading support
 - `multiprocessing.Pool` works out of the box — cloudpickle handles serialization of REPL-defined functions, lambdas, and closures. Single vCPU means no CPU-bound speedup, but I/O-bound parallelism and `Pool`-based APIs work correctly
@@ -775,6 +813,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 | Bun | 1.3 | Runtime, bundler, package manager ([docs](https://bun.com/docs)) |
 
 **Usage notes:**
+
 - Bun is a Node.js-compatible runtime (not Node.js itself)
 - Built-in TypeScript/JSX support, no transpilation needed
 - Use `bun install` for packages, `bun run` for scripts
@@ -783,6 +822,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 ### Raw Image
 
 Minimal Alpine Linux with common tools only. Use for:
+
 - Shell script execution (`language="raw"`) — runs under **GNU Bash**, full bash syntax supported
 - Custom runtime installation
 - Lightweight workloads

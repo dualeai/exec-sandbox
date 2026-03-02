@@ -172,6 +172,14 @@ bench:
 bench-pool:
 	uv run python scripts/benchmark_latency.py -n 10 --pool 8
 
+# 2D overcommit sweep — finds Pareto-optimal (CPU_OC, MEM_OC) configs.
+# Fires N VMs per combo across a 4x4 grid, ranks by Sharpe-like efficiency
+# (throughput / RSS fraction), and reports the efficient frontier.
+# Run on a KVM-capable host for production-representative results.
+# Usage: make bench-sweep [N_VMS=200]
+bench-sweep:
+	uv run --script scripts/benchmark_burst.py $(if $(N_VMS),-n $(N_VMS),)
+
 # ============================================================================
 # Flamegraph Profiling (requires sudo on macOS)
 # ============================================================================
