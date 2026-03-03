@@ -412,7 +412,7 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `s3_region` | us-east-1 | AWS region |
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
-| `memory_overcommit_ratio` | 2.9 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
+| `memory_overcommit_ratio` | 8.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
 | `cpu_overcommit_ratio` | 2.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
 | `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
@@ -427,19 +427,19 @@ Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) us
 
 ### Concurrent Throughput
 
-500 VMs fired simultaneously per configuration, 16 overcommit combinations swept. Latency is split into **setup** (admission queue + overlay) and **exec** (VM boot + code execution):
+500 VMs per config, 16 overcommit combos. **Admission** = queue wait, **Setup** = overlay + cgroup, **Exec** = VM boot + code run:
 
-| Config | VMs/s | Setup p50/p95 | Exec p50/p95 | Total p50/p95 | Peak RSS | Efficiency |
-|--------|-------|---------------|--------------|---------------|----------|------------|
-| CPU=2x MEM=3x (≈default) | **35.9** | 7.3s / 12.9s | 57ms / 73ms | **7.4s / 13.1s** | 2.4 GB (7.8%) | 463 |
-| CPU=2x MEM=1.5x | 35.9 | 6.9s / 13.0s | 57ms / 71ms | 7.1s / 13.2s | 2.5 GB (8.0%) | 448 |
-| CPU=4x MEM=5x | 35.7 | 7.1s / 12.7s | 63ms / 87ms | 7.3s / 12.8s | 4.9 GB (15.6%) | 229 |
-| CPU=8x MEM=3x | 35.1 | 7.6s / 12.8s | 73ms / 142ms | 7.9s / 12.9s | 10.7 GB (33.8%) | 104 |
-| CPU=12x MEM=8x | 1.4 | 66.7s / 133.1s | 8.3s / 48.5s | 127.1s / 140.9s | 22.1 GB (70.0%) | 2 |
+| Config | VMs/s | Admit p50/p95 | Setup p50/p95 | Exec p50/p95 | Total p50/p95 | Peak RSS | Efficiency |
+|--------|-------|---------------|---------------|--------------|---------------|----------|------------|
+| CPU=2x MEM=8x (default) | **39.0** | 5.7s / 11.0s | 344ms / 921ms | 57ms / 71ms | **6.3s / 11.5s** | 2.2 GB (7.0%) | 1116 |
+| CPU=2x MEM=3x | 39.0 | 5.8s / 11.0s | 367ms / 938ms | 57ms / 71ms | 6.3s / 11.5s | 2.6 GB (8.1%) | 1110 |
+| CPU=4x MEM=5x | 39.1 | 5.2s / 10.3s | 902ms / 1.4s | 63ms / 103ms | 6.3s / 11.4s | 5.8 GB (18.4%) | 867 |
+| CPU=8x MEM=3x | 37.1 | 5.3s / 10.5s | 1.7s / 2.5s | 100ms / 370ms | 7.4s / 12.0s | 10.2 GB (32.4%) | 470 |
+| CPU=12x MEM=8x | 27.8 | 8.4s / 14.8s | 2.6s / 7.1s | 182ms / 587ms | 12.1s / 15.6s | 16.9 GB (53.6%) | 253 |
 
-**Exec latency** (boot + execute) is only 57-73ms p50 at the optimal config — the admission queue dominates total latency under burst load. **Efficiency** = throughput / RSS fraction (higher is better). The defaults (CPU=2x, MEM=2.9x) were determined by RBF surrogate optimization, predicting optimal efficiency at CPU=2.0, MEM=2.9 (464 VMs/s per RSS-fraction). Beyond 2x CPU, RSS grows sharply (8% → 18% → 36% → 52%) while throughput stays flat (~35 VMs/s), and at 12x the system OOMs under sustained load.
+Exec latency is only 57ms p50 at the optimal config — admission dominates under burst load. **Efficiency** = 10⁶ / geomean(admission, setup, exec) p95; higher is better. Beyond CPU=2x, setup and exec degrade sharply while throughput stays flat. 13/16 configs achieved 100% success (7,995/8,000 VMs).
 
-15/16 configurations achieved **100% success rate** (7,707/8,000 VMs). Only CPU=12x MEM=8x failed (41% success — OOM at 70% RSS).
+> **Production sizing.** The 11s admission p95 is specific to this stress test (500 VMs on 24 slots). When `concurrent_requests ≤ max_slots`, admission is **0ms**. Scale horizontally — add hosts so that `max_slots ≥ peak_concurrency`, don't increase overcommit.
 
 ### Single VM Latency
 
@@ -452,7 +452,7 @@ Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) us
 
 ### Tuning
 
-The defaults were determined by RBF surrogate optimization over a 4×4 Pareto-optimal sweep (`scripts/benchmark_optimizer.py`). Re-run after changing VM sizing, admission logic, or target hardware:
+Re-run the optimizer after changing VM sizing, admission logic, or target hardware:
 
 ```bash
 make bench-optimizer              # 200 VMs per combo (4x4 grid = 16 combos)

@@ -6,15 +6,20 @@
 """Overcommit optimizer for exec-sandbox.
 
 Runs a 2D grid sweep over CPU and memory overcommit ratios, firing N VMs
-per combination.  Computes a Markowitz-inspired efficient frontier
-(Pareto-optimal configs on latency vs resource cost), ranks by a
-Sharpe-like efficiency score (throughput / RSS fraction), and optionally
-fits an RBF surrogate surface via scipy to predict the optimal beyond the
-sampled grid.
+per combination.  Optimizes across three latency dimensions:
+
+  admission_p95 — time blocked in the admission queue
+  setup_p95     — infra setup (overlay, cgroup)
+  exec_p95      — VM boot + code execution
+
+Computes a 3D Pareto front (non-dominated on all three), ranks by a
+latency efficiency score (10^6 / geometric mean of the three p95s, per
+Fleming & Wallace 1986 / SPEC convention), and fits an RBF surrogate
+surface via scipy to predict the optimal beyond the sampled grid.
 
 The sweep results inform the defaults in constants.py:
   DEFAULT_CPU_OVERCOMMIT_RATIO = 2.0
-  DEFAULT_MEMORY_OVERCOMMIT_RATIO = 2.9
+  DEFAULT_MEMORY_OVERCOMMIT_RATIO = 8.0
 
 Re-run after changing VM sizing, admission logic, or target hardware:
     make bench-optimizer              # 200 VMs per combo (default)
@@ -120,16 +125,16 @@ class BurstResult:
     n_ok: int
     n_fail: int
     wall_s: float
-    # Setup latency (admission-dominated)
-    setup_p50_ms: int
-    setup_p95_ms: int
-    # Admission queue latency (subset of setup, 0 for warm pool hits)
+    # Admission queue latency (0 for warm pool hits)
     admission_p50_ms: int
     admission_p95_ms: int
+    # Setup latency — infra only (cache + overlay + cgroup), excludes admission
+    setup_p50_ms: int
+    setup_p95_ms: int
     # Exec latency (boot + execute, hardware-dominated)
     exec_p50_ms: int
     exec_p95_ms: int
-    # Total (setup + boot + execute + teardown)
+    # Total (admission + setup + boot + execute + teardown)
     total_p50_ms: int
     total_p95_ms: int
     # System pressure
@@ -153,17 +158,23 @@ class BurstResult:
 
     @property
     def efficiency(self) -> float:
-        """Sharpe-like ratio: throughput / resource cost.
+        """Latency efficiency: 10^6 / geometric mean of p95 tail latencies.
 
-        Higher is better -- more VMs completed per unit of memory consumed.
-        Returns NaN when RSS is unmeasured (monitor gap) so the result is
-        excluded from ranking and surrogate training rather than silently
-        scoring zero alongside all-failed configs.
+        Uses the geometric mean of (admission_p95, setup_p95, exec_p95) so
+        equal-percentage improvements in any dimension contribute equally,
+        regardless of absolute scale (admission ~10s, setup ~1s, exec ~70ms).
+        This follows the Fleming & Wallace (1986) / SPEC convention for
+        combining benchmark metrics: geomean is normalization-invariant.
+
+        Formula: efficiency = 10^6 / (admission * setup * exec)^(1/3)
+
+        Higher is better.  Returns NaN when any p95 is zero (degenerate
+        burst with no successful VMs).
         """
-        if self.rss_fraction <= 0:
-            # RSS unmeasured (monitor gap) or no memory used — cannot compute.
-            return float("nan") if self.n_ok > 0 else 0.0
-        return self.throughput / self.rss_fraction
+        a, s, e = self.admission_p95_ms, self.setup_p95_ms, self.exec_p95_ms
+        if a <= 0 or s <= 0 or e <= 0:
+            return float("nan")
+        return 1_000_000 / (a * s * e) ** (1 / 3)
 
 
 def _build_task_list(n: int) -> list[tuple[Language, str]]:
@@ -367,10 +378,10 @@ async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float) -> BurstResult:
         n_ok=len(ok_results),
         n_fail=n_vms - len(ok_results),
         wall_s=wall_elapsed,
-        setup_p50_ms=_percentile(setup_sorted, 50),
-        setup_p95_ms=_percentile(setup_sorted, 95),
         admission_p50_ms=_percentile(admission_sorted, 50),
         admission_p95_ms=_percentile(admission_sorted, 95),
+        setup_p50_ms=_percentile(setup_sorted, 50),
+        setup_p95_ms=_percentile(setup_sorted, 95),
         exec_p50_ms=_percentile(exec_sorted, 50),
         exec_p95_ms=_percentile(exec_sorted, 95),
         total_p50_ms=_percentile(e2e_sorted, 50),
@@ -387,16 +398,16 @@ async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float) -> BurstResult:
 
 
 def _pareto_front(results: list[BurstResult]) -> set[tuple[float, float]]:
-    """Non-dominated sorting on (minimize exec_p95, minimize RSS fraction).
+    """3D non-dominated sorting on (admission_p95, setup_p95, exec_p95).
 
-    Uses exec latency (boot + execute) rather than total, so admission queue
-    contention doesn't pollute the hardware efficiency frontier.
+    Finds configs where no other config is simultaneously better on all
+    three latency dimensions.  O(M*N^2) with M=3, N=16 combos — trivial.
 
     Only configs with 100% success participate — a config with failures should
     never appear on the efficient frontier regardless of survivor latency.
 
-    A point dominates another if it is <= on all objectives and strictly
-    < on at least one.  The Pareto front is the set of non-dominated points.
+    Dominance: b dominates a iff b <= a on all 3 objectives AND b < a on
+    at least one.  The Pareto front is the set of non-dominated points.
 
     Returns set of (cpu_oc, mem_oc) tuples on the Pareto front.
     """
@@ -407,11 +418,17 @@ def _pareto_front(results: list[BurstResult]) -> set[tuple[float, float]]:
         for b in candidates:
             if b is a:
                 continue
-            if (
-                b.exec_p95_ms <= a.exec_p95_ms
-                and b.rss_fraction <= a.rss_fraction
-                and (b.exec_p95_ms < a.exec_p95_ms or b.rss_fraction < a.rss_fraction)
-            ):
+            b_leq = (
+                b.admission_p95_ms <= a.admission_p95_ms
+                and b.setup_p95_ms <= a.setup_p95_ms
+                and b.exec_p95_ms <= a.exec_p95_ms
+            )
+            b_lt = (
+                b.admission_p95_ms < a.admission_p95_ms
+                or b.setup_p95_ms < a.setup_p95_ms
+                or b.exec_p95_ms < a.exec_p95_ms
+            )
+            if b_leq and b_lt:
                 dominated = True
                 break
         if not dominated:
@@ -426,14 +443,14 @@ def _print_ranking(results: list[BurstResult]) -> None:
     ranked = sorted(results, key=lambda r: -r.efficiency if math.isfinite(r.efficiency) else float("inf"))
 
     print(f"\n{'=' * 140}")
-    print("  EFFICIENT FRONTIER RANKING (Sharpe-like: throughput / RSS fraction)")
+    print("  LATENCY FRONTIER RANKING (10^6 / geomean(admission, setup, exec) p95)")
     print(f"{'=' * 140}")
     print(
         f"  {'Rank':>4}  {'CPU_OC':>6}  {'MEM_OC':>6}  {'OK%':>4}  {'VMs/s':>6}  "
-        f"{'RSS%':>5}  {'Effic':>7}  {'Pareto':>6}  "
-        f"{'setup50':>8}  {'setup95':>8}  {'admit50':>8}  {'admit95':>8}  "
+        f"{'Effic':>7}  {'Pareto':>6}  "
+        f"{'admit50':>8}  {'admit95':>8}  {'setup50':>8}  {'setup95':>8}  "
         f"{'exec50':>8}  {'exec95':>8}  "
-        f"{'total50':>8}  {'total95':>8}"
+        f"{'total50':>8}  {'total95':>8}  {'RSS%':>5}"
     )
     print(f"  {'─' * 138}")
 
@@ -442,12 +459,13 @@ def _print_ranking(results: list[BurstResult]) -> None:
         eff_str = f"{r.efficiency:7.1f}" if math.isfinite(r.efficiency) else "    n/a"
         print(
             f"  {rank:4d}  {r.cpu_oc:6.1f}  {r.mem_oc:6.1f}  {r.success_pct:3d}%  "
-            f"{r.throughput:6.1f}  {r.rss_fraction * 100:4.1f}%  {eff_str}  "
+            f"{r.throughput:6.1f}  {eff_str}  "
             f"{star:>6}  "
-            f"{r.setup_p50_ms:6d}ms  {r.setup_p95_ms:6d}ms  "
             f"{r.admission_p50_ms:6d}ms  {r.admission_p95_ms:6d}ms  "
+            f"{r.setup_p50_ms:6d}ms  {r.setup_p95_ms:6d}ms  "
             f"{r.exec_p50_ms:6d}ms  {r.exec_p95_ms:6d}ms  "
-            f"{r.total_p50_ms:6d}ms  {r.total_p95_ms:6d}ms"
+            f"{r.total_p50_ms:6d}ms  {r.total_p95_ms:6d}ms  "
+            f"{r.rss_fraction * 100:4.1f}%"
         )
 
     print(f"{'=' * 140}")
@@ -455,22 +473,22 @@ def _print_ranking(results: list[BurstResult]) -> None:
     # Pareto front explanation
     pareto_results = [r for r in ranked if (r.cpu_oc, r.mem_oc) in pareto]
     if pareto_results:
-        print("\n  ★ Pareto-optimal: no other config has BOTH lower exec p95 AND lower RSS")
-        for r in sorted(pareto_results, key=lambda r: r.exec_p95_ms):
+        print("\n  ★ Pareto-optimal: no other config is better on ALL of admission, setup, exec p95")
+        for r in sorted(pareto_results, key=lambda r: r.admission_p95_ms + r.setup_p95_ms + r.exec_p95_ms):
             print(
                 f"    CPU={r.cpu_oc:.0f}x MEM={r.mem_oc:.1f}x → "
-                f"exec_p95={r.exec_p95_ms}ms, setup_p95={r.setup_p95_ms}ms, "
-                f"admission_p95={r.admission_p95_ms}ms, "
-                f"RSS={r.rss_fraction * 100:.1f}%"
+                f"admit_p95={r.admission_p95_ms}ms  setup_p95={r.setup_p95_ms}ms  "
+                f"exec_p95={r.exec_p95_ms}ms  "
+                f"(geomean={int((r.admission_p95_ms * r.setup_p95_ms * r.exec_p95_ms) ** (1 / 3))}ms)"
             )
 
 
 def _surrogate_analysis(results: list[BurstResult]) -> None:
     """RBF surrogate surface + scipy.optimize to find predicted optimal.
 
-    Fits a radial basis function interpolant on the sampled grid, then
-    runs multi-start L-BFGS-B to locate the global maximum of the
-    efficiency surface.
+    Fits a radial basis function interpolant on the sampled grid using
+    the latency efficiency score (10^6 / geomean of p95 tail latencies),
+    then runs multi-start L-BFGS-B to locate the global maximum.
     """
     # Filter results with unmeasured RSS (NaN efficiency) — cannot train on them
     valid = [r for r in results if math.isfinite(r.efficiency)]
@@ -478,7 +496,7 @@ def _surrogate_analysis(results: list[BurstResult]) -> None:
         print(f"\n  (need >= 4 valid grid points for surrogate, got {len(valid)} -- skipping)")
         return
 
-    # Training data: (cpu_oc, mem_oc) -> efficiency
+    # Training data: (cpu_oc, mem_oc) -> latency efficiency
     coords = np.array([[r.cpu_oc, r.mem_oc] for r in valid])  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
     values = np.array([r.efficiency for r in valid])  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
@@ -523,15 +541,17 @@ def _print_surrogate_result(
     opt_cpu = float(x[0])  # type: ignore[reportUnknownArgumentType]
     opt_mem = float(x[1])  # type: ignore[reportUnknownArgumentType]
     print(f"    Predicted optimal: CPU_OC={opt_cpu:.1f}, MEM_OC={opt_mem:.1f}")
-    print(f"    Predicted efficiency: {best_val:.1f} VMs/s per RSS-fraction")
+    print(f"    Predicted latency efficiency: {best_val:.1f}")
     best_sampled = max(results, key=lambda r: r.efficiency)
-    delta = best_val - best_sampled.efficiency
+    delta_pct = (
+        (best_val - best_sampled.efficiency) / best_sampled.efficiency * 100 if best_sampled.efficiency > 0 else 0
+    )
     print(
         f"    Best sampled: CPU_OC={best_sampled.cpu_oc:.1f}, "
-        f"MEM_OC={best_sampled.mem_oc:.1f}, efficiency={best_sampled.efficiency:.1f}"
+        f"MEM_OC={best_sampled.mem_oc:.1f}, latency efficiency={best_sampled.efficiency:.1f}"
     )
-    if delta > 1.0:
-        print(f"    → Surrogate suggests {delta:.1f} better efficiency beyond grid (consider refining)")
+    if delta_pct > 2.0:
+        print(f"    → Surrogate suggests {delta_pct:.1f}% better beyond grid (consider refining)")
     else:
         print("    → Grid already covers the optimum")
 
@@ -566,8 +586,8 @@ async def main() -> int:
         print(
             f"    → {burst.n_ok}/{burst.n_vms} ok ({burst.success_pct}%) | "
             f"wall={burst.wall_s:.1f}s | "
-            f"setup={burst.setup_p50_ms}/{burst.setup_p95_ms}ms "
             f"admit={burst.admission_p50_ms}/{burst.admission_p95_ms}ms "
+            f"setup={burst.setup_p50_ms}/{burst.setup_p95_ms}ms "
             f"exec={burst.exec_p50_ms}/{burst.exec_p95_ms}ms "
             f"total={burst.total_p50_ms}/{burst.total_p95_ms}ms | "
             f"RSS={burst.peak_rss_mb}MB ({burst.rss_fraction * 100:.1f}%) | "

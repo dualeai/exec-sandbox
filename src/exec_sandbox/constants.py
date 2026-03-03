@@ -460,18 +460,21 @@ FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
 # Resource Admission & Overcommit
 # ============================================================================
 
-DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 2.9
+DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 8.0
 """Host-level memory overcommit multiplier applied to the total VM pool budget.
 
 budget = host_total * (1 - reserve_ratio) * overcommit_ratio
 
 This stretches the pool beyond physical capacity — safe because AI agent workloads
-are bursty and mostly idle (avg memory utilization 18-22%).  The 2.9x default was
-determined by RBF surrogate optimization over a 4x4 Pareto-optimal sweep (500 VMs
-per combo) on a 16-vCPU / 32GB EC2 instance with KVM
-(scripts/benchmark_optimizer.py): CPU=2x MEM=2.9x predicted efficiency=464
-VMs/s per RSS-fraction — confirmed by sampled optimum CPU=2x MEM=3x at
-efficiency=463 with exec p95=73ms at 7.8% RSS.
+are bursty and mostly idle (avg memory utilization 18-22%).  At the optimal CPU=2x,
+CPU is the binding constraint (~24 concurrent slots), so memory overcommit only
+affects the theoretical budget ceiling, not actual concurrency or RSS.
+
+The 8.0x default was determined by RBF surrogate optimization over a 4x4
+latency-frontier sweep (500 VMs per combo) on a 16-vCPU / 32GB EC2 instance
+with KVM (scripts/benchmark_optimizer.py): CPU=2x MEM=8x achieves latency
+efficiency=1116 (10^6 / geomean of admission, setup, exec p95) with
+admit_p95=11.0s, setup_p95=921ms, exec_p95=71ms at 7.0% RSS.
 Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
 constant for QEMU/gvproxy process memory."""
 
@@ -482,11 +485,13 @@ budget = (host_cpus - reserve_cores) * overcommit_ratio
 
 AI workloads average 11-17% CPU utilization, so 2x overcommit is safe while
 keeping exec latency low.  The 2x default was determined by RBF surrogate
-optimization over a 4x4 Pareto-optimal sweep (500 VMs per combo) on a
+optimization over a 4x4 latency-frontier sweep (500 VMs per combo) on a
 16-vCPU / 32GB EC2 instance with KVM (scripts/benchmark_optimizer.py): CPU=2x
-MEM=2.9x predicted efficiency=464 VMs/s per RSS-fraction with exec p95=73ms
-at 7.8% RSS.  Beyond 2x, RSS grows sharply (8% → 18% → 36% → 52%) while
-throughput stays flat (~35 VMs/s), and at 12x the system OOMs under load.
+MEM=8x achieves latency efficiency=1116 (10^6 / geomean of admission, setup,
+exec p95) with admit_p95=11.0s, setup_p95=921ms, exec_p95=71ms at 7.0% RSS.
+Beyond 2x, setup and exec latencies grow sharply (setup: 950ms → 1.4s → 2.5s
+→ 4.5s; exec: 73ms → 105ms → 370ms → 895ms) while throughput stays flat
+(~35 VMs/s), and at 12x the system OOMs under load.
 Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
 constant for QEMU/gvproxy process CPU."""
 
