@@ -1135,8 +1135,14 @@ def _qemu_cmd_mocks(
     tsc_deadline: bool = True,
     unshare: bool = False,
     io_uring: bool = False,
+    qemu_vm_uid: int | None = None,
+    os_getuid: int = 1000,
 ):
-    """Return a combined context manager that patches all build_qemu_cmd() probes."""
+    """Return a combined context manager that patches all build_qemu_cmd() probes.
+
+    Also mocks get_qemu_vm_uid() and os.getuid() to prevent any real
+    user-database or privilege lookups during tests.
+    """
     stack = ExitStack()
     stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=qemu_version))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.detect_host_os", return_value=host_os))
@@ -1144,6 +1150,8 @@ def _qemu_cmd_mocks(
     stack.enter_context(patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=tsc_deadline))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=unshare))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=io_uring))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.get_qemu_vm_uid", return_value=qemu_vm_uid))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.os.getuid", return_value=os_getuid))
     return stack
 
 
@@ -4308,3 +4316,275 @@ class TestWaitForGuest:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ============================================================================
+# Unit Tests - QMP Socket Activation (fd-based vs path-based)
+# ============================================================================
+
+
+class TestQmpSocketActivation(_QemuCmdTestBase):
+    """Verify QMP socket activation (fd-based) vs legacy path-based syntax.
+
+    When qmp_fd is set, build_qemu_cmd() must emit:
+        -chardev socket,id=qmp0,fd=N,server=on,wait=off
+        -mon chardev=qmp0,mode=control
+    When qmp_fd is None, it must emit legacy:
+        -qmp unix:<path>,server=on,wait=off
+    """
+
+    async def test_qmp_fd_generates_chardev_mon_syntax(self, vm_settings, workdir) -> None:
+        """qmp_fd=7 produces -chardev/-mon pair, never -qmp."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-fd",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                qmp_fd=7,
+            )
+
+        assert "socket,id=qmp0,fd=7,server=on,wait=off" in " ".join(cmd)
+        assert "-mon" in cmd
+        mon_idx = cmd.index("-mon")
+        assert cmd[mon_idx + 1] == "chardev=qmp0,mode=control"
+        assert "-qmp" not in cmd
+
+    async def test_qmp_fd_none_generates_legacy_syntax(self, vm_settings, workdir) -> None:
+        """qmp_fd=None (default) produces -qmp, never -chardev with qmp0."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-legacy",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert "-qmp" in cmd
+        qmp_idx = cmd.index("-qmp")
+        assert cmd[qmp_idx + 1].startswith("unix:")
+        # Must not contain socket-activation syntax
+        cmd_str = " ".join(cmd)
+        assert "qmp0" not in cmd_str
+        assert "-mon" not in cmd
+
+    async def test_qmp_fd_with_defer_incoming(self, vm_settings, workdir) -> None:
+        """qmp_fd + defer_incoming=True: both chardev and -incoming defer appear."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-defer",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                qmp_fd=7,
+                defer_incoming=True,
+            )
+
+        cmd_str = " ".join(cmd)
+        assert "socket,id=qmp0,fd=7,server=on,wait=off" in cmd_str
+        idx = cmd.index("-incoming")
+        assert cmd[idx + 1] == "defer"
+
+    async def test_qmp_fd_zero(self, vm_settings, workdir) -> None:
+        """qmp_fd=0 is valid (not falsy) and generates fd=0."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-fd0",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                qmp_fd=0,
+            )
+
+        cmd_str = " ".join(cmd)
+        assert "socket,id=qmp0,fd=0,server=on,wait=off" in cmd_str
+        assert "-qmp" not in cmd
+
+    async def test_qmp_fd_high_number(self, vm_settings, workdir) -> None:
+        """qmp_fd=1023: large fd properly stringified in chardev arg."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-highfd",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                qmp_fd=1023,
+            )
+
+        cmd_str = " ".join(cmd)
+        assert "socket,id=qmp0,fd=1023,server=on,wait=off" in cmd_str
+        assert "-qmp" not in cmd
+
+    async def test_qmp_fd_not_used_with_sudo_path(self, vm_settings, workdir) -> None:
+        """use_qemu_vm_user=True + different UID: sudo wraps cmd, legacy -qmp syntax."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        workdir.use_qemu_vm_user = True
+
+        # qemu_vm_uid=999, os_getuid=1000 → different user → sudo wraps
+        with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=1000):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-sudo",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert "-qmp" in cmd
+        qmp_idx = cmd.index("-qmp")
+        assert cmd[qmp_idx + 1].startswith("unix:")
+        assert "server=on,wait=off" in cmd[qmp_idx + 1]
+        assert "sudo" in cmd
+
+    async def test_qmp_fd_skips_sudo_when_already_target_user(self, vm_settings, workdir) -> None:
+        """use_qemu_vm_user=True + same UID: no sudo, socket activation works."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        workdir.use_qemu_vm_user = True
+
+        # qemu_vm_uid=999, os_getuid=999 → same user → no sudo needed
+        with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=999):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-same-user",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+                qmp_fd=7,
+            )
+
+        # Socket activation syntax (no sudo blocking fds)
+        cmd_str = " ".join(cmd)
+        assert "socket,id=qmp0,fd=7,server=on,wait=off" in cmd_str
+        assert "-mon" in cmd
+        # No sudo or legacy -qmp
+        assert "sudo" not in cmd
+        assert "-qmp" not in cmd
+
+    async def test_qmp_fd_with_all_features(self, vm_settings, workdir) -> None:
+        """Smoke test: qmp_fd + defer_incoming + allow_network + snapshot_drive."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-qmp-all",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=True,
+                qmp_fd=7,
+                defer_incoming=True,
+                snapshot_drive="/tmp/snap.qcow2",
+            )
+
+        cmd_str = " ".join(cmd)
+        # Socket activation syntax present
+        assert "socket,id=qmp0,fd=7,server=on,wait=off" in cmd_str
+        assert "-mon" in cmd
+        # Defer incoming present
+        idx = cmd.index("-incoming")
+        assert cmd[idx + 1] == "defer"
+        # Snapshot drive present
+        assert "snap" in cmd_str
+        # No legacy -qmp
+        assert "-qmp" not in cmd
+
+
+# ============================================================================
+# Unit Tests - QMP Abort Check (process liveness during restore)
+# ============================================================================
+
+
+def _make_check_qemu_alive(process_mock, vm_id="test-vm"):
+    """Mimic the _check_qemu_alive closure from _restore_vm_with_reservation.
+
+    Checks process.returncode; if not None, the process has exited and
+    we raise VmTransientError to abort the restore early.
+    """
+
+    def _check():
+        if process_mock.returncode is not None:
+            raise VmTransientError(
+                f"QEMU died during L1 restore for {vm_id} (rc={process_mock.returncode})",
+                context={"vm_id": vm_id, "returncode": process_mock.returncode},
+            )
+
+    return _check
+
+
+class TestQmpAbortCheck:
+    """Verify the QEMU-alive check pattern used during L1 snapshot restore.
+
+    The _check_qemu_alive closure inspects process.returncode:
+    - None means still running (no exception).
+    - Any int means exited (raise VmTransientError).
+    """
+
+    def test_check_qemu_alive_running_process(self) -> None:
+        """returncode=None (running): no exception raised."""
+        proc = MagicMock()
+        proc.returncode = None
+
+        check = _make_check_qemu_alive(proc)
+        check()  # Should not raise
+
+    def test_check_qemu_alive_dead_process(self) -> None:
+        """returncode=-6 (SIGABRT): raises VmTransientError with context."""
+        proc = MagicMock()
+        proc.returncode = -6
+
+        check = _make_check_qemu_alive(proc, vm_id="vm-abort")
+        with pytest.raises(VmTransientError, match=r"QEMU died during L1 restore.*rc=-6"):
+            check()
+
+    def test_check_qemu_alive_exit_zero(self) -> None:
+        """returncode=0 (clean exit during restore): still raises."""
+        proc = MagicMock()
+        proc.returncode = 0
+
+        check = _make_check_qemu_alive(proc, vm_id="vm-clean-exit")
+        with pytest.raises(VmTransientError, match=r"rc=0"):
+            check()
+
+    def test_check_qemu_alive_negative_signal(self) -> None:
+        """returncode=-9 (SIGKILL): raises with signal info in message."""
+        proc = MagicMock()
+        proc.returncode = -9
+
+        check = _make_check_qemu_alive(proc, vm_id="vm-killed")
+        with pytest.raises(VmTransientError, match=r"rc=-9") as exc_info:
+            check()
+        assert exc_info.value.context["returncode"] == -9
+        assert exc_info.value.context["vm_id"] == "vm-killed"

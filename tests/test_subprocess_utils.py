@@ -5,9 +5,13 @@ No mocks - spawns actual processes.
 """
 
 import asyncio
+import tempfile
+from pathlib import Path
+
+import pytest
 
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.subprocess_utils import drain_subprocess_output
+from exec_sandbox.subprocess_utils import drain_subprocess_output, wait_for_socket
 
 
 async def create_process(cmd: list[str]) -> ProcessWrapper:
@@ -243,3 +247,174 @@ print('another stdout')
         assert "stdout message" in captured_stdout
         assert "another stdout" in captured_stdout
         assert "stderr message" in captured_stderr
+
+
+class TestWaitForSocket:
+    """Tests for wait_for_socket function.
+
+    Uses real Unix sockets - no mocking.
+    Uses tempfile.TemporaryDirectory() (short paths) instead of tmp_path
+    to avoid macOS AF_UNIX 104-byte path limit.
+    """
+
+    async def test_socket_ready_immediately(self) -> None:
+        """Socket already listening before wait_for_socket is called."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+
+            async def _handler(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                w.close()
+                await w.wait_closed()
+
+            server = await asyncio.start_unix_server(_handler, path=str(sock_path))
+            try:
+                result = await wait_for_socket(sock_path, timeout=2.0)
+                assert result is None
+            finally:
+                server.close()
+                await server.wait_closed()
+
+    async def test_socket_appears_after_delay(self) -> None:
+        """Socket created by a background task after a short delay."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+
+            async def _handler(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                w.close()
+                await w.wait_closed()
+
+            async def _create_server_later() -> asyncio.Server:
+                await asyncio.sleep(0.1)
+                return await asyncio.start_unix_server(_handler, path=str(sock_path))
+
+            task = asyncio.create_task(_create_server_later())
+            try:
+                result = await wait_for_socket(sock_path, timeout=2.0)
+                assert result is None
+            finally:
+                server = await task
+                server.close()
+                await server.wait_closed()
+
+    async def test_keep_connection_true_returns_streams(self) -> None:
+        """keep_connection=True returns (reader, writer) streams."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+
+            async def _handler(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                w.close()
+                await w.wait_closed()
+
+            server = await asyncio.start_unix_server(_handler, path=str(sock_path))
+            try:
+                result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=True)
+                assert result is not None
+                r, w = result
+                assert isinstance(r, asyncio.StreamReader)
+                assert isinstance(w, asyncio.StreamWriter)
+                w.write(b"ping")
+                w.close()
+                await w.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+    async def test_keep_connection_false_returns_none(self) -> None:
+        """keep_connection=False (default) returns None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+
+            async def _handler(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                w.close()
+                await w.wait_closed()
+
+            server = await asyncio.start_unix_server(_handler, path=str(sock_path))
+            try:
+                result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=False)
+                assert result is None
+            finally:
+                server.close()
+                await server.wait_closed()
+
+    async def test_timeout_no_socket(self) -> None:
+        """TimeoutError when socket file never appears."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+            with pytest.raises(TimeoutError):
+                await wait_for_socket(sock_path, timeout=0.1)
+
+    async def test_socket_file_exists_but_not_listening(self) -> None:
+        """Fails when path exists as regular file, not a socket.
+
+        On Linux: connect() retries with ConnectionRefused → TimeoutError.
+        On macOS: connect() raises OSError (ENOTSOCK) immediately.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+            sock_path.write_text("not a socket")
+            with pytest.raises((TimeoutError, OSError)):
+                await wait_for_socket(sock_path, timeout=0.2)
+
+    async def test_abort_check_raises(self) -> None:
+        """abort_check exception propagates instead of TimeoutError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+            call_count = 0
+
+            def _abort() -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    raise RuntimeError("process died")
+
+            with pytest.raises(RuntimeError, match="process died"):
+                await wait_for_socket(sock_path, timeout=5.0, abort_check=_abort)
+
+    async def test_abort_check_called_each_iteration(self) -> None:
+        """abort_check is invoked on every poll iteration."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+            call_count = 0
+
+            def _count() -> None:
+                nonlocal call_count
+                call_count += 1
+
+            with pytest.raises(TimeoutError):
+                await wait_for_socket(sock_path, timeout=0.1, abort_check=_count)
+
+            assert call_count > 0
+
+    async def test_zero_timeout(self) -> None:
+        """Zero timeout raises TimeoutError immediately."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+            with pytest.raises(TimeoutError):
+                await wait_for_socket(sock_path, timeout=0.0)
+
+    async def test_concurrent_wait_for_socket(self) -> None:
+        """Multiple concurrent waits all succeed against the same server."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "s.sock"
+
+            async def _handler(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                w.close()
+                await w.wait_closed()
+
+            server = await asyncio.start_unix_server(_handler, path=str(sock_path))
+            try:
+                results = await asyncio.gather(
+                    wait_for_socket(sock_path, timeout=2.0, keep_connection=False),
+                    wait_for_socket(sock_path, timeout=2.0, keep_connection=False),
+                    wait_for_socket(sock_path, timeout=2.0, keep_connection=False),
+                )
+                assert all(r is None for r in results)
+            finally:
+                server.close()
+                await server.wait_closed()
+
+    async def test_socket_path_in_nonexistent_directory(self) -> None:
+        """TimeoutError when socket path is in a directory that does not exist."""
+        sock_path = Path("/tmp/nonexistent_dir_xyz/test.sock")
+        with pytest.raises(TimeoutError):
+            await wait_for_socket(sock_path, timeout=0.1)

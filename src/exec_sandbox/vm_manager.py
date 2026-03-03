@@ -67,6 +67,7 @@ from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
+from exec_sandbox.socket_auth import create_unix_socket
 from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, wait_for_socket
 from exec_sandbox.system_probes import (
     check_tsc_deadline,
@@ -657,6 +658,7 @@ class VmManager:
         on_boot_log: Callable[[str], None] | None = None,
         gvproxy_proc: ProcessWrapper | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> QemuVM:
         """Launch QEMU subprocess, create VM object, register in tracking.
 
@@ -684,6 +686,7 @@ class VmManager:
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                     preexec_fn=_set_umask_007 if infra.workdir.use_qemu_vm_user else None,
+                    pass_fds=pass_fds,
                 )
             )
             register_process(qemu_proc)
@@ -1030,7 +1033,7 @@ class VmManager:
                 start_time=start_time,
             )
 
-    async def _restore_vm_with_reservation(
+    async def _restore_vm_with_reservation(  # noqa: PLR0915
         self,
         reservation: ResourceReservation,
         *,
@@ -1052,29 +1055,50 @@ class VmManager:
         if infra.workdir.use_qemu_vm_user and snapshot_drive:
             await grant_qemu_vm_file_access(snapshot_drive, writable=False)
 
-        # Phase 2: Build QEMU command (restore-specific — use guest values for QEMU)
-        vdb_path = str(snapshot_drive) if snapshot_drive else None
-        qemu_cmd = await build_qemu_cmd(
-            self.settings,
-            self.arch,
-            infra.vm_id,
-            infra.workdir,
-            reservation.guest_memory_mb,
-            reservation.guest_cpu_cores,
-            allow_network=allow_network,
-            expose_ports=expose_ports,
-            snapshot_drive=vdb_path,
-            defer_incoming=True,  # VM starts paused, waiting for migration stream
+        # Phase 2: Socket activation for QMP (eliminates TOCTOU race)
+        # Pre-create the QMP listening socket so QEMU inherits it via pass_fds.
+        # Only disabled when sudo wraps the QEMU command — sudo >= 1.9.14
+        # closes all fds >= 3 (closefrom security policy). When the process is
+        # already running as qemu-vm user, no sudo is needed and fd inheritance
+        # works normally. See: https://www.sudo.ws/docs/man/sudo.man/
+        qmp_parent_sock = None
+        qmp_fd: int | None = None
+        qemu_vm_uid = get_qemu_vm_uid()
+        sudo_wraps_qemu = (
+            infra.workdir.use_qemu_vm_user
+            and (qemu_vm_uid is None or os.getuid() != qemu_vm_uid)
         )
+        if not sudo_wraps_qemu:
+            qmp_parent_sock = create_unix_socket(str(infra.workdir.qmp_socket))
+            qmp_fd = qmp_parent_sock.fileno()
 
-        # Phase 3: Start gvproxy if network topology requires it
-        gvproxy_proc, gvproxy_log_task, _ = await self._start_gvproxy_for_vm(
-            infra, language, allow_network, allowed_domains, expose_ports
-        )
-
-        # Phase 4: Launch QEMU (shared helper) and restore snapshot
+        # Phase 3-5 wrapped in try so qmp_parent_sock is always cleaned up
         vm_created = False
+        gvproxy_proc: ProcessWrapper | None = None
+        gvproxy_log_task: asyncio.Task[None] | None = None
         try:
+            # Phase 3: Build QEMU command (restore-specific — use guest values for QEMU)
+            vdb_path = str(snapshot_drive) if snapshot_drive else None
+            qemu_cmd = await build_qemu_cmd(
+                self.settings,
+                self.arch,
+                infra.vm_id,
+                infra.workdir,
+                reservation.guest_memory_mb,
+                reservation.guest_cpu_cores,
+                allow_network=allow_network,
+                expose_ports=expose_ports,
+                snapshot_drive=vdb_path,
+                defer_incoming=True,  # VM starts paused, waiting for migration stream
+                qmp_fd=qmp_fd,
+            )
+
+            # Phase 4: Start gvproxy if network topology requires it
+            gvproxy_proc, gvproxy_log_task, _ = await self._start_gvproxy_for_vm(
+                infra, language, allow_network, allowed_domains, expose_ports
+            )
+
+            # Phase 5: Launch QEMU (shared helper) and restore snapshot
             vm = await self._launch_qemu_vm(
                 infra,
                 qemu_cmd,
@@ -1082,24 +1106,50 @@ class VmManager:
                 reservation,
                 gvproxy_proc=gvproxy_proc,
                 gvproxy_log_task=gvproxy_log_task,
+                pass_fds=(qmp_fd,) if qmp_fd is not None else (),
             )
 
-            # Wait for QMP socket to exist (QEMU needs a few ms after fork)
+            # Close parent's copy of the QMP fd after QEMU inherits it
+            if qmp_parent_sock is not None:
+                qmp_parent_sock.close()
+                qmp_parent_sock = None
+
+            # Abort-check: fail fast if QEMU dies during startup
+            # Reuses QSD pattern (qemu_storage_daemon.py:313-315)
+            def _check_qemu_alive() -> None:
+                if vm.process.returncode is not None:
+                    raise VmTransientError(
+                        f"QEMU died during L1 restore for {infra.vm_id} (rc={vm.process.returncode})",
+                        context={"vm_id": infra.vm_id, "returncode": vm.process.returncode},
+                    )
+
+            _check_qemu_alive()
+
+            # Wait for QMP socket (only needed on sudo path where QEMU creates the socket)
             qemu_version = await probe_qemu_version()
-            try:
-                await wait_for_socket(vm.qmp_socket, timeout=5.0)
-            except TimeoutError as e:
-                await vm.destroy()
-                raise VmTransientError(
-                    f"QMP socket never appeared for {infra.vm_id}",
-                    context={"vm_id": infra.vm_id, "qmp_socket": str(vm.qmp_socket)},
-                ) from e
+            if qmp_fd is None:
+                # Sudo path: QEMU creates the socket — must poll for it
+                try:
+                    await wait_for_socket(
+                        vm.qmp_socket,
+                        timeout=constants.MEMORY_SNAPSHOT_QMP_SOCKET_TIMEOUT_SECONDS,
+                        abort_check=_check_qemu_alive,
+                    )
+                except TimeoutError as e:
+                    await vm.destroy()
+                    raise VmTransientError(
+                        f"QMP socket never appeared for {infra.vm_id}",
+                        context={"vm_id": infra.vm_id, "qmp_socket": str(vm.qmp_socket)},
+                    ) from e
+            # else: socket activation — socket is pre-created, no wait needed
 
             # Restore VM state via QMP migration (load vmstate → resume vCPU)
             try:
                 async with MigrationClient(vm.qmp_socket, infra.expected_uid) as client:
                     await client.restore_snapshot(vmstate_path, qemu_version=qemu_version)
             except Exception as e:
+                # Check if QEMU died — provides a more informative error
+                _check_qemu_alive()
                 diag = await vm.collect_diagnostics()
                 logger.error(
                     "L1 restore failed",
@@ -1147,6 +1197,9 @@ class VmManager:
             return vm
 
         except BaseException:
+            if qmp_parent_sock is not None:
+                with suppress(OSError):
+                    qmp_parent_sock.close()
             if not vm_created:
                 await self._cleanup_failed_launch(
                     infra.vm_id,

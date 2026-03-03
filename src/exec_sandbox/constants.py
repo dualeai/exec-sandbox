@@ -360,6 +360,13 @@ MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
 MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.005
 """Interval between query-migrate polls (5ms)."""
 
+MEMORY_SNAPSHOT_QMP_SOCKET_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout waiting for QMP socket to appear during L1 restore (sudo path only).
+
+Only used when socket activation is unavailable (sudo wraps QEMU, closing
+inherited fds). With socket activation, the socket is pre-created and no
+polling is needed."""
+
 MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
 """Minimum QEMU version for mapped-ram + multifd migration capabilities.
 Changing capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""

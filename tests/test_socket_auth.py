@@ -18,6 +18,7 @@ from exec_sandbox.exceptions import SocketAuthError
 from exec_sandbox.socket_auth import (
     PeerCredentials,
     connect_and_verify,
+    create_unix_socket,
     get_peer_credentials,
     get_qemu_vm_uid,
     verify_socket_peer,
@@ -754,3 +755,70 @@ class TestEdgeCases:
             finally:
                 server.close()
                 await server.wait_closed()
+
+
+class TestSocketActivation:
+    """Integration tests for socket activation flow using real sockets."""
+
+    async def test_socket_activation_real_server(self) -> None:
+        """Pre-created listening socket accepts client connections."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "qmp.sock"
+            sock = create_unix_socket(str(path))
+            try:
+                # Client can connect to pre-created socket
+                _reader, writer = await asyncio.open_unix_connection(str(path))
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                sock.close()
+
+    async def test_socket_activation_no_toctou(self) -> None:
+        """Pre-bound socket survives sequential connect-close-reopen cycles."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "qmp.sock"
+            sock = create_unix_socket(str(path))
+            try:
+                for _ in range(3):
+                    _reader, writer = await asyncio.open_unix_connection(str(path))
+                    writer.close()
+                    await writer.wait_closed()
+            finally:
+                sock.close()
+
+    async def test_socket_activation_accept_after_parent_close(self) -> None:
+        """Closing the parent socket fd prevents new connections."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "qmp.sock"
+            sock = create_unix_socket(str(path))
+            # Close parent's copy — no listener anymore
+            sock.close()
+            # New connections should fail (no process accepted)
+            with pytest.raises((ConnectionRefusedError, ConnectionResetError, OSError)):
+                await asyncio.wait_for(
+                    asyncio.open_unix_connection(str(path)),
+                    timeout=1.0,
+                )
+
+    async def test_create_unix_socket_backlog(self) -> None:
+        """create_unix_socket with custom backlog accepts connections."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "qmp.sock"
+            sock = create_unix_socket(str(path), backlog=1)
+            try:
+                _reader, writer = await asyncio.open_unix_connection(str(path))
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                sock.close()
+
+    async def test_create_unix_socket_existing_path_fails(self) -> None:
+        """create_unix_socket raises OSError when path is already bound."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "qmp.sock"
+            sock1 = create_unix_socket(str(path))
+            try:
+                with pytest.raises(OSError):
+                    create_unix_socket(str(path))
+            finally:
+                sock1.close()
