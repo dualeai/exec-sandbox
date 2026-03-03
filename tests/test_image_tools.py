@@ -69,10 +69,6 @@ PYTHON_IMAGE_TOOLS = [
         "git",
         "import subprocess; r = subprocess.run(['git', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
     ),
-    (
-        "gcc",
-        "import subprocess; r = subprocess.run(['gcc', '--version'], capture_output=True, text=True); print(r.stdout); exit(r.returncode)",
-    ),
 ]
 
 

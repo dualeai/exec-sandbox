@@ -8,13 +8,19 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncGenerator, Iterator
+from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import pytest
+from _pytest.runner import runtestprotocol
 
 from exec_sandbox.config import SchedulerConfig
+from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available
 from exec_sandbox.vm_manager import VmManager
 
@@ -94,8 +100,6 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     """
     if not os.environ.get("GITHUB_ACTIONS"):
         return None  # Use default protocol outside CI
-
-    from _pytest.runner import runtestprotocol
 
     for attempt in range(_QEMU_CRASH_MAX_RETRIES + 1):
         reports = runtestprotocol(item, nextitem=nextitem, log=False)
@@ -293,8 +297,6 @@ async def dual_scheduler(
 @pytest.fixture
 def vm_settings(images_dir: Path):
     """Settings for VM tests with hardware acceleration."""
-    from exec_sandbox.settings import Settings
-
     return Settings(
         base_images_dir=images_dir,
         kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
@@ -315,8 +317,6 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
 @pytest.fixture
 def emulation_settings(images_dir: Path):
     """Settings with forced software emulation (no KVM/HVF)."""
-    from exec_sandbox.settings import Settings
-
     return Settings(
         base_images_dir=images_dir,
         kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
@@ -341,8 +341,6 @@ def unit_test_settings():
 
     Uses nonexistent paths since unit tests don't boot actual VMs.
     """
-    from exec_sandbox.settings import Settings
-
     return Settings(
         base_images_dir=Path("/nonexistent"),
         kernel_path=Path("/nonexistent"),
@@ -352,8 +350,6 @@ def unit_test_settings():
 @pytest.fixture
 def unit_test_vm_manager(unit_test_settings):
     """VmManager for unit tests that don't boot real VMs."""
-    from exec_sandbox.vm_manager import VmManager
-
     return VmManager(unit_test_settings)  # type: ignore[arg-type]
 
 
@@ -370,9 +366,6 @@ def make_vm_settings(images_dir: Path):
         def test_something(make_vm_settings, tmp_path):
             settings = make_vm_settings(disk_snapshot_cache_dir=tmp_path / "cache")
     """
-    from typing import Any
-
-    from exec_sandbox.settings import Settings
 
     def _make(**overrides: Any) -> Settings:
         defaults: dict[str, Any] = {
@@ -396,11 +389,6 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
         async def test_something(make_vm_manager, tmp_path):
             vm_manager = await make_vm_manager(disk_snapshot_cache_dir=tmp_path / "cache")
     """
-    from contextlib import AsyncExitStack
-    from typing import Any
-
-    from exec_sandbox.vm_manager import VmManager
-
     async with AsyncExitStack() as stack:
 
         async def _make(**settings_overrides: Any) -> VmManager:
@@ -410,6 +398,63 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
             return manager
 
         yield _make
+
+
+@pytest.fixture
+async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def]
+    """Factory to create (DiskSnapshotManager, Settings) with optional Settings overrides.
+
+    Consolidates the repeated pattern of creating settings + vm_manager +
+    DiskSnapshotManager with consistent kwargs and automatic cache dir creation.
+    Settings are created once (inside make_vm_manager) and reused, avoiding
+    the kwargs-passed-twice problem.
+
+    Usage:
+        async def test_something(make_snapshot_manager, tmp_path):
+            snapshot_manager, settings = await make_snapshot_manager(
+                disk_snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket=None,
+            )
+    """
+
+    async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Any]:
+        vm_manager = await make_vm_manager(**overrides)
+        settings = vm_manager.settings
+        if settings.disk_snapshot_cache_dir:
+            settings.disk_snapshot_cache_dir.mkdir(parents=True, exist_ok=True)
+        return DiskSnapshotManager(settings, vm_manager), settings
+
+    return _make
+
+
+# ============================================================================
+# Shared test helpers
+# ============================================================================
+
+
+def random_test_id() -> str:
+    """Generate a unique random identifier for test isolation.
+
+    Returns the full 32-char hex of a UUID4.  Callers add their own prefix
+    (e.g. ``f"task-{random_test_id()}"``).
+    """
+    return uuid4().hex
+
+
+async def create_test_qcow2(path: Path, size: str = "1M") -> None:
+    """Create a minimal valid qcow2 file via qemu-img."""
+    proc = await asyncio.create_subprocess_exec(
+        "qemu-img",
+        "create",
+        "-f",
+        "qcow2",
+        str(path),
+        size,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    assert proc.returncode == 0, f"qemu-img create failed for {path}"
 
 
 # ============================================================================

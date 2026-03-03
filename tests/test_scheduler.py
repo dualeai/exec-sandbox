@@ -5,16 +5,22 @@ Integration tests: Test real VM execution (requires QEMU + images).
 """
 
 import asyncio
+import json
+import platform
+import shutil
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
+from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import SandboxError
-from exec_sandbox.models import Language
+from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB, MAX_CODE_SIZE
+from exec_sandbox.exceptions import AssetDownloadError, SandboxError, SnapshotError, VmConfigError, VmTimeoutError
+from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_fast_balloon, skip_unless_hwaccel
+from tests.conftest import create_test_qcow2, random_test_id, skip_unless_fast_balloon, skip_unless_hwaccel
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -114,7 +120,6 @@ class TestMemoryValidation:
 
     async def test_memory_below_minimum_rejected(self) -> None:
         """memory_mb=1 raises VmConfigError before reaching QEMU."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -124,7 +129,6 @@ class TestMemoryValidation:
 
     async def test_memory_at_minimum_accepted(self) -> None:
         """memory_mb=128 passes validation (may fail later without QEMU)."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -137,7 +141,6 @@ class TestMemoryValidation:
 
     async def test_memory_127_rejected(self) -> None:
         """memory_mb=127 (just below minimum) raises VmConfigError."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -147,7 +150,6 @@ class TestMemoryValidation:
 
     async def test_memory_large_value_accepted(self) -> None:
         """Large memory_mb values pass validation (no upper bound)."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -163,8 +165,6 @@ class TestCodeSizeValidation:
 
     async def test_code_exceeds_limit_rejected(self) -> None:
         """Code larger than MAX_CODE_SIZE raises VmConfigError before VM boot."""
-        from exec_sandbox.constants import MAX_CODE_SIZE
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -174,8 +174,6 @@ class TestCodeSizeValidation:
 
     async def test_code_at_limit_accepted(self) -> None:
         """Code exactly at MAX_CODE_SIZE passes size validation."""
-        from exec_sandbox.constants import MAX_CODE_SIZE
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -209,8 +207,6 @@ class TestPackageValidation:
         # Create test catalogs
         catalogs_dir = tmp_path / "catalogs"
         catalogs_dir.mkdir()
-
-        import json
 
         (catalogs_dir / "pypi_top_10k.json").write_text(json.dumps(["pandas", "numpy"]))
         (catalogs_dir / "npm_top_10k.json").write_text(json.dumps(["lodash", "axios"]))
@@ -267,6 +263,340 @@ class TestSchedulerSnapshotInit:
         async with Scheduler(scheduler_config) as scheduler:
             assert scheduler._snapshot_manager is not None
             assert scheduler._snapshot_manager.vm_manager is scheduler._vm_manager
+
+
+class TestBaseImageFetchBeforeSnapshot:
+    """Regression tests: fetch_base_image ordering in _get_or_create_snapshot.
+
+    When EXEC_SANDBOX_CACHE_DIR points to a fresh directory (pip-install user),
+    ensure_assets() at startup only downloads kernel/initramfs/gvproxy (no
+    language param). If packages are requested, _compute_cache_key() needs the
+    base image on disk to hash it. Without the fetch_base_image() call in
+    _get_or_create_snapshot(), get_base_image() glob fails with VmDependencyError.
+    """
+
+    @staticmethod
+    def _make_fresh_images_dir(images_dir: Path, tmp_path: Path) -> tuple[Path, str]:
+        """Create isolated images dir with kernel/initramfs but no base images.
+
+        Returns (fresh_images_path, arch_string).
+        """
+        fresh_images = tmp_path / "fresh-images"
+        fresh_images.mkdir()
+        arch = "aarch64" if platform.machine() == "arm64" else platform.machine()
+        for name in images_dir.iterdir():
+            if name.name.startswith(("vmlinuz", "vmlinux", "initramfs")):
+                shutil.copy2(name, fresh_images / name.name)
+        return fresh_images, arch
+
+    @staticmethod
+    def _mock_snapshot_result(scheduler: Scheduler, tmp_path: Path) -> Path:
+        """Mock get_or_create_snapshot to return a pre-created qcow2."""
+        snap = tmp_path / f"snap-{random_test_id()}.qcow2"
+        scheduler._snapshot_manager.get_or_create_snapshot = AsyncMock(  # type: ignore[union-attr]
+            return_value=snap,
+        )
+        snap.touch()
+        return snap
+
+    @staticmethod
+    def _setup_cold_boot_mocks(scheduler: Scheduler) -> MagicMock:
+        """Disable warm pool + memory snapshots, mock create_vm for cold boot path."""
+        mock_vm = MagicMock()
+        mock_vm.vm_id = f"vm-{random_test_id()}"
+        scheduler._warm_pool = None  # type: ignore[assignment]
+        scheduler._memory_snapshot_manager = None  # type: ignore[assignment]
+        scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
+        return mock_vm
+
+    async def test_missing_base_image_fetched_before_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
+        """Regression: fresh cache dir without base image does not raise VmDependencyError.
+
+        Reproduces the original bug: _compute_cache_key() calls get_base_image()
+        which globs for python-*-base-*.qcow2. Without the fetch_base_image()
+        call, the glob finds nothing and raises VmDependencyError.
+
+        This test uses a real DiskSnapshotManager (no mock on get_or_create_snapshot)
+        so that _compute_cache_key → get_base_image → glob actually runs.
+        """
+        fresh_images, arch = self._make_fresh_images_dir(images_dir, tmp_path)
+
+        cache_dir = tmp_path / "snapshot-cache"
+        cache_dir.mkdir()
+
+        config = SchedulerConfig(
+            images_dir=fresh_images,
+            auto_download_assets=True,
+            default_timeout_seconds=120,
+            disk_snapshot_cache_dir=cache_dir,
+        )
+        async with Scheduler(config) as scheduler:
+            # fetch_base_image mock: writes a real qcow2 at the expected path
+            # (simulates what the real downloader does)
+            base_image_path = fresh_images / f"python-3.14-base-{arch}.qcow2"
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                # Write a minimal valid qcow2 so get_base_image() glob succeeds
+                await create_test_qcow2(base_image_path)
+                return base_image_path
+
+            # Mock _create_snapshot to avoid QEMU boot — write to the real
+            # cache_key path so file_lock's "already exists" check stays correct.
+            async def mock_create_snapshot(language, packages, key, *args, **kwargs):  # type: ignore[no-untyped-def]
+                snap = cache_dir / f"{key}.qcow2"
+                await create_test_qcow2(snap)
+                return snap
+
+            with (
+                patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+                patch.object(scheduler._snapshot_manager, "_create_snapshot", side_effect=mock_create_snapshot),
+            ):
+                # This would raise VmDependencyError without the fix
+                result = await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+
+            assert result.exists()
+            assert result.suffix == ".qcow2"
+
+    async def test_fetch_called_before_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
+        """auto_download_assets=True + packages → fetch_base_image called before snapshot manager."""
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+            fetch_called = False
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal fetch_called
+                fetch_called = True
+
+            snap = self._mock_snapshot_result(scheduler, tmp_path)
+            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
+                result = await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+
+            assert fetch_called, "fetch_base_image must be called before snapshot cache key computation"
+            assert result == snap
+
+    async def test_fetch_skipped_when_auto_download_disabled(self, images_dir: Path, tmp_path: Path) -> None:
+        """auto_download_assets=False → fetch_base_image NOT called (images must exist locally)."""
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+            fetch_called = False
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal fetch_called
+                fetch_called = True
+
+            self._mock_snapshot_result(scheduler, tmp_path)
+            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
+                await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+
+            assert not fetch_called, "fetch_base_image should NOT be called when auto_download_assets=False"
+
+    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
+    async def test_fetch_called_with_correct_language(
+        self, images_dir: Path, tmp_path: Path, language: Language
+    ) -> None:
+        """fetch_base_image receives the correct language argument."""
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+            captured_language = None
+
+            async def mock_fetch(lang, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal captured_language
+                captured_language = lang
+
+            self._mock_snapshot_result(scheduler, tmp_path)
+            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
+                await scheduler._get_or_create_snapshot(language, ["some-pkg==1.0"], 256)
+
+            assert captured_language == language
+
+    async def test_snapshot_path_skipped_without_packages(self, images_dir: Path, tmp_path: Path) -> None:
+        """Empty packages → _get_or_create_snapshot is never called by _prepare_vm.
+
+        The guard `if packages:` at the _prepare_vm call site prevents reaching
+        _get_or_create_snapshot (and therefore fetch_base_image at the snapshot
+        stage). Verify this by spying on _get_or_create_snapshot during a
+        _prepare_vm call with packages=[].
+        """
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+            snapshot_spy = AsyncMock()
+            self._setup_cold_boot_mocks(scheduler)
+
+            with (
+                patch.object(scheduler, "_get_or_create_snapshot", snapshot_spy),
+                patch("exec_sandbox.scheduler.fetch_base_image", new_callable=AsyncMock),
+            ):
+                await scheduler._prepare_vm(
+                    language=Language.PYTHON,
+                    packages=[],
+                    memory_mb=None,
+                    allow_network=False,
+                    allowed_domains=None,
+                    expose_ports=None,
+                    task_id=f"test-{random_test_id()}",
+                )
+
+            snapshot_spy.assert_not_called()
+
+    async def test_fetch_idempotent_on_cache_hit(self, images_dir: Path, tmp_path: Path) -> None:
+        """When base image already exists, fetch_base_image is called but completes fast."""
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+            call_count = 0
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal call_count
+                call_count += 1
+
+            self._mock_snapshot_result(scheduler, tmp_path)
+            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
+                # Call twice with same language
+                await scheduler._get_or_create_snapshot(Language.PYTHON, ["pkg==1.0"], 256)
+                await scheduler._get_or_create_snapshot(Language.PYTHON, ["pkg==1.0"], 256)
+
+            assert call_count == 2, "fetch_base_image should be called each time (it's idempotent internally)"
+
+    async def test_fetch_failure_propagates(self, images_dir: Path, tmp_path: Path) -> None:
+        """fetch_base_image raising AssetDownloadError propagates to caller."""
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+
+            async def mock_fetch_fail(language, **kwargs):  # type: ignore[no-untyped-def]
+                raise AssetDownloadError("Network unreachable")
+
+            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch_fail):
+                with pytest.raises(AssetDownloadError, match="Network unreachable"):
+                    await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+
+    async def test_concurrent_fetch_same_language(self, images_dir: Path, tmp_path: Path) -> None:
+        """Two concurrent _get_or_create_snapshot calls for the same language succeed without races.
+
+        Concurrent fetch_base_image calls must be idempotent and the file_lock in
+        get_or_create_snapshot must serialize snapshot creation so both callers
+        get the same result.
+        """
+        fresh_images, arch = self._make_fresh_images_dir(images_dir, tmp_path)
+
+        # Pre-create base image so image_hash is stable across concurrent calls
+        base_image_path = fresh_images / f"python-3.14-base-{arch}.qcow2"
+        await create_test_qcow2(base_image_path)
+
+        cache_dir = tmp_path / "snapshot-cache"
+        cache_dir.mkdir()
+
+        config = SchedulerConfig(
+            images_dir=fresh_images,
+            auto_download_assets=True,
+            default_timeout_seconds=120,
+            disk_snapshot_cache_dir=cache_dir,
+        )
+        async with Scheduler(config) as scheduler:
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                await asyncio.sleep(0.05)
+                # No-op: base image already exists (idempotent)
+
+            async def mock_create_snapshot(language, packages, key, *args, **kwargs):  # type: ignore[no-untyped-def]
+                snap = cache_dir / f"{key}.qcow2"
+                if not snap.exists():
+                    await create_test_qcow2(snap)
+                return snap
+
+            with (
+                patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+                patch.object(scheduler._snapshot_manager, "_create_snapshot", side_effect=mock_create_snapshot),
+            ):
+                result1, result2 = await asyncio.gather(
+                    scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256),
+                    scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256),
+                )
+
+            assert result1.exists()
+            assert result2.exists()
+            # Both should resolve to the same snapshot file (same cache key)
+            assert result1 == result2
+
+    async def test_fetch_called_once_when_packages_present(self, images_dir: Path, tmp_path: Path) -> None:
+        """With packages, fetch is called from _get_or_create_snapshot only; cold boot skips it.
+
+        When _get_or_create_snapshot returns a snapshot_path, the cold-boot guard
+        `if ... and not snapshot_path` in _prepare_vm prevents a second
+        fetch_base_image call. This test ensures fetch is invoked exactly once.
+        """
+
+        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
+        async with Scheduler(config) as scheduler:
+            fetch_count = 0
+
+            async def counting_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal fetch_count
+                fetch_count += 1
+
+            self._setup_cold_boot_mocks(scheduler)
+            self._mock_snapshot_result(scheduler, tmp_path)
+
+            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=counting_fetch):
+                await scheduler._prepare_vm(
+                    language=Language.PYTHON,
+                    packages=["pandas==2.0.0"],
+                    memory_mb=None,
+                    allow_network=False,
+                    allowed_domains=None,
+                    expose_ports=None,
+                    task_id=f"test-{random_test_id()}",
+                )
+
+            # fetch called once from _get_or_create_snapshot, NOT again from cold boot
+            assert fetch_count == 1, (
+                f"fetch_base_image called {fetch_count} times, expected 1 "
+                "(cold boot should skip fetch when snapshot_path is set)"
+            )
+
+    async def test_fetch_ok_but_snapshot_creation_fails(self, images_dir: Path, tmp_path: Path) -> None:
+        """fetch_base_image succeeds but _create_snapshot raises SnapshotError.
+
+        Verifies that SnapshotError propagates to the caller and that the
+        base image (written by fetch_base_image) is NOT cleaned up — only the
+        snapshot file is cleaned up by _create_snapshot's own finally block.
+        """
+        fresh_images, arch = self._make_fresh_images_dir(images_dir, tmp_path)
+
+        cache_dir = tmp_path / "snapshot-cache"
+        cache_dir.mkdir()
+
+        config = SchedulerConfig(
+            images_dir=fresh_images,
+            auto_download_assets=True,
+            default_timeout_seconds=120,
+            disk_snapshot_cache_dir=cache_dir,
+        )
+        async with Scheduler(config) as scheduler:
+            base_image_path = fresh_images / f"python-3.14-base-{arch}.qcow2"
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                await create_test_qcow2(base_image_path)
+                return base_image_path
+
+            with (
+                patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+                patch.object(
+                    scheduler._snapshot_manager,
+                    "_create_snapshot",
+                    new_callable=AsyncMock,
+                    side_effect=SnapshotError("VM boot failed"),
+                ),
+            ):
+                with pytest.raises(SnapshotError, match="VM boot failed"):
+                    await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+
+            # Base image should still exist (not cleaned up on downstream failure)
+            assert base_image_path.exists(), "Base image must survive downstream SnapshotError"
 
 
 # ============================================================================
@@ -464,8 +794,6 @@ class TestSchedulerShutdownOrdering:
         then a third acquire (background save) blocks until slots are freed.
         Budget must account for DEFAULT_VM_MEMORY_OVERHEAD_MB added by acquire().
         """
-        from exec_sandbox.admission import ResourceAdmissionController
-        from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB
 
         guest_mb = 512
         total_per_vm = guest_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
@@ -644,8 +972,6 @@ time.sleep(30)
 """
 
         async with Scheduler(config) as scheduler:
-            from exec_sandbox.exceptions import VmTimeoutError
-
             try:
                 result = await scheduler.run(
                     code=code,
@@ -796,7 +1122,6 @@ class TestTimingBreakdownModel:
 
     def test_timing_breakdown_all_fields_required(self) -> None:
         """TimingBreakdown requires all four timing fields."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50, total_ms=350)
         assert timing.setup_ms == 100
@@ -806,7 +1131,6 @@ class TestTimingBreakdownModel:
 
     def test_timing_breakdown_zero_values_valid(self) -> None:
         """TimingBreakdown accepts zero values (warm pool case)."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=50, total_ms=50)
         assert timing.setup_ms == 0
@@ -814,9 +1138,6 @@ class TestTimingBreakdownModel:
 
     def test_timing_breakdown_missing_field_raises(self) -> None:
         """TimingBreakdown raises if any field is missing."""
-        from pydantic import ValidationError
-
-        from exec_sandbox.models import TimingBreakdown
 
         with pytest.raises(ValidationError):
             TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50)  # type: ignore[call-arg]
@@ -827,9 +1148,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_timing_required(self) -> None:
         """ExecutionResult requires timing field."""
-        from pydantic import ValidationError
-
-        from exec_sandbox.models import ExecutionResult
 
         with pytest.raises(ValidationError):
             ExecutionResult(  # type: ignore[call-arg]
@@ -841,7 +1159,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_with_timing(self) -> None:
         """ExecutionResult accepts timing field."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -854,7 +1171,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_warm_pool_hit_default_false(self) -> None:
         """warm_pool_hit defaults to False."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -866,7 +1182,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_warm_pool_hit_explicit_true(self) -> None:
         """warm_pool_hit can be set to True."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -881,7 +1196,6 @@ class TestExecutionResultTiming:
 
     def test_timing_breakdown_with_connect_ms(self) -> None:
         """TimingBreakdown with optional connect_ms field."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(
             setup_ms=10,
@@ -894,7 +1208,6 @@ class TestExecutionResultTiming:
 
     def test_timing_breakdown_without_connect_ms(self) -> None:
         """TimingBreakdown without connect_ms (backwards compat)."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(
             setup_ms=10,
@@ -906,7 +1219,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_with_guest_timing(self) -> None:
         """ExecutionResult with guest-reported spawn_ms and process_ms."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="",
@@ -921,7 +1233,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_without_guest_timing(self) -> None:
         """ExecutionResult without guest timing (backwards compat)."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="",
@@ -934,7 +1245,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_full_timing(self) -> None:
         """ExecutionResult with all timing fields populated."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -1051,8 +1361,6 @@ class TestSchedulerTimingIntegration:
         code = "import time; time.sleep(10)"
 
         async with Scheduler(config) as sched:
-            from exec_sandbox.exceptions import VmTimeoutError
-
             try:
                 result = await sched.run(
                     code=code,
@@ -1291,8 +1599,6 @@ class TestSchedulerWarmPoolTiming:
 
     async def test_warm_pool_exhaustion_falls_back_to_cold(self, scheduler_config: SchedulerConfig) -> None:
         """When warm pool is exhausted, falls back to cold boot with full timing."""
-        import asyncio
-
         # Create scheduler with very small pool (1 VM)
         config = SchedulerConfig(
             images_dir=scheduler_config.images_dir,
@@ -1375,7 +1681,7 @@ print(f"httpx={httpx.__version__}")
         None,
         id="python-multi",
     ),
-    # Python - C extension packages (native binaries, musllinux wheels)
+    # Python - C extension packages (prebuilt musllinux wheels, no source builds)
     pytest.param(
         Language.PYTHON,
         ["numpy==2.4.2"],

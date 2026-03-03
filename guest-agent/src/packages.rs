@@ -147,6 +147,7 @@ pub(crate) async fn install_packages(
             let mut c = Command::new("uv");
             c.arg("pip")
                 .arg("install")
+                .arg("--no-build")
                 .arg("--python")
                 .arg(format!("{PYTHON_HOME}/bin/python3"))
                 .arg("--target")
