@@ -108,8 +108,9 @@ SWEEP_DEFAULT_N_VMS: Final[int] = 200
 class BurstResult:
     """Summary metrics from a single burst run.
 
-    Latency is split into two independent dimensions:
-    - **setup**: admission queue wait + cache lookup + overlay + cgroup
+    Latency is split into three dimensions:
+    - **setup**: cache lookup + overlay + cgroup (excludes admission)
+    - **admission**: time blocked in admission queue (subset of setup, 0 for warm pool hits)
     - **exec**: VM boot + code execution (the actual work)
     """
 
@@ -122,6 +123,9 @@ class BurstResult:
     # Setup latency (admission-dominated)
     setup_p50_ms: int
     setup_p95_ms: int
+    # Admission queue latency (subset of setup, 0 for warm pool hits)
+    admission_p50_ms: int
+    admission_p95_ms: int
     # Exec latency (boot + execute, hardware-dominated)
     exec_p50_ms: int
     exec_p95_ms: int
@@ -275,6 +279,7 @@ class VMResult:
     ok: bool
     elapsed_ms: int
     setup_ms: int
+    admission_ms: int  # Time blocked in admission queue (0 for warm pool hits)
     exec_ms: int  # boot_ms + execute_ms (includes VM boot, not pure execution)
     error: str | None = None
 
@@ -291,6 +296,7 @@ async def _run_single(scheduler: Scheduler, idx: int, lang: Language, code: str)
             ok=result.exit_code == 0,
             elapsed_ms=round(elapsed * 1000),
             setup_ms=t.setup_ms,
+            admission_ms=t.admission_ms or 0,
             exec_ms=t.boot_ms + t.execute_ms,
         )
     except Exception as exc:
@@ -300,6 +306,7 @@ async def _run_single(scheduler: Scheduler, idx: int, lang: Language, code: str)
             ok=False,
             elapsed_ms=round(elapsed * 1000),
             setup_ms=0,
+            admission_ms=0,
             exec_ms=0,
             error=str(exc)[:200],
         )
@@ -345,8 +352,9 @@ async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float) -> BurstResult:
     # Total latency includes ALL VMs (failed VMs use wall-clock elapsed_ms,
     # reflecting the user-visible wait time including timeout).
     e2e_sorted = sorted(r.elapsed_ms for r in results)
-    # Setup/exec only from successes (failed VMs have setup_ms=0, exec_ms=0).
+    # Setup/admission/exec only from successes (failed VMs have setup_ms=0, admission_ms=0, exec_ms=0).
     setup_sorted = sorted(r.setup_ms for r in ok_results) if ok_results else []
+    admission_sorted = sorted(r.admission_ms for r in ok_results) if ok_results else []
     exec_sorted = sorted(r.exec_ms for r in ok_results) if ok_results else []
     peak_qemu = max((_g(s, "qemu_procs") for s in monitor.samples), default=0)
     peak_rss = max((_g(s, "qemu_rss_mb") for s in monitor.samples), default=0)
@@ -361,6 +369,8 @@ async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float) -> BurstResult:
         wall_s=wall_elapsed,
         setup_p50_ms=_percentile(setup_sorted, 50),
         setup_p95_ms=_percentile(setup_sorted, 95),
+        admission_p50_ms=_percentile(admission_sorted, 50),
+        admission_p95_ms=_percentile(admission_sorted, 95),
         exec_p50_ms=_percentile(exec_sorted, 50),
         exec_p95_ms=_percentile(exec_sorted, 95),
         total_p50_ms=_percentile(e2e_sorted, 50),
@@ -415,16 +425,17 @@ def _print_ranking(results: list[BurstResult]) -> None:
     # NaN efficiency (unmeasured RSS) sorts to the bottom
     ranked = sorted(results, key=lambda r: -r.efficiency if math.isfinite(r.efficiency) else float("inf"))
 
-    print(f"\n{'=' * 120}")
+    print(f"\n{'=' * 140}")
     print("  EFFICIENT FRONTIER RANKING (Sharpe-like: throughput / RSS fraction)")
-    print(f"{'=' * 120}")
+    print(f"{'=' * 140}")
     print(
         f"  {'Rank':>4}  {'CPU_OC':>6}  {'MEM_OC':>6}  {'OK%':>4}  {'VMs/s':>6}  "
         f"{'RSS%':>5}  {'Effic':>7}  {'Pareto':>6}  "
-        f"{'setup50':>8}  {'setup95':>8}  {'exec50':>8}  {'exec95':>8}  "
+        f"{'setup50':>8}  {'setup95':>8}  {'admit50':>8}  {'admit95':>8}  "
+        f"{'exec50':>8}  {'exec95':>8}  "
         f"{'total50':>8}  {'total95':>8}"
     )
-    print(f"  {'─' * 118}")
+    print(f"  {'─' * 138}")
 
     for rank, r in enumerate(ranked, 1):
         star = "★" if (r.cpu_oc, r.mem_oc) in pareto else ""
@@ -434,11 +445,12 @@ def _print_ranking(results: list[BurstResult]) -> None:
             f"{r.throughput:6.1f}  {r.rss_fraction * 100:4.1f}%  {eff_str}  "
             f"{star:>6}  "
             f"{r.setup_p50_ms:6d}ms  {r.setup_p95_ms:6d}ms  "
+            f"{r.admission_p50_ms:6d}ms  {r.admission_p95_ms:6d}ms  "
             f"{r.exec_p50_ms:6d}ms  {r.exec_p95_ms:6d}ms  "
             f"{r.total_p50_ms:6d}ms  {r.total_p95_ms:6d}ms"
         )
 
-    print(f"{'=' * 120}")
+    print(f"{'=' * 140}")
 
     # Pareto front explanation
     pareto_results = [r for r in ranked if (r.cpu_oc, r.mem_oc) in pareto]
@@ -448,6 +460,7 @@ def _print_ranking(results: list[BurstResult]) -> None:
             print(
                 f"    CPU={r.cpu_oc:.0f}x MEM={r.mem_oc:.1f}x → "
                 f"exec_p95={r.exec_p95_ms}ms, setup_p95={r.setup_p95_ms}ms, "
+                f"admission_p95={r.admission_p95_ms}ms, "
                 f"RSS={r.rss_fraction * 100:.1f}%"
             )
 
@@ -554,6 +567,7 @@ async def main() -> int:
             f"    → {burst.n_ok}/{burst.n_vms} ok ({burst.success_pct}%) | "
             f"wall={burst.wall_s:.1f}s | "
             f"setup={burst.setup_p50_ms}/{burst.setup_p95_ms}ms "
+            f"admit={burst.admission_p50_ms}/{burst.admission_p95_ms}ms "
             f"exec={burst.exec_p50_ms}/{burst.exec_p95_ms}ms "
             f"total={burst.total_p50_ms}/{burst.total_p95_ms}ms | "
             f"RSS={burst.peak_rss_mb}MB ({burst.rss_fraction * 100:.1f}%) | "

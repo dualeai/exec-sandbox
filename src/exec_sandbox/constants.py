@@ -388,11 +388,13 @@ OVERLAY_POOL_FALLBACK_SIZE: Final[int] = 5
 Provides a reasonable default for pre-created overlays per base image
 when the admission controller cannot determine host capacity."""
 
-OVERLAY_POOL_SIZE_RATIO: Final[float] = 0.5
-"""Overlay pool size as ratio of effective max VMs (50%).
+OVERLAY_POOL_SIZE_RATIO: Final[float] = 1.0
+"""Overlay pool size as ratio of effective max VMs (100%).
 
-With 10 max VMs, pool will have 5 pre-created overlays per base image.
-Higher ratio = more pool hits, lower ratio = less disk usage.
+Matches the max concurrent VM count so the first complete admission cycle
+gets pool hits (<1ms) instead of on-demand daemon creation (~8ms).
+With 24 max VMs, pool will have 24 pre-created overlays per base image
+(~200KB each = ~5MB per image, negligible disk cost).
 """
 
 OVERLAY_POOL_REPLENISH_BATCH_SIZE: Final[int] = 8

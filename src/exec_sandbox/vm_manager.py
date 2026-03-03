@@ -557,14 +557,11 @@ class VmManager:
         accel_type = await self._detect_accel_type()
         use_tcg = accel_type == AccelType.TCG
 
-        # Overlay + cgroup + permissions (parallel where possible)
-        try:
-            await self._overlay_pool.acquire(base_image, workdir.overlay_image)
-        except (QemuImgError, QemuStorageDaemonError) as e:
-            raise VmOverlayError(str(e)) from e
-
-        perm_result, cgroup_result = await asyncio.gather(
-            self._apply_overlay_permissions(base_image, workdir.overlay_image),
+        # Overlay + cgroup in parallel (overlay doesn't depend on reservation;
+        # cgroup needs reservation limits but both can run concurrently).
+        # Permissions must wait for overlay to exist, so it runs after.
+        overlay_result, cgroup_result = await asyncio.gather(
+            self._overlay_pool.acquire(base_image, workdir.overlay_image),
             cgroup.setup_cgroup(
                 vm_id,
                 tenant_id,
@@ -573,12 +570,16 @@ class VmManager:
             ),
             return_exceptions=True,
         )
-        if isinstance(perm_result, BaseException):
-            raise perm_result
+        if isinstance(overlay_result, BaseException):
+            if isinstance(overlay_result, (QemuImgError, QemuStorageDaemonError)):
+                raise VmOverlayError(str(overlay_result)) from overlay_result
+            raise overlay_result
         if isinstance(cgroup_result, BaseException):
             raise cgroup_result
         cgroup_path: Path | None = cgroup_result
-        workdir.use_qemu_vm_user = perm_result
+
+        # Permissions need the overlay file to exist (changes ownership/mode)
+        workdir.use_qemu_vm_user = await self._apply_overlay_permissions(base_image, workdir.overlay_image)
 
         # Socket cleanup + channel
         for socket_path in [workdir.cmd_socket, workdir.event_socket, str(workdir.qmp_socket)]:

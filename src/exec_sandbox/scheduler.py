@@ -347,7 +347,7 @@ class Scheduler:
             )
         timeout = timeout_seconds if timeout_seconds is not None else self.config.default_timeout_seconds
 
-        vm, resolved_ports, is_cold_boot, prepare_start_time = await self._prepare_vm(
+        vm, resolved_ports, is_cold_boot, prepare_start_time, admission_ms = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -377,8 +377,8 @@ class Scheduler:
 
             # boot_ms from VM (0 for warm pool/L1), setup_ms = prepare time minus boot
             boot_ms = vm.boot_ms if is_cold_boot and vm.boot_ms is not None else 0
-            # setup_ms = all pre-boot time (admission + cache + overlay + cgroup)
-            setup_ms = max(0, round((prepare_end_time - prepare_start_time) * 1000) - boot_ms)
+            # setup_ms = infra time only (cache + overlay + cgroup), excluding admission wait
+            setup_ms = max(0, round((prepare_end_time - prepare_start_time) * 1000) - boot_ms - admission_ms)
             # Granular setup timing
             overlay_ms = vm.overlay_ms if is_cold_boot and vm.overlay_ms is not None else 0
             # Granular boot timing
@@ -405,6 +405,7 @@ class Scheduler:
                     execute_ms=execute_ms,
                     total_ms=0,  # placeholder — patched after teardown
                     connect_ms=result.timing.connect_ms,
+                    admission_ms=admission_ms,
                     overlay_ms=overlay_ms,
                     qemu_cmd_build_ms=qemu_cmd_build_ms,
                     gvproxy_start_ms=gvproxy_start_ms,
@@ -489,7 +490,7 @@ class Scheduler:
         """
         idle_timeout = idle_timeout_seconds or self.config.session_idle_timeout_seconds
 
-        vm, resolved_ports, _is_cold_boot, _prepare_start_time = await self._prepare_vm(
+        vm, resolved_ports, _is_cold_boot, _prepare_start_time, _admission_ms = await self._prepare_vm(
             language=language,
             packages=packages,
             memory_mb=memory_mb,
@@ -534,7 +535,7 @@ class Scheduler:
         expose_ports: list[PortMapping | int] | None,
         task_id: str,
         on_boot_log: Callable[[str], None] | None = None,
-    ) -> tuple[QemuVM, list[ExposedPort], bool, float]:
+    ) -> tuple[QemuVM, list[ExposedPort], bool, float, int]:
         """Create and boot a VM with the given configuration.
 
         Shared by run() and session() - handles validation, snapshots,
@@ -551,7 +552,7 @@ class Scheduler:
             on_boot_log: Optional callback for streaming boot console output.
 
         Returns:
-            Tuple of (vm, resolved_ports, is_cold_boot, prepare_start_time).
+            Tuple of (vm, resolved_ports, is_cold_boot, prepare_start_time, admission_ms).
 
         Raises:
             SandboxError: Scheduler not started.
@@ -609,6 +610,7 @@ class Scheduler:
         # requested (warm pool VMs booted without on_boot_log — callback would never fire)
         vm: QemuVM | None = None
         is_cold_boot = False
+        admission_ms = 0
         needs_network: bool = allow_network or bool(resolved_ports)
         if self._warm_pool and not packages and not needs_network and on_boot_log is None:
             vm = await self._warm_pool.get_vm(language, packages)
@@ -616,10 +618,12 @@ class Scheduler:
         if vm is None:
             is_cold_boot = True
 
+            admission_start = asyncio.get_running_loop().time()
             async with self._vm_manager.reservation_context(
                 vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}",
                 memory_mb=memory,
             ) as reservation:
+                admission_ms = round((asyncio.get_running_loop().time() - admission_start) * 1000)
                 # L1 memory snapshot restore (~100ms)
                 # Cache key includes network topology (needs_network, not just allow_network)
                 # because expose_ports also adds a virtio-net device.
@@ -687,7 +691,7 @@ class Scheduler:
                             allow_network=needs_network,
                         )
 
-        return vm, resolved_ports, is_cold_boot, prepare_start_time
+        return vm, resolved_ports, is_cold_boot, prepare_start_time, admission_ms
 
     def _create_settings(self) -> Settings:
         """Create Settings from SchedulerConfig.

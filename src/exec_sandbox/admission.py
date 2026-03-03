@@ -11,7 +11,8 @@ Four admission gates (all must pass):
 Gates 1-2 are budget-based (stable). Gates 3a/3b are dynamic (inline probe,
 ~3-5µs each, cached 100ms). A self-wake timer periodically notifies blocked
 waiters so Gate 3 re-probes even without local release() events.
-All gates block via asyncio.Condition, timing out with VmCapacityError.
+All gates block via asyncio.Condition with FIFO notify(1) wakeup (O(1) per
+release instead of O(N) thundering herd), timing out with VmCapacityError.
 
 Capacity detection priority chain:
   manual override > cgroup limit > psutil total
@@ -84,8 +85,8 @@ class ResourceReservation:
 # Sentinel for "no limit" when psutil probe fails
 _UNLIMITED: Final[float] = float("inf")
 
-# Probe cache TTL: collapses N identical probes into 1 when
-# notify_all() wakes multiple waiters simultaneously
+# Probe cache TTL: collapses repeated probes into 1 when
+# self-wake timer or stop() wakes multiple waiters simultaneously
 _PROBE_CACHE_TTL_SECONDS: Final[float] = 0.1
 
 # Linux PSI threshold: percentage of last 10s ALL tasks were stalled on memory.
@@ -614,8 +615,13 @@ class ResourceAdmissionController:
                 },
             )
 
-            # Wake ALL waiters - multiple may now fit
-            self._condition.notify_all()
+            # Wake exactly 1 waiter — all VMs request identical resources
+            # (DEFAULT_VM_CPU_CORES + overhead), so freeing 1 slot can only
+            # satisfy 1 waiter.  Eliminates O(N²) thundering herd under burst
+            # load (500 waiters x 500 releases = 250k wasted wakeups).
+            # Gate 3 recovery (external memory pressure drop) is handled by
+            # _self_wake_loop which still uses notify_all() every 10s.
+            self._condition.notify(1)
 
     def effective_max_vms(
         self,

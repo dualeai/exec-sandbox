@@ -10,7 +10,8 @@ Measures:
 - Warm pool latency: Time with pre-warmed VMs (sequential and concurrent)
 
 Uses TimingBreakdown from exec-sandbox for detailed phase timings:
-- setup_ms: Resource setup (admission, cache, overlay, cgroup)
+- setup_ms: Infra setup (cache, overlay, cgroup) — excludes admission
+- admission_ms: Time blocked in admission queue (subset of setup, 0 for warm pool hits)
 - boot_ms: VM boot (QEMU + kernel + initramfs + guest-agent)
 - execute_ms: Code execution (connect + run + response)
 - teardown_ms: VM teardown (destroy + cleanup)
@@ -74,6 +75,7 @@ _ALWAYS_FIELDS: tuple[tuple[str, str], ...] = (
 _OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
     ("execution_time_ms", "guest_exec"),
     ("timing.teardown_ms", "teardown"),
+    ("timing.admission_ms", "admission"),
     ("timing.overlay_ms", "overlay"),
     ("timing.connect_ms", "connect"),
     ("timing.l1_restore_ms", "l1_restore"),
@@ -98,6 +100,7 @@ class TimingStats:
     teardown: list[float] = field(default_factory=list[float])
     guest_exec: list[float] = field(default_factory=list[float])
     # Granular setup timing
+    admission: list[float] = field(default_factory=list[float])  # Admission queue wait (0 for warm pool hits)
     overlay: list[float] = field(default_factory=list[float])  # Overlay acquisition (pool or on-demand)
     # Granular execute timing
     connect: list[float] = field(default_factory=list[float])  # Host: channel.connect()
@@ -213,7 +216,8 @@ def fmt_stats(values: list[float]) -> str:
 
 # Tree breakdown tables: (label, stats_attr, annotation | None)
 _MAIN_TREE: list[tuple[str, str, str | None]] = [
-    ("Setup", "setup", "admission + cache + overlay + cgroup"),
+    ("Admission", "admission", "queue wait (0 for warm pool)"),
+    ("Setup", "setup", "cache + overlay + cgroup"),
     ("Boot", "boot", None),
     ("Execute", "execute", None),
     ("Teardown", "teardown", "destroy + cleanup"),
