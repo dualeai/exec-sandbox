@@ -5,8 +5,9 @@ import logging
 import os
 import random
 import sys
+import tempfile
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
 
 import pytest
@@ -202,6 +203,18 @@ skip_on_python_312_subprocess_bug = pytest.mark.skipif(
 # ============================================================================
 # Common Paths and Config Fixtures
 # ============================================================================
+
+
+@pytest.fixture
+def short_tmp_dir() -> Iterator[Path]:
+    """Short temp directory for Unix socket paths (macOS 104-byte AF_UNIX limit).
+
+    Uses tempfile.TemporaryDirectory() instead of pytest tmp_path because
+    tmp_path generates long paths that exceed macOS's 104-byte limit for
+    AF_UNIX socket addresses.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
 
 
 @pytest.fixture

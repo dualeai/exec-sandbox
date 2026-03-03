@@ -4333,21 +4333,26 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
         -qmp unix:<path>,server=on,wait=off
     """
 
-    async def test_qmp_fd_generates_chardev_mon_syntax(self, vm_settings, workdir) -> None:
-        """qmp_fd=7 produces -chardev/-mon pair, never -qmp."""
+    @staticmethod
+    async def _build_cmd(vm_settings, workdir, *, vm_id: str = "test-vm", allow_network: bool = False, **kwargs):
+        """Build a QEMU command with shared defaults for QMP tests."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
+        return await build_qemu_cmd(
+            settings=vm_settings,
+            arch=HostArch.X86_64,
+            vm_id=vm_id,
+            workdir=workdir,
+            memory_mb=256,
+            cpu_cores=1,
+            allow_network=allow_network,
+            **kwargs,
+        )
+
+    async def test_qmp_fd_generates_chardev_mon_syntax(self, vm_settings, workdir) -> None:
+        """qmp_fd=7 produces -chardev/-mon pair, never -qmp."""
         with _qemu_cmd_mocks():
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-fd",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-                qmp_fd=7,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-fd", qmp_fd=7)
 
         assert "socket,id=qmp0,fd=7,server=on,wait=off" in " ".join(cmd)
         assert "-mon" in cmd
@@ -4357,18 +4362,8 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_none_generates_legacy_syntax(self, vm_settings, workdir) -> None:
         """qmp_fd=None (default) produces -qmp, never -chardev with qmp0."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         with _qemu_cmd_mocks():
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-legacy",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-legacy")
 
         assert "-qmp" in cmd
         qmp_idx = cmd.index("-qmp")
@@ -4380,20 +4375,8 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_with_defer_incoming(self, vm_settings, workdir) -> None:
         """qmp_fd + defer_incoming=True: both chardev and -incoming defer appear."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         with _qemu_cmd_mocks():
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-defer",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-                qmp_fd=7,
-                defer_incoming=True,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-defer", qmp_fd=7, defer_incoming=True)
 
         cmd_str = " ".join(cmd)
         assert "socket,id=qmp0,fd=7,server=on,wait=off" in cmd_str
@@ -4402,19 +4385,8 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_zero(self, vm_settings, workdir) -> None:
         """qmp_fd=0 is valid (not falsy) and generates fd=0."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         with _qemu_cmd_mocks():
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-fd0",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-                qmp_fd=0,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-fd0", qmp_fd=0)
 
         cmd_str = " ".join(cmd)
         assert "socket,id=qmp0,fd=0,server=on,wait=off" in cmd_str
@@ -4422,19 +4394,8 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_high_number(self, vm_settings, workdir) -> None:
         """qmp_fd=1023: large fd properly stringified in chardev arg."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         with _qemu_cmd_mocks():
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-highfd",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-                qmp_fd=1023,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-highfd", qmp_fd=1023)
 
         cmd_str = " ".join(cmd)
         assert "socket,id=qmp0,fd=1023,server=on,wait=off" in cmd_str
@@ -4442,21 +4403,11 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_not_used_with_sudo_path(self, vm_settings, workdir) -> None:
         """use_qemu_vm_user=True + different UID: sudo wraps cmd, legacy -qmp syntax."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         workdir.use_qemu_vm_user = True
 
         # qemu_vm_uid=999, os_getuid=1000 → different user → sudo wraps
         with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=1000):
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-sudo",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-sudo")
 
         assert "-qmp" in cmd
         qmp_idx = cmd.index("-qmp")
@@ -4466,22 +4417,11 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_skips_sudo_when_already_target_user(self, vm_settings, workdir) -> None:
         """use_qemu_vm_user=True + same UID: no sudo, socket activation works."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         workdir.use_qemu_vm_user = True
 
         # qemu_vm_uid=999, os_getuid=999 → same user → no sudo needed
         with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=999):
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
-                vm_id="test-vm-qmp-same-user",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
-                qmp_fd=7,
-            )
+            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-same-user", qmp_fd=7)
 
         # Socket activation syntax (no sudo blocking fds)
         cmd_str = " ".join(cmd)
@@ -4493,16 +4433,11 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
 
     async def test_qmp_fd_with_all_features(self, vm_settings, workdir) -> None:
         """Smoke test: qmp_fd + defer_incoming + allow_network + snapshot_drive."""
-        from exec_sandbox.qemu_cmd import build_qemu_cmd
-
         with _qemu_cmd_mocks():
-            cmd = await build_qemu_cmd(
-                settings=vm_settings,
-                arch=HostArch.X86_64,
+            cmd = await self._build_cmd(
+                vm_settings,
+                workdir,
                 vm_id="test-vm-qmp-all",
-                workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
                 allow_network=True,
                 qmp_fd=7,
                 defer_incoming=True,

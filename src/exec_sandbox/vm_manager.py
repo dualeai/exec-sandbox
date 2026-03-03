@@ -1062,10 +1062,7 @@ class VmManager:
         qmp_parent_sock = None
         qmp_fd: int | None = None
         qemu_vm_uid = get_qemu_vm_uid()
-        sudo_wraps_qemu = (
-            infra.workdir.use_qemu_vm_user
-            and (qemu_vm_uid is None or os.getuid() != qemu_vm_uid)
-        )
+        sudo_wraps_qemu = infra.workdir.use_qemu_vm_user and (qemu_vm_uid is None or os.getuid() != qemu_vm_uid)
         if not sudo_wraps_qemu:
             qmp_parent_sock = create_unix_socket(str(infra.workdir.qmp_socket))
             qmp_fd = qmp_parent_sock.fileno()

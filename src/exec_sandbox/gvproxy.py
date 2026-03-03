@@ -198,6 +198,9 @@ async def start_gvproxy(  # noqa: PLR0915
         if "Listening on QEMU socket" in line:
             ready_event.set()
 
+    def check_error(line: str) -> None:
+        logger.error(f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line})
+
     # Background task to drain gvproxy output (prevent pipe deadlock)
     gvproxy_log_task = asyncio.create_task(
         drain_subprocess_output(
@@ -205,9 +208,7 @@ async def start_gvproxy(  # noqa: PLR0915
             process_name="gvproxy-wrapper",
             context_id=vm_id,
             stdout_handler=check_ready,
-            stderr_handler=lambda line: logger.error(
-                f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line}
-            ),
+            stderr_handler=check_error,
         )
     )
     gvproxy_log_task.add_done_callback(log_task_exception)

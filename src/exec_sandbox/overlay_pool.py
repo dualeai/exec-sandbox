@@ -479,7 +479,7 @@ class OverlayPool:
                     "Overlay pool replenished",
                     extra={
                         "base_image": key,
-                        "created_count": batch_size,  # Avoid "created", conflicts with LogRecord.created
+                        "created_count": batch_size,  # Not "created" — conflicts with LogRecord.created
                         "current_size": pool.qsize(),
                         "target_size": self._pool_size,
                     },
