@@ -469,7 +469,7 @@ This stretches the pool beyond physical capacity — safe because AI agent workl
 are bursty and mostly idle (avg memory utilization 18-22%).  The 2.9x default was
 determined by RBF surrogate optimization over a 4x4 Pareto-optimal sweep (500 VMs
 per combo) on a 16-vCPU / 32GB EC2 instance with KVM
-(scripts/benchmark_burst.py): CPU=2x MEM=2.9x predicted efficiency=464
+(scripts/benchmark_optimizer.py): CPU=2x MEM=2.9x predicted efficiency=464
 VMs/s per RSS-fraction — confirmed by sampled optimum CPU=2x MEM=3x at
 efficiency=463 with exec p95=73ms at 7.8% RSS.
 Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
@@ -483,7 +483,7 @@ budget = (host_cpus - reserve_cores) * overcommit_ratio
 AI workloads average 11-17% CPU utilization, so 2x overcommit is safe while
 keeping exec latency low.  The 2x default was determined by RBF surrogate
 optimization over a 4x4 Pareto-optimal sweep (500 VMs per combo) on a
-16-vCPU / 32GB EC2 instance with KVM (scripts/benchmark_burst.py): CPU=2x
+16-vCPU / 32GB EC2 instance with KVM (scripts/benchmark_optimizer.py): CPU=2x
 MEM=2.9x predicted efficiency=464 VMs/s per RSS-fraction with exec p95=73ms
 at 7.8% RSS.  Beyond 2x, RSS grows sharply (8% → 18% → 36% → 52%) while
 throughput stays flat (~35 VMs/s), and at 12x the system OOMs under load.

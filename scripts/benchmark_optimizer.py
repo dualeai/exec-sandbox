@@ -17,9 +17,9 @@ The sweep results inform the defaults in constants.py:
   DEFAULT_MEMORY_OVERCOMMIT_RATIO = 2.9
 
 Re-run after changing VM sizing, admission logic, or target hardware:
-    make bench-sweep              # 200 VMs per combo (default)
-    make bench-sweep N_VMS=500    # heavier load
-    uv run python scripts/benchmark_burst.py -n 50   # quick local test
+    make bench-optimizer              # 200 VMs per combo (default)
+    make bench-optimizer N_VMS=500    # heavier load
+    uv run python scripts/benchmark_optimizer.py -n 50   # quick local test
 """
 
 from __future__ import annotations

@@ -452,11 +452,11 @@ Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) us
 
 ### Tuning
 
-The defaults were determined by RBF surrogate optimization over a 4×4 Pareto-optimal sweep (`scripts/benchmark_burst.py`). Re-run after changing VM sizing, admission logic, or target hardware:
+The defaults were determined by RBF surrogate optimization over a 4×4 Pareto-optimal sweep (`scripts/benchmark_optimizer.py`). Re-run after changing VM sizing, admission logic, or target hardware:
 
 ```bash
-make bench-sweep              # 200 VMs per combo (4x4 grid = 16 combos)
-make bench-sweep N_VMS=500    # heavier load
+make bench-optimizer              # 200 VMs per combo (4x4 grid = 16 combos)
+make bench-optimizer N_VMS=500    # heavier load
 ```
 
 ## Memory Optimization
