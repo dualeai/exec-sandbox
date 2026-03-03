@@ -64,9 +64,10 @@ from exec_sandbox.hash_utils import crc64
 from exec_sandbox.lock_utils import file_lock
 from exec_sandbox.models import Language
 from exec_sandbox.overlay_pool import QemuImgError
-from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.qemu_vm import guest_error_to_exception
+from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
+from exec_sandbox.subprocess_utils import start_managed_process
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -323,14 +324,8 @@ class DiskSnapshotManager(BaseCacheManager):
 
         # Verify qcow2 format (standalone ext4 snapshot, no backing file expected)
         try:
-            proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    "qemu-img",
-                    "check",
-                    str(snapshot_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+            proc = await start_managed_process(
+                ["qemu-img", "check", str(snapshot_path)],
             )
             await proc.communicate()
 
@@ -458,17 +453,8 @@ class DiskSnapshotManager(BaseCacheManager):
                         raise
 
                     # Shutdown QEMU process cleanly
-                    we_initiated_shutdown = False
-                    if vm.process.returncode is None:
-                        we_initiated_shutdown = True
-                        await vm.process.terminate()
-                        try:
-                            await asyncio.wait_for(vm.process.wait(), timeout=5.0)
-                        except TimeoutError:
-                            await vm.process.kill()
-                            await vm.process.wait()
-                    else:
-                        await vm.process.wait()
+                    we_initiated_shutdown = vm.process.returncode is None
+                    await cleanup_process(vm.process, "QEMU", cache_key, term_timeout=5.0)
 
                     # Verify QEMU exited cleanly
                     if we_initiated_shutdown:
@@ -591,8 +577,8 @@ class DiskSnapshotManager(BaseCacheManager):
             SnapshotError: qemu-img command failed
         """
         try:
-            proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
+            proc = await start_managed_process(
+                [
                     "qemu-img",
                     "create",
                     "-f",
@@ -601,11 +587,9 @@ class DiskSnapshotManager(BaseCacheManager):
                     "cluster_size=128k,lazy_refcounts=on,extended_l2=on",
                     str(snapshot_path),
                     "512M",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+                ],
             )
-            _stdout, stderr = await proc.communicate()
+            _, stderr = await proc.communicate()
             if proc.returncode != 0:
                 raise QemuImgError(f"qemu-img create failed: {stderr.decode().strip()}")
         except QemuImgError as e:

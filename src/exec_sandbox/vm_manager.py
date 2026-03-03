@@ -61,14 +61,19 @@ from exec_sandbox.permission_utils import (
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, ProcessWrapper, detect_host_arch
-from exec_sandbox.process_registry import register_process, unregister_process
+from exec_sandbox.process_registry import unregister_process
 from exec_sandbox.qemu_cmd import build_qemu_cmd
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
-from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, wait_for_socket
+from exec_sandbox.subprocess_utils import (
+    drain_subprocess_output,
+    log_task_exception,
+    start_managed_process,
+    wait_for_socket,
+)
 from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
@@ -644,7 +649,6 @@ class VmManager:
             expose_ports=expose_ports,
             block_outbound=is_mode1,
         )
-        register_process(gvproxy_proc)
         await cgroup.attach_if_available(infra.cgroup_path, gvproxy_proc.pid)
         gvproxy_start_ms = round((asyncio.get_running_loop().time() - gvproxy_start_time) * 1000)
         return gvproxy_proc, gvproxy_log_task, gvproxy_start_ms
@@ -679,17 +683,11 @@ class VmManager:
             def _set_umask_007() -> None:
                 os.umask(0o007)
 
-            qemu_proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    *qemu_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                    preexec_fn=_set_umask_007 if infra.workdir.use_qemu_vm_user else None,
-                    pass_fds=pass_fds,
-                )
+            qemu_proc = await start_managed_process(
+                qemu_cmd,
+                preexec_fn=_set_umask_007 if infra.workdir.use_qemu_vm_user else None,
+                pass_fds=pass_fds,
             )
-            register_process(qemu_proc)
             await cgroup.attach_if_available(infra.cgroup_path, qemu_proc.pid)
         except (OSError, FileNotFoundError) as e:
             raise VmDependencyError(

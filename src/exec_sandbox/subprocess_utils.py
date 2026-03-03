@@ -1,5 +1,6 @@
 """Subprocess lifecycle utilities.
 
+- start_managed_process: launch a subprocess with standard piping and process registration
 - drain_subprocess_output: concurrent stdout/stderr draining (prevents 64KB pipe deadlock)
 - wait_for_socket: poll for a Unix socket created by a child process after fork+exec
 """
@@ -10,14 +11,57 @@ import asyncio
 from typing import TYPE_CHECKING, Literal, overload
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.process_registry import register_process
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
-    from exec_sandbox.platform_utils import ProcessWrapper
-
 logger = get_logger(__name__)
+
+
+async def start_managed_process(
+    cmd: Sequence[str],
+    *,
+    pass_fds: tuple[int, ...] = (),
+    preexec_fn: Callable[[], None] | None = None,
+) -> ProcessWrapper:
+    """Launch a subprocess with standard piping and process registration.
+
+    Common boilerplate for all subprocesses (QEMU, gvproxy, QSD, qemu-img):
+    - Wraps asyncio subprocess with ProcessWrapper for PID-reuse safety
+    - Pipes stdout/stderr (prevents 64 KiB deadlock when paired with drain_subprocess_output)
+    - Registers in process_registry for emergency Ctrl+C kill (prevents orphans)
+    - Creates new session (isolates signal delivery, enables killpg)
+
+    Callers handle their own error wrapping (VmDependencyError, VmGvproxyError, etc.)
+    and domain-specific post-launch steps (cgroup attachment, socket wait, etc.).
+
+    Args:
+        cmd: Command and arguments.
+        pass_fds: File descriptors to inherit (socket activation).
+        preexec_fn: Function called in child between fork and exec.
+
+    Returns:
+        ProcessWrapper instance with stdout/stderr pipes.
+
+    Raises:
+        OSError: Process spawn failed.
+        FileNotFoundError: Binary not found.
+    """
+    proc = ProcessWrapper(
+        await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            preexec_fn=preexec_fn,
+            pass_fds=pass_fds,
+        )
+    )
+    register_process(proc)
+    return proc
 
 
 async def drain_subprocess_output(
