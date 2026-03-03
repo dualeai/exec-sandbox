@@ -1270,11 +1270,11 @@ def test_effective_max_vms_basic() -> None:
 def test_effective_max_vms_with_tcg() -> None:
     """effective_max_vms accounts for TCG overhead when use_tcg=True."""
     # Use high CPU count so memory is the bottleneck (not CPU)
-    ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=100.0)
+    ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=200.0)
     result_kvm = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=False)
     result_tcg = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=True)
     mem_budget = 16_000 * (1 - DEFAULT_HOST_MEMORY_RESERVE_RATIO) * DEFAULT_MEMORY_OVERCOMMIT_RATIO
-    cpu_budget = (100.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO
+    cpu_budget = (200.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO
     cpu_per_vm = 1.0 + DEFAULT_VM_CPU_OVERHEAD_CORES
     kvm_mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
     tcg_mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
@@ -1291,8 +1291,8 @@ def test_effective_max_vms_one_dimension_unlimited() -> None:
     # Manually set memory unlimited, CPU finite
     ctrl._memory_budget_mb = float("inf")
     result = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
-    # CPU: (8-0.5) * 4.0 = 30.0, per-VM = 1.25, max_cpu = 24
-    assert result == 24
+    # CPU: (8-0.5) * 2.0 = 15.0, per-VM = 1.25, max_cpu = 12
+    assert result == 12
 
     # Manually set CPU unlimited, memory finite
     ctrl._memory_budget_mb = 21600.0
