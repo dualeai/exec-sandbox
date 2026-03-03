@@ -39,10 +39,12 @@ _MAX_CONCURRENT = (os.cpu_count() or 4) // 2 or 1
 # Threshold covers 3.14t worst case (164MB observed) with headroom for GC timing variance
 _LEAK_THRESHOLD_MB = 200
 
-# Peak RAM per VM threshold (MB) - measured ~9.5MB for single VM on arm64
-# x64 has ~2MB higher overhead per VM due to architecture differences
-# 3.14t: mimalloc per-thread arenas + per-object biased refcounting add ~50% overhead
-_PEAK_RAM_PER_VM_MB = 18
+# Peak RAM per VM threshold (MB):
+#   arm64/HVF macOS: ~2-4MB/VM
+#   x64/KVM Linux:   ~11.5MB/VM
+#   x64/KVM 3.14t:   ~17-18MB/VM (mimalloc arenas + biased refcounting)
+# 21MB gives ~20% headroom over 3.14t worst case for CI variance.
+_PEAK_RAM_PER_VM_MB = 21
 
 # Code that exercises network stack without external dependencies
 _NETWORK_TEST_CODE = """
@@ -468,6 +470,11 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
     Warmup run absorbs one-time init costs and, when allow_network=True,
     also primes the gvproxy/network path — see test_no_memory_leak_without_network
     docstring for rationale.
+
+    Baseline is taken inside the measurement Scheduler (after startup but
+    before launching VMs) so Scheduler creation cost isn't counted as per-VM
+    growth.  gc.collect() before baseline and before stopping the tracker
+    reduces RSS noise from dead objects.
     """
     config = SchedulerConfig(
         images_dir=images_dir,
@@ -475,7 +482,8 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
         default_timeout_seconds=30 if allow_network else 10,
     )
 
-    _, baseline_rss = await _warmup_and_baseline(
+    # Warmup absorbs one-time init costs (Pydantic, psutil, mimalloc arenas)
+    await _warmup_and_baseline(
         config,
         code=_NETWORK_TEST_CODE if allow_network else "print('warmup')",
         allow_network=allow_network,
@@ -483,8 +491,12 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
 
     tracker = PeakMemoryTracker()
     code = _NETWORK_TEST_CODE if allow_network else "print('ok')"
+    process = psutil.Process()
 
     async with Scheduler(config) as scheduler:
+        # Baseline inside the Scheduler so startup cost isn't counted as per-VM growth
+        gc.collect()
+        baseline_rss = process.memory_info().rss
         tracker.start(baseline_rss)
 
         tasks = [
@@ -493,6 +505,7 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        gc.collect()
         peak_rss = await tracker.stop()
 
         _assert_success_rate(results, concurrent_vms, check_exit_code=True)
