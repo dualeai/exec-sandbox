@@ -62,6 +62,37 @@ ERRNO_PERMISSION_DENIED: Final[int] = 13
 # both raw byte values (memory.limit_in_bytes) and page-counter representations.
 _CGROUP_V1_UNLIMITED_THRESHOLD: Final[int] = 2**62
 
+
+# =============================================================================
+# Self Cgroup Resolution
+# =============================================================================
+
+
+def resolve_self_cgroup_v2() -> str | None:
+    """Return the current process's cgroup v2 relative path, or None.
+
+    Parses ``/proc/self/cgroup`` which may contain multiple lines on hybrid
+    v1+v2 systems (e.g. RHEL 8).  The cgroup v2 entry is always ``0::/path``.
+
+    Returns:
+        Relative cgroup path (e.g. ``/system.slice/docker-xxx.scope``),
+        or None if not on Linux, not cgroup v2, or ``/proc`` is unavailable.
+    """
+    if detect_host_os() != HostOS.LINUX:
+        return None
+
+    try:
+        content = Path("/proc/self/cgroup").read_text()
+    except (OSError, ValueError):
+        return None
+
+    for line in content.splitlines():
+        parts = line.split(":")
+        if len(parts) == 3 and parts[0] == "0":  # noqa: PLR2004
+            return parts[2]
+    return None
+
+
 # =============================================================================
 # Container Cgroup Detection
 # =============================================================================
