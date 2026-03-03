@@ -37,16 +37,18 @@ import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import psutil
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import VmOverlayError as QemuStorageDaemonError
-from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.process_registry import register_process, unregister_process
-from exec_sandbox.subprocess_utils import wait_for_socket
+from exec_sandbox.process_registry import unregister_process
+from exec_sandbox.subprocess_utils import start_managed_process, wait_for_socket
+
+if TYPE_CHECKING:
+    from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
 
@@ -147,15 +149,7 @@ class QemuStorageDaemon:
         ]
 
         try:
-            self._process = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,
-                )
-            )
-            register_process(self._process)
+            self._process = await start_managed_process(cmd)
 
             # Wait for socket and connect (single step to avoid TOCTOU)
             await self._wait_and_connect_qmp()

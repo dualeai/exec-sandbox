@@ -360,6 +360,13 @@ MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
 MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS: Final[float] = 0.005
 """Interval between query-migrate polls (5ms)."""
 
+MEMORY_SNAPSHOT_QMP_SOCKET_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Timeout waiting for QMP socket to appear during L1 restore (sudo path only).
+
+Only used when socket activation is unavailable (sudo wraps QEMU, closing
+inherited fds). With socket activation, the socket is pre-created and no
+polling is needed."""
+
 MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
 """Minimum QEMU version for mapped-ram + multifd migration capabilities.
 Changing capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
@@ -381,11 +388,13 @@ OVERLAY_POOL_FALLBACK_SIZE: Final[int] = 5
 Provides a reasonable default for pre-created overlays per base image
 when the admission controller cannot determine host capacity."""
 
-OVERLAY_POOL_SIZE_RATIO: Final[float] = 0.5
-"""Overlay pool size as ratio of effective max VMs (50%).
+OVERLAY_POOL_SIZE_RATIO: Final[float] = 1.0
+"""Overlay pool size as ratio of effective max VMs (100%).
 
-With 10 max VMs, pool will have 5 pre-created overlays per base image.
-Higher ratio = more pool hits, lower ratio = less disk usage.
+Matches the max concurrent VM count so the first complete admission cycle
+gets pool hits (<1ms) instead of on-demand daemon creation (~8ms).
+With 24 max VMs, pool will have 24 pre-created overlays per base image
+(~200KB each = ~5MB per image, negligible disk cost).
 """
 
 OVERLAY_POOL_REPLENISH_BATCH_SIZE: Final[int] = 8
@@ -451,22 +460,38 @@ FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
 # Resource Admission & Overcommit
 # ============================================================================
 
-DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 1.5
+DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 8.0
 """Host-level memory overcommit multiplier applied to the total VM pool budget.
 
 budget = host_total * (1 - reserve_ratio) * overcommit_ratio
 
 This stretches the pool beyond physical capacity — safe because AI agent workloads
-are bursty and mostly idle (avg memory utilization 18-22%).
+are bursty and mostly idle (avg memory utilization 18-22%).  At the optimal CPU=2x,
+CPU is the binding constraint (~24 concurrent slots), so memory overcommit only
+affects the theoretical budget ceiling, not actual concurrency or RSS.
+
+The 8.0x default was determined by RBF surrogate optimization over a 4x4
+latency-frontier sweep (500 VMs per combo) on a 16-vCPU / 32GB EC2 instance
+with KVM (scripts/benchmark_optimizer.py): CPU=2x MEM=8x achieves latency
+efficiency=1116 (10^6 / geomean of admission, setup, exec p95) with
+admit_p95=11.0s, setup_p95=921ms, exec_p95=71ms at 7.0% RSS.
 Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
 constant for QEMU/gvproxy process memory."""
 
-DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 4.0
+DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 2.0
 """Host-level CPU overcommit multiplier applied to the total VM pool budget.
 
 budget = (host_cpus - reserve_cores) * overcommit_ratio
 
-AI workloads average 11-17% CPU utilization, so 4x overcommit is safe.
+AI workloads average 11-17% CPU utilization, so 2x overcommit is safe while
+keeping exec latency low.  The 2x default was determined by RBF surrogate
+optimization over a 4x4 latency-frontier sweep (500 VMs per combo) on a
+16-vCPU / 32GB EC2 instance with KVM (scripts/benchmark_optimizer.py): CPU=2x
+MEM=8x achieves latency efficiency=1116 (10^6 / geomean of admission, setup,
+exec p95) with admit_p95=11.0s, setup_p95=921ms, exec_p95=71ms at 7.0% RSS.
+Beyond 2x, setup and exec latencies grow sharply (setup: 950ms → 1.4s → 2.5s
+→ 4.5s; exec: 73ms → 105ms → 370ms → 895ms) while throughput stays flat
+(~35 VMs/s), and at 12x the system OOMs under load.
 Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
 constant for QEMU/gvproxy process CPU."""
 

@@ -73,14 +73,15 @@ class TimingBreakdown(BaseModel):
     All times are in milliseconds, measured from the host side.
     Follows Firecracker/AWS Lambda SnapStart conventions for phase separation.
 
-    Phase coverage:
-    - setup_ms: All pre-boot time (admission acquire, cache lookup, overlay, cgroup)
+    Phase coverage (non-overlapping):
+    - admission_ms: Time blocked in admission queue (0 for warm pool hits)
+    - setup_ms: Infra setup (cache lookup, overlay, cgroup) — excludes admission
     - boot_ms: VM boot (QEMU start + kernel + initramfs + guest-agent ready)
     - execute_ms: Code execution (connect + run + response)
     - teardown_ms: Post-execute cleanup (VM destroy, workdir cleanup, admission release)
-    - total_ms = setup + boot + execute + teardown (true end-to-end)
+    - total_ms = admission + setup + boot + execute + teardown (true end-to-end)
 
-    For warm pool hits, boot_ms is 0 (pre-paid at pool startup). setup_ms
+    For warm pool hits, boot_ms and admission_ms are 0.  setup_ms
     reflects the pool lookup time (typically <1ms).
 
     Granular boot timing note: The sum of (qemu_cmd_build_ms + gvproxy_start_ms +
@@ -89,15 +90,19 @@ class TimingBreakdown(BaseModel):
     console log setup, VM registration, state transitions).
     """
 
-    setup_ms: int = Field(description="Resource setup time (admission acquire, cache lookup, overlay, cgroup)")
+    setup_ms: int = Field(description="Infra setup time (cache lookup, overlay, cgroup) — excludes admission wait")
     boot_ms: int = Field(description="VM boot time (QEMU start + kernel + initramfs + guest-agent ready)")
     execute_ms: int = Field(description="Code execution time (connect + run + response)")
-    total_ms: int = Field(description="Total end-to-end time (setup + boot + execute + teardown)")
+    total_ms: int = Field(description="Total end-to-end time (admission + setup + boot + execute + teardown)")
     connect_ms: int | None = Field(
         default=None,
         description="Time for channel.connect() in milliseconds (host-measured)",
     )
     # Granular setup timing (for tracing/profiling)
+    admission_ms: int | None = Field(
+        default=None,
+        description="Time blocked in admission queue waiting for a resource slot (0 for warm pool hits)",
+    )
     overlay_ms: int | None = Field(
         default=None,
         description="Time for overlay acquisition (pool hit <1ms, on-demand 30-400ms)",

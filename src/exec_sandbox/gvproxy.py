@@ -5,7 +5,6 @@ the gvproxy-wrapper process that provides network connectivity with outbound fil
 """
 
 import asyncio
-import contextlib
 import json
 
 from exec_sandbox._logging import get_logger
@@ -14,8 +13,9 @@ from exec_sandbox.exceptions import VmDependencyError, VmGvproxyError
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.permission_utils import grant_qemu_vm_access
 from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.socket_auth import create_unix_socket
-from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception
+from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, start_managed_process
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 logger = get_logger(__name__)
@@ -163,14 +163,9 @@ async def start_gvproxy(  # noqa: PLR0915
         )
 
     try:
-        proc = ProcessWrapper(
-            await asyncio.create_subprocess_exec(
-                *gvproxy_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,  # Create new process group for proper cleanup
-                pass_fds=(socket_fd,),  # Pass pre-bound socket FD to child
-            )
+        proc = await start_managed_process(
+            gvproxy_args,
+            pass_fds=(socket_fd,),
         )
     except (OSError, FileNotFoundError) as e:
         parent_sock.close()
@@ -203,6 +198,9 @@ async def start_gvproxy(  # noqa: PLR0915
         if "Listening on QEMU socket" in line:
             ready_event.set()
 
+    def check_error(line: str) -> None:
+        logger.error(f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line})
+
     # Background task to drain gvproxy output (prevent pipe deadlock)
     gvproxy_log_task = asyncio.create_task(
         drain_subprocess_output(
@@ -210,9 +208,7 @@ async def start_gvproxy(  # noqa: PLR0915
             process_name="gvproxy-wrapper",
             context_id=vm_id,
             stdout_handler=check_ready,
-            stderr_handler=lambda line: logger.error(
-                f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line}
-            ),
+            stderr_handler=check_error,
         )
     )
     gvproxy_log_task.add_done_callback(log_task_exception)
@@ -222,8 +218,7 @@ async def start_gvproxy(  # noqa: PLR0915
         await asyncio.wait_for(ready_event.wait(), timeout=5.0)
     except TimeoutError:
         parent_sock.close()
-        await proc.terminate()
-        await proc.wait()
+        await cleanup_process(proc, "gvproxy", vm_id)
         raise VmGvproxyError(
             "gvproxy-wrapper did not become ready in time",
             context={
@@ -235,10 +230,7 @@ async def start_gvproxy(  # noqa: PLR0915
     except BaseException:
         # CancelledError or other unexpected exception — clean up socket and process
         parent_sock.close()
-        with contextlib.suppress(ProcessLookupError):
-            await proc.terminate()
-        with contextlib.suppress(ProcessLookupError):
-            await proc.wait()
+        await cleanup_process(proc, "gvproxy", vm_id)
         raise
     else:
         # Close parent's copy of FD now that gvproxy is fully initialized

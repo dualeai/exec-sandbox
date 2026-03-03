@@ -61,11 +61,13 @@ from exec_sandbox.guest_agent_protocol import (
 )
 from exec_sandbox.guest_channel import consume_stream
 from exec_sandbox.hash_utils import crc64
+from exec_sandbox.lock_utils import file_lock
 from exec_sandbox.models import Language
 from exec_sandbox.overlay_pool import QemuImgError
-from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.qemu_vm import guest_error_to_exception
+from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
+from exec_sandbox.subprocess_utils import start_managed_process
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -164,12 +166,6 @@ class DiskSnapshotManager(BaseCacheManager):
         # Max 1 concurrent snapshot creation (heavy operations: VM boot + package install)
         self._creation_semaphore = asyncio.Semaphore(1)
 
-        # Per-cache-key locks to prevent race conditions during snapshot creation
-        # When creating a snapshot, other VMs wanting the same snapshot wait rather than
-        # trying to use a partially-created file
-        self._creation_locks: dict[str, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()  # Protects _creation_locks dict
-
         # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
         # S3 PutObject is atomic - aborted uploads leave no partial blobs
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
@@ -232,18 +228,13 @@ class DiskSnapshotManager(BaseCacheManager):
             return snapshot_path
 
         # Slow path: Need to create or wait for creation
-        # Use per-cache-key lock to prevent races during snapshot creation
-        async with self._locks_lock:
-            if cache_key not in self._creation_locks:
-                self._creation_locks[cache_key] = asyncio.Lock()
-            lock = self._creation_locks[cache_key]
-
-        async with lock:
-            # Re-check L2 cache under lock (another request may have created it)
-            snapshot_path = await self._check_l2_cache(cache_key)
-            if snapshot_path:
+        # File lock serializes across coroutines and processes; yields False if
+        # the target .qcow2 was created by another caller while we waited.
+        target_path = self._cache_path(cache_key)
+        async with file_lock(target_path) as should_create:
+            if not should_create:
                 logger.debug("L2 cache hit (after lock)", extra={"cache_key": cache_key})
-                return snapshot_path
+                return target_path
 
             # L3 cache check (S3) - only for images with packages
             # Base images are already distributed via asset downloads, no need for S3
@@ -326,21 +317,15 @@ class DiskSnapshotManager(BaseCacheManager):
         Returns:
             Path to qcow2 snapshot if valid cache hit, None otherwise.
         """
-        snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
+        snapshot_path = self._cache_path(cache_key)
 
         if not await aiofiles.os.path.exists(snapshot_path):
             return None
 
         # Verify qcow2 format (standalone ext4 snapshot, no backing file expected)
         try:
-            proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
-                    "qemu-img",
-                    "check",
-                    str(snapshot_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+            proc = await start_managed_process(
+                ["qemu-img", "check", str(snapshot_path)],
             )
             await proc.communicate()
 
@@ -395,7 +380,7 @@ class DiskSnapshotManager(BaseCacheManager):
             VmQemuCrashError: VM crashed during snapshot creation
         """
         start_time = asyncio.get_running_loop().time()
-        snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
+        snapshot_path = self._cache_path(cache_key)
         success = False
 
         # Ensure snapshot VMs have enough memory for package managers (uv/bun).
@@ -468,17 +453,8 @@ class DiskSnapshotManager(BaseCacheManager):
                         raise
 
                     # Shutdown QEMU process cleanly
-                    we_initiated_shutdown = False
-                    if vm.process.returncode is None:
-                        we_initiated_shutdown = True
-                        await vm.process.terminate()
-                        try:
-                            await asyncio.wait_for(vm.process.wait(), timeout=5.0)
-                        except TimeoutError:
-                            await vm.process.kill()
-                            await vm.process.wait()
-                    else:
-                        await vm.process.wait()
+                    we_initiated_shutdown = vm.process.returncode is None
+                    await cleanup_process(vm.process, "QEMU", cache_key, term_timeout=5.0)
 
                     # Verify QEMU exited cleanly
                     if we_initiated_shutdown:
@@ -601,8 +577,8 @@ class DiskSnapshotManager(BaseCacheManager):
             SnapshotError: qemu-img command failed
         """
         try:
-            proc = ProcessWrapper(
-                await asyncio.create_subprocess_exec(
+            proc = await start_managed_process(
+                [
                     "qemu-img",
                     "create",
                     "-f",
@@ -611,11 +587,9 @@ class DiskSnapshotManager(BaseCacheManager):
                     "cluster_size=128k,lazy_refcounts=on,extended_l2=on",
                     str(snapshot_path),
                     "512M",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+                ],
             )
-            _stdout, stderr = await proc.communicate()
+            _, stderr = await proc.communicate()
             if proc.returncode != 0:
                 raise QemuImgError(f"qemu-img create failed: {stderr.decode().strip()}")
         except QemuImgError as e:
@@ -759,13 +733,13 @@ class DiskSnapshotManager(BaseCacheManager):
         Raises:
             SnapshotError: Download failed
         """
-        snapshot_path = self.cache_dir / f"{cache_key}.qcow2"
-        compressed_path = self.cache_dir / f"{cache_key}.qcow2.zst"
+        snapshot_path = self._cache_path(cache_key)
+        compressed_path = snapshot_path.with_suffix(".qcow2.zst")
 
         try:
             async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
                 # Download compressed qcow2
-                s3_key = f"snapshots/{cache_key}.qcow2.zst"
+                s3_key = f"snapshots/{compressed_path.name}"
                 await s3.download_file(  # type: ignore[union-attr]
                     self.settings.s3_bucket,
                     s3_key,
@@ -814,7 +788,7 @@ class DiskSnapshotManager(BaseCacheManager):
             cache_key: Snapshot cache key
             snapshot_path: Local qcow2 snapshot path
         """
-        compressed_path = self.cache_dir / f"{cache_key}.qcow2.zst"
+        compressed_path = snapshot_path.with_suffix(".qcow2.zst")
 
         # Acquire semaphore to limit concurrent uploads
         async with self._upload_semaphore:
@@ -841,7 +815,7 @@ class DiskSnapshotManager(BaseCacheManager):
 
                 async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
                     # Upload compressed qcow2
-                    s3_key = f"snapshots/{cache_key}.qcow2.zst"
+                    s3_key = f"snapshots/{compressed_path.name}"
                     await s3.upload_file(  # type: ignore[union-attr]
                         str(compressed_path),
                         self.settings.s3_bucket,

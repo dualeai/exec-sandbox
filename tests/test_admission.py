@@ -1087,6 +1087,10 @@ async def test_controller_release_unblocks_other_controller() -> None:
         await ctrl_a.release(r_a)
         available_mb[0] += 384.0  # 116 → 500
 
+        # Invalidate probe cache so B sees the fresh 500MB value when woken
+        # (without this, the 100ms TTL cache may still return stale 116MB)
+        _invalidate_probe_caches(ctrl_b)
+
         # Notify B's condition (in real usage, self-wake timer does this)
         async with ctrl_b._condition:
             ctrl_b._condition.notify_all()

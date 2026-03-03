@@ -285,8 +285,10 @@ class TestQemuStorageDaemonUnit:
         sock.touch()
 
         try:
-            count = QemuStorageDaemon._reap_stale_daemons()
-            assert count >= 1
+            # Don't assert on count — a parallel worker's reaper (e.g. from
+            # OverlayPool.start()) may have already cleaned this socket via the
+            # shared tmpdir, making our call return 0.
+            QemuStorageDaemon._reap_stale_daemons()
             assert not sock.exists()
         finally:
             # Cleanup if test fails

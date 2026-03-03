@@ -157,10 +157,10 @@ lint:
 run_id ?=
 
 ci-status:
-	@./scripts/ci-diagnose.sh status $(run_id)
+	@uv run scripts/ci_diagnose.py status $(run_id)
 
 ci-diagnose:
-	@./scripts/ci-diagnose.sh diagnose $(run_id)
+	@uv run scripts/ci_diagnose.py diagnose $(run_id)
 
 # ============================================================================
 # Benchmarking (concurrent VM latency)
@@ -171,6 +171,14 @@ bench:
 
 bench-pool:
 	uv run python scripts/benchmark_latency.py -n 10 --pool 8
+
+# 2D overcommit optimizer — finds Pareto-optimal (CPU_OC, MEM_OC) configs.
+# Fires N VMs per combo across a 4x4 grid, ranks by Sharpe-like efficiency
+# (throughput / RSS fraction), and reports the efficient frontier.
+# Run on a KVM-capable host for production-representative results.
+# Usage: make bench-optimizer [N_VMS=200]
+bench-optimizer:
+	uv run --script scripts/benchmark_optimizer.py $(if $(N_VMS),-n $(N_VMS),)
 
 # ============================================================================
 # Flamegraph Profiling (requires sudo on macOS)

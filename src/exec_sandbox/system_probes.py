@@ -11,12 +11,14 @@ import re
 import sys
 from collections.abc import Callable, Coroutine
 from functools import wraps
+from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
 import aiofiles
 import aiofiles.os
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.cgroup import CGROUP_V2_BASE_PATH, is_cgroup_available, resolve_self_cgroup_v2
 from exec_sandbox.permission_utils import can_access
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.vm_types import AccelType
@@ -40,7 +42,282 @@ __all__ = [
     "probe_qemu_accelerators",
     "probe_qemu_version",
     "probe_unshare_support",
+    "raise_fd_limit",
+    "raise_nproc_limit",
+    "warn_cgroup_pids_limit",
+    "warn_max_map_count",
+    "warn_overcommit",
+    "warn_threads_max",
 ]
+
+# ============================================================================
+# Recommended System Limit Thresholds
+# ============================================================================
+# Centralized thresholds for all startup probes. Each probe warns when
+# the corresponding system limit is below these values.
+
+_MIN_RECOMMENDED_FD_LIMIT = 8192  # RLIMIT_NOFILE — each VM needs ~7-10 fds
+_MIN_RECOMMENDED_NPROC_LIMIT = 4096  # RLIMIT_NPROC — 50 VMs x 15 threads = 750
+_MIN_RECOMMENDED_MAX_MAP_COUNT = 262_144  # vm.max_map_count — each VM uses ~340 VMAs
+_MIN_RECOMMENDED_THREADS_MAX = 100_000  # kernel.threads-max — default ~60K on 7GB RAM
+_MIN_RECOMMENDED_CGROUP_PIDS = 8192  # cgroup pids.max — Docker default is 4096
+
+# ============================================================================
+# File Descriptor Limit Tuning
+# ============================================================================
+
+
+def raise_fd_limit() -> None:
+    """Raise the soft file descriptor limit to the hard limit (no privileges needed).
+
+    On most Linux/macOS systems, the default soft limit is 1024 (inherited from
+    ancient ``select()`` compat) while the hard limit is much higher (e.g., 524288
+    on Debian, 1048576 on Ubuntu). Each QEMU VM consumes ~7-10 fds from the
+    orchestrator process for subprocess pipes, sockets, and lock files.
+
+    At 100 concurrent VMs the default 1024 soft limit is exhausted, causing QEMU
+    to die with SIGABRT ("qemu_thread_create: Resource temporarily unavailable").
+
+    This follows the same pattern as Go 1.19+ which automatically raises
+    ``RLIMIT_NOFILE`` soft to hard at runtime startup (go#46279).
+
+    POSIX guarantees that any unprivileged process can raise its soft limit up to
+    the hard limit — no root/``CAP_SYS_RESOURCE`` needed. Only raising the hard
+    limit requires privileges.
+
+    Called once during Scheduler startup, before any VMs are created.
+    """
+    import resource  # noqa: PLC0415
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft >= hard:
+            logger.debug("fd limit already at maximum", extra={"soft": soft, "hard": hard})
+            return
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        logger.info(
+            "Raised fd soft limit to hard limit",
+            extra={"old_soft": soft, "new_soft": hard, "hard": hard},
+        )
+
+        if hard < _MIN_RECOMMENDED_FD_LIMIT:
+            logger.warning(
+                "Hard fd limit is low — high-concurrency workloads (>50 VMs) may hit fd exhaustion. "
+                "Raise with: ulimit -n 65536 (or set in /etc/security/limits.conf)",
+                extra={"hard": hard, "recommended_min": _MIN_RECOMMENDED_FD_LIMIT},
+            )
+    except (ValueError, OSError) as e:
+        # Not fatal — log and continue. Worst case: QEMU dies under high concurrency
+        # and the existing retry logic handles it.
+        logger.warning("Failed to raise fd limit", extra={"error": str(e)})
+
+
+# ============================================================================
+# Virtual Memory Overcommit Check
+# ============================================================================
+
+
+def warn_overcommit() -> None:
+    """Warn if Linux ``vm.overcommit_memory=0`` (heuristic mode) is active.
+
+    With heuristic overcommit (mode 0, the default), the kernel may reject
+    ``mmap`` calls for QEMU thread stacks during burst VM startup, even when
+    the system has ample free RAM.  glibc converts the resulting ``ENOMEM``
+    to ``EAGAIN``, which QEMU treats as fatal (``abort()`` with zero retry).
+    This manifests as ``qemu_thread_create: Resource temporarily unavailable``.
+
+    Setting ``vm.overcommit_memory=1`` ("always allow") eliminates the
+    heuristic check.  The OOM killer remains as the backstop, which is
+    appropriate for ephemeral VM workloads.
+
+    Empirically, switching from mode 0 to 1 reduced 100-VM burst failures
+    from 14 % to 1 % on a 16-core / 32 GB EC2 instance.
+
+    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    """
+    if detect_host_os() != HostOS.LINUX:
+        return
+
+    try:
+        overcommit = int(Path("/proc/sys/vm/overcommit_memory").read_text().strip())
+    except (OSError, ValueError):
+        return  # /proc not available or unreadable — skip silently
+
+    if overcommit == 0:
+        logger.warning(
+            "vm.overcommit_memory=0 (heuristic) — QEMU thread creation may fail under "
+            "burst VM startup. Set to 1 for reliable high-concurrency operation: "
+            "sudo sysctl -w vm.overcommit_memory=1",
+            extra={"current": overcommit, "recommended": 1},
+        )
+
+
+# ============================================================================
+# Process/Thread Limit Tuning
+# ============================================================================
+
+
+def raise_nproc_limit() -> None:
+    """Raise the soft process/thread limit to the hard limit (no privileges needed).
+
+    RLIMIT_NPROC limits the total number of processes+threads for the current UID.
+    Each QEMU VM spawns ~15 threads, so the default soft limit (e.g., 63281 on
+    Linux, 5568 on macOS) can be exhausted under high concurrency.
+
+    When exhausted, ``pthread_create`` fails with ``EAGAIN``, which QEMU converts
+    to a fatal ``abort()`` — "qemu_thread_create: Resource temporarily unavailable".
+
+    Called once during Scheduler startup, before any VMs are created.
+    """
+    import resource  # noqa: PLC0415
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NPROC, (hard, hard))
+            logger.info(
+                "Raised nproc soft limit to hard limit",
+                extra={"old_soft": soft, "new_soft": hard, "hard": hard},
+            )
+        else:
+            logger.debug("nproc limit already at maximum", extra={"soft": soft, "hard": hard})
+
+        # Warn unconditionally if hard limit is low (even if soft == hard)
+        if hard < _MIN_RECOMMENDED_NPROC_LIMIT:
+            logger.warning(
+                "Hard nproc limit is low — QEMU thread creation may fail under high concurrency. "
+                "Raise with: ulimit -u 65536",
+                extra={"hard": hard, "recommended_min": _MIN_RECOMMENDED_NPROC_LIMIT},
+            )
+    except (ValueError, OSError) as e:
+        logger.warning("Failed to raise nproc limit", extra={"error": str(e)})
+
+
+# ============================================================================
+# Virtual Memory Map Count Check
+# ============================================================================
+
+
+def warn_max_map_count() -> None:
+    """Warn if Linux ``vm.max_map_count`` is below the recommended threshold.
+
+    Each QEMU VM creates ~340 virtual memory areas (VMAs) for virtio rings,
+    guest RAM mappings, and device MMIO regions. The kernel default of 65530
+    is exhausted at ~190 concurrent VMs, causing ``mmap`` failures.
+
+    This is a well-known limit also raised by Elasticsearch, Docker, and
+    Kata Containers.
+
+    Called once during Scheduler startup on Linux only. No-op on macOS.
+    """
+    if detect_host_os() != HostOS.LINUX:
+        return
+
+    try:
+        max_map_count = int(Path("/proc/sys/vm/max_map_count").read_text().strip())
+    except (OSError, ValueError):
+        return
+
+    if max_map_count < _MIN_RECOMMENDED_MAX_MAP_COUNT:
+        logger.warning(
+            "vm.max_map_count is low — QEMU mmap may fail under high VM concurrency. "
+            "Raise with: sudo sysctl -w vm.max_map_count=262144",
+            extra={"current": max_map_count, "recommended_min": _MIN_RECOMMENDED_MAX_MAP_COUNT},
+        )
+
+
+# ============================================================================
+# Kernel Threads-Max Check
+# ============================================================================
+
+
+def warn_threads_max() -> None:
+    """Warn if Linux ``kernel.threads-max`` is below the recommended threshold.
+
+    ``kernel.threads-max`` is the system-wide limit on total threads (all UIDs).
+    On low-memory hosts (e.g., 7 GB CI runners) the default (~60K) can be
+    reached before per-UID ``RLIMIT_NPROC``, causing ``pthread_create`` failures
+    across all processes — not just QEMU.
+
+    Called once during Scheduler startup on Linux only. No-op on macOS.
+    """
+    if detect_host_os() != HostOS.LINUX:
+        return
+
+    try:
+        threads_max = int(Path("/proc/sys/kernel/threads-max").read_text().strip())
+    except (OSError, ValueError):
+        return
+
+    if threads_max < _MIN_RECOMMENDED_THREADS_MAX:
+        logger.warning(
+            "kernel.threads-max is low — system-wide thread creation may fail under high VM concurrency. "
+            "Raise with: sudo sysctl -w kernel.threads-max=120000",
+            extra={"current": threads_max, "recommended_min": _MIN_RECOMMENDED_THREADS_MAX},
+        )
+
+
+# ============================================================================
+# Cgroup PIDs Limit Check
+# ============================================================================
+
+
+def warn_cgroup_pids_limit() -> None:
+    """Warn if any cgroup v2 ancestor has a low ``pids.max`` limit.
+
+    In containerized environments (Docker, Kubernetes, systemd slices), the
+    effective PID limit is the *minimum* ``pids.max`` across all ancestor
+    cgroups. Docker defaults to ``--pids-limit=4096`` and systemd sets
+    ``DefaultTasksMax`` based on ``kernel.pid_max``.
+
+    Only the tightest ancestor is reported to avoid log spam.
+
+    Called once during Scheduler startup on Linux only. No-op on macOS.
+    """
+    cgroup_root = Path(CGROUP_V2_BASE_PATH)
+    if not is_cgroup_available(cgroup_root):
+        return
+
+    cgroup_rel = resolve_self_cgroup_v2()
+    if cgroup_rel is None:
+        return
+
+    # Walk from current cgroup up to root, find the tightest pids.max
+    tightest_limit: int | None = None
+    tightest_path: str | None = None
+
+    current = cgroup_root / cgroup_rel.lstrip("/")
+    while current != current.parent:  # Stop at filesystem root (safety bound)
+        try:
+            content = (current / "pids.max").read_text().strip()
+            if content != "max":
+                limit = int(content)
+                if tightest_limit is None or limit < tightest_limit:
+                    tightest_limit = limit
+                    tightest_path = str(current.relative_to(cgroup_root))
+        except (OSError, ValueError):
+            pass  # File doesn't exist or isn't readable at this level
+
+        if current == cgroup_root:
+            break
+        current = current.parent
+
+    if tightest_limit is not None and tightest_limit < _MIN_RECOMMENDED_CGROUP_PIDS:
+        logger.warning(
+            "cgroup pids.max is low — container/systemd PID limit may cause thread creation failures. "
+            "Fix with: docker run --pids-limit=-1, or systemd TasksMax=infinity",
+            extra={
+                "current": tightest_limit,
+                "cgroup": tightest_path,
+                "recommended_min": _MIN_RECOMMENDED_CGROUP_PIDS,
+            },
+        )
+
+
+# ============================================================================
+# Probe Cache
+# ============================================================================
 
 # Sentinel value for "not yet cached" (distinguishes from None results)
 _NOT_CACHED: Any = object()

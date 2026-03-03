@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import AssetChecksumError, AssetDownloadError, AssetNotFoundError
 from exec_sandbox.hash_utils import IncrementalHasher, file_hash, parse_hash_spec
+from exec_sandbox.lock_utils import file_lock
 from exec_sandbox.platform_utils import get_arch_name, get_cache_dir, get_os_name
 
 logger = get_logger(__name__)
@@ -80,22 +81,37 @@ async def retrieve(
     fname = url.split("/")[-1]
     dest = cache_dir / fname
 
-    # Check if already cached with correct hash
-    if dest.exists():
-        if await _verify_hash(dest, known_hash):
-            logger.debug("Cache hit", extra={"file": str(dest)})
-            return dest
-        logger.warning("Cache file hash mismatch, re-downloading", extra={"file": str(dest)})
-        dest.unlink()
+    # Use a file lock to prevent concurrent download+decompress of the same asset
+    # across both coroutines and processes.  Without this, two callers can race:
+    # one's retry cleanup (dest.unlink) deletes the .zst while another decompresses it.
+    # Lock target is the final output (e.g., .qcow2 after decompressing .qcow2.zst).
+    # Lock on the final output to serialize the full download+process pipeline.
+    # For decompress_zstd the final file is dest without .zst; otherwise dest itself.
+    final_dest = dest.with_suffix("") if processor == decompress_zstd else dest
+    async with file_lock(final_dest) as should_download:
+        if not should_download:
+            # With a processor (e.g., decompress), the final output's existence
+            # is authoritative — hash was verified on the raw download before
+            # processing.  Without a processor, verify hash to detect corruption.
+            if processor or await _verify_hash(final_dest, known_hash):
+                logger.debug("Already cached by another caller", extra={"file": str(final_dest)})
+                return final_dest
+            # Corrupted cache — clean up and fall through to re-download
+            logger.warning("Cache file hash mismatch (post-lock)", extra={"file": str(final_dest)})
+            final_dest.unlink(missing_ok=True)
 
-    # Download with retries
-    await _download_with_retry(url, dest, known_hash, progressbar)
+        # Check if raw download is already cached with correct hash (skip re-download)
+        if not dest.exists() or not await _verify_hash(dest, known_hash):
+            if dest.exists():
+                logger.warning("Cache file hash mismatch, re-downloading", extra={"file": str(dest)})
+                dest.unlink()
+            await _download_with_retry(url, dest, known_hash, progressbar)
 
-    # Apply processor if provided (e.g., decompress)
-    if processor:
-        dest = await processor(dest)
+        # Apply processor if provided (e.g., decompress)
+        if processor:
+            dest = await processor(dest)
 
-    return dest
+        return dest
 
 
 async def _verify_hash(path: Path, expected_hash: str) -> bool:
@@ -374,18 +390,6 @@ class AsyncPooch:
 # Processors (post-download transformations)
 # ============================================================================
 
-# Per-file locks for decompression to prevent concurrent writes to same destination
-_decompression_locks: dict[Path, asyncio.Lock] = {}
-_decompression_locks_guard = asyncio.Lock()
-
-
-async def _get_decompression_lock(dest: Path) -> asyncio.Lock:
-    """Get or create a lock for a specific destination file."""
-    async with _decompression_locks_guard:
-        if dest not in _decompression_locks:
-            _decompression_locks[dest] = asyncio.Lock()
-        return _decompression_locks[dest]
-
 
 async def decompress_zstd(fname: Path) -> Path:
     """
@@ -393,9 +397,11 @@ async def decompress_zstd(fname: Path) -> Path:
 
     Uses Python's native zstd module (3.14+) or backports.zstd for older versions.
     Streaming decompression ensures minimal memory usage regardless of file size.
+    Uses atomic write pattern (temp file → rename) so partial results are never
+    visible.
 
-    Thread-safety: Uses per-file locks and atomic write pattern to prevent race
-    conditions when multiple callers decompress the same file concurrently.
+    Concurrency safety is provided by the caller (``retrieve``'s cross-process
+    file lock).  This function must not be called without external serialization.
 
     Memory usage: ~64KB (chunk size) regardless of file size.
 
@@ -415,50 +421,36 @@ async def decompress_zstd(fname: Path) -> Path:
 
     dest = fname.with_suffix("")  # Remove .zst
 
-    # Acquire per-file lock to prevent concurrent decompression of same file
-    lock = await _get_decompression_lock(dest)
-    async with lock:
-        # Another caller may have completed decompression while we waited
-        if dest.exists():
-            logger.debug("Already decompressed by another caller", extra={"file": str(dest)})
-            return dest
+    logger.debug("Decompressing", extra={"src": str(fname), "dest": str(dest)})
 
-        # Check source still exists (may have been consumed by another caller)
-        if not fname.exists():
-            if dest.exists():
-                return dest
-            raise FileNotFoundError(f"Source file not found: {fname}")
+    # Use atomic write pattern: write to temp file, then rename
+    temp_dest = dest.with_suffix(".tmp")
 
-        logger.debug("Decompressing", extra={"src": str(fname), "dest": str(dest)})
+    def _decompress_sync() -> None:
+        try:
+            with fname.open("rb") as src, temp_dest.open("wb") as dst:
+                # Use streaming decompression with incremental decompressor
+                decompressor = zstd.ZstdDecompressor()
+                while True:
+                    chunk = src.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    decompressed = decompressor.decompress(chunk)
+                    if decompressed:
+                        dst.write(decompressed)
+            # Atomic rename (POSIX guarantees atomicity)
+            temp_dest.rename(dest)
+            # Remove compressed file only after successful rename
+            fname.unlink()
+        except Exception:
+            # Clean up temp file on failure
+            temp_dest.unlink(missing_ok=True)
+            raise
 
-        # Use atomic write pattern: write to temp file, then rename
-        temp_dest = dest.with_suffix(".tmp")
+    await asyncio.to_thread(_decompress_sync)
 
-        def _decompress_sync() -> None:
-            try:
-                with fname.open("rb") as src, temp_dest.open("wb") as dst:
-                    # Use streaming decompression with incremental decompressor
-                    decompressor = zstd.ZstdDecompressor()
-                    while True:
-                        chunk = src.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        decompressed = decompressor.decompress(chunk)
-                        if decompressed:
-                            dst.write(decompressed)
-                # Atomic rename (POSIX guarantees atomicity)
-                temp_dest.rename(dest)
-                # Remove compressed file only after successful rename
-                fname.unlink()
-            except Exception:
-                # Clean up temp file on failure
-                temp_dest.unlink(missing_ok=True)
-                raise
-
-        await asyncio.to_thread(_decompress_sync)
-
-        logger.debug("Decompression complete", extra={"file": str(dest)})
-        return dest
+    logger.debug("Decompression complete", extra={"file": str(dest)})
+    return dest
 
 
 async def untar(fname: Path) -> Path:

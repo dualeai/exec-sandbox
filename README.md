@@ -412,14 +412,52 @@ Assets are verified against SHA256 checksums and built with [provenance attestat
 | `s3_region` | us-east-1 | AWS region |
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
-| `memory_overcommit_ratio` | 1.5 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
-| `cpu_overcommit_ratio` | 4.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
+| `memory_overcommit_ratio` | 8.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
+| `cpu_overcommit_ratio` | 2.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
 | `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
 
 Environment variables: `EXEC_SANDBOX_IMAGES_DIR`, `EXEC_SANDBOX_CACHE_DIR`, `EXEC_SANDBOX_OFFLINE`, etc.
+
+## Performance
+
+Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) using a mixed workload of Python, JavaScript, and shell commands.
+
+### Concurrent Throughput
+
+500 VMs per config, 16 overcommit combos. **Admission** = queue wait, **Setup** = overlay + cgroup, **Exec** = VM boot + code run:
+
+| Config | VMs/s | Admit p50/p95 | Setup p50/p95 | Exec p50/p95 | Total p50/p95 | Peak RSS | Efficiency |
+|--------|-------|---------------|---------------|--------------|---------------|----------|------------|
+| CPU=2x MEM=8x (default) | **39.0** | 5.7s / 11.0s | 344ms / 921ms | 57ms / 71ms | **6.3s / 11.5s** | 2.2 GB (7.0%) | 1116 |
+| CPU=2x MEM=3x | 39.0 | 5.8s / 11.0s | 367ms / 938ms | 57ms / 71ms | 6.3s / 11.5s | 2.6 GB (8.1%) | 1110 |
+| CPU=4x MEM=5x | 39.1 | 5.2s / 10.3s | 902ms / 1.4s | 63ms / 103ms | 6.3s / 11.4s | 5.8 GB (18.4%) | 867 |
+| CPU=8x MEM=3x | 37.1 | 5.3s / 10.5s | 1.7s / 2.5s | 100ms / 370ms | 7.4s / 12.0s | 10.2 GB (32.4%) | 470 |
+| CPU=12x MEM=8x | 27.8 | 8.4s / 14.8s | 2.6s / 7.1s | 182ms / 587ms | 12.1s / 15.6s | 16.9 GB (53.6%) | 253 |
+
+Exec latency is only 57ms p50 at the optimal config — admission dominates under burst load. **Efficiency** = 10⁶ / geomean(admission, setup, exec) p95; higher is better. Beyond CPU=2x, setup and exec degrade sharply while throughput stays flat. 13/16 configs achieved 100% success (7,995/8,000 VMs).
+
+> **Production sizing.** The 11s admission p95 is specific to this stress test (500 VMs on 24 slots). When `concurrent_requests ≤ max_slots`, admission is **0ms**. Scale horizontally — add hosts so that `max_slots ≥ peak_concurrency`, don't increase overcommit.
+
+### Single VM Latency
+
+| Path | Time to First Exec |
+|------|--------------------|
+| Warm pool hit | 1-2ms |
+| L1 memory snapshot | ~100ms |
+| Cold boot (KVM) | ~400ms boot + 4-5s REPL |
+| Cold boot (HVF/macOS) | ~400ms boot + 4-11s REPL |
+
+### Tuning
+
+Re-run the optimizer after changing VM sizing, admission logic, or target hardware:
+
+```bash
+make bench-optimizer              # 200 VMs per combo (4x4 grid = 16 combos)
+make bench-optimizer N_VMS=500    # heavier load
+```
 
 ## Memory Optimization
 
@@ -764,6 +802,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 | cloudpickle | 3.1.2 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
 
 **Usage notes:**
+
 - Use `uv pip install` instead of `pip install` (pip not included)
 - Python 3.14 includes t-strings, deferred annotations, free-threading support
 - `multiprocessing.Pool` works out of the box — cloudpickle handles serialization of REPL-defined functions, lambdas, and closures. Single vCPU means no CPU-bound speedup, but I/O-bound parallelism and `Pool`-based APIs work correctly
@@ -775,6 +814,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 | Bun | 1.3 | Runtime, bundler, package manager ([docs](https://bun.com/docs)) |
 
 **Usage notes:**
+
 - Bun is a Node.js-compatible runtime (not Node.js itself)
 - Built-in TypeScript/JSX support, no transpilation needed
 - Use `bun install` for packages, `bun run` for scripts
@@ -783,6 +823,7 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 ### Raw Image
 
 Minimal Alpine Linux with common tools only. Use for:
+
 - Shell script execution (`language="raw"`) — runs under **GNU Bash**, full bash syntax supported
 - Custom runtime installation
 - Lightweight workloads

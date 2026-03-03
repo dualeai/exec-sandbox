@@ -211,31 +211,31 @@ class TestWrapWithUlimit:
 
             assert wrapped[0] == "bash"
             assert wrapped[1] == "-c"
-            # Linux should have -v (virtual memory), -t (CPU time), and -u (processes)
+            # Linux should have -v (virtual memory) and -t (CPU time)
+            # -u (RLIMIT_NPROC) intentionally removed — per-UID, not per-process
             assert "-v" in wrapped[2]
             assert f"-t {ULIMIT_CPU_TIME_SECONDS}" in wrapped[2]
-            assert f"-u {CGROUP_PIDS_LIMIT}" in wrapped[2]
+            assert "-u" not in wrapped[2]
             assert "qemu-system-x86_64" in wrapped[2]
 
-    def test_macos_uses_process_limit_only(self):
-        """macOS uses only process (-u) limit; -v and -t not supported or break stdout."""
+    def test_macos_skips_all_ulimits(self):
+        """macOS skips all ulimits — -v not supported, -t breaks pipes, -u is per-UID."""
         with patch("exec_sandbox.cgroup.detect_host_os") as mock_os:
             mock_os.return_value = HostOS.MACOS
 
             cmd = ["qemu-system-aarch64", "-m", "512"]
             wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=512)
 
-            # macOS should have ulimit with -u (processes) only
-            assert "ulimit" in wrapped[2]
-            assert f"-u {CGROUP_PIDS_LIMIT}" in wrapped[2]
-            # Should NOT have -v (virtual memory) - not supported on macOS kernel
+            # macOS: no ulimit controls, just exec
+            assert "ulimit" not in wrapped[2]
             assert "-v" not in wrapped[2]
-            # Should NOT have -t (CPU time) - breaks subprocess stdout pipe on macOS
             assert "-t" not in wrapped[2]
+            assert "-u" not in wrapped[2]
+            assert "exec" in wrapped[2]
             assert "qemu-system-aarch64" in wrapped[2]
 
-    def test_macos_x86_64_uses_process_limit_only(self):
-        """macOS x86_64 uses only process (-u) limit, same as ARM64."""
+    def test_macos_x86_64_skips_all_ulimits(self):
+        """macOS x86_64 skips all ulimits, same as ARM64."""
         with patch("exec_sandbox.cgroup.detect_host_os") as mock_os:
             mock_os.return_value = HostOS.MACOS
 
@@ -243,13 +243,12 @@ class TestWrapWithUlimit:
             cmd = ["qemu-system-x86_64", "-m", "512"]
             wrapped = wrap_with_ulimit(cmd, cgroup_memory_mb=512)
 
-            # macOS should have ulimit with -u (processes) only
-            assert "ulimit" in wrapped[2]
-            assert f"-u {CGROUP_PIDS_LIMIT}" in wrapped[2]
-            # Should NOT have -v (virtual memory) - not supported on macOS
+            # macOS: no ulimit controls, just exec
+            assert "ulimit" not in wrapped[2]
             assert "-v" not in wrapped[2]
-            # Should NOT have -t (CPU time) - breaks subprocess stdout on macOS
             assert "-t" not in wrapped[2]
+            assert "-u" not in wrapped[2]
+            assert "exec" in wrapped[2]
             assert "qemu-system-x86_64" in wrapped[2]
 
     def test_memory_multiplier_applied(self):

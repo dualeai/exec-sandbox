@@ -4,10 +4,13 @@ Builds QEMU command arguments based on platform capabilities, acceleration type,
 and VM configuration.
 """
 
+import os
+
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import VmDependencyError
 from exec_sandbox.models import ExposedPort
+from exec_sandbox.permission_utils import get_qemu_vm_uid
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
@@ -36,6 +39,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     debug_boot: bool = False,
     snapshot_drive: str | None = None,
     defer_incoming: bool = False,
+    qmp_fd: int | None = None,
 ) -> list[str]:
     """Build QEMU command for microVM execution.
 
@@ -61,6 +65,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             (direct_write=True), the ext4 drive is writable; for usage, read-only.
         defer_incoming: Start QEMU with `-incoming defer` for L1 memory snapshot
             restore. The VM starts paused, waiting for a migration stream via QMP.
+        qmp_fd: File descriptor of a pre-created listening socket for QMP
+            (socket activation pattern). When set, uses ``-chardev socket,fd=N,...``
+            + ``-mon chardev=qmp0,mode=control`` instead of ``-qmp`` shorthand
+            (which does not support ``fd=``). None (default) uses the legacy
+            path-based ``-qmp`` syntax.
 
     Returns:
         QEMU command as list of strings
@@ -631,12 +640,35 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         qemu_args.extend(["-nic", "none"])
 
     # QMP (QEMU Monitor Protocol) socket for VM control operations
-    qemu_args.extend(
-        [
-            "-qmp",
-            f"unix:{workdir.qmp_socket},server=on,wait=off",
-        ]
-    )
+    #
+    # Two modes:
+    #   1. Socket activation (qmp_fd != None): Parent pre-creates a listening
+    #      Unix socket and passes the fd to QEMU via pass_fds. QEMU's
+    #      chardev/char-socket.c accepts fd= with server=on — it skips
+    #      bind()/listen() and uses the inherited fd directly. This eliminates
+    #      the TOCTOU race between wait_for_socket() probe-close and
+    #      MigrationClient's real connect on single-client QMP chardev.
+    #      The -qmp shorthand does NOT support fd= — must use the explicit
+    #      -chardev + -mon pair (same as libvirt since QEMU 2.12).
+    #      Refs:
+    #        - QEMU chardev fd= support: chardev/char-socket.c tcp_chr_new_server()
+    #        - libvirt fd-passing: https://libvirt.org/news.html (2018, QEMU 2.12)
+    #        - Kata Containers: uses fd=3 for QMP monitor
+    #
+    #   2. Legacy path (qmp_fd == None): QEMU creates and binds the socket
+    #      itself. Used when fd inheritance is impossible (e.g., sudo wraps
+    #      the command — sudo closes all fds >= 3 by default).
+    if qmp_fd is not None:
+        qemu_args.extend(
+            [
+                "-chardev",
+                f"socket,id=qmp0,fd={qmp_fd},server=on,wait=off",
+                "-mon",
+                "chardev=qmp0,mode=control",
+            ]
+        )
+    else:
+        qemu_args.extend(["-qmp", f"unix:{workdir.qmp_socket},server=on,wait=off"])
 
     # L1 memory snapshot restore: QEMU starts paused, waiting for migration stream
     if defer_incoming:
@@ -650,18 +682,25 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
     # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
     if workdir.use_qemu_vm_user:
-        # SECURITY: Avoid shell injection by not using 'sh -c'.
-        # Instead, we use direct exec with preexec_fn to set umask.
-        # stdbuf -oL forces line-buffered stdout to ensure console output is captured
-        # immediately rather than being block-buffered (which happens with piped stdout).
-        # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security.
-        #
-        # umask 007 is set via preexec_fn at subprocess creation time.
-        # Creates chardev sockets with owner+group permissions (0660).
-        # Host user must be in 'qemu-vm' group to connect to sockets owned by 'qemu-vm'.
-        # More secure than 0666 (world-writable). Follows libvirt group membership pattern.
-        cmd.extend(["sudo", "-u", "qemu-vm", "stdbuf", "-oL", *qemu_args])
-        return cmd
+        # Skip sudo when already running as qemu-vm user. This enables fd
+        # inheritance (socket activation) which sudo >= 1.9.14 blocks via its
+        # closefrom security policy (closes all fds >= 3 before exec).
+        # See: https://www.sudo.ws/docs/man/sudo.man/
+        qemu_vm_uid = get_qemu_vm_uid()
+        if qemu_vm_uid is None or os.getuid() != qemu_vm_uid:
+            # SECURITY: Avoid shell injection by not using 'sh -c'.
+            # Instead, we use direct exec with preexec_fn to set umask.
+            # stdbuf -oL forces line-buffered stdout to ensure console output is captured
+            # immediately rather than being block-buffered (which happens with piped stdout).
+            # IMPORTANT: stdbuf must come AFTER sudo - sudo sanitizes LD_PRELOAD for security.
+            #
+            # umask 007 is set via preexec_fn at subprocess creation time.
+            # Creates chardev sockets with owner+group permissions (0660).
+            # Host user must be in 'qemu-vm' group to connect to sockets owned by 'qemu-vm'.
+            # More secure than 0666 (world-writable). Follows libvirt group membership pattern.
+            cmd.extend(["sudo", "-u", "qemu-vm", "stdbuf", "-oL", *qemu_args])
+            return cmd
+        # Already running as qemu-vm — no sudo needed, fall through to direct exec
 
     cmd.extend(qemu_args)
 

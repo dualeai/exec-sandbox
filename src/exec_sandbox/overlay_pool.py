@@ -29,8 +29,8 @@ import aiofiles.os
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.exceptions import VmOverlayError as QemuImgError
-from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError
+from exec_sandbox.subprocess_utils import start_managed_process
 
 logger = get_logger(__name__)
 
@@ -69,14 +69,7 @@ async def create_qcow2_overlay(base_image: Path, overlay_path: Path) -> None:
         str(overlay_path),
     ]
 
-    proc = ProcessWrapper(
-        await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-    )
+    proc = await start_managed_process(cmd)
     _, stderr = await proc.communicate()
 
     if proc.returncode != 0:
@@ -486,7 +479,7 @@ class OverlayPool:
                     "Overlay pool replenished",
                     extra={
                         "base_image": key,
-                        "created_count": batch_size,  # Avoid "created", conflicts with LogRecord.created
+                        "created_count": batch_size,  # Not "created" — conflicts with LogRecord.created
                         "current_size": pool.qsize(),
                         "target_size": self._pool_size,
                     },

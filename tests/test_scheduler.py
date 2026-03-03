@@ -1391,6 +1391,7 @@ print(f"inv_sum={b.sum():.1f}")
         ["numpy=2.4.2", "det=-2.0", "inv_sum=0.0"],
         None,
         id="python-numpy",
+        marks=skip_unless_hwaccel,  # pip install routinely exceeds 940s under TCG
     ),
     pytest.param(
         Language.PYTHON,
@@ -1472,6 +1473,7 @@ console.log("output=" + result.code.trim());
         ["esbuild=0.25.4", "output=const x = 1;"],
         None,
         id="js-esbuild",
+        marks=skip_unless_hwaccel,  # npm install with native binary exceeds 940s under TCG
     ),
 ]
 
