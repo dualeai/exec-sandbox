@@ -765,7 +765,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 
 | Image | Runtime | Package Manager | Size | Description |
 |-------|---------|-----------------|------|-------------|
-| `python-3.14-base` | Python 3.14 | uv | ~140MB | Full Python environment with C extension support |
+| `python-3.14-base` | Python 3.14 | uv | ~75MB | Full Python environment |
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
 | `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
@@ -798,12 +798,12 @@ All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and includ
 |-----------|---------|-------|
 | Python | 3.14 | [python-build-standalone](https://github.com/astral-sh/python-build-standalone) (musl) |
 | uv | 0.9+ | 10-100x faster than pip ([docs](https://docs.astral.sh/uv/)) |
-| gcc, musl-dev | Alpine | For C extensions (numpy, pandas, etc.) |
 | cloudpickle | 3.1.2 | Serialization for `multiprocessing` in REPL ([docs](https://github.com/cloudpipe/cloudpickle)) |
 
 **Usage notes:**
 
 - Use `uv pip install` instead of `pip install` (pip not included)
+- Only prebuilt wheels are supported — packages without `cp314` `musllinux` wheels will fail instantly. No source builds (gcc/musl-dev not included; see [python-build-standalone#684](https://github.com/astral-sh/python-build-standalone/issues/684))
 - Python 3.14 includes t-strings, deferred annotations, free-threading support
 - `multiprocessing.Pool` works out of the box — cloudpickle handles serialization of REPL-defined functions, lambdas, and closures. Single vCPU means no CPU-bound speedup, but I/O-bound parallelism and `Pool`-based APIs work correctly
 

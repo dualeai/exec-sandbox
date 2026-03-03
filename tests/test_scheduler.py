@@ -1681,7 +1681,7 @@ print(f"httpx={httpx.__version__}")
         None,
         id="python-multi",
     ),
-    # Python - C extension packages (native binaries, musllinux wheels)
+    # Python - C extension packages (prebuilt musllinux wheels, no source builds)
     pytest.param(
         Language.PYTHON,
         ["numpy==2.4.2"],

@@ -39,7 +39,7 @@ pub(crate) async fn spawn_repl(
             c.env("PYTHONPYCACHEPREFIX", "/home/user/.pycache");
             // Replace musl's slow default malloc with jemalloc (~30% Python startup speedup).
             // musl's allocator uses a global lock; Python calls malloc ~26k times during init.
-            // Note: inherited by subprocesses (gcc, etc.) — harmless but visible.
+            // Note: inherited by subprocesses (uv, etc.) — harmless but visible.
             // See: https://developers.home-assistant.io/blog/2020/07/13/alpine-python/
             c.env("LD_PRELOAD", JEMALLOC_LIB);
             c

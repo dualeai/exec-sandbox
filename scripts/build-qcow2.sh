@@ -2,7 +2,7 @@
 # Build qcow2 images from Alpine base with language runtimes
 #
 # Variants:
-#   python - Alpine + Python + gcc/musl-dev (for C extensions)
+#   python - Alpine + Python (prebuilt wheels only, no source builds)
 #   node   - Alpine + bun
 #   raw    - Alpine only (no runtime)
 #
@@ -47,8 +47,8 @@ BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 #   wget (~590KB), xz (~163KB), zip (~373KB), tzdata (~436KB), rsync (~375KB)
 COMMON_PKGS="ca-certificates curl git jq bash coreutils grep findutils sed gawk diffutils patch less make tree tar gzip unzip file iputils e2fsprogs"
 
-# Python: add build tools for C extensions (numpy, pandas, etc.)
-PYTHON_PKGS="$COMMON_PKGS gcc musl-dev libffi-dev jemalloc"
+# Python: jemalloc for guest-agent LD_PRELOAD (no build tools — prebuilt wheels only)
+PYTHON_PKGS="$COMMON_PKGS jemalloc"
 
 # Node: bun needs libgcc/libstdc++
 NODE_PKGS="$COMMON_PKGS libgcc libstdc++"
