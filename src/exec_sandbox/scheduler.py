@@ -664,8 +664,9 @@ class Scheduler:
 
                 # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
                 if vm is None:
-                    # Auto-download base image if needed
-                    if self.config.auto_download_assets:
+                    # Auto-download base image if needed (skip when snapshot_path
+                    # is set — _get_or_create_snapshot already fetched it)
+                    if self.config.auto_download_assets and not snapshot_path:
                         await fetch_base_image(language)
 
                     vm = await self._vm_manager.create_vm(
@@ -755,6 +756,11 @@ class Scheduler:
         """
         if not self._snapshot_manager:
             raise SandboxError("Packages requested but snapshot manager is not configured")
+
+        # Ensure base image is on disk before computing snapshot cache key
+        # (_compute_cache_key hashes the base image file via get_base_image() glob)
+        if self.config.auto_download_assets:
+            await fetch_base_image(language)
 
         snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
             language=language,

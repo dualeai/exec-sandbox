@@ -412,6 +412,55 @@ async def make_vm_manager(make_vm_settings):  # type: ignore[no-untyped-def]
         yield _make
 
 
+@pytest.fixture
+async def make_snapshot_manager(make_vm_settings, make_vm_manager):  # type: ignore[no-untyped-def]
+    """Factory to create (DiskSnapshotManager, Settings) with optional Settings overrides.
+
+    Consolidates the repeated pattern of creating settings + vm_manager +
+    DiskSnapshotManager with consistent kwargs and automatic cache dir creation.
+
+    Usage:
+        async def test_something(make_snapshot_manager, tmp_path):
+            snapshot_manager, settings = await make_snapshot_manager(
+                disk_snapshot_cache_dir=tmp_path / "cache",
+                s3_bucket=None,
+            )
+    """
+    from typing import Any
+
+    from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
+
+    async def _make(**overrides: Any) -> tuple[DiskSnapshotManager, Any]:
+        settings = make_vm_settings(**overrides)
+        if settings.disk_snapshot_cache_dir:
+            settings.disk_snapshot_cache_dir.mkdir(parents=True, exist_ok=True)
+        vm_manager = await make_vm_manager(**overrides)
+        return DiskSnapshotManager(settings, vm_manager), settings
+
+    return _make
+
+
+# ============================================================================
+# Shared test helpers
+# ============================================================================
+
+
+async def create_test_qcow2(path: Path, size: str = "1M") -> None:
+    """Create a minimal valid qcow2 file via qemu-img."""
+    proc = await asyncio.create_subprocess_exec(
+        "qemu-img",
+        "create",
+        "-f",
+        "qcow2",
+        str(path),
+        size,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    assert proc.returncode == 0, f"qemu-img create failed for {path}"
+
+
 # ============================================================================
 # Network test constants — shared by test_dns_filtering / test_ech_proxy_behavior
 # ============================================================================
