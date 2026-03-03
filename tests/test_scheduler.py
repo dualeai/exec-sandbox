@@ -5,19 +5,22 @@ Integration tests: Test real VM execution (requires QEMU + images).
 """
 
 import asyncio
+import json
 import platform
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
+from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import SandboxError, SnapshotError
-from exec_sandbox.models import Language
+from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB, MAX_CODE_SIZE
+from exec_sandbox.exceptions import AssetDownloadError, SandboxError, SnapshotError, VmConfigError, VmTimeoutError
+from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import create_test_qcow2, skip_unless_fast_balloon, skip_unless_hwaccel
+from tests.conftest import create_test_qcow2, random_test_id, skip_unless_fast_balloon, skip_unless_hwaccel
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -117,7 +120,6 @@ class TestMemoryValidation:
 
     async def test_memory_below_minimum_rejected(self) -> None:
         """memory_mb=1 raises VmConfigError before reaching QEMU."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -127,7 +129,6 @@ class TestMemoryValidation:
 
     async def test_memory_at_minimum_accepted(self) -> None:
         """memory_mb=128 passes validation (may fail later without QEMU)."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -140,7 +141,6 @@ class TestMemoryValidation:
 
     async def test_memory_127_rejected(self) -> None:
         """memory_mb=127 (just below minimum) raises VmConfigError."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -150,7 +150,6 @@ class TestMemoryValidation:
 
     async def test_memory_large_value_accepted(self) -> None:
         """Large memory_mb values pass validation (no upper bound)."""
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -166,8 +165,6 @@ class TestCodeSizeValidation:
 
     async def test_code_exceeds_limit_rejected(self) -> None:
         """Code larger than MAX_CODE_SIZE raises VmConfigError before VM boot."""
-        from exec_sandbox.constants import MAX_CODE_SIZE
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -177,8 +174,6 @@ class TestCodeSizeValidation:
 
     async def test_code_at_limit_accepted(self) -> None:
         """Code exactly at MAX_CODE_SIZE passes size validation."""
-        from exec_sandbox.constants import MAX_CODE_SIZE
-        from exec_sandbox.exceptions import VmConfigError
 
         scheduler = Scheduler()
         scheduler._started = True
@@ -212,8 +207,6 @@ class TestPackageValidation:
         # Create test catalogs
         catalogs_dir = tmp_path / "catalogs"
         catalogs_dir.mkdir()
-
-        import json
 
         (catalogs_dir / "pypi_top_10k.json").write_text(json.dumps(["pandas", "numpy"]))
         (catalogs_dir / "npm_top_10k.json").write_text(json.dumps(["lodash", "axios"]))
@@ -299,7 +292,7 @@ class TestBaseImageFetchBeforeSnapshot:
     @staticmethod
     def _mock_snapshot_result(scheduler: Scheduler, tmp_path: Path) -> Path:
         """Mock get_or_create_snapshot to return a pre-created qcow2."""
-        snap = tmp_path / f"snap-{uuid4().hex[:8]}.qcow2"
+        snap = tmp_path / f"snap-{random_test_id()}.qcow2"
         scheduler._snapshot_manager.get_or_create_snapshot = AsyncMock(  # type: ignore[union-attr]
             return_value=snap,
         )
@@ -310,7 +303,7 @@ class TestBaseImageFetchBeforeSnapshot:
     def _setup_cold_boot_mocks(scheduler: Scheduler) -> MagicMock:
         """Disable warm pool + memory snapshots, mock create_vm for cold boot path."""
         mock_vm = MagicMock()
-        mock_vm.vm_id = f"vm-{uuid4().hex[:8]}"
+        mock_vm.vm_id = f"vm-{random_test_id()}"
         scheduler._warm_pool = None  # type: ignore[assignment]
         scheduler._memory_snapshot_manager = None  # type: ignore[assignment]
         scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
@@ -444,7 +437,7 @@ class TestBaseImageFetchBeforeSnapshot:
                     allow_network=False,
                     allowed_domains=None,
                     expose_ports=None,
-                    task_id=f"test-{uuid4().hex[:8]}",
+                    task_id=f"test-{random_test_id()}",
                 )
 
             snapshot_spy.assert_not_called()
@@ -470,8 +463,6 @@ class TestBaseImageFetchBeforeSnapshot:
 
     async def test_fetch_failure_propagates(self, images_dir: Path, tmp_path: Path) -> None:
         """fetch_base_image raising AssetDownloadError propagates to caller."""
-
-        from exec_sandbox.exceptions import AssetDownloadError
 
         config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
         async with Scheduler(config) as scheduler:
@@ -558,7 +549,7 @@ class TestBaseImageFetchBeforeSnapshot:
                     allow_network=False,
                     allowed_domains=None,
                     expose_ports=None,
-                    task_id=f"test-{uuid4().hex[:8]}",
+                    task_id=f"test-{random_test_id()}",
                 )
 
             # fetch called once from _get_or_create_snapshot, NOT again from cold boot
@@ -803,8 +794,6 @@ class TestSchedulerShutdownOrdering:
         then a third acquire (background save) blocks until slots are freed.
         Budget must account for DEFAULT_VM_MEMORY_OVERHEAD_MB added by acquire().
         """
-        from exec_sandbox.admission import ResourceAdmissionController
-        from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB
 
         guest_mb = 512
         total_per_vm = guest_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
@@ -983,8 +972,6 @@ time.sleep(30)
 """
 
         async with Scheduler(config) as scheduler:
-            from exec_sandbox.exceptions import VmTimeoutError
-
             try:
                 result = await scheduler.run(
                     code=code,
@@ -1135,7 +1122,6 @@ class TestTimingBreakdownModel:
 
     def test_timing_breakdown_all_fields_required(self) -> None:
         """TimingBreakdown requires all four timing fields."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50, total_ms=350)
         assert timing.setup_ms == 100
@@ -1145,7 +1131,6 @@ class TestTimingBreakdownModel:
 
     def test_timing_breakdown_zero_values_valid(self) -> None:
         """TimingBreakdown accepts zero values (warm pool case)."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=50, total_ms=50)
         assert timing.setup_ms == 0
@@ -1153,9 +1138,6 @@ class TestTimingBreakdownModel:
 
     def test_timing_breakdown_missing_field_raises(self) -> None:
         """TimingBreakdown raises if any field is missing."""
-        from pydantic import ValidationError
-
-        from exec_sandbox.models import TimingBreakdown
 
         with pytest.raises(ValidationError):
             TimingBreakdown(setup_ms=100, boot_ms=200, execute_ms=50)  # type: ignore[call-arg]
@@ -1166,9 +1148,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_timing_required(self) -> None:
         """ExecutionResult requires timing field."""
-        from pydantic import ValidationError
-
-        from exec_sandbox.models import ExecutionResult
 
         with pytest.raises(ValidationError):
             ExecutionResult(  # type: ignore[call-arg]
@@ -1180,7 +1159,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_with_timing(self) -> None:
         """ExecutionResult accepts timing field."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -1193,7 +1171,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_warm_pool_hit_default_false(self) -> None:
         """warm_pool_hit defaults to False."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -1205,7 +1182,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_warm_pool_hit_explicit_true(self) -> None:
         """warm_pool_hit can be set to True."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -1220,7 +1196,6 @@ class TestExecutionResultTiming:
 
     def test_timing_breakdown_with_connect_ms(self) -> None:
         """TimingBreakdown with optional connect_ms field."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(
             setup_ms=10,
@@ -1233,7 +1208,6 @@ class TestExecutionResultTiming:
 
     def test_timing_breakdown_without_connect_ms(self) -> None:
         """TimingBreakdown without connect_ms (backwards compat)."""
-        from exec_sandbox.models import TimingBreakdown
 
         timing = TimingBreakdown(
             setup_ms=10,
@@ -1245,7 +1219,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_with_guest_timing(self) -> None:
         """ExecutionResult with guest-reported spawn_ms and process_ms."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="",
@@ -1260,7 +1233,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_without_guest_timing(self) -> None:
         """ExecutionResult without guest timing (backwards compat)."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="",
@@ -1273,7 +1245,6 @@ class TestExecutionResultTiming:
 
     def test_execution_result_full_timing(self) -> None:
         """ExecutionResult with all timing fields populated."""
-        from exec_sandbox.models import ExecutionResult, TimingBreakdown
 
         result = ExecutionResult(
             stdout="hello",
@@ -1390,8 +1361,6 @@ class TestSchedulerTimingIntegration:
         code = "import time; time.sleep(10)"
 
         async with Scheduler(config) as sched:
-            from exec_sandbox.exceptions import VmTimeoutError
-
             try:
                 result = await sched.run(
                     code=code,
@@ -1630,8 +1599,6 @@ class TestSchedulerWarmPoolTiming:
 
     async def test_warm_pool_exhaustion_falls_back_to_cold(self, scheduler_config: SchedulerConfig) -> None:
         """When warm pool is exhausted, falls back to cold boot with full timing."""
-        import asyncio
-
         # Create scheduler with very small pool (1 VM)
         config = SchedulerConfig(
             images_dir=scheduler_config.images_dir,
