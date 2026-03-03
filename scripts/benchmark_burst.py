@@ -13,8 +13,8 @@ fits an RBF surrogate surface via scipy to predict the optimal beyond the
 sampled grid.
 
 The sweep results inform the defaults in constants.py:
-  DEFAULT_CPU_OVERCOMMIT_RATIO = 4.0
-  DEFAULT_MEMORY_OVERCOMMIT_RATIO = 3.0
+  DEFAULT_CPU_OVERCOMMIT_RATIO = 2.0
+  DEFAULT_MEMORY_OVERCOMMIT_RATIO = 2.9
 
 Re-run after changing VM sizing, admission logic, or target hardware:
     make bench-sweep              # 200 VMs per combo (default)

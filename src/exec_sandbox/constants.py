@@ -458,29 +458,33 @@ FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
 # Resource Admission & Overcommit
 # ============================================================================
 
-DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 3.0
+DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 2.9
 """Host-level memory overcommit multiplier applied to the total VM pool budget.
 
 budget = host_total * (1 - reserve_ratio) * overcommit_ratio
 
 This stretches the pool beyond physical capacity — safe because AI agent workloads
-are bursty and mostly idle (avg memory utilization 18-22%).  The 3x default was
-determined by Pareto-optimal sweep on a 16-vCPU / 32GB EC2 instance with KVM
-(scripts/benchmark_burst.py): CPU=4x MEM=3x yielded 36.6 VMs/s with exec p95=117ms
-at 17% RSS — best throughput on the efficient frontier.
+are bursty and mostly idle (avg memory utilization 18-22%).  The 2.9x default was
+determined by RBF surrogate optimization over a 4x4 Pareto-optimal sweep (500 VMs
+per combo) on a 16-vCPU / 32GB EC2 instance with KVM
+(scripts/benchmark_burst.py): CPU=2x MEM=2.9x predicted efficiency=464
+VMs/s per RSS-fraction — confirmed by sampled optimum CPU=2x MEM=3x at
+efficiency=463 with exec p95=73ms at 7.8% RSS.
 Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
 constant for QEMU/gvproxy process memory."""
 
-DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 4.0
+DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 2.0
 """Host-level CPU overcommit multiplier applied to the total VM pool budget.
 
 budget = (host_cpus - reserve_cores) * overcommit_ratio
 
-AI workloads average 11-17% CPU utilization, so 4x overcommit is safe.  The 4x
-default was confirmed by Pareto-optimal sweep on a 16-vCPU / 32GB EC2 instance
-with KVM (scripts/benchmark_burst.py): CPU=4x MEM=3x yielded 36.6 VMs/s with
-exec p95=117ms at 17% RSS — best throughput on the efficient frontier.  Beyond 4x,
-throughput degrades while memory pressure grows sharply (17% → 32% → 55% RSS).
+AI workloads average 11-17% CPU utilization, so 2x overcommit is safe while
+keeping exec latency low.  The 2x default was determined by RBF surrogate
+optimization over a 4x4 Pareto-optimal sweep (500 VMs per combo) on a
+16-vCPU / 32GB EC2 instance with KVM (scripts/benchmark_burst.py): CPU=2x
+MEM=2.9x predicted efficiency=464 VMs/s per RSS-fraction with exec p95=73ms
+at 7.8% RSS.  Beyond 2x, RSS grows sharply (8% → 18% → 36% → 52%) while
+throughput stays flat (~35 VMs/s), and at 12x the system OOMs under load.
 Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
 constant for QEMU/gvproxy process CPU."""
 
