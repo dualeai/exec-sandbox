@@ -123,6 +123,31 @@ pub(crate) async fn spawn_repl(
             c
         }
         Language::Raw => {
+            // TLS certificate trust chain — Alpine system curl (OpenSSL 3.5.x)
+            //
+            // The raw/shell REPL executes user commands via eval, so TLS is
+            // handled by whatever tool the user invokes — typically curl or git.
+            // Alpine's curl dynamically links against the system OpenSSL 3.5.x
+            // (libssl.so.3 / libcrypto.so.3) and is compiled with:
+            //
+            //   --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt
+            //   --with-ca-path=/etc/ssl/certs
+            //   --enable-ares          (c-ares async DNS resolver)
+            //   --with-openssl-quic    (HTTP/3 support)
+            //
+            // The ca-certificates-bundle package is a runtime dependency of
+            // libcurl on Alpine, so the Mozilla CA store is always present.
+            // No environment overrides are needed — curl's compiled-in defaults
+            // match the Alpine cert layout exactly.
+            //
+            // Note on DNS: despite c-ares being compiled in, certain code paths
+            // (SOCKS proxy, edge cases) can still fall back to musl's blocking
+            // getaddrinfo().  musl's resolver ignores EINTR during poll(), so
+            // curl's --max-time cannot interrupt a stuck DNS lookup.  Tests
+            // wrap curl with coreutils `timeout` as a process-level safety net.
+            //
+            // See: https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/main/curl/APKBUILD
+            //      https://www.openwall.com/lists/musl/2017/09/28/1
             let mut c = Command::new(BASH_BIN_PATH);
             c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));
