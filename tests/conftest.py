@@ -1,6 +1,7 @@
 """Shared pytest fixtures for exec-sandbox tests."""
 
 import asyncio
+import io
 import logging
 import os
 import random
@@ -492,3 +493,33 @@ def setup_test_environment():
     # Cleanup
     os.environ.pop("ENVIRONMENT", None)
     os.environ.pop("LOG_LEVEL", None)
+
+
+# ============================================================================
+# Shared test helpers
+# ============================================================================
+
+
+class NonSeekableIO(io.RawIOBase):
+    """Non-seekable in-memory byte stream for testing IO[bytes] code paths.
+
+    Wraps a ``bytes`` buffer and exposes it as a readable, non-seekable raw
+    stream.  Wrap with ``io.BufferedReader`` for a buffered ``IO[bytes]``.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: bytearray | memoryview) -> int:  # type: ignore[override]
+        remaining = len(self._data) - self._pos
+        n = min(len(b), remaining)
+        b[:n] = self._data[self._pos : self._pos + n]
+        self._pos += n
+        return n
+
+    def seekable(self) -> bool:
+        return False

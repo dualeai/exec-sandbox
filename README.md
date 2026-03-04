@@ -134,23 +134,25 @@ Sessions auto-close after idle timeout (default: 300s, configurable via `session
 Sessions support reading, writing, and listing files inside the sandbox.
 
 ```python
+import io
 from pathlib import Path
 from exec_sandbox import Scheduler
 
 async with Scheduler() as scheduler:
     async with await scheduler.session(language="python") as session:
-        # Write a file into the sandbox
+        # Write from bytes, a local Path, or any IO[bytes] stream
         await session.write_file("input.csv", b"name,score\nAlice,95\nBob,87")
-
-        # Write from a local file
         await session.write_file("model.pkl", Path("./local_model.pkl"))
+        await session.write_file("data.bin", io.BytesIO(b"in-memory"))
 
         # Execute code that reads input and writes output
         await session.exec("data = open('input.csv').read().upper()")
         await session.exec("open('output.csv', 'w').write(data)")
 
-        # Read a file back from the sandbox
+        # Read to a local Path or any IO[bytes] buffer
         await session.read_file("output.csv", destination=Path("./output.csv"))
+        buf = io.BytesIO()
+        await session.read_file("data.bin", destination=buf)
 
         # List files in a directory
         files = await session.list_files("")  # sandbox root

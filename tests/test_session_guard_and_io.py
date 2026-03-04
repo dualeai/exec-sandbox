@@ -13,6 +13,7 @@ are mocked. Covers:
 """
 
 import asyncio
+import io
 import json
 import random
 from pathlib import Path
@@ -382,19 +383,21 @@ class TestGuardConcurrentFileIO:
 class TestResolveContentNormal:
     """Happy-path tests for _resolve_content()."""
 
-    async def test_bytes_returns_bytesio(self) -> None:
-        """Bytes content is wrapped in BytesIO."""
+    async def test_bytes_returns_bytesio_owned(self) -> None:
+        """Bytes content is wrapped in BytesIO, owned=True."""
         session, _, _ = _make_session()
-        stream = await session._resolve_content(b"hello")
+        stream, owned = await session._resolve_content(b"hello")
+        assert owned is True
         assert stream.read() == b"hello"
         stream.close()
 
-    async def test_path_returns_file_handle(self, tmp_path: Path) -> None:
-        """Path returns an open file handle (streams from disk)."""
+    async def test_path_returns_file_handle_owned(self, tmp_path: Path) -> None:
+        """Path returns an open file handle (streams from disk), owned=True."""
         f = tmp_path / "small.txt"
         f.write_bytes(b"small content")
         session, _, _ = _make_session()
-        stream = await session._resolve_content(f)
+        stream, owned = await session._resolve_content(f)
+        assert owned is True
         assert stream.read() == b"small content"
         stream.close()
 
@@ -405,9 +408,19 @@ class TestResolveContentNormal:
         f.write_bytes(content)
 
         session, _, _ = _make_session()
-        stream = await session._resolve_content(f)
+        stream, owned = await session._resolve_content(f)
+        assert owned is True
         assert stream.read() == content
         stream.close()
+
+    async def test_io_bytes_returns_same_buf_not_owned(self) -> None:
+        """IO[bytes] input returns the same buffer, owned=False."""
+        session, _, _ = _make_session()
+        buf = io.BytesIO(b"hello")
+        stream, owned = await session._resolve_content(buf)
+        assert owned is False
+        assert stream is buf
+        assert stream.read() == b"hello"
 
     async def test_write_file_resolve_before_lock(self, tmp_path: Path) -> None:
         """write_file() resolves Path BEFORE acquiring the exec lock.
@@ -427,7 +440,7 @@ class TestResolveContentNormal:
         resolve_called = asyncio.Event()
         original_resolve = session._resolve_content
 
-        async def spied_resolve(content: bytes | Path) -> IO[bytes]:
+        async def spied_resolve(content: bytes | Path | IO[bytes]) -> tuple[IO[bytes], bool]:
             result = await original_resolve(content)
             resolve_called.set()
             # Wait a bit to ensure read_file tries to acquire the lock
@@ -462,7 +475,8 @@ class TestResolveContentEdgeCases:
         """Bytes of exactly MAX_FILE_SIZE_BYTES are accepted."""
         session, _, _ = _make_session()
         content = b"x" * MAX_FILE_SIZE_BYTES
-        stream = await session._resolve_content(content)
+        stream, owned = await session._resolve_content(content)
+        assert owned is True
         assert stream.read() == content
         stream.close()
 
@@ -477,7 +491,8 @@ class TestResolveContentEdgeCases:
         f = tmp_path / "exact.bin"
         f.write_bytes(b"x" * MAX_FILE_SIZE_BYTES)
         session, _, _ = _make_session()
-        stream = await session._resolve_content(f)
+        stream, owned = await session._resolve_content(f)
+        assert owned is True
         assert stream.read() == b"x" * MAX_FILE_SIZE_BYTES
         stream.close()
 
@@ -492,7 +507,8 @@ class TestResolveContentEdgeCases:
     async def test_empty_bytes_accepted(self) -> None:
         """Empty bytes (0 length) are accepted."""
         session, _, _ = _make_session()
-        stream = await session._resolve_content(b"")
+        stream, owned = await session._resolve_content(b"")
+        assert owned is True
         assert stream.read() == b""
         stream.close()
 
@@ -501,9 +517,45 @@ class TestResolveContentEdgeCases:
         f = tmp_path / "empty.bin"
         f.write_bytes(b"")
         session, _, _ = _make_session()
-        stream = await session._resolve_content(f)
+        stream, owned = await session._resolve_content(f)
+        assert owned is True
         assert stream.read() == b""
         stream.close()
+
+    async def test_seekable_io_bytes_at_max_size_accepted(self) -> None:
+        """Seekable IO[bytes] of exactly MAX_FILE_SIZE_BYTES is accepted."""
+        session, _, _ = _make_session()
+        buf = io.BytesIO(b"x" * MAX_FILE_SIZE_BYTES)
+        stream, owned = await session._resolve_content(buf)
+        assert owned is False
+        assert stream is buf
+
+    async def test_seekable_io_bytes_over_max_rejected(self) -> None:
+        """Seekable IO[bytes] exceeding MAX_FILE_SIZE_BYTES raises ValueError."""
+        session, _, _ = _make_session()
+        buf = io.BytesIO(b"x" * (MAX_FILE_SIZE_BYTES + 1))
+        with pytest.raises(ValueError, match="exceeds"):
+            await session._resolve_content(buf)
+
+    async def test_non_seekable_io_bytes_skips_validation(self) -> None:
+        """Non-seekable IO[bytes] skips size validation."""
+        from tests.conftest import NonSeekableIO
+
+        session, _, _ = _make_session()
+        raw = NonSeekableIO(b"x" * 100)
+        buf = io.BufferedReader(raw)
+        stream, owned = await session._resolve_content(buf)  # type: ignore[arg-type]
+        assert owned is False
+        assert stream is buf
+
+    async def test_seekable_io_bytes_preserves_position(self) -> None:
+        """Size validation restores the original stream position."""
+        session, _, _ = _make_session()
+        buf = io.BytesIO(b"prefix" + b"data")
+        buf.seek(6)  # Position past "prefix"
+        _, owned = await session._resolve_content(buf)
+        assert owned is False
+        assert buf.tell() == 6  # Position preserved
 
 
 # ============================================================================
@@ -552,7 +604,8 @@ class TestResolveContentToctou:
         content = b"x" * 1000
         f.write_bytes(content)
         session, _, _ = _make_session()
-        stream = await session._resolve_content(f)
+        stream, owned = await session._resolve_content(f)
+        assert owned is True
         assert stream.read() == content
         stream.close()
 
