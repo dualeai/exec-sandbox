@@ -2,6 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["exec-sandbox"]
+#
+# [tool.uv.sources]
+# exec-sandbox = { path = ".." }
 # ///
 """Benchmark VM latency for exec-sandbox.
 
