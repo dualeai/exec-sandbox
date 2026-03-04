@@ -49,6 +49,45 @@ For S3 snapshot caching:
     pip install exec-sandbox[s3]
 """
 
+# ---------------------------------------------------------------------------
+# Platform gate — fail fast on unsupported operating systems
+# ---------------------------------------------------------------------------
+# exec-sandbox is deeply POSIX-specific: Unix domain sockets (AF_UNIX),
+# signals (SIGKILL/SIGTERM/SIGSTOP), cgroups v2, /proc, fcntl file locking,
+# termios, os.getuid(), unshare namespaces, and QEMU with KVM (Linux) or
+# HVF (macOS) acceleration.  None of these are available on Windows.
+#
+# We detect the platform via psutil (see platform_utils.detect_host_os) and
+# raise PermanentError — a SandboxError subclass — so that cross-platform
+# orchestrators can handle the rejection gracefully:
+#
+#     from exec_sandbox.exceptions import PermanentError
+#
+#     try:
+#         from exec_sandbox import Scheduler
+#     except PermanentError:
+#         # Fall back to another execution backend
+#         pass
+#
+# The exceptions module is pure Python with no POSIX dependencies, so it
+# imports successfully on any platform.
+# ---------------------------------------------------------------------------
+from exec_sandbox.platform_utils import HostOS, detect_host_os
+
+if detect_host_os() == HostOS.UNKNOWN:
+    import platform
+
+    from exec_sandbox.exceptions import PermanentError
+
+    raise PermanentError(
+        "exec-sandbox requires Linux or macOS. "
+        f"Detected platform '{platform.system()}' is not supported because "
+        "exec-sandbox relies on QEMU with KVM/HVF acceleration, Unix domain sockets, "
+        "and POSIX process management (signals, cgroups, overlayfs). "
+        "Consider running inside WSL2 on Windows.",
+        context={"platform": platform.system()},
+    )
+
 from importlib.metadata import PackageNotFoundError, version
 
 try:
