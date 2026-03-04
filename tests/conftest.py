@@ -465,9 +465,9 @@ async def create_test_qcow2(path: Path, size: str = "1M") -> None:
 
 NET_CONNECT_TIMEOUT_S = 5  # TCP connect timeout (socket, curl --connect-timeout)
 NET_OP_TIMEOUT_S = 10  # Full operation timeout (AbortSignal, urllib, curl --max-time)
-NET_SAFETY_TIMEOUT_S = 15  # Process-level kill — catches musl DNS hang under TCG
-NET_RETRY_COUNT = 2  # Retries for allowed-domain tests (3 total attempts)
-NET_RETRY_BACKOFF_S = 1  # Linear backoff base (1s, 2s between retries)
+NET_SAFETY_TIMEOUT_S = 30  # Process-level kill — catches musl DNS hang under TCG
+NET_RETRY_COUNT = 4  # Retries for allowed-domain tests (5 total attempts)
+NET_RETRY_BACKOFF_S = 1  # Linear backoff base (1s, 2s, … between retries)
 
 # Safety preambles — kill the process if musl DNS blocks beyond the safety timeout.
 # threading.Timer fires even when the main thread is stuck in getaddrinfo().

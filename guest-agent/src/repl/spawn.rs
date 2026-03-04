@@ -52,6 +52,33 @@ pub(crate) async fn spawn_repl(
                 "NODE_PATH",
                 format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
+            // TLS certificate trust chain — Bun 1.3.x (BoringSSL)
+            //
+            // Bun embeds a bundled Mozilla CA store (NSS 3.117 as of 1.3.3) and also
+            // probes system CA paths via X509_STORE_set_default_paths():
+            //   /etc/ssl/certs/ca-certificates.crt  (Alpine, installed via ca-certificates pkg)
+            //   /etc/ssl/cert.pem                   (Alpine fallback)
+            //
+            // This is sufficient for the vast majority of TLS connections.  However,
+            // BoringSSL intermittently surfaces X509_V_ERR_UNSPECIFIED ("unknown
+            // certificate verification error") for specific CDN edges — observed on
+            // github.com in CI while cloudflare.com and pypi.org succeed in the same
+            // VM session.  The error is non-deterministic across sessions (passes most
+            // CI runs) but deterministic within a single Bun process lifetime.
+            //
+            // Root cause is unresolved upstream.  Bun 1.3.0 had a regression (#23735)
+            // where system CAs were gated behind NODE_USE_SYSTEM_CA; fixed in 1.3.2
+            // (PR #24350).  The intermittent failures on 1.3.10 are a separate issue —
+            // likely BoringSSL's session cache or CDN edge certificate rotation.
+            //
+            // We do NOT set SSL_CERT_FILE here: Bun's Linux cert loader short-circuits
+            // when SSL_CERT_FILE is set, skipping all other path probing.  The default
+            // multi-path probing is more resilient.
+            //
+            // Mitigation: test-side retries (NET_RETRY_COUNT) absorb the flake.
+            //
+            // See: https://github.com/oven-sh/bun/issues/23735
+            //      https://github.com/oven-sh/bun/pull/24350
             c.env("BUN_JSC_useFTLJIT", "0");
             // Minimize background thread CPU when idle. Without these, JSC's
             // concurrent GC/JIT threads and Bun's GC timer cause ~20-25% CPU

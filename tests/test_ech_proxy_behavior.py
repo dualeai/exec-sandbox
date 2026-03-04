@@ -89,9 +89,10 @@ def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT, *, retries: bool 
     accepted for signature compatibility but ignored.
 
     When *retries* is True (default for allowed-domain tests), retries up
-    to 3 times with linear backoff to absorb transient connection resets
-    from real-world domains like github.com on CI runners — matching the
-    curl variant's ``--retry 2`` pattern.
+    to ``NET_RETRY_COUNT + 1`` times with linear backoff to absorb
+    transient connection resets and BoringSSL certificate verification
+    flakes observed in CI (see guest-agent ``spawn.rs`` TLS comment for
+    full analysis).
     """
     if retries:
         return (
