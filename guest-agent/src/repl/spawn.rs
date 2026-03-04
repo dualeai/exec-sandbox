@@ -26,6 +26,33 @@ pub(crate) async fn spawn_repl(
 
     let mut cmd = match language {
         Language::Python => {
+            // TLS certificate trust chain — python-build-standalone (OpenSSL 3.5.x)
+            //
+            // The standalone CPython musl build statically links OpenSSL 3.5.x
+            // (no runtime libssl.so dependency).  The compiled-in openssldir is
+            // /etc/ssl (set via --openssldir=/etc/ssl in the PBS build script),
+            // giving these defaults for ssl.get_default_verify_paths():
+            //
+            //   openssl_cafile = /etc/ssl/cert.pem
+            //   openssl_capath = /etc/ssl/certs
+            //
+            // Alpine's ca-certificates package (in COMMON_PKGS) provides exactly
+            // these paths: /etc/ssl/cert.pem is a symlink to the Mozilla CA
+            // bundle at /etc/ssl/certs/ca-certificates.crt.  No certificates are
+            // embedded in the standalone distribution — it relies entirely on the
+            // host system.  This is why ca-certificates in the rootfs is critical.
+            //
+            // We do NOT set SSL_CERT_FILE here: OpenSSL's default path probing
+            // already matches Alpine's layout, and setting the env var would
+            // short-circuit the multi-path fallback (cafile + capath).
+            //
+            // Known issues (none affect Alpine):
+            //   - RHEL/Fedora use /etc/pki/tls/ instead of /etc/ssl/, causing
+            //     CERTIFICATE_VERIFY_FAILED (astral-sh/python-build-standalone#259).
+            //   - PR #976 proposes a fallback; not yet merged.
+            //
+            // See: https://github.com/astral-sh/python-build-standalone/issues/259
+            //      https://github.com/astral-sh/python-build-standalone/issues/858
             let mut c = Command::new(format!("{PYTHON_HOME}/bin/python3"));
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
             c.env(
