@@ -26,6 +26,33 @@ pub(crate) async fn spawn_repl(
 
     let mut cmd = match language {
         Language::Python => {
+            // TLS certificate trust chain — python-build-standalone (OpenSSL 3.5.x)
+            //
+            // The standalone CPython musl build statically links OpenSSL 3.5.x
+            // (no runtime libssl.so dependency).  The compiled-in openssldir is
+            // /etc/ssl (set via --openssldir=/etc/ssl in the PBS build script),
+            // giving these defaults for ssl.get_default_verify_paths():
+            //
+            //   openssl_cafile = /etc/ssl/cert.pem
+            //   openssl_capath = /etc/ssl/certs
+            //
+            // Alpine's ca-certificates package (in COMMON_PKGS) provides exactly
+            // these paths: /etc/ssl/cert.pem is a symlink to the Mozilla CA
+            // bundle at /etc/ssl/certs/ca-certificates.crt.  No certificates are
+            // embedded in the standalone distribution — it relies entirely on the
+            // host system.  This is why ca-certificates in the rootfs is critical.
+            //
+            // We do NOT set SSL_CERT_FILE here: OpenSSL's default path probing
+            // already matches Alpine's layout, and setting the env var would
+            // short-circuit the multi-path fallback (cafile + capath).
+            //
+            // Known issues (none affect Alpine):
+            //   - RHEL/Fedora use /etc/pki/tls/ instead of /etc/ssl/, causing
+            //     CERTIFICATE_VERIFY_FAILED (astral-sh/python-build-standalone#259).
+            //   - PR #976 proposes a fallback; not yet merged.
+            //
+            // See: https://github.com/astral-sh/python-build-standalone/issues/259
+            //      https://github.com/astral-sh/python-build-standalone/issues/858
             let mut c = Command::new(format!("{PYTHON_HOME}/bin/python3"));
             c.arg(format!("{SANDBOX_ROOT}/_repl.py"));
             c.env(
@@ -52,6 +79,33 @@ pub(crate) async fn spawn_repl(
                 "NODE_PATH",
                 format!("{SANDBOX_ROOT}/node_modules:{NODE_MODULES_SYSTEM}"),
             );
+            // TLS certificate trust chain — Bun 1.3.x (BoringSSL)
+            //
+            // Bun embeds a bundled Mozilla CA store (NSS 3.117 as of 1.3.3) and also
+            // probes system CA paths via X509_STORE_set_default_paths():
+            //   /etc/ssl/certs/ca-certificates.crt  (Alpine, installed via ca-certificates pkg)
+            //   /etc/ssl/cert.pem                   (Alpine fallback)
+            //
+            // This is sufficient for the vast majority of TLS connections.  However,
+            // BoringSSL intermittently surfaces X509_V_ERR_UNSPECIFIED ("unknown
+            // certificate verification error") for specific CDN edges — observed on
+            // github.com in CI while cloudflare.com and pypi.org succeed in the same
+            // VM session.  The error is non-deterministic across sessions (passes most
+            // CI runs) but deterministic within a single Bun process lifetime.
+            //
+            // Root cause is unresolved upstream.  Bun 1.3.0 had a regression (#23735)
+            // where system CAs were gated behind NODE_USE_SYSTEM_CA; fixed in 1.3.2
+            // (PR #24350).  The intermittent failures on 1.3.10 are a separate issue —
+            // likely BoringSSL's session cache or CDN edge certificate rotation.
+            //
+            // We do NOT set SSL_CERT_FILE here: Bun's Linux cert loader short-circuits
+            // when SSL_CERT_FILE is set, skipping all other path probing.  The default
+            // multi-path probing is more resilient.
+            //
+            // Mitigation: test-side retries (NET_RETRY_COUNT) absorb the flake.
+            //
+            // See: https://github.com/oven-sh/bun/issues/23735
+            //      https://github.com/oven-sh/bun/pull/24350
             c.env("BUN_JSC_useFTLJIT", "0");
             // Minimize background thread CPU when idle. Without these, JSC's
             // concurrent GC/JIT threads and Bun's GC timer cause ~20-25% CPU
@@ -69,6 +123,31 @@ pub(crate) async fn spawn_repl(
             c
         }
         Language::Raw => {
+            // TLS certificate trust chain — Alpine system curl (OpenSSL 3.5.x)
+            //
+            // The raw/shell REPL executes user commands via eval, so TLS is
+            // handled by whatever tool the user invokes — typically curl or git.
+            // Alpine's curl dynamically links against the system OpenSSL 3.5.x
+            // (libssl.so.3 / libcrypto.so.3) and is compiled with:
+            //
+            //   --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt
+            //   --with-ca-path=/etc/ssl/certs
+            //   --enable-ares          (c-ares async DNS resolver)
+            //   --with-openssl-quic    (HTTP/3 support)
+            //
+            // The ca-certificates-bundle package is a runtime dependency of
+            // libcurl on Alpine, so the Mozilla CA store is always present.
+            // No environment overrides are needed — curl's compiled-in defaults
+            // match the Alpine cert layout exactly.
+            //
+            // Note on DNS: despite c-ares being compiled in, certain code paths
+            // (SOCKS proxy, edge cases) can still fall back to musl's blocking
+            // getaddrinfo().  musl's resolver ignores EINTR during poll(), so
+            // curl's --max-time cannot interrupt a stuck DNS lookup.  Tests
+            // wrap curl with coreutils `timeout` as a process-level safety net.
+            //
+            // See: https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/main/curl/APKBUILD
+            //      https://www.openwall.com/lists/musl/2017/09/28/1
             let mut c = Command::new(BASH_BIN_PATH);
             c.args(["--norc", "--noprofile"]);
             c.arg(format!("{SANDBOX_ROOT}/_repl.sh"));

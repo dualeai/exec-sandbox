@@ -165,7 +165,7 @@ def get_connection_test_code(language: Language, test_domain: str, *, retries: b
     fail DNS resolution, allowed domains resolve and connect via TLS.
 
     When *retries* is True the generated code retries transient failures
-    (matching curl's ``--retry 2`` pattern) — used for allowed-domain tests.
+    (``NET_RETRY_COUNT`` attempts) — used for allowed-domain tests.
     """
     if language == Language.PYTHON:
         if retries:
@@ -227,8 +227,8 @@ try {{
 """
         )
     # RAW — ``timeout`` wraps curl because curl's ``--max-time`` cannot
-    # interrupt musl's blocking ``getaddrinfo()`` (Alpine ships curl without
-    # c-ares).  See ``_curl_tls_code`` in test_ech_proxy_behavior.py.
+    # interrupt musl's blocking ``getaddrinfo()`` (even with c-ares, some
+    # code paths fall back to musl).  See ``_curl_tls_code`` docstring.
     retry_flags = f" --retry {NET_RETRY_COUNT} --retry-connrefused" if retries else ""
     return (
         f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf"

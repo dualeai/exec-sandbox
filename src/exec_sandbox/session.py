@@ -127,14 +127,15 @@ class Session:
             self._reset_idle_timer()
             yield
 
-    async def _resolve_content(self, content: bytes | Path) -> IO[bytes]:
-        """Convert bytes | Path to a readable binary stream with size validation.
+    async def _resolve_content(self, content: bytes | Path | IO[bytes]) -> tuple[IO[bytes], bool]:
+        """Convert content to a readable binary stream with size validation.
 
         Called BEFORE _guard() so local disk I/O doesn't hold the exec lock.
 
         Returns:
-            IO[bytes]: BytesIO for bytes input, open file handle for Path input.
-            Caller is responsible for closing the stream.
+            (stream, owned): The stream and whether the caller should close it.
+            ``owned=True`` means we created the stream (bytes→BytesIO, Path→file);
+            ``owned=False`` means the caller passed an IO[bytes] they own.
 
         TOCTOU note: for Path, we stat() before open(). The file could grow
         between stat() and actual reads. The guest agent also enforces the
@@ -147,10 +148,21 @@ class Session:
             if file_size > MAX_FILE_SIZE_BYTES:
                 raise ValueError(f"File {content.name} is {file_size} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
             # Return open file handle — streams from disk, never loads full content.
-            return content.open("rb")
-        if len(content) > MAX_FILE_SIZE_BYTES:
-            raise ValueError(f"Content is {len(content)} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
-        return io.BytesIO(content)
+            return content.open("rb"), True
+        if isinstance(content, bytes):
+            if len(content) > MAX_FILE_SIZE_BYTES:
+                raise ValueError(f"Content is {len(content)} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+            return io.BytesIO(content), True
+        # IO[bytes] — caller owns the stream, we do NOT close it.
+        # Validate size only if the stream is seekable.
+        if content.seekable():
+            pos = content.tell()
+            content.seek(0, 2)
+            size = content.tell()
+            content.seek(pos)
+            if size - pos > MAX_FILE_SIZE_BYTES:
+                raise ValueError(f"Stream content is {size - pos} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+        return content, False
 
     # -------------------------------------------------------------------------
     # Core API
@@ -255,13 +267,14 @@ class Session:
     # File I/O
     # -------------------------------------------------------------------------
 
-    async def write_file(self, path: str, content: bytes | Path, *, make_executable: bool = False) -> None:
+    async def write_file(self, path: str, content: bytes | Path | IO[bytes], *, make_executable: bool = False) -> None:
         """Write a file to the sandbox at the given path.
 
         Args:
             path: Relative path in sandbox (e.g., "input.csv", "data/model.pkl").
-            content: File content as bytes or a local Path to read from.
+            content: File content as bytes, a local Path, or an IO[bytes] stream.
                 For Path, content is streamed from disk — never fully loaded.
+                For IO[bytes], the caller retains ownership (stream is NOT closed).
             make_executable: Set executable permission (0o755 vs 0o644).
 
         Raises:
@@ -272,22 +285,25 @@ class Session:
         """
         # Resolve content to a stream BEFORE acquiring the lock —
         # local disk I/O should not block other session operations.
-        stream = await self._resolve_content(content)
+        stream, owned = await self._resolve_content(content)
         try:
             async with self._guard():
                 await self._vm.write_file(path, stream, make_executable=make_executable)
         finally:
-            stream.close()
+            if owned:
+                stream.close()
 
-    async def read_file(self, path: str, *, destination: Path) -> None:
-        """Read a file from the sandbox, streaming directly to a local file.
+    async def read_file(self, path: str, *, destination: Path | IO[bytes]) -> None:
+        """Read a file from the sandbox, streaming to a local file or buffer.
 
         Decompressed chunks are written directly to *destination* — peak
         memory is ~128 KB regardless of file size.
 
         Args:
             path: Relative path in sandbox (e.g., "output.csv").
-            destination: Local file path to stream content into.
+            destination: Local file path or IO[bytes] buffer to stream content into.
+                For IO[bytes], content is written at the current position and
+                the caller retains ownership (stream is NOT closed).
 
         Raises:
             SessionClosedError: Session has been closed.

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["aiohttp", "tenacity"]
+# ///
 """Build package allow-lists from PyPI and npm registries.
 
 Fetches top N packages by download count to create security allow-lists.

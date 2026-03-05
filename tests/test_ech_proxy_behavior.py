@@ -89,9 +89,10 @@ def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT, *, retries: bool 
     accepted for signature compatibility but ignored.
 
     When *retries* is True (default for allowed-domain tests), retries up
-    to 3 times with linear backoff to absorb transient connection resets
-    from real-world domains like github.com on CI runners — matching the
-    curl variant's ``--retry 2`` pattern.
+    to ``NET_RETRY_COUNT + 1`` times with linear backoff to absorb
+    transient connection resets and BoringSSL certificate verification
+    flakes observed in CI (see guest-agent ``spawn.rs`` TLS comment for
+    full analysis).
     """
     if retries:
         return (
@@ -130,14 +131,24 @@ def _curl_tls_code(
     """curl connection test with optional TLS version forcing and extra flags.
 
     Uses coreutils ``timeout`` as an outer wall-clock deadline because curl's
-    ``--max-time`` cannot interrupt musl's blocking ``getaddrinfo()``.  Alpine
-    ships curl without c-ares, so DNS resolution is a synchronous libc call.
-    musl's resolver ignores EINTR from SIGALRM (``if (poll(…) <= 0) continue``
-    in ``res_msend.c``), which means curl's internal timer never fires while
-    the process is stuck in DNS.  Under ARM64 TCG with parallel test load the
-    entire operation can be inflated 10-25x by CPU starvation, easily exceeding
-    the 120 s guest-agent timeout.  ``timeout {NET_SAFETY_TIMEOUT_S}`` guarantees
-    the command terminates and the ``|| echo "BLOCKED"`` fallback always runs.
+    ``--max-time`` cannot interrupt musl's blocking ``getaddrinfo()``.
+    Although Alpine's curl includes c-ares (``--enable-ares``), certain code
+    paths still fall back to musl's synchronous resolver.  musl ignores
+    EINTR during ``poll()`` (``if (poll(…) <= 0) continue`` in
+    ``res_msend.c``), so curl's internal SIGALRM timer never fires while
+    DNS is stuck.  Under ARM64 TCG with parallel test load the entire
+    operation can be inflated 10-25x by CPU starvation, easily exceeding
+    the 120 s guest-agent timeout.  ``timeout {NET_SAFETY_TIMEOUT_S}``
+    guarantees the command terminates and the ``|| echo "BLOCKED"``
+    fallback always runs.
+
+    See guest-agent ``spawn.rs`` Raw language comment for full TLS analysis.
+
+    References:
+        - Alpine curl APKBUILD (--enable-ares, --with-ca-bundle):
+          https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/main/curl/APKBUILD
+        - musl res_msend.c poll() loop (ignores EINTR):
+          https://www.openwall.com/lists/musl/2017/09/28/1
     """
     parts: list[str] = []
     version_flag = _CURL_VERSION_FLAGS.get(tls_version)
@@ -405,10 +416,11 @@ async def test_curl_verbose_tls_negotiation(
 ) -> None:
     """curl verbose output confirms TLS version and cipher negotiated.
 
-    ``timeout 15`` wraps the entire pipeline so that even if curl hangs in
-    musl's blocking ``getaddrinfo()`` (see ``_curl_tls_code`` docstring),
-    grep still receives EOF and the ``|| echo "BLOCKED"`` fallback fires
-    instead of the pipeline hanging until the guest-agent timeout.
+    ``timeout {NET_SAFETY_TIMEOUT_S}`` wraps the entire pipeline so that
+    even if curl hangs in musl's blocking ``getaddrinfo()`` (see
+    ``_curl_tls_code`` docstring), grep still receives EOF and the
+    ``|| echo "BLOCKED"`` fallback fires instead of the pipeline hanging
+    until the guest-agent timeout.
     """
     curl_flags = _CURL_VERSION_FLAGS[tls_version]
     code = (

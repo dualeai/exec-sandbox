@@ -2,6 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["exec-sandbox", "scipy", "numpy"]
+#
+# [tool.uv.sources]
+# exec-sandbox = { path = ".." }
 # ///
 """Overcommit optimizer for exec-sandbox.
 

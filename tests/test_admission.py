@@ -25,7 +25,6 @@ from exec_sandbox.constants import (
     DEFAULT_MEMORY_OVERCOMMIT_RATIO,
     DEFAULT_TCG_TB_CACHE_SIZE_MB,
     DEFAULT_VM_CPU_CORES,
-    DEFAULT_VM_CPU_OVERHEAD_CORES,
     DEFAULT_VM_MEMORY_OVERHEAD_MB,
     RESOURCE_ADMISSION_TIMEOUT_SECONDS,
 )
@@ -1255,57 +1254,46 @@ async def test_stop_unblocks_waiting_acquires() -> None:
 # ============================================================================
 
 
-def test_effective_max_vms_basic() -> None:
-    """effective_max_vms returns correct value for standard config."""
-    ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=8.0)
-    result = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
-    mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
-    mem_budget = 16_000 * (1 - DEFAULT_HOST_MEMORY_RESERVE_RATIO) * DEFAULT_MEMORY_OVERCOMMIT_RATIO
-    cpu_per_vm = 1.0 + DEFAULT_VM_CPU_OVERHEAD_CORES
-    cpu_budget = (8.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO
-    expected = min(int(mem_budget // mem_per_vm), int(cpu_budget // cpu_per_vm))
-    assert result == expected
+def test_effective_max_vms() -> None:
+    """effective_max_vms: behavioral checks immune to constant tuning."""
+    ctrl = _make_controller()
 
+    # Both finite → positive
+    kvm = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
+    assert kvm > 0
 
-def test_effective_max_vms_with_tcg() -> None:
-    """effective_max_vms accounts for TCG overhead when use_tcg=True."""
-    # Use high CPU count so memory is the bottleneck (not CPU)
-    ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=100.0)
-    result_kvm = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=False)
-    result_tcg = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=True)
-    mem_budget = 16_000 * (1 - DEFAULT_HOST_MEMORY_RESERVE_RATIO) * DEFAULT_MEMORY_OVERCOMMIT_RATIO
-    cpu_budget = (100.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO
-    cpu_per_vm = 1.0 + DEFAULT_VM_CPU_OVERHEAD_CORES
-    kvm_mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
-    tcg_mem_per_vm = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
-    expected_kvm = min(int(mem_budget // kvm_mem_per_vm), int(cpu_budget // cpu_per_vm))
-    expected_tcg = min(int(mem_budget // tcg_mem_per_vm), int(cpu_budget // cpu_per_vm))
-    assert result_tcg < result_kvm
-    assert result_kvm == expected_kvm
-    assert result_tcg == expected_tcg
-
-
-def test_effective_max_vms_one_dimension_unlimited() -> None:
-    """effective_max_vms uses the finite dimension when only one is unlimited."""
-    ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=8.0)
-    # Manually set memory unlimited, CPU finite
-    ctrl._memory_budget_mb = float("inf")
-    result = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
-    # CPU: (8-0.5) * 4.0 = 30.0, per-VM = 1.25, max_cpu = 24
-    assert result == 24
-
-    # Manually set CPU unlimited, memory finite
-    ctrl._memory_budget_mb = 21600.0
+    # TCG overhead strictly reduces capacity (isolate memory dimension)
     ctrl._cpu_budget = float("inf")
-    result = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
-    # Memory: 21600 / 384 = 56
-    assert result == 56
+    kvm_mem = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=False)
+    tcg_mem = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0, use_tcg=True)
+    assert 0 < tcg_mem < kvm_mem
+    ctrl._cpu_budget = (8.0 - DEFAULT_HOST_CPU_RESERVE_CORES) * DEFAULT_CPU_OVERCOMMIT_RATIO  # restore
 
+    # Monotonicity: more host resources → more VMs
+    small = _make_controller(host_memory_mb=4_000.0, host_cpu_count=4.0)
+    large = _make_controller(host_memory_mb=64_000.0, host_cpu_count=64.0)
+    assert small.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0) < large.effective_max_vms(
+        guest_memory_mb=256, cpu_per_vm=1.0
+    )
 
-def test_effective_max_vms_both_unlimited() -> None:
-    """effective_max_vms returns -1 when both budgets are unlimited."""
-    ctrl = _make_controller(host_memory_mb=16_000.0, host_cpu_count=8.0)
+    # Memory-only: more guest memory → fewer VMs
+    ctrl._cpu_budget = float("inf")
+    mem_small = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
+    mem_big = ctrl.effective_max_vms(guest_memory_mb=1024, cpu_per_vm=1.0)
+    assert 0 < mem_big < mem_small
+    # Guest CPU irrelevant when CPU is unlimited
+    assert ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=4.0) == mem_small
+
+    # CPU-only: more guest CPU → fewer VMs
     ctrl._memory_budget_mb = float("inf")
+    ctrl._cpu_budget = 30.0
+    cpu_light = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0)
+    cpu_heavy = ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=4.0)
+    assert 0 < cpu_heavy < cpu_light
+    # Guest memory irrelevant when memory is unlimited
+    assert ctrl.effective_max_vms(guest_memory_mb=1024, cpu_per_vm=1.0) == cpu_light
+
+    # Both unlimited → sentinel
     ctrl._cpu_budget = float("inf")
     assert ctrl.effective_max_vms(guest_memory_mb=256, cpu_per_vm=1.0) == -1
 

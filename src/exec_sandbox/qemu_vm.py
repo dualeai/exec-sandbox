@@ -5,6 +5,7 @@ code execution, state management, and resource cleanup.
 """
 
 import asyncio
+import base64
 import contextlib
 import json
 import signal
@@ -684,7 +685,6 @@ class QemuVM:
             VmPermanentError: On validation or write failure
             VmTransientError: On timeout or communication failure
         """
-        import base64  # noqa: PLC0415
 
         # Validate path
         if not path:
@@ -787,7 +787,7 @@ class QemuVM:
         finally:
             await self.channel.unregister_op(op_id)
 
-    async def read_file(self, path: str, *, destination: Path) -> None:
+    async def read_file(self, path: str, *, destination: Path | IO[bytes]) -> None:
         """Read a file from the sandbox via streaming zstd-compressed chunks.
 
         Protocol:
@@ -795,24 +795,62 @@ class QemuVM:
         2. Receive FileChunkResponseMessage messages (zstd-compressed)
         3. Receive FileReadCompleteMessage (end of stream)
 
-        Each compressed chunk is decompressed immediately on arrival and
-        written to a temp sibling of *destination* (``<dest>.<op_id>.tmp``).
-        The op_id suffix prevents collisions between concurrent transfers
-        targeting the same destination.  On success the temp file is
-        atomically renamed to *destination*, so readers never see a
-        partial / corrupted file.  On error the temp file is removed.
+        When *destination* is a ``Path``, chunks are written to a temp sibling
+        (``<dest>.<op_id>.tmp``) and atomically renamed on success.
+        When *destination* is an ``IO[bytes]``, chunks are written directly
+        to the buffer at its current position; the caller retains ownership.
+
         Peak memory is bounded by queue depths (OP_QUEUE_DEPTH items x ~200KB),
         not file size.
 
         Args:
             path: Relative path in sandbox (PATH_MAX 4096, NAME_MAX 255 per component)
-            destination: Local file path to stream decompressed content into
+            destination: Local file path or IO[bytes] buffer to stream into
 
         Raises:
             VmPermanentError: On not-found or validation failure
             VmTransientError: On timeout or communication failure
         """
-        import base64  # noqa: PLC0415
+        if isinstance(destination, Path):
+            await self._read_file_to_path(path, destination)
+        else:
+            await self._read_file_to_buffer(path, destination)
+
+    async def _recv_file_chunks(self, path: str, op_id: str, sink: IO[bytes]) -> None:
+        """Connect, send ReadFileRequest, and stream decompressed chunks into *sink*.
+
+        Shared protocol implementation for both Path and IO[bytes] destinations.
+        The caller is responsible for op registration/unregistration and sink lifecycle.
+        """
+        await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+        op_queue = await self.channel.register_op(op_id)
+
+        request = ReadFileRequest(op_id=op_id, path=path)
+        request_bytes = request.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
+        await self.channel.enqueue_raw(request_bytes)
+
+        loop = asyncio.get_running_loop()
+        decompressor = zstd.ZstdDecompressor()
+        while True:
+            msg = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
+
+            if isinstance(msg, FileChunkResponseMessage):
+                # TODO: Binary framing would eliminate this base64 decode overhead (~33% wire bloat)
+                compressed_chunk = base64.b64decode(msg.data)
+                decompressed = decompressor.decompress(compressed_chunk)
+                await loop.run_in_executor(None, sink.write, decompressed)
+            elif isinstance(msg, FileReadCompleteMessage):
+                break
+            elif isinstance(msg, StreamingErrorMessage):
+                raise guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
+            else:
+                raise VmPermanentError(
+                    f"read_file unexpected message type: {type(msg).__name__}",
+                    context={"vm_id": self.vm_id, "path": path},
+                )
+
+    async def _read_file_to_path(self, path: str, destination: Path) -> None:
+        """Stream sandbox file to a local Path with atomic rename."""
 
         op_id = uuid4().hex
         # Temp path scoped by op_id: foo.bin -> foo.bin.<op_id>.tmp
@@ -820,39 +858,14 @@ class QemuVM:
         tmp_dest = destination.with_suffix(f"{destination.suffix}.{op_id}.tmp")
 
         try:
-            await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-            op_queue = await self.channel.register_op(op_id)
-
-            # Send read request
-            request = ReadFileRequest(op_id=op_id, path=path)
-            request_bytes = request.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
-            await self.channel.enqueue_raw(request_bytes)
-
             # Stream decompressed chunks to .tmp file.
             # All disk I/O is offloaded to the thread pool to avoid blocking
             # the event loop (decompressed chunks can be large).
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: destination.parent.mkdir(parents=True, exist_ok=True))
             sink = await loop.run_in_executor(None, tmp_dest.open, "wb")
-            decompressor = zstd.ZstdDecompressor()
             try:
-                while True:
-                    msg = await asyncio.wait_for(op_queue.get(), timeout=constants.FILE_IO_TIMEOUT_SECONDS)
-
-                    if isinstance(msg, FileChunkResponseMessage):
-                        # TODO: Binary framing would eliminate this base64 decode overhead (~33% wire bloat)
-                        compressed_chunk = base64.b64decode(msg.data)
-                        decompressed = decompressor.decompress(compressed_chunk)
-                        await loop.run_in_executor(None, sink.write, decompressed)
-                    elif isinstance(msg, FileReadCompleteMessage):
-                        break
-                    elif isinstance(msg, StreamingErrorMessage):
-                        raise guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
-                    else:
-                        raise VmPermanentError(
-                            f"read_file unexpected message type: {type(msg).__name__}",
-                            context={"vm_id": self.vm_id, "path": path},
-                        )
+                await self._recv_file_chunks(path, op_id, sink)
             finally:
                 await loop.run_in_executor(None, sink.close)
 
@@ -872,6 +885,26 @@ class QemuVM:
         finally:
             # Clean up partial .tmp on any failure (no-op after successful rename)
             tmp_dest.unlink(missing_ok=True)
+            await self.channel.unregister_op(op_id)
+
+    async def _read_file_to_buffer(self, path: str, sink: IO[bytes]) -> None:
+        """Stream sandbox file directly into an IO[bytes] buffer."""
+
+        op_id = uuid4().hex
+
+        try:
+            await self._recv_file_chunks(path, op_id, sink)
+        except TimeoutError as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} read_file timed out for '{path}'",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+        except (OSError, json.JSONDecodeError) as e:
+            raise VmTransientError(
+                f"VM {self.vm_id} read_file communication failed: {e}",
+                context={"vm_id": self.vm_id, "path": path},
+            ) from e
+        finally:
             await self.channel.unregister_op(op_id)
 
     async def list_files(self, path: str = "") -> list[FileInfo]:

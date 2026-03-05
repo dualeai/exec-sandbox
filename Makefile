@@ -157,20 +157,20 @@ lint:
 run_id ?=
 
 ci-status:
-	@uv run scripts/ci_diagnose.py status $(run_id)
+	@uv run --script scripts/ci_diagnose.py status $(run_id)
 
 ci-diagnose:
-	@uv run scripts/ci_diagnose.py diagnose $(run_id)
+	@uv run --script scripts/ci_diagnose.py diagnose $(run_id)
 
 # ============================================================================
 # Benchmarking (concurrent VM latency)
 # ============================================================================
 
 bench:
-	uv run python scripts/benchmark_latency.py -n 10
+	uv run --script scripts/benchmark_latency.py -n 10
 
 bench-pool:
-	uv run python scripts/benchmark_latency.py -n 10 --pool 8
+	uv run --script scripts/benchmark_latency.py -n 10 --pool 8
 
 # 2D overcommit optimizer — finds Pareto-optimal (CPU_OC, MEM_OC) configs.
 # Fires N VMs per combo across a 4x4 grid, ranks by Sharpe-like efficiency
@@ -216,7 +216,7 @@ bench-flamegraph:
 		--rate $(PYSPY_RATE) \
 		--format speedscope \
 		--output $(PYSPY_OUTPUT) \
-		-- uv run python scripts/benchmark_latency.py -n 10
+		-- uv run --script scripts/benchmark_latency.py -n 10
 	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
 	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 
@@ -228,7 +228,7 @@ bench-pool-flamegraph:
 		--rate $(PYSPY_RATE) \
 		--format speedscope \
 		--output $(PYSPY_OUTPUT) \
-		-- uv run python scripts/benchmark_latency.py -n 10 --pool 8
+		-- uv run --script scripts/benchmark_latency.py -n 10 --pool 8
 	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
 	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 
