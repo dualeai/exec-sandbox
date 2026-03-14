@@ -46,6 +46,13 @@ install:
 	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory gvproxy-wrapper install
+	$(MAKE) install-seek
+
+# Code search using seek (trigram index via zoekt, sub-second queries)
+# Usage: seek "pattern" (on PATH via direnv)
+# See: https://github.com/dualeai/seek
+install-seek:
+	@curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
 
 install-deps:
 	uv sync --extra dev --extra s3
