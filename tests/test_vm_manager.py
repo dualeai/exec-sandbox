@@ -1199,7 +1199,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.KVM,
                 True,
                 HostOS.LINUX,
-                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,dump-guest-core=off",
+                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=on,dump-guest-core=off",
                 id="x86-kvm-tsc-linux",
             ),
             pytest.param(
@@ -1207,7 +1207,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.KVM,
                 False,
                 HostOS.LINUX,
-                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off",
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=on,dump-guest-core=off",
                 id="x86-kvm-notsc-linux",
             ),
             pytest.param(
@@ -1223,7 +1223,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.TCG,
                 False,
                 HostOS.LINUX,
-                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,dump-guest-core=off",
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=on,dump-guest-core=off",
                 id="x86-tcg-linux",
             ),
             pytest.param(
@@ -1239,7 +1239,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.KVM,
                 False,
                 HostOS.LINUX,
-                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,dump-guest-core=off",
+                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=on,dump-guest-core=off",
                 id="arm64-kvm-linux",
             ),
             pytest.param(

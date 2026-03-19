@@ -8,10 +8,10 @@ Architecture:
 Performance Optimizations (QEMU 10.0+):
 - CPU host passthrough (KVM): Enables all host CPU features (AVX2, AES-NI)
 - Memory preallocation: Eliminates page fault latency during code execution
-- virtio-blk: 4K blocks, num-queues=1, queue-size=256
+- virtio-blk: 4K blocks, num-queues=1, queue-size=64
 - virtio-net: multiqueue off, TCP offload disabled (simpler for short VMs)
 - Drive tuning: detect-zeroes=unmap, copy-on-read off, werror/rerror explicit
-- Machine: mem-merge off (no KSM), dump-guest-core off
+- Machine: mem-merge on (KSM page dedup, Linux only; off on macOS HVF), dump-guest-core off
 - io_uring AIO: Modern Linux async I/O (probed at startup, threads fallback)
 - cache=unsafe: Safe for ephemeral VMs, major I/O performance boost
 - microvm fast shutdown: -no-reboot + triple-fault for ~1-2s cleanup
@@ -51,6 +51,7 @@ from exec_sandbox.exceptions import (
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.gvproxy import start_gvproxy
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, SnapshotMetadata
 from exec_sandbox.migration_client import MigrationClient
 from exec_sandbox.models import ExposedPort, Language
 from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
@@ -341,6 +342,8 @@ class VmManager:
         expose_ports: list[ExposedPort] | None = None,
         snapshot_drive: Path | None = None,
         retry_profile: constants.RetryProfile = constants.RETRY_USER_FACING,
+        mem_path: str | None = None,
+        mem_path_share: bool = False,
     ) -> AsyncGenerator[QemuVM]:
         """Create a VM, yield it, destroy it on exit.
 
@@ -373,6 +376,8 @@ class VmManager:
             expose_ports=expose_ports,
             snapshot_drive=snapshot_drive,
             retry_profile=retry_profile,
+            mem_path=mem_path,
+            mem_path_share=mem_path_share,
         )
         try:
             yield vm
@@ -393,6 +398,8 @@ class VmManager:
         snapshot_drive: Path | None = None,
         reservation: ResourceReservation | None = None,
         retry_profile: constants.RetryProfile = constants.RETRY_USER_FACING,
+        mem_path: str | None = None,
+        mem_path_share: bool = False,
     ) -> QemuVM:
         """Create and boot QEMU microVM with automatic retry on transient failures.
 
@@ -445,6 +452,8 @@ class VmManager:
                 on_boot_log=on_boot_log,
                 snapshot_drive=snapshot_drive,
                 retry_profile=retry_profile,
+                mem_path=mem_path,
+                mem_path_share=mem_path_share,
             )
 
         async with self.reservation_context(
@@ -463,6 +472,8 @@ class VmManager:
                 on_boot_log=on_boot_log,
                 snapshot_drive=snapshot_drive,
                 retry_profile=retry_profile,
+                mem_path=mem_path,
+                mem_path_share=mem_path_share,
             )
 
     async def _create_vm_with_reservation(
@@ -479,6 +490,8 @@ class VmManager:
         on_boot_log: Callable[[str], None] | None,
         snapshot_drive: Path | None,
         retry_profile: constants.RetryProfile,
+        mem_path: str | None = None,
+        mem_path_share: bool = False,
     ) -> QemuVM:
         """Boot VM with retries. Reservation ownership transfers to the VM on success."""
         async for attempt in AsyncRetrying(
@@ -505,6 +518,8 @@ class VmManager:
                     on_boot_log=on_boot_log,
                     snapshot_drive=snapshot_drive,
                     boot_timeout_seconds=retry_profile.boot_timeout_seconds,
+                    mem_path=mem_path,
+                    mem_path_share=mem_path_share,
                 )
                 # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
                 vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
@@ -779,6 +794,8 @@ class VmManager:
         on_boot_log: Callable[[str], None] | None = None,
         snapshot_drive: Path | None = None,
         boot_timeout_seconds: int = constants.VM_BOOT_TIMEOUT_SECONDS,
+        mem_path: str | None = None,
+        mem_path_share: bool = False,
     ) -> QemuVM:
         """Create and boot QEMU microVM (implementation).
 
@@ -843,6 +860,8 @@ class VmManager:
             direct_write=direct_write_target is not None,
             debug_boot=on_boot_log is not None,
             snapshot_drive=vdb_path,
+            mem_path=mem_path,
+            mem_path_share=mem_path_share,
         )
 
         # Phase 3: Start gvproxy BEFORE QEMU
@@ -1075,6 +1094,17 @@ class VmManager:
         try:
             # Phase 3: Build QEMU command (restore-specific — use guest values for QEMU)
             vdb_path = str(snapshot_drive) if snapshot_drive else None
+            # VM Templating: check metadata to see if save used template mode.
+            # Only use template restore if the save ACTUALLY skipped RAM
+            # (use_template=True in metadata AND vmstate is small).
+            ram_path = MemorySnapshotManager.ram_path_from_vmstate(vmstate_path)
+            meta_path = vmstate_path.with_suffix(".vmstate.meta")
+            use_template = False
+            if ram_path.exists() and meta_path.exists():
+                meta = SnapshotMetadata.from_json(meta_path.read_text())
+                use_template = meta is not None and meta.use_template
+            mem_path_str = str(ram_path) if use_template else None
+
             qemu_cmd = await build_qemu_cmd(
                 self.settings,
                 self.arch,
@@ -1087,6 +1117,8 @@ class VmManager:
                 snapshot_drive=vdb_path,
                 defer_incoming=True,  # VM starts paused, waiting for migration stream
                 qmp_fd=qmp_fd,
+                mem_path=mem_path_str,
+                mem_path_share=False,  # Clone: MAP_PRIVATE (COW)
             )
 
             # Phase 4: Start gvproxy if network topology requires it
@@ -1142,7 +1174,7 @@ class VmManager:
             # Restore VM state via QMP migration (load vmstate → resume vCPU)
             try:
                 async with MigrationClient(vm.qmp_socket, infra.expected_uid) as client:
-                    await client.restore_snapshot(vmstate_path, qemu_version=qemu_version)
+                    await client.restore_snapshot(vmstate_path, qemu_version=qemu_version, use_template=use_template)
             except Exception as e:
                 # Check if QEMU died — provides a more informative error
                 _check_qemu_alive()

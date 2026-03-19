@@ -70,7 +70,7 @@ with open('/sys/block/zram0/comp_algorithm') as f:
     algo = f.read().strip()
     assert '[lz4]' in algo, f'Expected [lz4] active, got: {algo}'
 
-# --- disksize is ~50% of RAM ---
+# --- disksize is ~40% of RAM ---
 with open('/proc/meminfo') as f:
     for line in f:
         if 'MemTotal' in line:
@@ -78,7 +78,7 @@ with open('/proc/meminfo') as f:
             break
 zram_kb = disksize // 1024
 ratio = zram_kb / mem_kb
-assert 0.45 <= ratio <= 0.55, f'zram ratio {ratio:.3f} not ~50%'
+assert 0.35 <= ratio <= 0.45, f'zram ratio {ratio:.3f} not ~40%'
 
 # --- page-cluster=0 (disables swap readahead for compressed swap) ---
 with open('/proc/sys/vm/page-cluster') as f:
@@ -362,10 +362,18 @@ while True:
 
 
 class TestBalloonDevice:
-    """Tests for virtio-balloon device in guest."""
+    """Tests for virtio-balloon device in guest.
+
+    Balloon is only present on cold-boot VMs (anonymous memory).  Template-restored
+    VMs (L1 cache hit) use file-backed COW memory which is incompatible with balloon.
+    """
 
     async def test_balloon_device_and_driver(self, scheduler: Scheduler) -> None:
-        """Balloon device should be visible with correct type (5), bound to a driver, and expose features."""
+        """Balloon device should be visible with correct type (5), bound to a driver, and expose features.
+
+        On L1-restored VMs (template COW), balloon is absent by design — verify
+        that instead.
+        """
         result = await scheduler.run(
             code="""
 import os
@@ -401,14 +409,21 @@ for dev in os.listdir(virtio_path):
 
         break
 
-assert found_balloon, 'Balloon device (type 5) not found in /sys/bus/virtio'
-print('PASS: Balloon device visible and driver functional')
+if found_balloon:
+    print('PASS: Balloon device visible and driver functional')
+else:
+    print('NO_BALLOON: Balloon device absent (expected for template COW VMs)')
 """,
             language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
-        assert "d00000005" in result.stdout
+        if result.l1_cache_hit:
+            # Template-restored VM: balloon absent by design (COW file-backed memory)
+            assert "NO_BALLOON" in result.stdout
+        else:
+            # Cold-boot VM: balloon must be present
+            assert "PASS" in result.stdout
+            assert "d00000005" in result.stdout
 
 
 # ============================================================================

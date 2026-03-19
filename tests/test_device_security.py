@@ -182,8 +182,8 @@ with open('/proc/mounts') as f:
         assert result.exit_code == 0
         assert "usrquota" in result.stdout
 
-    async def test_shm_size_is_half_memtotal(self, dual_scheduler: Scheduler) -> None:
-        """Verify /dev/shm size is ~50% of MemTotal (memory-proportional)."""
+    async def test_shm_size_is_forty_pct_memtotal(self, dual_scheduler: Scheduler) -> None:
+        """Verify /dev/shm size is ~40% of MemTotal (memory-proportional)."""
         code = """\
 import os
 with open('/proc/meminfo') as f:
@@ -192,12 +192,13 @@ with open('/proc/meminfo') as f:
             mem_total_kb = int(line.split()[1])
             break
 page_size = os.sysconf('SC_PAGESIZE')
-half_mem_bytes = (mem_total_kb // 2) * 1024 // page_size * page_size  # page-align
+# 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5, page-aligned
+expected_bytes = (mem_total_kb * 2048 // 5) // page_size * page_size
 s = os.statvfs('/dev/shm')
 shm_bytes = s.f_blocks * s.f_frsize
-print(f'HALF_MEM_BYTES:{half_mem_bytes}')
+print(f'EXPECTED_BYTES:{expected_bytes}')
 print(f'SHM_BYTES:{shm_bytes}')
-print(f'MATCH:{shm_bytes == half_mem_bytes}')
+print(f'MATCH:{shm_bytes == expected_bytes}')
 """
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
@@ -1996,8 +1997,8 @@ with open('/proc/mounts') as f:
         assert result.exit_code == 0
         assert "usrquota" in result.stdout
 
-    async def test_size_is_half_memtotal(self, dual_scheduler: Scheduler) -> None:
-        """Verify /home/user size is ~50% of MemTotal (memory-proportional)."""
+    async def test_size_is_forty_pct_memtotal(self, dual_scheduler: Scheduler) -> None:
+        """Verify /home/user size is ~40% of MemTotal (memory-proportional)."""
         code = """\
 import os
 with open('/proc/meminfo') as f:
@@ -2006,12 +2007,13 @@ with open('/proc/meminfo') as f:
             mem_total_kb = int(line.split()[1])
             break
 page_size = os.sysconf('SC_PAGESIZE')
-half_mem_bytes = (mem_total_kb // 2) * 1024 // page_size * page_size  # page-align
+# 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5, page-aligned
+expected_bytes = (mem_total_kb * 2048 // 5) // page_size * page_size
 s = os.statvfs('/home/user')
 home_bytes = s.f_blocks * s.f_frsize
-print(f'HALF_MEM_BYTES:{half_mem_bytes}')
+print(f'EXPECTED_BYTES:{expected_bytes}')
 print(f'HOME_BYTES:{home_bytes}')
-print(f'MATCH:{home_bytes == half_mem_bytes}')
+print(f'MATCH:{home_bytes == expected_bytes}')
 """
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0

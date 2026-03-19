@@ -8,6 +8,7 @@ import asyncio
 import json
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.assets import get_gvproxy_path
 from exec_sandbox.dns_filter import generate_outbound_allow_json
 from exec_sandbox.exceptions import VmDependencyError, VmGvproxyError
 from exec_sandbox.models import ExposedPort
@@ -113,8 +114,6 @@ async def start_gvproxy(  # noqa: PLR0915
         ) from e
 
     # Start gvproxy-wrapper with pre-bound FD
-    from exec_sandbox.assets import get_gvproxy_path  # noqa: PLC0415
-
     gvproxy_binary = await get_gvproxy_path()
     if gvproxy_binary is None:
         parent_sock.close()

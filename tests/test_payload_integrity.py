@@ -58,7 +58,7 @@ EXTRA_LARGE_TIMEOUT_SECONDS = 300
 # Throughput thresholds (MiB/s) - CI runners have variable I/O performance,
 # so we use low thresholds to catch severe regressions only
 MIN_THROUGHPUT_DEVZERO_MIBPS = 1  # /dev/zero throughput (local: ~20+, CI: ~2)
-MIN_THROUGHPUT_URANDOM_MIBPS = 1  # /dev/urandom throughput (local: ~15+, CI: ~3)
+MIN_THROUGHPUT_URANDOM_MIBPS = 0.5  # /dev/urandom throughput (local: ~15+, CI: ~0.8-3)
 
 
 @pytest.fixture(params=list(PAYLOAD_SIZES.keys()))

@@ -40,6 +40,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     snapshot_drive: str | None = None,
     defer_incoming: bool = False,
     qmp_fd: int | None = None,
+    mem_path: str | None = None,
+    mem_path_share: bool = False,
 ) -> list[str]:
     """Build QEMU command for microVM execution.
 
@@ -70,6 +72,13 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + ``-mon chardev=qmp0,mode=control`` instead of ``-qmp`` shorthand
             (which does not support ``fd=``). None (default) uses the legacy
             path-based ``-qmp`` syntax.
+        mem_path: Path to file-backed RAM for VM Templating (COW sharing).
+            Template save uses share=on (QEMU writes RAM to file).
+            Template restore uses share=off (MAP_PRIVATE = COW from file).
+            None (default) uses anonymous memory (standard mode).
+        mem_path_share: When True, memory-backend-file uses share=on (template
+            save). When False, uses share=off,readonly=on,rom=off (clone restore,
+            MAP_PRIVATE COW). Only meaningful when mem_path is set.
 
     Returns:
         QEMU command as list of strings
@@ -137,10 +146,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         #   (not PCI), so MSI-X translation is unused; skips kernel ITS init (1-3ms)
         # dtb-randomness=off: Skip writing random seeds to DTB — redundant with
         #   random.trust_cpu=on in kernel cmdline
+        # mem-merge: KSM page dedup (Linux only; macOS HVF does not support it)
+        mem_merge = "off" if is_macos else "on"
         machine_type = (
-            "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off"
+            f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge}"
             if is_macos
-            else "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,dump-guest-core=off"
+            else f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge},dump-guest-core=off"
         )
     else:
         arch_suffix = "x86_64"
@@ -174,10 +185,32 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         parts = ["microvm", "acpi=off", "x-option-roms=off"]
         if tsc_available:
             parts.extend(["pit=off", "pic=off", "rtc=off"])
-        parts.extend(["isa-serial=off", "mem-merge=off"])
+        # mem-merge: KSM page dedup (Linux only; macOS HVF does not support it)
+        parts.extend(["isa-serial=off", f"mem-merge={'off' if is_macos else 'on'}"])
         if not is_macos:
             parts.append("dump-guest-core=off")
         machine_type = ",".join(parts)
+
+    # VM Templating: file-backed memory for COW sharing across VMs.
+    # When mem_path is set, use memory-backend-file instead of anonymous RAM.
+    # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED).
+    # Template restore: share=off,readonly=on,rom=off (MAP_PRIVATE = COW).
+    # Ref: https://www.qemu.org/docs/master/system/vm-templating.html
+    mem_backend_args: list[str] = []
+    if mem_path is not None:
+        if mem_path_share:
+            # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED)
+            backend_opts = f"memory-backend-file,id=mem0,size={int(memory_mb)}M,mem-path={mem_path},share=on"
+        else:
+            # Template restore: share=off (MAP_PRIVATE = COW), readonly=on (open
+            # file O_RDONLY for safety), rom=off (don't mark memory as ROM — guest
+            # must be able to write).
+            # Ref: https://www.qemu.org/docs/master/system/vm-templating.html
+            backend_opts = (
+                f"memory-backend-file,id=mem0,size={int(memory_mb)}M,mem-path={mem_path},share=off,readonly=on,rom=off"
+            )
+        mem_backend_args = ["-object", backend_opts]
+        machine_type += ",memory-backend=mem0"
 
     # Auto-discover kernel and initramfs based on architecture
     # Note: existence validated in create_vm() before calling this method
@@ -261,6 +294,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 if arch == HostArch.AARCH64
                 else "SapphireRapids-v2"
             ),
+            *mem_backend_args,  # Empty for anonymous RAM, or -object memory-backend-file for COW
             "-M",
             machine_type,
             "-no-reboot",
@@ -280,12 +314,16 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # config (exec-sandbox.config). Only params with NO CONFIG equivalent
             # remain here. See exec-sandbox.config for the full CONFIG↔cmdline map.
             #
-            # Removed (enforced by CONFIG): init_on_alloc, init_on_free,
+            # Removed (enforced by CONFIG): init_on_free,
             #   scsi_mod.scan, audit, slab_nomerge, nomodule, preempt,
             #   noresume, raid, numa_balancing, i8042.*, random.trust_cpu,
             #   panic, rcupdate.rcu_expedited, edd, noautogroup, io_delay
             # =============================================================
             f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            # Disable page zeroing on alloc — KVM provides zero pages via shared zero
+            # page, so guest-side zeroing is redundant for ephemeral VMs. Overrides
+            # CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y at runtime. Saves 5-10% page faults.
+            + " init_on_alloc=0"
             # THP: CONFIG_TRANSPARENT_HUGEPAGE=y enables EROFS large folios
             # (16-64KB per fault instead of 4KB), but transparent_hugepage=never
             # disables anonymous 2MB hugepages (no khugepaged, no compaction stalls).
@@ -436,13 +474,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # rootfs drive, regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates
     # virtio devices in reverse declaration order, so /dev/vda != first -device on ARM.
     # D2: event_idx=off reduces interrupt coalescing overhead during boot.
-    # queue-size=256: tested at 128 vs 256 during cold-start investigation (session 4);
-    # no measurable wall-time difference on HVF (bottleneck is Mach kernel, not queue
-    # depth). Kept at 256 as a reasonable setting for throughput workloads.
+    qs = constants.VIRTIO_QUEUE_SIZE
     qemu_args.extend(
         [
             "-device",
-            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size=256,event_idx=off",
+            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size={qs},event_idx=off",
         ]
     )
 
@@ -469,7 +505,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         qemu_args.extend(
             [
                 "-device",
-                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size=256,event_idx=off",
+                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size={qs},event_idx=off",
             ]
         )
 
@@ -538,16 +574,22 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # virtio-balloon for host memory efficiency (deflate/inflate for warm pool)
-    # - deflate-on-oom: guest returns memory under OOM pressure
-    # - free-page-reporting: proactive free page hints to host (QEMU 5.1+/kernel 5.7+)
-    #   Disabled permanently to avoid kernel page scanning overhead (10-20ms)
-    qemu_args.extend(
-        [
-            "-device",
-            f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=off",
-        ]
-    )
+    # virtio-balloon for host memory efficiency (deflate/inflate for warm pool).
+    # Disabled for ALL template VMs (save AND restore):
+    #   1. Device topology must match between save and restore — QEMU migration
+    #      fails with "Unknown section" if one side has balloon and the other doesn't.
+    #   2. VM Templating docs state: "virtio-balloon inflation and free page reporting
+    #      cannot discard VM RAM and will repeatedly report errors [...] free page
+    #      reporting should be disabled and the balloon should not be inflated."
+    #      Ref: https://www.qemu.org/docs/master/system/vm-templating.html
+    # Template VMs rely on COW page sharing instead of ballooning.
+    if mem_path is None:
+        qemu_args.extend(
+            [
+                "-device",
+                f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=on",
+            ]
+        )
 
     # virtio-rng: continuous host→guest entropy via /dev/urandom backend.
     # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh

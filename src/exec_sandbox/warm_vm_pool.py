@@ -12,7 +12,7 @@ Architecture:
 Performance:
 - Default image (packages=[]): 1-2ms allocation (vs 400ms cold boot)
 - Custom packages: Fallback to cold boot (no change)
-- Memory overhead: ~160MB idle (balloon inflated) / ~192MB active per VM
+- Memory overhead: ~140MB idle (balloon inflated) / ~192MB active per VM
 
 L2 Disk Snapshots:
 - Uses L2 cache (local qcow2) for faster warm pool boots
@@ -21,7 +21,7 @@ L2 Disk Snapshots:
 Memory Optimization (Balloon):
 - Idle pool VMs have balloon inflated (guest has BALLOON_INFLATE_TARGET_MB)
 - Before execution, balloon deflates (guest gets full memory back)
-- Reduces idle memory per VM (160MB idle vs 192MB active)
+- Reduces idle memory per VM (140MB idle vs 192MB active)
 
 Example:
     ```python
@@ -51,7 +51,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from exec_sandbox import constants
+from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.balloon_client import BalloonClient, BalloonError
 from exec_sandbox.exceptions import SocketAuthError
@@ -279,8 +279,10 @@ class WarmVMPool:
             # Non-blocking get (raises QueueEmpty if pool exhausted)
             vm = self.pools[language].get_nowait()
 
-            # Deflate balloon to restore memory before code execution
-            await self._deflate_balloon(vm)
+            # Deflate balloon to restore memory before code execution.
+            # Skip for L1-restored VMs: no balloon device (COW file-backed memory).
+            if not vm.l1_restored:
+                await self._deflate_balloon(vm)
 
             logger.debug(
                 "Warm VM allocated",
@@ -441,8 +443,17 @@ class WarmVMPool:
                             if not vm.l1_restored:
                                 await self._warm_repl(vm, language)
 
-            # Inflate balloon to reduce idle memory footprint
-            await self._inflate_balloon(vm)
+            # Inflate balloon to reduce idle memory footprint.
+            # Skip for L1-restored VMs: they use file-backed MAP_PRIVATE memory
+            # (COW template), which is incompatible with balloon (no virtio-balloon
+            # device — balloon MADV_DONTNEED on MAP_PRIVATE pages causes data loss).
+            if not vm.l1_restored:
+                await self._inflate_balloon(vm)
+
+                # Proactively compress remaining anonymous pages into zswap (Linux 6.1+).
+                # After balloon inflation, the guest has ~140MB but most is idle kernel/
+                # runtime pages.  memory.reclaim compresses them, dropping host RSS further.
+                await cgroup.reclaim_memory(vm.cgroup_path)
 
             await self.pools[language].put(vm)
             logger.info(

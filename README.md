@@ -362,7 +362,7 @@ async with Scheduler(config) as scheduler:
 | `s3_region` | us-east-1 | AWS region |
 | `s3_prefix` | snapshots/ | Prefix for S3 keys |
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
-| `memory_overcommit_ratio` | 8.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
+| `memory_overcommit_ratio` | 5.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
 | `cpu_overcommit_ratio` | 2.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
 | `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
 | `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
@@ -377,19 +377,21 @@ Measured on a 16-vCPU / 32 GB EC2 instance (Intel Xeon 6975P, KVM, Debian 13) us
 
 ### Concurrent Throughput
 
-500 VMs per config, 16 overcommit combos. **Admission** = queue wait, **Setup** = overlay + cgroup, **Exec** = VM boot + code run:
+250 VMs per config, 16 overcommit combos. **Admission** = queue wait, **Setup** = overlay + cgroup, **Exec** = VM boot + code run:
 
 | Config | VMs/s | Admit p50/p95 | Setup p50/p95 | Exec p50/p95 | Total p50/p95 | Peak RSS | Efficiency |
 |--------|-------|---------------|---------------|--------------|---------------|----------|------------|
-| CPU=2x MEM=8x (default) | **39.0** | 5.7s / 11.0s | 344ms / 921ms | 57ms / 71ms | **6.3s / 11.5s** | 2.2 GB (7.0%) | 1116 |
-| CPU=2x MEM=3x | 39.0 | 5.8s / 11.0s | 367ms / 938ms | 57ms / 71ms | 6.3s / 11.5s | 2.6 GB (8.1%) | 1110 |
-| CPU=4x MEM=5x | 39.1 | 5.2s / 10.3s | 902ms / 1.4s | 63ms / 103ms | 6.3s / 11.4s | 5.8 GB (18.4%) | 867 |
-| CPU=8x MEM=3x | 37.1 | 5.3s / 10.5s | 1.7s / 2.5s | 100ms / 370ms | 7.4s / 12.0s | 10.2 GB (32.4%) | 470 |
-| CPU=12x MEM=8x | 27.8 | 8.4s / 14.8s | 2.6s / 7.1s | 182ms / 587ms | 12.1s / 15.6s | 16.9 GB (53.6%) | 253 |
+| CPU=2x MEM=5x (default) | **66.8** | 1.5s / 3.0s | 83ms / 160ms | 132ms / 188ms | **1.8s / 3.3s** | 1.1 GB (3.4%) | 2223 |
+| CPU=2x MEM=3x | 66.7 | 1.5s / 3.0s | 84ms / 163ms | 134ms / 193ms | 1.8s / 3.3s | 1.0 GB (3.2%) | 2201 |
+| CPU=4x MEM=5x | 63.9 | 1.4s / 2.7s | 221ms / 719ms | 170ms / 336ms | 1.9s / 3.2s | 1.9 GB (5.9%) | 1159 |
+| CPU=8x MEM=5x | 47.8 | 1.4s / 2.6s | 505ms / 768ms | 296ms / 783ms | 2.6s / 3.5s | 3.9 GB (12.4%) | 857 |
+| CPU=12x MEM=1.5x | 4.0 | 0s / 17.1s | 12.9s / 31.1s | 1.9s / 37.8s | 50.9s / 52.8s | 11.6 GB (36.9%) | 37 |
 
-Exec latency is only 57ms p50 at the optimal config — admission dominates under burst load. **Efficiency** = 10⁶ / geomean(admission, setup, exec) p95; higher is better. Beyond CPU=2x, setup and exec degrade sharply while throughput stays flat. 13/16 configs achieved 100% success (7,995/8,000 VMs).
+Exec latency is only 132ms p50 at the optimal config — admission dominates under burst load. **Efficiency** = 10⁶ / geomean(admission, setup, exec) p95; higher is better. 13/16 configs achieved 100% success (3,151/4,000 VMs).
 
-> **Production sizing.** The 11s admission p95 is specific to this stress test (500 VMs on 24 slots). When `concurrent_requests ≤ max_slots`, admission is **0ms**. Scale horizontally — add hosts so that `max_slots ≥ peak_concurrency`, don't increase overcommit.
+> **Production sizing.** The 3s admission p95 is specific to this stress test (250 VMs on ~24 slots). When `concurrent_requests ≤ max_slots`, admission is **0ms**. Scale horizontally — add hosts so that `max_slots ≥ peak_concurrency`, don't increase overcommit.
+>
+> **Local/desktop tuning.** The defaults (CPU=2x, MEM=5x) were optimized via RBF surrogate on production KVM hosts. On a desktop (macOS HVF or fewer cores), run `make bench-optimizer` to find the optimal values for your hardware.
 
 ### Single VM Latency
 
@@ -406,7 +408,7 @@ Re-run the optimizer after changing VM sizing, admission logic, or target hardwa
 
 ```bash
 make bench-optimizer              # 200 VMs per combo (4x4 grid = 16 combos)
-make bench-optimizer N_VMS=500    # heavier load
+make bench-optimizer N_VMS=250    # heavier load (recommended for tuning)
 ```
 
 ## Memory Optimization
@@ -414,7 +416,7 @@ make bench-optimizer N_VMS=500    # heavier load
 VMs include automatic memory optimization (no configuration required):
 
 - **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
-- **Memory reclamation (virtio-balloon)** - Reclaims unused guest pages on idle warm-pool VMs (192→160 MB default), reducing host memory pressure
+- **Memory reclamation (virtio-balloon)** - Reclaims unused guest pages on idle warm-pool VMs (192→140 MB default), reducing host memory pressure
 
 ### Memory Architecture
 
@@ -425,17 +427,45 @@ Guest RAM (default 192 MB)
 ├── Kernel + slab caches     (~20 MB fixed)
 ├── Userspace (code execution) (variable)
 ├── tmpfs mounts (on demand, per-UID quota)
-│   ├── /home/user           50% of RAM — user files, packages
+│   ├── /home/user           40% of RAM — user files, packages
 │   ├── /tmp                 50% of RAM — pip/uv wheel builds, temp files
-│   └── /dev/shm             50% of RAM — POSIX shared memory
-└── zram compressed swap     (~25% effective bonus)
+│   └── /dev/shm             40% of RAM — POSIX shared memory
+└── zram compressed swap     (40% disksize, 20% mem_limit)
 ```
 
 | Mount | Size | Purpose |
 |---|---|---|
-| `/home/user` | 50% of RAM | Writable home dir — installed packages, user scripts, data files |
+| `/home/user` | 40% of RAM | Writable home dir — installed packages, user scripts, data files |
 | `/tmp` | 50% of RAM | Scratch space for package managers (wheel builds), temp files |
-| `/dev/shm` | 50% of RAM | POSIX shared memory segments (Python multiprocessing semaphores) |
+| `/dev/shm` | 40% of RAM | POSIX shared memory segments (Python multiprocessing semaphores) |
+
+## Design Trade-offs
+
+Optimized for AI agent workloads: long-lived but mostly idle sessions, high concurrency, untrusted code.
+
+### Why QEMU over alternatives
+
+| Approach | Trade-off |
+|----------|-----------|
+| **Containers** (Docker, K8s pods) | Shared host kernel — container escapes are a proven, recurring class: [CVE-2019-5736](https://nvd.nist.gov/vuln/detail/CVE-2019-5736) (runc), [CVE-2024-21626](https://nvd.nist.gov/vuln/detail/CVE-2024-21626) (runc "Leaky Vessels"), [CVE-2022-0185](https://nvd.nist.gov/vuln/detail/CVE-2022-0185) (user namespace). VMs run their own kernel, eliminating this class. Remaining surface is the [hypervisor device model](https://venom.crowdstrike.com/) |
+| **gVisor** | User-space kernel ([Sentry](https://gvisor.dev/docs/architecture_guide/security/)), not a hardware boundary. A Sentry bug exposes the host. Incomplete syscall coverage breaks some workloads |
+| **Firecracker** | Genuine VM isolation (powers AWS Lambda, [E2B](https://e2b.dev)). But [requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) — no macOS, no software emulation fallback. Many cloud VMs and containerized environments don't expose nested virtualization |
+| **Cloud sandboxes** | Data leaves your network. Per-execution pricing. Vendor lock-in |
+| **Namespace isolation** (Bubblewrap, nsjail) | No hardware boundary — host kernel processes all syscalls directly |
+
+QEMU/KVM: [in the Linux kernel since 2007](https://kernelnewbies.org/Linux_2_6_20), powers [Google Cloud](https://cloud.google.com/blog/products/gcp/7-ways-we-harden-our-kvm-hypervisor-at-google-cloud-security-in-plaintext) and [AWS Nitro](https://perspectives.mvdirona.com/2019/02/aws-nitro-system/). exec-sandbox uses KVM on Linux, HVF on macOS, and falls back to software emulation (TCG) when neither is available — deploy on bare metal, cloud VMs, or inside containers without nested virtualization. The trade-off is complexity: cross-platform support (KVM/HVF/TCG × x86_64/aarch64) requires careful engineering.
+
+### Optimized for sandbox density, not raw performance
+
+AI agent sandboxes are long-lived (hours) but mostly idle — typical code bursts every 30s to 5 min, each lasting seconds. **Sandbox density** (VMs per GB) matters more than per-VM performance.
+
+Memory optimizations maximize VMs per host: COW template memory (x-ignore-shared VM templating — L1 snapshots save 350KB device state, restored VMs share RAM pages via MAP_PRIVATE), free page reporting, KSM page dedup (Linux), cgroup memory.reclaim, zram compression, and virtio-balloon reclamation. Trade-off: template VMs cannot use balloon (incompatible with file-backed COW); cold-boot VMs retain balloon.
+
+### Why not Kubernetes for sandbox orchestration
+
+Kubernetes targets long-running services, not high-churn ephemeral workloads. At scale, pod lifecycle hits [etcd throughput](https://etcd.io/docs/v3.5/op-guide/performance/), [scheduler limits (~100-200 pods/s)](https://github.com/kubernetes/community/blob/master/sig-scalability/slos/slos.md), and [cluster ceiling (~150k pods)](https://kubernetes.io/docs/setup/best-practices/cluster-large/). [Knative](https://knative.dev/) and [agent-sandbox](https://agent-sandbox.sigs.k8s.io/) help, but each sandbox still pays the full pod lifecycle cost with multiple etcd writes per transition.
+
+exec-sandbox manages VMs directly as processes — no orchestration layer. A single host sustains [39 VMs/s](#concurrent-throughput) with sub-second setup.
 
 ## Snapshot Caching Architecture
 
@@ -635,7 +665,7 @@ async with await scheduler.session(language="python") as session:
 | Layer | Technology | Protection |
 |-------|------------|------------|
 | 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
-| 2 | Custom hardened kernel | Modules disabled at compile time, io_uring compiled out, slab/memory hardening, ~360+ subsystems removed |
+| 2 | Custom hardened kernel | Modules disabled at compile time, [io_uring](https://security.googleblog.com/2023/06/learnings-from-kctf-vrps-42-linux.html) and eBPF compiled out, slab/memory hardening, ~360+ subsystems removed |
 | 3 | Unprivileged QEMU | No root privileges, minimal exposure |
 | 4 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
 | 5 | System call filtering (seccomp) | Blocks unauthorized OS calls |

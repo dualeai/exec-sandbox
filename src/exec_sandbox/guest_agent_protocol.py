@@ -12,7 +12,14 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
+from exec_sandbox.constants import (
+    ENV_VAR_FORBIDDEN_CONTROL_CHARS,
+    MAX_CODE_SIZE,
+    MAX_ENV_VAR_NAME_LENGTH,
+    MAX_ENV_VAR_VALUE_LENGTH,
+    MAX_ENV_VARS,
+    MAX_FILE_PATH_LENGTH,
+)
 from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
 
 # ============================================================================
@@ -80,13 +87,6 @@ class ExecuteCodeRequest(GuestAgentRequest):
         Security: Rejects control characters to prevent terminal escape injection,
         log injection, and protocol manipulation attacks.
         """
-        from exec_sandbox.constants import (  # noqa: PLC0415
-            ENV_VAR_FORBIDDEN_CONTROL_CHARS,
-            MAX_ENV_VAR_NAME_LENGTH,
-            MAX_ENV_VAR_VALUE_LENGTH,
-            MAX_ENV_VARS,
-        )
-
         if len(v) > MAX_ENV_VARS:
             raise ValueError(f"Too many environment variables: {len(v)} (max {MAX_ENV_VARS})")
 

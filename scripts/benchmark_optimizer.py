@@ -20,9 +20,8 @@ latency efficiency score (10^6 / geometric mean of the three p95s, per
 Fleming & Wallace 1986 / SPEC convention), and fits an RBF surrogate
 surface via scipy to predict the optimal beyond the sampled grid.
 
-The sweep results inform the defaults in constants.py:
-  DEFAULT_CPU_OVERCOMMIT_RATIO = 2.0
-  DEFAULT_MEMORY_OVERCOMMIT_RATIO = 8.0
+The sweep results inform the defaults in constants.py
+(DEFAULT_CPU_OVERCOMMIT_RATIO, DEFAULT_MEMORY_OVERCOMMIT_RATIO).
 
 Re-run after changing VM sizing, admission logic, or target hardware:
     make bench-optimizer              # 200 VMs per combo (default)
@@ -51,6 +50,7 @@ from scipy.optimize import minimize  # type: ignore[reportMissingImports]
 
 from exec_sandbox import Scheduler, SchedulerConfig
 from exec_sandbox._logging import configure_logging
+from exec_sandbox.constants import DEFAULT_CPU_OVERCOMMIT_RATIO, DEFAULT_MEMORY_OVERCOMMIT_RATIO
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
@@ -171,12 +171,16 @@ class BurstResult:
 
         Formula: efficiency = 10^6 / (admission * setup * exec)^(1/3)
 
-        Higher is better.  Returns NaN when any p95 is zero (degenerate
-        burst with no successful VMs).
+        Higher is better.  When admission_p95 is 0 (no queueing), uses
+        only setup and exec for a 2D geomean.  Returns NaN only when both
+        setup and exec are zero (degenerate burst with no successful VMs).
         """
         a, s, e = self.admission_p95_ms, self.setup_p95_ms, self.exec_p95_ms
-        if a <= 0 or s <= 0 or e <= 0:
+        if s <= 0 or e <= 0:
             return float("nan")
+        if a <= 0:
+            # No admission queueing — use 2D geomean of setup and exec
+            return 1_000_000 / (s * e) ** (1 / 2)
         return 1_000_000 / (a * s * e) ** (1 / 3)
 
 
@@ -503,7 +507,11 @@ def _surrogate_analysis(results: list[BurstResult]) -> None:
     coords = np.array([[r.cpu_oc, r.mem_oc] for r in valid])  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
     values = np.array([r.efficiency for r in valid])  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
-    rbf = RBFInterpolator(coords, values, kernel="thin_plate_spline")  # type: ignore[reportUnknownVariableType]
+    try:
+        rbf = RBFInterpolator(coords, values, kernel="thin_plate_spline")  # type: ignore[reportUnknownVariableType]
+    except np.linalg.LinAlgError:  # type: ignore[reportUnknownMemberType]
+        print(f"\n  (surrogate: singular matrix with {len(valid)} points — data may be collinear, skipping)")
+        return
 
     # Search bounds from grid extremes
     cpu_lo = float(coords[:, 0].min())  # type: ignore[reportUnknownMemberType]
@@ -579,6 +587,7 @@ async def main() -> int:
     print(f"  2D OVERCOMMIT SWEEP: {len(combos)} combos x {n_vms} VMs each")
     print(f"  CPU_OC = {SWEEP_CPU_OC}")
     print(f"  MEM_OC = {SWEEP_MEM_OC}")
+    print(f"  Current defaults: CPU={DEFAULT_CPU_OVERCOMMIT_RATIO}x, MEM={DEFAULT_MEMORY_OVERCOMMIT_RATIO}x")
     print("=" * 80)
 
     all_results: list[BurstResult] = []

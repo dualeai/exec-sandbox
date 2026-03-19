@@ -23,6 +23,7 @@ import asyncio
 import errno
 import hashlib
 import json
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 from exec_sandbox import __version__, constants
@@ -61,6 +62,63 @@ def _sha256_file(path: Path) -> str:
     return sha256.hexdigest()
 
 
+@dataclass(frozen=True)
+class SnapshotMetadata:
+    """Typed L1 memory snapshot metadata sidecar.
+
+    Serialized to JSON alongside the vmstate file.  All fields that affect
+    VM state compatibility are included so stale cache entries are detected.
+    """
+
+    qemu_version: list[int] | None
+    arch: str
+    accel: str
+    memory_mb: int
+    cpu_cores: int
+    language: str
+    packages: list[str]
+    allow_network: bool
+    exec_sandbox_version: str
+    vmstate_sha256: str
+    vmstate_size: int
+    use_template: bool = False
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, text: str) -> SnapshotMetadata | None:
+        """Parse JSON text into SnapshotMetadata, or None on failure."""
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return cls._from_dict(parsed)  # type: ignore[arg-type]  # json.loads returns Any
+
+    @staticmethod
+    def _from_dict(d: dict[str, object]) -> SnapshotMetadata | None:  # type: ignore[override]
+        """Construct from a typed dict. Separate method to isolate Any boundary."""
+        try:
+            return SnapshotMetadata(
+                qemu_version=list(d["qemu_version"]) if d.get("qemu_version") else None,  # type: ignore[arg-type]
+                arch=str(d.get("arch", "")),
+                accel=str(d.get("accel", "")),
+                memory_mb=int(d.get("memory_mb", 0)),  # type: ignore[arg-type]
+                cpu_cores=int(d.get("cpu_cores", 0)),  # type: ignore[arg-type]
+                language=str(d.get("language", "")),
+                packages=list(d.get("packages", [])),  # type: ignore[arg-type]
+                allow_network=bool(d.get("allow_network", False)),
+                exec_sandbox_version=str(d.get("exec_sandbox_version", "")),
+                vmstate_sha256=str(d.get("vmstate_sha256", "")),
+                vmstate_size=int(d.get("vmstate_size", 0)),  # type: ignore[arg-type]
+                use_template=bool(d.get("use_template", False)),
+            )
+        except (TypeError, KeyError, ValueError):
+            return None
+
+
 class MemorySnapshotManager(BaseCacheManager):
     """L1 memory snapshot cache. Manages vmstate files + metadata sidecars.
 
@@ -70,7 +128,7 @@ class MemorySnapshotManager(BaseCacheManager):
     """
 
     _cache_ext: ClassVar[str] = ".vmstate"
-    _sidecar_exts: ClassVar[tuple[str, ...]] = (".vmstate.meta",)
+    _sidecar_exts: ClassVar[tuple[str, ...]] = (".vmstate.meta", ".ram")
 
     def __init__(
         self,
@@ -90,6 +148,17 @@ class MemorySnapshotManager(BaseCacheManager):
         """Return (vmstate_path, meta_path) for a given cache key."""
         vmstate_path = self._cache_path(key)
         return (vmstate_path, vmstate_path.with_suffix(".vmstate.meta"))
+
+    @staticmethod
+    def ram_path_from_vmstate(vmstate_path: Path) -> Path:
+        """Derive RAM template file path from vmstate path.
+
+        The RAM file is a sibling of the vmstate with ``.ram`` extension.
+        Used by vm_manager to pass mem_path to build_qemu_cmd for COW restore.
+        """
+        # vmstate_path = /cache/l1-python-v1.2-abcd1234.vmstate
+        # ram_path     = /cache/l1-python-v1.2-abcd1234.ram
+        return vmstate_path.with_suffix(".ram")
 
     async def compute_cache_key(
         self,
@@ -173,32 +242,37 @@ class MemorySnapshotManager(BaseCacheManager):
         except OSError:
             return None
 
-        # Validate metadata sidecar parses and verify vmstate integrity
+        # Validate metadata sidecar parses into typed structure
         try:
-            meta_text = meta_path.read_text()
-            meta = json.loads(meta_text)
-        except (OSError, json.JSONDecodeError):
+            meta = SnapshotMetadata.from_json(meta_path.read_text())
+        except OSError:
+            meta = None
+        if meta is None:
             logger.warning("L1 cache metadata invalid, removing", extra={"key": key})
             vmstate_path.unlink(missing_ok=True)
             meta_path.unlink(missing_ok=True)
             return None
 
-        # Verify vmstate SHA-256 integrity (if hash present in metadata)
-        expected_sha256: str | None = None
-        if isinstance(meta, dict):
-            val = meta.get("vmstate_sha256")  # type: ignore[union-attr]
-            if isinstance(val, str):
-                expected_sha256 = val
-        if expected_sha256:
+        # Verify vmstate SHA-256 integrity
+        if meta.vmstate_sha256:
             try:
                 actual_sha256 = await asyncio.to_thread(_sha256_file, vmstate_path)
-                if actual_sha256 != expected_sha256:
+                if actual_sha256 != meta.vmstate_sha256:
                     logger.warning("L1 cache vmstate integrity check failed, removing", extra={"key": key})
                     vmstate_path.unlink(missing_ok=True)
                     meta_path.unlink(missing_ok=True)
                     return None
             except OSError:
                 logger.warning("L1 cache vmstate unreadable during integrity check, removing", extra={"key": key})
+                vmstate_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                return None
+
+        # Validate RAM template file exists (for v3+ template format)
+        if meta.use_template:
+            ram_path = self.ram_path_from_vmstate(vmstate_path)
+            if not ram_path.exists():
+                logger.warning("L1 cache RAM template missing, removing", extra={"key": key})
                 vmstate_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
                 return None
@@ -281,29 +355,45 @@ class MemorySnapshotManager(BaseCacheManager):
                 tmp_path.touch()
                 await grant_qemu_vm_file_access(tmp_path, writable=True)
 
+            # VM Templating: with x-ignore-shared, migration saves only device
+            # state (~340KB).  RAM stays in the memory-backend-file (share=on).
+            # Only enable if the VM was started with file-backed memory (mem_path
+            # passed to ephemeral_vm), indicated by the .ram file existing.
+            ram_path = self.ram_path_from_vmstate(vmstate_path)
+            use_template = (
+                ram_path.exists()
+                and qemu_version is not None
+                and qemu_version >= constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
+            )
             async with MigrationClient(vm.qmp_socket, expected_uid) as client:
-                await client.save_snapshot(tmp_path, qemu_version=qemu_version)
+                await client.save_snapshot(tmp_path, qemu_version=qemu_version, use_template=use_template)
+
+            # Verify RAM template file still exists after save
+            if use_template and not ram_path.exists():
+                logger.warning("RAM template file not created by QEMU", extra={"ram_path": str(ram_path)})
+                use_template = False  # Fall back to full vmstate
 
             # Compute SHA-256 of vmstate for integrity verification on restore.
             vmstate_sha256 = await asyncio.to_thread(_sha256_file, tmp_path)
 
-            # Write metadata sidecar before atomic rename
+            # Write typed metadata sidecar before atomic rename
             arch = detect_host_arch()
             accel_type = await detect_accel_type(force_emulation=self.settings.force_emulation)
-            meta = {
-                "qemu_version": list(qemu_version) if qemu_version else None,
-                "arch": arch.name,
-                "accel": accel_type.value,
-                "memory_mb": memory_mb,
-                "cpu_cores": cpu_cores,
-                "language": language.value,
-                "packages": sorted(packages),
-                "allow_network": allow_network,
-                "exec_sandbox_version": __version__,
-                "vmstate_sha256": vmstate_sha256,
-                "vmstate_size": tmp_path.stat().st_size,
-            }
-            meta_path.write_text(json.dumps(meta))
+            meta = SnapshotMetadata(
+                qemu_version=list(qemu_version) if qemu_version else None,
+                arch=arch.name,
+                accel=accel_type.value,
+                memory_mb=memory_mb,
+                cpu_cores=cpu_cores,
+                language=language.value,
+                packages=sorted(packages),
+                allow_network=allow_network,
+                exec_sandbox_version=__version__,
+                vmstate_sha256=vmstate_sha256,
+                vmstate_size=tmp_path.stat().st_size,
+                use_template=use_template,
+            )
+            meta_path.write_text(meta.to_json())
 
             # Atomic commit: rename is atomic on POSIX
             tmp_path.rename(vmstate_path)
@@ -316,11 +406,13 @@ class MemorySnapshotManager(BaseCacheManager):
             return vmstate_path
 
         except OSError as e:
+            ram_path = self.ram_path_from_vmstate(vmstate_path)
             if e.errno == errno.ENOSPC:
                 # Disk full — evict oldest and retry once
                 tmp_path.unlink(missing_ok=True)
                 vmstate_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
+                ram_path.unlink(missing_ok=True)
                 await self._evict_oldest_snapshot()
                 logger.info("L1 evicted oldest on ENOSPC, will retry on next request", extra={"key": key})
                 return None
@@ -337,6 +429,7 @@ class MemorySnapshotManager(BaseCacheManager):
         except BaseException as e:
             # Catch BaseException (not just Exception) to handle CancelledError too.
             # Prevents orphaned partial files on SIGTERM / task cancellation.
+            ram_path_cleanup = self.ram_path_from_vmstate(vmstate_path)
             if not isinstance(e, Exception):
                 logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
             else:
@@ -348,6 +441,7 @@ class MemorySnapshotManager(BaseCacheManager):
             tmp_path.unlink(missing_ok=True)
             vmstate_path.unlink(missing_ok=True)
             meta_path.unlink(missing_ok=True)
+            ram_path_cleanup.unlink(missing_ok=True)
             if isinstance(e, Exception):
                 return None
             raise
@@ -395,6 +489,13 @@ class MemorySnapshotManager(BaseCacheManager):
                         logger.debug("L1 background save skipped (already exists)", extra={"key": key})
                         return
 
+                    # Compute RAM file path for template save.
+                    # The sacrificial VM uses memory-backend-file,share=on so QEMU
+                    # writes guest RAM to this file.  After migration with x-ignore-shared,
+                    # the vmstate contains only device state; the RAM file is the template.
+                    vmstate_path_for_ram, _meta = self._cache_paths(key)
+                    ram_path = self.ram_path_from_vmstate(vmstate_path_for_ram)
+
                     # Boot sacrificial VM — ephemeral_vm handles lifecycle
                     async with self.vm_manager.ephemeral_vm(
                         language=language,
@@ -404,6 +505,8 @@ class MemorySnapshotManager(BaseCacheManager):
                         allow_network=allow_network,
                         snapshot_drive=snapshot_drive,
                         retry_profile=constants.RETRY_BACKGROUND,
+                        mem_path=str(ram_path),
+                        mem_path_share=True,  # Template save: QEMU writes RAM to file
                     ) as vm:
                         # Warm REPL (Python takes 10-15s on HVF, needs dedicated timeout)
                         response = await vm.channel.send_request(

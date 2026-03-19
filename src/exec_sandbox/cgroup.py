@@ -11,6 +11,7 @@ References:
 """
 
 import contextlib
+import shlex
 from pathlib import Path
 from typing import Final
 
@@ -332,6 +333,28 @@ def is_cgroup_available(cgroup_path: Path | None) -> bool:
 
 
 # =============================================================================
+# Internal Helpers
+# =============================================================================
+
+
+async def _write_cgroup_optional(path: Path, value: str) -> bool:
+    """Write to a cgroup control file, silently ignoring if unsupported.
+
+    Used for optional cgroup features (memory.high, memory.oom.group,
+    memory.zswap.writeback) that may not exist on older kernels.
+
+    Returns:
+        True if written successfully, False if file doesn't exist or write failed.
+    """
+    try:
+        async with aiofiles.open(path, "w") as f:
+            await f.write(value)
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
+# =============================================================================
 # Setup
 # =============================================================================
 
@@ -381,8 +404,24 @@ async def setup_cgroup(
         await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
 
         # Apply effective memory limit (pre-computed by admission controller)
+        memory_max_bytes = cgroup_memory_mb * 1024 * 1024
         async with aiofiles.open(cgroup_path / "memory.max", "w") as f:
-            await f.write(str(cgroup_memory_mb * 1024 * 1024))
+            await f.write(str(memory_max_bytes))
+
+        # Soft memory limit at 85% of max — triggers kernel reclaim before OOM.
+        # Creates a buffer zone: between high and max, the kernel aggressively
+        # reclaims (page cache eviction, zswap compression) without killing.
+        memory_high_bytes = int(memory_max_bytes * 0.85)
+        await _write_cgroup_optional(cgroup_path / "memory.high", str(memory_high_bytes))
+
+        # Kill entire cgroup as a unit on OOM (QEMU + gvproxy together).
+        # Without this, OOM may kill only gvproxy, leaving QEMU orphaned.
+        await _write_cgroup_optional(cgroup_path / "memory.oom.group", "1")
+
+        # Prevent zswap from writing back to disk swap — keeps VM latency
+        # predictable.  Without this, under host pressure zswap may evict
+        # compressed pages to disk, causing multi-ms stalls.
+        await _write_cgroup_optional(cgroup_path / "memory.zswap.writeback", "0")
 
         # Apply effective CPU limit (pre-computed by admission controller)
         cpu_quota = int(CGROUP_CPU_PERIOD_US * cgroup_cpu_cores)
@@ -505,6 +544,56 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
 
 
 # =============================================================================
+# Memory Reclaim
+# =============================================================================
+
+
+async def reclaim_memory(cgroup_path: Path | None, amount_mb: int = 32) -> bool:
+    """Proactively reclaim memory from a VM's cgroup via memory.reclaim.
+
+    Triggers the kernel to compress anonymous pages into zswap/zram, reducing
+    RSS without killing the process.  This is the mechanism Meta uses in TMO
+    (Transparent Memory Offloading) for 20-32% fleet-wide memory savings.
+
+    Requires Linux >= 6.9 for the ``swappiness`` parameter.  Falls back to
+    plain reclaim on older kernels, and is a no-op on macOS or when cgroups
+    are unavailable.
+
+    Args:
+        cgroup_path: VM cgroup directory
+        amount_mb: Amount of memory to reclaim (default 32 MB)
+
+    Returns:
+        True if reclaim was issued, False if unavailable or failed
+    """
+    if not is_cgroup_available(cgroup_path) or cgroup_path is None:
+        return False
+
+    reclaim_file = cgroup_path / "memory.reclaim"
+    amount_bytes = amount_mb * 1024 * 1024
+
+    try:
+        # Try with swappiness=200 first (kernel 6.9+, aggressively compress anon pages)
+        async with aiofiles.open(reclaim_file, "w") as f:
+            await f.write(f"{amount_bytes} swappiness=200")
+        return True
+    except OSError:
+        pass
+
+    try:
+        # Fall back to plain reclaim (kernel 6.1+)
+        async with aiofiles.open(reclaim_file, "w") as f:
+            await f.write(str(amount_bytes))
+        return True
+    except OSError as e:
+        logger.debug(
+            "memory.reclaim unavailable",
+            extra={"cgroup_path": str(cgroup_path), "error": str(e)},
+        )
+        return False
+
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 
@@ -610,8 +699,6 @@ def wrap_with_ulimit(cmd: list[str], cgroup_memory_mb: int) -> list[str]:
     Returns:
         Command wrapped with ulimit via bash -c (bash required for -u support)
     """
-    import shlex  # noqa: PLC0415
-
     cmd_str = " ".join(shlex.quote(arg) for arg in cmd)
 
     # Memory overhead: ~14x effective memory for TCG worst case

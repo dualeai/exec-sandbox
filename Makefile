@@ -46,6 +46,13 @@ install:
 	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) install
 	$(MAKE) --directory gvproxy-wrapper install
+	$(MAKE) install-seek
+
+# Code search using seek (trigram index via zoekt, sub-second queries)
+# Usage: seek "pattern" (on PATH via direnv)
+# See: https://github.com/dualeai/seek
+install-seek:
+	@curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
 
 install-deps:
 	uv sync --extra dev --extra s3
@@ -179,6 +186,16 @@ bench-pool:
 # Usage: make bench-optimizer [N_VMS=200]
 bench-optimizer:
 	uv run --script scripts/benchmark_optimizer.py $(if $(N_VMS),-n $(N_VMS),)
+
+# VM density benchmark — measures host memory cost per VM.
+# Boots N VMs, holds them alive, samples host memory to compute marginal cost.
+# Usage: make bench-density [N_VMS=10]
+#        make bench-density-sweep          # sweep N=5,10,20 VMs
+bench-density:
+	uv run --script scripts/benchmark_density.py $(if $(N_VMS),-n $(N_VMS),) --workload
+
+bench-density-sweep:
+	uv run --script scripts/benchmark_density.py --sweep 3 5 10 --workload --json
 
 # ============================================================================
 # Flamegraph Profiling (requires sudo on macOS)
