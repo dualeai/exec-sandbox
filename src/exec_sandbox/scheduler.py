@@ -62,9 +62,11 @@ from exec_sandbox.system_probes import (
     raise_fd_limit,
     raise_nproc_limit,
     warn_cgroup_pids_limit,
+    warn_damon,
     warn_max_map_count,
     warn_overcommit,
     warn_threads_max,
+    warn_zswap,
 )
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -145,6 +147,8 @@ class Scheduler:
         warn_max_map_count()
         warn_threads_max()
         warn_cgroup_pids_limit()
+        warn_zswap()
+        warn_damon()
 
         logger.info(
             "Starting scheduler",

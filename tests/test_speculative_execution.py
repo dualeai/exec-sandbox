@@ -245,9 +245,9 @@ except PermissionError:
         """KSM (Kernel Same-page Merging) must be disabled inside the guest.
 
         KSM enables cross-VM side channels by measuring page deduplication
-        timing. QEMU mem-merge=off disables KSM for the VM's memory on the
-        host side; this test verifies the guest kernel also has it off.
-        Ref: Firecracker prod-host-setup recommends disabling KSM.
+        timing. Host-side KSM (QEMU mem-merge=on) is enabled for density but
+        the guest kernel must NOT have CONFIG_KSM to prevent in-guest
+        side-channel attacks. This test verifies the guest kernel has it off.
         """
         code = """\
 try:
@@ -267,11 +267,12 @@ except PermissionError:
             f"Expected KSM disabled (run=0) or not available. stdout: {stdout}"
         )
 
-    async def test_mem_merge_off_effect(self, dual_scheduler: Scheduler) -> None:
-        """Verify KSM pages_shared is 0 (effect of QEMU mem-merge=off).
+    async def test_guest_ksm_pages_shared_zero(self, dual_scheduler: Scheduler) -> None:
+        """Verify KSM pages_shared is 0 inside the guest.
 
-        Even if KSM kernel support exists, mem-merge=off means QEMU never
-        registers the VM's memory with KSM, so pages_shared should be 0.
+        Guest kernel has CONFIG_KSM disabled, so pages_shared should be 0
+        or the file should not exist. Host-side KSM (mem-merge=on) operates
+        at the QEMU process level and is invisible to the guest.
         """
         code = """\
 try:

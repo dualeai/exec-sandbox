@@ -147,19 +147,23 @@ pub(crate) async fn wait_for_network() {
 
 /// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
 ///
-/// Sized to 50% of RAM with per-UID quota enforcement (`usrquota` +
+/// Sized to 40% of RAM with per-UID quota enforcement (`usrquota` +
 /// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
 /// Quota must be set at initial mount time — cannot be added via remount.
+///
+/// 40% (vs 50% prior): most sandbox code uses <30MB; 40% of 192MB = 77MB
+/// which provides ample headroom while reducing tmpfs metadata overhead.
 fn mount_home_tmpfs() {
     // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
     let page_mask = !(page_size() - 1);
-    let half_mem_bytes = (read_mem_total_kb() / 2 * 1024) & page_mask;
+    // 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5
+    let tmpfs_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
     let ret = unsafe {
         let source = std::ffi::CString::new("tmpfs").unwrap();
         let target = std::ffi::CString::new("/home/user").unwrap();
         let fstype = std::ffi::CString::new("tmpfs").unwrap();
         let data = std::ffi::CString::new(format!(
-            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
+            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},size={tmpfs_bytes},usrquota,usrquota_block_hardlimit={tmpfs_bytes},noswap"
         ))
         .unwrap();
         libc::mount(
@@ -274,15 +278,15 @@ fn setup_dev_symlinks() {
 /// B4: Mount /dev/shm for POSIX shared memory / semaphores.
 /// Only needed for Python multiprocessing and similar use cases.
 ///
-/// Sized to 50% of RAM with per-UID quota enforcement (`usrquota` +
+/// Sized to 40% of RAM with per-UID quota enforcement (`usrquota` +
 /// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
 /// Quota must be set at initial mount time — cannot be added via remount.
 fn setup_dev_shm() {
     // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
     let page_mask = !(page_size() - 1);
-    let half_mem_bytes = (read_mem_total_kb() / 2 * 1024) & page_mask;
-    let opts =
-        format!("size={half_mem_bytes},usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap");
+    // 40% of RAM (matching /home/user sizing)
+    let shm_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
+    let opts = format!("size={shm_bytes},usrquota,usrquota_block_hardlimit={shm_bytes},noswap");
 
     fn try_mount_shm(opts: &str) -> libc::c_int {
         unsafe {
@@ -373,8 +377,10 @@ fn setup_zram_swap() {
 
     let mem_kb = read_mem_total_kb();
 
-    // disksize = 50% of RAM (in bytes)
-    let zram_size = mem_kb * 512;
+    // disksize = 40% of RAM (in bytes): mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5
+    // Reduced from 50% to lower slab metadata overhead (~10MB savings).
+    // 40% with LZ4 (~2.5x ratio) gives ~160MB usable swap on 192MB VM.
+    let zram_size = mem_kb * 2048 / 5;
     if std::fs::write("/sys/block/zram0/disksize", zram_size.to_string()).is_err() {
         log_warn!("[zram] failed to set disksize, skipping");
         return;
@@ -386,13 +392,14 @@ fn setup_zram_swap() {
     // timeout. With mem_limit, once compressed storage is full zram returns
     // -ENOMEM on write → swap fails → OOM fires within seconds.
     //
-    // Sizing: 25% of RAM × 2-3x lz4 ratio ≈ 50-75% effective swap capacity.
-    // For a 192 MB VM this means ~48 MB compressed → ~96-144 MB usable swap.
+    // Sizing: 20% of RAM × 2-3x lz4 ratio ≈ 40-60% effective swap capacity.
+    // For a 192 MB VM this means ~38 MB compressed → ~76-115 MB usable swap.
+    // Reduced from 25% proportionally with disksize (40% disk / 20% mem).
     //
     // Refs:
     //   - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
     //   - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
-    let mem_limit = mem_kb * 256; // 25% of RAM in bytes (KB * 1024 / 4)
+    let mem_limit = mem_kb * 1024 / 5; // 20% of RAM in bytes
     let _ = std::fs::write("/sys/block/zram0/mem_limit", mem_limit.to_string());
 
     // Build and write swap header (mkswap equivalent)

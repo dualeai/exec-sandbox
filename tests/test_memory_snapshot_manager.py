@@ -675,30 +675,30 @@ class TestCheckCacheEdgeCases:
     async def test_metadata_is_json_array(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata is valid JSON but not a dict (array) → SHA-256 check skipped, still hits."""
+        """Metadata is valid JSON but not a dict (array) → typed parse rejects → miss."""
         _vmstate, meta = await self._populate(manager)
         meta.write_text("[1, 2, 3]")
         result = await manager.check_cache(Language.PYTHON, [], 512)
-        # JSON array is valid JSON, parses OK, but isinstance(meta, dict) is False
-        # → SHA-256 check skipped → cache hit
-        assert result is not None
+        # SnapshotMetadata.from_json rejects non-dict JSON → cache miss + cleanup
+        assert result is None
 
     async def test_metadata_is_json_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata is valid JSON but a bare string → SHA-256 check skipped, still hits."""
+        """Metadata is valid JSON but a bare string → typed parse rejects → miss."""
         _vmstate, meta = await self._populate(manager)
         meta.write_text('"just a string"')
         result = await manager.check_cache(Language.PYTHON, [], 512)
-        assert result is not None
+        assert result is None
 
     async def test_metadata_sha256_is_not_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
-        """Metadata has vmstate_sha256 but it's an int → SHA-256 check skipped, still hits."""
+        """Metadata has vmstate_sha256 as int → coerced to str, SHA-256 mismatch → miss."""
         _vmstate, _meta = await self._populate(manager, meta_dict={"vmstate_sha256": 12345})
         result = await manager.check_cache(Language.PYTHON, [], 512)
-        assert result is not None  # isinstance(val, str) is False → skipped
+        # SnapshotMetadata.from_json coerces 12345 to "12345" which won't match actual hash
+        assert result is None
 
     async def test_metadata_sha256_empty_string(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]

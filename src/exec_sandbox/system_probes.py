@@ -8,11 +8,12 @@ import asyncio
 import os
 import platform
 import re
+import resource
 import sys
 from collections.abc import Callable, Coroutine
 from functools import wraps
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, Final, ParamSpec, TypeVar
 
 import aiofiles
 import aiofiles.os
@@ -87,8 +88,6 @@ def raise_fd_limit() -> None:
 
     Called once during Scheduler startup, before any VMs are created.
     """
-    import resource  # noqa: PLC0415
-
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if soft >= hard:
@@ -170,8 +169,6 @@ def raise_nproc_limit() -> None:
 
     Called once during Scheduler startup, before any VMs are created.
     """
-    import resource  # noqa: PLC0415
-
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
         if soft < hard:
@@ -313,6 +310,89 @@ def warn_cgroup_pids_limit() -> None:
                 "recommended_min": _MIN_RECOMMENDED_CGROUP_PIDS,
             },
         )
+
+
+_ZSWAP_PARAM_BASE: Final[str] = "/sys/module/zswap/parameters"
+
+
+def _read_zswap_param(name: str) -> str | None:
+    """Read a zswap sysfs parameter, or None if unavailable."""
+    try:
+        return Path(f"{_ZSWAP_PARAM_BASE}/{name}").read_text().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def warn_zswap() -> None:
+    """Warn if Linux zswap is disabled or suboptimally configured.
+
+    zswap provides a compressed write-back cache for swap pages, absorbing
+    transient host memory pressure spikes without disk I/O.  Combined with
+    per-VM ``memory.reclaim``, it enables proactive compression of idle VM
+    memory (Meta TMO: 20-32% fleet-wide savings).
+
+    Recommended config for VM density::
+
+        echo 1 > /sys/module/zswap/parameters/enabled
+        echo lz4 > /sys/module/zswap/parameters/compressor
+        echo zsmalloc > /sys/module/zswap/parameters/zpool
+        echo 40 > /sys/module/zswap/parameters/max_pool_percent
+
+    LZ4 is preferred over zstd: lower latency (1-2µs vs 5-10µs per page),
+    better for interactive VM workloads.  40% pool allows 2-3x effective
+    memory capacity under pressure.
+
+    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    """
+    if detect_host_os() != HostOS.LINUX:
+        return
+
+    enabled = _read_zswap_param("enabled")
+    if enabled is None:
+        return  # zswap module not loaded or /sys unavailable
+
+    if enabled != "Y":
+        logger.warning(
+            "zswap disabled — enable for better VM density under memory pressure: "
+            "echo 1 > /sys/module/zswap/parameters/enabled && "
+            "echo lz4 > /sys/module/zswap/parameters/compressor && "
+            "echo zsmalloc > /sys/module/zswap/parameters/zpool && "
+            "echo 40 > /sys/module/zswap/parameters/max_pool_percent",
+        )
+        return
+
+    # Check tuning of enabled zswap
+    pool_pct = _read_zswap_param("max_pool_percent")
+    if pool_pct is not None and int(pool_pct) < 30:  # noqa: PLR2004
+        logger.info(
+            "zswap max_pool_percent is low — raise to 40 for better VM density: "
+            "echo 40 > /sys/module/zswap/parameters/max_pool_percent",
+            extra={"current": pool_pct, "recommended": 40},
+        )
+
+
+def warn_damon() -> None:
+    """Log DAMON availability for idle VM page reclamation.
+
+    DAMON (Data Access MONitor, kernel 5.16+) with DAMOS can automatically
+    pageout guest memory pages not accessed for a configurable period,
+    providing continuous host-driven reclamation without guest cooperation.
+    This supplements ``memory.reclaim`` with proactive kernel-driven reclaim.
+
+    Called once during Scheduler startup on Linux only.  No-op on macOS.
+    """
+    if detect_host_os() != HostOS.LINUX:
+        return
+
+    damon_dir = Path("/sys/kernel/mm/damon/admin")
+    if not damon_dir.is_dir():
+        logger.info(
+            "DAMON not available — enable CONFIG_DAMON + CONFIG_DAMON_SYSFS in host "
+            "kernel for automatic idle VM memory reclamation",
+        )
+        return
+
+    logger.debug("DAMON available for idle VM page reclamation")
 
 
 # ============================================================================

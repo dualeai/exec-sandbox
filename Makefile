@@ -187,6 +187,16 @@ bench-pool:
 bench-optimizer:
 	uv run --script scripts/benchmark_optimizer.py $(if $(N_VMS),-n $(N_VMS),)
 
+# VM density benchmark — measures host memory cost per VM.
+# Boots N VMs, holds them alive, samples host memory to compute marginal cost.
+# Usage: make bench-density [N_VMS=10]
+#        make bench-density-sweep          # sweep N=5,10,20 VMs
+bench-density:
+	uv run --script scripts/benchmark_density.py $(if $(N_VMS),-n $(N_VMS),) --workload
+
+bench-density-sweep:
+	uv run --script scripts/benchmark_density.py --sweep 3 5 10 --workload --json
+
 # ============================================================================
 # Flamegraph Profiling (requires sudo on macOS)
 # ============================================================================

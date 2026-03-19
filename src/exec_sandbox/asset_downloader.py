@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import http
 import os
+import tarfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -463,8 +464,6 @@ async def untar(fname: Path) -> Path:
     Returns:
         Path to extracted directory
     """
-    import tarfile  # noqa: PLC0415
-
     dest_dir = fname.parent / fname.stem.replace(".tar", "")
 
     def _extract_sync() -> None:

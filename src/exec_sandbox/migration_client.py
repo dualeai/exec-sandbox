@@ -166,13 +166,21 @@ class MigrationClient:
                 logger.debug("QMP event: %s data=%s", data.get("event"), data.get("data"))
         raise MigrationTransientError("Too many QMP events without command response")
 
-    async def _set_capabilities(self, qemu_version: tuple[int, int, int] | None) -> None:
+    async def _set_capabilities(
+        self,
+        qemu_version: tuple[int, int, int] | None,
+        use_template: bool = False,
+    ) -> None:
         """Configure migration capabilities for file: transport.
 
         On QEMU >= 9.0, enables mapped-ram + multifd for parallel page I/O.
         mapped-ram maps RAM pages to fixed offsets in the file (seekable),
-        multifd enables multi-threaded transfer. Together they significantly
-        speed up save/restore for file:-based migration.
+        multifd enables multi-threaded transfer.
+
+        When use_template=True, also enables x-ignore-shared: QEMU skips RAM
+        pages backed by shared memory during migration, saving only device state.
+        This is the key mechanism for VM Templating (COW memory sharing).
+        Ref: https://www.qemu.org/docs/master/system/vm-templating.html
 
         Both sender (save) and receiver (restore) MUST set the same
         capabilities, otherwise QEMU rejects with "received capability is off".
@@ -180,10 +188,24 @@ class MigrationClient:
         if qemu_version is None or qemu_version < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
             return
 
-        capabilities = [
-            {"capability": "multifd", "state": True},
-            {"capability": "mapped-ram", "state": True},
-        ]
+        if use_template:
+            # VM Templating: x-ignore-shared skips RAM pages backed by shared
+            # memory-backend-file.  mapped-ram is INCOMPATIBLE with x-ignore-shared
+            # in QEMU <= 10.x: mapped-ram's bitmap code dereferences null pointers
+            # for ignored blocks, crashing with "Bad address".  Fix merged for 11.0.
+            # Ref: QEMU commit "migration/mapped-ram: Fix x-ignore-shared snapshots"
+            #      (Pawel Zmarzly, Nov 2025; reviewed by Peter Xu, Dec 2025)
+            # TODO(qemu-11): Re-enable mapped-ram + multifd alongside x-ignore-shared
+            # once QEMU >= 11.0 is the minimum version.  This will give parallel I/O
+            # for the device-state portion of the vmstate.
+            capabilities = [
+                {"capability": "x-ignore-shared", "state": True},
+            ]
+        else:
+            capabilities = [
+                {"capability": "multifd", "state": True},
+                {"capability": "mapped-ram", "state": True},
+            ]
         resp = await self._execute(
             "migrate-set-capabilities",
             {"capabilities": capabilities},
@@ -201,10 +223,16 @@ class MigrationClient:
         vmstate_path: Path,
         qemu_version: tuple[int, int, int] | None = None,
         timeout: float = constants.MEMORY_SNAPSHOT_SAVE_TIMEOUT_SECONDS,
+        use_template: bool = False,
     ) -> None:
         """Save VM state to file. VM pauses and then quit is sent.
 
         After this call, the QEMU process will exit.
+
+        When use_template=True, x-ignore-shared is enabled: QEMU saves only
+        device state (CPU registers, virtio rings, etc.), skipping RAM pages
+        that are backed by shared memory-backend-file. The resulting vmstate
+        is small (~100KB-1MB) instead of the full guest memory dump.
 
         With mapped-ram + multifd (QEMU >= 9.0), QEMU can finish writing the
         vmstate file and exit before our first query-migrate poll. If the connection
@@ -214,7 +242,7 @@ class MigrationClient:
         Raises:
             MigrationTransientError: Save failed
         """
-        await self._set_capabilities(qemu_version)
+        await self._set_capabilities(qemu_version, use_template=use_template)
 
         # Stop vCPU before migration to avoid HVF assertion crash.
         # On ARM64 HVF, if the vCPU is running when migration starts, the pause
@@ -259,15 +287,20 @@ class MigrationClient:
         vmstate_path: Path,
         qemu_version: tuple[int, int, int] | None = None,
         timeout: float = constants.MEMORY_SNAPSHOT_RESTORE_TIMEOUT_SECONDS,
+        use_template: bool = False,
     ) -> None:
         """Restore VM from file. Precondition: QEMU started with -incoming defer.
 
         After this call, the VM is running (cont sent).
 
+        When use_template=True, x-ignore-shared is enabled: QEMU loads only
+        device state from the vmstate file, skipping RAM (already present via
+        file-backed memory-backend-file with MAP_PRIVATE COW mapping).
+
         Raises:
             MigrationTransientError: Restore failed
         """
-        await self._set_capabilities(qemu_version)
+        await self._set_capabilities(qemu_version, use_template=use_template)
 
         # Load migration stream
         uri = f"file:{vmstate_path}"

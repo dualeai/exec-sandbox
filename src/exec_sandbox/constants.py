@@ -281,6 +281,19 @@ DISK_IOPS_LIMIT: Final[int] = 1000
 DISK_IOPS_BURST: Final[int] = 2000
 """Burst IOPS limit (npm install, pip install)."""
 
+VIRTIO_QUEUE_SIZE: Final[int] = 64
+"""Virtio device queue depth (entries per virtqueue).
+
+Each entry costs ~90 bytes of host memory (16-byte descriptor + 2-byte avail
+ring entry + 8-byte used ring entry + ~64 bytes host metadata). At 64 entries
+per queue, each virtqueue costs ~5.6KB. With 2 queues per virtio-blk device
+(+ 1 for virtio-net, 1 for virtio-serial), total per-VM queue memory is ~25KB.
+
+Reduced from 256 (default) for density: sandbox I/O is sequential and
+low-throughput, 64 entries is sufficient. No measurable wall-time difference
+observed in cold-start benchmarks (bottleneck is Mach kernel / KVM, not
+queue depth)."""
+
 # ============================================================================
 # Kernel Version Requirements
 # ============================================================================
@@ -323,7 +336,7 @@ WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
 # Balloon Memory Management (for warm pool memory efficiency)
 # ============================================================================
 
-BALLOON_INFLATE_TARGET_MB: Final[int] = 160
+BALLOON_INFLATE_TARGET_MB: Final[int] = 140
 """Target guest memory in MB when inflating balloon for idle warm pool VMs.
 Inflating the balloon reduces guest memory, allowing host to reclaim.
 
@@ -331,8 +344,9 @@ History: 64MB caused unresponsive guests (only ~14MB headroom). 96MB still
 caused freezes on kernel 6.18 where ~38MB overhead + guest-agent + Python
 leaves <20MB free under pressure. 128MB caused ~20% QEMU vCPU overhead on
 Bun VMs (42MB RSS) because the balloon driver couldn't reach target and kept
-retrying page reclaim. 160MB provides sufficient headroom for all runtimes
-(~70MB free after Bun overhead) while achieving 17% memory reduction vs 192MB."""
+retrying page reclaim. 140MB provides ~50MB headroom after Bun overhead
+(zram swap provides additional buffer) while achieving 27% memory reduction
+vs 192MB."""
 
 BALLOON_TOLERANCE_MB: Final[int] = 40
 """Tolerance in MB for balloon target polling. Allows early exit when balloon is
@@ -371,11 +385,13 @@ MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
 """Minimum QEMU version for mapped-ram + multifd migration capabilities.
 Changing capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
 
-MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 2
+MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 3
 """Migration format version. Bump when changing QMP capabilities or migration
 protocol to invalidate stale L1 cache entries. History:
   v1: Plain streaming format (no mapped-ram)
   v2: mapped-ram + multifd (QEMU >= 9.0)
+  v3: x-ignore-shared VM templating — device-state-only vmstate + separate
+      RAM file for COW sharing across VMs (QEMU >= 9.0)
 """
 
 # ============================================================================
@@ -449,7 +465,7 @@ FILE_TRANSFER_CHUNK_SIZE: Final[int] = 128 * 1024  # 128KB
 """Raw chunk size for streaming file transfers (before zstd compression).
 
 128KB balances fewer frames (halves syscalls, JSON parses, base64 en/decodes
-vs 64KB) while staying within virtio queue depth (128-256 descriptors).
+vs 64KB) while staying within virtio queue depth (VIRTIO_QUEUE_SIZE=64 entries).
 On-wire size after base64+JSON is ~175KB per frame.
 """
 
@@ -460,7 +476,7 @@ FILE_TRANSFER_ZSTD_LEVEL: Final[int] = 3
 # Resource Admission & Overcommit
 # ============================================================================
 
-DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 8.0
+DEFAULT_MEMORY_OVERCOMMIT_RATIO: Final[float] = 5.0
 """Host-level memory overcommit multiplier applied to the total VM pool budget.
 
 budget = host_total * (1 - reserve_ratio) * overcommit_ratio
@@ -470,11 +486,19 @@ are bursty and mostly idle (avg memory utilization 18-22%).  At the optimal CPU=
 CPU is the binding constraint (~24 concurrent slots), so memory overcommit only
 affects the theoretical budget ceiling, not actual concurrency or RSS.
 
-The 8.0x default was determined by RBF surrogate optimization over a 4x4
-latency-frontier sweep (500 VMs per combo) on a 16-vCPU / 32GB EC2 instance
-with KVM (scripts/benchmark_optimizer.py): CPU=2x MEM=8x achieves latency
-efficiency=1116 (10^6 / geomean of admission, setup, exec p95) with
-admit_p95=11.0s, setup_p95=921ms, exec_p95=71ms at 7.0% RSS.
+The 5.0x default was determined by RBF surrogate optimization (thin-plate spline,
+16 samples) over a 4x4 latency-frontier sweep (250 VMs per combo) on a 16-vCPU /
+32GB EC2 instance with KVM + KSM (scripts/benchmark_optimizer.py):
+
+  Predicted optimal: CPU_OC=2.0, MEM_OC=4.6 (efficiency=2227.9)
+  Best sampled:      CPU_OC=2.0, MEM_OC=5.0 (efficiency=2223.3)
+  → Grid already covers the optimum
+
+CPU=2x MEM=5x achieves latency efficiency=2223 (10^6 / geomean of admission,
+setup, exec p95) with admit_p95=3025ms, setup_p95=160ms, exec_p95=188ms at
+3.4% RSS.  13/16 grid combos achieved 100% success (250 VMs each); CPU=12x
+combos degraded under extreme contention (13-100% success, 37-49% RSS).
+
 Not to be confused with DEFAULT_VM_MEMORY_OVERHEAD_MB which is a per-VM additive
 constant for QEMU/gvproxy process memory."""
 
@@ -484,14 +508,19 @@ DEFAULT_CPU_OVERCOMMIT_RATIO: Final[float] = 2.0
 budget = (host_cpus - reserve_cores) * overcommit_ratio
 
 AI workloads average 11-17% CPU utilization, so 2x overcommit is safe while
-keeping exec latency low.  The 2x default was determined by RBF surrogate
-optimization over a 4x4 latency-frontier sweep (500 VMs per combo) on a
-16-vCPU / 32GB EC2 instance with KVM (scripts/benchmark_optimizer.py): CPU=2x
-MEM=8x achieves latency efficiency=1116 (10^6 / geomean of admission, setup,
-exec p95) with admit_p95=11.0s, setup_p95=921ms, exec_p95=71ms at 7.0% RSS.
-Beyond 2x, setup and exec latencies grow sharply (setup: 950ms → 1.4s → 2.5s
-→ 4.5s; exec: 73ms → 105ms → 370ms → 895ms) while throughput stays flat
-(~35 VMs/s), and at 12x the system OOMs under load.
+keeping exec latency low.  The 2x default was confirmed by RBF surrogate
+optimization (thin-plate spline, 16 samples) over a 4x4 latency-frontier sweep
+(250 VMs per combo) on a 16-vCPU / 32GB EC2 instance with KVM + KSM
+(scripts/benchmark_optimizer.py):
+
+  Predicted optimal: CPU_OC=2.0, MEM_OC=4.6
+
+Beyond 2x, setup and exec p95 degrade sharply under sustained load (250 VMs):
+  CPU=2x: setup_p95=160ms, exec_p95=188ms, RSS=3.4%
+  CPU=4x: setup_p95=719ms, exec_p95=336ms, RSS=5.9%
+  CPU=8x: setup_p95=768ms, exec_p95=783ms, RSS=12.4%
+  CPU=12x: setup_p95=31s, exec_p95=38s, RSS=36.9% (system collapse)
+
 Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
 constant for QEMU/gvproxy process CPU."""
 
@@ -513,7 +542,7 @@ DEFAULT_VM_CPU_CORES: Final[int] = 1
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
 
-DEFAULT_VM_MEMORY_OVERHEAD_MB: Final[int] = 128
+DEFAULT_VM_MEMORY_OVERHEAD_MB: Final[int] = 96
 """QEMU + gvproxy process memory overhead added to guest memory for admission and cgroup limits.
 
 Covers host-side process memory beyond guest RAM (QEMU VMM + gvproxy share a
@@ -529,8 +558,10 @@ Measured breakdown:
   - gvproxy (Go binary, network proxy)    : ~15-30 MB
   - Combined total                        : ~50-80 MB
 
-128 MB provides ~60% headroom above observed combined peak. If OOM-kills
-are observed, bump this — but first verify with:
+96 MB provides ~20-90% headroom above observed combined peak. Reduced from
+128 MB to improve admission controller accuracy (allows more concurrent VMs
+within the same memory budget). If OOM-kills are observed, bump this — but
+first verify with:
   ``ps -o rss= -p <qemu_pid>`` and ``ps -o rss= -p <gvproxy_pid>``."""
 
 DEFAULT_VM_CPU_OVERHEAD_CORES: Final[float] = 0.25
