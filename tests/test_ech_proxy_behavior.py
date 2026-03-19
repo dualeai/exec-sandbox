@@ -39,7 +39,6 @@ from .conftest import (
 ECH_DOMAIN_CLOUDFLARE = "cloudflare.com"
 ECH_DOMAIN_ONE = "one.one.one.one"
 # Non-ECH domains (standard TLS 1.3)
-DOMAIN_GITHUB = "github.com"
 DOMAIN_PYPI = "pypi.org"
 
 # TLS version constants
@@ -212,10 +211,10 @@ ECH_ALLOWED_CASES = [
     ),
     pytest.param(
         Language.JAVASCRIPT,
-        DOMAIN_GITHUB,
+        ECH_DOMAIN_ONE,
         TLS_DEFAULT,
-        [DOMAIN_GITHUB],
-        id="js-github",
+        [ECH_DOMAIN_ONE],
+        id="js-one",
     ),
     pytest.param(
         Language.JAVASCRIPT,
