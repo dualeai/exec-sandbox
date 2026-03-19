@@ -437,6 +437,34 @@ Guest RAM (default 192 MB)
 | `/tmp` | 50% of RAM | Scratch space for package managers (wheel builds), temp files |
 | `/dev/shm` | 50% of RAM | POSIX shared memory segments (Python multiprocessing semaphores) |
 
+## Design Trade-offs
+
+Optimized for AI agent workloads: long-lived but mostly idle sessions, high concurrency, untrusted code.
+
+### Why QEMU over alternatives
+
+| Approach | Trade-off |
+|----------|-----------|
+| **Containers** (Docker, K8s pods) | Shared host kernel — container escapes are a proven, recurring class: [CVE-2019-5736](https://nvd.nist.gov/vuln/detail/CVE-2019-5736) (runc), [CVE-2024-21626](https://nvd.nist.gov/vuln/detail/CVE-2024-21626) (runc "Leaky Vessels"), [CVE-2022-0185](https://nvd.nist.gov/vuln/detail/CVE-2022-0185) (user namespace). VMs run their own kernel, eliminating this class. Remaining surface is the [hypervisor device model](https://venom.crowdstrike.com/) |
+| **gVisor** | User-space kernel ([Sentry](https://gvisor.dev/docs/architecture_guide/security/)), not a hardware boundary. A Sentry bug exposes the host. Incomplete syscall coverage breaks some workloads |
+| **Firecracker** | Genuine VM isolation (powers AWS Lambda, [E2B](https://e2b.dev)). But [requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) — no macOS, no software emulation fallback. Many cloud VMs and containerized environments don't expose nested virtualization |
+| **Cloud sandboxes** | Data leaves your network. Per-execution pricing. Vendor lock-in |
+| **Namespace isolation** (Bubblewrap, nsjail) | No hardware boundary — host kernel processes all syscalls directly |
+
+QEMU/KVM: [in the Linux kernel since 2007](https://kernelnewbies.org/Linux_2_6_20), powers [Google Cloud](https://cloud.google.com/blog/products/gcp/7-ways-we-harden-our-kvm-hypervisor-at-google-cloud-security-in-plaintext) and [AWS Nitro](https://perspectives.mvdirona.com/2019/02/aws-nitro-system/). exec-sandbox uses KVM on Linux, HVF on macOS, and falls back to software emulation (TCG) when neither is available — deploy on bare metal, cloud VMs, or inside containers without nested virtualization. The trade-off is complexity: cross-platform support (KVM/HVF/TCG × x86_64/aarch64) requires careful engineering.
+
+### Optimized for sandbox density, not raw performance
+
+AI agent sandboxes are long-lived (hours) but mostly idle — typical code bursts every 30s to 5 min, each lasting seconds. **Sandbox density** (VMs per GB) matters more than per-VM performance.
+
+The [memory optimizations above](#memory-optimization) (zram compression, virtio-balloon reclamation) plus 8× default memory overcommit yield ~25-35% better VM density. Trade-off: compressed swap adds minor CPU overhead on memory-intensive workloads.
+
+### Why not Kubernetes for sandbox orchestration
+
+Kubernetes targets long-running services, not high-churn ephemeral workloads. At scale, pod lifecycle hits [etcd throughput](https://etcd.io/docs/v3.5/op-guide/performance/), [scheduler limits (~100-200 pods/s)](https://github.com/kubernetes/community/blob/master/sig-scalability/slos/slos.md), and [cluster ceiling (~150k pods)](https://kubernetes.io/docs/setup/best-practices/cluster-large/). [Knative](https://knative.dev/) and [agent-sandbox](https://agent-sandbox.sigs.k8s.io/) help, but each sandbox still pays the full pod lifecycle cost with multiple etcd writes per transition.
+
+exec-sandbox manages VMs directly as processes — no orchestration layer. A single host sustains [39 VMs/s](#concurrent-throughput) with sub-second setup.
+
 ## Snapshot Caching Architecture
 
 exec-sandbox uses a 3-tier snapshot cache to eliminate redundant work across executions. The first run with a given configuration pays the full cost (boot + package install); every subsequent run restores from cache.
@@ -635,7 +663,7 @@ async with await scheduler.session(language="python") as session:
 | Layer | Technology | Protection |
 |-------|------------|------------|
 | 1 | Hardware virtualization (KVM/HVF) | CPU isolation enforced by hardware |
-| 2 | Custom hardened kernel | Modules disabled at compile time, io_uring compiled out, slab/memory hardening, ~360+ subsystems removed |
+| 2 | Custom hardened kernel | Modules disabled at compile time, [io_uring](https://security.googleblog.com/2023/06/learnings-from-kctf-vrps-42-linux.html) and eBPF compiled out, slab/memory hardening, ~360+ subsystems removed |
 | 3 | Unprivileged QEMU | No root privileges, minimal exposure |
 | 4 | Non-root REPL (UID 1000) | Blocks mount, ptrace, raw sockets, kernel modules |
 | 5 | System call filtering (seccomp) | Blocks unauthorized OS calls |
