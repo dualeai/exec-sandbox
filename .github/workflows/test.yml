@@ -19,7 +19,7 @@ jobs:
 
   static-python:
     name: Static / Python
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -47,7 +47,7 @@ jobs:
 
   static-rust-guest-agent:
     name: Static / Rust (guest-agent)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     defaults:
       run:
         working-directory: guest-agent
@@ -64,7 +64,7 @@ jobs:
 
   static-rust-tiny-init:
     name: Static / Rust (tiny-init)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     defaults:
       run:
         working-directory: tiny-init
@@ -87,7 +87,7 @@ jobs:
 
   static-go:
     name: Static / Go
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     defaults:
       run:
         working-directory: gvproxy-wrapper
@@ -115,14 +115,14 @@ jobs:
         include:
           - arch: x64
             os-version: noble
-            runner: ubuntu-24.04
+            runner: blacksmith-8vcpu-ubuntu-2404
           - arch: arm64
             os-version: noble
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
           # Jammy build for CodSpeed macro runners (Ubuntu 22.04 ARM64)
           - arch: arm64
             os-version: jammy
-            runner: ubuntu-22.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2204-arm
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -145,7 +145,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
           # See: https://wiki.qemu.org/Hosts/Linux
-          sudo apt-get install -y ccache ninja-build meson libglib2.0-dev libfdt-dev libpixman-1-dev libseccomp-dev libslirp-dev liburing-dev flex bison
+          sudo apt-get install -y ccache ninja-build meson libglib2.0-dev libfdt-dev libpixman-1-dev libseccomp-dev libslirp-dev liburing-dev flex bison python3-venv python3-tomli
 
       - name: Cache ccache
         if: steps.qemu-cache.outputs.cache-hit != 'true'
@@ -174,10 +174,10 @@ jobs:
         include:
           - os: linux
             arch: x64
-            runner: ubuntu-24.04
+            runner: blacksmith-4vcpu-ubuntu-2404
           - os: linux
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
           - os: macos
             arch: x64
             runner: macos-15-intel
@@ -199,7 +199,7 @@ jobs:
 
   build-guest-agent:
     name: Build / guest-agent (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -232,7 +232,7 @@ jobs:
 
   build-tiny-init:
     name: Build / tiny-init (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -265,7 +265,7 @@ jobs:
 
   build-vm-images:
     name: Build / VM images (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-8vcpu-ubuntu-2404-arm' }}
     needs: [build-guest-agent, build-tiny-init]
     strategy:
       matrix:
@@ -319,7 +319,7 @@ jobs:
 
   test-rust:
     name: Test / Rust
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     defaults:
       run:
         working-directory: guest-agent
@@ -336,7 +336,7 @@ jobs:
 
   test-go:
     name: Test / Go
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     defaults:
       run:
         working-directory: gvproxy-wrapper
@@ -371,10 +371,10 @@ jobs:
         platform:
           - os: linux
             arch: x64
-            runner: ubuntu-24.04
+            runner: blacksmith-8vcpu-ubuntu-2404
           - os: linux
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
           - os: macos
             arch: x64
             runner: macos-15-intel
@@ -404,7 +404,12 @@ jobs:
         run: |
           # Make files readable and directories traversable for qemu-vm user
           # Need to make parent directories traversable too (home dirs are often 700)
-          chmod a+x /home/runner /home/runner/work
+          # Use GITHUB_WORKSPACE to avoid hardcoding runner paths (differs between providers)
+          dir="$GITHUB_WORKSPACE"
+          while [ "$dir" != "/" ]; do
+            chmod a+x "$dir" 2>/dev/null || break
+            dir=$(dirname "$dir")
+          done
           chmod -R a+rX .
 
       - name: Setup VM infrastructure
@@ -523,6 +528,7 @@ jobs:
           os: linux
           arch: arm64
           os-version: jammy
+          setup-cgroups: "false"
 
       # --- Python + deps ---
 

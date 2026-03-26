@@ -16,6 +16,10 @@ inputs:
     description: Ubuntu codename for QEMU build artifact (noble or jammy)
     required: false
     default: noble
+  setup-cgroups:
+    description: Setup cgroup delegation (disable for sandboxed runners like CodSpeed)
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -104,7 +108,7 @@ runs:
         fi
 
     - name: Setup cgroup delegation (Linux)
-      if: inputs.os == 'linux'
+      if: inputs.os == 'linux' && inputs.setup-cgroups == 'true'
       shell: bash
       run: |
         # Create cgroup directory for VM resource limits
@@ -119,7 +123,7 @@ runs:
         sudo chown -R runner:runner /sys/fs/cgroup/code-exec
 
     - name: Increase system limits (Linux)
-      if: inputs.os == 'linux'
+      if: inputs.os == 'linux' && inputs.setup-cgroups == 'true'
       shell: bash
       run: |
         # Increase process/thread limits to prevent QEMU thread creation failures
