@@ -102,6 +102,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     if not os.environ.get("GITHUB_ACTIONS"):
         return None  # Use default protocol outside CI
 
+    # Let CodSpeed's protocol hook handle benchmark tests — returning True here
+    # would prevent CodSpeed from wrapping item.runtest with instrumentation,
+    # resulting in "0 benchmarked".
+    if item.get_closest_marker("benchmark") is not None:
+        return None
+
     for attempt in range(_QEMU_CRASH_MAX_RETRIES + 1):
         reports = runtestprotocol(item, nextitem=nextitem, log=False)
 

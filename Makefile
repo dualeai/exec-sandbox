@@ -128,11 +128,11 @@ endef
 
 # All tests together for accurate coverage measurement (excludes sudo and slow tests)
 test-func:
-	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "not sudo and not slow")
+	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "not sudo and not slow" --ignore=tests/benchmarks)
 
 # Tests requiring sudo privileges (run sequentially on slow CI runners)
 test-sudo:
-	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m "sudo")
+	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m "sudo" --ignore=tests/benchmarks)
 
 # Unit tests only (fast)
 test-unit:
@@ -143,7 +143,7 @@ test-unit:
 
 # Memory leak detection tests (slow, run sequentially for accurate measurement)
 test-slow:
-	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m slow)
+	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m slow --ignore=tests/benchmarks)
 
 # ============================================================================
 # Linting
@@ -209,7 +209,7 @@ test-flamegraph:
 		--rate $(PYSPY_RATE) \
 		--format speedscope \
 		--output $(PYSPY_OUTPUT) \
-		-- uv run pytest tests/ -v -n auto --no-cov --basetemp=$(PYSPY_BASETEMP) -m "not sudo"
+		-- uv run pytest tests/ -v -n auto --no-cov --basetemp=$(PYSPY_BASETEMP) -m "not sudo" --ignore=tests/benchmarks
 	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
 	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 

@@ -72,6 +72,7 @@ dev = [
     "twine~=6.1",  # Package verification before PyPI upload
     "vulture~=2.14",  # Dead code detection
     "moto[s3,server]~=5.0",  # AWS mocking for S3 tests (server mode for aioboto3)
+    "pytest-codspeed~=4.3",  # CodSpeed performance benchmarks
 ]
 
 [project.urls]
@@ -98,6 +99,7 @@ addopts = [
 markers = [
     "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
     "slow: marks tests as slow running (deselect with -m 'not slow')",
+    "benchmark: CodSpeed performance benchmarks (run separately via codspeed.yml)",
 ]
 filterwarnings = [
     # Catch pending task warnings early - Python 3.14 has stricter detection
