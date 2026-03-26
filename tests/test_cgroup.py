@@ -1320,13 +1320,15 @@ class TestCgroupIntegration:
         # Override pids.max to a very low value for testing
         (cgroup_path / "pids.max").write_text("5")
 
-        # Start a process that tries to fork many children
+        # Start a process that waits on stdin before forking, so we can
+        # attach it to the cgroup first (avoids race where process exits
+        # before cgroup attachment).
         proc = await asyncio.create_subprocess_exec(
             "python3",
             "-c",
             """
-import os
-import sys
+import os, sys
+sys.stdin.readline()  # wait for go signal after cgroup attach
 pids = []
 try:
     for i in range(20):
@@ -1347,6 +1349,7 @@ finally:
         except:
             pass
 """,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1354,6 +1357,12 @@ finally:
         try:
             assert proc.pid is not None
             await attach_to_cgroup(cgroup_path, proc.pid)
+
+            # Signal subprocess to start forking
+            assert proc.stdin is not None
+            proc.stdin.write(b"\n")
+            await proc.stdin.drain()
+            proc.stdin.close()
 
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
 
