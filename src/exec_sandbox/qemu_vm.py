@@ -18,7 +18,13 @@ from typing import IO, TYPE_CHECKING
 from uuid import uuid4
 
 from pydantic import ValidationError
-from tenacity import AsyncRetrying, retry_if_exception_type, wait_random_exponential
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
@@ -662,7 +668,7 @@ class QemuVM:
     # File I/O
     # -------------------------------------------------------------------------
 
-    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:  # noqa: PLR0915
+    async def write_file(self, path: str, content: IO[bytes], *, make_executable: bool = False) -> None:
         """Write a file to the sandbox via streaming zstd-compressed chunks.
 
         Protocol:
@@ -676,6 +682,10 @@ class QemuVM:
         Neither the full content nor the full compressed payload is ever
         held in memory — only the current chunk pair.
 
+        Retries once on "No active write" protocol errors, which indicate the
+        WriteFile header was dropped by QEMU's virtio-serial during a guest
+        agent reconnection cycle (READ_TIMEOUT_MS=18s idle timeout).
+
         Args:
             path: Relative path in sandbox (PATH_MAX 4096, NAME_MAX 255 per component)
             content: Readable binary stream (BytesIO for bytes, open file for Path)
@@ -686,7 +696,7 @@ class QemuVM:
             VmTransientError: On timeout or communication failure
         """
 
-        # Validate path
+        # Validate path (once, before any retry)
         if not path:
             raise VmPermanentError(
                 "write_file path must not be empty",
@@ -697,6 +707,32 @@ class QemuVM:
                 f"write_file path is {len(path)} chars, exceeds {constants.MAX_FILE_PATH_LENGTH}",
                 context={"vm_id": self.vm_id, "path_length": len(path)},
             )
+
+        # Retry once for "No active write" — a transient protocol error caused
+        # by QEMU dropping the WriteFile header when the guest virtio-serial
+        # port is closed during the guest agent's 18s idle-timeout reconnect.
+        async for attempt in AsyncRetrying(
+            retry=retry_if_exception(lambda exc: isinstance(exc, VmPermanentError) and "No active write" in str(exc)),
+            stop=stop_after_attempt(2),
+            reraise=True,
+        ):
+            with attempt:
+                if attempt.retry_state.attempt_number > 1:
+                    logger.warning(
+                        "write_file header dropped (stale connection), forcing reconnect and retrying",
+                        extra={"vm_id": self.vm_id, "path": path},
+                    )
+                    await self.channel.close()
+                    if content.seekable():
+                        content.seek(0)
+                    else:
+                        raise attempt.retry_state.outcome.exception()  # type: ignore[union-attr]
+                await self._write_file_protocol(path, content, make_executable=make_executable)
+
+    async def _write_file_protocol(  # noqa: PLR0915
+        self, path: str, content: IO[bytes], *, make_executable: bool = False
+    ) -> None:
+        """Execute the write_file streaming protocol (single attempt)."""
 
         op_id = uuid4().hex
 
