@@ -418,26 +418,6 @@ jobs:
           os: ${{ matrix.platform.os }}
           arch: ${{ matrix.platform.arch }}
 
-      - name: Verify QEMU installation
-        run: |
-          echo "=== QEMU binaries ==="
-          which qemu-system-x86_64 || echo "qemu-system-x86_64 not found"
-          which qemu-system-x86_64-microvm || echo "qemu-system-x86_64-microvm not found"
-          which qemu-system-aarch64 || echo "qemu-system-aarch64 not found"
-          echo ""
-          echo "=== QEMU version ==="
-          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} --version
-          echo ""
-          echo "=== Available machine types (first 20) ==="
-          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} -machine help | head -20
-          echo ""
-          echo "=== Hardware acceleration ==="
-          if [ "${{ matrix.platform.os }}" = "linux" ]; then
-            ls -la /dev/kvm || echo "/dev/kvm not available"
-          else
-            sysctl kern.hv_support || echo "HVF not available"
-          fi
-
       - name: Setup uv
         uses: astral-sh/setup-uv@v7.1.6
         with:
@@ -516,11 +496,17 @@ jobs:
       - name: Make binaries executable
         run: chmod +x gvproxy-wrapper/bin/gvproxy-wrapper-*
 
-      - name: Make files accessible
+      - name: Make images readable (Linux)
         run: |
+          # Make files readable and directories traversable for qemu-vm user
+          # Need to make parent directories traversable too (home dirs are often 700)
+          # Use GITHUB_WORKSPACE to avoid hardcoding runner paths (differs between providers)
+          dir="$GITHUB_WORKSPACE"
+          while [ "$dir" != "/" ]; do
+            chmod a+x "$dir" 2>/dev/null || break
+            dir=$(dirname "$dir")
+          done
           chmod -R a+rX .
-
-      # --- QEMU + VM infrastructure (shared action) ---
 
       - name: Setup VM infrastructure
         uses: ./.github/actions/setup-vm-infra
@@ -528,29 +514,31 @@ jobs:
           os: linux
           arch: arm64
           os-version: jammy
-          setup-cgroups: "false"
-
-      # --- Python + deps ---
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7.1.6
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v6.1.0
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Install
         run: make install-deps
-
-      # --- Run benchmarks ---
 
       - name: Run benchmarks
         timeout-minutes: 30
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation,memory
-          run: uv run pytest tests/benchmarks/ --codspeed -v --no-cov -p no:xdist -o "addopts="
+          run: |
+            # Move into delegated cgroup subtree so QEMU child processes can be managed
+            echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+            # Remove nproc limit for current shell (PAM limits only apply to new logins)
+            sudo prlimit --pid $$ --nproc=unlimited:unlimited
+            # Activate qemu-vm group membership for socket access (chardev sockets are 0660)
+            sg qemu-vm -c "uv run pytest tests/benchmarks/ --codspeed -v --no-cov -p no:xdist -o 'addopts='"

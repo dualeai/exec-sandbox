@@ -200,3 +200,27 @@ runs:
           fi
           DIR=$(dirname "$DIR")
         done
+
+    # --- Verify installation ---
+
+    - name: Verify QEMU installation
+      shell: bash
+      run: |
+        echo "=== QEMU binaries ==="
+        which qemu-system-x86_64 || echo "qemu-system-x86_64 not found"
+        which qemu-system-x86_64-microvm || echo "qemu-system-x86_64-microvm not found"
+        which qemu-system-aarch64 || echo "qemu-system-aarch64 not found"
+        echo ""
+        echo "=== QEMU version ==="
+        QEMU_BIN="${{ inputs.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }}"
+        "$QEMU_BIN" --version
+        echo ""
+        echo "=== Available machine types (first 20) ==="
+        "$QEMU_BIN" -machine help | head -20
+        echo ""
+        echo "=== Hardware acceleration ==="
+        if [ "${{ inputs.os }}" = "linux" ]; then
+          ls -la /dev/kvm || echo "/dev/kvm not available"
+        else
+          sysctl kern.hv_support || echo "HVF not available"
+        fi
