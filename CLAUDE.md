@@ -23,3 +23,7 @@ seek 'type:file Makefile'                           # find files by name
 Install (if missing): `curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh` — requires `universal-ctags`.
 
 When spawning sub-agents, pass: "Use `seek 'pattern'` for code search. All filters in ONE quoted string. Never use grep/rg."
+
+## GitHub Actions — pin to commit SHAs
+
+Pin third-party actions to full commit SHA + version comment: `uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1`. Never use mutable tags (`@v4`, `@v6.0.1`). Resolve SHAs with `gh api repos/OWNER/REPO/git/ref/tags/TAG --jq '.object.sha'` (dereference annotated tags via `git/tags/SHA`).
