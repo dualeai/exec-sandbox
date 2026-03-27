@@ -60,23 +60,28 @@ _CURL_VERSION_FLAGS: dict[str, str] = {
 
 def _python_tls_code(domain: str, tls_version: str = TLS_DEFAULT) -> str:
     """Python ssl connection test with optional TLS version forcing."""
-    version_lines = ["    ctx = ssl.create_default_context()"]
+    version_lines = ["        ctx = ssl.create_default_context()"]
     if tls_version == TLS_12:
-        version_lines.append("    ctx.maximum_version = ssl.TLSVersion.TLSv1_2")
+        version_lines.append("        ctx.maximum_version = ssl.TLSVersion.TLSv1_2")
     elif tls_version == TLS_13:
-        version_lines.append("    ctx.minimum_version = ssl.TLSVersion.TLSv1_3")
+        version_lines.append("        ctx.minimum_version = ssl.TLSVersion.TLSv1_3")
     ctx_setup = "\n".join(version_lines)
     return (
         PY_SAFETY
         + f"""
-import socket, ssl
-try:
+import socket, ssl, time
+for attempt in range({NET_RETRY_COUNT + 1}):
+    try:
 {ctx_setup}
-    with socket.create_connection(("{domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="{domain}") as ssock:
-            print(f"CONNECTED:{{ssock.version()}}")
-except Exception as e:
-    print(f"BLOCKED:{{type(e).__name__}}")
+        with socket.create_connection(("{domain}", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
+            with ctx.wrap_socket(sock, server_hostname="{domain}") as ssock:
+                print(f"CONNECTED:{{ssock.version()}}")
+                break
+    except Exception as e:
+        if attempt < {NET_RETRY_COUNT}:
+            time.sleep({NET_RETRY_BACKOFF_S} * (attempt + 1))
+            continue
+        print(f"BLOCKED:{{type(e).__name__}}")
 """
     )
 

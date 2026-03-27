@@ -379,7 +379,8 @@ time.sleep(60)
 
         Normal case: SIGSEGV (signal 11) kills the REPL process.
         The guest-agent should report exit_code=128+11=139 per Unix convention.
-        Slow under TCG: signal delivery + REPL teardown can exceed the 10s timeout.
+        Slow under TCG: signal delivery + REPL teardown need the full
+        scheduler default timeout (120s hwaccel / 240s TCG).
         """
         code = """
 import os
@@ -389,7 +390,6 @@ os.kill(os.getpid(), signal.SIGSEGV)
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=10,
         )
 
         # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
