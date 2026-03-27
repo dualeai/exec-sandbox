@@ -382,7 +382,7 @@ class TestProcessWrapperIsRunning:
 
     async def test_is_running_async(self) -> None:
         """is_running doesn't block the event loop."""
-        proc = await create_wrapped_process(["sleep", "0.1"])
+        proc = await create_wrapped_process(["sleep", "10"])
 
         # Run is_running concurrently with other tasks
         async def other_task() -> str:
@@ -397,6 +397,8 @@ class TestProcessWrapperIsRunning:
         assert results[0] is True
         assert results[1] == "done"
 
+        # Clean up
+        await proc.terminate()
         await proc.wait()
 
 
