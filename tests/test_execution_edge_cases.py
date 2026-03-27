@@ -373,11 +373,13 @@ time.sleep(60)
         # Process caught SIGTERM and called sys.exit(42) — normal exit, not a signal kill
         assert result.exit_code == 42
 
+    @pytest.mark.slow
     async def test_signal_kill_returns_128_plus_signal(self, scheduler: Scheduler) -> None:
         """Process killed by uncaught signal returns 128+signal_number.
 
         Normal case: SIGSEGV (signal 11) kills the REPL process.
         The guest-agent should report exit_code=128+11=139 per Unix convention.
+        Slow under TCG: signal delivery + REPL teardown can exceed the 10s timeout.
         """
         code = """
 import os

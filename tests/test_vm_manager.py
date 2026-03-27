@@ -47,6 +47,7 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     probe_cache,
     probe_qemu_accelerators,
+    probe_qemu_sandbox_support,
 )
 from exec_sandbox.validation import (
     clear_kernel_validation_cache,
@@ -349,6 +350,218 @@ class TestQemuAcceleratorProbe:
     async def test_cache_cleared_between_tests(self) -> None:
         """Verify cache is properly cleared (test isolation)."""
         assert probe_cache.qemu_accels is NOT_CACHED
+
+
+# ============================================================================
+# Unit Tests - QEMU Sandbox (Seccomp) Probe
+# ============================================================================
+
+
+class TestQemuSandboxProbe:
+    """Tests for probe_qemu_sandbox_support() — seccomp sandbox detection.
+
+    The probe launches ``qemu-system-xxx -machine none -sandbox on -S -display none``
+    and inspects the outcome:
+    - Timeout (process stays alive) → sandbox supported (QEMU accepted -sandbox, paused on -S)
+    - Exit 0 → sandbox supported
+    - Exit 1 with "option group" in stderr → sandbox not compiled in (CONFIG_SECCOMP absent)
+    - FileNotFoundError / OSError → graceful False
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_sandbox_cache(self) -> None:
+        """Clear QEMU sandbox cache before each test."""
+        probe_cache.reset("qemu_sandbox")
+
+    # ========================================================================
+    # Normal Cases
+    # ========================================================================
+
+    async def test_supported_timeout(self) -> None:
+        """Sandbox supported: QEMU stays alive (accepted -sandbox, paused on -S)."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is True
+            mock_proc.kill.assert_called_once()
+
+    async def test_supported_clean_exit(self) -> None:
+        """Sandbox supported: QEMU exits 0."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is True
+
+    async def test_not_supported_option_group_error(self) -> None:
+        """Sandbox not supported: QEMU exits 1 with 'option group' error."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"There is no option group 'sandbox'\n"))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    async def test_macos_returns_false_immediately(self) -> None:
+        """macOS: returns False without spawning a subprocess."""
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.MACOS),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+            mock_exec.assert_not_called()
+
+    async def test_result_is_cached(self) -> None:
+        """Subsequent calls return cached result."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec,
+        ):
+            result1 = await probe_qemu_sandbox_support()
+            result2 = await probe_qemu_sandbox_support()
+            assert result1 is result2
+            assert mock_exec.call_count == 1  # Only one subprocess
+
+    # ========================================================================
+    # Edge Cases
+    # ========================================================================
+
+    async def test_qemu_binary_not_found(self) -> None:
+        """Returns False when QEMU binary is not on PATH."""
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            mock_exec.side_effect = FileNotFoundError("qemu-system-x86_64 not found")
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    async def test_exit_1_unknown_stderr(self) -> None:
+        """Returns False on exit 1 with unrelated stderr (e.g., missing display)."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"gtk initialization failed\n"))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    async def test_exit_0_with_warnings(self) -> None:
+        """Returns True on exit 0 even if stderr has warnings."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"WARNING: some deprecation notice\n"))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is True
+
+    # ========================================================================
+    # Out-of-Bound / Error Cases
+    # ========================================================================
+
+    async def test_oserror_permission_denied(self) -> None:
+        """Returns False on OSError (e.g., permission denied)."""
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            mock_exec.side_effect = OSError("Permission denied")
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    async def test_qemu_killed_by_signal(self) -> None:
+        """Returns False when QEMU is killed by a signal (negative returncode)."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = -11  # SIGSEGV
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    async def test_empty_stderr_on_failure(self) -> None:
+        """Returns False on exit 1 with empty stderr."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    # ========================================================================
+    # Weird Cases
+    # ========================================================================
+
+    async def test_sandbox_not_enabled_message(self) -> None:
+        """Handles the two-line error from newer QEMU versions."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(
+            return_value=(
+                b"",
+                b"There is no option group 'sandbox'\n-sandbox support is not enabled in this QEMU binary\n",
+            )
+        )
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is False
+
+    async def test_kill_race_process_already_exited(self) -> None:
+        """Returns True even when process exits between timeout and kill (race)."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
+        mock_proc.kill = MagicMock(side_effect=ProcessLookupError())
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("exec_sandbox.system_probes.detect_host_os", return_value=HostOS.LINUX),
+            patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec", return_value=mock_proc),
+        ):
+            result = await probe_qemu_sandbox_support()
+            assert result is True  # Timeout means sandbox was accepted
+
+    async def test_cache_cleared_between_tests(self) -> None:
+        """Verify cache is properly cleared (test isolation)."""
+        assert probe_cache.qemu_sandbox is NOT_CACHED
 
 
 # ============================================================================
@@ -1135,6 +1348,7 @@ def _qemu_cmd_mocks(
     tsc_deadline: bool = True,
     unshare: bool = False,
     io_uring: bool = False,
+    qemu_sandbox: bool = True,
     qemu_vm_uid: int | None = None,
     os_getuid: int = 1000,
 ):
@@ -1150,6 +1364,7 @@ def _qemu_cmd_mocks(
     stack.enter_context(patch("exec_sandbox.qemu_cmd.check_tsc_deadline", return_value=tsc_deadline))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_unshare_support", return_value=unshare))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_io_uring_support", return_value=io_uring))
+    stack.enter_context(patch("exec_sandbox.qemu_cmd.probe_qemu_sandbox_support", return_value=qemu_sandbox))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.get_qemu_vm_uid", return_value=qemu_vm_uid))
     stack.enter_context(patch("exec_sandbox.qemu_cmd.os.getuid", return_value=os_getuid))
     return stack
@@ -1568,17 +1783,17 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
     """
 
     @pytest.mark.parametrize(
-        "host_os, expect_sandbox",
+        "qemu_sandbox, expect_sandbox",
         [
-            pytest.param(HostOS.LINUX, True, id="linux-has-sandbox"),
-            pytest.param(HostOS.MACOS, False, id="macos-no-sandbox"),
+            pytest.param(True, True, id="sandbox-supported"),
+            pytest.param(False, False, id="sandbox-unsupported"),
         ],
     )
-    async def test_sandbox_flag(self, vm_settings, workdir, host_os: HostOS, expect_sandbox: bool) -> None:
-        """-sandbox present on Linux, absent on macOS."""
+    async def test_sandbox_flag(self, vm_settings, workdir, qemu_sandbox: bool, expect_sandbox: bool) -> None:
+        """-sandbox present when probe reports support, absent otherwise."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks(host_os=host_os):
+        with _qemu_cmd_mocks(qemu_sandbox=qemu_sandbox):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=HostArch.X86_64,

@@ -79,6 +79,7 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
     probe_io_uring_support,
+    probe_qemu_sandbox_support,
     probe_qemu_version,
     probe_unshare_support,
 )
@@ -210,11 +211,12 @@ class VmManager:
 
         # Run all async probes concurrently (they cache their results at module level)
         # This prevents cache stampede when multiple VMs start concurrently
-        accel_type, io_uring_available, unshare_available, qemu_version = await asyncio.gather(
+        accel_type, io_uring_available, unshare_available, qemu_version, _sandbox = await asyncio.gather(
             self._detect_accel_type(),  # Pre-warms HVF/KVM + QEMU accelerator caches
             probe_io_uring_support(),
             probe_unshare_support(),
             probe_qemu_version(),  # Pre-warm QEMU version for netdev reconnect
+            probe_qemu_sandbox_support(),  # Pre-warm seccomp sandbox availability
         )
 
         # Pre-warm TSC deadline (unified function handles arch/OS dispatch)

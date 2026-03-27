@@ -17,6 +17,7 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
     probe_io_uring_support,
+    probe_qemu_sandbox_support,
     probe_qemu_version,
     probe_unshare_support,
 )
@@ -407,8 +408,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # but had NO effect — ARM VHE Stage-2 PTEs are still created lazily by hardware
     # on first guest access, regardless of host page presence.
 
-    # Layer 3: Seccomp sandbox - Linux only
-    if detect_host_os() != HostOS.MACOS:
+    # Layer 3: Seccomp sandbox — requires CONFIG_SECCOMP at QEMU compile time.
+    # Probe rather than assume: some runners (e.g. CodSpeed macro) may resolve
+    # a system QEMU built without --enable-seccomp.
+    if await probe_qemu_sandbox_support():
         qemu_args.extend(
             [
                 "-sandbox",
