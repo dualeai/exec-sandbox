@@ -130,9 +130,9 @@ endef
 test-func:
 	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "not sudo and not slow" --ignore=tests/benchmarks)
 
-# Tests requiring sudo privileges (run sequentially on slow CI runners)
+# Tests requiring sudo privileges (parallelised — each test uses isolated tmp_path / UUID cgroups)
 test-sudo:
-	$(call ci-monitor-run,uv run pytest tests/ -v -n 0 -m "sudo" --ignore=tests/benchmarks)
+	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "sudo" --ignore=tests/benchmarks)
 
 # Unit tests only (fast)
 test-unit:

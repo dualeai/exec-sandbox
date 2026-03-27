@@ -94,7 +94,7 @@ addopts = [
     "--tb=short",
     "--strict-markers",
     "-n", "auto",  # pytest-xdist: parallel execution using all CPU cores
-    "--dist", "loadfile",  # Keep tests in same file together (shared fixtures)
+    "--dist", "load",  # Round-robin individual tests across workers (no module/session-scoped fixtures)
 ]
 markers = [
     "sudo: tests that test sudo-related functionality (may require sudo privileges in real environment)",
