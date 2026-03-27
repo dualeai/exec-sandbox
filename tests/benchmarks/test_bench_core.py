@@ -1,7 +1,8 @@
 """Performance benchmarks for exec-sandbox.
 
 Benchmarks real VM operations: cold boot, warm pool, session exec round-trip,
-network overhead, and memory configurations.
+network overhead, and memory configurations.  Also benchmarks system probes
+that run on every Scheduler init (subprocess cost, cached per process).
 
 Parameterized by Language enum so new languages are automatically covered.
 
@@ -19,6 +20,15 @@ import pytest
 from exec_sandbox import Scheduler, SchedulerConfig
 from exec_sandbox.constants import DEFAULT_MEMORY_MB, MIN_MEMORY_MB
 from exec_sandbox.models import Language
+from exec_sandbox.system_probes import (
+    check_tsc_deadline,
+    detect_accel_type,
+    probe_cache,
+    probe_io_uring_support,
+    probe_qemu_sandbox_support,
+    probe_qemu_version,
+    probe_unshare_support,
+)
 
 pytestmark = pytest.mark.benchmark
 
@@ -137,3 +147,51 @@ async def test_bench_session_exec(language: Language) -> None:
             for _i in range(10):
                 result = await session.exec(_HELLO_CODE[language])
                 assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# System probes — subprocess cost paid on every Scheduler init.
+# Each probe spawns a QEMU subprocess (or syscall test) and caches the result.
+# Regressions here directly impact cold-start latency for the first VM.
+# Cache is reset before each call to measure real (uncached) cost.
+# ---------------------------------------------------------------------------
+
+
+async def test_bench_probe_qemu_version() -> None:
+    """Probe: detect QEMU binary version via --version."""
+    probe_cache.reset("qemu_version")
+    result = await probe_qemu_version()
+    assert result is not None
+
+
+async def test_bench_probe_qemu_sandbox() -> None:
+    """Probe: detect -sandbox (seccomp) support via trial execution."""
+    probe_cache.reset("qemu_sandbox")
+    await probe_qemu_sandbox_support()
+
+
+async def test_bench_probe_accel_type() -> None:
+    """Probe: detect virtualization mode (KVM/HVF/TCG) via -accel help + OS checks."""
+    probe_cache.reset("kvm")
+    probe_cache.reset("hvf")
+    probe_cache.reset("qemu_accels")
+    result = await detect_accel_type()
+    assert result is not None
+
+
+async def test_bench_probe_io_uring() -> None:
+    """Probe: detect io_uring support via syscall test."""
+    probe_cache.reset("io_uring")
+    await probe_io_uring_support()
+
+
+async def test_bench_probe_unshare() -> None:
+    """Probe: detect unshare (namespace) support."""
+    probe_cache.reset("unshare")
+    await probe_unshare_support()
+
+
+async def test_bench_probe_tsc_deadline() -> None:
+    """Probe: detect TSC deadline timer support."""
+    probe_cache.reset("tsc_deadline")
+    await check_tsc_deadline()
