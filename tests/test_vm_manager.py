@@ -2182,7 +2182,7 @@ class TestNetdevReconnectIntegration:
     which helps recover from transient gvproxy crashes or socket EOF errors.
     """
 
-    async def test_network_recovers_after_gvproxy_restart(self, vm_manager) -> None:
+    async def test_network_recovers_after_gvproxy_restart(self, vm_manager, execute_timeout) -> None:
         """QEMU reconnects to gvproxy after socket disconnect.
 
         Simulates the real-world scenario where gvproxy crashes or socket EOF
@@ -2229,7 +2229,7 @@ class TestNetdevReconnectIntegration:
                     await asyncio.sleep(2)
                 result1 = await vm.execute(
                     code=tls_connect_code + "print('INITIAL_OK')",
-                    timeout_seconds=30,
+                    timeout_seconds=execute_timeout,
                 )
                 if result1.exit_code == 0 and "INITIAL_OK" in result1.stdout:
                     break
@@ -2269,7 +2269,7 @@ class TestNetdevReconnectIntegration:
                 await asyncio.sleep(2 + attempt)  # 2s, 3s, 4s, 5s, 6s
                 result2 = await vm.execute(
                     code=tls_connect_code + "print('RECONNECT_OK')",
-                    timeout_seconds=30,
+                    timeout_seconds=execute_timeout,
                 )
                 if result2.exit_code == 0 and "RECONNECT_OK" in result2.stdout:
                     break
@@ -2280,7 +2280,7 @@ class TestNetdevReconnectIntegration:
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def test_dns_resolution_after_gvproxy_restart(self, vm_manager) -> None:
+    async def test_dns_resolution_after_gvproxy_restart(self, vm_manager, execute_timeout) -> None:
         """DNS resolution works after gvproxy restart.
 
         This specifically tests the DNS resolution path since the original issue
@@ -2317,7 +2317,7 @@ class TestNetdevReconnectIntegration:
                 reraise=True,
             ):
                 with attempt:
-                    result1 = await vm.execute(code=dns_code, timeout_seconds=30)
+                    result1 = await vm.execute(code=dns_code, timeout_seconds=execute_timeout)
                     assert result1.exit_code == 0 and "DNS_OK:" in result1.stdout, (
                         f"Initial DNS failed: {result1.stderr}"
                     )
@@ -2348,7 +2348,7 @@ class TestNetdevReconnectIntegration:
                 reraise=True,
             ):
                 with attempt:
-                    result2 = await vm.execute(code=dns_code, timeout_seconds=30)
+                    result2 = await vm.execute(code=dns_code, timeout_seconds=execute_timeout)
                     assert result2.exit_code == 0 and "DNS_OK:" in result2.stdout, (
                         f"DNS after reconnect failed: {result2.stderr}"
                     )
@@ -2721,7 +2721,7 @@ class TestVmManagerIntegration:
             await vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
 
-    async def test_vm_execute_code(self, vm_manager) -> None:
+    async def test_vm_execute_code(self, vm_manager, execute_timeout) -> None:
         """Execute code in a VM."""
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
@@ -2735,7 +2735,7 @@ class TestVmManagerIntegration:
         try:
             result = await vm.execute(
                 code="print('hello from vm')",
-                timeout_seconds=30,
+                timeout_seconds=execute_timeout,
                 env_vars=None,
                 on_stdout=None,
                 on_stderr=None,
@@ -2913,6 +2913,7 @@ class TestAllImageTypes:
     async def test_vm_execute_code_all_images(
         self,
         vm_manager,
+        execute_timeout,
         language: Language,
         code: str,
         expected_output: str,
@@ -2930,7 +2931,7 @@ class TestAllImageTypes:
         try:
             result = await vm.execute(
                 code=code,
-                timeout_seconds=30,
+                timeout_seconds=execute_timeout,
                 env_vars=None,
                 on_stdout=None,
                 on_stderr=None,

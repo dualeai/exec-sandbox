@@ -138,14 +138,27 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 
 
 # ============================================================================
-# Shared Skip Markers
+# Hardware Probe, Timeout Constants, and Skip Markers
 # ============================================================================
+
+# Probed once at import time; used for skip markers and timeout scaling.
+_hwaccel_available: bool = asyncio.run(check_hwaccel_available())
+
+# Central test-execution timeout (seconds).
+# TCG software emulation under ``pytest -n auto`` contention can inflate
+# wall-clock times 5-8x; even trivial code that takes <1s locally can
+# consume >30s.  All tests — whether they go through the Scheduler or call
+# ``vm.execute()`` directly — should derive their timeout from these
+# constants so that the budget is adjusted in exactly one place.
+_TIMEOUT_HWACCEL: int = 120
+_TIMEOUT_TCG: int = 240
+_DEFAULT_TEST_TIMEOUT: int = _TIMEOUT_HWACCEL if _hwaccel_available else _TIMEOUT_TCG
 
 # Skip marker for timing-sensitive tests that require hardware acceleration.
 # TCG (software emulation) is ~5-8x slower than KVM/HVF, making these tests
 # unreliable on GitHub Actions macOS runners (no nested virtualization).
 skip_unless_hwaccel = pytest.mark.skipif(
-    not asyncio.run(check_hwaccel_available()),
+    not _hwaccel_available,
     reason="Requires hardware acceleration (KVM/HVF) - TCG too slow for timing-sensitive tests",
 )
 
@@ -241,14 +254,28 @@ def scheduler_config(images_dir: Path) -> SchedulerConfig:
     Uses pre-built images from images/dist/ directory.
     Disables auto_download_assets since images are provided locally.
 
-    Timeout is 120s (vs library default 30s) to absorb parallel-load
+    Timeout comes from ``_DEFAULT_TEST_TIMEOUT`` to absorb parallel-load
     slowdowns: ``pytest -n auto`` runs ~10 QEMU VMs concurrently, and TCG
     emulation + L1 restore contention can inflate wall-clock times 4-5x.
     Individual tests should NOT override ``timeout_seconds`` unless they
     intentionally need a *shorter* deadline (e.g. testing the timeout
     mechanism itself).
     """
-    return SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
+    return SchedulerConfig(
+        images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=_DEFAULT_TEST_TIMEOUT
+    )
+
+
+@pytest.fixture
+def execute_timeout() -> int:
+    """Execution timeout for tests that call ``vm.execute()`` directly.
+
+    Returns ``_DEFAULT_TEST_TIMEOUT`` (``_TIMEOUT_HWACCEL`` when KVM/HVF
+    is available, ``_TIMEOUT_TCG`` under software emulation).  Use this
+    instead of hardcoding ``timeout_seconds=30`` in tests that bypass the
+    Scheduler.
+    """
+    return _DEFAULT_TEST_TIMEOUT
 
 
 @pytest.fixture
@@ -276,20 +303,20 @@ async def dual_scheduler(
 
     This ensures security properties hold regardless of QEMU backend.
 
-    Uses the same 120s default timeout as ``scheduler_config`` for hwaccel.
-    Emulation gets 240s because parallel TCG VMs on CI runners can starve
-    each other — trivial code that takes <1s locally consumed the full 120s
-    execution budget on a loaded macOS arm64 runner (cold-boot fallback +
-    TCG + ``pytest -n auto`` contention).
+    hwaccel gets ``_TIMEOUT_HWACCEL``; emulation gets ``_TIMEOUT_TCG``.
+    The emulation budget is higher because parallel TCG VMs on CI runners
+    starve each other — trivial code that takes <1s locally consumed the
+    full hwaccel budget on a loaded macOS arm64 runner (cold-boot fallback
+    + TCG + ``pytest -n auto`` contention).
     """
     if request.param == "hwaccel":
-        if not await check_hwaccel_available():
+        if not _hwaccel_available:
             pytest.skip("Hardware acceleration not available")
         monkeypatch.delenv("EXEC_SANDBOX_FORCE_EMULATION", raising=False)
-        timeout = 120
+        timeout = _TIMEOUT_HWACCEL
     else:
         monkeypatch.setenv("EXEC_SANDBOX_FORCE_EMULATION", "true")
-        timeout = 240
+        timeout = _TIMEOUT_TCG
 
     config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=timeout)
     async with Scheduler(config) as sched:
@@ -303,7 +330,7 @@ async def dual_scheduler(
 
 @pytest.fixture
 def vm_settings(images_dir: Path):
-    """Settings for VM tests with hardware acceleration."""
+    """Settings for VM tests (auto-detects KVM/HVF, falls back to TCG)."""
     return Settings(
         base_images_dir=images_dir,
         kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
@@ -312,7 +339,11 @@ def vm_settings(images_dir: Path):
 
 @pytest.fixture
 async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
-    """VmManager with hardware acceleration (started).
+    """VmManager with auto-detected acceleration (started).
+
+    Uses KVM/HVF when available, falls back to TCG.  Tests using this
+    fixture should pass ``execute_timeout`` to ``vm.execute()`` instead
+    of hardcoding a timeout — see ``_DEFAULT_TEST_TIMEOUT``.
 
     Automatically calls start() to start the overlay pool daemon,
     and stop() for cleanup.

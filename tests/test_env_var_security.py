@@ -277,14 +277,14 @@ class TestGuestAgentControlCharValidation:
         )
         assert exit_code != 0 or "control character" in stderr.lower()
 
-    async def test_tab_allowed_by_rust(self, running_vm: "QemuVM") -> None:
+    async def test_tab_allowed_by_rust(self, running_vm: "QemuVM", execute_timeout: int) -> None:
         """Tab character is allowed by Rust guest-agent."""
         # Use model_construct to bypass Pydantic, proving Rust allows tabs
         request = ExecuteCodeRequest.model_construct(
             action="exec",
             language=Language.PYTHON,
             code="import os; print(repr(os.environ.get('FOO')))",
-            timeout=30,
+            timeout=execute_timeout,
             env_vars={"FOO": "col1\tcol2"},
         )
 
@@ -298,7 +298,7 @@ class TestGuestAgentControlCharValidation:
 
         stdout = ""
         exit_code = -1
-        async for msg in running_vm.channel.stream_messages(request, timeout=30):
+        async for msg in running_vm.channel.stream_messages(request, timeout=execute_timeout):
             if isinstance(msg, OutputChunkMessage) and msg.type == "stdout":
                 stdout += msg.chunk
             elif isinstance(msg, ExecutionCompleteMessage):
