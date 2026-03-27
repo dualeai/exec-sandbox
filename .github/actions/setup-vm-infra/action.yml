@@ -111,10 +111,26 @@ runs:
       if: inputs.os == 'linux' && inputs.setup-cgroups == 'true'
       shell: bash
       run: |
-        # Create cgroup directory for VM resource limits
+        # cgroupv2 delegation setup for VM resource limits.
+        #
+        # Hierarchy:
+        #   /sys/fs/cgroup/
+        #   └── code-exec/                  ← delegated root (runner-owned)
+        #       ├── cgroup.subtree_control  ← +memory +cpu +pids
+        #       ├── runner/                 ← runner process lives here
+        #       └── exec-sandbox/           ← created at runtime by exec_sandbox
+        #           └── session-xxx/        ← per-VM cgroup with resource limits
+        #
+        # The runner process must be moved into code-exec/runner/ (via sudo,
+        # before any sandboxed execution like CodSpeed/valgrind). Once inside,
+        # all child processes inherit the cgroup. exec_sandbox then moves QEMU
+        # from code-exec/runner/ to code-exec/exec-sandbox/session-xxx/.
+        # This intra-subtree migration only needs write to the common ancestor
+        # (code-exec/cgroup.procs), which is runner-owned — no sudo required.
+        # Ref: https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation
+        #
         sudo mkdir -p /sys/fs/cgroup/code-exec
-        # Enable required controllers (memory, cpu, pids) at root and code-exec levels
-        # This allows nested cgroups like /sys/fs/cgroup/code-exec/{tenant}/{vm}
+        # Enable controllers at root and code-exec levels for nested VM cgroups
         echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
         echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/code-exec/cgroup.subtree_control
         # Create runner cgroup (cgroups with subtree_control can't have processes directly)

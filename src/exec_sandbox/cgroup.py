@@ -5,6 +5,29 @@ Provides:
 - ulimit fallback for environments without cgroups (Docker Desktop, macOS)
 - Graceful degradation when cgroups unavailable
 
+Delegation model
+----------------
+The orchestrator process must live inside the delegated cgroup subtree
+**before** spawning VMs.  cgroupv2 PID migration (writing a PID to
+``cgroup.procs``) requires two permission checks:
+
+1. VFS write permission on the **destination** ``cgroup.procs`` — checked
+   at ``open()`` time by the normal VFS path.
+2. Write permission on the ``cgroup.procs`` of the **common ancestor** of
+   the source and destination cgroups — checked at ``write()`` time by the
+   kernel's ``cgroup_procs_write_permission()`` using the credentials
+   captured at open.
+
+When the orchestrator is in ``code-exec/runner/`` and the VM cgroup is
+``code-exec/exec-sandbox/session-xxx/``, the common ancestor is
+``code-exec/`` — owned by the runner user, so both checks pass without
+root privileges.
+
+If the orchestrator is outside the subtree (e.g. in a system slice), the
+common ancestor is ``/sys/fs/cgroup/`` (root-owned) and check 2 fails
+with EACCES.  The CI workflow handles this by moving the runner process
+into the subtree via ``sudo`` before any sandboxed execution.
+
 References:
 - Kernel cgroup v2 docs: https://docs.kernel.org/admin-guide/cgroup-v2.html
 - pids.max limits both processes AND threads (goroutines in Go)
@@ -55,6 +78,9 @@ ERRNO_READ_ONLY_FILESYSTEM: Final[int] = 30
 
 ERRNO_PERMISSION_DENIED: Final[int] = 13
 """errno for permission denied (EACCES)."""
+
+ERRNO_OPERATION_NOT_PERMITTED: Final[int] = 1
+"""errno for operation not permitted (EPERM)."""
 
 
 # cgroup v1 "unlimited" sentinel: values at or above this threshold are treated
@@ -432,9 +458,12 @@ async def setup_cgroup(
         async with aiofiles.open(cgroup_path / "pids.max", "w") as f:
             await f.write(str(CGROUP_PIDS_LIMIT))
 
-        # Verify cgroup.procs is writable (required for attaching processes)
-        # Writing to control files (memory.max, etc.) requires different privileges
-        # than writing to cgroup.procs, which needs proper systemd delegation
+        # Sanity-check that we can open cgroup.procs for writing.
+        # This validates the VFS permission (check 1 in module docstring) but
+        # NOT the common-ancestor check (check 2), which fires at write() time
+        # inside the kernel's cgroup_attach_task().  If the orchestrator is
+        # outside the delegated subtree, this passes but attach_to_cgroup()
+        # fails later — attach_if_available() handles that gracefully.
         async with aiofiles.open(cgroup_path / "cgroup.procs", "a") as f:
             pass  # Just test we can open for writing
 
@@ -460,36 +489,69 @@ async def setup_cgroup(
 async def attach_to_cgroup(cgroup_path: Path, pid: int) -> None:
     """Attach process to cgroup.
 
+    Writes *pid* to ``cgroup_path/cgroup.procs``.  The kernel checks
+    write permission on the **common ancestor's** ``cgroup.procs`` at
+    write time (see module docstring for the full delegation model).
+    If the orchestrator lives inside the delegated subtree, the common
+    ancestor is runner-owned and no root privileges are needed.
+
     Args:
         cgroup_path: cgroup directory
         pid: Process ID to attach
 
     Raises:
-        VmDependencyError: Failed to attach process
+        VmDependencyError: Failed to attach process (e.g. EACCES when
+            the orchestrator is outside the delegated subtree)
     """
     try:
         async with aiofiles.open(cgroup_path / "cgroup.procs", "w") as f:
             await f.write(str(pid))
-    except (OSError, PermissionError) as e:
+    except OSError as e:  # includes PermissionError (EACCES)
         raise VmDependencyError(f"Failed to attach PID {pid} to cgroup: {e}") from e
 
 
 async def attach_if_available(cgroup_path: Path | None, pid: int | None) -> bool:
-    """Attach process to cgroup if available.
+    """Attach process to cgroup if available, gracefully degrading on failure.
 
-    Convenience wrapper that handles None values and availability check.
+    Convenience wrapper that handles None values, availability check,
+    and permission errors.  The latter can occur when the orchestrator
+    process is outside the delegated cgroup subtree (e.g. sandboxed CI
+    runners like CodSpeed/valgrind where the initial ``sudo`` move into
+    the subtree was not possible).  In that case resource limits are not
+    enforced for this VM, but execution continues.
 
     Args:
         cgroup_path: cgroup directory (may be dummy path if unavailable)
         pid: Process ID to attach (may be None if process failed to start)
 
     Returns:
-        True if attached, False if cgroups unavailable or pid is None
+        True if attached, False if cgroups unavailable, pid is None,
+        or attachment failed
     """
     if not is_cgroup_available(cgroup_path) or pid is None:
         return False
-    await attach_to_cgroup(cgroup_path, pid)  # type: ignore[arg-type]
-    return True
+    try:
+        await attach_to_cgroup(cgroup_path, pid)  # type: ignore[arg-type]
+        return True
+    except VmDependencyError as e:
+        # Only degrade gracefully for permission errors (delegation not
+        # possible).  Other errors (ENOENT, EINVAL) indicate a real fault
+        # and should propagate.
+        cause = e.__cause__
+        if isinstance(cause, OSError) and cause.errno in (
+            ERRNO_PERMISSION_DENIED,
+            ERRNO_OPERATION_NOT_PERMITTED,
+        ):
+            logger.warning(
+                "cgroup attachment failed, resource limits not enforced for this VM",
+                extra={
+                    "cgroup_path": str(cgroup_path),
+                    "pid": pid,
+                    "errno": cause.errno,
+                },
+            )
+            return False
+        raise
 
 
 # =============================================================================

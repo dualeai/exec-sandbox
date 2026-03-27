@@ -437,11 +437,12 @@ jobs:
         if: matrix.platform.os == 'linux'
         timeout-minutes: 90
         run: |
-          # Move into delegated cgroup subtree so QEMU child processes can be managed
+          # Enter the delegated cgroup subtree. cgroupv2 PID migration requires
+          # write to the common ancestor's cgroup.procs — this initial move from
+          # the system cgroup needs sudo (root owns /sys/fs/cgroup/cgroup.procs).
+          # Once inside, exec_sandbox moves QEMU within the subtree without sudo.
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          # Remove nproc limit for current shell (PAM limits only apply to new logins)
-          # QEMU creates many threads per VM; parallel tests can exhaust default limits
-          # prlimit requires sudo to raise limits above current hard limit
+          # Raise nproc for this shell (PAM limits only apply to new logins).
           sudo prlimit --pid $$ --nproc=unlimited:unlimited
           # Activate qemu-vm group membership for socket access (chardev sockets are 0660)
           # Sudo tests require elevated privileges
@@ -532,10 +533,23 @@ jobs:
 
       - name: Prepare benchmark environment
         run: |
-          # Raise nproc limit on the runner process so the CodSpeed child inherits it.
-          # PAM limits only apply to new logins; prlimit modifies the live process.
-          # CodSpeed's sandbox blocks setuid binaries (sudo, sg), so this must happen
-          # in a normal step before the CodSpeed action.
+          # CodSpeed instruments benchmarks under valgrind (simulation mode).
+          # The kernel strips setuid/setgid bits on execve() for ptrace-traced
+          # processes, so sudo and sg are blocked inside the CodSpeed action.
+          # All privileged setup must happen here, in a normal step before CodSpeed.
+          #
+          # 1. Move the runner process ($PPID) into the delegated cgroup subtree.
+          #    cgroupv2 PID migration requires write access to the common ancestor's
+          #    cgroup.procs.  Once the runner is inside code-exec/runner/, all child
+          #    processes (CodSpeed → valgrind → pytest → exec_sandbox → QEMU)
+          #    inherit that cgroup via fork().  Subsequent intra-subtree moves
+          #    (e.g. code-exec/runner/ → code-exec/exec-sandbox/session-xxx/) only
+          #    need write to code-exec/cgroup.procs, which is runner-owned.
+          #    Ref: https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation
+          echo $PPID | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          #
+          # 2. Raise nproc limit on the runner process so CodSpeed inherits it.
+          #    PAM limits only apply to new logins; prlimit modifies the live process.
           sudo prlimit --pid $PPID --nproc=unlimited:unlimited
 
       - name: Run benchmarks
@@ -544,10 +558,9 @@ jobs:
         with:
           mode: simulation,memory
           run: |
-            # Move into delegated cgroup subtree so QEMU child processes can be managed.
-            # No sudo needed — cgroup is owned by runner (setup-vm-infra chowns it).
-            echo $$ > /sys/fs/cgroup/code-exec/runner/cgroup.procs
-            # Run benchmarks directly. Inside the CodSpeed sandbox, sudo/sg are blocked,
-            # so probe_sudo_as_qemu_vm() returns False and QEMU runs as the current user
-            # (sockets are runner-owned, no group membership needed).
+            # No privileged setup needed here — the pre-step moved the runner
+            # process into the delegated cgroup and raised nproc.  This process
+            # inherits both via fork().  Under ptrace, probe_sudo_as_qemu_vm()
+            # returns False, so QEMU runs as the current user (sockets are
+            # runner-owned, no sg/group membership needed).
             uv run pytest tests/benchmarks/ --codspeed -v --no-cov -p no:xdist -o 'addopts='
