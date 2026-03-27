@@ -533,15 +533,13 @@ jobs:
 
       - name: Prepare benchmark environment
         run: |
-          # CodSpeed instruments benchmarks under valgrind (simulation mode).
-          # The kernel strips setuid/setgid bits on execve() for ptrace-traced
-          # processes, so sudo and sg are blocked inside the CodSpeed action.
+          # CodSpeed memory mode uses memtrack which may restrict setuid/ptrace.
           # All privileged setup must happen here, in a normal step before CodSpeed.
           #
           # 1. Move the runner process ($PPID) into the delegated cgroup subtree.
           #    cgroupv2 PID migration requires write access to the common ancestor's
           #    cgroup.procs.  Once the runner is inside code-exec/runner/, all child
-          #    processes (CodSpeed → valgrind → pytest → exec_sandbox → QEMU)
+          #    processes (CodSpeed → pytest → exec_sandbox → QEMU)
           #    inherit that cgroup via fork().  Subsequent intra-subtree moves
           #    (e.g. code-exec/runner/ → code-exec/exec-sandbox/session-xxx/) only
           #    need write to code-exec/cgroup.procs, which is runner-owned.
@@ -556,7 +554,7 @@ jobs:
         timeout-minutes: 30
         uses: CodSpeedHQ/action@1c8ae4843586d3ba879736b7f6b7b0c990757fab # v4
         with:
-          mode: simulation,memory
+          mode: walltime,memory
           run: |
             # No privileged setup needed here — the pre-step moved the runner
             # process into the delegated cgroup and raised nproc.  This process
