@@ -2286,6 +2286,13 @@ class TestNetdevReconnectIntegration:
         This specifically tests the DNS resolution path since the original issue
         was DNS failures due to socket EOF between QEMU and gvproxy.
         """
+        from tenacity import (
+            AsyncRetrying,
+            retry_if_exception_type,
+            stop_after_attempt,
+            wait_random_exponential,
+        )
+
         from exec_sandbox.gvproxy import start_gvproxy
         from exec_sandbox.models import Language
 
@@ -2298,22 +2305,22 @@ class TestNetdevReconnectIntegration:
             allowed_domains=["example.com"],
         )
 
+        dns_code = "import socket\nip = socket.gethostbyname('example.com')\nprint(f'DNS_OK:{ip}')"
+
         try:
-            # Verify initial DNS resolution (retry for transient failures
-            # under TCG emulation).
-            last_err = ""
-            for attempt in range(3):
-                if attempt:
-                    await asyncio.sleep(2)
-                result1 = await vm.execute(
-                    code=("import socket\nip = socket.gethostbyname('example.com')\nprint(f'INITIAL_DNS_OK:{ip}')"),
-                    timeout_seconds=30,
-                )
-                if result1.exit_code == 0 and "INITIAL_DNS_OK:" in result1.stdout:
-                    break
-                last_err = result1.stderr
-            else:
-                pytest.fail(f"Initial DNS failed after 3 attempts: {last_err}")
+            # Verify initial DNS resolution (retry with jitter for TCG
+            # emulation + pytest -n auto CPU contention on CI).
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(5),
+                wait=wait_random_exponential(min=1, max=10),
+                retry=retry_if_exception_type(AssertionError),
+                reraise=True,
+            ):
+                with attempt:
+                    result1 = await vm.execute(code=dns_code, timeout_seconds=30)
+                    assert result1.exit_code == 0 and "DNS_OK:" in result1.stdout, (
+                        f"Initial DNS failed: {result1.stderr}"
+                    )
 
             # Kill and restart gvproxy
             assert vm.gvproxy_proc is not None
@@ -2332,20 +2339,19 @@ class TestNetdevReconnectIntegration:
             )
             vm.gvproxy_proc = new_proc
 
-            # Verify DNS still works after reconnect (retry with backoff
+            # Verify DNS still works after reconnect (retry with jitter
             # for CI CPU contention, same rationale as TLS reconnect test).
-            last_err = ""
-            for attempt in range(5):
-                await asyncio.sleep(2 + attempt)
-                result2 = await vm.execute(
-                    code=("import socket\nip = socket.gethostbyname('example.com')\nprint(f'RECONNECT_DNS_OK:{ip}')"),
-                    timeout_seconds=30,
-                )
-                if result2.exit_code == 0 and "RECONNECT_DNS_OK:" in result2.stdout:
-                    break
-                last_err = result2.stderr
-            else:
-                pytest.fail(f"DNS after reconnect failed after 5 attempts: {last_err}")
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(5),
+                wait=wait_random_exponential(min=2, max=15),
+                retry=retry_if_exception_type(AssertionError),
+                reraise=True,
+            ):
+                with attempt:
+                    result2 = await vm.execute(code=dns_code, timeout_seconds=30)
+                    assert result2.exit_code == 0 and "DNS_OK:" in result2.stdout, (
+                        f"DNS after reconnect failed: {result2.stderr}"
+                    )
 
         finally:
             await vm_manager.destroy_vm(vm)
