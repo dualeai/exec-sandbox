@@ -53,7 +53,18 @@ runs:
       run: |
         # Restore executable permissions (stripped by actions/download-artifact)
         chmod +x ~/qemu-build/bin/*
-        # Copy pre-built QEMU to /usr/local/ (takes precedence over /usr/bin/ in PATH)
+        # Uninstall any system-packaged QEMU to prevent PATH shadowing.
+        # Some runners (e.g. CodSpeed macro) ship Ubuntu's qemu-system-arm package,
+        # which lacks --enable-seccomp.  Just deleting the binaries (rm -f /usr/bin/qemu-*)
+        # is insufficient: the package remains registered in dpkg, so any subsequent
+        # apt operation (e.g. CodSpeed's valgrind .deb install via apt-get) can
+        # reinstall the missing files.  A clean apt remove ensures dpkg no longer
+        # considers the package installed.
+        if dpkg -l 'qemu-system-*' 2>/dev/null | grep -q '^ii'; then
+            echo "Removing system QEMU packages..."
+            sudo apt-get remove -y 'qemu-system-*' 2>/dev/null || true
+        fi
+        # Copy pre-built QEMU to /usr/local/
         sudo cp -a ~/qemu-build/bin/* /usr/local/bin/
         sudo cp -a ~/qemu-build/share/qemu /usr/local/share/qemu 2>/dev/null || true
 
