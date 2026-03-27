@@ -17,10 +17,10 @@ runs:
   using: composite
   steps:
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v4
+      uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
 
     - name: Set up Docker Buildx
-      uses: useblacksmith/setup-docker-builder@v1
+      uses: useblacksmith/setup-docker-builder@44c43c0599d417cb00afb09a18ee099347a34b70 # v1
       with:
         github-token: ${{ github.token }}
 
@@ -41,7 +41,7 @@ runs:
 
     - name: Download previous build
       if: steps.latest-run.outputs.run_id != ''
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
       with:
         name: vm-images-${{ inputs.arch == 'x86_64' && 'x64' || 'arm64' }}
         path: images/dist/
