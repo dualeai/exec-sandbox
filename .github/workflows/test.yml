@@ -199,7 +199,7 @@ jobs:
 
   build-guest-agent:
     name: Build / guest-agent (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-2vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -232,7 +232,7 @@ jobs:
 
   build-tiny-init:
     name: Build / tiny-init (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-2vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
