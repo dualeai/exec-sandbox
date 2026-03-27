@@ -22,7 +22,7 @@ from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
-from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available
+from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available, probe_cache
 from exec_sandbox.vm_manager import VmManager
 
 logger = logging.getLogger(__name__)
@@ -519,6 +519,26 @@ JS_SAFETY = (
 # ============================================================================
 # Test Utilities
 # ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _reset_probe_caches() -> Iterator[None]:
+    """Reset all system-probe caches before and after every test.
+
+    Tests that mock QEMU subprocess output (version, accelerators, sandbox)
+    populate ``probe_cache`` via the ``@_async_cached_probe`` decorator.
+    Without a post-test reset, a subsequent test on the same pytest-xdist
+    worker inherits the stale value — e.g. ``qemu_version=(8,2,0)`` from a
+    mock causes real integration tests to raise ``VmDependencyError``, or
+    ``kvm=True`` from a mock causes ``-accel kvm`` on macOS (crash).
+
+    Resetting *all* attributes (not just a subset) is intentional: it
+    eliminates the need for per-class fixtures and prevents future probes
+    from being forgotten.
+    """
+    probe_cache.reset()
+    yield
+    probe_cache.reset()
 
 
 @pytest.fixture(autouse=True)

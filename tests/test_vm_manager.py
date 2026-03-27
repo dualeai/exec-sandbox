@@ -152,11 +152,6 @@ class TestQemuAcceleratorProbe:
     - Layer 2: QEMU binary level (what accelerators QEMU actually supports)
     """
 
-    @pytest.fixture(autouse=True)
-    def clear_qemu_cache(self) -> None:
-        """Clear QEMU accelerator cache before each test."""
-        probe_cache.reset("qemu_accels")
-
     # ========================================================================
     # Normal Cases - Happy path scenarios
     # ========================================================================
@@ -368,11 +363,6 @@ class TestQemuSandboxProbe:
     - FileNotFoundError / OSError → graceful False
     """
 
-    @pytest.fixture(autouse=True)
-    def clear_sandbox_cache(self) -> None:
-        """Clear QEMU sandbox cache before each test."""
-        probe_cache.reset("qemu_sandbox")
-
     # ========================================================================
     # Normal Cases
     # ========================================================================
@@ -577,11 +567,6 @@ class TestQemuVersionProbe:
     - QEMU 8.0-9.1: reconnect (seconds)
     """
 
-    @pytest.fixture(autouse=True)
-    def clear_version_cache(self) -> None:
-        """Clear QEMU version cache before each test."""
-        probe_cache.reset("qemu_version")
-
     # ========================================================================
     # Normal Cases - Happy path scenarios
     # ========================================================================
@@ -774,11 +759,6 @@ class TestNetdevReconnect:
     The reconnect parameter helps recover from transient socket disconnections
     between QEMU and gvproxy (which can cause DNS resolution failures).
     """
-
-    @pytest.fixture(autouse=True)
-    def clear_version_cache(self) -> None:
-        """Clear QEMU version cache before each test."""
-        probe_cache.reset("qemu_version")
 
     async def test_netdev_uses_reconnect_ms_for_qemu_9_2(self, vm_settings, tmp_path: Path) -> None:
         """QEMU 9.2+ uses reconnect-ms parameter."""
@@ -987,11 +967,6 @@ class TestQemuNicNone:
     this cold-start overhead.
     """
 
-    @pytest.fixture(autouse=True)
-    def clear_version_cache(self) -> None:
-        """Clear QEMU version cache before each test."""
-        probe_cache.reset("qemu_version")
-
     @pytest.fixture
     async def workdir(self):
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
@@ -1093,11 +1068,6 @@ class TestRunWithExitParent:
     when its parent dies (PR_SET_PDEATHSIG on Linux, kqueue on macOS).
     """
 
-    @pytest.fixture(autouse=True)
-    def clear_version_cache(self) -> None:
-        """Clear QEMU version cache before each test."""
-        probe_cache.reset("qemu_version")
-
     async def test_run_with_exit_parent_for_qemu_10_2(self, vm_settings, tmp_path: Path) -> None:
         """QEMU 10.2+ gets -run-with exit-with-parent=on."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
@@ -1174,11 +1144,6 @@ class TestRunWithExitParent:
 class TestSmpCpuCores:
     """Verify -smp flag scales with cpu_cores parameter."""
 
-    @pytest.fixture(autouse=True)
-    def clear_version_cache(self) -> None:
-        """Clear QEMU version cache before each test."""
-        probe_cache.reset("qemu_version")
-
     @pytest.mark.parametrize("cpu_cores", [1, 2, 4])
     async def test_smp_matches_cpu_cores(self, vm_settings, cpu_cores: int) -> None:
         """-smp N matches the cpu_cores parameter."""
@@ -1214,14 +1179,8 @@ class _QemuCmdTestBase:
     """Base class for build_qemu_cmd() unit tests with shared fixtures.
 
     Provides:
-    - clear_caches: autouse fixture that resets probe caches between tests
     - workdir: async fixture providing a temporary VmWorkingDirectory
     """
-
-    @pytest.fixture(autouse=True)
-    def clear_caches(self) -> None:
-        probe_cache.reset("qemu_version")
-        probe_cache.reset("tsc_deadline")
 
     @pytest.fixture
     async def workdir(self):
@@ -2360,12 +2319,6 @@ class TestNetdevReconnectIntegration:
 class TestTwoLayerKvmDetection:
     """Tests for 2-layer KVM detection (kernel + QEMU verification)."""
 
-    @pytest.fixture(autouse=True)
-    def clear_caches(self) -> None:
-        """Clear all relevant caches before each test."""
-        probe_cache.reset("kvm")
-        probe_cache.reset("qemu_accels")
-
     async def test_kvm_fails_when_qemu_lacks_kvm_support(self) -> None:
         """KVM detection fails if QEMU doesn't have KVM compiled in."""
         # Mock Layer 1 passing (kernel check)
@@ -2423,12 +2376,6 @@ class TestTwoLayerKvmDetection:
 class TestTwoLayerHvfDetection:
     """Tests for 2-layer HVF detection (kernel + QEMU verification)."""
 
-    @pytest.fixture(autouse=True)
-    def clear_caches(self) -> None:
-        """Clear all relevant caches before each test."""
-        probe_cache.reset("hvf")
-        probe_cache.reset("qemu_accels")
-
     async def test_hvf_fails_when_qemu_lacks_hvf_support(self) -> None:
         """HVF detection fails if QEMU doesn't have HVF compiled in."""
         with patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec:
@@ -2480,13 +2427,6 @@ class TestTwoLayerHvfDetection:
 
 class TestCheckHwaccelAvailable:
     """Tests for check_hwaccel_available()."""
-
-    @pytest.fixture(autouse=True)
-    def clear_caches(self) -> None:
-        """Clear all relevant caches before each test."""
-        probe_cache.reset("kvm")
-        probe_cache.reset("hvf")
-        probe_cache.reset("qemu_accels")
 
     async def test_returns_boolean(self) -> None:
         """check_hwaccel_available returns a boolean."""
