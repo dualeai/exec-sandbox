@@ -95,7 +95,7 @@ jobs:
       - uses: actions/checkout@v6.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.24"
           cache-dependency-path: gvproxy-wrapper/go.sum
@@ -160,7 +160,7 @@ jobs:
         run: make build-qemu
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-${{ matrix.arch }}-${{ matrix.os-version }}
           path: ~/qemu-build/
@@ -191,7 +191,7 @@ jobs:
         uses: ./.github/actions/build-gvproxy-wrapper
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gvproxy-wrapper-${{ matrix.os }}-${{ matrix.arch }}
           path: gvproxy-wrapper/bin/
@@ -222,7 +222,7 @@ jobs:
           rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: guest-agent-${{ matrix.arch }}
           path: |
@@ -255,7 +255,7 @@ jobs:
           rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tiny-init-${{ matrix.arch }}
           path: |
@@ -279,13 +279,13 @@ jobs:
       - uses: actions/checkout@v6.0.1
 
       - name: Download guest-agent
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: guest-agent-${{ matrix.arch }}
           path: images/dist/
 
       - name: Download tiny-init
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: tiny-init-${{ matrix.arch }}
           path: images/dist/
@@ -301,7 +301,7 @@ jobs:
           alpine-version: ${{ steps.alpine.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-images-${{ matrix.arch }}
           path: |
@@ -344,7 +344,7 @@ jobs:
       - uses: actions/checkout@v6.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.24"
           cache-dependency-path: gvproxy-wrapper/go.sum
@@ -385,13 +385,13 @@ jobs:
       - uses: actions/checkout@v6.0.1
 
       - name: Download gvproxy-wrapper
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gvproxy-wrapper-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vm-images-${{ matrix.platform.arch }}
           path: images/dist/
@@ -483,13 +483,13 @@ jobs:
       # --- Download build artifacts (same as test-python) ---
 
       - name: Download gvproxy-wrapper
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gvproxy-wrapper-linux-arm64
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vm-images-arm64
           path: images/dist/

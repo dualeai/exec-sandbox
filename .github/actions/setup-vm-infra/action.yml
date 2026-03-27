@@ -42,7 +42,7 @@ runs:
 
     - name: Download QEMU build (Linux)
       if: inputs.os == 'linux'
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: qemu-${{ inputs.arch }}-${{ inputs.os-version }}
         path: ~/qemu-build/
