@@ -4242,7 +4242,7 @@ class TestWaitForGuest:
         - Error message contains "clean exit"
         - Error context includes host_os for diagnostics
         """
-        vm = self._make_vm(returncode=0)
+        vm = self._make_vm(returncode=0, connect_side_effect=OSError("connection refused"))
 
         with pytest.raises(VmQemuCrashError, match="clean exit") as exc_info:
             await vm.wait_for_guest(timeout=5)
@@ -4253,7 +4253,7 @@ class TestWaitForGuest:
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
     async def test_tcg_clean_exit_during_boot_raises_vm_error(self, _mock_os, _mock_accel) -> None:
         """TCG exits with code 0 during boot (ARM64 timing race)."""
-        vm = self._make_vm(returncode=0)
+        vm = self._make_vm(returncode=0, connect_side_effect=OSError("connection refused"))
 
         with pytest.raises(VmQemuCrashError):
             await vm.wait_for_guest(timeout=5)
