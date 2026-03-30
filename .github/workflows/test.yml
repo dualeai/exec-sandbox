@@ -167,7 +167,7 @@ jobs:
           retention-days: 1
 
   build-gvproxy-wrapper:
-    name: Build / gvproxy-wrapper (${{ matrix.os }}/${{ matrix.arch }})
+    name: Build / gvproxy-wrapper (${{ matrix.os }}${{ matrix.os_version && format('-{0}', matrix.os_version) || '' }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -179,11 +179,13 @@ jobs:
             arch: arm64
             runner: blacksmith-4vcpu-ubuntu-2404-arm
           - os: macos
-            arch: x64
-            runner: macos-15-intel
+            arch: arm64
+            os_version: "15"
+            runner: blacksmith-6vcpu-macos-15
           - os: macos
             arch: arm64
-            runner: macos-26
+            os_version: "26"
+            runner: blacksmith-6vcpu-macos-26
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -193,7 +195,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
-          name: gvproxy-wrapper-${{ matrix.os }}-${{ matrix.arch }}
+          name: gvproxy-wrapper-${{ matrix.os }}${{ matrix.os_version && format('-{0}', matrix.os_version) || '' }}-${{ matrix.arch }}
           path: gvproxy-wrapper/bin/
           retention-days: 1
 
@@ -357,7 +359,7 @@ jobs:
   # ==========================================================================
 
   test-python:
-    name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
+    name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}/${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
     needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
     env:
@@ -376,18 +378,20 @@ jobs:
             arch: arm64
             runner: blacksmith-8vcpu-ubuntu-2404-arm
           - os: macos
-            arch: x64
-            runner: macos-15-intel
+            arch: arm64
+            os_version: "15"
+            runner: blacksmith-12vcpu-macos-15
           - os: macos
             arch: arm64
-            runner: macos-26
+            os_version: "26"
+            runner: blacksmith-12vcpu-macos-26
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Download gvproxy-wrapper
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: gvproxy-wrapper-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+          name: gvproxy-wrapper-${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}-${{ matrix.platform.arch }}
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
