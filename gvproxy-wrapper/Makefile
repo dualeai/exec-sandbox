@@ -1,5 +1,8 @@
+JUNIT_XML ?= junit.xml
+
 install:
 	go mod download
+	go install gotest.tools/gotestsum@latest
 
 upgrade:
 	# Pin gvisor to upstream's version (avoid broken transitive upgrades)
@@ -18,7 +21,7 @@ test-static:
 	test -z "$$(gofmt -l .)"
 
 test-unit:
-	go test -v -race -coverprofile=coverage.out ./...
+	gotestsum --junitfile $(JUNIT_XML) -- -v -race -coverprofile=coverage.out ./...
 
 lint:
 	go fmt ./...
@@ -37,5 +40,5 @@ build-all:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o bin/gvproxy-wrapper-darwin-arm64 .
 
 clean:
-	rm -f coverage.out
+	rm -f coverage.out $(JUNIT_XML)
 	rm -rf bin

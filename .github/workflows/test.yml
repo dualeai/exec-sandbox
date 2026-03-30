@@ -339,6 +339,8 @@ jobs:
   test-go:
     name: Test / Go
     runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    env:
+      JUNIT_XML: junit-gvproxy-wrapper.xml
     defaults:
       run:
         working-directory: gvproxy-wrapper
@@ -351,8 +353,21 @@ jobs:
           go-version: "1.24"
           cache-dependency-path: gvproxy-wrapper/go.sum
 
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
       - name: Unit tests
         run: make test-unit
+        env:
+          JUNIT_XML: ${{ env.JUNIT_XML }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: ${{ env.JUNIT_XML }}
+          path: gvproxy-wrapper/${{ env.JUNIT_XML }}
+          if-no-files-found: ignore
 
   # ==========================================================================
   # Integration Tests - Run after builds complete
@@ -365,6 +380,8 @@ jobs:
     env:
       # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # JUnit XML for Blacksmith test analytics (auto-detected on disk)
+      JUNIT_XML: junit-exec-sandbox-${{ matrix.python-version }}-${{ matrix.test-type }}-${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}-${{ matrix.platform.arch }}.xml
     strategy:
       fail-fast: false
       matrix:
@@ -440,6 +457,8 @@ jobs:
       - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'
         timeout-minutes: 90
+        env:
+          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
         run: |
           # Enter the delegated cgroup subtree. cgroupv2 PID migration requires
           # write to the common ancestor's cgroup.procs — this initial move from
@@ -451,7 +470,7 @@ jobs:
           # Activate qemu-vm group membership for socket access (chardev sockets are 0660)
           # Sudo tests require elevated privileges
           if [ "${{ matrix.test-type }}" = "sudo" ]; then
-            sudo env "PATH=$PATH" sg qemu-vm -c "make test-${{ matrix.test-type }}"
+            sudo env "PATH=$PATH" "PYTEST_ADDOPTS=$PYTEST_ADDOPTS" sg qemu-vm -c "make test-${{ matrix.test-type }}"
           else
             sg qemu-vm -c "make test-${{ matrix.test-type }}"
           fi
@@ -459,12 +478,22 @@ jobs:
       - name: Run tests (macOS)
         if: matrix.platform.os == 'macos'
         timeout-minutes: 90
+        env:
+          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
         run: |
           if [ "${{ matrix.test-type }}" = "sudo" ]; then
-            sudo make test-${{ matrix.test-type }}
+            sudo env "PYTEST_ADDOPTS=$PYTEST_ADDOPTS" make test-${{ matrix.test-type }}
           else
             make test-${{ matrix.test-type }}
           fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: ${{ env.JUNIT_XML }}
+          path: ${{ env.JUNIT_XML }}
+          if-no-files-found: ignore
 
   # ==========================================================================
   # CodSpeed Benchmarks — real VM operations
