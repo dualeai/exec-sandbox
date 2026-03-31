@@ -82,6 +82,12 @@ Repository = "https://github.com/dualeai/exec-sandbox.git"
 Changelog = "https://github.com/dualeai/exec-sandbox/releases"
 Issues = "https://github.com/dualeai/exec-sandbox/issues"
 
+[tool.uv]
+# Supply chain security: reject packages published less than 7 days ago.
+# Protects against typosquatting, account compromise, and dependency confusion
+# by ensuring every release has survived a public quarantine window.
+exclude-newer = "7 days"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/exec_sandbox"]
 

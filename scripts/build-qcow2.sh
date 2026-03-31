@@ -344,6 +344,7 @@ create_python_rootfs() {
         /rootfs/usr/local/bin/uv pip install \
             --python /rootfs/opt/python/bin/python3 \
             --target /rootfs/usr/lib/python3/site-packages \
+            --exclude-newer "7 days" \
             "cloudpickle==$CLOUDPICKLE_VERSION"
 
     # Verify jemalloc is installed at the expected path (LD_PRELOAD in guest-agent)
