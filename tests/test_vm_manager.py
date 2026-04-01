@@ -1163,9 +1163,9 @@ class TestSmpCpuCores:
                     allow_network=False,
                 )
 
-            # Find -smp value
+            # Find -smp value (maxcpus capped to prevent QEMU allocating extra vCPU structs)
             smp_idx = cmd.index("-smp")
-            assert cmd[smp_idx + 1] == str(cpu_cores)
+            assert cmd[smp_idx + 1] == f"{cpu_cores},maxcpus={cpu_cores}"
         finally:
             await workdir.cleanup()
 

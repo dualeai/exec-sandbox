@@ -71,15 +71,11 @@ pub(crate) fn setup_phase2_core() {
     apply_zram_vm_tuning();
     // Readahead tuning for virtio-blk + EROFS.
     //
-    // EROFS pcluster is 16KB (-C16384). We set readahead to 128KB (8 pclusters)
-    // to batch more data per virtio-blk request, which is a reasonable default for
-    // sequential workloads (Python/Bun startup loads .pyc/.so files in order).
-    //
-    // NOTE: Tested 16KB vs 128KB readahead during cold-start investigation
-    // (session 4). No measurable wall-time improvement — the bottleneck is
-    // macOS Mach kernel hv_trap overhead (~360µs per VM exit), not I/O batch
-    // size. Kept at 128KB as a sensible default (fewer bio submissions for
-    // sequential reads), but this is NOT a cold-start fix.
+    // EROFS pcluster is 16KB (-C16384). Readahead set to 16KB (1 pcluster)
+    // to minimize per-file readahead buffer memory. Tested 128KB vs 16KB:
+    // no measurable wall-time difference (bottleneck is Mach kernel hv_trap
+    // overhead, not I/O batch size). Lower readahead = less kernel page cache
+    // pressure from speculative reads that may never be consumed.
     //
     // Set on all vd* block devices — device naming varies by architecture
     // (ARM MMIO enumerates in reverse order), so we don't assume vda=base.
@@ -91,7 +87,7 @@ pub(crate) fn setup_phase2_core() {
         let name = entry.file_name();
         if name.to_string_lossy().starts_with("vd") {
             let path = entry.path().join("queue/read_ahead_kb");
-            let _ = std::fs::write(path, "128");
+            let _ = std::fs::write(path, "16");
         }
     }
     // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()

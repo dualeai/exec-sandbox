@@ -151,13 +151,15 @@ Accounts for:
 - Safety buffer (~1s)
 Must be >= guest-agent TERM_GRACE_PERIOD_SECONDS (5s) + overhead."""
 
-SNAPSHOT_CREATION_MIN_MEMORY_MB: Final[int] = 384
+SNAPSHOT_CREATION_MIN_MEMORY_MB: Final[int] = 320
 """Minimum guest memory for snapshot creation VMs (package installation).
 
 Snapshot creation runs uv/bun (large binaries) inside the guest. Under TCG,
 the cold-start JIT translation of uv (~30MB Rust binary) plus TLS crypto drives
 RSS above 192MB, triggering zram compression which runs in emulated code (5-8x
-slower). 384MB provides headroom to avoid zram thrashing during pip/npm install."""
+slower). 320MB provides 128MB headroom above the TCG pressure threshold while
+saving 64MB per snapshot creation VM vs the previous 384MB. On KVM/HVF,
+192MB suffices but the minimum is kept conservative for TCG CI environments."""
 
 PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
 """Timeout for package installation in guest VM.
@@ -348,9 +350,14 @@ retrying page reclaim. 140MB provides ~50MB headroom after Bun overhead
 (zram swap provides additional buffer) while achieving 27% memory reduction
 vs 192MB."""
 
-BALLOON_TOLERANCE_MB: Final[int] = 40
+BALLOON_TOLERANCE_MB: Final[int] = 20
 """Tolerance in MB for balloon target polling. Allows early exit when balloon is
-'close enough' to target, accounting for kernel overhead and slow CI runners."""
+'close enough' to target, accounting for kernel overhead and slow CI runners.
+
+Reduced from 40 to 20: at tolerance=40 with target=140, balloon accepted guest
+memory at 180MB (only 12MB reclaimed from 192MB). At tolerance=20, balloon pushes
+to 160MB, reclaiming ~32MB vs ~12MB — 2.7x more memory freed per idle VM.
+Safe because the balloon falls back after 10 retries if target is unreachable."""
 
 BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
 """Timeout for balloon inflate operation (reducing guest memory for idle pool)."""
@@ -524,12 +531,16 @@ Beyond 2x, setup and exec p95 degrade sharply under sustained load (250 VMs):
 Not to be confused with DEFAULT_VM_CPU_OVERHEAD_CORES which is a per-VM additive
 constant for QEMU/gvproxy process CPU."""
 
-DEFAULT_HOST_MEMORY_RESERVE_RATIO: Final[float] = 0.1
+DEFAULT_HOST_MEMORY_RESERVE_RATIO: Final[float] = 0.08
 """Fraction of host memory reserved for OS and non-VM processes.
 Scales with host size:
-- 4GB host  → 400MB reserved  → 3.6GB for VMs
-- 16GB host → 1.6GB reserved  → 14.4GB for VMs
-- 64GB host → 6.4GB reserved  → 57.6GB for VMs"""
+- 4GB host  → 320MB reserved  → 3.7GB for VMs
+- 16GB host → 1.3GB reserved  → 14.7GB for VMs
+- 64GB host → 5.1GB reserved  → 58.9GB for VMs
+
+Reduced from 0.10 to 0.08: Python scheduler + OS overhead on a tuned
+server is ~300-800MB. At 0.08, a 16GB host reserves 1.3GB — ample for
+OS + scheduler. Frees ~2% more host memory for VM admission."""
 
 DEFAULT_HOST_CPU_RESERVE_CORES: Final[float] = 0.5
 """CPU cores reserved for host processes (OS, Python scheduler, qemu-storage-daemon).
@@ -542,7 +553,7 @@ DEFAULT_VM_CPU_CORES: Final[int] = 1
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
 
-DEFAULT_VM_MEMORY_OVERHEAD_MB: Final[int] = 96
+DEFAULT_VM_MEMORY_OVERHEAD_MB: Final[int] = 80
 """QEMU + gvproxy process memory overhead added to guest memory for admission and cgroup limits.
 
 Covers host-side process memory beyond guest RAM (QEMU VMM + gvproxy share a
@@ -558,10 +569,11 @@ Measured breakdown:
   - gvproxy (Go binary, network proxy)    : ~15-30 MB
   - Combined total                        : ~50-80 MB
 
-96 MB provides ~20-90% headroom above observed combined peak. Reduced from
-128 MB to improve admission controller accuracy (allows more concurrent VMs
-within the same memory budget). If OOM-kills are observed, bump this — but
-first verify with:
+80 MB matches observed combined peak (50-80 MB). Reduced from 96 MB (which
+had 20-90% headroom) to improve admission density — tighter accounting allows
+more concurrent VMs within the same memory budget. Saves 16 MB per VM in
+admission accounting (e.g., 100 VMs = 1.6 GB more headroom).
+If OOM-kills are observed, bump this — but first verify with:
   ``ps -o rss= -p <qemu_pid>`` and ``ps -o rss= -p <gvproxy_pid>``."""
 
 DEFAULT_VM_CPU_OVERHEAD_CORES: Final[float] = 0.25
@@ -578,15 +590,20 @@ Measured breakdown:
 Only applies when gvproxy is in the cgroup (networking enabled). Without gvproxy,
 overhead is ~5-10%, but we use 0.25 uniformly for simplicity."""
 
-DEFAULT_TCG_TB_CACHE_SIZE_MB: Final[int] = 256
+DEFAULT_TCG_TB_CACHE_SIZE_MB: Final[int] = 128
 """TCG translation block cache size in MB (must match tb-size in qemu_cmd.py).
 
 QEMU 5.0+ defaults to 1GB which causes OOM on CI runners with multiple VMs.
-256MB balances cache hit rate and memory usage:
+128MB balances cache hit rate and memory usage for density:
 - 32MB (old default): ~15 TB flushes, slower but minimal memory
-- 256MB (our choice): ~5 TB flushes, good balance for CI workloads
-- 512MB: ~3 TB flushes, better perf but higher memory pressure
-- 1GB (QEMU default): ~1 TB flush, best perf but OOM risk"""
+- 128MB (our choice): ~8 TB flushes, good density vs perf tradeoff
+- 256MB (previous):   ~5 TB flushes, higher memory per VM
+- 512MB:              ~3 TB flushes, better perf but higher pressure
+- 1GB (QEMU default): ~1 TB flush, best perf but OOM risk
+
+Reduced from 256→128 for density: sandbox workloads are short-lived code
+execution (not long-running compilation), so TB cache churn is low. Saves
+128MB per VM in cgroup limits and admission budget on TCG environments."""
 
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for

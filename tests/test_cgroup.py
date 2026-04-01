@@ -1019,8 +1019,8 @@ class TestCgroupConstants:
         assert 32 <= DEFAULT_VM_MEMORY_OVERHEAD_MB <= 128
 
     def test_tcg_cache_size_is_reasonable(self):
-        """TCG TB cache size is reasonable (256MB-1GB)."""
-        assert 256 <= DEFAULT_TCG_TB_CACHE_SIZE_MB <= 1024
+        """TCG TB cache size is reasonable (128MB-1GB, shrunk for VM density)."""
+        assert 128 <= DEFAULT_TCG_TB_CACHE_SIZE_MB <= 1024
 
     def test_pids_limit_is_reasonable(self):
         """PIDs limit is reasonable (50-500)."""

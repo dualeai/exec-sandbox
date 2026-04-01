@@ -302,7 +302,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-m",
             f"{int(memory_mb)}M",  # QEMU -m requires integer MB
             "-smp",
-            str(int(cpu_cores)),  # QEMU -smp requires integer vCPU count
+            f"{int(cpu_cores)},maxcpus={int(cpu_cores)}",  # Cap maxcpus to prevent QEMU allocating extra vCPU structs
             "-kernel",
             str(kernel_path),
             "-initrd",
@@ -320,7 +320,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #   noresume, raid, numa_balancing, i8042.*, random.trust_cpu,
             #   panic, rcupdate.rcu_expedited, edd, noautogroup, io_delay
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=0 swiotlb=0"
             # Disable page zeroing on alloc — KVM provides zero pages via shared zero
             # page, so guest-side zeroing is redundant for ephemeral VMs. Overrides
             # CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y at runtime. Saves 5-10% page faults.
@@ -335,8 +335,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + (" loglevel=7" if debug_boot else " quiet loglevel=0")
             # Skip timer calibration — safe in virtualized env with reliable TSC (10-30ms)
             + " no_timer_check"
-            # Keep expedited RCU after boot (built-in boot expediting covers boot phase)
-            + " rcupdate.rcu_normal_after_boot=0"
+            # Revert to normal (lazy) RCU after boot. Expedited RCU uses IPIs and
+            # per-CPU tracking for fast grace periods — useful during boot but wasteful
+            # for steady-state single-execution VMs. Normal RCU has lower memory and CPU
+            # overhead at the cost of ~10-30ms grace period latency (irrelevant for
+            # ephemeral workloads).
+            + " rcupdate.rcu_normal_after_boot=1"
             # /dev/kmsg access: on for debug, off for production
             + (" printk.devkmsg=on" if debug_boot else " printk.devkmsg=off")
             # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
@@ -394,6 +398,29 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + (" cpuidle.governor=haltpoll" if accel_type == AccelType.KVM else " cpuidle.off=1")
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
+            # Disable KASLR — the VM is the security boundary, not the guest kernel.
+            # Saves ~1-2MB page table memory and speeds boot by skipping randomization.
+            + " nokaslr"
+            # Disable CPU speculative execution mitigations in the guest kernel.
+            # The VM boundary (KVM/HVF) provides host isolation. Guest-side mitigations
+            # (Spectre, MDS, L1TF, etc.) add ~2-5% CPU overhead and allocate per-CPU
+            # tracking structures. Safe: host mitigations remain active.
+            + " mitigations=off"
+            # Limit possible CPUs to match -smp. Without this, QEMU machine types
+            # advertise many possible CPUs (virt: up to 512, microvm: up to 256),
+            # and the kernel allocates per-CPU data structures for ALL possible CPUs.
+            # nr_cpus=N caps possible CPUs, saving ~50-200KB per unused CPU slot.
+            + f" nr_cpus={int(cpu_cores)}"
+            # Disable lockup detection — saves per-CPU watchdog threads and timers.
+            # Ephemeral microVMs rely on host-side timeouts, not guest watchdogs.
+            + " nowatchdog"
+            # Disable cgroup controllers — minimal init with no systemd, no
+            # resource isolation needed inside the VM. Saves slab caches and
+            # per-CPU structures for each disabled controller.
+            + " cgroup_disable=memory,cpu,blkio,pids"
+            # Disable NUMA-aware workqueues — single-NUMA VM has no topology to
+            # optimize for. Saves per-NUMA-node workqueue pool allocation.
+            + " workqueue.disable_numa=1"
             + (" init.rw=1" if direct_write else "")
             + (" init.snap=1" if snapshot_drive else "")
             # Guest-agent log verbosity: init.quiet=0 un-gates log_info! macros
@@ -438,11 +465,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #         is Mach kernel hv_trap (~360µs/exit), not QEMU I/O processing.
     #   TCG:  software-emulated ioeventfd, moderate benefit (I/O off main loop).
     iothread_id = f"iothread0-{vm_id}"
-    # Cap I/O thread pool to 16 (QEMU default is 64).  With single-queue
-    # virtio-blk on qcow2, 16 is more than sufficient.  When aio=io_uring
-    # is active the pool is unused (no-op).  When aio=threads, this caps
-    # peak threads from ~72 to ~24, preventing pids.max exhaustion.
-    qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=16"])
+    # Cap I/O thread pool to 8 (QEMU default is 64).  With single-queue
+    # virtio-blk on qcow2, 8 is sufficient.  When aio=io_uring is active
+    # the pool is unused (no-op).  When aio=threads, this caps peak threads
+    # from ~72 to ~16, reducing per-VM thread count and stack memory.
+    qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=8"])
 
     # Disk configuration (EROFS base drive, serial=base)
     # Uses qcow2 overlay backed by the EROFS base image
@@ -540,8 +567,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-chardev",
             f"socket,id=event0,path={workdir.event_socket},server=on,wait=off",
             # Chardev for console output - connected to virtconsole (hvc0)
+            # mux=off: no multiplexing needed since -monitor none (no QEMU monitor).
+            # Removes mux input processing layer and its per-chardev state.
             "-chardev",
-            "stdio,id=virtiocon0,mux=on,signal=off",
+            "stdio,id=virtiocon0,signal=off",
         ]
     )
 
@@ -598,13 +627,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh
     # entropy to reseed from after L1 snapshot restore. Without this, the input
     # pool after restore contains only stale (cloned) entropy.
-    # max-bytes + period: rate-limit to 1024B/100ms (10KB/s) to avoid host exhaustion.
+    # max-bytes + period: rate-limit to 256B/1000ms (0.25KB/s). Ephemeral VMs
+    # only need initial entropy reseed; continuous high-rate entropy is wasteful.
     qemu_args.extend(
         [
             "-object",
             "rng-random,id=rng0,filename=/dev/urandom",
             "-device",
-            f"virtio-rng-{virtio_suffix},rng=rng0,max-bytes=1024,period=100",
+            f"virtio-rng-{virtio_suffix},rng=rng0,max-bytes=256,period=1000",
         ]
     )
 
