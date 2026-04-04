@@ -19,7 +19,7 @@ jobs:
 
   static-python:
     name: Static / Python
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -47,7 +47,7 @@ jobs:
 
   static-rust-guest-agent:
     name: Static / Rust (guest-agent)
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: guest-agent
@@ -64,7 +64,7 @@ jobs:
 
   static-rust-tiny-init:
     name: Static / Rust (tiny-init)
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: tiny-init
@@ -87,7 +87,7 @@ jobs:
 
   static-go:
     name: Static / Go
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: gvproxy-wrapper
@@ -115,14 +115,10 @@ jobs:
         include:
           - arch: x64
             os-version: noble
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - arch: arm64
             os-version: noble
-            runner: blacksmith-8vcpu-ubuntu-2404-arm
-          # Jammy build for CodSpeed macro runners (Ubuntu 22.04 ARM64)
-          - arch: arm64
-            os-version: jammy
-            runner: blacksmith-8vcpu-ubuntu-2204-arm
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -174,18 +170,18 @@ jobs:
         include:
           - os: linux
             arch: x64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - os: linux
             arch: arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
           - os: macos
             arch: arm64
             os_version: "15"
-            runner: blacksmith-6vcpu-macos-15
+            runner: macos-15
           - os: macos
             arch: arm64
             os_version: "26"
-            runner: blacksmith-6vcpu-macos-26
+            runner: macos-26
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -201,7 +197,7 @@ jobs:
 
   build-guest-agent:
     name: Build / guest-agent (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-2vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -234,7 +230,7 @@ jobs:
 
   build-tiny-init:
     name: Build / tiny-init (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-2vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
       matrix:
         arch: [x64, arm64]
@@ -267,7 +263,7 @@ jobs:
 
   build-vm-images:
     name: Build / VM images (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-8vcpu-ubuntu-2404-arm' }}
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     needs: [build-guest-agent, build-tiny-init]
     strategy:
       matrix:
@@ -321,7 +317,7 @@ jobs:
 
   test-rust:
     name: Test / Rust
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: guest-agent
@@ -338,7 +334,7 @@ jobs:
 
   test-go:
     name: Test / Go
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     env:
       JUNIT_XML: junit-gvproxy-wrapper.xml
     defaults:
@@ -375,12 +371,13 @@ jobs:
 
   test-python:
     name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}/${{ matrix.platform.arch }})
-    runs-on: ${{ matrix.platform.runner }}
+    # Linux: RunsOn with nested-virt (KVM required for QEMU integration tests)
+    # macOS: GitHub-hosted (Apple Silicon HVF supports nested virtualization)
+    runs-on: ${{ matrix.platform.runs_on && format('runs-on={0}-test-python-{1}/{2}', github.run_id, strategy.job-index, matrix.platform.runs_on) || matrix.platform.runner }}
     needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
     env:
       # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # JUnit XML for Blacksmith test analytics (auto-detected on disk)
       JUNIT_XML: junit-exec-sandbox-${{ matrix.python-version }}-${{ matrix.test-type }}-${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}-${{ matrix.platform.arch }}.xml
     strategy:
       fail-fast: false
@@ -390,18 +387,18 @@ jobs:
         platform:
           - os: linux
             arch: x64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            runs_on: "runner=8cpu-linux-x64/nested-virt"
           - os: linux
             arch: arm64
-            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            runs_on: "runner=8cpu-linux-arm64/nested-virt"
           - os: macos
             arch: arm64
             os_version: "15"
-            runner: blacksmith-12vcpu-macos-15
+            runner: macos-15
           - os: macos
             arch: arm64
             os_version: "26"
-            runner: blacksmith-12vcpu-macos-26
+            runner: macos-26
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -503,7 +500,7 @@ jobs:
 
   benchmarks:
     name: Benchmark / CodSpeed
-    runs-on: codspeed-macro
+    runs-on: runs-on=${{github.run_id}}-benchmarks/runner=4cpu-linux-arm64/nested-virt
     concurrency:
       group: codspeed-${{ github.ref }}
       cancel-in-progress: true
@@ -547,7 +544,6 @@ jobs:
         with:
           os: linux
           arch: arm64
-          os-version: jammy
 
       - name: Setup uv
         uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v7.1.6

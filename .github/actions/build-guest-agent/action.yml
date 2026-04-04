@@ -16,9 +16,7 @@ runs:
       uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
 
     - name: Set up Docker Buildx
-      uses: useblacksmith/setup-docker-builder@44c43c0599d417cb00afb09a18ee099347a34b70 # v1
-      with:
-        github-token: ${{ github.token }}
+      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
     # Try to restore from latest run on same branch (hash-based caching in build script will skip if unchanged)
     - name: Get latest run ID
