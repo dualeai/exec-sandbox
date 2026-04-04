@@ -370,15 +370,16 @@ jobs:
   # ==========================================================================
 
   test-python:
-    name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}/${{ matrix.platform.arch }})
-    # Linux: RunsOn with nested-virt (KVM required for QEMU integration tests)
+    name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
+    # Linux x64: RunsOn with nested-virt (KVM required for QEMU integration tests)
+    # Linux arm64: GitHub-hosted (RunsOn doesn't support nested-virt on ARM)
     # macOS: GitHub-hosted (Apple Silicon HVF supports nested virtualization)
-    runs-on: ${{ matrix.platform.runs_on && format('runs-on={0}-test-python-{1}/{2}', github.run_id, strategy.job-index, matrix.platform.runs_on) || matrix.platform.runner }}
+    runs-on: ${{ startsWith(matrix.platform.runner, 'runner=') && format('runs-on={0}-test-python-{1}/{2}', github.run_id, strategy.job-index, matrix.platform.runner) || matrix.platform.runner }}
     needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
     env:
       # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      JUNIT_XML: junit-exec-sandbox-${{ matrix.python-version }}-${{ matrix.test-type }}-${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}-${{ matrix.platform.arch }}.xml
+      JUNIT_XML: junit-exec-sandbox-${{ matrix.python-version }}-${{ matrix.test-type }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.xml
     strategy:
       fail-fast: false
       matrix:
@@ -387,17 +388,15 @@ jobs:
         platform:
           - os: linux
             arch: x64
-            runs_on: "runner=8cpu-linux-x64/nested-virt"
+            runner: "runner=8cpu-linux-x64/nested-virt"
           - os: linux
             arch: arm64
-            runs_on: "runner=8cpu-linux-arm64/nested-virt"
-          - os: macos
+            runner: ubuntu-24.04-arm
+          - os: macos-15
             arch: arm64
-            os_version: "15"
             runner: macos-15
-          - os: macos
+          - os: macos-26
             arch: arm64
-            os_version: "26"
             runner: macos-26
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -405,7 +404,7 @@ jobs:
       - name: Download gvproxy-wrapper
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: gvproxy-wrapper-${{ matrix.platform.os }}${{ matrix.platform.os_version && format('-{0}', matrix.platform.os_version) || '' }}-${{ matrix.platform.arch }}
+          name: gvproxy-wrapper-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
@@ -433,7 +432,7 @@ jobs:
       - name: Setup VM infrastructure
         uses: ./.github/actions/setup-vm-infra
         with:
-          os: ${{ matrix.platform.os }}
+          os: ${{ startsWith(matrix.platform.os, 'macos') && 'macos' || matrix.platform.os }}
           arch: ${{ matrix.platform.arch }}
 
       - name: Setup uv
@@ -473,7 +472,7 @@ jobs:
           fi
 
       - name: Run tests (macOS)
-        if: matrix.platform.os == 'macos'
+        if: startsWith(matrix.platform.os, 'macos')
         timeout-minutes: 90
         env:
           PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
@@ -500,7 +499,7 @@ jobs:
 
   benchmarks:
     name: Benchmark / CodSpeed
-    runs-on: runs-on=${{github.run_id}}-benchmarks/runner=4cpu-linux-arm64/nested-virt
+    runs-on: runs-on=${{github.run_id}}-benchmarks/runner=4cpu-linux-x64/nested-virt
     concurrency:
       group: codspeed-${{ github.ref }}
       cancel-in-progress: true
@@ -515,13 +514,13 @@ jobs:
       - name: Download gvproxy-wrapper
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: gvproxy-wrapper-linux-arm64
+          name: gvproxy-wrapper-linux-x64
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: vm-images-arm64
+          name: vm-images-x64
           path: images/dist/
 
       - name: Make binaries executable
@@ -543,7 +542,7 @@ jobs:
         uses: ./.github/actions/setup-vm-infra
         with:
           os: linux
-          arch: arm64
+          arch: x64
 
       - name: Setup uv
         uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v7.1.6
