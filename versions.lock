@@ -12,10 +12,10 @@ ALPINE_IMAGE_DIGEST=sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6e
 QEMU_VERSION=11.0.2
 # QEMU_SHA256: distributed 2026-06-28 (tarball publication)
 QEMU_SHA256=3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5
-# RUST_VERSION: distributed 2026-02-12 (stable channel release)
-RUST_VERSION=1.93
-# RUST_IMAGE_DIGEST: distributed 2026-02-27 (image build)
-RUST_IMAGE_DIGEST=sha256:c0a38f5662afdb298898da1d70b909af4bda4e0acff2dc52aea6360a9b9c6956
+# RUST_VERSION: distributed 2026-06-30 (stable channel release)
+RUST_VERSION=1.96
+# RUST_IMAGE_DIGEST: distributed 2026-07-01 (image build)
+RUST_IMAGE_DIGEST=sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523
 # LINUX_VIRT_VERSION: distributed 2026-07-04 (kernel.org tarball publication)
 LINUX_VIRT_VERSION=6.18.38-r0
 # KERNEL_VERSION: distributed 2026-07-04 (ships in linux-virt above)

@@ -30,11 +30,12 @@
 #   - QEMU: newest release tag whose tarball was published (HTTP Last-Modified
 #     on download.qemu.org — server-set, unlike backdatable git tag dates)
 #     on/before the cutoff.
-#   - Rust: the stable channel manifest carries its release date; a too-young
-#     channel keeps the previous RUST_VERSION + RUST_IMAGE_DIGEST pair from
-#     the lock (pair kept atomically — in tag@digest references the tag is
-#     decorative, so a new version with an old digest would silently pull the
-#     old toolchain).
+#   - Rust: channel manifests carry their release date; the walk descends
+#     minor by minor (each minor's latest patch) until one clears the window.
+#     Only when the walk dead-ends does the previous RUST_VERSION +
+#     RUST_IMAGE_DIGEST pair freeze from the lock (pair kept atomically — in
+#     tag@digest references the tag is decorative, so a new version with an
+#     old digest would silently pull the old toolchain).
 #   - Image digests are NOT quarantined: a same-tag re-push is a patch or
 #     security refresh of an already-cleared version, and pinning superseded
 #     untagged manifests risks registry garbage collection.
@@ -252,27 +253,48 @@ for v in sorted(versions, reverse=True):
     die "No quarantine-cleared QEMU release found in the newest 10 tags"
 }
 
-# Current stable Rust channel as "<major.minor> <channel-date>". The caller
-# applies the quarantine (freeze-to-lock — dated stable snapshots exist only
-# on release days, so there is no walkable history).
+# Newest stable Rust whose channel date clears the cutoff, walking minor by
+# minor down from current stable: latest minor's latest patch first, then
+# minor-1's latest patch, and so on (each versioned manifest
+# channel-rust-X.Y.toml tracks that minor's newest patch — the exact artifact
+# the rust:X.Y-slim image tag ships, so its date gates what is consumed).
+# Output: "<major.minor> <channel-date>". When the walk exhausts (cap, major
+# rollover, or missing manifest) the newest too-young pair is returned and
+# the CALLER's gate freezes to the previous lock pin.
 #
-# Section-scoped parse: the manifest lists sections alphabetically and
-# [pkg.cargo] carries a version line (0.x) BEFORE [pkg.rust]. The ~850KB body
-# is fetched fully first, and both extractions read to EOF (a mid-pipeline
-# early-exit like grep -m1 would SIGPIPE the producer under pipefail).
+# Section-scoped parse: manifests list sections alphabetically and
+# [pkg.cargo] carries a version line (0.x) BEFORE [pkg.rust]. Each ~850KB
+# body is fetched fully first, and both extractions read to EOF (a
+# mid-pipeline early-exit like grep -m1 would SIGPIPE the producer under
+# pipefail).
 resolve_rust() {
-    local body
-    body=$(curl -sf --retry 3 "https://static.rust-lang.org/dist/channel-rust-stable.toml") \
-        || die "Could not fetch channel-rust-stable.toml"
-    local channel_date
-    channel_date=$(printf '%s\n' "$body" | awk -F'"' '/^date = /{d=$2} END{print d}')
-    [ -n "$channel_date" ] || die "Could not parse channel date from channel-rust-stable.toml"
-    local full
-    full=$(printf '%s\n' "$body" \
-        | awk '/^\[pkg\.rust\]$/ {f=1} f && /^version = /{print; f=0}' \
-        | cut -d'"' -f2 | cut -d' ' -f1)
-    [ -n "$full" ] || die "Could not parse [pkg.rust] version from channel-rust-stable.toml"
-    echo "$(echo "$full" | cut -d. -f1,2) $channel_date"
+    local cutoff_date=$1
+    local url="https://static.rust-lang.org/dist/channel-rust-stable.toml"
+    local steps=0 body channel_date full major minor
+    while :; do
+        body=$(curl -sf --retry 3 "$url") || die "Could not fetch $url"
+        channel_date=$(printf '%s\n' "$body" | awk -F'"' '/^date = /{d=$2} END{print d}')
+        [ -n "$channel_date" ] || die "Could not parse channel date from $url"
+        full=$(printf '%s\n' "$body" \
+            | awk '/^\[pkg\.rust\]$/ {f=1} f && /^version = /{print; f=0}' \
+            | cut -d'"' -f2 | cut -d' ' -f1)
+        [ -n "$full" ] || die "Could not parse [pkg.rust] version from $url"
+        major=$(echo "$full" | cut -d. -f1)
+        minor=$(echo "$full" | cut -d. -f2)
+        if [ "$channel_date" \< "$cutoff_date" ] || [ "$channel_date" = "$cutoff_date" ]; then
+            echo "${major}.${minor} $channel_date"
+            return 0
+        fi
+        steps=$((steps + 1))
+        [ "$steps" -le 8 ] || break
+        # Major rollover: the prior major's last minor is not derivable
+        [ "$minor" -gt 0 ] || break
+        echo "QUARANTINED: rust ${major}.${minor} distributed $channel_date — trying ${major}.$((minor - 1))" >&2
+        url="https://static.rust-lang.org/dist/channel-rust-${major}.$((minor - 1)).toml"
+        # A missing versioned manifest ends the walk (freeze fallback)
+        curl -sfI --retry 3 "$url" >/dev/null 2>&1 || break
+    done
+    echo "${major}.${minor} $channel_date"
 }
 
 # linux-virt package version for one arch from the Alpine APKINDEX.
@@ -456,7 +478,7 @@ main() {
 
     # --- Rust: freeze the version+digest PAIR while the channel is young ---
     local rust_new rust_date rust_frozen=false
-    out=$(resolve_rust) || die "Rust resolution failed"
+    out=$(resolve_rust "$cutoff_date") || die "Rust resolution failed"
     read -r rust_new rust_date <<< "$out"
     [ -n "$rust_new" ] || die "Rust resolution returned no version"
     [ -n "$rust_date" ] || die "Rust resolution returned no date"
