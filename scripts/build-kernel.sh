@@ -61,12 +61,14 @@ detect_arch() {
 
 # All hash inputs are git-tracked bytes — cached builds need no network,
 # and cache keys change exactly at reviewed commits (lock or config edits).
+# Lock KEY=VALUE lines only: comment lines (distribution dates) are
+# documentation and must never invalidate the kernel cache.
 # Keep byte-identical to compute_kernel_hash in extract-kernel.sh.
 compute_hash() {
     local arch=$1
     (
         echo "arch=$arch"
-        cat "$LOCK_FILE"
+        grep '^[A-Z]' "$LOCK_FILE"
         cat "$REPO_ROOT/images/kernel/exec-sandbox.config"
         cat "$REPO_ROOT/images/kernel/alpine-virt-${arch}.config"
         cat "$SCRIPT_DIR/build-kernel.sh"

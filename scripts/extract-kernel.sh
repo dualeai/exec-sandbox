@@ -51,12 +51,14 @@ detect_arch() {
 # config fragment, vendored Alpine base config, build script). No network:
 # cached builds work offline, and this stays in lock-step with the version
 # build-kernel.sh actually builds (no index-fetch TOCTOU).
+# Lock KEY=VALUE lines only: comment lines (distribution dates) are
+# documentation and must never invalidate the kernel cache.
 # Keep byte-identical to compute_hash in build-kernel.sh.
 compute_kernel_hash() {
     local arch=$1
     (
         echo "arch=$arch"
-        cat "$LOCK_FILE"
+        grep '^[A-Z]' "$LOCK_FILE"
         cat "$REPO_ROOT/images/kernel/exec-sandbox.config"
         cat "$REPO_ROOT/images/kernel/alpine-virt-${arch}.config"
         cat "$SCRIPT_DIR/build-kernel.sh"
