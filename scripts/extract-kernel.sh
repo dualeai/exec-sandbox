@@ -16,7 +16,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-ALPINE_VERSION="${ALPINE_VERSION:?ALPINE_VERSION must be set (exported by root Makefile)}"
+LOCK_FILE="$REPO_ROOT/versions.lock"
+
+if [ ! -f "$LOCK_FILE" ]; then
+    echo "ERROR: versions.lock not found — run './scripts/upgrade-versions.sh' (or restore it from git)" >&2
+    exit 1
+fi
+# Fail-closed: versions.lock is the single source of truth. Parsed with grep
+# (never sourced — lock values must not be executable). `|| true` keeps a
+# missing key from silently killing the script before the -z diagnostics.
+lock_get() {
+    grep -m1 "^$1=" "$LOCK_FILE" | cut -d= -f2- || true
+}
+ALPINE_VERSION=$(lock_get ALPINE_VERSION)
+ALPINE_IMAGE_DIGEST=$(lock_get ALPINE_IMAGE_DIGEST)
+if [ -z "$ALPINE_VERSION" ] || [ -z "$ALPINE_IMAGE_DIGEST" ]; then
+    echo "ERROR: versions.lock lacks ALPINE_VERSION/ALPINE_IMAGE_DIGEST — run 'make upgrade'" >&2
+    exit 1
+fi
 
 detect_arch() {
     case "$(uname -m)" in
@@ -30,31 +47,18 @@ detect_arch() {
 # Cache helpers - content-addressable build caching via .hash sidecar files
 # =============================================================================
 
-# Get kernel package version from Alpine's package index (without running Docker)
-# This ensures cache invalidation when Alpine updates the kernel package
-get_kernel_version() {
-    local arch=$1
-    local apk_arch
-    case "$arch" in
-        x86_64)  apk_arch="x86_64" ;;
-        aarch64) apk_arch="aarch64" ;;
-    esac
-    curl -sf "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${apk_arch}/APKINDEX.tar.gz" 2>/dev/null \
-        | tar -xzO APKINDEX 2>/dev/null \
-        | grep -A1 "^P:linux-virt$" \
-        | grep "^V:" \
-        | cut -d: -f2 \
-        || echo "unknown"
-}
-
-# Compute hash for kernel inputs (Alpine version + arch + kernel version + config fragment + build script)
+# Compute hash for kernel inputs — all git-tracked bytes (versions.lock,
+# config fragment, vendored Alpine base config, build script). No network:
+# cached builds work offline, and this stays in lock-step with the version
+# build-kernel.sh actually builds (no index-fetch TOCTOU).
+# Keep byte-identical to compute_hash in build-kernel.sh.
 compute_kernel_hash() {
     local arch=$1
-    local kernel_ver
-    kernel_ver=$(get_kernel_version "$arch")
     (
-        echo "alpine=$ALPINE_VERSION arch=$arch kernel=$kernel_ver"
+        echo "arch=$arch"
+        cat "$LOCK_FILE"
         cat "$REPO_ROOT/images/kernel/exec-sandbox.config"
+        cat "$REPO_ROOT/images/kernel/alpine-virt-${arch}.config"
         cat "$SCRIPT_DIR/build-kernel.sh"
     ) | sha256sum | cut -d' ' -f1
 }
@@ -171,7 +175,7 @@ extract_for_arch() {
             # falls back to real-mode boot, negating the latency win.
             # Uses Docker because readelf is not installed on macOS hosts.
             if ! docker run --rm -v "$OUTPUT_DIR:/output" --platform linux/amd64 \
-                "alpine:$ALPINE_VERSION" sh -c "apk add --no-cache binutils >/dev/null 2>&1 && readelf -n /output/vmlinux-x86_64 2>/dev/null | grep -q Xen"; then
+                "alpine:${ALPINE_VERSION}@${ALPINE_IMAGE_DIGEST}" sh -c "apk add --no-cache binutils >/dev/null 2>&1 && readelf -n /output/vmlinux-x86_64 2>/dev/null | grep -q Xen"; then
                 echo "ERROR: vmlinux lacks PVH note for x86_64" >&2
                 rm -f "$vmlinux_file"
                 return 1

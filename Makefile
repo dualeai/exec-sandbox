@@ -1,9 +1,12 @@
 # Misc
 name ?= exec_sandbox
 python_version ?= 3.12  # Lowest compatible version (see pyproject.toml requires-python)
-rust_version ?= 1.93
-alpine_version ?= 3.23
-qemu_version ?= 10.2.1  # For CI build-from-source (Ubuntu 24.04 ships 8.2.2 which has ARM64 TCG bugs)
+
+# System version pins + content hashes — managed by `make upgrade`
+# (scripts/upgrade-versions.sh). versions.lock is the single source of truth:
+# build scripts and sub-makes read it themselves; nothing passes versions around.
+# qemu pin exists for CI build-from-source (Ubuntu 24.04 ships 8.2.2 with ARM64 TCG bugs).
+include versions.lock
 
 # Versions
 version_full ?= $(shell $(MAKE) --silent version-full)
@@ -25,13 +28,13 @@ version-pypi:
 	@bash ./cicd/version.sh -g .
 
 rust-version:
-	@echo $(rust_version)
+	@echo $(RUST_VERSION)
 
 alpine-version:
-	@echo $(alpine_version)
+	@echo $(ALPINE_VERSION)
 
 qemu-version:
-	@echo $(qemu_version)
+	@echo $(QEMU_VERSION)
 
 # ============================================================================
 # Installation
@@ -43,8 +46,8 @@ install-sys:
 install:
 	uv venv --python $(python_version) --allow-existing
 	$(MAKE) install-deps
-	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) install
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) install
+	$(MAKE) --directory guest-agent install
+	$(MAKE) --directory tiny-init install
 	$(MAKE) --directory gvproxy-wrapper install
 	$(MAKE) install-seek
 
@@ -60,17 +63,20 @@ install-deps:
 # Build QEMU from source (Linux CI only — Ubuntu 24.04 ships 8.2.2 with ARM64 TCG bugs)
 # Usage: make build-qemu [QEMU_PREFIX=~/qemu-build]
 build-qemu:
-	QEMU_VERSION=$(qemu_version) ./scripts/build-qemu.sh
+	./scripts/build-qemu.sh
 
 # ============================================================================
 # Upgrade (auto-called targets for dependency updates)
 # ============================================================================
 
+# Refresh versions.lock first — each sub-make below re-parses the lock on
+# invocation, so the cargo upgrades run in the freshly pinned rust image.
 upgrade:
+	./scripts/upgrade-versions.sh
 	uv lock --upgrade --refresh
 	$(MAKE) build-catalogs
-	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) upgrade
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) upgrade
+	$(MAKE) --directory guest-agent upgrade
+	$(MAKE) --directory tiny-init upgrade
 	$(MAKE) --directory gvproxy-wrapper upgrade
 
 # Build package allow-lists from PyPI and npm registries
@@ -92,7 +98,7 @@ IMAGE_VARIANT ?= all
 build:
 	$(MAKE) --directory gvproxy-wrapper build
 	@echo "🔨 Building QEMU images (arch=$(IMAGE_ARCH), variant=$(IMAGE_VARIANT))..."
-	RUST_VERSION=$(rust_version) ALPINE_VERSION=$(alpine_version) ./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
+	./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
 
 # Kept as alias for backwards compatibility and CI scripts.
 build-images: build
@@ -111,9 +117,20 @@ test-static:
 	uv run pyright .
 	uv run -m vulture src/ scripts/ --min-confidence 80
 	shellcheck scripts/*.sh cicd/*.sh
-	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-static
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-static
+	$(MAKE) test-kernel-hash-sync
+	$(MAKE) --directory guest-agent test-static
+	$(MAKE) --directory tiny-init test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
+
+# Kernel hash functions must stay byte-identical between the two scripts:
+# extract-kernel.sh writes the .hash sidecar that build-kernel.sh reads —
+# divergence makes extract-kernel serve a stale vmlinux/initramfs silently.
+test-kernel-hash-sync:
+	@a=$$(mktemp) && b=$$(mktemp) && \
+		sed -n '/^compute_hash() {/,/^}/p' scripts/build-kernel.sh | tail -n +2 > "$$a" && \
+		sed -n '/^compute_kernel_hash() {/,/^}/p' scripts/extract-kernel.sh | tail -n +2 > "$$b" && \
+		{ diff "$$a" "$$b" || { echo "ERROR: compute_hash (build-kernel.sh) and compute_kernel_hash (extract-kernel.sh) diverged"; rm -f "$$a" "$$b"; exit 1; }; } && \
+		rm -f "$$a" "$$b"
 
 # CI resource monitor — wraps a command with background metrics collection.
 # Runs in a single shell: start monitor, run command, kill monitor, propagate exit code.
@@ -137,8 +154,8 @@ test-sudo:
 # Unit tests only (fast)
 test-unit:
 	$(MAKE) test-func
-	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) test-unit
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) test-unit
+	$(MAKE) --directory guest-agent test-unit
+	$(MAKE) --directory tiny-init test-unit
 	$(MAKE) --directory gvproxy-wrapper test-unit
 
 # Memory leak detection tests (slow, run sequentially for accurate measurement)
@@ -152,8 +169,8 @@ test-slow:
 lint:
 	uv run ruff format .
 	uv run ruff check --fix .
-	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) lint
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) lint
+	$(MAKE) --directory guest-agent lint
+	$(MAKE) --directory tiny-init lint
 	$(MAKE) --directory gvproxy-wrapper lint
 
 # ============================================================================
@@ -254,7 +271,7 @@ bench-pool-flamegraph:
 # ============================================================================
 
 clean:
-	$(MAKE) --directory guest-agent RUST_VERSION=$(rust_version) clean
-	$(MAKE) --directory tiny-init RUST_VERSION=$(rust_version) clean
+	$(MAKE) --directory guest-agent clean
+	$(MAKE) --directory tiny-init clean
 	$(MAKE) --directory gvproxy-wrapper clean
 	rm -rf .pytest_cache .coverage htmlcov

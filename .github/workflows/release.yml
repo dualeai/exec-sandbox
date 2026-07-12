@@ -195,15 +195,10 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-
       - name: Build guest-agent
         uses: ./.github/actions/build-guest-agent
         with:
           arch: ${{ matrix.arch }}
-          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -220,15 +215,10 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-
       - name: Build tiny-init
         uses: ./.github/actions/build-tiny-init
         with:
           arch: ${{ matrix.arch }}
-          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -262,15 +252,10 @@ jobs:
           name: tiny-init-${{ matrix.arch }}
           path: images/dist/
 
-      - name: Get Alpine version
-        id: alpine
-        run: echo "version=$(make --silent alpine-version)" >> "$GITHUB_OUTPUT"
-
       - name: Build VM images
         uses: ./.github/actions/build-vm-images
         with:
           arch: ${{ matrix.arch }}
-          alpine-version: ${{ steps.alpine.outputs.version }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7

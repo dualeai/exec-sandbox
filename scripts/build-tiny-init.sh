@@ -15,7 +15,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-RUST_VERSION="${RUST_VERSION:?RUST_VERSION must be set (exported by root Makefile)}"
+# Rust toolchain version + image digest come from versions.lock only.
+# Fail-closed: a missing lock or missing keys abort the build.
+LOCK_FILE="$REPO_ROOT/versions.lock"
+if [ ! -f "$LOCK_FILE" ]; then
+    echo "ERROR: versions.lock not found — run './scripts/upgrade-versions.sh' (or restore it from git)" >&2
+    exit 1
+fi
+RUST_VERSION=$(grep -m1 '^RUST_VERSION=' "$LOCK_FILE" | cut -d= -f2- || true)
+RUST_IMAGE_DIGEST=$(grep -m1 '^RUST_IMAGE_DIGEST=' "$LOCK_FILE" | cut -d= -f2- || true)
+if [ -z "$RUST_VERSION" ] || [ -z "$RUST_IMAGE_DIGEST" ]; then
+    echo "ERROR: versions.lock lacks RUST_VERSION/RUST_IMAGE_DIGEST — run 'make upgrade'" >&2
+    exit 1
+fi
 
 # NOTE: Check periodically if -Zbuild-std and panic_immediate_abort have been stabilized.
 # When stable, we can add: RUSTFLAGS="-Cpanic=immediate-abort" cargo build -Zbuild-std=std,panic_abort
@@ -44,10 +56,15 @@ compute_hash() {
     (
         echo "arch=$arch"
         echo "rust=$RUST_VERSION"
+        # Toolchain image digest: a re-pushed rust:X.Y-slim must rebuild the binary
+        echo "rust_image_digest=$RUST_IMAGE_DIGEST"
         cat "$REPO_ROOT/tiny-init/Cargo.lock" 2>/dev/null || true
         cat "$REPO_ROOT/tiny-init/Cargo.toml" 2>/dev/null || true
         find "$REPO_ROOT/tiny-init/src" -type f -name "*.rs" -print0 2>/dev/null | \
             sort -z | xargs -0 cat 2>/dev/null || true
+        # Self-hash: build-logic changes (Dockerfile heredoc, flags) must miss the
+        # cache — CI restores prior sidecars, which would otherwise mask them forever
+        cat "$SCRIPT_DIR/build-tiny-init.sh"
     ) | sha256sum | cut -d' ' -f1
 }
 
@@ -102,14 +119,14 @@ build_for_arch() {
     # The Dockerfile downloads musl.cc cross-toolchains for cross-arch builds
     DOCKER_BUILDKIT=1 docker buildx build \
         --output "type=local,dest=$OUTPUT_DIR" \
-        --build-arg RUST_VERSION="$RUST_VERSION" \
+        --build-arg RUST_IMAGE="rust:${RUST_VERSION}-slim@${RUST_IMAGE_DIGEST}" \
         --build-arg RUST_TARGET="$rust_target" \
         --build-arg ARCH="$arch" \
         ${cache_args[@]+"${cache_args[@]}"} \
         -f - "$REPO_ROOT" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
-ARG RUST_VERSION
-FROM rust:${RUST_VERSION}-slim AS builder
+ARG RUST_IMAGE
+FROM ${RUST_IMAGE} AS builder
 ARG RUST_TARGET
 ARG ARCH
 WORKDIR /workspace
@@ -158,7 +175,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cp target/${RUST_TARGET}/release/tiny-init /tiny-init-${ARCH}
 
 FROM scratch
-ARG ARCH
 COPY --from=builder /tiny-init-* .
 DOCKERFILE
 

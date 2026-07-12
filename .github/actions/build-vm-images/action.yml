@@ -5,9 +5,6 @@ inputs:
   arch:
     description: Target architecture (x86_64 or aarch64)
     required: true
-  alpine-version:
-    description: Alpine Linux version (sourced from Makefile alpine_version)
-    required: true
   variant:
     description: Image variant (python, node, raw, or all)
     required: false
@@ -49,12 +46,8 @@ runs:
 
     - name: Build kernel + initramfs
       shell: bash
-      env:
-        ALPINE_VERSION: ${{ inputs.alpine-version }}
       run: ./scripts/extract-kernel.sh ${{ inputs.arch }}
 
     - name: Build qcow2
       shell: bash
-      env:
-        ALPINE_VERSION: ${{ inputs.alpine-version }}
       run: ./scripts/build-qcow2.sh ${{ inputs.variant }} ${{ inputs.arch }}

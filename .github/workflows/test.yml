@@ -54,13 +54,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-        working-directory: .
-
       - name: Static checks
-        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-static
+        run: make test-static
 
   static-rust-tiny-init:
     name: Static / Rust (tiny-init)
@@ -77,13 +72,8 @@ jobs:
           components: rustfmt, clippy
           cache-workspaces: tiny-init
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-        working-directory: .
-
       - name: Static checks
-        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-static
+        run: make test-static
 
   static-go:
     name: Static / Go
@@ -123,7 +113,7 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       # Cache the final build output — skip everything on version match.
-      # Key includes qemu_version from Makefile, build script, and OS version;
+      # Key includes qemu_version from versions.lock, build script, and OS version;
       # bumping any invalidates the cache.
       # save-always is false (default), so a failed build won't cache corrupt output.
       - name: Cache QEMU build
@@ -131,7 +121,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/qemu-build
-          key: qemu-${{ matrix.arch }}-${{ matrix.os-version }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+          key: qemu-${{ matrix.arch }}-${{ matrix.os-version }}-${{ hashFiles('Makefile', 'versions.lock', 'scripts/build-qemu.sh') }}
 
       - name: Install build deps
         if: steps.qemu-cache.outputs.cache-hit != 'true'
@@ -148,7 +138,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.ccache
-          key: ccache-qemu-${{ matrix.arch }}-${{ matrix.os-version }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+          key: ccache-qemu-${{ matrix.arch }}-${{ matrix.os-version }}-${{ hashFiles('Makefile', 'versions.lock', 'scripts/build-qemu.sh') }}
           restore-keys: ccache-qemu-${{ matrix.arch }}-${{ matrix.os-version }}-
 
       - name: Build
@@ -209,15 +199,10 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-
       - name: Build
         uses: ./.github/actions/build-guest-agent
         with:
           arch: ${{ matrix.image_arch }}
-          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -242,15 +227,10 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-
       - name: Build
         uses: ./.github/actions/build-tiny-init
         with:
           arch: ${{ matrix.image_arch }}
-          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -288,15 +268,10 @@ jobs:
           name: tiny-init-${{ matrix.arch }}
           path: images/dist/
 
-      - name: Get Alpine version
-        id: alpine
-        run: echo "version=$(make --silent alpine-version)" >> "$GITHUB_OUTPUT"
-
       - name: Build
         uses: ./.github/actions/build-vm-images
         with:
           arch: ${{ matrix.image_arch }}
-          alpine-version: ${{ steps.alpine.outputs.version }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -307,6 +282,7 @@ jobs:
             images/dist/vmlinuz-${{ matrix.image_arch }}
             images/dist/vmlinuz-${{ matrix.image_arch }}.hash
             images/dist/initramfs-${{ matrix.image_arch }}
+            images/dist/initramfs-${{ matrix.image_arch }}.hash
             images/dist/*-${{ matrix.image_arch }}.qcow2
             images/dist/*-${{ matrix.image_arch }}.qcow2.hash
           retention-days: 7
@@ -324,13 +300,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-        working-directory: .
-
       - name: Unit tests
-        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-unit
+        run: make test-unit
 
   test-go:
     name: Test / Go

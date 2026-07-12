@@ -1,10 +1,13 @@
 #!/bin/bash
 # Build custom Linux kernel for QEMU microVM using Docker BuildKit
 #
-# Uses Alpine's linux-virt config as base, merges our exec-sandbox.config
-# fragment on top using the kernel's scripts/kconfig/merge_config.sh.
-# Zero-maintenance: when Alpine upgrades the kernel, merge auto-inherits
-# new defaults — we only maintain what we intentionally changed.
+# Kernel version + tarball sha256 come from versions.lock (managed by
+# `make upgrade`). The base config is Alpine's linux-virt config, vendored
+# into images/kernel/alpine-virt-<arch>.config at upgrade time; our
+# exec-sandbox.config fragment is merged on top using the kernel's
+# scripts/kconfig/merge_config.sh. Kernel bumps land as reviewable git
+# diffs (lock + vendored configs) — builds hash only git-tracked bytes,
+# so cached builds need no network.
 #
 # Cross-compilation via musl.cc toolchains (same as build-guest-agent.sh).
 # BuildKit cache mounts for kernel source, ccache, and toolchains.
@@ -20,7 +23,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-ALPINE_VERSION="${ALPINE_VERSION:?ALPINE_VERSION must be set (exported by root Makefile)}"
+LOCK_FILE="$REPO_ROOT/versions.lock"
+
+if [ ! -f "$LOCK_FILE" ]; then
+    echo "ERROR: versions.lock not found — run './scripts/upgrade-versions.sh' (or restore it from git)" >&2
+    exit 1
+fi
+# Fail-closed: versions.lock is the single source of truth. Parsed with grep
+# (never sourced — lock values must not be executable). `|| true` keeps a
+# missing key from silently killing the script before the -z diagnostics.
+lock_get() {
+    grep -m1 "^$1=" "$LOCK_FILE" | cut -d= -f2- || true
+}
+KERNEL_VERSION=$(lock_get KERNEL_VERSION)
+KERNEL_TARBALL_VERSION=$(lock_get KERNEL_TARBALL_VERSION)
+KERNEL_SHA256=$(lock_get KERNEL_SHA256)
+if [ -z "$KERNEL_VERSION" ] || [ -z "$KERNEL_TARBALL_VERSION" ] || [ -z "$KERNEL_SHA256" ]; then
+    echo "ERROR: versions.lock lacks KERNEL_VERSION/KERNEL_TARBALL_VERSION/KERNEL_SHA256 — run 'make upgrade'" >&2
+    exit 1
+fi
 
 # Buildx cache configuration (for CI)
 BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
@@ -38,31 +59,16 @@ detect_arch() {
 # Cache helpers
 # =============================================================================
 
-# Get kernel package version from Alpine's APKINDEX (reused from extract-kernel.sh)
-get_kernel_version() {
-    local arch=$1
-    curl -sf "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/main/${arch}/APKINDEX.tar.gz" 2>/dev/null \
-        | tar -xzO APKINDEX 2>/dev/null \
-        | grep -A1 "^P:linux-virt$" \
-        | grep "^V:" \
-        | cut -d: -f2 \
-        || echo "unknown"
-}
-
-# Get upstream kernel version (strip Alpine revision suffix like -r0)
-get_upstream_kernel_version() {
-    local alpine_ver=$1
-    # Alpine version format: 6.12.67-r0 -> upstream: 6.12.67
-    echo "${alpine_ver%%-*}"
-}
-
+# All hash inputs are git-tracked bytes — cached builds need no network,
+# and cache keys change exactly at reviewed commits (lock or config edits).
+# Keep byte-identical to compute_kernel_hash in extract-kernel.sh.
 compute_hash() {
     local arch=$1
-    local kernel_ver
-    kernel_ver=$(get_kernel_version "$arch")
     (
-        echo "alpine=$ALPINE_VERSION arch=$arch kernel=$kernel_ver"
+        echo "arch=$arch"
+        cat "$LOCK_FILE"
         cat "$REPO_ROOT/images/kernel/exec-sandbox.config"
+        cat "$REPO_ROOT/images/kernel/alpine-virt-${arch}.config"
         cat "$SCRIPT_DIR/build-kernel.sh"
     ) | sha256sum | cut -d' ' -f1
 }
@@ -81,12 +87,6 @@ cache_hit() {
     fi
 }
 
-save_hash() {
-    local output_file=$1
-    local hash=$2
-    echo "$hash" > "${output_file}.hash"
-}
-
 # =============================================================================
 # Build function
 # =============================================================================
@@ -103,37 +103,25 @@ build_for_arch() {
         return 0
     fi
 
-    local alpine_kernel_ver
-    alpine_kernel_ver=$(get_kernel_version "$arch")
-    local kernel_ver
-    kernel_ver=$(get_upstream_kernel_version "$alpine_kernel_ver")
-
-    if [ "$kernel_ver" = "unknown" ]; then
-        echo "ERROR: Could not determine kernel version from Alpine APKINDEX" >&2
-        return 1
-    fi
-
-    echo "Building custom kernel $kernel_ver for $arch (Alpine $ALPINE_VERSION)..."
+    echo "Building custom kernel $KERNEL_VERSION for $arch (from versions.lock)..."
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Map arch to kernel ARCH, image target, and Docker platform
-    local kernel_arch kernel_image docker_platform
+    # Map arch to kernel ARCH and image target
+    local kernel_arch kernel_image
     case "$arch" in
         x86_64)
             kernel_arch="x86"
             kernel_image="bzImage"
-            docker_platform="linux/amd64"
             ;;
         aarch64)
             kernel_arch="arm64"
             kernel_image="Image"
-            docker_platform="linux/arm64"
             ;;
     esac
 
     # Scope includes arch and kernel version to avoid cache collisions
-    local cache_scope="kernel-${kernel_ver}-${arch}"
+    local cache_scope="kernel-${KERNEL_VERSION}-${arch}"
     local cache_args=()
     [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
     [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
@@ -141,28 +129,24 @@ build_for_arch() {
     # Build using buildx with cross-compilation (NO --platform flag on builder to avoid QEMU)
     DOCKER_BUILDKIT=1 docker buildx build \
         --output "type=local,dest=$OUTPUT_DIR" \
-        --build-arg ALPINE_VERSION="$ALPINE_VERSION" \
-        --build-arg DOCKER_PLATFORM="$docker_platform" \
         --build-arg ARCH="$arch" \
         --build-arg KERNEL_ARCH="$kernel_arch" \
         --build-arg KERNEL_IMAGE="$kernel_image" \
-        --build-arg KERNEL_VERSION="$kernel_ver" \
+        --build-arg KERNEL_VERSION="$KERNEL_VERSION" \
+        --build-arg KERNEL_TARBALL_VERSION="$KERNEL_TARBALL_VERSION" \
+        --build-arg KERNEL_SHA256="$KERNEL_SHA256" \
         ${cache_args[@]+"${cache_args[@]}"} \
         -f - "$REPO_ROOT" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
 
-# Stage 1: Extract Alpine's linux-virt config for target arch only
-ARG ALPINE_VERSION
-ARG DOCKER_PLATFORM
-FROM --platform=${DOCKER_PLATFORM} alpine:${ALPINE_VERSION} AS config-extractor
-RUN apk add --no-cache linux-virt >/dev/null 2>&1 && cp /boot/config-*-virt /alpine-virt.config
-
-# Stage 2: Build kernel natively with cross-compilation
+# Build kernel natively with cross-compilation
 FROM debian:bookworm-slim AS builder
 ARG ARCH
 ARG KERNEL_ARCH
 ARG KERNEL_IMAGE
 ARG KERNEL_VERSION
+ARG KERNEL_TARBALL_VERSION
+ARG KERNEL_SHA256
 
 # Install kernel build dependencies
 RUN apt-get update -qq && apt-get install -qq -y --no-install-recommends \
@@ -189,21 +173,26 @@ RUN --mount=type=cache,target=/tmp/toolchain-cache,sharing=locked \
 
 WORKDIR /build
 
-# Download kernel source (cached)
+# Download kernel source (cached), pinned by sha256 from versions.lock.
+# Both the cached copy and a fresh download are verified — a corrupt or
+# tampered tarball fails the build instead of being compiled.
+# KERNEL_TARBALL_VERSION comes from the lock (kernel.org names first-in-series
+# tarballs without .0: linux-6.19.tar.xz for Alpine's 6.19.0).
 RUN --mount=type=cache,target=/tmp/kernel-cache,sharing=locked \
     set -e && \
     MAJOR=$(echo $KERNEL_VERSION | cut -d. -f1) && \
-    TARBALL="linux-${KERNEL_VERSION}.tar.xz" && \
-    if [ ! -f "/tmp/kernel-cache/$TARBALL" ] || [ ! -s "/tmp/kernel-cache/$TARBALL" ]; then \
+    TARBALL="linux-${KERNEL_TARBALL_VERSION}.tar.xz" && \
+    if ! echo "${KERNEL_SHA256}  /tmp/kernel-cache/$TARBALL" | sha256sum -c - >/dev/null 2>&1; then \
         rm -f "/tmp/kernel-cache/$TARBALL" && \
         wget -q "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/$TARBALL" \
-            -O "/tmp/kernel-cache/$TARBALL"; \
+            -O "/tmp/kernel-cache/$TARBALL" && \
+        echo "${KERNEL_SHA256}  /tmp/kernel-cache/$TARBALL" | sha256sum -c -; \
     fi && \
     tar -xf "/tmp/kernel-cache/$TARBALL" -C /build/ && \
-    ln -s "/build/linux-${KERNEL_VERSION}" /build/linux
+    ln -s "/build/linux-${KERNEL_TARBALL_VERSION}" /build/linux
 
-# Copy Alpine's base config (single arch, from config-extractor stage)
-COPY --from=config-extractor /alpine-virt.config /tmp/alpine-virt.config
+# Copy Alpine's base config (vendored into git by `make upgrade`)
+COPY images/kernel/alpine-virt-${ARCH}.config /tmp/alpine-virt.config
 
 # Copy our config fragment
 COPY images/kernel/exec-sandbox.config /tmp/exec-sandbox.config
@@ -249,11 +238,13 @@ RUN --mount=type=cache,target=/root/.ccache \
 
 # Output stage
 FROM scratch
-ARG ARCH
 COPY --from=builder /vmlinuz-* .
 DOCKERFILE
 
-    save_hash "$output_file" "$current_hash"
+    # Sidecar (.hash) is written by extract-kernel.sh only — the orchestrator
+    # owns it so a standalone build here leaves a hash miss, forcing
+    # extract-kernel.sh to refresh derived artifacts (vmlinux PVH extraction)
+    # instead of serving a stale one.
 
     local size
     size=$(du -h "$output_file" | cut -f1)

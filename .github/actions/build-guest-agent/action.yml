@@ -5,9 +5,6 @@ inputs:
   arch:
     description: Target architecture (x86_64 or aarch64)
     required: true
-  rust-version:
-    description: Rust toolchain version (sourced from Makefile rust_version)
-    required: true
 
 runs:
   using: composite
@@ -45,6 +42,4 @@ runs:
 
     - name: Build guest-agent
       shell: bash
-      env:
-        RUST_VERSION: ${{ inputs.rust-version }}
       run: ./scripts/build-guest-agent.sh ${{ inputs.arch }}

@@ -1,0 +1,13 @@
+# Managed by `make upgrade` (scripts/upgrade-versions.sh). Do not edit manually.
+# KEY=VALUE, no spaces: consumed by Make (include) and parsed by shell via grep
+# (never sourced — lock values must not be executable).
+ALPINE_VERSION=3.23
+ALPINE_IMAGE_DIGEST=sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+QEMU_VERSION=10.2.1
+QEMU_SHA256=a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1
+RUST_VERSION=1.93
+RUST_IMAGE_DIGEST=sha256:c0a38f5662afdb298898da1d70b909af4bda4e0acff2dc52aea6360a9b9c6956
+LINUX_VIRT_VERSION=6.18.38-r0
+KERNEL_VERSION=6.18.38
+KERNEL_TARBALL_VERSION=6.18.38
+KERNEL_SHA256=ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045
