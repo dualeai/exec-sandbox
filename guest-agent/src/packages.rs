@@ -141,6 +141,7 @@ pub(crate) async fn install_packages(
     }
 
     let start = Instant::now();
+    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::Fatal(e.into()))?;
 
     let mut cmd = match language {
         Language::Python => {
@@ -209,13 +210,12 @@ pub(crate) async fn install_packages(
             )));
         }
     };
-
+    let observed_exit_code = exit_code_from_status(status);
+    let exit_code = crate::oom_guard::reconcile_retirement_exit(observed_exit_code);
     let stdout_lines = stdout_task.await.unwrap_or_default();
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let exit_code = exit_code_from_status(status);
-
     // Sync filesystem for snapshot safety
     if exit_code == 0 {
         unsafe { libc::sync() };

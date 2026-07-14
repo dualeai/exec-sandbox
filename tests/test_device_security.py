@@ -635,7 +635,7 @@ with open('/home/user/still_works.txt') as f:
 # Block device hardening
 # =============================================================================
 class TestBlockDeviceHardening:
-    """Block device nodes (/dev/vda, /dev/zram0) are removed by tiny-init after use."""
+    """Setup-only block device nodes are absent before untrusted execution."""
 
     # --- Normal cases: device nodes removed and filesystem still works ---
 
@@ -648,14 +648,14 @@ class TestBlockDeviceHardening:
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
 
-    async def test_zram_swap_active(self, dual_scheduler: Scheduler) -> None:
-        """zram swap is active — guest-agent sets up /dev/zram0 then removes the device node for security."""
+    async def test_dev_zram0_not_exists(self, dual_scheduler: Scheduler) -> None:
+        """The guest agent removes /dev/zram0 after activating swap."""
         result = await dual_scheduler.run(
-            code="print('zram0' in open('/proc/swaps').read())",
+            code="import os; print(os.path.lexists('/dev/zram0'))",
             language=Language.PYTHON,
         )
         assert result.exit_code == 0
-        assert result.stdout.strip() == "True"
+        assert result.stdout.strip() == "False"
 
     async def test_filesystem_still_works(self, dual_scheduler: Scheduler) -> None:
         """Read/write on the root filesystem works after /dev/vda removal."""
@@ -765,19 +765,17 @@ except (FileNotFoundError, PermissionError, OSError):
     # --- Out of bounds cases: no block device nodes remain anywhere in /dev ---
 
     async def test_no_block_devices_in_dev(self, dual_scheduler: Scheduler) -> None:
-        """Only expected block device nodes exist under /dev (zram for swap)."""
+        """No block device nodes remain under /dev."""
         code = """\
 import os, stat
 
-# zram0 is expected: used for compressed swap in microVM
-allowed = {'/dev/zram0'}
 block_devices = []
 for dirpath, dirnames, filenames in os.walk('/dev'):
     for name in filenames:
         path = os.path.join(dirpath, name)
         try:
             s = os.lstat(path)
-            if stat.S_ISBLK(s.st_mode) and path not in allowed:
+            if stat.S_ISBLK(s.st_mode):
                 block_devices.append(path)
         except OSError:
             pass
@@ -803,12 +801,11 @@ class TestLoopDeviceBlocked:
     nosuid), and multiple ext4/btrfs/xfs kernel bugs triggered by mounting
     crafted filesystem images (CVE-2025-38220, CVE-2025-38222, CVE-2024-39472).
 
-    5 independent layers block loop device + mkfs operations:
-    1. No loop.ko in initramfs (module list: virtio, ext4, zram only)
-    2. modules_disabled=1 (irreversible sysctl set by tiny-init)
-    3. No /dev/loop* nodes (kernel never creates them without loop module)
-    4. /dev is read-only (mknod returns EROFS)
-    5. No CAP_MKNOD (UID 1000, verified in TestDevReadonlyHardening)
+    4 independent layers block loop device + mkfs operations:
+    1. CONFIG_MODULES=n, so no loadable loop driver exists
+    2. No /dev/loop* nodes (the kernel has no loop device support)
+    3. /dev is read-only (mknod returns EROFS)
+    4. No CAP_MKNOD (UID 1000, verified in TestDevReadonlyHardening)
     """
 
     # --- Normal: verify loop infrastructure absent ---
@@ -911,14 +908,14 @@ print(f'FORMAT_RC:{r.returncode}')
     # --- Out of bounds: full attack chains blocked ---
 
     async def test_loop_module_load_blocked(self, dual_scheduler: Scheduler) -> None:
-        """modprobe loop fails — modules_disabled=1 is irreversible."""
+        """modprobe loop fails because the kernel has no module support."""
         result = await dual_scheduler.run(
             code="modprobe loop 2>&1; echo EXIT:$?",
             language=Language.RAW,
         )
         assert result.exit_code == 0
         assert "EXIT:0" not in result.stdout, (
-            f"Expected modprobe loop to fail with modules_disabled=1.\nstdout: {result.stdout}"
+            f"Expected modprobe loop to fail with CONFIG_MODULES=n.\nstdout: {result.stdout}"
         )
 
     async def test_file_backed_loop_mount_blocked(self, dual_scheduler: Scheduler) -> None:
@@ -974,8 +971,8 @@ class TestProcSysHardening:
     - randomize_va_space=0 (disables ASLR system-wide)
     - ip_forward (network pivoting), hostname, panic, panic_on_oom (DoS)
 
-    All sysctl tuning is done by tiny-init during setup_zram() before
-    switch_root, so no writes to /proc/sys are needed at runtime.
+    Required VM tuning is applied by guest-agent before /proc/sys is sealed
+    read-only, so untrusted code needs no writes there at runtime.
 
     See: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (runc /proc/sys escapes)
     """

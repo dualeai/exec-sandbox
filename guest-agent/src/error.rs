@@ -343,6 +343,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exit_code_maps_signals_and_codes() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        // Raw wait status: low byte = signal number, code<<8 = normal exit.
+        assert_eq!(exit_code_from_status(ExitStatus::from_raw(9)), 137); // SIGKILL
+        assert_eq!(exit_code_from_status(ExitStatus::from_raw(11)), 139); // SIGSEGV
+        assert_eq!(exit_code_from_status(ExitStatus::from_raw(0)), 0);
+        assert_eq!(exit_code_from_status(ExitStatus::from_raw(1 << 8)), 1);
+        assert_eq!(exit_code_from_status(ExitStatus::from_raw(137 << 8)), 137);
+    }
+
+    #[test]
     fn test_cmd_error_env_var() {
         let err = CmdError::env_var("blocked env var");
         match err {

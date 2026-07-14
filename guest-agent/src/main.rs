@@ -45,6 +45,7 @@ mod connection;
 mod error;
 mod file_io;
 mod init;
+mod oom_guard;
 mod packages;
 mod repl;
 mod types;
@@ -183,28 +184,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         t_phase1 - t_start
     );
 
-    // Phase 2 core runs on spawn_blocking while we concurrently attempt
-    // the first virtio port open. Virtio ports appear ~5-15ms into boot
-    // while init does filesystem/sysctl work — overlapping saves 2-5ms.
-    // Phase 2 must complete before any request processing (Ping).
+    // Phase 2 core performs blocking filesystem and sysctl setup off the async
+    // runtime. It must complete before any request processing (Ping).
     let phase2_handle = tokio::task::spawn_blocking(|| {
         init::setup_phase2_core();
         let t_phase2 = monotonic_ms();
         log_info!("[timing] agent_phase2_core: {}ms", t_phase2);
     });
 
-    // Background tasks — none block Ping/file I/O readiness.
-    // ExecuteCode/InstallPackages gate on NETWORK_READY only.
-    tokio::spawn(init::setup_network_background());
-    tokio::spawn(init::setup_zram_background());
-    tokio::spawn(init::reap_zombies());
-    init::spawn_oom_watchdog();
-
     log_info!("Guest agent starting (dual ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH})...");
 
     // Wait for phase2 to finish before entering the connection loop.
     // This ensures all mounts, sysctls, and dev setup are complete before Ping.
-    phase2_handle.await.ok();
+    phase2_handle.await?;
+
+    // Start independent work only after phase 2 has prepared /dev. Zram setup
+    // is awaited so it removes its setup-only node and seals the final /dev
+    // mount before the long-lived virtio port descriptors are opened; L1
+    // snapshots rely on that stable ordering when reconnecting the ports.
+    tokio::spawn(init::reap_zombies());
+    tokio::spawn(init::setup_network_background());
+    init::setup_zram_and_seal_dev().await;
 
     listen_virtio_serial().await
 }

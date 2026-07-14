@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicU8, AtomicU64};
 
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
@@ -146,10 +146,25 @@ pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
     "MALLOC_PERTURB_",
 ];
 
-/// Network readiness gate: signals when ip + gvproxy setup is complete.
-/// ExecuteCode/InstallPackages wait on this; Ping/file I/O respond immediately.
-pub(crate) static NETWORK_READY: AtomicBool = AtomicBool::new(false);
+/// Network readiness gate: 0=pending, 1=ready (including intentionally offline),
+/// 2=failed. ExecuteCode/InstallPackages wait on this; Ping/file I/O respond
+/// immediately.
+pub(crate) const NETWORK_PENDING: u8 = 0;
+pub(crate) const NETWORK_READY: u8 = 1;
+pub(crate) const NETWORK_FAILED: u8 = 2;
+pub(crate) const NETWORK_SETUP_TIMEOUT_SECONDS: u64 = 7;
+pub(crate) static NETWORK_STATE: AtomicU8 = AtomicU8::new(NETWORK_PENDING);
 pub(crate) static NETWORK_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+/// Capped-zram safety gate. Untrusted process spawning is blocked until the
+/// configured active-swap policy has fully started. Production has no
+/// intentional no-swap mode: every setup failure makes the VM unavailable.
+/// The state is terminal before the virtio listener starts (main.rs awaits
+/// zram setup), so readers check it synchronously — no waiter machinery.
+pub(crate) const ZRAM_PENDING: u8 = 0;
+pub(crate) const ZRAM_READY: u8 = 1;
+pub(crate) const ZRAM_FAILED: u8 = 2;
+pub(crate) static ZRAM_STATE: AtomicU8 = AtomicU8::new(ZRAM_PENDING);
 
 /// Monotonic counter for sentinel IDs. Combined with nanosecond timestamp
 /// to produce unique, unpredictable IDs without the uuid crate dependency.

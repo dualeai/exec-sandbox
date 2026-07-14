@@ -144,6 +144,30 @@ impl NonBlockingFile {
 // Connection handler
 // ============================================================================
 
+/// Report a command-handler outcome on the dispatch loop.
+///
+/// `Ok(())` and `Reply` errors are recoverable (the loop continues); only a
+/// closed write queue or a `Fatal` error terminate the connection. Folds the
+/// four identical Ok/Reply/Fatal match blocks (install/execute/read/list) into
+/// one site: `if let Err(e) = report(&writer, handler(...).await).await { break Err(e); }`.
+async fn report(
+    writer: &ResponseWriter,
+    outcome: Result<(), CmdError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(CmdError::Reply {
+            message,
+            error_type,
+            ..
+        }) => writer
+            .send_error(message, error_type)
+            .await
+            .map_err(|_| "write queue closed".into()),
+        Err(CmdError::Fatal(e)) => Err(e.to_string().into()),
+    }
+}
+
 /// Handle connection with non-blocking command reader.
 pub(crate) async fn handle_connection(
     cmd_reader: &mut NonBlockingFile,
@@ -271,6 +295,21 @@ pub(crate) async fn handle_connection(
             }
             GuestCommand::WarmRepl { language } => {
                 log_info!("Processing: warm_repl (language={language})");
+                if let Err(error) = crate::init::wait_for_untrusted_readiness().await {
+                    log_warn!("REPL warm-up readiness failed: {error}");
+                    if writer
+                        .send(&GuestResponse::WarmReplAck {
+                            language,
+                            status: "error".to_string(),
+                            message: Some(format!("guest readiness failed: {error}")),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Err("write queue closed".into());
+                    }
+                    continue;
+                }
                 let lang = match Language::parse(&language) {
                     Some(l) => l,
                     None => {
@@ -353,8 +392,20 @@ pub(crate) async fn handle_connection(
                 packages,
                 timeout,
             } => {
-                // Gate: wait for network setup (ip + gvproxy) before package install
-                crate::init::wait_for_network().await;
+                // Gate all process spawning on network and capped-zram safety.
+                if let Err(error) = crate::init::wait_for_untrusted_readiness().await {
+                    if writer
+                        .send_error(
+                            format!("VM readiness failed before package installation: {error}"),
+                            ErrorType::Execution.as_str(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break Err("write queue closed".into());
+                    }
+                    continue;
+                }
                 log_info!(
                     "Processing: install_packages (language={language}, count={}, timeout={timeout}s)",
                     packages.len()
@@ -378,20 +429,13 @@ pub(crate) async fn handle_connection(
                         continue;
                     }
                 };
-                match install_packages(lang, &packages, timeout, &writer).await {
-                    Ok(()) => {}
-                    Err(CmdError::Reply {
-                        message,
-                        error_type,
-                        ..
-                    }) => {
-                        if writer.send_error(message, error_type).await.is_err() {
-                            break Err("write queue closed".into());
-                        }
-                    }
-                    Err(CmdError::Fatal(e)) => {
-                        break Err(e.to_string().into());
-                    }
+                if let Err(e) = report(
+                    &writer,
+                    install_packages(lang, &packages, timeout, &writer).await,
+                )
+                .await
+                {
+                    break Err(e);
                 }
             }
             GuestCommand::ExecuteCode {
@@ -400,12 +444,24 @@ pub(crate) async fn handle_connection(
                 timeout,
                 env_vars,
             } => {
-                // Gate: wait for network setup (ip + gvproxy) before code execution
+                // Gate all process spawning on network and capped-zram safety.
                 let t_net = crate::monotonic_ms();
-                crate::init::wait_for_network().await;
+                if let Err(error) = crate::init::wait_for_untrusted_readiness().await {
+                    if writer
+                        .send_error(
+                            format!("VM readiness failed before code execution: {error}"),
+                            ErrorType::Execution.as_str(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break Err("write queue closed".into());
+                    }
+                    continue;
+                }
                 let t_net_done = crate::monotonic_ms();
                 log_info!(
-                    "[timing] wait_for_network: {}ms (at {}ms)",
+                    "[timing] wait_for_untrusted_readiness: {}ms (at {}ms)",
                     t_net_done - t_net,
                     t_net_done
                 );
@@ -414,20 +470,10 @@ pub(crate) async fn handle_connection(
                     code.len(),
                     env_vars.len()
                 );
-                match execute_code_streaming(&language, &code, timeout, &env_vars, &writer).await {
-                    Ok(()) => {}
-                    Err(CmdError::Reply {
-                        message,
-                        error_type,
-                        ..
-                    }) => {
-                        if writer.send_error(message, error_type).await.is_err() {
-                            break Err("write queue closed".into());
-                        }
-                    }
-                    Err(CmdError::Fatal(e)) => {
-                        break Err(e.to_string().into());
-                    }
+                let outcome =
+                    execute_code_streaming(&language, &code, timeout, &env_vars, &writer).await;
+                if let Err(e) = report(&writer, outcome).await {
+                    break Err(e);
                 }
             }
             GuestCommand::WriteFile {
@@ -593,38 +639,16 @@ pub(crate) async fn handle_connection(
             }
             GuestCommand::ReadFile { op_id, path } => {
                 log_info!("Processing: read_file (op_id={op_id}, path={path})");
-                match handle_read_file(&op_id, &path, &writer).await {
-                    Ok(()) => {}
-                    Err(CmdError::Reply {
-                        message,
-                        error_type,
-                        ..
-                    }) => {
-                        if writer.send_error(message, error_type).await.is_err() {
-                            break Err("write queue closed".into());
-                        }
-                    }
-                    Err(CmdError::Fatal(e)) => {
-                        break Err(e.to_string().into());
-                    }
+                if let Err(e) =
+                    report(&writer, handle_read_file(&op_id, &path, &writer).await).await
+                {
+                    break Err(e);
                 }
             }
             GuestCommand::ListFiles { path } => {
                 log_info!("Processing: list_files (path={path})");
-                match handle_list_files(&path, &writer).await {
-                    Ok(()) => {}
-                    Err(CmdError::Reply {
-                        message,
-                        error_type,
-                        ..
-                    }) => {
-                        if writer.send_error(message, error_type).await.is_err() {
-                            break Err("write queue closed".into());
-                        }
-                    }
-                    Err(CmdError::Fatal(e)) => {
-                        break Err(e.to_string().into());
-                    }
+                if let Err(e) = report(&writer, handle_list_files(&path, &writer).await).await {
+                    break Err(e);
                 }
             }
         }

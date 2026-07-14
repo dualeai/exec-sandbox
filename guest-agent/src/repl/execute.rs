@@ -16,6 +16,52 @@ use crate::repl::spawn::spawn_repl;
 use crate::types::GuestResponse;
 use crate::validation::{prepend_env_vars, validate_code_params, validate_env_vars};
 
+fn read_bounded_diagnostic(path: &str, limit: u64) -> String {
+    use std::io::Read as _;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return "unavailable".to_string();
+    };
+    let mut value = String::new();
+    match file.take(limit).read_to_string(&mut value) {
+        Ok(_) => value.trim().to_string(),
+        Err(error) => format!("read_error:{error}"),
+    }
+}
+
+/// Capture enough bounded state to distinguish an interpreter/read stall from
+/// a normal long-running program on the next failure. Never delay termination
+/// on an external diagnostic command.
+fn log_repl_timeout_diagnostics(pid: Option<u32>, first_io_logged: bool) {
+    let Some(pid) = pid else {
+        log_warn!("[repl-timeout] pid=unavailable first_io={first_io_logged}");
+        return;
+    };
+
+    let status = read_bounded_diagnostic(&format!("/proc/{pid}/status"), 8 * 1024);
+    let status_summary = status
+        .lines()
+        .filter(|line| {
+            line.starts_with("State:")
+                || line.starts_with("VmRSS:")
+                || line.starts_with("VmSwap:")
+                || line.starts_with("Threads:")
+                || line.starts_with("voluntary_ctxt_switches:")
+                || line.starts_with("nonvoluntary_ctxt_switches:")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let wchan = read_bounded_diagnostic(&format!("/proc/{pid}/wchan"), 256);
+    let stack =
+        read_bounded_diagnostic(&format!("/proc/{pid}/stack"), 4 * 1024).replace('\n', "; ");
+    let memory_psi = read_bounded_diagnostic("/proc/pressure/memory", 2 * 1024).replace('\n', "; ");
+    let zram_mm = read_bounded_diagnostic("/sys/block/zram0/mm_stat", 2 * 1024);
+
+    log_warn!(
+        "[repl-timeout] pid={pid} first_io={first_io_logged} status=[{status_summary}] wchan={wchan} stack=[{stack}] memory_psi=[{memory_psi}] zram_mm=[{zram_mm}]"
+    );
+}
+
 /// Helper to flush a buffer as a Stdout/Stderr response message.
 async fn flush_output_buffer(
     writer: &ResponseWriter,
@@ -64,58 +110,71 @@ fn process_stderr_chunk(
     stderr_buffer: &mut String,
 ) -> Option<i32> {
     stderr_line_buf.push_str(&String::from_utf8_lossy(chunk));
+
+    // Single linear pass: scan complete lines in place, then drain them all at
+    // once. Per-line drain+collect was O(remaining) per line plus a heap
+    // allocation per line — quadratic on newline-dense chunks.
     let mut sentinel_exit_code: Option<i32> = None;
-    while let Some(nl) = stderr_line_buf.find('\n') {
-        let line: String = stderr_line_buf.drain(..=nl).collect();
-        // drain includes the '\n'; strip it for sentinel parsing
-        let line = &line[..line.len() - 1];
-        if let Some(code) = parse_stderr_line_for_sentinel(line, sentinel_prefix, stderr_buffer) {
+    let mut consumed = 0;
+    for line in stderr_line_buf.split_inclusive('\n') {
+        if !line.ends_with('\n') {
+            break; // trailing partial line stays buffered for the next chunk
+        }
+        consumed += line.len();
+        if let Some(code) =
+            parse_stderr_line_for_sentinel(&line[..line.len() - 1], sentinel_prefix, stderr_buffer)
+        {
             // Last sentinel wins if multiple appear in one chunk
             sentinel_exit_code = Some(code);
         }
     }
+    stderr_line_buf.drain(..consumed);
+
+    // Bound the un-terminated tail. A newline-free flood would otherwise grow
+    // this buffer without limit — the caller's MAX_STDERR_BYTES cap clears
+    // stderr_buffer but keeps reading here for the sentinel. A sentinel line is
+    // short and always ends in '\n', so retaining only the final window cannot
+    // drop one; any dropped prefix is already-over-limit data.
+    let max_tail = MAX_STDERR_BYTES + sentinel_prefix.len();
+    if stderr_line_buf.len() > max_tail {
+        let cut = stderr_line_buf.len() - max_tail;
+        let boundary = stderr_line_buf
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= cut)
+            .unwrap_or(stderr_line_buf.len());
+        stderr_line_buf.drain(..boundary);
+    }
+
     sentinel_exit_code
 }
 
-/// Drain stdout with a cumulative deadline after sentinel detection or SIGTERM.
-/// Uses up to DRAIN_TIMEOUT_MS per read attempt (clamped to remaining deadline),
-/// keeping per-read latency low while `deadline_ms` bounds total drain time.
+/// Drain stdout until a continuous idle window (no data for DRAIN_IDLE_MS) or
+/// the cumulative `deadline_ms` elapses, whichever comes first.
 ///
-/// Tolerates up to `MAX_CONSECUTIVE_DRAIN_TIMEOUTS` successive read timeouts before
-/// concluding the pipe is empty. Under QEMU TCG software emulation (~8× slower than
-/// KVM/HVF), a single DRAIN_TIMEOUT_MS window (5 ms) can be too tight for tokio to
-/// service a kernel pipe read — the event-loop overhead (timer wheel + epoll_wait
-/// jiffies rounding at HZ=250) can itself consume the budget, causing a false timeout
-/// even when data is sitting in the pipe buffer.
-const MAX_CONSECUTIVE_DRAIN_TIMEOUTS: u32 = 8; // up to 8 × 5 ms = 40 ms idle tolerance
+/// A single continuous idle window (rather than N discrete short windows)
+/// tolerates event-loop overhead under QEMU TCG (~8× slower than KVM/HVF),
+/// where a byte arriving late in a short window could otherwise trip a false
+/// timeout boundary while data is still in the pipe buffer.
+const DRAIN_IDLE_MS: u64 = 40;
 
 async fn drain_stdout(
     stdout: &mut tokio::process::ChildStdout,
     stdout_buffer: &mut String,
     deadline_ms: u64,
 ) {
-    let drain_deadline = Instant::now() + Duration::from_millis(deadline_ms);
+    let total_deadline = Instant::now() + Duration::from_millis(deadline_ms);
     let mut buf = [0u8; 8192];
-    let mut consecutive_timeouts: u32 = 0;
     loop {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let total_remaining = total_deadline.saturating_duration_since(Instant::now());
+        if total_remaining.is_zero() {
             break;
         }
-        let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
-        match tokio::time::timeout(per_read, stdout.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => break,
-            Err(_) => {
-                // Timeout — retry until idle threshold or deadline.
-                consecutive_timeouts += 1;
-                if consecutive_timeouts >= MAX_CONSECUTIVE_DRAIN_TIMEOUTS {
-                    break;
-                }
-            }
-            Ok(Ok(n)) => {
-                consecutive_timeouts = 0;
-                stdout_buffer.push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
+        let window = total_remaining.min(Duration::from_millis(DRAIN_IDLE_MS));
+        match tokio::time::timeout(window, stdout.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => stdout_buffer.push_str(&String::from_utf8_lossy(&buf[..n])),
+            // EOF, read error, idle window elapsed, or total deadline hit.
+            _ => break,
         }
     }
 }
@@ -145,7 +204,6 @@ async fn drain_after_sigterm(
         if remaining.is_zero() || (stdout_done && stderr_done) {
             break;
         }
-        let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
 
         // Sentinel found — switch to stdout-only drain (stderr no longer needed)
         if sentinel_exit_code.is_some() {
@@ -153,51 +211,26 @@ async fn drain_after_sigterm(
             break;
         }
 
-        // Once stderr is done, only drain stdout
-        if stderr_done {
-            match tokio::time::timeout(per_read, stdout.read(&mut stdout_buf)).await {
-                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
-                Ok(Ok(n)) => {
-                    stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_buf[..n]));
-                }
-            }
-            continue;
-        }
+        let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
 
-        // Once stdout is done, only drain stderr
-        if stdout_done {
-            match tokio::time::timeout(per_read, stderr.read(&mut stderr_buf)).await {
-                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
-                Ok(Ok(n)) => {
-                    if let Some(code) = process_stderr_chunk(
-                        &stderr_buf[..n],
-                        stderr_line_buf,
-                        sentinel_prefix,
-                        stderr_buffer,
-                    ) {
-                        sentinel_exit_code = Some(code);
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Both pipes active — use select
+        // Branch preconditions disable a stream once it is done; the
+        // `Err(_) if !other_done` arm reproduces the read asymmetry: while both
+        // streams are active a timeout retries, but once only one remains the
+        // first timeout terminates it. (At least one branch is always enabled —
+        // the loop guard breaks when both are done.)
         tokio::select! {
-            result = tokio::time::timeout(per_read, stdout.read(&mut stdout_buf)) => {
-                match result {
-                    Ok(Ok(0)) | Ok(Err(_)) => { stdout_done = true; }
-                    Err(_) => {} // timeout — try again
-                    Ok(Ok(n)) => {
+            r = tokio::time::timeout(per_read, stdout.read(&mut stdout_buf)), if !stdout_done => {
+                match r {
+                    Ok(Ok(n)) if n > 0 => {
                         stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_buf[..n]));
                     }
+                    Err(_) if !stderr_done => {} // both active: timeout retries
+                    _ => stdout_done = true,      // EOF/error always; timeout in single-stream mode
                 }
             }
-            result = tokio::time::timeout(per_read, stderr.read(&mut stderr_buf)) => {
-                match result {
-                    Ok(Ok(0)) | Ok(Err(_)) => { stderr_done = true; }
-                    Err(_) => {} // timeout — try again
-                    Ok(Ok(n)) => {
+            r = tokio::time::timeout(per_read, stderr.read(&mut stderr_buf)), if !stderr_done => {
+                match r {
+                    Ok(Ok(n)) if n > 0 => {
                         if let Some(code) = process_stderr_chunk(
                             &stderr_buf[..n],
                             stderr_line_buf,
@@ -207,6 +240,8 @@ async fn drain_after_sigterm(
                             sentinel_exit_code = Some(code);
                         }
                     }
+                    Err(_) if !stdout_done => {}
+                    _ => stderr_done = true,
                 }
             }
         }
@@ -240,17 +275,20 @@ async fn submit_code_to_repl(
 }
 
 /// Exercise a freshly-spawned REPL with a no-op to block until the interpreter
-/// is fully loaded.
+/// is fully loaded. `spawn_repl()` only proves fork+exec returned; the loader
+/// and interpreter may still be consuming executable/data pages.
 ///
-/// The warm pool calls this so `wait_pool_ready()` doesn't return until the
-/// interpreter has actually finished loading (Python ~10s, Bun ~9s on HVF).
-/// Without this, `spawn_repl()` returns after fork+exec (~4ms) but the
-/// interpreter is still importing modules from EROFS.
+/// Pre-advertisement paths only (warm-pool pre-warm and background L1
+/// snapshot saves), hence the generous deadline: it runs before the VM is
+/// available to callers.
 pub(crate) async fn warm_exercise_repl(
     repl: &mut crate::repl::spawn::ReplState,
     language: crate::types::Language,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::types::Language;
+
+    const PHASE: &str = "warm_pool";
+    let timeout = Duration::from_secs(120);
 
     let (sentinel_id, sentinel_prefix) = generate_sentinel();
 
@@ -264,16 +302,15 @@ pub(crate) async fn warm_exercise_repl(
     submit_code_to_repl(&mut repl.stdin, &sentinel_id, code).await?;
 
     log_info!(
-        "[warm] sent no-op to {} REPL, waiting for readiness...",
+        "[repl-readiness] phase={PHASE} language={} action=waiting timeout_ms={}",
         language.as_str(),
+        timeout.as_millis(),
     );
 
     // Wait for sentinel on stderr (this is where the interpreter startup time is spent)
     let mut stderr_line_buf = String::new();
     let mut stderr_discard = String::new();
     let mut buf = [0u8; 4096];
-    let timeout = Duration::from_secs(120); // generous timeout for cold start
-
     let result = tokio::time::timeout(timeout, async {
         loop {
             let n = repl.stderr.read(&mut buf).await?;
@@ -292,17 +329,40 @@ pub(crate) async fn warm_exercise_repl(
     })
     .await;
 
+    match repl.child.try_wait() {
+        Ok(Some(status)) => {
+            let exit_code = exit_code_from_status(status);
+            crate::oom_guard::reconcile_retirement_exit(exit_code);
+            return Err(format!("REPL exited during warm-up with code {exit_code}").into());
+        }
+        Ok(None) => {}
+        Err(error) => return Err(format!("Failed to inspect warmed REPL: {error}").into()),
+    }
+    if crate::oom_guard::retirement_required() {
+        return Err("VM retirement required during REPL warm-up".into());
+    }
+
     match result {
         Ok(Ok(())) => {
             // Drain any stdout the no-op may have produced.
             // 250 ms: warm-up is trivial so output here is not user-visible,
             // but TCG needs slack beyond the idle-tolerance window (40 ms).
             drain_stdout(&mut repl.stdout, &mut String::new(), 250).await;
-            log_info!("[warm] {} REPL ready", language.as_str());
+            log_info!(
+                "[repl-readiness] phase={PHASE} language={} action=ready",
+                language.as_str()
+            );
             Ok(())
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("REPL warm-up timed out (120s)".into()),
+        Err(_) => {
+            log_repl_timeout_diagnostics(repl.child.id(), false);
+            Err(format!(
+                "REPL {PHASE} readiness timed out after {}ms",
+                timeout.as_millis()
+            )
+            .into())
+        }
     }
 }
 
@@ -328,7 +388,13 @@ pub(crate) async fn execute_code_streaming(
         let mut states = REPL_STATES.lock().await;
         match states.remove(&language) {
             Some(mut existing) => match existing.child.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
+                    let exit_code = exit_code_from_status(status);
+                    if crate::oom_guard::reconcile_retirement_exit(exit_code) == 137 {
+                        return Err(CmdError::Fatal(
+                            "VM retirement required after idle REPL death".into(),
+                        ));
+                    }
                     log_warn!("REPL for {} died, spawning fresh", language.as_str());
                     was_fresh_spawn = true;
                     spawn_repl(language)
@@ -358,6 +424,8 @@ pub(crate) async fn execute_code_streaming(
         was_fresh_spawn,
         spawn_ms
     );
+
+    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::Fatal(e.into()))?;
 
     // Generate unique sentinel
     let (sentinel_id, sentinel_prefix) = generate_sentinel();
@@ -497,10 +565,6 @@ pub(crate) async fn execute_code_streaming(
             }
 
             if sentinel_exit_code.is_some() {
-                // 500 ms: post-sentinel stdout flush. The JS REPL yields 50 ms
-                // for back-pressure before the sentinel, but under TCG (~8× slower)
-                // data may still be in the kernel pipe buffer.
-                drain_stdout(&mut repl.stdout, &mut stdout_buffer, 500).await;
                 break;
             }
             if stdout_done && stderr_done {
@@ -509,6 +573,16 @@ pub(crate) async fn execute_code_streaming(
         }
     })
     .await;
+
+    if loop_result.is_ok()
+        && sentinel_exit_code.is_some()
+        && !crate::oom_guard::retirement_required()
+    {
+        // 500 ms: post-sentinel stdout flush. The JS REPL yields 50 ms for
+        // back-pressure before the sentinel, but under TCG (~8× slower) data
+        // may still be in the kernel pipe buffer.
+        drain_stdout(&mut repl.stdout, &mut stdout_buffer, 500).await;
+    }
 
     // Flush residual buffers (skip capped streams)
     if !stderr_line_buf.is_empty() && !stderr_capped {
@@ -527,6 +601,22 @@ pub(crate) async fn execute_code_streaming(
     match loop_result {
         Ok(()) if sentinel_exit_code.is_some() => {
             let exit_code = sentinel_exit_code.unwrap();
+
+            // A terminal pressure decision can race with buffered sentinel
+            // delivery. Do not pool the REPL or report a non-terminal result
+            // once that decision is visible (see reconcile_retirement_exit).
+            if crate::oom_guard::reconcile_retirement_exit(exit_code) == 137 {
+                writer
+                    .send(&GuestResponse::Complete {
+                        exit_code: 137,
+                        execution_time_ms: duration_ms,
+                        spawn_ms: Some(spawn_ms),
+                        process_ms,
+                    })
+                    .await?;
+                return Ok(());
+            }
+
             REPL_STATES.lock().await.insert(language, repl);
 
             if stdout_capped || stderr_capped {
@@ -557,7 +647,8 @@ pub(crate) async fn execute_code_streaming(
         }
         Ok(()) => {
             let status = repl.child.wait().await;
-            let exit_code = status.map(exit_code_from_status).unwrap_or(-1);
+            let observed_exit_code = status.map(exit_code_from_status).unwrap_or(-1);
+            let exit_code = crate::oom_guard::reconcile_retirement_exit(observed_exit_code);
             log_warn!(
                 "REPL for {} died with exit_code={}",
                 language.as_str(),
@@ -574,6 +665,7 @@ pub(crate) async fn execute_code_streaming(
                 .await?;
         }
         Err(_) => {
+            log_repl_timeout_diagnostics(repl.child.id(), first_io_logged);
             log_warn!(
                 "REPL for {} timed out after {}s, sending SIGTERM",
                 language.as_str(),
@@ -606,9 +698,22 @@ pub(crate) async fn execute_code_streaming(
                     let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
                 }
                 // Timeout takes precedence over output limit — REPL is dead (SIGTERM'd)
+                let exit_code = crate::oom_guard::reconcile_retirement_exit(exit_code);
                 writer
                     .send(&GuestResponse::Complete {
                         exit_code,
+                        execution_time_ms: duration_ms,
+                        spawn_ms: Some(spawn_ms),
+                        process_ms,
+                    })
+                    .await?;
+                return Ok(());
+            }
+
+            if crate::oom_guard::retirement_required() {
+                writer
+                    .send(&GuestResponse::Complete {
+                        exit_code: 137,
                         execution_time_ms: duration_ms,
                         spawn_ms: Some(spawn_ms),
                         process_ms,
@@ -1018,5 +1123,38 @@ mod tests {
         let line = format!("{prefix}{code}__\n");
         let result = process_stderr_chunk(line.as_bytes(), &mut line_buf, prefix, &mut stderr_buf);
         assert_eq!(result, Some(code));
+    }
+
+    #[test]
+    fn newline_free_flood_keeps_line_buffer_bounded() {
+        let mut line_buf = String::new();
+        let mut stderr_buf = String::new();
+        let prefix = "__SENTINEL_1_0_";
+        let chunk = vec![b'x'; 256 * 1024];
+        // Many chunks, never a newline: the tail must stay bounded, not grow.
+        for _ in 0..40 {
+            assert_eq!(
+                process_stderr_chunk(&chunk, &mut line_buf, prefix, &mut stderr_buf),
+                None
+            );
+        }
+        assert!(line_buf.len() <= MAX_STDERR_BYTES + prefix.len());
+    }
+
+    #[test]
+    fn sentinel_survives_after_newline_free_flood() {
+        let mut line_buf = String::new();
+        let mut stderr_buf = String::new();
+        let prefix = "__SENTINEL_1_0_";
+        let flood = vec![b'x'; 2 * 1024 * 1024];
+        process_stderr_chunk(&flood, &mut line_buf, prefix, &mut stderr_buf);
+        // A terminated sentinel line delivered after the flood is still parsed.
+        let result = process_stderr_chunk(
+            b"\n__SENTINEL_1_0_5__\n",
+            &mut line_buf,
+            prefix,
+            &mut stderr_buf,
+        );
+        assert_eq!(result, Some(5));
     }
 }

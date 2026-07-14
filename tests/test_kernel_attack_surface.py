@@ -934,11 +934,12 @@ print(f"ret={ret} errno={err}")
         assert "ret=" in result.stdout, f"Unexpected keyctl output. stdout: {result.stdout}"
 
     async def test_modules_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
-        """kernel.modules_disabled=1 prevents ALL module loading (irreversible).
+        """The custom CONFIG_MODULES=n kernel exposes no module-loading support.
 
-        With CONFIG_MODULES=y: set by tiny-init after module loading.
-        With CONFIG_MODULES=n (custom kernel): sysctl doesn't exist (NOT_FOUND),
-        which is even stronger — the syscall itself returns ENOSYS.
+        Asserts module loading is unavailable: with the shipped
+        CONFIG_MODULES=n kernel the sysctl does not exist (NOT_FOUND); the
+        assertion also tolerates the weaker modules_disabled=1 / EPERM
+        outcomes as defense-in-depth.
         """
         code = """\
 try:

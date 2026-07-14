@@ -6,7 +6,6 @@
 #[macro_use]
 mod sys;
 mod device;
-mod zram;
 
 use std::ffi::CString;
 use std::fs;

@@ -1350,6 +1350,28 @@ class TestKernelCmdlineMitigations(_QemuCmdTestBase):
             )
 
 
+class TestKernelCmdlinePressureStallInformation(_QemuCmdTestBase):
+    """Pin PSI activation required by the guest capped-zram guard."""
+
+    @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64])
+    async def test_memory_psi_is_explicitly_enabled(self, vm_settings, workdir, arch) -> None:
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-memory-psi",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        tokens = _extract_kernel_cmdline(cmd).split()
+        assert tokens.count("psi=1") == 1
+
+
 # ============================================================================
 # Shared helpers for build_qemu_cmd() unit tests
 # ============================================================================

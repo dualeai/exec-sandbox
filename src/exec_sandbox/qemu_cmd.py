@@ -427,6 +427,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # Disable lockup detection — saves per-CPU watchdog threads and timers.
             # Ephemeral microVMs rely on host-side timeouts, not guest watchdogs.
             + " nowatchdog"
+            # The guest's capped-zram safety guard uses a memory PSI stall
+            # trigger. The merged Alpine base config builds PSI in but sets
+            # CONFIG_PSI_DEFAULT_DISABLED=y (images/kernel/alpine-virt-*.config),
+            # so PSI stays off unless this explicit token is present;
+            # fail-closed zram setup verifies it.
+            + " psi=1"
             # Disable cgroup controllers — minimal init with no systemd, no
             # resource isolation needed inside the VM. Saves slab caches and
             # per-CPU structures for each disabled controller.
@@ -660,8 +666,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Mode 0: No network (default)
     #   - Explicit "-nic none" suppresses QEMU's default NIC
     #   - Without this, machine types without -nodefaults (ARM64 virt)
-    #     create a default NIC, causing the guest-agent's
-    #     verify_gvproxy() to burn ~4s in exponential-backoff retries
+    #     create a default NIC; the guest-agent then requires a reachable
+    #     gvproxy and marks the network terminally failed, so every
+    #     ExecuteCode/InstallPackages on the VM is rejected (fail-closed)
     #   - microvm already uses -nodefaults so -nic none is redundant
     #     but harmless there
     #   - See: https://www.qemu.org/docs/master/system/qemu-manpage.html
@@ -720,11 +727,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
     else:
         # Suppress QEMU's default NIC.  Without this, machine types that don't
-        # use -nodefaults (ARM64 virt) create a default virtio-net
-        # device, causing the guest-agent to detect eth0 and run verify_gvproxy()
-        # with exponential-backoff retries (~4s) before marking NETWORK_READY.
-        # ExecuteCode/InstallPackages gate on NETWORK_READY, so the default NIC
-        # adds ~4s to every cold-start execution even when no network is needed.
+        # use -nodefaults (ARM64 virt) create a default virtio-net device; the
+        # guest-agent then detects eth0 and requires a reachable gvproxy
+        # (verify_gvproxy), which fails without one — the network state goes
+        # terminal-failed and every ExecuteCode/InstallPackages on the VM is
+        # rejected by the untrusted-readiness gate. A surprise NIC now
+        # permanently fails the VM, not merely slows it.
         qemu_args.extend(["-nic", "none"])
 
     # QMP (QEMU Monitor Protocol) socket for VM control operations

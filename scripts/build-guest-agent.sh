@@ -170,8 +170,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         export CC=musl-gcc; \
     fi && \
     cd guest-agent && \
-    cargo build --release --target ${RUST_TARGET} && \
-    cp target/${RUST_TARGET}/release/guest-agent /guest-agent-linux-${ARCH}
+    # The target/ cache mount persists across builds and can be overwritten by
+    # concurrent builds; cargo freshness for path packages is mtime-based and
+    # can false-hit on restored contents, serving a stale binary. Clean only
+    # the leaf crate — registry deps are checksum-fingerprinted and stay cached.
+    cargo clean --package guest-agent --release --target "${RUST_TARGET}" && \
+    cargo build --release --target "${RUST_TARGET}" && \
+    cp "target/${RUST_TARGET}/release/guest-agent" "/guest-agent-linux-${ARCH}"
 
 FROM scratch
 COPY --from=builder /guest-agent-linux-* .

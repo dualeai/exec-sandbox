@@ -353,7 +353,7 @@ async with Scheduler(config) as scheduler:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript, Raw). Set >0 to enable |
-| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
+| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Compressed swap (zram) adds ~40% logical headroom, physically capped at 20% of RAM |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
@@ -416,7 +416,7 @@ make bench-optimizer N_VMS=250    # heavier load (recommended for tuning)
 
 VMs include automatic memory optimization (no configuration required):
 
-- **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
+- **Compressed swap (zram)** - 40% of RAM as lz4-compressed swap, physically capped at 20% of RAM
 - **Memory reclamation (virtio-balloon)** - Reclaims unused guest pages on idle warm-pool VMs (192→140 MB default), reducing host memory pressure
 
 ### Memory Architecture
