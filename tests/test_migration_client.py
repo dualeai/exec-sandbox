@@ -12,13 +12,14 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from exec_sandbox import constants
 from exec_sandbox.exceptions import MigrationTransientError
 from exec_sandbox.migration_client import MigrationClient
+from exec_sandbox.qmp_exchange import _MAX_SKIPPED_MESSAGES
 
 # ============================================================================
 # Test Helpers
@@ -60,8 +61,17 @@ def _make_connected(
     reader = asyncio.StreamReader()
     writer = FakeWriter()
     if responses:
+        # QMP echoes the request id on every command response. _execute tags
+        # commands migration-1, migration-2, ... in order, so mirror that here:
+        # each non-event response carries the next sequential id (events don't
+        # consume an id). Explicitly-set ids are preserved.
+        seq = 0
         for resp in responses:
-            reader.feed_data(json.dumps(resp).encode() + b"\n")
+            tagged = dict(resp)
+            if "event" not in tagged and "id" not in tagged:
+                seq += 1
+                tagged["id"] = f"migration-{seq}"
+            reader.feed_data(json.dumps(tagged).encode() + b"\n")
     if feed_eof:
         reader.feed_eof()
     object.__setattr__(client, "_connected", True)
@@ -92,6 +102,81 @@ class TestMigrationClientInit:
         assert client._writer is None
 
 
+class TestMigrationClientConnectOwnership:
+    """Failed QMP handshakes close their published stream owner."""
+
+    @staticmethod
+    def _streams() -> tuple[AsyncMock, MagicMock]:
+        reader = AsyncMock()
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
+        return reader, writer
+
+    async def test_capabilities_error_closes_writer(self) -> None:
+        reader, writer = self._streams()
+        reader.readline = AsyncMock(
+            side_effect=[
+                b'{"QMP": {}}\n',
+                b'{"error": {"class": "CommandNotFound"}}\n',
+            ]
+        )
+        client = MigrationClient(Path("/tmp/fake.sock"), 501)
+
+        with patch(
+            "exec_sandbox.migration_client.connect_and_verify",
+            new_callable=AsyncMock,
+            return_value=(reader, writer),
+        ):
+            with pytest.raises(MigrationTransientError, match="QMP capabilities failed"):
+                await client.connect()
+
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_awaited_once()
+        assert client._writer is None
+
+    async def test_cancellation_waits_for_handshake_cleanup(self) -> None:
+        reader, writer = self._streams()
+        greeting_entered = asyncio.Event()
+        close_entered = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def blocked_greeting() -> bytes:
+            greeting_entered.set()
+            await asyncio.Event().wait()
+            return b""
+
+        async def blocked_wait_closed() -> None:
+            close_entered.set()
+            await release_close.wait()
+
+        reader.readline = AsyncMock(side_effect=blocked_greeting)
+        writer.wait_closed = AsyncMock(side_effect=blocked_wait_closed)
+        client = MigrationClient(Path("/tmp/fake.sock"), 501)
+
+        with patch(
+            "exec_sandbox.migration_client.connect_and_verify",
+            new_callable=AsyncMock,
+            return_value=(reader, writer),
+        ):
+            connect = asyncio.create_task(client.connect())
+            await asyncio.wait_for(greeting_entered.wait(), timeout=1)
+            connect.cancel()
+            await asyncio.wait_for(close_entered.wait(), timeout=1)
+            connect.cancel()
+            await asyncio.sleep(0)
+            assert not connect.done()
+            release_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await connect
+
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_awaited_once()
+        assert client._reader is None
+        assert client._writer is None
+        assert client._connected is False
+
+
 # ============================================================================
 # _execute — real protocol stack
 # ============================================================================
@@ -117,7 +202,7 @@ class TestMigrationClientExecute:
         )
 
         result = await client._execute("query-migrate")
-        assert result == {"return": {"status": "completed"}}
+        assert result["return"] == {"status": "completed"}
 
     async def test_connection_closed_raises(self) -> None:
         """Should raise when connection is closed (empty readline)."""
@@ -144,7 +229,8 @@ class TestMigrationClientExecute:
         await client._execute("stop")
 
         cmds = writer.commands
-        assert cmds[0] == {"execute": "stop"}
+        assert cmds[0]["execute"] == "stop"
+        assert cmds[0]["id"] == "migration-1"
         assert "arguments" not in cmds[0]
 
     async def test_error_response_returned(self) -> None:
@@ -174,21 +260,23 @@ class TestMigrationClientExecuteEdgeCases:
             await client._execute("test-command")
 
     async def test_event_flood_hits_safety_cap(self) -> None:
-        """32+ consecutive events without a response should raise."""
-        events = [{"event": f"EVENT_{i}", "data": {}} for i in range(33)]
+        """More skipped messages than the safety cap should raise."""
+        events = [{"event": f"EVENT_{i}", "data": {}} for i in range(_MAX_SKIPPED_MESSAGES + 1)]
         client, _reader, _writer = _make_connected(events)
 
-        with pytest.raises(MigrationTransientError, match="Too many QMP events"):
+        with pytest.raises(MigrationTransientError, match="Too many QMP messages"):
             await client._execute("query-migrate")
 
-    async def test_exactly_32_events_then_response(self) -> None:
-        """31 events + 1 response (within 32 iterations) should succeed."""
-        responses: list[dict[str, Any]] = [{"event": f"EVENT_{i}", "data": {}} for i in range(31)]
+    async def test_events_just_under_cap_then_response(self) -> None:
+        """cap-1 events + 1 response (within the cap) should succeed."""
+        responses: list[dict[str, Any]] = [
+            {"event": f"EVENT_{i}", "data": {}} for i in range(_MAX_SKIPPED_MESSAGES - 1)
+        ]
         responses.append({"return": {"status": "ok"}})
         client, _reader, _writer = _make_connected(responses)
 
         result = await client._execute("query-migrate")
-        assert result == {"return": {"status": "ok"}}
+        assert result["return"] == {"status": "ok"}
 
 
 # ============================================================================

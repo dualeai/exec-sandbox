@@ -28,7 +28,10 @@ Test categories:
 """
 
 from exec_sandbox.models import Language
+from exec_sandbox.platform_utils import HostArch, detect_host_arch
 from exec_sandbox.scheduler import Scheduler
+
+IS_X86 = detect_host_arch() == HostArch.X86_64
 
 
 # =============================================================================
@@ -90,10 +93,12 @@ except PermissionError:
         )
 
     async def test_unprivileged_bpf_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
-        """kernel.unprivileged_bpf_disabled should be 1 or 2.
+        """The eBPF-specific unprivileged-BPF sysctl must not exist.
 
         CVE-2021-3490, CVE-2021-31440, CVE-2023-2163: All require unprivileged
-        BPF access to exploit eBPF verifier bugs.
+        BPF access to exploit eBPF verifier bugs. CONFIG_BPF_SYSCALL=n removes
+        the attack surface entirely; accepting sysctl values would miss a
+        kernel-config regression.
         """
         code = """\
 try:
@@ -107,12 +112,9 @@ except PermissionError:
 """
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
-        # Value of 1 or 2 means unprivileged BPF is disabled
-        # NOT_FOUND means /proc/sys is restricted or sysctl doesn't exist
-        # PERM_DENIED also acceptable (read blocked)
         stdout = result.stdout.strip()
-        assert "VALUE:1" in stdout or "VALUE:2" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected unprivileged BPF to be disabled. stdout: {stdout}"
+        assert stdout == "NOT_FOUND", (
+            f"CONFIG_BPF_SYSCALL=n requires unprivileged_bpf_disabled to be absent, got: {stdout!r}"
         )
 
 
@@ -666,10 +668,11 @@ class TestProcInfoLeaks:
     CVE-2023-3269 (StackRot): Requires knowing kernel addresses to exploit.
     """
 
-    async def test_proc_kallsyms_restricted(self, dual_scheduler: Scheduler) -> None:
-        """Kernel symbol addresses in /proc/kallsyms should be zeroed.
+    async def test_proc_kallsyms_absent(self, dual_scheduler: Scheduler) -> None:
+        """The kernel symbol table must be compiled out.
 
-        kptr_restrict >= 1 ensures unprivileged users see 0x0 addresses.
+        CONFIG_KALLSYMS=n removes /proc/kallsyms entirely. Accepting zeroed or
+        unreadable content would miss an accidental config re-enable.
         """
         code = """\
 try:
@@ -698,9 +701,7 @@ except FileNotFoundError:
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        assert "ZEROED:True" in stdout or "PERM_DENIED" in stdout or "EMPTY" in stdout or "NOT_FOUND" in stdout, (
-            f"Kernel addresses should be hidden. stdout: {stdout}"
-        )
+        assert stdout == "NOT_FOUND", f"CONFIG_KALLSYMS=n requires /proc/kallsyms to be absent, got: {stdout!r}"
 
     async def test_proc_kcore_not_readable(self, dual_scheduler: Scheduler) -> None:
         """Kernel memory via /proc/kcore must not be readable."""
@@ -843,7 +844,13 @@ for p in paths:
 """
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
-        for line in result.stdout.strip().splitlines():
+        lines = result.stdout.strip().splitlines()
+        # One status line per masked path — truncated output must fail, not
+        # silently skip the loop below. /proc/cmdline masking also means boot
+        # posture (mitigations=off) is asserted host-side, in
+        # test_vm_manager.py::TestKernelCmdlineMitigations.
+        assert len(lines) == 5, f"expected 5 mask-status lines, got {len(lines)}: {result.stdout!r}"
+        for line in lines:
             path = line.split(":")[0]
             assert ":len=0:" in line or ":EPERM" in line or ":ENOENT" in line, (
                 f"{path} should be masked (empty/blocked), got: {line}"
@@ -857,10 +864,11 @@ class TestKernelExploitPrimitivesBlocked:
     """Operations that are first steps in kernel exploitation chains."""
 
     async def test_unprivileged_userfaultfd_sysctl(self, dual_scheduler: Scheduler) -> None:
-        """vm.unprivileged_userfaultfd should be 0.
+        """The userfaultfd sysctl must not exist.
 
         userfaultfd is the primary race condition primitive in kernel UAF exploits.
-        Setting to 0 restricts it to CAP_SYS_PTRACE holders only.
+        CONFIG_USERFAULTFD=n removes the syscall and sysctl entirely; accepting
+        value 0 would miss an accidental kernel-config re-enable.
         """
         code = """\
 try:
@@ -875,8 +883,8 @@ except PermissionError:
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        assert "VALUE:0" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected unprivileged_userfaultfd=0. stdout: {stdout}"
+        assert stdout == "NOT_FOUND", (
+            f"CONFIG_USERFAULTFD=n requires unprivileged_userfaultfd to be absent, got: {stdout!r}"
         )
 
     async def test_userfaultfd_restricted(self, dual_scheduler: Scheduler) -> None:
@@ -926,11 +934,12 @@ print(f"ret={ret} errno={err}")
         assert "ret=" in result.stdout, f"Unexpected keyctl output. stdout: {result.stdout}"
 
     async def test_modules_disabled_sysctl(self, dual_scheduler: Scheduler) -> None:
-        """kernel.modules_disabled=1 prevents ALL module loading (irreversible).
+        """The custom CONFIG_MODULES=n kernel exposes no module-loading support.
 
-        With CONFIG_MODULES=y: set by tiny-init after module loading.
-        With CONFIG_MODULES=n (custom kernel): sysctl doesn't exist (NOT_FOUND),
-        which is even stronger — the syscall itself returns ENOSYS.
+        Asserts module loading is unavailable: with the shipped
+        CONFIG_MODULES=n kernel the sysctl does not exist (NOT_FOUND); the
+        assertion also tolerates the weaker modules_disabled=1 / EPERM
+        outcomes as defense-in-depth.
         """
         code = """\
 try:
@@ -1120,26 +1129,35 @@ except (FileNotFoundError, PermissionError):
         )
 
     async def test_perf_event_paranoid(self, dual_scheduler: Scheduler) -> None:
-        """kernel.perf_event_paranoid=3 disables perf for all users.
+        """perf is restricted by sysctl on x86 and compiled out on arm64.
 
-        Perf events enable side-channel attacks and kernel exploitation.
+        Perf events enable side-channel attacks and kernel exploitation. The
+        x86 arch force-selects CONFIG_PERF_EVENTS, while the final arm64 kernel
+        honors CONFIG_PERF_EVENTS=n.
         """
         code = """\
 try:
     with open('/proc/sys/kernel/perf_event_paranoid') as f:
         val = f.read().strip()
         print(f'PERF_PARANOID:{val}')
-except (FileNotFoundError, PermissionError):
-    print('INACCESSIBLE')
+except FileNotFoundError:
+    print('NOT_FOUND')
+except PermissionError:
+    print('PERM_DENIED')
 """
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        if "PERF_PARANOID:" in stdout and stdout.split(":")[1].lstrip("-").isdigit():
+        if IS_X86:
+            assert "PERF_PARANOID:" in stdout and stdout.split(":", 1)[1].lstrip("-").isdigit(), (
+                f"x86 force-selects CONFIG_PERF_EVENTS; expected readable perf_event_paranoid, got: {stdout!r}"
+            )
             val = int(stdout.split(":")[1])
             assert val >= 3, f"Expected perf_event_paranoid >= 3, got {val}"
         else:
-            assert "INACCESSIBLE" in stdout, f"Expected perf_event_paranoid >= 3 or INACCESSIBLE. stdout: {stdout}"
+            assert stdout == "NOT_FOUND", (
+                f"arm64 CONFIG_PERF_EVENTS=n requires no perf_event_paranoid sysctl, got: {stdout!r}"
+            )
 
     async def test_kptr_restrict(self, dual_scheduler: Scheduler) -> None:
         """kernel.kptr_restrict=2 hides kernel pointers from all users.

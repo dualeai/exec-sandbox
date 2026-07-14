@@ -38,7 +38,7 @@ class SchedulerConfig(BaseModel):
     Production deployments should tune resource overcommit ratios based on host resources.
 
     Attributes:
-        warm_pool_size: Number of pre-booted VMs per language (python, javascript).
+        warm_pool_size: Number of pre-booted VMs per language (Python, JavaScript, raw).
             0 disables warm pool. Default: 0 (cold boot only).
         default_memory_mb: Default guest VM memory in MB. Can be overridden per-run.
             Minimum: 128. No upper bound (limited by host resources). Default: 192.
@@ -110,7 +110,6 @@ class SchedulerConfig(BaseModel):
         default_factory=lambda: get_cache_dir() / "memory-snapshots",
         description="Local memory snapshot cache directory (L1 cache)",
     )
-
     # S3 snapshot backup (optional)
     s3_bucket: str | None = Field(
         default=None,

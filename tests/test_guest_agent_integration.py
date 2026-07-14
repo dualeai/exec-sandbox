@@ -26,7 +26,7 @@ class TestGuestAgentReconnect:
     These tests verify that behavior works correctly.
     """
 
-    async def test_reconnect_after_idle_timeout(self, vm_manager: VmManager) -> None:
+    async def test_reconnect_after_idle_timeout(self, vm_manager: VmManager, execute_timeout: int) -> None:
         """Verify guest agent recovers after idle timeout.
 
         The guest agent has an 18-second read timeout (READ_TIMEOUT_MS).
@@ -50,7 +50,7 @@ class TestGuestAgentReconnect:
             # First execution - establishes connection
             result1 = await vm.execute(
                 code="print('before timeout')",
-                timeout_seconds=30,
+                timeout_seconds=execute_timeout,
                 env_vars=None,
                 on_stdout=None,
                 on_stderr=None,
@@ -67,7 +67,7 @@ class TestGuestAgentReconnect:
             # If NonBlockingFile timeout didn't work, guest would be hung
             result2 = await vm.execute(
                 code="print('after timeout')",
-                timeout_seconds=30,
+                timeout_seconds=execute_timeout,
                 env_vars=None,
                 on_stdout=None,
                 on_stderr=None,
@@ -79,7 +79,7 @@ class TestGuestAgentReconnect:
             await vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
 
-    async def test_multiple_reconnects(self, vm_manager: VmManager) -> None:
+    async def test_multiple_reconnects(self, vm_manager: VmManager, execute_timeout: int) -> None:
         """Verify guest agent handles multiple timeout/reconnect cycles.
 
         Tests that the reconnect mechanism is robust and can handle
@@ -101,7 +101,7 @@ class TestGuestAgentReconnect:
                 # Execute code
                 result = await vm.execute(
                     code=f"print('iteration {i}')",
-                    timeout_seconds=30,
+                    timeout_seconds=execute_timeout,
                     env_vars=None,
                     on_stdout=None,
                     on_stderr=None,
@@ -126,7 +126,7 @@ class TestWriteFileAfterIdleTimeout:
     reconnection, and write_file sends into a dead socket.
     """
 
-    async def test_write_file_after_idle_timeout(self, vm_manager: VmManager) -> None:
+    async def test_write_file_after_idle_timeout(self, vm_manager: VmManager, execute_timeout: int) -> None:
         """write_file succeeds after a single idle timeout cycle."""
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
@@ -141,7 +141,7 @@ class TestWriteFileAfterIdleTimeout:
             # Establish connection via execute
             result1 = await vm.execute(
                 code="print('connected')",
-                timeout_seconds=30,
+                timeout_seconds=execute_timeout,
                 env_vars=None,
                 on_stdout=None,
                 on_stderr=None,
@@ -158,7 +158,7 @@ class TestWriteFileAfterIdleTimeout:
             # Verify via execute
             result2 = await vm.execute(
                 code="print(open('/home/user/test.txt').read())",
-                timeout_seconds=30,
+                timeout_seconds=execute_timeout,
                 env_vars=None,
                 on_stdout=None,
                 on_stderr=None,
@@ -170,7 +170,7 @@ class TestWriteFileAfterIdleTimeout:
             await vm_manager.destroy_vm(vm)
             assert vm.state == VmState.DESTROYED
 
-    async def test_write_file_after_multiple_idle_timeouts(self, vm_manager: VmManager) -> None:
+    async def test_write_file_after_multiple_idle_timeouts(self, vm_manager: VmManager, execute_timeout: int) -> None:
         """write_file survives 3 consecutive idle timeout cycles."""
         vm = await vm_manager.create_vm(
             language=Language.PYTHON,
@@ -188,7 +188,7 @@ class TestWriteFileAfterIdleTimeout:
                 # Execute to ensure connection is alive
                 result = await vm.execute(
                     code=f"print('cycle {i}')",
-                    timeout_seconds=30,
+                    timeout_seconds=execute_timeout,
                     env_vars=None,
                     on_stdout=None,
                     on_stderr=None,
@@ -206,7 +206,7 @@ class TestWriteFileAfterIdleTimeout:
                 # Verify via execute (absolute path inside VM)
                 verify = await vm.execute(
                     code=f"print(open('/home/user/{rel_path}').read())",
-                    timeout_seconds=30,
+                    timeout_seconds=execute_timeout,
                     env_vars=None,
                     on_stdout=None,
                     on_stderr=None,

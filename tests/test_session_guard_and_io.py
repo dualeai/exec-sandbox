@@ -1,10 +1,13 @@
 # pyright: reportPrivateUsage=false
+# OperationInbox deliberately exposes no direct-enqueue/inspection surface in
+# production; tests pre-fill and inspect via the private _queue instead.
 """Unit tests for Session._guard(), _resolve_content(), write_file streaming protocol,
 FileOpDispatcher routing, DualPortChannel reconnection probe, and idle timer lifecycle.
 
 Tests the orchestration layer WITHOUT requiring VMs. All VM/channel interactions
 are mocked. Covers:
-- _guard() lifecycle checks, lock serialization, idle timer reset
+- _guard() lifecycle checks, lock serialization, idle timer suspension
+  during operations, and fail-fast retirement of dead VMs
 - _resolve_content() sync/async file reads, boundary validation
 - WriteFileRequest header serialization: validity, escaping
 - FileOpDispatcher message routing by op_id
@@ -13,8 +16,10 @@ are mocked. Covers:
 """
 
 import asyncio
+import base64
 import io
 import json
+import os
 import random
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -23,7 +28,12 @@ import pytest
 
 from exec_sandbox import constants
 from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
-from exec_sandbox.exceptions import SessionClosedError
+from exec_sandbox.exceptions import (
+    CommunicationError,
+    CommunicationOutcomeUnknownError,
+    SessionClosedError,
+    VmPermanentError,
+)
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     FileChunkResponseMessage,
@@ -36,21 +46,37 @@ from exec_sandbox.guest_agent_protocol import (
     StreamingMessage,
     WriteFileRequest,
 )
-from exec_sandbox.guest_channel import DualPortChannel, FileOpDispatcher, UnixSocketChannel
+from exec_sandbox.guest_channel import (
+    OP_QUEUE_DEPTH,
+    DualPortChannel,
+    FileOpDispatcher,
+    OperationInbox,
+    UnixSocketChannel,
+)
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
+from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.session import Session
+from exec_sandbox.vm_types import VmState
+from tests.conftest import make_destroy_mock
 
 # ============================================================================
 # Helpers — build a Session with mocked VM + VmManager
 # ============================================================================
 
 
-def _make_exec_result() -> ExecutionResult:
+def _real_enqueue_registered(inbox: OperationInbox, _data: bytes) -> None:
+    """Mirror DualPortChannel.enqueue_registered's two contract lines so mocks
+    cannot drift on the ensure-open-before-mark ordering."""
+    inbox.ensure_open()
+    inbox.mark_command_sent()
+
+
+def _make_exec_result(exit_code: int = 0) -> ExecutionResult:
     """Build a minimal ExecutionResult for mocks."""
     return ExecutionResult(
         stdout="",
         stderr="",
-        exit_code=0,
+        exit_code=exit_code,
         execution_time_ms=1,
         external_cpu_time_ms=None,
         external_memory_peak_mb=None,
@@ -68,16 +94,19 @@ def _make_session(
 
     Returns (session, mock_vm, mock_vm_manager).
     """
-    mock_vm = AsyncMock()
+    mock_vm = AsyncMock(spec=QemuVM)
     mock_vm.vm_id = "test-vm-001"
     mock_vm.execute = AsyncMock(return_value=_make_exec_result())
     mock_vm.write_file = AsyncMock()
     mock_vm.read_file = AsyncMock(return_value=None)
     mock_vm.list_files = AsyncMock(return_value=[FileInfo(name="a.txt", is_dir=False, size=10)])
     mock_vm.exposed_ports = []
+    mock_vm.state = VmState.READY
+    mock_vm.process = MagicMock()
+    mock_vm.process.returncode = None
 
     mock_vm_manager = AsyncMock()
-    mock_vm_manager.destroy_vm = AsyncMock()
+    mock_vm_manager.destroy_vm = make_destroy_mock("confirmed")
 
     session = Session(
         vm=mock_vm,
@@ -143,6 +172,28 @@ class TestGuardNormal:
         await session.exec("print(1)")
         mock_vm.execute.assert_awaited_once()
         assert session.exec_count == 1
+
+    @pytest.mark.parametrize("terminal_state", [VmState.DESTROYING, VmState.DESTROYED])
+    async def test_exec_closes_when_process_exit_races_normal_result(self, terminal_state: VmState) -> None:
+        """A normal terminal result cannot leave a dead session VM reusable.
+
+        A concurrent destroy can publish DESTROYING or, if it completes before
+        execute() returns, DESTROYED — both must retire the session.
+        """
+        session, vm, manager = _make_session()
+
+        async def complete_while_dying(**_kwargs: object) -> ExecutionResult:
+            vm.state = terminal_state
+            return _make_exec_result()
+
+        vm.execute.side_effect = complete_while_dying
+        result = await session.exec("print(1)")
+
+        assert result.exit_code == 0
+        assert session.closed
+        manager.destroy_vm.assert_awaited_once_with(vm)
+        with pytest.raises(SessionClosedError):
+            await session.exec("print(2)")
 
     async def test_read_file_calls_vm(self, tmp_path: Path) -> None:
         """read_file() delegates to VM under _guard."""
@@ -647,9 +698,10 @@ class TestWriteFilePathValidation:
         vm.channel.enqueue_raw = AsyncMock()
         vm.channel.unregister_op = AsyncMock()
         ack = FileWriteAckMessage(op_id="test", path="x" * MAX_FILE_PATH_LENGTH, bytes_written=4)
-        op_queue: asyncio.Queue[FileWriteAckMessage] = asyncio.Queue()
-        op_queue.put_nowait(ack)
+        op_queue = OperationInbox()
+        op_queue._queue.put_nowait(ack)
         vm.channel.register_op = AsyncMock(return_value=op_queue)
+        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
 
         # Should not raise
         await QemuVM.write_file(vm, "x" * MAX_FILE_PATH_LENGTH, io.BytesIO(b"data"))
@@ -667,6 +719,219 @@ class TestWriteFilePathValidation:
 
         with pytest.raises(VmPermanentError, match="exceeds"):
             await QemuVM.write_file(vm, "x" * (MAX_FILE_PATH_LENGTH + 1), io.BytesIO(b"data"))
+
+    async def test_retry_restores_the_callers_initial_stream_position(self) -> None:
+        """A stale-header retry resends exactly the caller-selected suffix."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        content = io.BytesIO(b"prefix-payload")
+        content.seek(len(b"prefix-"))
+        positions: list[int] = []
+
+        async def protocol(*_args: object, **_kwargs: object) -> None:
+            positions.append(content.tell())
+            content.read(1)
+            if len(positions) == 1:
+                raise VmPermanentError("No active write")
+
+        vm = MagicMock(spec=QemuVM)
+        vm.vm_id = "retry-position-vm"
+        vm.channel = AsyncMock()
+        vm._write_file_protocol = AsyncMock(side_effect=protocol)
+
+        await QemuVM.write_file(vm, "target.bin", content)
+
+        assert positions == [len(b"prefix-"), len(b"prefix-")]
+
+
+class TestWriteFileCommitProtocol:
+    """A file_end frame is a commit record, never best-effort cleanup."""
+
+    @staticmethod
+    def _make_vm(response: StreamingMessage | None = None) -> tuple[MagicMock, OperationInbox]:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm = MagicMock(spec=QemuVM)
+        vm.vm_id = "write-commit-vm"
+        vm.channel = AsyncMock()
+        vm.channel.connect = AsyncMock()
+        vm.channel.enqueue_raw = AsyncMock()
+        vm.channel.unregister_op = AsyncMock()
+        inbox = OperationInbox()
+        if response is not None:
+            inbox._queue.put_nowait(response)
+        vm.channel.register_op = AsyncMock(return_value=inbox)
+        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
+        return vm, inbox
+
+    async def test_source_failure_after_prefix_never_sends_file_end(self) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class FailingReader:
+            reads = 0
+
+            def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return b"prefix"
+                raise OSError("injected source failure")
+
+        vm, _inbox = self._make_vm()
+        with pytest.raises(CommunicationOutcomeUnknownError, match="after dispatch"):
+            await QemuVM._write_file_protocol(vm, "target.bin", FailingReader())  # type: ignore[arg-type]
+
+        actions = [json.loads(call.args[0])["action"] for call in vm.channel.enqueue_raw.await_args_list]
+        assert "file_end" not in actions
+        vm.channel.unregister_op.assert_awaited_once()
+
+    async def test_failed_chunk_enqueue_never_starts_the_next_source_read(self) -> None:
+        """A failed enqueue cannot return while look-ahead still owns the stream."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class CountingReader:
+            reads = 0
+
+            def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return os.urandom(FILE_TRANSFER_CHUNK_SIZE)
+                return b""
+
+        reader = CountingReader()
+        vm, _inbox = self._make_vm()
+        vm.channel.enqueue_raw = AsyncMock(side_effect=OSError("injected enqueue failure"))
+
+        with pytest.raises(CommunicationOutcomeUnknownError, match="after dispatch"):
+            await QemuVM._write_file_protocol(vm, "target.bin", reader)  # type: ignore[arg-type]
+
+        assert reader.reads == 1
+
+    async def test_prefailed_registration_is_reported_before_dispatch(self) -> None:
+        """A dead registered inbox proves that no header reached the write queue."""
+        from exec_sandbox.exceptions import VmTransientError
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm, inbox = self._make_vm()
+        inbox.fail("event transport already closed")
+        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
+
+        with pytest.raises(VmTransientError, match="before dispatch"):
+            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"))
+
+        vm.channel.enqueue_raw.assert_not_awaited()
+
+    async def test_ack_timeout_after_commit_is_outcome_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 0.01)
+        vm, _inbox = self._make_vm()
+        with pytest.raises(CommunicationOutcomeUnknownError, match="after dispatch") as exc_info:
+            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"))
+
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+        actions = [json.loads(call.args[0])["action"] for call in vm.channel.enqueue_raw.await_args_list]
+        assert actions[-1] == "file_end"
+
+    @pytest.mark.parametrize(
+        ("ack_path", "ack_size"),
+        [("different.bin", 7), ("target.bin", 6)],
+    )
+    async def test_ack_must_bind_path_and_source_size(self, ack_path: str, ack_size: int) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        ack = FileWriteAckMessage(op_id="write-op", path=ack_path, bytes_written=ack_size)
+        vm, _inbox = self._make_vm(ack)
+        with pytest.raises(CommunicationOutcomeUnknownError, match="acknowledgement did not bind"):
+            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"))
+
+
+class TestReadFileTerminalIntegrity:
+    """File-read completion metadata must bind the bytes actually received."""
+
+    async def test_declared_size_mismatch_is_communication_failure(self) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm = MagicMock(spec=QemuVM)
+        vm.vm_id = "test-vm"
+        vm.channel = AsyncMock()
+        inbox = OperationInbox()
+        inbox._queue.put_nowait(FileReadCompleteMessage(op_id="read-op", path="file.bin", size=1))
+        vm.channel.register_op = AsyncMock(return_value=inbox)
+        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
+
+        with pytest.raises(CommunicationError, match="declared_size=1, received_size=0"):
+            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", io.BytesIO())
+
+    @staticmethod
+    def _file_read_vm(payload: bytes) -> MagicMock:
+        from exec_sandbox.qemu_vm import QemuVM, zstd
+
+        vm = MagicMock(spec=QemuVM)
+        vm.vm_id = "test-vm"
+        vm.channel = AsyncMock()
+        inbox = OperationInbox()
+        compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
+        compressed = compressor.compress(payload) + compressor.flush()
+        inbox._queue.put_nowait(
+            FileChunkResponseMessage(op_id="read-op", data=base64.b64encode(compressed).decode("ascii"))
+        )
+        inbox._queue.put_nowait(FileReadCompleteMessage(op_id="read-op", path="file.bin", size=len(payload)))
+        vm.channel.register_op = AsyncMock(return_value=inbox)
+        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
+        return vm
+
+    async def test_short_destination_writes_are_completed(self) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class ShortWriter:
+            def __init__(self) -> None:
+                self.value = bytearray()
+
+            def write(self, data: bytes) -> int:
+                count = max(1, len(data) // 2)
+                self.value.extend(data[:count])
+                return count
+
+        payload = b"short writes still preserve every byte"
+        writer = ShortWriter()
+        vm = self._file_read_vm(payload)
+        await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", writer)  # type: ignore[arg-type]
+        assert bytes(writer.value) == payload
+
+    async def test_zero_progress_destination_write_is_rejected(self) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class ZeroWriter:
+            def write(self, _data: bytes) -> int:
+                return 0
+
+        vm = self._file_read_vm(b"payload")
+        with pytest.raises(OSError, match="no write progress"):
+            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", ZeroWriter())  # type: ignore[arg-type]
+
+    async def test_none_returning_destination_write_is_rejected(self) -> None:
+        """A raw non-blocking writer returns None on would-block — OSError, not TypeError."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class NoneWriter:
+            def write(self, _data: bytes) -> None:
+                return None
+
+        vm = self._file_read_vm(b"payload")
+        with pytest.raises(OSError, match="no write progress"):
+            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", NoneWriter())  # type: ignore[arg-type]
+
+    async def test_over_reporting_destination_write_is_rejected(self) -> None:
+        """A writer claiming more progress than requested must not report success."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class OverWriter:
+            def write(self, data: bytes) -> int:
+                return len(data) + 1
+
+        vm = self._file_read_vm(b"payload")
+        with pytest.raises(OSError, match="no write progress"):
+            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", OverWriter())  # type: ignore[arg-type]
 
 
 # ============================================================================
@@ -871,7 +1136,7 @@ def _feed(reader: asyncio.StreamReader, msg: dict[str, object]) -> None:
     reader.feed_data(json.dumps(msg).encode() + b"\n")
 
 
-async def _drain(queue: asyncio.Queue[StreamingMessage], timeout: float = 0.5) -> list[StreamingMessage]:
+async def _drain(queue: OperationInbox, timeout: float = 0.5) -> list[StreamingMessage]:
     """Drain all messages from a queue with a short timeout."""
     msgs: list[StreamingMessage] = []
     try:
@@ -1089,7 +1354,7 @@ class TestFileOpDispatcherRouting:
 
         # Message should be discarded, not in default queue or op-A queue
 
-        assert qa.empty()
+        assert qa._queue.empty()
 
         await dispatcher.stop()
 
@@ -1175,7 +1440,7 @@ class TestFileOpDispatcherRouting:
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
 
-        queues: dict[str, asyncio.Queue[StreamingMessage]] = {}
+        queues: dict[str, OperationInbox] = {}
         for i in range(100):
             queues[f"op-{i}"] = await dispatcher.register_op(f"op-{i}")
 
@@ -1322,8 +1587,8 @@ class TestDispatchLoopConnectionReset:
     # Weird / out-of-bounds cases
     # ------------------------------------------------------------------
 
-    async def test_oserror_leaves_registered_queues_intact(self) -> None:
-        """After OSError exit, registered queues still exist but get no phantom messages."""
+    async def test_oserror_wakes_registered_queue_with_transport_failure(self) -> None:
+        """An active operation receives a terminal transient transport event."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
@@ -1334,10 +1599,228 @@ class TestDispatchLoopConnectionReset:
         assert dispatcher._task is not None
         await asyncio.wait_for(dispatcher._task, timeout=1.0)
 
+        with pytest.raises(CommunicationError, match="ConnectionResetError"):
+            await asyncio.wait_for(op_queue.get(), timeout=1.0)
+
         await dispatcher.stop()
 
-        # Queue should be empty — no phantom messages injected
-        assert op_queue.empty()
+    async def test_eof_wakes_full_queue_without_losing_buffered_messages(self) -> None:
+        """Transport failure follows every buffered item when the op queue is full."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("op-full")
+        for index in range(OP_QUEUE_DEPTH):
+            op_queue._queue.put_nowait(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-full"))
+
+        reader.feed_eof()
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        messages = [await asyncio.wait_for(op_queue.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH)]
+        assert len(messages) == OP_QUEUE_DEPTH
+        assert isinstance(messages[0], OutputChunkMessage)
+        assert messages[0].chunk == "0"
+        with pytest.raises(CommunicationError, match="EOF"):
+            await op_queue.get()
+
+        await dispatcher.stop()
+
+    async def test_registration_after_eof_fails_immediately(self) -> None:
+        """A race registering after dispatcher death cannot wait for a hard timeout."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        reader.feed_eof()
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        op_queue = await dispatcher.register_op("late-op")
+        with pytest.raises(CommunicationError, match="EOF"):
+            op_queue.ensure_open()
+
+        await dispatcher.stop()
+
+    async def test_full_queue_preserves_buffered_completion_before_transport_failure(self) -> None:
+        """EOF cannot turn a complete valid stream into truncated success."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+
+        op_queue = await dispatcher.register_op("op-complete")
+        for index in range(OP_QUEUE_DEPTH - 1):
+            op_queue._queue.put_nowait(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-complete"))
+        op_queue._queue.put_nowait(ExecutionCompleteMessage(exit_code=0, execution_time_ms=1, op_id="op-complete"))
+
+        reader.feed_eof()
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+
+        messages = [await asyncio.wait_for(op_queue.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH)]
+        assert [message.chunk for message in messages[:-1] if isinstance(message, OutputChunkMessage)] == [
+            str(index) for index in range(OP_QUEUE_DEPTH - 1)
+        ]
+        assert isinstance(messages[-1], ExecutionCompleteMessage)
+        with pytest.raises(CommunicationError, match="EOF"):
+            await op_queue.get()
+
+        await dispatcher.stop()
+
+    async def test_real_dispatch_backpressure_preserves_all_data_before_eof(self) -> None:
+        """The 65th routed message waits for its consumer instead of failing."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        op_queue = await dispatcher.register_op("overflow")
+
+        for index in range(OP_QUEUE_DEPTH + 1):
+            _feed(reader, {"type": "stdout", "chunk": str(index), "op_id": "overflow"})
+        reader.feed_eof()
+
+        messages = [await asyncio.wait_for(op_queue.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH + 1)]
+        assert [message.chunk for message in messages if isinstance(message, OutputChunkMessage)] == [
+            str(index) for index in range(OP_QUEUE_DEPTH + 1)
+        ]
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+        with pytest.raises(CommunicationError, match="EOF"):
+            await op_queue.get()
+        await dispatcher.stop()
+
+    async def test_unregister_full_queue_releases_dispatcher_for_later_operation(self) -> None:
+        """A cancelled full inbox cannot wedge the one global dispatch task."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        abandoned = await dispatcher.register_op("abandoned")
+
+        for index in range(OP_QUEUE_DEPTH + 1):
+            _feed(reader, {"type": "stdout", "chunk": str(index), "op_id": "abandoned"})
+        await asyncio.sleep(0)  # dispatcher fills 64 slots, then blocks routing the 65th
+        assert abandoned._queue.full()
+        await dispatcher.unregister_op("abandoned")
+
+        later = await dispatcher.register_op("later")
+        _feed(reader, {"type": "complete", "exit_code": 0, "execution_time_ms": 1, "op_id": "later"})
+        message = await asyncio.wait_for(later.get(), timeout=1.0)
+        assert isinstance(message, ExecutionCompleteMessage)
+
+        reader.feed_eof()
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+        await dispatcher.stop()
+
+    async def test_qemu_exit_drains_reader_buffered_terminal_before_failure(self) -> None:
+        """Process death cannot overtake a terminal frame accepted by the reader."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        inbox = await dispatcher.register_op("terminal")
+        inbox.mark_command_sent()
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._dispatcher = dispatcher
+
+        _feed(reader, {"type": "complete", "exit_code": 137, "execution_time_ms": 321, "op_id": "terminal"})
+        reader.feed_eof()
+        await channel.fail_pending_operations("QEMU exited with code 0")
+
+        message = await asyncio.wait_for(inbox.get(), timeout=1.0)
+        assert isinstance(message, ExecutionCompleteMessage)
+        assert message.exit_code == 137
+        with pytest.raises(CommunicationOutcomeUnknownError, match="EOF"):
+            await inbox.get()
+        await dispatcher.stop()
+
+    async def test_qemu_exit_with_full_queue_preserves_late_terminal(self) -> None:
+        """Backpressure plus peer exit cannot overtake a buffered terminal."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        inbox = await dispatcher.register_op("terminal-after-overflow")
+        inbox.mark_command_sent()
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._dispatcher = dispatcher
+
+        for index in range(OP_QUEUE_DEPTH + 1):
+            _feed(
+                reader,
+                {
+                    "type": "stdout",
+                    "chunk": str(index),
+                    "op_id": "terminal-after-overflow",
+                },
+            )
+        _feed(
+            reader,
+            {
+                "type": "complete",
+                "exit_code": 137,
+                "execution_time_ms": 321,
+                "op_id": "terminal-after-overflow",
+            },
+        )
+        reader.feed_eof()
+
+        failure = asyncio.create_task(channel.fail_pending_operations("QEMU exited with code 0"))
+        messages = [await asyncio.wait_for(inbox.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH + 2)]
+        await asyncio.wait_for(failure, timeout=1.0)
+
+        assert [message.chunk for message in messages[:-1] if isinstance(message, OutputChunkMessage)] == [
+            str(index) for index in range(OP_QUEUE_DEPTH + 1)
+        ]
+        assert isinstance(messages[-1], ExecutionCompleteMessage)
+        assert messages[-1].exit_code == 137
+        with pytest.raises(CommunicationOutcomeUnknownError, match="EOF"):
+            await inbox.get()
+        await dispatcher.stop()
+
+    async def test_total_deadline_during_registration_is_predispatch(self) -> None:
+        """The total timer includes registration without inventing dispatch."""
+        from exec_sandbox.guest_agent_protocol import PingRequest
+        from exec_sandbox.guest_channel import StreamDeadlineExceededError
+
+        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
+        channel._dispatcher = MagicMock()
+
+        async def blocked_registration(_op_id: str) -> OperationInbox:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        channel.register_op = blocked_registration  # type: ignore[method-assign]
+        stream = channel.stream_messages(PingRequest(), timeout=0)
+        with pytest.raises(StreamDeadlineExceededError) as exc_info:
+            await anext(stream)
+        assert exc_info.value.command_dispatched is False
+
+    async def test_transport_loss_after_dispatch_is_outcome_unknown(self) -> None:
+        """Host transport loss is never fabricated as a retryable guest error."""
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        op_queue = await dispatcher.register_op("sent")
+        op_queue.mark_command_sent()
+        reader.feed_eof()
+
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+        with pytest.raises(CommunicationOutcomeUnknownError, match="EOF"):
+            await op_queue.get()
+        await dispatcher.stop()
+
+    async def test_limit_overrun_wakes_ops_and_stop_remains_safe(self) -> None:
+        """An oversized event frame fails active ops and cannot poison close()."""
+        reader = asyncio.StreamReader(limit=16)
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        op_queue = await dispatcher.register_op("oversized")
+        reader.feed_data(b"x" * 64 + b"\n")
+
+        assert dispatcher._task is not None
+        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+        with pytest.raises(CommunicationError, match="reader limit"):
+            await op_queue.get()
+        await dispatcher.stop()
 
 
 # ============================================================================
@@ -1780,7 +2263,7 @@ class TestOpIdDispatcherRouting:
         # Wait a bit for the dispatch loop to process
         await asyncio.sleep(0.1)
 
-        assert op_queue.empty()
+        assert op_queue._queue.empty()
 
         await dispatcher.stop()
 
@@ -1859,133 +2342,90 @@ class TestWriteWorkerFailureHandling:
 # ============================================================================
 
 
-def _orphaned_timer_tasks() -> list[asyncio.Task[None]]:
-    """Return any idle_timeout_handler tasks still alive in the event loop."""
-    return [t for t in asyncio.all_tasks() if "idle_timeout_handler" in repr(t.get_coro())]
-
-
 class TestIdleTimerLifecycleNormal:
-    """Normal cases: close() properly awaits cancelled timer tasks."""
+    """close() and operations leave no armed idle deadline."""
 
-    async def test_close_leaves_no_orphaned_tasks(self) -> None:
-        """Core regression test: close() must leave zero idle_timeout_handler tasks."""
+    async def test_close_disarms_timer(self) -> None:
+        """close() cancels the pending idle deadline."""
         session, _, _ = _make_session()
+        assert session._idle_timer_handle is not None
         await session.close()
-        assert _orphaned_timer_tasks() == []
+        assert session._idle_timer_handle is None
 
-    async def test_cancelled_timers_empty_after_close(self) -> None:
-        """Strong-ref set is cleared after close (no memory leak)."""
-        session, _, _ = _make_session()
-        await session.close()
-        assert session._cancelled_timers == set()
-
-    async def test_multiple_exec_then_close_no_orphans(self) -> None:
-        """Each exec() resets the timer; close() cleans up the final one."""
+    async def test_multiple_exec_then_close_disarms(self) -> None:
+        """Each exec() re-arms the deadline; close() disarms the final one."""
         session, _, _ = _make_session()
         for _ in range(5):
             await session.exec("x = 1")
         await session.close()
-        assert _orphaned_timer_tasks() == []
-        assert session._cancelled_timers == set()
+        assert session._idle_timer_handle is None
 
-    async def test_context_manager_no_orphans(self) -> None:
-        """async with Session cleans up via __aexit__."""
+    async def test_context_manager_disarms(self) -> None:
+        """async with Session disarms via __aexit__."""
         session, _, _ = _make_session()
         async with session:
             await session.exec("x = 1")
-        assert _orphaned_timer_tasks() == []
-        assert session._cancelled_timers == set()
+        assert session._idle_timer_handle is None
 
 
 class TestIdleTimerLifecycleEdge:
-    """Edge cases for cancelled timer cleanup."""
+    """Edge cases for the idle deadline handle."""
 
     async def test_double_close_no_error(self) -> None:
-        """Second close() is idempotent — no crash, set stays empty."""
+        """Second close() is idempotent — no crash, timer stays disarmed."""
         session, _, _ = _make_session()
         await session.close()
         await session.close()
-        assert _orphaned_timer_tasks() == []
-        assert session._cancelled_timers == set()
+        assert session._idle_timer_handle is None
 
     async def test_close_from_exec_error_path(self) -> None:
-        """VM failure in exec() triggers close() internally — no orphans."""
+        """VM failure in exec() triggers close() internally — timer disarmed."""
         session, mock_vm, _ = _make_session()
         mock_vm.execute = AsyncMock(side_effect=RuntimeError("VM died"))
         with pytest.raises(RuntimeError, match="VM died"):
             await session.exec("x = 1")
-        # exec() called close() internally on VM failure
         assert session.closed
-        assert _orphaned_timer_tasks() == []
-        assert session._cancelled_timers == set()
+        assert session._idle_timer_handle is None
 
-    async def test_done_callback_auto_cleans_between_execs(self) -> None:
-        """Cancelled timers are removed by done_callback before close()."""
+    async def test_reset_replaces_pending_handle(self) -> None:
+        """Re-arming cancels the prior handle and installs a fresh one."""
         session, _, _ = _make_session()
-
-        # First exec cancels the initial timer
-        await session.exec("x = 1")
-        # Yield twice: once for CancelledError delivery, once for done_callback
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-
-        # The auto-removal callback should have cleaned _cancelled_timers
-        assert session._cancelled_timers == set()
-
+        first = session._idle_timer_handle
+        session._reset_idle_timer()
+        assert session._idle_timer_handle is not first
+        assert first is not None and first.cancelled()
         await session.close()
 
-    async def test_natural_idle_timeout_no_crash(self) -> None:
-        """Timer fires naturally (not cancelled) — no orphan, no crash.
-
-        When the idle timeout handler calls close(), _cancel_idle_timer
-        detects self-cancel (current_task == timer task) and skips both
-        cancel and tracking. The handler completes on its own.
-        """
-        session, _, _ = _make_session(idle_timeout_seconds=0)
-        # Let the timer fire (it calls close() internally) and complete
-        await asyncio.sleep(0.1)
+    async def test_natural_idle_timeout_closes_session(self) -> None:
+        """The deadline callback fires and closes the session with no crash."""
+        session, _, manager = _make_session(idle_timeout_seconds=0)
+        # call_later(0) fires on the next loop turn and spawns the close task;
+        # await it so destroy_vm completes before asserting (session.closed
+        # flips True before _close_impl reaches its destroy_vm await).
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if session._idle_close_task is not None:
+                break
+        assert session._idle_close_task is not None
+        await session._idle_close_task
         assert session.closed
-        assert session._cancelled_timers == set()
-        # All timer tasks should have completed naturally
-        assert _orphaned_timer_tasks() == []
+        assert session._idle_timer_handle is None
+        manager.destroy_vm.assert_awaited_once()
 
 
 class TestIdleTimerLifecycleStress:
-    """Weird / out-of-bound / stress scenarios."""
+    """Stress scenarios for the idle deadline."""
 
     async def test_rapid_reset_storm(self) -> None:
-        """50 rapid _reset_idle_timer() calls without yielding.
-
-        All cancelled tasks pile up in _cancelled_timers. close() must
-        await all of them via gather().
-        """
+        """50 rapid re-arms leak nothing — each cancels the prior handle."""
         session, _, _ = _make_session()
         for _ in range(50):
             session._reset_idle_timer()
-        # Many cancelled tasks now in _cancelled_timers
-        assert len(session._cancelled_timers) <= 51  # at most 1 initial + 50 resets
         await session.close()
-        assert _orphaned_timer_tasks() == []
-        assert session._cancelled_timers == set()
-
-    async def test_gc_pressure_between_cancel_and_await(self) -> None:
-        """Force GC after cancel but before close() gather — strong ref keeps task alive."""
-        import gc
-
-        session, _, _ = _make_session()
-        # Manually cancel to separate the cancel/gather steps
-        session._cancel_idle_timer()
-        # Strong ref in _cancelled_timers must survive GC
-        gc.collect()
-        assert len(session._cancelled_timers) == 1
-
-        # close() will gather the surviving task cleanly
-        await session.close()
-        assert _orphaned_timer_tasks() == []
-        assert session._cancelled_timers == set()
+        assert session._idle_timer_handle is None
 
     async def test_concurrent_close_and_exec(self) -> None:
-        """Race close() against exec() — one wins, no orphans either way."""
+        """Race close() against exec() — one wins, timer disarmed either way."""
         session, _, _ = _make_session()
         results = await asyncio.gather(
             session.close(),
@@ -1996,4 +2436,200 @@ class TestIdleTimerLifecycleStress:
         errors = [r for r in results if isinstance(r, SessionClosedError)]
         assert len(errors) <= 1
         assert session.closed
-        assert _orphaned_timer_tasks() == []
+        assert session._idle_timer_handle is None
+
+    async def test_concurrent_close_waits_for_shared_destroy(self) -> None:
+        """All close callers wait for the one in-flight VM destruction."""
+        session, _, manager = _make_session()
+        destroy_started = asyncio.Event()
+        allow_destroy = asyncio.Event()
+
+        async def delayed_destroy(vm: AsyncMock) -> bool:
+            destroy_started.set()
+            await allow_destroy.wait()
+            vm.state = VmState.DESTROYED
+            return True
+
+        manager.destroy_vm.side_effect = delayed_destroy
+        first = asyncio.create_task(session.close())
+        await destroy_started.wait()
+        second = asyncio.create_task(session.close())
+        await asyncio.sleep(0)
+        assert session.closed
+        assert not second.done()
+
+        allow_destroy.set()
+        await asyncio.gather(first, second)
+        manager.destroy_vm.assert_awaited_once()
+
+    async def test_destroy_error_propagates_from_close(self) -> None:
+        """A destroy error is propagated to the close caller."""
+        session, _, manager = _make_session()
+        manager.destroy_vm.side_effect = OSError("injected destroy failure")
+
+        with pytest.raises(OSError, match="injected destroy failure"):
+            await session.close()
+
+        assert session.closed
+
+    async def test_unconfirmed_vm_cleanup_raises(self) -> None:
+        """Unconfirmed process death is reported to the close caller."""
+        session, vm, manager = _make_session()
+        vm.state = VmState.DESTROYING
+        manager.destroy_vm = AsyncMock(return_value=False)
+
+        with pytest.raises(VmPermanentError, match="process cleanup was not confirmed"):
+            await session.close()
+
+        assert session.closed
+
+    async def test_terminal_result_survives_ancillary_cleanup_retry(self) -> None:
+        """Exit 137 returns once processes are dead, while ancillary retry stays owned."""
+        session, vm, manager = _make_session()
+        vm.execute.return_value = _make_exec_result(exit_code=137)
+
+        manager.destroy_vm = make_destroy_mock("ancillary_pending")
+        result = await session.exec("raise terminal pressure")
+
+        assert result.exit_code == 137
+        assert session.closed
+        manager.destroy_vm.assert_awaited_once_with(vm)
+
+    async def test_cancelled_exec_closes_before_propagating_cancellation(self) -> None:
+        """Caller cancellation cannot leave a possibly executing VM reusable."""
+        session, vm, manager = _make_session()
+        execute_started = asyncio.Event()
+
+        async def blocked_execute(**_kwargs: object) -> ExecutionResult:
+            execute_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        vm.execute.side_effect = blocked_execute
+        task = asyncio.create_task(session.exec("while True: pass"))
+        await execute_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        manager.destroy_vm.assert_awaited_once()
+        assert session.closed
+
+    async def test_idle_timer_suspended_during_operation(self) -> None:
+        """An operation running longer than the idle timeout is not destroyed.
+
+        Idle means "no operation in flight": the timer is cancelled while an
+        operation runs and re-armed afterwards.
+        """
+        session, vm, manager = _make_session(idle_timeout_seconds=1)
+
+        async def slow_execute(**_kwargs: object) -> ExecutionResult:
+            await asyncio.sleep(1.3)
+            return _make_exec_result()
+
+        vm.execute.side_effect = slow_execute
+        result = await session.exec("print(1)")
+
+        assert result.exit_code == 0
+        assert not session.closed
+        manager.destroy_vm.assert_not_awaited()
+        await session.close()
+
+    async def test_idle_timer_rearmed_after_operation(self) -> None:
+        """After an operation completes, the idle timer must fire again.
+
+        Kills the mutation "suspend forever": deleting the finally re-arm in
+        _guard would leak sessions that never idle-close after their first op.
+        """
+        session, _vm, manager = _make_session(idle_timeout_seconds=1)
+        await session.exec("print(1)")
+        assert not session.closed
+
+        await asyncio.sleep(1.3)
+        assert session.closed
+        manager.destroy_vm.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "state, returncode",
+        [
+            pytest.param(VmState.DESTROYING, None, id="state-destroying"),
+            pytest.param(VmState.DESTROYED, None, id="state-destroyed"),
+            pytest.param(VmState.READY, 137, id="returncode-only"),
+        ],
+    )
+    async def test_guard_fails_fast_on_dead_vm(self, state: VmState, returncode: int | None) -> None:
+        """All three death signals retire the session up front.
+
+        The returncode leg covers L1-restored VMs that have not executed yet
+        (their process-exit watcher is armed lazily on first execute).
+        """
+        session, vm, manager = _make_session()
+        vm.state = state
+        vm.process.returncode = returncode
+
+        with pytest.raises(SessionClosedError, match="retired"):
+            await session.list_files()
+
+        assert session.closed
+        manager.destroy_vm.assert_awaited_once_with(vm)
+
+    async def test_exec_error_remains_primary_when_close_fails(self) -> None:
+        """A close-time destroy error must not mask the VM error that caused it."""
+        session, vm, manager = _make_session()
+        vm.execute.side_effect = RuntimeError("VM died mid-execute")
+        manager.destroy_vm.side_effect = OSError("destroy also failed")
+
+        with pytest.raises(RuntimeError, match="VM died mid-execute"):
+            await session.exec("print(1)")
+
+        assert session.closed
+        manager.destroy_vm.assert_awaited_once()
+
+    async def test_cancellation_survives_close_failure(self) -> None:
+        """A close-time destroy error must not replace CancelledError.
+
+        Structured cancellation (asyncio.timeout / wait_for) relies on the
+        cancelled task actually ending with CancelledError.
+        """
+        session, vm, manager = _make_session()
+        execute_started = asyncio.Event()
+
+        async def blocked_execute(**_kwargs: object) -> ExecutionResult:
+            execute_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        vm.execute.side_effect = blocked_execute
+        manager.destroy_vm.side_effect = OSError("injected destroy failure")
+        task = asyncio.create_task(session.exec("while True: pass"))
+        await execute_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        manager.destroy_vm.assert_awaited_once()
+        assert session.closed
+
+    async def test_cancelled_write_closes_before_propagating_cancellation(self) -> None:
+        """A cancelled upload cannot commit later and leave the VM reusable."""
+        session, vm, manager = _make_session()
+        write_started = asyncio.Event()
+
+        async def blocked_write(*_args: object, **_kwargs: object) -> None:
+            write_started.set()
+            await asyncio.Event().wait()
+
+        vm.write_file.side_effect = blocked_write
+        task = asyncio.create_task(session.write_file("target.bin", b"payload"))
+        await write_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        manager.destroy_vm.assert_awaited_once()
+        assert session.closed
+        with pytest.raises(SessionClosedError):
+            await session.list_files()

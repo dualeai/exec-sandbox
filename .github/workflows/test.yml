@@ -10,6 +10,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write  # CodSpeed benchmarks (OpenID Connect authentication)
 
 jobs:
   # ==========================================================================
@@ -18,19 +19,19 @@ jobs:
 
   static-python:
     name: Static / Python
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v7.1.6
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v7.1.6
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
-        uses: actions/setup-python@v6.1.0
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: "3.12"
 
@@ -46,55 +47,45 @@ jobs:
 
   static-rust-guest-agent:
     name: Static / Rust (guest-agent)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: guest-agent
     steps:
-      - uses: actions/checkout@v6.0.1
-
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-        working-directory: .
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Static checks
-        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-static
+        run: make test-static
 
   static-rust-tiny-init:
     name: Static / Rust (tiny-init)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: tiny-init
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
         with:
           components: rustfmt, clippy
           cache-workspaces: tiny-init
 
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-        working-directory: .
-
       - name: Static checks
-        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-static
+        run: make test-static
 
   static-go:
     name: Static / Go
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: gvproxy-wrapper
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version: "1.24"
           cache-dependency-path: gvproxy-wrapper/go.sum
@@ -107,23 +98,30 @@ jobs:
   # ==========================================================================
 
   build-qemu:
-    name: Build / QEMU (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    name: Build / QEMU (${{ matrix.arch }}-${{ matrix.os-version }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        arch: [x64, arm64]
+        include:
+          - arch: x64
+            os-version: noble
+            runner: ubuntu-24.04
+          - arch: arm64
+            os-version: noble
+            runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       # Cache the final build output — skip everything on version match.
-      # Key includes qemu_version from Makefile and build script; bumping either invalidates the cache.
+      # Key includes qemu_version from versions.lock, build script, and OS version;
+      # bumping any invalidates the cache.
       # save-always is false (default), so a failed build won't cache corrupt output.
       - name: Cache QEMU build
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/qemu-build
-          key: qemu-${{ matrix.arch }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
+          key: qemu-${{ matrix.arch }}-${{ matrix.os-version }}-${{ hashFiles('Makefile', 'versions.lock', 'scripts/build-qemu.sh') }}
 
       - name: Install build deps
         if: steps.qemu-cache.outputs.cache-hit != 'true'
@@ -133,29 +131,29 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
           # See: https://wiki.qemu.org/Hosts/Linux
-          sudo apt-get install -y ccache ninja-build meson libglib2.0-dev libfdt-dev libpixman-1-dev libseccomp-dev libslirp-dev liburing-dev flex bison
+          sudo apt-get install -y ccache ninja-build meson libglib2.0-dev libfdt-dev libpixman-1-dev libseccomp-dev libslirp-dev liburing-dev flex bison python3-venv python3-tomli
 
       - name: Cache ccache
         if: steps.qemu-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.ccache
-          key: ccache-qemu-${{ matrix.arch }}-${{ hashFiles('Makefile', 'scripts/build-qemu.sh') }}
-          restore-keys: ccache-qemu-${{ matrix.arch }}-
+          key: ccache-qemu-${{ matrix.arch }}-${{ matrix.os-version }}-${{ hashFiles('Makefile', 'versions.lock', 'scripts/build-qemu.sh') }}
+          restore-keys: ccache-qemu-${{ matrix.arch }}-${{ matrix.os-version }}-
 
       - name: Build
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: make build-qemu
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
-          name: qemu-${{ matrix.arch }}
+          name: qemu-${{ matrix.arch }}-${{ matrix.os-version }}
           path: ~/qemu-build/
           retention-days: 1
 
   build-gvproxy-wrapper:
-    name: Build / gvproxy-wrapper (${{ matrix.os }}/${{ matrix.arch }})
+    name: Build / gvproxy-wrapper (${{ matrix.os }}${{ matrix.os_version && format('-{0}', matrix.os_version) || '' }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -167,21 +165,23 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
           - os: macos
-            arch: x64
-            runner: macos-15-intel
+            arch: arm64
+            os_version: "15"
+            runner: macos-15
           - os: macos
             arch: arm64
+            os_version: "26"
             runner: macos-26
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Build
         uses: ./.github/actions/build-gvproxy-wrapper
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
-          name: gvproxy-wrapper-${{ matrix.os }}-${{ matrix.arch }}
+          name: gvproxy-wrapper-${{ matrix.os }}${{ matrix.os_version && format('-{0}', matrix.os_version) || '' }}-${{ matrix.arch }}
           path: gvproxy-wrapper/bin/
           retention-days: 1
 
@@ -197,20 +197,15 @@ jobs:
           - arch: arm64
             image_arch: aarch64
     steps:
-      - uses: actions/checkout@v6.0.1
-
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Build
         uses: ./.github/actions/build-guest-agent
         with:
           arch: ${{ matrix.image_arch }}
-          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: guest-agent-${{ matrix.arch }}
           path: |
@@ -230,20 +225,15 @@ jobs:
           - arch: arm64
             image_arch: aarch64
     steps:
-      - uses: actions/checkout@v6.0.1
-
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Build
         uses: ./.github/actions/build-tiny-init
         with:
           arch: ${{ matrix.image_arch }}
-          rust-version: ${{ steps.rust.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: tiny-init-${{ matrix.arch }}
           path: |
@@ -264,32 +254,27 @@ jobs:
           - arch: arm64
             image_arch: aarch64
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Download guest-agent
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: guest-agent-${{ matrix.arch }}
           path: images/dist/
 
       - name: Download tiny-init
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: tiny-init-${{ matrix.arch }}
           path: images/dist/
-
-      - name: Get Alpine version
-        id: alpine
-        run: echo "version=$(make --silent alpine-version)" >> "$GITHUB_OUTPUT"
 
       - name: Build
         uses: ./.github/actions/build-vm-images
         with:
           arch: ${{ matrix.image_arch }}
-          alpine-version: ${{ steps.alpine.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: vm-images-${{ matrix.arch }}
           path: |
@@ -297,6 +282,7 @@ jobs:
             images/dist/vmlinuz-${{ matrix.image_arch }}
             images/dist/vmlinuz-${{ matrix.image_arch }}.hash
             images/dist/initramfs-${{ matrix.image_arch }}
+            images/dist/initramfs-${{ matrix.image_arch }}.hash
             images/dist/*-${{ matrix.image_arch }}.qcow2
             images/dist/*-${{ matrix.image_arch }}.qcow2.hash
           retention-days: 7
@@ -307,38 +293,48 @@ jobs:
 
   test-rust:
     name: Test / Rust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: guest-agent
     steps:
-      - uses: actions/checkout@v6.0.1
-
-      - name: Get Rust version
-        id: rust
-        run: echo "version=$(make --silent rust-version)" >> "$GITHUB_OUTPUT"
-        working-directory: .
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Unit tests
-        run: make RUST_VERSION=${{ steps.rust.outputs.version }} test-unit
+        run: make test-unit
 
   test-go:
     name: Test / Go
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    env:
+      JUNIT_XML: junit-gvproxy-wrapper.xml
     defaults:
       run:
         working-directory: gvproxy-wrapper
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
         with:
           go-version: "1.24"
           cache-dependency-path: gvproxy-wrapper/go.sum
 
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
       - name: Unit tests
         run: make test-unit
+        env:
+          JUNIT_XML: ${{ env.JUNIT_XML }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: ${{ env.JUNIT_XML }}
+          path: gvproxy-wrapper/${{ env.JUNIT_XML }}
+          if-no-files-found: ignore
 
   # ==========================================================================
   # Integration Tests - Run after builds complete
@@ -346,11 +342,15 @@ jobs:
 
   test-python:
     name: Test / Python ${{ matrix.python-version }} / ${{ matrix.test-type }} (${{ matrix.platform.os }}/${{ matrix.platform.arch }})
-    runs-on: ${{ matrix.platform.runner }}
+    # Linux x64: RunsOn with nested-virt (KVM required for QEMU integration tests)
+    # Linux arm64: GitHub-hosted (RunsOn doesn't support nested-virt on ARM)
+    # macOS: GitHub-hosted (Apple Silicon HVF supports nested virtualization)
+    runs-on: ${{ startsWith(matrix.platform.runner, 'runner=') && format('runs-on={0}-test-python-{1}/{2}', github.run_id, strategy.job-index, matrix.platform.runner) || matrix.platform.runner }}
     needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
     env:
       # Pass GitHub token for API calls (increases rate limit from 60 to 1000 req/hour)
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      JUNIT_XML: junit-exec-sandbox-${{ matrix.python-version }}-${{ matrix.test-type }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.xml
     strategy:
       fail-fast: false
       matrix:
@@ -359,27 +359,27 @@ jobs:
         platform:
           - os: linux
             arch: x64
-            runner: ubuntu-24.04
+            runner: "runner=8cpu-linux-x64/nested-virt"
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-          - os: macos
-            arch: x64
-            runner: macos-15-intel
-          - os: macos
+          - os: macos-15
+            arch: arm64
+            runner: macos-15
+          - os: macos-26
             arch: arm64
             runner: macos-26
     steps:
-      - uses: actions/checkout@v6.0.1
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Download gvproxy-wrapper
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: gvproxy-wrapper-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
           path: gvproxy-wrapper/bin/
 
       - name: Download VM images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: vm-images-${{ matrix.platform.arch }}
           path: images/dist/
@@ -392,233 +392,172 @@ jobs:
         run: |
           # Make files readable and directories traversable for qemu-vm user
           # Need to make parent directories traversable too (home dirs are often 700)
-          chmod a+x /home/runner /home/runner/work
+          # Use GITHUB_WORKSPACE to avoid hardcoding runner paths (differs between providers)
+          dir="$GITHUB_WORKSPACE"
+          while [ "$dir" != "/" ]; do
+            chmod a+x "$dir" 2>/dev/null || break
+            dir=$(dirname "$dir")
+          done
           chmod -R a+rX .
 
-      - name: Install QEMU (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Remove Microsoft repos that can cause 403 errors (we don't need Azure CLI etc.)
-          # See: https://github.com/actions/runner-images/issues/9733
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update
-          # Runtime shared libs for our QEMU build (--enable-fdt/linux-io-uring/seccomp/slirp/tools):
-          #   libfdt1 (libfdt.so.1), liburing2 (liburing.so.2), libseccomp2 (libseccomp.so.2),
-          #   libslirp0 (libslirp.so.0), libpixman-1-0
-          # No qemu-utils needed — our build includes qemu-img and qemu-storage-daemon (--enable-tools)
-          sudo apt-get install -y libfdt1 liburing2 libseccomp2 libslirp0 libpixman-1-0
-
-      - name: Download QEMU build (Linux)
-        if: matrix.platform.os == 'linux'
-        uses: actions/download-artifact@v4
+      - name: Setup VM infrastructure
+        uses: ./.github/actions/setup-vm-infra
         with:
-          name: qemu-${{ matrix.platform.arch }}
-          path: ~/qemu-build/
-
-      - name: Install QEMU to PATH (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Restore executable permissions (stripped by actions/download-artifact)
-          chmod +x ~/qemu-build/bin/*
-          # Copy pre-built QEMU to /usr/local/ (takes precedence over /usr/bin/ in PATH)
-          sudo cp -a ~/qemu-build/bin/* /usr/local/bin/
-          sudo cp -a ~/qemu-build/share/qemu /usr/local/share/qemu 2>/dev/null || true
-
-      - name: Install QEMU (macOS)
-        if: matrix.platform.os == 'macos'
-        run: brew install qemu coreutils
-
-      - name: Verify QEMU installation
-        run: |
-          echo "=== QEMU binaries ==="
-          which qemu-system-x86_64 || echo "qemu-system-x86_64 not found"
-          which qemu-system-x86_64-microvm || echo "qemu-system-x86_64-microvm not found"
-          which qemu-system-aarch64 || echo "qemu-system-aarch64 not found"
-          echo ""
-          echo "=== QEMU version ==="
-          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} --version
-          echo ""
-          echo "=== Available machine types (first 20) ==="
-          ${{ matrix.platform.arch == 'x64' && 'qemu-system-x86_64' || 'qemu-system-aarch64' }} -machine help | head -20
-          echo ""
-          echo "=== Hardware acceleration ==="
-          if [ "${{ matrix.platform.os }}" = "linux" ]; then
-            ls -la /dev/kvm || echo "/dev/kvm not available"
-          else
-            sysctl kern.hv_support || echo "HVF not available"
-          fi
-
-      - name: Setup KVM permissions (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Make /dev/kvm accessible to all users for hardware acceleration
-          # Using direct chmod because udevadm trigger can fail on some runners
-          # See: https://github.com/actions/runner-images/issues/8542
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            echo "KVM permissions updated:"
-            ls -la /dev/kvm
-          else
-            echo "WARNING: /dev/kvm not found - KVM acceleration not available"
-          fi
-
-      - name: Create qemu-vm user (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Create unprivileged user for QEMU process isolation
-          # Don't specify UID - let the system assign one to avoid conflicts
-          if ! id qemu-vm &>/dev/null; then
-            sudo useradd --system --no-create-home --shell /usr/sbin/nologin qemu-vm
-          fi
-          # Add qemu-vm to kvm group for hardware acceleration access
-          sudo usermod -aG kvm qemu-vm
-          # Add runner to qemu-vm group for socket access (sockets are 0660)
-          sudo usermod -aG qemu-vm runner
-          # Allow runner to run commands AS qemu-vm (for QEMU process)
-          # Note: runner already has full sudo via GitHub Actions, so chown works
-          echo "runner ALL=(qemu-vm) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/qemu-vm
-
-      - name: Enable unprivileged user namespaces (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor by default
-          # Disable this restriction to allow unshare for namespace isolation
-          # See: https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
-          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
+          os: ${{ startsWith(matrix.platform.os, 'macos') && 'macos' || matrix.platform.os }}
+          arch: ${{ matrix.platform.arch }}
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v7.1.6
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v7.1.6
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
-        uses: actions/setup-python@v6.1.0
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install
         run: make install-deps
 
-      - name: Setup cgroup delegation (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Create cgroup directory for VM resource limits
-          sudo mkdir -p /sys/fs/cgroup/code-exec
-          # Enable required controllers (memory, cpu, pids) at root and code-exec levels
-          # This allows nested cgroups like /sys/fs/cgroup/code-exec/{tenant}/{vm}
-          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
-          echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/code-exec/cgroup.subtree_control
-          # Create runner cgroup (cgroups with subtree_control can't have processes directly)
-          sudo mkdir -p /sys/fs/cgroup/code-exec/runner
-          # Delegate ownership to runner user so tests can create sub-cgroups
-          sudo chown -R runner:runner /sys/fs/cgroup/code-exec
-
-      - name: Increase system limits (Linux)
-        if: matrix.platform.os == 'linux'
-        run: |
-          # Increase process/thread limits to prevent QEMU thread creation failures
-          # QEMU creates multiple threads per VM (iothread, vCPU, virtio workers)
-          # With parallel tests spawning multiple VMs, we can exhaust default limits
-          # References:
-          #   - https://access.redhat.com/solutions/350593 (QEMU pthread_create failures)
-          #   - https://www.baeldung.com/linux/max-threads-per-process (threads-max formula)
-          #   - https://github.com/systemd/systemd/issues/3211 (TasksMax=512 fallout)
-          echo "=== Current limits ==="
-          ulimit -a
-          echo ""
-          echo "=== System thread/process limits ==="
-          cat /proc/sys/kernel/threads-max
-          cat /proc/sys/kernel/pid_max
-          echo ""
-          # 1. Kernel-level: increase threads-max (default = RAM/128KB, ~60k on 7GB runner)
-          #    Formula: max_threads = totalram_pages / 16 (x86)
-          sudo sysctl -w kernel.threads-max=120000
-          # 2. File descriptors: raise soft limit to hard limit.
-          #    Each QEMU VM needs ~7-10 fds from the orchestrator (subprocess pipes,
-          #    sockets, lock files). Default soft=1024 causes SIGABRT at ~85 concurrent VMs.
-          #    The Scheduler also does this at startup via raise_fd_limit(), but raising it
-          #    here ensures subprocesses and test harness also benefit.
-          echo "nofile soft/hard before: $(ulimit -Sn)/$(ulimit -Hn)"
-          ulimit -n "$(ulimit -Hn)"
-          echo "nofile soft/hard after:  $(ulimit -Sn)/$(ulimit -Hn)"
-          # 3. Memory mappings per process (QEMU uses many for virtio rings, RAM, etc.)
-          sudo sysctl -w vm.max_map_count=262144
-          # 3b. Overcommit: heuristic mode (0) causes kernel to reject mmap for QEMU
-          #     thread stacks during burst VM startup, even with ample free RAM.
-          #     glibc converts ENOMEM→EAGAIN, which QEMU treats as fatal (abort).
-          #     Mode 1 ("always allow") eliminates heuristic; OOM killer is the backstop.
-          sudo sysctl -w vm.overcommit_memory=1
-          # 4. PAM limits for qemu-vm user (nproc = threads + processes per UID)
-          echo "qemu-vm soft nproc unlimited" | sudo tee -a /etc/security/limits.d/90-qemu.conf
-          echo "qemu-vm hard nproc unlimited" | sudo tee -a /etc/security/limits.d/90-qemu.conf
-          echo "runner soft nproc unlimited" | sudo tee -a /etc/security/limits.d/90-qemu.conf
-          echo "runner hard nproc unlimited" | sudo tee -a /etc/security/limits.d/90-qemu.conf
-          # 5. systemd TasksMax: default is 15% of pid_max (~4915), can limit cgroup tasks
-          #    See: https://github.com/systemd/systemd/issues/3211
-          sudo mkdir -p /etc/systemd/system/user-.slice.d
-          echo -e "[Slice]\nTasksMax=infinity" | sudo tee /etc/systemd/system/user-.slice.d/90-tasksmax.conf
-          sudo systemctl daemon-reload
-          # 6. Diagnostic: dump all thread/pids limits for debugging
-          echo ""
-          echo "=== Cgroup pids limits (current session) ==="
-          CGROUP_PATH=$(cat /proc/self/cgroup | sed 's/0:://')
-          echo "Current cgroup: $CGROUP_PATH"
-          DIR="/sys/fs/cgroup${CGROUP_PATH}"
-          while [ "$DIR" != "/sys/fs/cgroup" ] && [ "$DIR" != "/" ]; do
-            PIDS_MAX=$(cat "$DIR/pids.max" 2>/dev/null || echo "N/A")
-            PIDS_CUR=$(cat "$DIR/pids.current" 2>/dev/null || echo "N/A")
-            echo "  $DIR: pids.max=$PIDS_MAX pids.current=$PIDS_CUR"
-            DIR=$(dirname "$DIR")
-          done
-          echo ""
-          echo "=== RLIMIT_NPROC and RLIMIT_NOFILE for runner and qemu-vm ==="
-          cat /proc/self/limits | grep -E "Max processes|Max open files"
-          sudo -u qemu-vm cat /proc/self/limits 2>/dev/null | grep -E "Max processes|Max open files" || echo "Cannot read qemu-vm limits"
-          echo ""
-          echo "=== systemd TasksMax for user slices ==="
-          systemctl show "user-$(id -u).slice" --property=TasksMax 2>/dev/null || true
-          echo ""
-          echo "=== io_uring availability ==="
-          cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "sysctl not present (io_uring enabled)"
-          # 7. Remove pids.max limits from runner's cgroup hierarchy
-          #    TasksMax=infinity drop-in only affects new sessions; directly write to live cgroup
-          CGROUP_PATH=$(cat /proc/self/cgroup | sed 's/0:://')
-          DIR="/sys/fs/cgroup${CGROUP_PATH}"
-          while [ "$DIR" != "/sys/fs/cgroup" ] && [ "$DIR" != "/" ]; do
-            if [ -f "$DIR/pids.max" ] && [ -w "$DIR/pids.max" ]; then
-              echo max | sudo tee "$DIR/pids.max" > /dev/null 2>&1 || true
-            fi
-            DIR=$(dirname "$DIR")
-          done
-
       - name: Run tests (Linux)
         if: matrix.platform.os == 'linux'
         timeout-minutes: 90
+        env:
+          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
         run: |
-          # Move into delegated cgroup subtree so QEMU child processes can be managed
+          # Enter the delegated cgroup subtree. cgroupv2 PID migration requires
+          # write to the common ancestor's cgroup.procs — this initial move from
+          # the system cgroup needs sudo (root owns /sys/fs/cgroup/cgroup.procs).
+          # Once inside, exec_sandbox moves QEMU within the subtree without sudo.
           echo $$ | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
-          # Remove nproc limit for current shell (PAM limits only apply to new logins)
-          # QEMU creates many threads per VM; parallel tests can exhaust default limits
-          # prlimit requires sudo to raise limits above current hard limit
+          # Raise nproc for this shell (PAM limits only apply to new logins).
           sudo prlimit --pid $$ --nproc=unlimited:unlimited
           # Activate qemu-vm group membership for socket access (chardev sockets are 0660)
           # Sudo tests require elevated privileges
           if [ "${{ matrix.test-type }}" = "sudo" ]; then
-            sudo env "PATH=$PATH" sg qemu-vm -c "make test-${{ matrix.test-type }}"
+            sudo env "PATH=$PATH" "PYTEST_ADDOPTS=$PYTEST_ADDOPTS" sg qemu-vm -c "make test-${{ matrix.test-type }}"
           else
             sg qemu-vm -c "make test-${{ matrix.test-type }}"
           fi
 
       - name: Run tests (macOS)
-        if: matrix.platform.os == 'macos'
+        if: startsWith(matrix.platform.os, 'macos')
         timeout-minutes: 90
+        env:
+          PYTEST_ADDOPTS: "--junit-xml=${{ env.JUNIT_XML }}"
         run: |
           if [ "${{ matrix.test-type }}" = "sudo" ]; then
-            sudo make test-${{ matrix.test-type }}
+            sudo env "PYTEST_ADDOPTS=$PYTEST_ADDOPTS" make test-${{ matrix.test-type }}
           else
             make test-${{ matrix.test-type }}
           fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: ${{ env.JUNIT_XML }}
+          path: ${{ env.JUNIT_XML }}
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # CodSpeed Benchmarks — real VM operations
+  # Reuses build artifacts from the same workflow run (current commit).
+  # Runs on CodSpeed macro runners (bare-metal, low-noise).
+  # ==========================================================================
+
+  benchmarks:
+    name: Benchmark / CodSpeed
+    runs-on: runs-on=${{github.run_id}}-benchmarks/runner=4cpu-linux-x64/nested-virt
+    concurrency:
+      group: codspeed-${{ github.ref }}
+      cancel-in-progress: true
+    needs: [build-qemu, build-gvproxy-wrapper, build-vm-images]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      # --- Download build artifacts (same as test-python) ---
+
+      - name: Download gvproxy-wrapper
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gvproxy-wrapper-linux-x64
+          path: gvproxy-wrapper/bin/
+
+      - name: Download VM images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: vm-images-x64
+          path: images/dist/
+
+      - name: Make binaries executable
+        run: chmod +x gvproxy-wrapper/bin/gvproxy-wrapper-*
+
+      - name: Make images readable (Linux)
+        run: |
+          # Make files readable and directories traversable for qemu-vm user
+          # Need to make parent directories traversable too (home dirs are often 700)
+          # Use GITHUB_WORKSPACE to avoid hardcoding runner paths (differs between providers)
+          dir="$GITHUB_WORKSPACE"
+          while [ "$dir" != "/" ]; do
+            chmod a+x "$dir" 2>/dev/null || break
+            dir=$(dirname "$dir")
+          done
+          chmod -R a+rX .
+
+      - name: Setup VM infrastructure
+        uses: ./.github/actions/setup-vm-infra
+        with:
+          os: linux
+          arch: x64
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v7.1.6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: make install-deps
+
+      - name: Prepare benchmark environment
+        run: |
+          # CodSpeed memory mode uses memtrack which may restrict setuid/ptrace.
+          # All privileged setup must happen here, in a normal step before CodSpeed.
+          #
+          # 1. Move the runner process ($PPID) into the delegated cgroup subtree.
+          #    cgroupv2 PID migration requires write access to the common ancestor's
+          #    cgroup.procs.  Once the runner is inside code-exec/runner/, all child
+          #    processes (CodSpeed → pytest → exec_sandbox → QEMU)
+          #    inherit that cgroup via fork().  Subsequent intra-subtree moves
+          #    (e.g. code-exec/runner/ → code-exec/exec-sandbox/session-xxx/) only
+          #    need write to code-exec/cgroup.procs, which is runner-owned.
+          #    Ref: https://docs.kernel.org/admin-guide/cgroup-v2.html#delegation
+          echo $PPID | sudo tee /sys/fs/cgroup/code-exec/runner/cgroup.procs > /dev/null
+          #
+          # 2. Raise nproc limit on the runner process so CodSpeed inherits it.
+          #    PAM limits only apply to new logins; prlimit modifies the live process.
+          sudo prlimit --pid $PPID --nproc=unlimited:unlimited
+
+      - name: Run benchmarks
+        timeout-minutes: 30
+        uses: CodSpeedHQ/action@1c8ae4843586d3ba879736b7f6b7b0c990757fab # v4
+        with:
+          mode: walltime,memory
+          run: |
+            # No privileged setup needed here — the pre-step moved the runner
+            # process into the delegated cgroup and raised nproc.  This process
+            # inherits both via fork().  Under ptrace, probe_sudo_as_qemu_vm()
+            # returns False, so QEMU runs as the current user (sockets are
+            # runner-owned, no sg/group membership needed).
+            uv run pytest tests/benchmarks/ --codspeed -v --no-cov -p no:xdist -o 'addopts='

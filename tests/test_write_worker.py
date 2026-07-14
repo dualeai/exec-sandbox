@@ -24,17 +24,15 @@ async def channel() -> UnixSocketChannel:
 
 async def _start_worker(ch: UnixSocketChannel) -> asyncio.Task[None]:
     """Start the write worker as a background task."""
-    ch._shutdown_event.clear()  # pyright: ignore[reportPrivateUsage]
     return asyncio.create_task(ch._write_worker())  # pyright: ignore[reportPrivateUsage]
 
 
 async def _stop_worker(ch: UnixSocketChannel, task: asyncio.Task[None]) -> None:
-    """Cleanly stop the write worker."""
-    ch._shutdown_event.set()
-    try:
+    """Cleanly stop the write worker by cancelling it (the authoritative stop)."""
+    if not task.done():
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5.0)
-    except asyncio.CancelledError:
-        pass
 
 
 # ============================================================================
@@ -44,23 +42,23 @@ async def _stop_worker(ch: UnixSocketChannel, task: asyncio.Task[None]) -> None:
 
 class TestWriteWorkerShutdown:
     @pytest.mark.asyncio
-    async def test_shutdown_event_stops_worker(self, channel: UnixSocketChannel):
-        """Set _shutdown_event, verify worker exits cleanly."""
+    async def test_cancel_stops_worker(self, channel: UnixSocketChannel):
+        """Cancelling the worker task is the authoritative stop."""
         task = await _start_worker(channel)
 
-        channel._shutdown_event.set()
-        await asyncio.wait_for(task, timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
 
         assert task.done()
-        assert task.exception() is None
 
     @pytest.mark.asyncio
-    async def test_timeout_cycles_until_shutdown(self, channel: UnixSocketChannel):
-        """Worker stays alive with empty queue, exits on shutdown."""
+    async def test_stays_alive_blocking_on_empty_queue(self, channel: UnixSocketChannel):
+        """Worker blocks on an empty queue indefinitely, stops on cancel."""
         task = await _start_worker(channel)
 
-        # Let the worker cycle through at least one timeout
-        await asyncio.sleep(1.5)
+        # No wakeup poll: the worker just blocks on queue.get() while idle.
+        await asyncio.sleep(0.2)
         assert not task.done(), "Worker should still be running"
 
         await _stop_worker(channel, task)
@@ -209,18 +207,17 @@ class TestWriteWorkerEdgeCases:
             await channel.enqueue_write(b"overflow", timeout=0.1)
 
     @pytest.mark.asyncio
-    async def test_concurrent_shutdown_and_data(self, channel: UnixSocketChannel):
-        """Put data AND set shutdown simultaneously — no crash."""
+    async def test_concurrent_cancel_and_data(self, channel: UnixSocketChannel):
+        """Enqueue data then cancel immediately — no crash, worker stops."""
         task = await _start_worker(channel)
 
-        # Race: enqueue data and signal shutdown at the same time
+        # Race: enqueue data and cancel in the same turn.
         await channel._write_queue.put(b"last\n")
-        channel._shutdown_event.set()
+        task.cancel()
 
-        await asyncio.wait_for(task, timeout=5.0)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
         assert task.done()
-        # Worker should not raise
-        assert task.exception() is None
 
     @pytest.mark.asyncio
     async def test_worker_exits_on_cancelled_error(self, channel: UnixSocketChannel):

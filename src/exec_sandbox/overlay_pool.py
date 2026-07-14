@@ -28,9 +28,10 @@ import aiofiles.os
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import settle_and_report
 from exec_sandbox.exceptions import VmOverlayError as QemuImgError
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError
-from exec_sandbox.subprocess_utils import start_managed_process
+from exec_sandbox.subprocess_utils import communicate_managed_process
 
 logger = get_logger(__name__)
 
@@ -69,10 +70,13 @@ async def create_qcow2_overlay(base_image: Path, overlay_path: Path) -> None:
         str(overlay_path),
     ]
 
-    proc = await start_managed_process(cmd)
-    _, stderr = await proc.communicate()
+    returncode, _, stderr = await communicate_managed_process(
+        cmd,
+        process_name="qemu-img-create-overlay",
+        context_id=str(overlay_path),
+    )
 
-    if proc.returncode != 0:
+    if returncode != 0:
         stderr_text = stderr.decode()
         raise QemuImgError(f"qemu-img create failed: {stderr_text}", stderr=stderr_text)
 
@@ -208,6 +212,19 @@ class OverlayPool:
         return cleaned
 
     async def start(self, base_images: list[Path] | None = None) -> None:
+        """Start the pool, rolling back any partially-started daemon lifecycle."""
+        try:
+            await self._start_impl(base_images)
+        except BaseException:
+            rollback = asyncio.create_task(self.stop())
+            if (rollback_error := await settle_and_report(rollback)) is not None:
+                logger.error(
+                    "Overlay pool startup rollback failed",
+                    extra={"error": str(rollback_error)},
+                )
+            raise
+
+    async def _start_impl(self, base_images: list[Path] | None = None) -> None:
         """Start the overlay pool and pre-create overlays for base images.
 
         If base_images is None, auto-discovers from images_path.
@@ -291,7 +308,7 @@ class OverlayPool:
 
     async def stop(self) -> None:
         """Stop the overlay pool: cancel tasks, stop daemon, cleanup pool directory."""
-        if not self._started:
+        if not self._started and self._daemon is None:
             return
 
         # Signal shutdown to replenishment loops

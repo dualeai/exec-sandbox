@@ -44,7 +44,7 @@ except Exception as e:
             code=code,
             language=Language.PYTHON,
             allow_network=True,
-            allowed_domains=["httpbin.org"],
+            allowed_domains=["cp.cloudflare.com"],
         )
         assert "BLOCKED:" in result.stdout, (
             f"Expected raw TCP to 8.8.8.8:53 to be blocked by gvproxy.\n"
@@ -83,7 +83,7 @@ finally:
             code=code,
             language=Language.PYTHON,
             allow_network=True,
-            allowed_domains=["httpbin.org"],
+            allowed_domains=["cp.cloudflare.com"],
         )
         assert "BLOCKED:" in result.stdout, (
             f"Expected UDP DNS to 8.8.8.8:53 to be blocked/timeout.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -98,7 +98,7 @@ finally:
             code="ip route show default",
             language=Language.RAW,
             allow_network=True,
-            allowed_domains=["httpbin.org"],
+            allowed_domains=["cp.cloudflare.com"],
         )
         assert "192.168.127.1" in result.stdout, (
             f"Expected default route via gvproxy gateway 192.168.127.1.\n"

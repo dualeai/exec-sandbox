@@ -17,8 +17,7 @@ proptest = "1"
 
 [profile.release]
 opt-level = "z"       # Optimize for size
-lto = true            # Link-time optimization
-codegen-units = 1     # Better optimization
+lto = "thin"          # Thin LTO — cross-crate optimisation, parallelised across codegen units (default 16)
 strip = true          # Strip symbols
 panic = "abort"       # Abort on panic (smaller binary, no unwinding)
 overflow-checks = false  # Disable overflow checks (~5% smaller binary)

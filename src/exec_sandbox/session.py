@@ -17,7 +17,9 @@ Lifecycle:
     - Created via scheduler.session() (returns Session owning a VM)
     - exec() calls execute code in the same VM (state persists)
     - close() destroys the VM (called automatically by context manager)
-    - Idle timeout auto-closes after inactivity
+    - Idle timeout auto-closes after inactivity (time between operations)
+    - Failure closes: cancellation, unknown-outcome transport loss, exit 137,
+      and a VM found dead are all terminal — see Session.exec and _guard()
 """
 
 from __future__ import annotations
@@ -33,9 +35,17 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS
-from exec_sandbox.exceptions import InputValidationError, OutputLimitError, SessionClosedError, VmConfigError
+from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES, MAX_TIMEOUT_SECONDS, SIGKILL_EXIT_CODE
+from exec_sandbox.exceptions import (
+    CommunicationOutcomeUnknownError,
+    InputValidationError,
+    OutputLimitError,
+    SessionClosedError,
+    VmConfigError,
+    VmPermanentError,
+)
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
+from exec_sandbox.vm_types import VmState
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -73,12 +83,15 @@ class Session:
         self._idle_timeout_seconds = idle_timeout_seconds
         self._default_timeout_seconds = default_timeout_seconds
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._exec_count = 0
         self._exec_lock = asyncio.Lock()
-        self._idle_timer_task: asyncio.Task[None] | None = None
-        # Strong refs to cancelled timer tasks awaiting CancelledError processing.
-        # done_callback auto-removes; close() gathers any remaining.
-        self._cancelled_timers: set[asyncio.Task[None]] = set()
+        # loop.call_later handle for the idle deadline. cancel() is synchronous,
+        # allocation-light, and a no-op once fired — no task, no CancelledError
+        # to process, so no strong-ref set is needed.
+        self._idle_timer_handle: asyncio.TimerHandle | None = None
+        # Strong ref to the fire-and-forget close task the timer callback spawns.
+        self._idle_close_task: asyncio.Task[None] | None = None
         self._reset_idle_timer()
 
     # -------------------------------------------------------------------------
@@ -113,19 +126,64 @@ class Session:
     async def _guard(self) -> AsyncIterator[None]:
         """Acquire exec lock with session lifecycle checks.
 
-        Encapsulates the 4-step preamble shared by all public methods:
+        Encapsulates the preamble shared by all public methods:
         1. Check closed (fast path, no lock)
         2. Acquire _exec_lock
         3. Re-check closed (may have closed while waiting)
-        4. Reset idle timer
+        4. Retire fast if the VM process is already dead or being destroyed
+        5. Suspend the idle timer for the duration of the operation
+
+        Idle means "no operation in flight": the timer is cancelled while an
+        operation runs and re-armed when it finishes, so a long exec can never
+        be destroyed mid-flight by its own idle deadline.
+
+        On the way out it also owns VM retirement for cancellation and
+        unknown-outcome failures: any dispatched guest operation may still be
+        running after CancelledError or CommunicationOutcomeUnknownError, so
+        the session is closed before either propagates.
         """
         if self._closed:
             raise SessionClosedError("Session is closed")
         async with self._exec_lock:
             if self._closed:
                 raise SessionClosedError("Session closed while waiting for lock")
-            self._reset_idle_timer()
-            yield
+            if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED) or self._vm.process.returncode is not None:
+                # QEMU died while the session was idle: the process-exit
+                # watcher (armed lazily on first execute) publishes DESTROYING;
+                # before that first execute, death is visible only via
+                # returncode. Fail fast instead of letting every operation
+                # time out one transient error at a time.
+                await self._close_for_failure()
+                raise SessionClosedError("Session VM was retired")
+            self._cancel_idle_timer()
+            try:
+                yield
+            except asyncio.CancelledError:
+                # Every dispatched guest operation can outlive its cancelled
+                # host waiter.  Retire the VM before permitting reuse, for
+                # file/list operations as well as code execution.
+                await self._close_for_failure()
+                raise
+            except CommunicationOutcomeUnknownError:
+                # Dispatch may have reached the guest. Retire before exposing
+                # the reconciliation-required error so no API can reuse a VM
+                # whose command outcome is unknown.
+                await self._close_for_failure()
+                raise
+            finally:
+                if not self._closed:
+                    self._reset_idle_timer()
+
+    async def _close_for_failure(self) -> None:
+        """Close the session without letting a close-time error mask the
+        primary failure (or swallow the CancelledError) being propagated."""
+        try:
+            await self.close()
+        except Exception:
+            logger.exception(
+                "Session close failed while handling a prior failure",
+                extra={"vm_id": self._vm.vm_id},
+            )
 
     async def _resolve_content(self, content: bytes | Path | IO[bytes]) -> tuple[IO[bytes], bool]:
         """Convert content to a readable binary stream with size validation.
@@ -180,7 +238,10 @@ class Session:
         """Execute code in the session VM.
 
         State (variables, imports, functions) persists from previous exec() calls.
-        Non-zero exit codes do NOT close the session - only VM failures do.
+        Non-zero exit codes do not normally close the session. Two cases are
+        terminal: exit 137 (reserved as a terminal result) and a VM whose QEMU
+        died while delivering the result — both return the result, then close
+        the session.
 
         Args:
             code: Source code to execute.
@@ -199,7 +260,11 @@ class Session:
             SessionClosedError: Session has been closed.
             VmPermanentError: VM communication failed (session auto-closed).
             VmTransientError: VM communication failed (session auto-closed).
-            VmBootTimeoutError: Execution exceeded timeout (session auto-closed).
+            VmBootTimeoutError: Host deadline hit before command dispatch or
+                guest connection timed out (session auto-closed) — not a
+                user-code timeout; those return exit_code=-1.
+            CommunicationOutcomeUnknownError: Transport failed after dispatch;
+                the session is closed and callers must reconcile before retrying.
 
         Note:
             Execution timeouts (guest agent level) return a result with
@@ -234,8 +299,9 @@ class Session:
                 # Session stays alive — caller can retry with less output.
                 raise
             except Exception:
-                # VM failure - auto-close session
-                await self.close()
+                # VM failure — auto-close session. CancelledError is handled by
+                # _guard, which retires the VM for every dispatched operation.
+                await self._close_for_failure()
                 raise
 
             execute_end = asyncio.get_running_loop().time()
@@ -243,8 +309,8 @@ class Session:
 
             self._exec_count += 1
 
-            # Populate timing with session-measured values
-            return ExecutionResult(
+            # Populate timing with session-measured values.
+            execution_result = ExecutionResult(
                 stdout=result.stdout,
                 stderr=result.stderr,
                 exit_code=result.exit_code,
@@ -262,6 +328,17 @@ class Session:
                 spawn_ms=result.spawn_ms,
                 process_ms=result.process_ms,
             )
+            if result.exit_code == SIGKILL_EXIT_CODE or self._vm.state in (VmState.DESTROYING, VmState.DESTROYED):
+                logger.warning(
+                    "Retiring session VM after terminal execution result",
+                    extra={
+                        "vm_id": self._vm.vm_id,
+                        "exit_code": result.exit_code,
+                        "vm_state": self._vm.state.value,
+                    },
+                )
+                await self.close()
+            return execution_result
 
     # -------------------------------------------------------------------------
     # File I/O
@@ -282,6 +359,9 @@ class Session:
             ValueError: Content exceeds max file size limit.
             FileNotFoundError: Path source does not exist.
             VmPermanentError: Guest agent validation or write failure.
+            VmTransientError: Transport failed before dispatch (retryable).
+            CommunicationOutcomeUnknownError: Transport lost after dispatch —
+                the write may have landed (session auto-closed).
         """
         # Resolve content to a stream BEFORE acquiring the lock —
         # local disk I/O should not block other session operations.
@@ -308,6 +388,8 @@ class Session:
         Raises:
             SessionClosedError: Session has been closed.
             VmPermanentError: File not found or validation failure.
+            VmTransientError: Timeout or transport failure (retryable on a
+                live VM; cancellation and unknown outcomes auto-close).
         """
         async with self._guard():
             await self._vm.read_file(path, destination=destination)
@@ -324,6 +406,9 @@ class Session:
         Raises:
             SessionClosedError: Session has been closed.
             VmPermanentError: Directory not found or validation failure.
+            VmTransientError: Timeout or transport failure (retryable on a
+                live VM); CommunicationOutcomeUnknownError after dispatch
+                (session auto-closed).
         """
         async with self._guard():
             return await self._vm.list_files(path)
@@ -331,26 +416,23 @@ class Session:
     async def close(self) -> None:
         """Close the session and destroy the VM.
 
-        Idempotent: safe to call multiple times.
+        Idempotent: concurrent callers await the same cleanup task.
 
-        Concurrency contract: close() does NOT acquire _exec_lock.
-        Setting _closed=True is an atomic flag that _guard() checks at
-        two points (before and after lock acquisition). An in-flight
-        operation that already passed _guard() will complete its VM call
-        before the lock is released. The next operation will see _closed=True.
+        Concurrency contract: close() does NOT acquire _exec_lock. Setting
+        _closed=True immediately prevents new operations. An operation already
+        inside _guard() may be interrupted by VM destruction; explicit close is
+        the cancellation boundary, not a request-drain operation. Concurrent
+        close callers await the same cleanup task. A cleanup failure is raised
+        to every caller.
         """
-        if self._closed:
-            return
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close_impl())
+        await asyncio.shield(self._close_task)
 
-        self._closed = True
+    async def _close_impl(self) -> None:
+        """Perform the single shared cleanup operation."""
         self._cancel_idle_timer()
-
-        # Await cancelled timer tasks so they process CancelledError before
-        # the event loop shuts down. Without this, GC'd coroutines trigger
-        # "Event loop is closed" on Python 3.14t.
-        if self._cancelled_timers:
-            await asyncio.gather(*self._cancelled_timers, return_exceptions=True)
-            self._cancelled_timers.clear()
 
         logger.info(
             "Closing session",
@@ -360,12 +442,14 @@ class Session:
             },
         )
 
-        try:
-            await self._vm_manager.destroy_vm(self._vm)
-        except (OSError, RuntimeError, TimeoutError) as e:
-            logger.error(
-                "Error destroying session VM",
-                extra={"vm_id": self._vm.vm_id, "error": str(e)},
+        await self._vm_manager.destroy_vm(self._vm)
+        # destroy_vm keeps failed workdir/cgroup cleanup owned for retry, and
+        # publishes DESTROYED only after QEMU and gvproxy death is confirmed.
+        # Only that process boundary may hide a terminal execution result.
+        if self._vm.state is not VmState.DESTROYED:
+            raise VmPermanentError(
+                f"VM process cleanup was not confirmed for session VM {self._vm.vm_id}",
+                context={"vm_id": self._vm.vm_id, "operation": "session_close"},
             )
 
     # -------------------------------------------------------------------------
@@ -390,36 +474,25 @@ class Session:
     # -------------------------------------------------------------------------
 
     def _reset_idle_timer(self) -> None:
-        """Reset the idle timeout timer."""
+        """Arm (or re-arm) the idle deadline."""
         self._cancel_idle_timer()
-        self._idle_timer_task = asyncio.create_task(self._idle_timeout_handler())
+        loop = asyncio.get_running_loop()
+        self._idle_timer_handle = loop.call_later(self._idle_timeout_seconds, self._on_idle_timeout)
 
     def _cancel_idle_timer(self) -> None:
-        """Cancel the idle timeout timer.
+        """Cancel a pending idle deadline (no-op if it already fired)."""
+        if self._idle_timer_handle is not None:
+            self._idle_timer_handle.cancel()
+            self._idle_timer_handle = None
 
-        Adds the cancelled task to _cancelled_timers with a done callback
-        for auto-removal. This holds a strong reference, preventing GC
-        before the event loop processes CancelledError.
+    def _on_idle_timeout(self) -> None:
+        """Idle deadline reached — close the session.
 
-        When the idle timeout fires naturally, the handler calls close()
-        which calls us. In that case current_task IS the timer task — skip
-        both cancel and tracking since it will complete on its own.
+        Runs as a synchronous call_later callback, so it schedules the async
+        close as a fire-and-forget task and holds a strong ref to it (the
+        Session outlives it — close() publishes _close_task before any await).
         """
-        if self._idle_timer_task is not None:
-            if not self._idle_timer_task.done() and self._idle_timer_task is not asyncio.current_task():
-                self._idle_timer_task.cancel()
-                task = self._idle_timer_task
-                self._cancelled_timers.add(task)
-                task.add_done_callback(self._cancelled_timers.discard)
-            self._idle_timer_task = None
-
-    async def _idle_timeout_handler(self) -> None:
-        """Auto-close session after idle timeout."""
-        try:
-            await asyncio.sleep(self._idle_timeout_seconds)
-        except asyncio.CancelledError:
-            return
-
+        self._idle_timer_handle = None
         logger.info(
             "Session idle timeout",
             extra={
@@ -428,4 +501,4 @@ class Session:
                 "exec_count": self._exec_count,
             },
         )
-        await self.close()
+        self._idle_close_task = asyncio.create_task(self._close_for_failure())

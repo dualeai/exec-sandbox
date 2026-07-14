@@ -38,7 +38,9 @@ from exec_sandbox import constants
 if TYPE_CHECKING:
     from pathlib import Path
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_cancellation_safe
 from exec_sandbox.exceptions import BalloonTransientError as BalloonError
+from exec_sandbox.qmp_exchange import qmp_id_exchange
 from exec_sandbox.socket_auth import connect_and_verify
 
 logger = get_logger(__name__)
@@ -60,6 +62,7 @@ class BalloonClient:
         "_lock",
         "_qmp_socket",
         "_reader",
+        "_request_seq",
         "_writer",
     )
 
@@ -75,6 +78,7 @@ class BalloonClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
+        self._request_seq = 0
         self._lock = asyncio.Lock()
 
     async def connect(self, timeout: float = 5.0) -> None:
@@ -123,9 +127,13 @@ class BalloonClient:
                 self._connected = True
                 logger.debug("QMP connection established")
 
-            except (OSError, TimeoutError, json.JSONDecodeError) as e:
-                await self._cleanup()
-                raise BalloonError(f"QMP connection failed: {e}") from e
+            except BaseException as error:  # Every failed handshake owns socket cleanup.
+                await self._cleanup_after_connect_failure()
+                if isinstance(error, asyncio.CancelledError | BalloonError):
+                    raise
+                if isinstance(error, OSError | TimeoutError | json.JSONDecodeError):
+                    raise BalloonError(f"QMP connection failed: {error}") from error
+                raise
 
     async def close(self) -> None:
         """Close the QMP connection."""
@@ -134,13 +142,24 @@ class BalloonClient:
 
     async def _cleanup(self) -> None:
         """Internal cleanup (must hold lock)."""
-        if self._writer is not None:
-            self._writer.close()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
+        writer = self._writer
         self._reader = None
         self._writer = None
         self._connected = False
+        if writer is not None:
+            with contextlib.suppress(Exception):
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+
+    async def _cleanup_after_connect_failure(self) -> None:
+        """Finish handshake cleanup despite repeated caller cancellation.
+
+        Runs cleanup to completion and surfaces its own error, but does not
+        drop a caller cancellation observed mid-cleanup: await_cancellation_safe
+        re-raises it so a Ctrl-C during teardown still wins over the original
+        handshake error.
+        """
+        await await_cancellation_safe(self._cleanup())
 
     async def _execute(
         self,
@@ -164,26 +183,20 @@ class BalloonClient:
         if not self._connected or self._writer is None or self._reader is None:
             raise BalloonError("Not connected to QMP")
 
-        cmd: dict[str, Any] = {"execute": command}
-        if arguments:
-            cmd["arguments"] = arguments
-
-        self._writer.write(json.dumps(cmd).encode() + b"\n")
-        await self._writer.drain()
-
-        # QMP can send asynchronous events (e.g., BALLOON_CHANGE) at any time.
-        # We must skip over events and only return command responses ("return"
-        # or "error" key).  Without this, events desynchronize the request/
-        # response stream and corrupt subsequent commands.
-        # Global timeout covers the entire read loop, not per-readline.
-        async with asyncio.timeout(timeout):
-            for _ in range(16):
-                response = await self._reader.readline()
-                data: dict[str, Any] = json.loads(response)
-                if "event" not in data:
-                    return data
-                logger.debug("QMP event (skipped)", extra={"event": data.get("event")})
-        raise BalloonError("Too many QMP events without command response")
+        # Tag each command with a unique id and match it on the response. QMP
+        # interleaves async events (BALLOON_CHANGE) and, after a timed-out
+        # command with the connection left open, a stale reply — id-matching
+        # discards both so query N's late reply can't be read as query N+1's.
+        self._request_seq += 1
+        return await qmp_id_exchange(
+            self._reader,
+            self._writer,
+            f"balloon-{self._request_seq}",
+            command,
+            arguments,
+            timeout,
+            BalloonError,
+        )
 
     async def query(self, timeout: float = 5.0) -> int | None:
         """Query current balloon memory.

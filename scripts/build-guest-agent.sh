@@ -15,7 +15,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
-RUST_VERSION="${RUST_VERSION:?RUST_VERSION must be set (exported by root Makefile)}"
+# Rust toolchain version + image digest come from versions.lock only.
+# Fail-closed: a missing lock or missing keys abort the build.
+LOCK_FILE="$REPO_ROOT/versions.lock"
+if [ ! -f "$LOCK_FILE" ]; then
+    echo "ERROR: versions.lock not found — run './scripts/upgrade-versions.sh' (or restore it from git)" >&2
+    exit 1
+fi
+RUST_VERSION=$(grep -m1 '^RUST_VERSION=' "$LOCK_FILE" | cut -d= -f2- || true)
+RUST_IMAGE_DIGEST=$(grep -m1 '^RUST_IMAGE_DIGEST=' "$LOCK_FILE" | cut -d= -f2- || true)
+if [ -z "$RUST_VERSION" ] || [ -z "$RUST_IMAGE_DIGEST" ]; then
+    echo "ERROR: versions.lock lacks RUST_VERSION/RUST_IMAGE_DIGEST — run 'make upgrade'" >&2
+    exit 1
+fi
 
 # Buildx cache configuration (for CI)
 # Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
@@ -40,11 +52,16 @@ compute_hash() {
     (
         echo "arch=$arch"
         echo "rust=$RUST_VERSION"
+        # Toolchain image digest: a re-pushed rust:X.Y-slim must rebuild the binary
+        echo "rust_image_digest=$RUST_IMAGE_DIGEST"
         cat "$REPO_ROOT/guest-agent/Cargo.lock" 2>/dev/null || true
         cat "$REPO_ROOT/guest-agent/Cargo.toml" 2>/dev/null || true
         # Hash all source files: .rs code + embedded scripts (.py, .mjs, .sh via include_str!())
         find "$REPO_ROOT/guest-agent/src" -type f \( -name "*.rs" -o -name "*.py" -o -name "*.mjs" -o -name "*.sh" \) -print0 2>/dev/null | \
             sort -z | xargs -0 cat 2>/dev/null || true
+        # Self-hash: build-logic changes (Dockerfile heredoc, flags) must miss the
+        # cache — CI restores prior sidecars, which would otherwise mask them forever
+        cat "$SCRIPT_DIR/build-guest-agent.sh"
     ) | sha256sum | cut -d' ' -f1
 }
 
@@ -99,14 +116,14 @@ build_for_arch() {
     # The Dockerfile downloads musl.cc cross-toolchains for cross-arch builds
     DOCKER_BUILDKIT=1 docker buildx build \
         --output "type=local,dest=$OUTPUT_DIR" \
-        --build-arg RUST_VERSION="$RUST_VERSION" \
+        --build-arg RUST_IMAGE="rust:${RUST_VERSION}-slim@${RUST_IMAGE_DIGEST}" \
         --build-arg RUST_TARGET="$rust_target" \
         --build-arg ARCH="$arch" \
         ${cache_args[@]+"${cache_args[@]}"} \
         -f - "$REPO_ROOT" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
-ARG RUST_VERSION
-FROM rust:${RUST_VERSION}-slim AS builder
+ARG RUST_IMAGE
+FROM ${RUST_IMAGE} AS builder
 ARG RUST_TARGET
 ARG ARCH
 WORKDIR /workspace
@@ -153,11 +170,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         export CC=musl-gcc; \
     fi && \
     cd guest-agent && \
-    cargo build --release --target ${RUST_TARGET} && \
-    cp target/${RUST_TARGET}/release/guest-agent /guest-agent-linux-${ARCH}
+    # The target/ cache mount persists across builds and can be overwritten by
+    # concurrent builds; cargo freshness for path packages is mtime-based and
+    # can false-hit on restored contents, serving a stale binary. Clean only
+    # the leaf crate — registry deps are checksum-fingerprinted and stay cached.
+    cargo clean --package guest-agent --release --target "${RUST_TARGET}" && \
+    cargo build --release --target "${RUST_TARGET}" && \
+    cp "target/${RUST_TARGET}/release/guest-agent" "/guest-agent-linux-${ARCH}"
 
 FROM scratch
-ARG ARCH
 COPY --from=builder /guest-agent-linux-* .
 DOCKERFILE
 

@@ -6,11 +6,17 @@ No mocks - spawns actual processes.
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.subprocess_utils import drain_subprocess_output, wait_for_socket
+from exec_sandbox.subprocess_utils import (
+    communicate_managed_process,
+    drain_subprocess_output,
+    start_managed_process,
+    wait_for_socket,
+)
 
 
 async def _close_writer(_r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -27,6 +33,185 @@ async def create_process(cmd: list[str]) -> ProcessWrapper:
         stderr=asyncio.subprocess.PIPE,
     )
     return ProcessWrapper(proc)
+
+
+class TestStartManagedProcess:
+    """Process publication is atomic with respect to caller cancellation."""
+
+    async def test_cancelled_waiter_defers_until_spawn_is_published(self) -> None:
+        spawn_entered = asyncio.Event()
+        release_spawn = asyncio.Event()
+        async_proc = MagicMock()
+        wrapped_proc = MagicMock(spec=ProcessWrapper)
+        published: list[ProcessWrapper] = []
+
+        async def blocked_spawn(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            spawn_entered.set()
+            await release_spawn.wait()
+            return async_proc
+
+        with (
+            patch("exec_sandbox.subprocess_utils.asyncio.create_subprocess_exec", side_effect=blocked_spawn),
+            patch("exec_sandbox.subprocess_utils.ProcessWrapper", return_value=wrapped_proc),
+            patch("exec_sandbox.subprocess_utils.register_process") as register,
+        ):
+            waiter = asyncio.create_task(start_managed_process(["qemu-test"], on_process_started=published.append))
+            await spawn_entered.wait()
+            waiter.cancel()
+            await asyncio.sleep(0)
+
+            assert not waiter.done()
+            release_spawn.set()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+        register.assert_called_once_with(wrapped_proc)
+        assert published == [wrapped_proc]
+
+
+class TestCommunicateManagedProcess:
+    """Transient children retain cleanup ownership across cancellation."""
+
+    async def test_cancelled_communication_kills_reaps_and_unregisters(self) -> None:
+        communicate_entered = asyncio.Event()
+        proc = MagicMock(spec=ProcessWrapper)
+        proc.returncode = None
+
+        async def blocked_communicate() -> tuple[bytes, bytes]:
+            communicate_entered.set()
+            await asyncio.Event().wait()
+            return b"", b""
+
+        proc.communicate = blocked_communicate
+
+        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
+            assert on_process_started is not None
+            on_process_started(proc)
+            return proc
+
+        with (
+            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
+            patch(
+                "exec_sandbox.subprocess_utils.cleanup_process", new_callable=AsyncMock, return_value=True
+            ) as cleanup,
+            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
+        ):
+            task = asyncio.create_task(
+                communicate_managed_process(
+                    ["qemu-img", "info"],
+                    process_name="qemu-img",
+                    context_id="cancelled",
+                )
+            )
+            await communicate_entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        cleanup.assert_awaited_once_with(proc, "qemu-img", "cancelled")
+        unregister.assert_called_once_with(proc)
+
+    async def test_normal_completion_unregisters_after_confirmed_cleanup(self) -> None:
+        proc = MagicMock(spec=ProcessWrapper)
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"out", b"err"))
+
+        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
+            assert on_process_started is not None
+            on_process_started(proc)
+            return proc
+
+        with (
+            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
+            patch("exec_sandbox.subprocess_utils.cleanup_process", new_callable=AsyncMock, return_value=True),
+            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
+        ):
+            result = await communicate_managed_process(
+                ["qemu-img", "info"],
+                process_name="qemu-img",
+                context_id="normal",
+            )
+
+        assert result == (0, b"out", b"err")
+        unregister.assert_called_once_with(proc)
+
+    async def test_unconfirmed_cleanup_blocks_return_and_retries(self) -> None:
+        proc = MagicMock(spec=ProcessWrapper)
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"out", b""))
+        second_cleanup = asyncio.Event()
+
+        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
+            assert on_process_started is not None
+            on_process_started(proc)
+            return proc
+
+        async def cleanup(*_args, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
+            if not second_cleanup.is_set():
+                second_cleanup.set()
+                return False
+            return True
+
+        with (
+            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
+            patch("exec_sandbox.subprocess_utils.cleanup_process", side_effect=cleanup) as cleanup_mock,
+            patch("exec_sandbox.subprocess_utils.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
+        ):
+            result = await communicate_managed_process(
+                ["qemu-img", "info"],
+                process_name="qemu-img",
+                context_id="retry",
+            )
+
+        assert result == (0, b"out", b"")
+        assert cleanup_mock.await_count == 2
+        sleep.assert_awaited_once_with(1.0)
+        unregister.assert_called_once_with(proc)
+
+    async def test_cancellation_during_cleanup_backoff_still_confirms_death(self) -> None:
+        proc = MagicMock(spec=ProcessWrapper)
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        backoff_entered = asyncio.Event()
+        release_backoff = asyncio.Event()
+        cleanup_attempts = 0
+
+        async def publish_process(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
+            assert on_process_started is not None
+            on_process_started(proc)
+            return proc
+
+        async def cleanup(*_args, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            return cleanup_attempts >= 2
+
+        async def blocked_sleep(_delay: float) -> None:
+            backoff_entered.set()
+            await release_backoff.wait()
+
+        with (
+            patch("exec_sandbox.subprocess_utils.start_managed_process", side_effect=publish_process),
+            patch("exec_sandbox.subprocess_utils.cleanup_process", side_effect=cleanup),
+            patch("exec_sandbox.subprocess_utils.asyncio.sleep", side_effect=blocked_sleep),
+            patch("exec_sandbox.subprocess_utils.unregister_process") as unregister,
+        ):
+            task = asyncio.create_task(
+                communicate_managed_process(
+                    ["qemu-img", "info"],
+                    process_name="qemu-img",
+                    context_id="cancel-backoff",
+                )
+            )
+            await backoff_entered.wait()
+            task.cancel()
+            release_backoff.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert cleanup_attempts == 2
+        unregister.assert_called_once_with(proc)
 
 
 class TestDrainSubprocessOutput:

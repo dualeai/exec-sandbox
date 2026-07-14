@@ -373,11 +373,14 @@ time.sleep(60)
         # Process caught SIGTERM and called sys.exit(42) — normal exit, not a signal kill
         assert result.exit_code == 42
 
+    @pytest.mark.slow
     async def test_signal_kill_returns_128_plus_signal(self, scheduler: Scheduler) -> None:
         """Process killed by uncaught signal returns 128+signal_number.
 
         Normal case: SIGSEGV (signal 11) kills the REPL process.
         The guest-agent should report exit_code=128+11=139 per Unix convention.
+        Slow under TCG: signal delivery + REPL teardown need the full
+        scheduler default timeout (120s hwaccel / 240s TCG).
         """
         code = """
 import os
@@ -387,7 +390,6 @@ os.kill(os.getpid(), signal.SIGSEGV)
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=10,
         )
 
         # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
@@ -433,7 +435,7 @@ time.sleep(60)
         result = await scheduler.run(
             code=code,
             language=Language.PYTHON,
-            timeout_seconds=2,  # Host adds 8s margin for grace period
+            timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
         assert "IGNORING_SIGTERM" in result.stdout
@@ -460,7 +462,7 @@ wait
         result = await scheduler.run(
             code=code,
             language=Language.RAW,
-            timeout_seconds=2,  # Host adds 8s margin for grace period
+            timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
         assert "NESTED_SPAWNED" in result.stdout
@@ -482,12 +484,12 @@ wait
         result = await scheduler.run(
             code=code,
             language=Language.RAW,
-            timeout_seconds=2,  # Host adds 8s margin for grace period
+            timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
         assert "SPAWNED" in result.stdout
         # Key assertion: completes in reasonable time (not 60s)
-        # Expected: ~2s timeout + ~5s grace = ~7s (host allows 2+8=10s)
+        # Expected: ~2s timeout + ~5s grace = ~7s (host backstop is 2+10=12s)
         assert result.timing is not None
         assert result.timing.execute_ms < 12000  # < 12s (much less than 60s)
 
@@ -517,7 +519,7 @@ time.sleep(60)  # Wait to be killed
 
         assert "SPAWNED" in result.stdout
         # Should complete after timeout + grace, not after 60s
-        # Expected: ~15s timeout + ~5s grace = ~20s (host allows 15+8=23s)
+        # Expected: ~15s timeout + ~5s grace = ~20s (host backstop is 15+10=25s)
         assert result.timing is not None
         assert result.timing.execute_ms < 25000  # < 25s (much less than 60s)
 

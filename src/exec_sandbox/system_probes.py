@@ -5,6 +5,7 @@ Async probes use a shared cache container to avoid global statements.
 """
 
 import asyncio
+import contextlib
 import os
 import platform
 import re
@@ -41,6 +42,7 @@ __all__ = [
     "probe_cache",
     "probe_io_uring_support",
     "probe_qemu_accelerators",
+    "probe_qemu_sandbox_support",
     "probe_qemu_version",
     "probe_unshare_support",
     "raise_fd_limit",
@@ -426,6 +428,7 @@ class ProbeCache:
         "io_uring",
         "kvm",
         "qemu_accels",
+        "qemu_sandbox",
         "qemu_version",
         "tsc_deadline",
         "unshare",
@@ -436,6 +439,7 @@ class ProbeCache:
         self.io_uring: bool | None = _NOT_CACHED
         self.kvm: bool | None = _NOT_CACHED
         self.qemu_accels: set[str] | None = _NOT_CACHED  # Accelerators available in QEMU binary
+        self.qemu_sandbox: bool | None = _NOT_CACHED  # QEMU compiled with CONFIG_SECCOMP
         self.qemu_version: tuple[int, int, int] | None = _NOT_CACHED  # QEMU semver (major, minor, patch)
         self.tsc_deadline: bool | None = _NOT_CACHED
         self.unshare: bool | None = _NOT_CACHED
@@ -464,6 +468,7 @@ class ProbeCache:
             self.io_uring = _NOT_CACHED
             self.kvm = _NOT_CACHED
             self.qemu_accels = _NOT_CACHED
+            self.qemu_sandbox = _NOT_CACHED
             self.qemu_version = _NOT_CACHED
             self.tsc_deadline = _NOT_CACHED
             self.unshare = _NOT_CACHED
@@ -518,6 +523,12 @@ def _async_cached_probe(
     return decorator
 
 
+def _qemu_system_binary() -> str:
+    """Return the QEMU system emulator binary name for the host architecture."""
+    arch = detect_host_arch()
+    return "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+
+
 @_async_cached_probe("qemu_accels")
 async def probe_qemu_accelerators() -> set[str]:
     """Probe QEMU binary for available accelerators (cached).
@@ -537,9 +548,7 @@ async def probe_qemu_accelerators() -> set[str]:
     Returns:
         Set of available accelerator names (e.g., {"tcg", "kvm"} or {"tcg", "hvf"})
     """
-    # Determine QEMU binary based on host architecture
-    arch = detect_host_arch()
-    qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+    qemu_bin = _qemu_system_binary()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -598,9 +607,7 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
 
     Tuples compare naturally as semver: (9, 2, 0) >= (9, 2, 0) works correctly.
     """
-    # Determine QEMU binary based on host architecture
-    arch = detect_host_arch()
-    qemu_bin = "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+    qemu_bin = _qemu_system_binary()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -634,6 +641,81 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
     except (OSError, TimeoutError) as e:
         logger.warning("QEMU version probe failed", extra={"error": str(e)})
         return None
+
+
+@_async_cached_probe("qemu_sandbox")
+async def probe_qemu_sandbox_support() -> bool:
+    """Probe whether the QEMU binary supports -sandbox (seccomp) (cached).
+
+    The -sandbox option requires CONFIG_SECCOMP at QEMU compile time.  When
+    absent, QEMU rejects the flag at CLI parsing with "There is no option
+    group 'sandbox'" (util/qemu-config.c:find_list).  Neither ``-sandbox help``
+    nor ``--help`` output can reliably detect this (both produce false results).
+
+    Strategy: launch ``qemu-system-xxx -machine none -sandbox on -S -display none``
+    and inspect the outcome.  If -sandbox is unrecognised QEMU exits immediately
+    with code 1.  If it is recognised QEMU starts paused (``-S``), so we
+    treat a short timeout as "supported" and terminate the process.
+
+    Returns:
+        True if -sandbox is available, False otherwise.
+    """
+    # Seccomp is a Linux kernel feature — skip the subprocess on macOS.
+    if detect_host_os() != HostOS.LINUX:
+        return False
+
+    qemu_bin = _qemu_system_binary()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            qemu_bin,
+            "-machine",
+            "none",
+            "-sandbox",
+            "on",
+            "-S",
+            "-display",
+            "none",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
+        except TimeoutError:
+            # QEMU didn't exit → -sandbox was accepted, it's paused on -S.
+            # Guard kill() for the race where the process exits between the
+            # timeout firing and our kill signal.
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+            logger.debug("QEMU sandbox probe: supported (process stayed alive)")
+            return True
+
+        # QEMU exited on its own.
+        if proc.returncode == 0:
+            logger.debug("QEMU sandbox probe: supported (clean exit)")
+            return True
+
+        stderr_text = stderr.decode(errors="replace").strip() if stderr else ""
+        if "option group" in stderr_text or "sandbox" in stderr_text.lower():
+            logger.info(
+                "QEMU sandbox not available (compiled without CONFIG_SECCOMP)",
+                extra={"qemu_bin": qemu_bin, "stderr": stderr_text[:200]},
+            )
+        else:
+            logger.warning(
+                "QEMU sandbox probe failed",
+                extra={"qemu_bin": qemu_bin, "returncode": proc.returncode, "stderr": stderr_text[:200]},
+            )
+        return False
+
+    except FileNotFoundError:
+        logger.warning("QEMU binary not found for sandbox probe", extra={"qemu_bin": qemu_bin})
+        return False
+    except OSError as e:
+        logger.warning("QEMU sandbox probe failed", extra={"qemu_bin": qemu_bin, "error": str(e)})
+        return False
 
 
 @_async_cached_probe("kvm")

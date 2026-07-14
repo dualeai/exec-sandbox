@@ -11,8 +11,10 @@ import asyncio
 from typing import TYPE_CHECKING, Literal, overload
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.process_registry import register_process
+from exec_sandbox.process_registry import register_process, unregister_process
+from exec_sandbox.resource_cleanup import cleanup_process
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -26,6 +28,7 @@ async def start_managed_process(
     *,
     pass_fds: tuple[int, ...] = (),
     preexec_fn: Callable[[], None] | None = None,
+    on_process_started: Callable[[ProcessWrapper], None] | None = None,
 ) -> ProcessWrapper:
     """Launch a subprocess with standard piping and process registration.
 
@@ -50,18 +53,101 @@ async def start_managed_process(
         OSError: Process spawn failed.
         FileNotFoundError: Binary not found.
     """
-    proc = ProcessWrapper(
-        await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            preexec_fn=preexec_fn,
-            pass_fds=pass_fds,
+
+    async def spawn_and_publish() -> ProcessWrapper:
+        proc = ProcessWrapper(
+            await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                preexec_fn=preexec_fn,
+                pass_fds=pass_fds,
+            )
         )
-    )
-    register_process(proc)
-    return proc
+        # Registration and the optional domain owner callback are synchronous:
+        # no cancellation point can separate child creation from publication.
+        register_process(proc)
+        if on_process_started is not None:
+            on_process_started(proc)
+        return proc
+
+    # asyncio.create_subprocess_exec() can create the OS child just before its
+    # awaiting caller is cancelled. Keep spawn in a manager-owned task and defer
+    # cancellation propagation until that task has either published the child or
+    # failed. This prevents an unregistered/unowned process at the await boundary.
+    spawn_task = asyncio.create_task(spawn_and_publish())
+    try:
+        return await asyncio.shield(spawn_task)
+    except asyncio.CancelledError:
+        await await_settled(spawn_task)
+        if not spawn_task.cancelled():
+            # Retrieve any spawn exception so the manager-owned task cannot emit
+            # an unhandled-task warning; the caller's cancellation stays primary.
+            spawn_task.exception()
+        raise
+
+
+async def communicate_managed_process(
+    cmd: Sequence[str],
+    *,
+    process_name: str,
+    context_id: str,
+    pass_fds: tuple[int, ...] = (),
+    preexec_fn: Callable[[], None] | None = None,
+) -> tuple[int | None, bytes, bytes]:
+    """Run a transient child with cancellation-safe kill/reap/unregistration."""
+
+    async def run_and_cleanup() -> tuple[int | None, bytes, bytes]:
+        owned_process: ProcessWrapper | None = None
+
+        def publish_process(proc: ProcessWrapper) -> None:
+            nonlocal owned_process
+            owned_process = proc
+
+        try:
+            proc = await start_managed_process(
+                cmd,
+                pass_fds=pass_fds,
+                preexec_fn=preexec_fn,
+                on_process_started=publish_process,
+            )
+            stdout, stderr = await proc.communicate()
+            return proc.returncode, stdout, stderr
+        finally:
+            if owned_process is not None:
+                delay = 1.0
+                while True:
+                    try:
+                        if await cleanup_process(owned_process, process_name, context_id):
+                            unregister_process(owned_process)
+                            break
+                    except asyncio.CancelledError:
+                        # Cancellation may land after communicate() completed
+                        # but while cleanup is in flight. Keep this owned task
+                        # alive until death is confirmed; the outer waiter still
+                        # propagates its own cancellation.
+                        continue
+                    except Exception:
+                        logger.exception(
+                            "Transient process cleanup attempt failed",
+                            extra={"process_name": process_name, "context_id": context_id},
+                        )
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        continue
+                    delay = min(delay * 2, 30.0)
+
+    operation = asyncio.create_task(run_and_cleanup())
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        operation.cancel()
+        await await_settled(operation)
+        if not operation.cancelled():
+            operation.exception()
+        raise
 
 
 async def drain_subprocess_output(

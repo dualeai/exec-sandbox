@@ -21,6 +21,8 @@ pub(crate) struct ReplState {
 pub(crate) async fn spawn_repl(
     language: Language,
 ) -> Result<ReplState, Box<dyn std::error::Error>> {
+    crate::oom_guard::ensure_vm_usable()?;
+
     // Lazily write REPL wrapper scripts on first spawn
     crate::init::ensure_repl_wrappers();
 

@@ -28,7 +28,25 @@ PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-buil
 UV_VERSION="${UV_VERSION:-0.9.24}"  # From astral-sh/uv
 CLOUDPICKLE_VERSION="${CLOUDPICKLE_VERSION:-3.1.2}"  # From https://github.com/cloudpipe/cloudpickle/releases
 BUN_VERSION="${BUN_VERSION:-1.3.10}"
-ALPINE_VERSION="${ALPINE_VERSION:?ALPINE_VERSION must be set (exported by root Makefile)}"
+# Alpine version + digest come from versions.lock only (mutable tags can be
+# re-pushed; the digest pins the exact manifest). Fail-closed: a missing lock
+# or missing keys abort the build — no unpinned fallback.
+# Note: pins the base image only — `apk add` still fetches live packages,
+# which apk itself signature-verifies.
+LOCK_FILE="$REPO_ROOT/versions.lock"
+if [ ! -f "$LOCK_FILE" ]; then
+    echo "ERROR: versions.lock not found — run './scripts/upgrade-versions.sh' (or restore it from git)" >&2
+    exit 1
+fi
+ALPINE_VERSION=$(grep -m1 '^ALPINE_VERSION=' "$LOCK_FILE" | cut -d= -f2- || true)
+ALPINE_IMAGE_DIGEST=$(grep -m1 '^ALPINE_IMAGE_DIGEST=' "$LOCK_FILE" | cut -d= -f2- || true)
+if [ -z "$ALPINE_VERSION" ] || [ -z "$ALPINE_IMAGE_DIGEST" ]; then
+    echo "ERROR: versions.lock lacks ALPINE_VERSION/ALPINE_IMAGE_DIGEST — run 'make upgrade'" >&2
+    exit 1
+fi
+# Tag is decorative once @digest is present (Docker resolves by digest only);
+# kept for human readability.
+ALPINE_IMAGE_REF="alpine:${ALPINE_VERSION}@${ALPINE_IMAGE_DIGEST}"
 
 # Buildx cache configuration (for CI)
 # Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
@@ -88,7 +106,8 @@ create_alpine_rootfs() {
     local packages="$*"
 
     # Use docker buildx with BuildKit cache mounts for APK
-    # This caches both APK index and downloaded packages across builds
+    # This caches the APK index across builds (packages still re-download —
+    # apk only caches packages when /etc/apk/cache exists in the image)
     # Scope includes arch and Alpine version to avoid cache collisions
     local platform_arch="${docker_platform#linux/}"  # Extract arch from linux/arm64 -> arm64
     local cache_scope="alpine-${ALPINE_VERSION}-${platform_arch}"
@@ -100,13 +119,13 @@ create_alpine_rootfs() {
         --platform "$docker_platform" \
         --output "type=local,dest=$rootfs_dir" \
         --build-arg PACKAGES="$packages" \
-        --build-arg ALPINE_VERSION="$ALPINE_VERSION" \
+        --build-arg ALPINE_IMAGE_REF="$ALPINE_IMAGE_REF" \
         "${cache_args[@]+"${cache_args[@]}"}" \
         --quiet \
         -f - . <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
-ARG ALPINE_VERSION
-FROM alpine:${ALPINE_VERSION}
+ARG ALPINE_IMAGE_REF
+FROM ${ALPINE_IMAGE_REF}
 ARG PACKAGES
 # Use BuildKit cache mount for APK (persists across builds)
 RUN --mount=type=cache,target=/var/cache/apk,sharing=locked \
@@ -129,6 +148,7 @@ compute_rootfs_hash() {
         echo "variant=$variant"
         echo "arch=$target_arch"
         echo "alpine=$ALPINE_VERSION"
+        echo "alpine_digest=$ALPINE_IMAGE_DIGEST"
 
         # Variant-specific versions
         case "$variant" in
@@ -340,10 +360,11 @@ create_python_rootfs() {
     docker run --rm \
         -v "$rootfs_dir:/rootfs" \
         --platform "$docker_platform" \
-        "alpine:${ALPINE_VERSION}" \
+        "$ALPINE_IMAGE_REF" \
         /rootfs/usr/local/bin/uv pip install \
             --python /rootfs/opt/python/bin/python3 \
             --target /rootfs/usr/lib/python3/site-packages \
+            --exclude-newer "7 days" \
             "cloudpickle==$CLOUDPICKLE_VERSION"
 
     # Verify jemalloc is installed at the expected path (LD_PRELOAD in guest-agent)
@@ -357,7 +378,7 @@ create_python_rootfs() {
     docker run --rm \
         -v "$rootfs_dir:/rootfs" \
         --platform "$docker_platform" \
-        "alpine:${ALPINE_VERSION}" \
+        "$ALPINE_IMAGE_REF" \
         /rootfs/opt/python/bin/python3 -m compileall \
             --invalidation-mode unchecked-hash \
             -q \
@@ -574,7 +595,7 @@ build_qcow2() {
             #   -m4096:lz4hc,12  Compress inode metadata in 4KB pclusters with LZ4HC.
             #                    Reduces image size and improves readdir throughput ~2.5x
             #                    (926K → 2.38M files/sec in upstream benchmarks). Requires
-            #                    kernel 6.17+ (our kernel is 6.18).
+            #                    kernel 6.17+ (see KERNEL_VERSION in versions.lock).
             #                    Ref: https://www.phoronix.com/news/Linux-6.17-EROFS
             #
             # Size optimizations:

@@ -70,13 +70,29 @@ pub(crate) fn wait_for_block_device(path: &str) -> bool {
 }
 
 pub(crate) fn wait_for_virtio_ports() -> bool {
-    // Wait for virtio-ports directory to have entries
-    // Uses any() to stop at first entry (more efficient than count())
+    // A vport entry appears before QEMU publishes its name. Wait for both
+    // agent ports to be named so the one-shot symlink setup cannot miss one.
+    const REQUIRED_NAMES: [&str; 2] = ["org.dualeai.cmd", "org.dualeai.event"];
+
     // Tighter exponential backoff: 0.1+0.2+0.5+1+2+4+8 = 15.8ms max
     poll_backoff(&[100, 200, 500, 1000, 2000, 4000, 8000], || {
-        fs::read_dir("/sys/class/virtio-ports")
-            .map(|mut entries| entries.any(|e| e.is_ok()))
-            .unwrap_or(false)
+        let Ok(entries) = fs::read_dir("/sys/class/virtio-ports") else {
+            return false;
+        };
+        let mut found = [false; REQUIRED_NAMES.len()];
+
+        for entry in entries.flatten() {
+            let Ok(name) = fs::read_to_string(entry.path().join("name")) else {
+                continue;
+            };
+            for (index, required) in REQUIRED_NAMES.iter().enumerate() {
+                if name.trim() == *required {
+                    found[index] = true;
+                }
+            }
+        }
+
+        found.into_iter().all(|ready| ready)
     })
 }
 

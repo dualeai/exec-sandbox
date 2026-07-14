@@ -5,26 +5,15 @@ inputs:
   arch:
     description: Target architecture (x86_64 or aarch64)
     required: true
-  rust-version:
-    description: Rust toolchain version (sourced from Makefile rust_version)
-    required: true
 
 runs:
   using: composite
   steps:
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
+      uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Expose GitHub Actions cache variables
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_CACHE_URL', process.env['ACTIONS_CACHE_URL'] || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env['ACTIONS_RUNTIME_TOKEN'] || '');
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env['ACTIONS_RESULTS_URL'] || '');
+      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
     # Try to restore from latest run on same branch (hash-based caching in build script will skip if unchanged)
     - name: Get latest run ID
@@ -43,7 +32,7 @@ runs:
 
     - name: Download previous build
       if: steps.latest-run.outputs.run_id != ''
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
       with:
         name: guest-agent-${{ inputs.arch == 'x86_64' && 'x64' || 'arm64' }}
         path: images/dist/
@@ -53,8 +42,4 @@ runs:
 
     - name: Build guest-agent
       shell: bash
-      env:
-        RUST_VERSION: ${{ inputs.rust-version }}
-        BUILDX_CACHE_FROM: type=gha,ignore-error=true
-        BUILDX_CACHE_TO: type=gha,mode=max,ignore-error=true
       run: ./scripts/build-guest-agent.sh ${{ inputs.arch }}

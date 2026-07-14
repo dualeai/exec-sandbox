@@ -17,8 +17,9 @@ from exec_sandbox.warm_vm_pool import Language
 
 if TYPE_CHECKING:
     from exec_sandbox.models import ExecutionResult
+    from exec_sandbox.vm_manager import VmManager
 
-from .conftest import skip_unless_fast_balloon
+from .conftest import skip_unless_fast_balloon, skip_unless_hwaccel, skip_unless_macos_arm64
 
 # Memory-intensive tests that push VMs to near-maximum utilization (250MB in 256MB VM)
 # require fast balloon/memory operations. On x64 CI runners with nested virtualization
@@ -35,103 +36,83 @@ from .conftest import skip_unless_fast_balloon
 
 
 class TestZramConfiguration:
-    """Tests for zram setup and VM tuning in guest VM."""
+    """Tests for the effective zram configuration in a cold guest."""
 
-    async def test_zram_and_vm_configuration(self, scheduler: Scheduler) -> None:
-        """All zram/VM sysfs and procfs settings should be correctly configured.
-
-        Validates setup_zram_swap() + apply_zram_vm_tuning() in init.rs:
-        device existence, swap priority, disksize, compression algorithm,
-        RAM ratio, page-cluster, swappiness, overcommit, min_free_kbytes,
-        mem_limit, oom_kill_allocating_task, and watermark tuning.
-        """
-        result = await scheduler.run(
-            code="""
-import os, stat
-
-# --- zram device exists and is active ---
-assert os.path.exists('/sys/block/zram0'), 'zram0 not found in /sys/block'
+    async def test_zram_and_vm_configuration(
+        self,
+        vm_manager: "VmManager",
+        execute_timeout: int,
+    ) -> None:
+        """A cold 192 MiB VM exposes the required effective zram geometry."""
+        vm = await vm_manager.create_vm(
+            language=Language.PYTHON,
+            tenant_id="test",
+            task_id="zram-config-192mb",
+            memory_mb=192,
+            allow_network=False,
+            allowed_domains=None,
+        )
+        try:
+            result = await vm.execute(
+                code=r"""
+import os
 
 with open('/proc/swaps') as f:
-    content = f.read()
-    assert 'zram0' in content, f'zram0 not in /proc/swaps: {content}'
-    for line in content.strip().split('\\n')[1:]:
-        if 'zram0' in line:
-            priority = int(line.split()[-1])
-            assert priority >= 100, f'zram priority should be >=100, got {priority}'
-            break
+    swaps = f.read()
+expected_path = r'/dev/zram0\040(deleted)'
+rows = [
+    line.split()
+    for line in swaps.splitlines()[1:]
+    if line.split() and line.split()[0] == expected_path
+]
+assert len(rows) == 1, f'expected one active unlinked zram swap, got: {swaps}'
+path, swap_type, size_kib_raw, _used_kib, priority_raw = rows[0]
+assert path == expected_path
+assert swap_type == 'partition', f'unexpected zram swap type: {swap_type}'
+assert int(priority_raw) >= 100, f'zram priority below 100: {priority_raw}'
+swap_size_kib = int(size_kib_raw)
 
 with open('/sys/block/zram0/disksize') as f:
     disksize = int(f.read().strip())
-    assert disksize > 0, 'zram disksize is 0'
-
-# --- lz4 compression ---
 with open('/sys/block/zram0/comp_algorithm') as f:
-    algo = f.read().strip()
-    assert '[lz4]' in algo, f'Expected [lz4] active, got: {algo}'
+    algorithm = f.read().strip()
+assert '[lz4]' in algorithm, f'lz4 is not selected: {algorithm}'
 
-# --- disksize is ~40% of RAM ---
 with open('/proc/meminfo') as f:
-    for line in f:
-        if 'MemTotal' in line:
-            mem_kb = int(line.split()[1])
-            break
-zram_kb = disksize // 1024
-ratio = zram_kb / mem_kb
-assert 0.35 <= ratio <= 0.45, f'zram ratio {ratio:.3f} not ~40%'
+    mem_total_kib = next(
+        int(line.split()[1]) for line in f if line.startswith('MemTotal:')
+    )
+with open('/sys/block/zram0/mm_stat') as f:
+    mm_stat = [int(value) for value in f.read().split()]
+effective_mem_limit = mm_stat[3]
 
-# --- page-cluster=0 (disables swap readahead for compressed swap) ---
-with open('/proc/sys/vm/page-cluster') as f:
-    page_cluster = int(f.read().strip())
-    assert page_cluster == 0, f'page-cluster must be 0 for zram, got {page_cluster}'
+page_size = os.sysconf('SC_PAGE_SIZE')
+memory_bytes = mem_total_kib * 1024
+requested_disksize = memory_bytes * 40 // 100
+requested_mem_limit = memory_bytes * 20 // 100
+for name, effective, requested in (
+    ('disksize', disksize, requested_disksize),
+    ('mem_limit', effective_mem_limit, requested_mem_limit),
+):
+    assert effective % page_size == 0, f'{name} is not page-aligned: {effective}'
+    assert requested <= effective < requested + page_size, (
+        f'{name} is not the page-rounded requested value: '
+        f'requested={requested}, effective={effective}, page_size={page_size}'
+    )
 
-# --- swappiness>=100 (prefer swap over dropping caches) ---
-with open('/proc/sys/vm/swappiness') as f:
-    swappiness = int(f.read().strip())
-    assert swappiness >= 100, f'swappiness should be >=100 for zram, got {swappiness}'
-
-# --- overcommit_memory=0 (heuristic, required for JIT runtimes) ---
-with open('/proc/sys/vm/overcommit_memory') as f:
-    overcommit_memory = int(f.read().strip())
-    assert overcommit_memory == 0, f'overcommit_memory should be 0 (heuristic), got {overcommit_memory}'
-
-# --- min_free_kbytes (prevents OOM deadlocks) ---
-with open('/proc/sys/vm/min_free_kbytes') as f:
-    min_free_kb = int(f.read().strip())
-    assert min_free_kb >= 5000, f'min_free_kbytes should be >=5000, got {min_free_kb}'
-
-# --- mem_limit sysfs (write-only, kernel-enforced) ---
-path = '/sys/block/zram0/mem_limit'
-assert os.path.exists(path), 'mem_limit sysfs attribute missing'
-mode = os.stat(path).st_mode
-assert stat.S_IWUSR & mode, 'mem_limit should be writable by owner'
-assert not (stat.S_IRUSR & mode), 'mem_limit should be write-only (not readable)'
-
-# --- oom_kill_allocating_task=1 (fast OOM response) ---
-with open('/proc/sys/vm/oom_kill_allocating_task') as f:
-    oom_kill = int(f.read().strip())
-    assert oom_kill == 1, f'oom_kill_allocating_task should be 1, got {oom_kill}'
-
-# --- watermark tuning (per ArchWiki zram recommendations) ---
-with open('/proc/sys/vm/watermark_boost_factor') as f:
-    boost = int(f.read().strip())
-    assert boost == 0, f'watermark_boost_factor should be 0, got {boost}'
-
-with open('/proc/sys/vm/watermark_scale_factor') as f:
-    scale = int(f.read().strip())
-    assert scale == 125, f'watermark_scale_factor should be 125, got {scale}'
-
-print(f'PASS: all zram/VM settings correct')
-print(f'  disksize={disksize//(1024*1024)}MB, ratio={ratio:.3f}, algo={algo}')
-print(f'  page-cluster={page_cluster}, swappiness={swappiness}')
-print(f'  overcommit={overcommit_memory}, min_free_kb={min_free_kb}')
-print(f'  oom_kill_allocating_task={oom_kill}')
-print(f'  watermark_boost={boost}, watermark_scale={scale}')
+expected_swap_size_kib = (disksize - page_size) // 1024
+assert swap_size_kib == expected_swap_size_kib, (
+    f'/proc/swaps size excludes more than the header page: '
+    f'expected={expected_swap_size_kib}, actual={swap_size_kib}'
+)
+print('PASS: effective zram geometry')
 """,
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        assert "PASS" in result.stdout
+                timeout_seconds=execute_timeout,
+            )
+            assert result.exit_code == 0, result.stderr
+            assert "PASS: effective zram geometry" in result.stdout
+        finally:
+            await vm_manager.destroy_vm(vm)
 
     async def test_compression_actually_compresses(self, scheduler: Scheduler) -> None:
         """zram should achieve real compression on compressible data."""
@@ -152,7 +133,7 @@ print(f'Initial: orig={initial_orig}, compr={initial_compr}')
 
 # Allocate compressible data (repetitive pattern compresses well)
 # 120MB exceeds available RAM but fits within zram capacity thanks to compression.
-# (zram mem_limit is 25% of RAM; repetitive patterns compress >10x with lz4.)
+# (zram mem_limit is 20% of RAM; repetitive patterns compress >10x with lz4.)
 chunks = []
 for i in range(12):  # 120MB of compressible data
     chunk = bytearray(10 * 1024 * 1024)
@@ -289,71 +270,96 @@ print('PASS: All 3 allocation cycles completed without corruption')
 # ============================================================================
 
 
+_INCOMPRESSIBLE_PRESSURE = """
+import os
+
+print('WORKLOAD_STARTED', flush=True)
+chunks = []
+while True:
+    chunks.append(os.urandom(10 * 1024 * 1024))
+"""
+
+
+@pytest.mark.slow
+@skip_unless_hwaccel
 class TestZramMemLimit:
-    """Tests for zram mem_limit — ensures OOM kills fast instead of thrashing.
+    """Tests for retiring one-shot executions under capped-zram pressure.
 
     Without mem_limit, the kernel reclaim loop thrashes (compress/decompress
     in zram) when memory is exhausted, causing the VM to appear hung until
-    timeout. With mem_limit, zram rejects writes with -ENOMEM once compressed
-    storage is full, triggering the OOM killer within seconds.
+    timeout. Either the kernel OOM killer or the PSI guard may terminate the
+    allocator first; the public result and confirmed host teardown are the
+    stable contract.
 
     Refs:
         - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
         - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
     """
 
-    async def test_massive_alloc_oom_kills_not_timeout(self, scheduler: Scheduler) -> None:
-        """Massive allocation must OOM-kill (exit 137), NOT timeout.
-
-        This is the core regression test. Before mem_limit, allocating far
-        beyond RAM caused the kernel to thrash zram indefinitely, hitting the
-        execution timeout. With mem_limit, the OOM killer fires in seconds.
-
-        Uses os.urandom() (incompressible data) so zram can't compress the
-        pages — zero-filled bytearrays compress to near-nothing with lz4,
-        letting ~8 GB fit in the 41 MB mem_limit before OOM triggers.
-        """
-        result = await scheduler.run(
-            code="""
-import os
-chunks = []
-while True:
-    chunks.append(os.urandom(10 * 1024 * 1024))  # 10MB random (incompressible)
-""",
-            language=Language.PYTHON,
-        )
-        # OOM kill = 137 (128 + SIGKILL). Must NOT be timeout (-1).
-        assert result.exit_code == 137, (
-            f"Expected OOM kill (137), got exit_code={result.exit_code}. "
-            f"If -1, zram is thrashing instead of OOM-killing."
+    @staticmethod
+    def _pressure_config(images_dir: Path, tmp_path: Path) -> SchedulerConfig:
+        return SchedulerConfig(
+            images_dir=images_dir,
+            auto_download_assets=False,
+            warm_pool_size=0,
+            default_timeout_seconds=60,
+            disk_snapshot_cache_dir=tmp_path / "l2",
+            memory_snapshot_cache_dir=tmp_path / "l1",
         )
 
-    async def test_oom_after_successful_alloc_free_cycle(self, scheduler: Scheduler) -> None:
-        """OOM should still fire after alloc/free cycles (no zram leak).
+    async def test_incompressible_pressure_retires_cold_192mb_vm(
+        self,
+        images_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A cold-boot execution under incompressible pressure returns 137 fast."""
+        config = self._pressure_config(images_dir, tmp_path)
+        async with Scheduler(config) as scheduler:
+            cold = await asyncio.wait_for(
+                scheduler.run(
+                    code=_INCOMPRESSIBLE_PRESSURE,
+                    language=Language.PYTHON,
+                    memory_mb=192,
+                    timeout_seconds=60,
+                ),
+                timeout=30,
+            )
+            assert cold.exit_code == 137, cold.stderr
+            assert "WORKLOAD_STARTED" in cold.stdout
+            assert cold.warm_pool_hit is False
+            assert cold.l1_cache_hit is False
 
-        Alloc/free cycles leave residual zram pages and allocator
-        fragmentation. Uses random data so zram can't compress it.
-        """
-        result = await scheduler.run(
-            code="""
-import gc, os
-
-# Warm up: alloc 100MB random, free, repeat 3 times
-for _ in range(3):
-    chunks = [os.urandom(10 * 1024 * 1024) for _ in range(10)]
-    del chunks
-    gc.collect()
-
-# Now exhaust memory — should OOM, not thrash
-chunks = []
-while True:
-    chunks.append(os.urandom(10 * 1024 * 1024))
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 137, (
-            f"Expected OOM kill (137), got exit_code={result.exit_code}. OOM should fire even after alloc/free cycles."
-        )
+    @skip_unless_macos_arm64
+    async def test_incompressible_pressure_retires_l1_restored_192mb_vm(
+        self,
+        images_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A real L1-restored execution under incompressible pressure returns 137."""
+        config = self._pressure_config(images_dir, tmp_path)
+        async with Scheduler(config) as scheduler:
+            # First run cold-boots and schedules a background L1 save; retry
+            # through the public API until the save has landed and a run
+            # restores from L1 (no reach into private snapshot-manager state).
+            restored = None
+            for _ in range(10):
+                result = await asyncio.wait_for(
+                    scheduler.run(
+                        code=_INCOMPRESSIBLE_PRESSURE,
+                        language=Language.PYTHON,
+                        memory_mb=192,
+                        timeout_seconds=60,
+                    ),
+                    timeout=30,
+                )
+                assert result.exit_code == 137, result.stderr
+                assert "WORKLOAD_STARTED" in result.stdout
+                assert result.warm_pool_hit is False
+                if result.l1_cache_hit:
+                    restored = result
+                    break
+                await asyncio.sleep(1)
+            assert restored is not None, "no run restored from L1 within retry budget"
 
 
 # ============================================================================

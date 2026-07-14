@@ -12,7 +12,7 @@ import os
 import shutil
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -315,6 +315,35 @@ class TestOverlayPoolStaleCleanup:
 
 class TestOverlayPoolErrorHandling:
     """Tests for error handling - mocks needed to simulate failures."""
+
+    async def test_cancelled_start_rolls_back_started_daemon(self, tmp_path: Path) -> None:
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        pool = OverlayPool(pool_size=1, pool_dir=tmp_path / "pool")
+        daemon = MagicMock()
+        daemon.start = AsyncMock()
+        daemon.stop = AsyncMock()
+        daemon.started = True
+        creation_entered = asyncio.Event()
+
+        async def blocked_create(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            creation_entered.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch("exec_sandbox.overlay_pool.QemuStorageDaemon", return_value=daemon),
+            patch.object(pool, "_cleanup_stale_pool_dirs", return_value=0),
+            patch.object(pool, "_create_and_enqueue", side_effect=blocked_create),
+        ):
+            startup = asyncio.create_task(pool.start([Path("/tmp/base.qcow2")]))
+            await creation_entered.wait()
+            startup.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+
+        daemon.stop.assert_awaited_once_with()
+        assert pool._daemon is None
+        assert pool._started is False
 
     @pytest.fixture
     def mock_pool(self, tmp_path: Path) -> types.SimpleNamespace:
@@ -886,7 +915,7 @@ class TestOverlayPoolIntegration:
 
         await pool.stop()
 
-    async def test_vm_boots_with_pooled_overlay(self, vm_manager, vm_settings) -> None:
+    async def test_vm_boots_with_pooled_overlay(self, vm_manager, vm_settings, execute_timeout) -> None:
         """Full integration: VM boots successfully with pooled overlay."""
         from exec_sandbox.models import Language
 
@@ -898,12 +927,14 @@ class TestOverlayPoolIntegration:
         )
 
         try:
-            result = await vm.execute("print('hello from pool')", timeout_seconds=30)
+            result = await vm.execute("print('hello from pool')", timeout_seconds=execute_timeout)
             assert "hello from pool" in result.stdout
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def test_fallback_to_ondemand_when_pool_exhausted(self, make_vm_settings, tmp_path: Path) -> None:
+    async def test_fallback_to_ondemand_when_pool_exhausted(
+        self, make_vm_settings, execute_timeout, tmp_path: Path
+    ) -> None:
         """VM still boots when pool is empty (fallback to _create_overlay)."""
         from exec_sandbox.models import Language
         from exec_sandbox.vm_manager import VmManager
@@ -926,7 +957,7 @@ class TestOverlayPoolIntegration:
 
             # All VMs should work
             for vm in vms:
-                result = await vm.execute("print(1)", timeout_seconds=30)
+                result = await vm.execute("print(1)", timeout_seconds=execute_timeout)
                 assert "1" in result.stdout
 
             for vm in vms:

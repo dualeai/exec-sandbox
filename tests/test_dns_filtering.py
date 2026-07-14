@@ -31,15 +31,15 @@ OUTBOUND_FILTER_NORMAL_CASES = [
     # Explicitly allowed domain should connect
     pytest.param(
         Language.PYTHON,
-        ["httpbin.org"],
-        "httpbin.org",
+        ["cp.cloudflare.com"],
+        "cp.cloudflare.com",
         True,
         id="normal-allowed-connects",
     ),
     # Non-allowed domain should be blocked
     pytest.param(
         Language.PYTHON,
-        ["httpbin.org"],
+        ["cp.cloudflare.com"],
         "google.com",
         False,
         id="normal-blocked-fails",
@@ -47,8 +47,8 @@ OUTBOUND_FILTER_NORMAL_CASES = [
     # Multiple allowed domains
     pytest.param(
         Language.PYTHON,
-        ["google.com", "pypi.org", "httpbin.org"],
-        "httpbin.org",
+        ["google.com", "pypi.org", "cp.cloudflare.com"],
+        "cp.cloudflare.com",
         True,
         id="normal-multiple-domains-third-connects",
     ),
@@ -107,16 +107,16 @@ OUTBOUND_FILTER_EDGE_CASES = [
     # Parent domain NOT allowed when only subdomain specified
     pytest.param(
         Language.PYTHON,
-        ["sub.httpbin.org"],
-        "httpbin.org",
+        ["sub.cp.cloudflare.com"],
+        "cp.cloudflare.com",
         False,
         id="edge-parent-blocked-when-subdomain-allowed",
     ),
     # Sibling subdomain NOT allowed
     pytest.param(
         Language.PYTHON,
-        ["api.httpbin.org"],
-        "www.httpbin.org",
+        ["api.cp.cloudflare.com"],
+        "www.cp.cloudflare.com",
         False,
         id="edge-sibling-subdomain-blocked",
     ),
@@ -141,7 +141,7 @@ OUTBOUND_FILTER_SECURITY_CASES = [
     # and the TLS SNI is an IP literal, not a domain pattern. Should be blocked.
     pytest.param(
         Language.PYTHON,
-        ["httpbin.org"],
+        ["cp.cloudflare.com"],
         "93.184.216.34",
         False,
         id="security-direct-ip-no-dns-blocked",
@@ -369,12 +369,22 @@ except OSError as e:
 # RAW language tests (using curl instead of Python)
 # =============================================================================
 async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
-    """Test outbound filtering with RAW language using curl."""
+    """Test outbound filtering with RAW language using curl.
+
+    Uses a planet-scale connectivity-check (NCSI) endpoint — no rate limits,
+    no bot challenges, no scheduled downtime. No ``-f``: any HTTP response
+    proves the path works end-to-end (DNS, SNI filter, TLS).
+    """
     result = await scheduler.run(
-        code=f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} --retry {NET_RETRY_COUNT} --retry-connrefused https://httpbin.org/ && echo 'SUCCESS' || echo 'FAILED'",
+        code=(
+            f"timeout {NET_SAFETY_TIMEOUT_S} curl -s"
+            f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
+            f" --retry {NET_RETRY_COUNT} --retry-connrefused -o /dev/null"
+            " https://cp.cloudflare.com/generate_204 && echo 'SUCCESS' || echo 'FAILED'"
+        ),
         language=Language.RAW,
         allow_network=True,
-        allowed_domains=["httpbin.org"],
+        allowed_domains=["cp.cloudflare.com"],
     )
 
     assert "SUCCESS" in result.stdout, (
@@ -388,7 +398,7 @@ async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
         code=f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
         language=Language.RAW,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # google.com not allowed
+        allowed_domains=["cp.cloudflare.com"],  # google.com not allowed
     )
 
     assert "BLOCKED" in result.stdout, (
@@ -439,7 +449,7 @@ async def test_outbound_filtering_plain_http_blocked(scheduler: Scheduler) -> No
         + f"""
 import urllib.request
 try:
-    with urllib.request.urlopen("http://httpbin.org/", timeout={NET_OP_TIMEOUT_S}) as r:
+    with urllib.request.urlopen("http://cp.cloudflare.com/", timeout={NET_OP_TIMEOUT_S}) as r:
         print(f"STATUS:{{r.status}}")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
@@ -450,7 +460,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # Allowed, but only on TLS
+        allowed_domains=["cp.cloudflare.com"],  # Allowed, but only on TLS
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -484,7 +494,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # google.com NOT allowed
+        allowed_domains=["cp.cloudflare.com"],  # google.com NOT allowed
     )
 
     # DNS should be blocked for non-allowed domains
@@ -505,7 +515,7 @@ async def test_outbound_filtering_dns_works_for_allowed(
         + """
 import socket
 try:
-    ip = socket.gethostbyname("httpbin.org")
+    ip = socket.gethostbyname("cp.cloudflare.com")
     print(f"RESOLVED:{ip}")
 except Exception as e:
     print(f"DNS_FAILED:{type(e).__name__}")
@@ -516,7 +526,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],
+        allowed_domains=["cp.cloudflare.com"],
     )
 
     # Allowed domain should resolve to a real IP
@@ -546,8 +556,8 @@ async def test_outbound_filtering_block_all_outbound(scheduler: Scheduler) -> No
 import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("httpbin.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
+    with socket.create_connection(("cp.cloudflare.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
+        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
             print("CONNECTED")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
@@ -588,8 +598,8 @@ async def test_outbound_filtering_raw_tcp_blocked(scheduler: Scheduler) -> None:
 import socket
 try:
     # Try raw TCP to port 80 (HTTP, no TLS/SNI)
-    sock = socket.create_connection(("httpbin.org", 80), timeout={NET_CONNECT_TIMEOUT_S})
-    sock.sendall(b"GET / HTTP/1.1\\r\\nHost: httpbin.org\\r\\n\\r\\n")
+    sock = socket.create_connection(("cp.cloudflare.com", 80), timeout={NET_CONNECT_TIMEOUT_S})
+    sock.sendall(b"GET / HTTP/1.1\\r\\nHost: cp.cloudflare.com\\r\\n\\r\\n")
     data = sock.recv(1024)
     sock.close()
     print(f"TCP_CONNECTED:{{len(data)}}")
@@ -602,7 +612,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # Allowed, but only TLS
+        allowed_domains=["cp.cloudflare.com"],  # Allowed, but only TLS
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -623,11 +633,11 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_with_sni(
         + f"""
 import socket, ssl
 try:
-    ip = socket.gethostbyname("httpbin.org")
+    ip = socket.gethostbyname("cp.cloudflare.com")
     print(f"RESOLVED:{{ip}}")
     ctx = ssl.create_default_context()
     with socket.create_connection((ip, 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
+        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
             print("CONNECTED")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
@@ -638,7 +648,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],
+        allowed_domains=["cp.cloudflare.com"],
     )
 
     assert "RESOLVED:" in result.stdout, (
@@ -663,11 +673,11 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_no_sni(
         + f"""
 import socket
 try:
-    ip = socket.gethostbyname("httpbin.org")
+    ip = socket.gethostbyname("cp.cloudflare.com")
     print(f"RESOLVED:{{ip}}")
     # Raw TCP to resolved IP on port 80 — no TLS, no SNI
     sock = socket.create_connection((ip, 80), timeout={NET_CONNECT_TIMEOUT_S})
-    sock.sendall(b"GET / HTTP/1.1\\r\\nHost: httpbin.org\\r\\n\\r\\n")
+    sock.sendall(b"GET / HTTP/1.1\\r\\nHost: cp.cloudflare.com\\r\\n\\r\\n")
     data = sock.recv(1024)
     sock.close()
     print(f"TCP_CONNECTED:{{len(data)}}")
@@ -680,7 +690,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],
+        allowed_domains=["cp.cloudflare.com"],
     )
 
     assert "RESOLVED:" in result.stdout, (
@@ -696,19 +706,19 @@ async def test_outbound_filtering_dns_resolve_then_ip_connect_wrong_sni(
 ) -> None:
     """DNS-resolve allowed domain, then TLS-connect to its IP with a DIFFERENT SNI.
 
-    SNI spoofing attempt: resolve httpbin.org → IP, then connect to that IP
+    SNI spoofing attempt: resolve cp.cloudflare.com → IP, then connect to that IP
     but claim to be pypi.org in the TLS SNI. The proxy cross-checks SNI
-    against DNS — pypi.org doesn't resolve to httpbin.org's IP, so it's blocked.
+    against DNS — pypi.org doesn't resolve to cp.cloudflare.com's IP, so it's blocked.
     """
     code = (
         PY_SAFETY
         + f"""
 import socket, ssl
 try:
-    ip = socket.gethostbyname("httpbin.org")
+    ip = socket.gethostbyname("cp.cloudflare.com")
     print(f"RESOLVED:{{ip}}")
     ctx = ssl.create_default_context()
-    # Connect to httpbin.org's IP but set SNI to pypi.org (not allowed domain)
+    # Connect to cp.cloudflare.com's IP but set SNI to pypi.org (not allowed domain)
     with socket.create_connection((ip, 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
         with ctx.wrap_socket(sock, server_hostname="pypi.org") as ssock:
             print("CONNECTED")
@@ -721,11 +731,11 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # pypi.org NOT in allowlist
+        allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT in allowlist
     )
 
     assert "BLOCKED:" in result.stdout, (
-        f"TLS with mismatched SNI (pypi.org) to httpbin.org IP should be blocked.\n"
+        f"TLS with mismatched SNI (pypi.org) to cp.cloudflare.com IP should be blocked.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
@@ -735,8 +745,10 @@ async def test_outbound_filtering_sni_spoof_allowed_domain_wrong_ip(
 ) -> None:
     """TLS-connect to a non-allowed IP while spoofing an allowed domain as SNI.
 
-    The proxy's DNS cross-check should catch this: the SNI says "httpbin.org"
-    but the destination IP (1.1.1.1) doesn't match httpbin.org's DNS records.
+    The proxy's DNS cross-check should catch this: the SNI says "cp.cloudflare.com"
+    but the destination IP (8.8.8.8) doesn't match cp.cloudflare.com's DNS records.
+    (8.8.8.8 — a non-Cloudflare anycast IP — so the SNI's provider can never
+    legitimately serve it.)
     """
     code = (
         PY_SAFETY
@@ -744,9 +756,9 @@ async def test_outbound_filtering_sni_spoof_allowed_domain_wrong_ip(
 import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    # Connect to Cloudflare DNS IP but claim to be httpbin.org
-    with socket.create_connection(("1.1.1.1", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
+    # Connect to Google DNS IP but claim to be cp.cloudflare.com
+    with socket.create_connection(("8.8.8.8", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
+        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
             print("CONNECTED")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
@@ -757,7 +769,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],
+        allowed_domains=["cp.cloudflare.com"],
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -773,7 +785,7 @@ async def test_outbound_filtering_many_domains(scheduler: Scheduler) -> None:
     """Test with many allowed domains (stress test pattern count)."""
     # 50 domains in allowlist
     many_domains = [f"domain{i}.com" for i in range(50)]
-    many_domains.append("httpbin.org")  # Add a real one
+    many_domains.append("cp.cloudflare.com")  # Add a real one
 
     code = (
         PY_SAFETY
@@ -781,8 +793,8 @@ async def test_outbound_filtering_many_domains(scheduler: Scheduler) -> None:
 import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("httpbin.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
+    with socket.create_connection(("cp.cloudflare.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
+        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
             print("CONNECTED")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
@@ -848,7 +860,7 @@ except Exception as e:
         code=code,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # .local not in allowlist
+        allowed_domains=["cp.cloudflare.com"],  # .local not in allowlist
     )
 
     # .local should be blocked (not in allowlist, and doesn't resolve via DNS)
@@ -866,8 +878,8 @@ async def test_outbound_filtering_single_domain_only(scheduler: Scheduler) -> No
 import socket, ssl
 try:
     ctx = ssl.create_default_context()
-    with socket.create_connection(("httpbin.org", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
-        with ctx.wrap_socket(sock, server_hostname="httpbin.org") as ssock:
+    with socket.create_connection(("cp.cloudflare.com", 443), timeout={NET_CONNECT_TIMEOUT_S}) as sock:
+        with ctx.wrap_socket(sock, server_hostname="cp.cloudflare.com") as ssock:
             print("CONNECTED")
 except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
@@ -877,7 +889,7 @@ except Exception as e:
         code=code_allowed,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],
+        allowed_domains=["cp.cloudflare.com"],
     )
     assert "CONNECTED" in result.stdout, (
         f"Allowed domain should connect.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -901,8 +913,8 @@ except Exception as e:
         code=code_blocked,
         language=Language.PYTHON,
         allow_network=True,
-        allowed_domains=["httpbin.org"],  # pypi.org NOT allowed
+        allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT allowed
     )
     assert "BLOCKED:" in result.stdout, (
-        f"pypi.org should be blocked when only httpbin.org allowed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        f"pypi.org should be blocked when only cp.cloudflare.com allowed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )

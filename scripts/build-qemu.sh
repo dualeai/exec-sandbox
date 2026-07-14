@@ -11,17 +11,29 @@
 # when ccache is in PATH. In CI, ~/.ccache is persisted via actions/cache.
 #
 # Usage:
-#   QEMU_VERSION=10.2.1 ./scripts/build-qemu.sh          # auto-detect arch
-#   QEMU_VERSION=10.2.1 ./scripts/build-qemu.sh x86_64   # explicit arch
-#   QEMU_VERSION=10.2.1 ./scripts/build-qemu.sh aarch64  # explicit arch
+#   ./scripts/build-qemu.sh            # version + sha256 pin from versions.lock
+#   ./scripts/build-qemu.sh x86_64     # explicit arch
 #
 # Environment:
-#   QEMU_VERSION   Required. Version to build (e.g. 10.2.1).
 #   QEMU_PREFIX    Build output prefix. Default: ~/qemu-build
 
 set -euo pipefail
 
-QEMU_VERSION="${QEMU_VERSION:?QEMU_VERSION must be set}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCK_FILE="$SCRIPT_DIR/../versions.lock"
+
+# Fail-closed pinning: versions.lock is the single source of truth — version
+# and sha256 come from it, nowhere else; a sha256 mismatch aborts the build.
+if [ ! -f "$LOCK_FILE" ]; then
+    echo "ERROR: versions.lock not found — run './scripts/upgrade-versions.sh' (or restore it from git)" >&2
+    exit 1
+fi
+QEMU_VERSION=$(grep -m1 '^QEMU_VERSION=' "$LOCK_FILE" | cut -d= -f2- || true)
+QEMU_SHA256=$(grep -m1 '^QEMU_SHA256=' "$LOCK_FILE" | cut -d= -f2- || true)
+if [ -z "$QEMU_VERSION" ] || [ -z "$QEMU_SHA256" ]; then
+    echo "ERROR: versions.lock lacks QEMU_VERSION/QEMU_SHA256 — run 'make upgrade'" >&2
+    exit 1
+fi
 QEMU_PREFIX="${QEMU_PREFIX:-$HOME/qemu-build}"
 
 # ============================================================================
@@ -71,7 +83,14 @@ WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 cd "$WORK_DIR"
-curl -fsSL "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" | tar xJ
+# Download to a file and verify against the sha256 pinned in versions.lock
+# before extracting (QEMU publishes GPG .sig only, no sha256 lists — the pin
+# is computed at `make upgrade` time). Mismatch aborts the build.
+TARBALL="qemu-${QEMU_VERSION}.tar.xz"
+curl -fsSL --retry 3 -o "$TARBALL" "https://download.qemu.org/$TARBALL"
+echo "$QEMU_SHA256  $TARBALL" | sha256sum -c - \
+    || { echo "ERROR: $TARBALL does not match QEMU_SHA256 in versions.lock — retry, or re-pin via 'make upgrade' if QEMU re-released the tarball" >&2; exit 1; }
+tar xJf "$TARBALL"
 cd "qemu-${QEMU_VERSION}"
 
 # --target-list: build only the system emulator for the current host arch.

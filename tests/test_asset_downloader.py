@@ -307,8 +307,9 @@ class TestRetrieve:
         """
         from exec_sandbox.asset_downloader import _verify_hash
 
-        # Create a 4MB file on disk
-        file_size = 4 * 1024 * 1024  # 4MB
+        # Use a 32MB file so the streaming-vs-full-read gap is large enough
+        # to tolerate GC-delay overhead on free-threaded Python (3.14t).
+        file_size = 32 * 1024 * 1024  # 32MB
         large_file = tmp_path / "large.bin"
 
         # Write file in chunks to avoid memory spike during setup
@@ -335,10 +336,15 @@ class TestRetrieve:
 
         assert result is True
 
-        # If streaming is broken, peak memory ≈ file_size (entire file in RAM).
-        # With streaming, peak stays well below half the file size even under
-        # worst-case allocator overhead (3.14t free-threaded + Linux ARM64 64KB
-        # pages ≈ 1.2MB for a 4MB file).
+        # Broken streaming (entire file read at once): peak = file_size
+        # (hashlib.update processes in-place, no copy).
+        # Working streaming on standard CPython: peak = chunk_size
+        # (refcounting frees each chunk immediately on walrus reassignment).
+        # Working streaming on free-threaded Python (3.14t): biased
+        # refcounting defers deallocation of bytes objects handed across
+        # threads (aiofiles worker -> event loop).  Observed ~4MB peak for
+        # a 4MB file (all 64 chunks alive).  A larger file gives more I/O
+        # scheduling points for deferred frees, keeping peak below file_size.
         max_allowed = file_size // 2
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "

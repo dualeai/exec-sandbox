@@ -23,9 +23,9 @@ import os
 import re
 import shlex
 from collections import deque
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,6 +41,7 @@ from tenacity import (
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.admission import ResourceAdmissionController, ResourceReservation
+from exec_sandbox.aio_utils import await_cancellation_safe as _await_cancellation_safe
 from exec_sandbox.exceptions import (
     VmBootTimeoutError,
     VmConfigError,
@@ -79,14 +80,36 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
     probe_io_uring_support,
+    probe_qemu_sandbox_support,
     probe_qemu_version,
     probe_unshare_support,
 )
 from exec_sandbox.validation import validate_kernel_initramfs
 from exec_sandbox.vm_types import AccelType, VmState
-from exec_sandbox.vm_working_directory import VmWorkingDirectory
+from exec_sandbox.vm_working_directory import VmWorkingDirectory, drain_workdir_cleanup_tasks
 
 logger = get_logger(__name__)
+LOG_DRAIN_AFTER_PROCESS_EXIT_TIMEOUT_SECONDS = 1.0
+
+
+async def _finish_process_log_drain(task: asyncio.Task[None] | None) -> None:
+    """Let a dead process's pipe reader consume EOF before cancelling it."""
+    if task is None:
+        return
+    if task.done():
+        # The done callback owns exception reporting. Retrieving the result here
+        # is unnecessary and could turn a logging failure into cleanup failure.
+        return
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=LOG_DRAIN_AFTER_PROCESS_EXIT_TIMEOUT_SECONDS,
+    )
+    if task not in done:
+        # A confirmed-dead process should close both pipes promptly. Keep cleanup
+        # bounded if an unexpected inherited descriptor prevents EOF.
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
 
 # Security: Identifier validation pattern
 # Only alphanumeric, underscore, and hyphen allowed to prevent:
@@ -134,6 +157,24 @@ class _VmInfra:
     use_tcg: bool
     expected_uid: int
     channel: GuestChannel
+    # The pre-launch owner published during setup; launch/boot logic reuses it
+    # instead of re-publishing.
+    pending: "_PendingLaunch"
+
+
+@dataclass
+class _PendingLaunch:
+    """Immediate owner for pre-QemuVM processes and dependent resources."""
+
+    vm_id: str
+    reservation: ResourceReservation
+    workdir: VmWorkingDirectory
+    cgroup_path: Path | None
+    qemu_proc: ProcessWrapper | None = None
+    gvproxy_proc: ProcessWrapper | None = None
+    qemu_log_task: asyncio.Task[None] | None = None
+    gvproxy_log_task: asyncio.Task[None] | None = None
+    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class VmManager:
@@ -172,7 +213,14 @@ class VmManager:
         self._initialized = False
 
         self._vms: dict[str, QemuVM] = {}  # vm_id -> VM object
+        self._pending_launches: dict[str, _PendingLaunch] = {}
         self._vms_lock = asyncio.Lock()  # Protect registry access
+        self._failed_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+        self._active_launches = 0
+        self._launches_drained = asyncio.Event()
+        self._launches_drained.set()
+        self._stopping = False
+        self._stop_task: asyncio.Task[None] | None = None
         self._admission = ResourceAdmissionController(
             memory_overcommit_ratio=settings.memory_overcommit_ratio,
             cpu_overcommit_ratio=settings.cpu_overcommit_ratio,
@@ -210,11 +258,12 @@ class VmManager:
 
         # Run all async probes concurrently (they cache their results at module level)
         # This prevents cache stampede when multiple VMs start concurrently
-        accel_type, io_uring_available, unshare_available, qemu_version = await asyncio.gather(
+        accel_type, io_uring_available, unshare_available, qemu_version, _sandbox = await asyncio.gather(
             self._detect_accel_type(),  # Pre-warms HVF/KVM + QEMU accelerator caches
             probe_io_uring_support(),
             probe_unshare_support(),
             probe_qemu_version(),  # Pre-warm QEMU version for netdev reconnect
+            probe_qemu_sandbox_support(),  # Pre-warm seccomp sandbox availability
         )
 
         # Pre-warm TSC deadline (unified function handles arch/OS dispatch)
@@ -258,18 +307,80 @@ class VmManager:
         """Stop VmManager and cleanup resources (tracked VMs, admission, overlay pool).
 
         Destroys all tracked VMs (including checked-out ones that were never
-        returned to a pool) before tearing down admission and overlay services.
+        returned to a pool) before tearing down overlay services. Concurrent
+        callers share one manager-owned stop task. Cancelling one waiter does
+        not cancel process cleanup; normal return proves all tracked QEMU and
+        gvproxy processes have confirmed death.
         """
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop_impl())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop_impl(self) -> None:
+        """Close launch ingress, drain owners, then tear down shared services."""
+        # Synchronous flag flip: single event loop, no await between check
+        # sites, so no lock is needed (see _launch_operation).
+        self._stopping = True
+
+        # Reject and wake admission waiters before taking a closed snapshot.
+        # Existing reservations remain releasable by their current owners.
+        await self._admission.stop()
+
+        # A launch that linearized before STOPPING either publishes a tracked VM
+        # or cleans up its partial resources before decrementing this counter.
+        await self._launches_drained.wait()
+
         # Snapshot the registry under lock, then destroy outside lock
         # (destroy_vm acquires _vms_lock internally to remove each entry).
         async with self._vms_lock:
             vms_to_destroy = list(self._vms.values())
+        pending_to_destroy = list(self._pending_launches.values())
         await asyncio.gather(
             *(self.destroy_vm(vm) for vm in vms_to_destroy),
+            *(self._cleanup_pending_launch(pending) for pending in pending_to_destroy),
             return_exceptions=True,
         )
-        await self._admission.stop()
+        # A successful stop is a proof that no tracked VM process remains.
+        # Shield independently owned reapers so cancellation of any stop waiter
+        # cannot turn an unconfirmed process into an unowned orphan.
+        while True:
+            async with self._vms_lock:
+                remaining_vms = list(self._vms.values())
+            remaining_pending = list(self._pending_launches.values())
+            for vm in remaining_vms:
+                self._schedule_failed_cleanup_retry(vm)
+            for pending in remaining_pending:
+                self._schedule_failed_pending_cleanup_retry(pending)
+
+            # Scheduling above either reused a live task or synchronously
+            # created a fresh (never-done) one under the same key, so a nonempty
+            # snapshot always yields nonempty retry_tasks — no empty-tasks arm.
+            retry_tasks = [task for task in self._failed_cleanup_tasks.values() if not task.done()]
+            if not retry_tasks:
+                break
+            await asyncio.shield(asyncio.gather(*retry_tasks, return_exceptions=True))
+        await drain_workdir_cleanup_tasks()
         await self._overlay_pool.stop()
+
+    @asynccontextmanager
+    async def _launch_operation(self) -> AsyncGenerator[None]:
+        """Linearize launch/restore work against manager shutdown.
+
+        The check-and-increment is synchronous (no await), so on a single
+        event loop it cannot interleave with _stop_impl's flag flip — plain
+        attributes suffice, no lock.
+        """
+        if self._stopping:
+            raise VmPermanentError("VmManager is stopping and cannot launch new VMs")
+        if self._active_launches == 0:
+            self._launches_drained.clear()
+        self._active_launches += 1
+        try:
+            yield
+        finally:
+            self._active_launches -= 1
+            if self._active_launches == 0:
+                self._launches_drained.set()
 
     async def __aenter__(self) -> "VmManager":
         """Enter async context manager, starting the manager."""
@@ -295,7 +406,8 @@ class VmManager:
         passed to create_vm/restore_vm via their ``reservation`` parameter.
 
         Contract:
-        - On exception: reservation is released automatically.
+        - On exception before process launch, reservation is released automatically.
+          If launched-process death is unconfirmed, the VM/reaper retains it.
         - On normal exit: the caller MUST have created a VM that took
           ownership (``vm.resource_reservation = reservation``).
           destroy_vm() releases it later. Exiting normally without
@@ -311,23 +423,57 @@ class VmManager:
                 if vm is None:
                     vm = await vm_manager.create_vm(..., reservation=reservation)
         """
-        accel_type = await self._detect_accel_type()
-        use_tcg = accel_type == AccelType.TCG
-        reservation = await self._admission.acquire(
-            vm_id=vm_id,
-            memory_mb=memory_mb,
-            cpu_cores=constants.DEFAULT_VM_CPU_CORES,
-            timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
-            use_tcg=use_tcg,
+        async with self._launch_operation():
+            accel_type = await self._detect_accel_type()
+            use_tcg = accel_type == AccelType.TCG
+            reservation = await self._admission.acquire(
+                vm_id=vm_id,
+                memory_mb=memory_mb,
+                cpu_cores=constants.DEFAULT_VM_CPU_CORES,
+                timeout=constants.RESOURCE_ADMISSION_TIMEOUT_SECONDS,
+                use_tcg=use_tcg,
+            )
+            try:
+                yield reservation
+            except BaseException:
+                # The caller will never receive any process published under
+                # this reservation. Destroy each such owner; unconfirmed death
+                # remains registry/reaper-owned.
+                await self._cleanup_reservation_owners(reservation, release_admission=True)
+                if not await self._reservation_is_retained(reservation):
+                    await _await_cancellation_safe(self._admission.release(reservation))
+                raise
+
+    async def _reservation_is_retained(self, reservation: ResourceReservation) -> bool:
+        """Whether a VM or pending launch still owns a reservation."""
+        async with self._vms_lock:
+            retained_by_vm = any(
+                vm.holds_admission_slot and vm.resource_reservation is reservation for vm in self._vms.values()
+            )
+        return retained_by_vm or any(pending.reservation is reservation for pending in self._pending_launches.values())
+
+    async def _cleanup_reservation_owners(
+        self,
+        reservation: ResourceReservation,
+        *,
+        release_admission: bool,
+    ) -> None:
+        """Destroy every resource owner published under one reservation."""
+        async with self._vms_lock:
+            retained_vms = [
+                vm for vm in self._vms.values() if vm.holds_admission_slot and vm.resource_reservation is reservation
+            ]
+        retained_pending = [
+            pending for pending in self._pending_launches.values() if pending.reservation is reservation
+        ]
+        await asyncio.gather(
+            *(self.destroy_vm(vm, _release_admission=release_admission) for vm in retained_vms),
+            *(
+                self._cleanup_pending_launch(pending, _release_admission=release_admission)
+                for pending in retained_pending
+            ),
+            return_exceptions=True,
         )
-        try:
-            yield reservation
-        except BaseException:
-            # Neither restore_vm nor create_vm consumed the reservation — release it.
-            # If a VM was successfully created, it owns the reservation and
-            # destroy_vm will release it. The double-release is safe (idempotent).
-            await self._admission.release(reservation)
-            raise
 
     @asynccontextmanager
     async def ephemeral_vm(
@@ -379,10 +525,28 @@ class VmManager:
             mem_path=mem_path,
             mem_path_share=mem_path_share,
         )
+        primary_error: BaseException | None = None
         try:
             yield vm
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            await self.destroy_vm(vm)
+            try:
+                cleanup_confirmed = await self.destroy_vm(vm)
+            except BaseException:
+                if primary_error is None:
+                    raise
+                logger.exception(
+                    "Ephemeral VM cleanup failed while preserving primary error",
+                    extra={"vm_id": vm.vm_id},
+                )
+            else:
+                if not cleanup_confirmed and primary_error is None:
+                    raise VmPermanentError(
+                        f"Ephemeral VM resource cleanup was not confirmed for {vm.vm_id}",
+                        context={"vm_id": vm.vm_id, "operation": "ephemeral_vm_cleanup"},
+                    )
 
     async def create_vm(
         self,
@@ -439,42 +603,49 @@ class VmManager:
             VmPermanentError: VM creation failed (not retryable)
             asyncio.TimeoutError: VM boot timeout after all retries
         """
-        if reservation is not None:
-            return await self._create_vm_with_reservation(
-                reservation,
-                language=language,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                allow_network=allow_network,
-                allowed_domains=allowed_domains,
-                direct_write_target=direct_write_target,
-                expose_ports=expose_ports,
-                on_boot_log=on_boot_log,
-                snapshot_drive=snapshot_drive,
-                retry_profile=retry_profile,
-                mem_path=mem_path,
-                mem_path_share=mem_path_share,
-            )
+        async with self._launch_operation():
+            if reservation is not None:
+                try:
+                    return await self._create_vm_with_reservation(
+                        reservation,
+                        language=language,
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        allow_network=allow_network,
+                        allowed_domains=allowed_domains,
+                        direct_write_target=direct_write_target,
+                        expose_ports=expose_ports,
+                        on_boot_log=on_boot_log,
+                        snapshot_drive=snapshot_drive,
+                        retry_profile=retry_profile,
+                        mem_path=mem_path,
+                        mem_path_share=mem_path_share,
+                    )
+                except BaseException:
+                    await self._cleanup_reservation_owners(reservation, release_admission=False)
+                    raise
 
-        async with self.reservation_context(
-            vm_id=f"{tenant_id}-{task_id}",
-            memory_mb=memory_mb,
-        ) as res:
-            return await self._create_vm_with_reservation(
-                res,
-                language=language,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                allow_network=allow_network,
-                allowed_domains=allowed_domains,
-                direct_write_target=direct_write_target,
-                expose_ports=expose_ports,
-                on_boot_log=on_boot_log,
-                snapshot_drive=snapshot_drive,
-                retry_profile=retry_profile,
-                mem_path=mem_path,
-                mem_path_share=mem_path_share,
-            )
+            # reservation_context.__aexit__ owns owner cleanup and admission
+            # release on failure — no second sweep here.
+            async with self.reservation_context(
+                vm_id=f"{tenant_id}-{task_id}",
+                memory_mb=memory_mb,
+            ) as res:
+                return await self._create_vm_with_reservation(
+                    res,
+                    language=language,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    allow_network=allow_network,
+                    allowed_domains=allowed_domains,
+                    direct_write_target=direct_write_target,
+                    expose_ports=expose_ports,
+                    on_boot_log=on_boot_log,
+                    snapshot_drive=snapshot_drive,
+                    retry_profile=retry_profile,
+                    mem_path=mem_path,
+                    mem_path_share=mem_path_share,
+                )
 
     async def _create_vm_with_reservation(
         self,
@@ -521,12 +692,9 @@ class VmManager:
                     mem_path=mem_path,
                     mem_path_share=mem_path_share,
                 )
-                # Track retry count (attempt.retry_state.attempt_number is 1-indexed)
+                # Track retry count (attempt.retry_state.attempt_number is 1-indexed).
+                # Admission ownership was already claimed inside _launch_qemu_vm.
                 vm.timing.boot_retries = attempt.retry_state.attempt_number - 1
-                # Mark VM as holding admission slot (released in destroy_vm)
-                vm.holds_admission_slot = True
-                # Store resource reservation on VM for release in destroy_vm
-                vm.resource_reservation = reservation
                 return vm
 
         # Unreachable: AsyncRetrying either returns or raises
@@ -555,8 +723,8 @@ class VmManager:
             reservation: Pre-acquired admission reservation with effective limits
 
         Returns:
-            _VmInfra with all pre-launch state. Caller must handle cleanup
-            via _cleanup_failed_launch on failure.
+            _VmInfra with all pre-launch state. Once returned, the caller must
+            publish a _PendingLaunch owner before another fallible await.
 
         Raises:
             VmDependencyError: Missing kernel, images, or qemu-vm user
@@ -568,64 +736,86 @@ class VmManager:
 
         vm_id = f"{tenant_id}-{task_id}-{uuid4()}"
         workdir = await VmWorkingDirectory.create(vm_id)
-        base_image = self.get_base_image(language).resolve()
-        accel_type = await self._detect_accel_type()
-        use_tcg = accel_type == AccelType.TCG
+        # Publish an owner before any overlay/cgroup/permission await. The real
+        # cgroup path is deterministic, so even cancellation during setup can
+        # remove a partially-created hierarchy.
+        expected_cgroup_path = Path(f"{cgroup.CGROUP_V2_BASE_PATH}/{cgroup.CGROUP_APP_NAMESPACE}/{tenant_id}/{vm_id}")
+        pending = self._publish_pending_resources(vm_id, reservation, workdir, expected_cgroup_path)
 
-        # Overlay + cgroup in parallel (overlay doesn't depend on reservation;
-        # cgroup needs reservation limits but both can run concurrently).
-        # Permissions must wait for overlay to exist, so it runs after.
-        overlay_result, cgroup_result = await asyncio.gather(
-            self._overlay_pool.acquire(base_image, workdir.overlay_image),
-            cgroup.setup_cgroup(
-                vm_id,
-                tenant_id,
-                cgroup_memory_mb=int(reservation.memory_mb),
-                cgroup_cpu_cores=reservation.cpu_cores,
-            ),
-            return_exceptions=True,
-        )
-        if isinstance(overlay_result, BaseException):
-            if isinstance(overlay_result, (QemuImgError, QemuStorageDaemonError)):
-                raise VmOverlayError(str(overlay_result)) from overlay_result
-            raise overlay_result
-        if isinstance(cgroup_result, BaseException):
-            raise cgroup_result
-        cgroup_path: Path | None = cgroup_result
+        try:
+            base_image = self.get_base_image(language).resolve()
+            accel_type = await self._detect_accel_type()
+            use_tcg = accel_type == AccelType.TCG
 
-        # Permissions need the overlay file to exist (changes ownership/mode)
-        workdir.use_qemu_vm_user = await self._apply_overlay_permissions(base_image, workdir.overlay_image)
+            # Overlay + cgroup in parallel (overlay doesn't depend on reservation;
+            # cgroup needs reservation limits but both can run concurrently).
+            # Permissions must wait for overlay to exist, so it runs after.
+            overlay_result, cgroup_result = await asyncio.gather(
+                self._overlay_pool.acquire(base_image, workdir.overlay_image),
+                cgroup.setup_cgroup(
+                    vm_id,
+                    tenant_id,
+                    cgroup_memory_mb=int(reservation.memory_mb),
+                    cgroup_cpu_cores=reservation.cpu_cores,
+                ),
+                return_exceptions=True,
+            )
+            if not isinstance(cgroup_result, BaseException):
+                pending.cgroup_path = cgroup_result
+            if isinstance(overlay_result, BaseException):
+                if isinstance(overlay_result, (QemuImgError, QemuStorageDaemonError)):
+                    raise VmOverlayError(str(overlay_result)) from overlay_result
+                raise overlay_result
+            if isinstance(cgroup_result, BaseException):
+                raise cgroup_result
+            cgroup_path: Path | None = cgroup_result
 
-        # Socket cleanup + channel
-        for socket_path in [workdir.cmd_socket, workdir.event_socket, str(workdir.qmp_socket)]:
-            with suppress(OSError):
-                await aiofiles.os.remove(socket_path)
+            # Permissions need the overlay file to exist (changes ownership/mode)
+            workdir.use_qemu_vm_user = await self._apply_overlay_permissions(base_image, workdir.overlay_image)
 
-        if workdir.use_qemu_vm_user:
-            expected_uid = get_qemu_vm_uid()
-            if expected_uid is None:
-                raise VmDependencyError(
-                    "qemu-vm user required for socket authentication but not found",
-                    {"use_qemu_vm_user": True},
-                )
-        else:
-            expected_uid = os.getuid()
+            # Socket cleanup + channel
+            for socket_path in [workdir.cmd_socket, workdir.event_socket, str(workdir.qmp_socket)]:
+                with suppress(OSError):
+                    await aiofiles.os.remove(socket_path)
 
-        channel: GuestChannel = DualPortChannel(workdir.cmd_socket, workdir.event_socket, expected_uid=expected_uid)
+            if workdir.use_qemu_vm_user:
+                expected_uid = get_qemu_vm_uid()
+                if expected_uid is None:
+                    raise VmDependencyError(
+                        "qemu-vm user required for socket authentication but not found",
+                        {"use_qemu_vm_user": True},
+                    )
+            else:
+                expected_uid = os.getuid()
 
-        return _VmInfra(
-            vm_id=vm_id,
-            workdir=workdir,
-            base_image=base_image,
-            cgroup_path=cgroup_path,
-            use_tcg=use_tcg,
-            expected_uid=expected_uid,
-            channel=channel,
-        )
+            channel: GuestChannel = DualPortChannel(
+                workdir.cmd_socket,
+                workdir.event_socket,
+                expected_uid=expected_uid,
+            )
+
+            return _VmInfra(
+                vm_id=vm_id,
+                workdir=workdir,
+                base_image=base_image,
+                cgroup_path=cgroup_path,
+                use_tcg=use_tcg,
+                expected_uid=expected_uid,
+                channel=channel,
+                pending=pending,
+            )
+        except BaseException as error:
+            if not await self._cleanup_failed_owner(vm_id):
+                raise VmPermanentError(
+                    f"VM infrastructure cleanup was not confirmed for {vm_id}",
+                    context={"vm_id": vm_id, "operation": "infrastructure_cleanup"},
+                ) from error
+            raise
 
     async def _start_gvproxy_for_vm(
         self,
         infra: _VmInfra,
+        pending: _PendingLaunch,
         language: Language,
         allow_network: bool,
         allowed_domains: list[str] | None,
@@ -657,6 +847,13 @@ class VmManager:
             },
         )
 
+        def record_process(proc: ProcessWrapper, log_task: asyncio.Task[None] | None) -> None:
+            pending.gvproxy_proc = proc
+            if log_task is not None:
+                pending.gvproxy_log_task = log_task
+
+        # record_process publishes proc + log_task to `pending` before any
+        # cancellation point inside start_gvproxy; no post-return re-publish.
         gvproxy_proc, gvproxy_log_task = await start_gvproxy(
             infra.vm_id,
             effective_allowed_domains,
@@ -664,6 +861,7 @@ class VmManager:
             infra.workdir,
             expose_ports=expose_ports,
             block_outbound=is_mode1,
+            on_process_started=record_process,
         )
         await cgroup.attach_if_available(infra.cgroup_path, gvproxy_proc.pid)
         gvproxy_start_ms = round((asyncio.get_running_loop().time() - gvproxy_start_time) * 1000)
@@ -672,6 +870,7 @@ class VmManager:
     async def _launch_qemu_vm(
         self,
         infra: _VmInfra,
+        pending: _PendingLaunch,
         qemu_cmd: list[str],
         language: Language,
         reservation: ResourceReservation,
@@ -685,8 +884,8 @@ class VmManager:
         Handles ulimit wrapping, subprocess fork, cgroup attach, output drain,
         QemuVM creation, and registry insertion.
 
-        Returns VM in BOOTING state. On failure, caller must clean up via
-        _cleanup_failed_launch.
+        Returns VM in BOOTING state. On failure, caller must clean up whichever
+        owner is published in _pending_launches or _vms.
 
         Raises:
             VmDependencyError: QEMU binary not found
@@ -699,12 +898,14 @@ class VmManager:
             def _set_umask_007() -> None:
                 os.umask(0o007)
 
+            # The callback publishes qemu_proc to `pending` synchronously inside
+            # the owned spawn task, before any cancellation point — no re-publish.
             qemu_proc = await start_managed_process(
                 qemu_cmd,
                 preexec_fn=_set_umask_007 if infra.workdir.use_qemu_vm_user else None,
                 pass_fds=pass_fds,
+                on_process_started=lambda proc: setattr(pending, "qemu_proc", proc),
             )
-            await cgroup.attach_if_available(infra.cgroup_path, qemu_proc.pid)
         except (OSError, FileNotFoundError) as e:
             raise VmDependencyError(
                 f"Failed to launch QEMU: {e}",
@@ -735,6 +936,7 @@ class VmManager:
             )
         )
         qemu_log_task.add_done_callback(log_task_exception)
+        pending.qemu_log_task = qemu_log_task
 
         vm = QemuVM(
             infra.vm_id,
@@ -747,41 +949,134 @@ class VmManager:
             gvproxy_proc,
             qemu_log_task,
             gvproxy_log_task,
+            release_callback=self.destroy_vm,
         )
 
-        async with self._vms_lock:
-            self._vms[vm.vm_id] = vm
+        # Process launch transfers admission ownership immediately, not only
+        # after guest readiness. A boot/restore failure can still leave a live
+        # QEMU process whose reservation must remain held until confirmed death.
+        vm.holds_admission_slot = True
+        vm.resource_reservation = reservation
 
+        # The event loop cannot interleave these synchronous dictionary writes:
+        # ownership transfers atomically from the pre-launch record to QemuVM
+        # before any post-spawn fallible await.
+        self._vms[vm.vm_id] = vm
+        self._pending_launches.pop(vm.vm_id, None)
+
+        await cgroup.attach_if_available(infra.cgroup_path, qemu_proc.pid)
         await vm.transition_state(VmState.BOOTING)
         return vm
 
-    async def _cleanup_failed_launch(
+    def _publish_pending_resources(
         self,
         vm_id: str,
-        qemu_proc: ProcessWrapper | None = None,
-        qemu_log_task: asyncio.Task[None] | None = None,
-        gvproxy_proc: ProcessWrapper | None = None,
-        workdir: VmWorkingDirectory | None = None,
-        cgroup_path: Path | None = None,
-    ) -> None:
-        """Clean up after failed VM launch: cancel drains, unregister, cleanup resources."""
-        if qemu_log_task is not None and not qemu_log_task.done():
-            qemu_log_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await qemu_log_task
+        reservation: ResourceReservation,
+        workdir: VmWorkingDirectory,
+        cgroup_path: Path | None,
+    ) -> _PendingLaunch:
+        """Publish the single pre-QemuVM owner for one launch attempt.
 
-        async with self._vms_lock:
-            self._vms.pop(vm_id, None)
-
-        await self._force_cleanup_all_resources(
+        Called once per attempt from _setup_vm_infra, which mints a fresh
+        uuid4-suffixed vm_id, so the key is always new — no refine path.
+        """
+        pending = _PendingLaunch(
             vm_id=vm_id,
-            qemu_proc=qemu_proc,
-            gvproxy_proc=gvproxy_proc,
+            reservation=reservation,
             workdir=workdir,
             cgroup_path=cgroup_path,
         )
+        self._pending_launches[vm_id] = pending
+        return pending
 
-    async def _create_vm_impl(
+    async def _cleanup_failed_owner(self, vm_id: str) -> bool:
+        """Clean a failed attempt without consuming its caller-owned reservation."""
+        async with self._vms_lock:
+            vm = self._vms.get(vm_id)
+        if vm is not None:
+            return await self.destroy_vm(vm, _release_admission=False)
+        pending = self._pending_launches.get(vm_id)
+        if pending is None:
+            return True
+        return await self._cleanup_pending_launch(pending, _release_admission=False)
+
+    async def _cleanup_pending_launch(
+        self,
+        pending: _PendingLaunch,
+        *,
+        _schedule_retry: bool = True,
+        _release_admission: bool = True,
+    ) -> bool:
+        """Confirm pre-VM process death before releasing launch ownership."""
+        try:
+            async with pending.cleanup_lock:
+                cleanup_results = await self._force_cleanup_all_resources(
+                    vm_id=pending.vm_id,
+                    qemu_proc=pending.qemu_proc,
+                    gvproxy_proc=pending.gvproxy_proc,
+                    workdir=pending.workdir,
+                    cgroup_path=pending.cgroup_path,
+                )
+                processes_destroyed = (
+                    cleanup_results.get("qemu") is True
+                    and cleanup_results.get("gvproxy", pending.gvproxy_proc is None) is True
+                )
+                await asyncio.gather(
+                    *(
+                        _finish_process_log_drain(task)
+                        for resource, task in (
+                            ("qemu", pending.qemu_log_task),
+                            ("gvproxy", pending.gvproxy_log_task),
+                        )
+                        if cleanup_results.get(
+                            resource,
+                            resource == "gvproxy" and pending.gvproxy_proc is None,
+                        )
+                        is True
+                    )
+                )
+                owner_cleaned = processes_destroyed and all(
+                    cleanup_results.get(resource) is True for resource in ("workdir", "cgroup")
+                )
+
+        except asyncio.CancelledError:
+            self._pending_launches[pending.vm_id] = pending
+            if _schedule_retry:
+                self._schedule_failed_pending_cleanup_retry(pending)
+            raise
+        except Exception:
+            self._pending_launches[pending.vm_id] = pending
+            if _schedule_retry:
+                self._schedule_failed_pending_cleanup_retry(pending)
+            raise
+
+        if owner_cleaned:
+
+            async def commit_cleanup() -> None:
+                # Keep the owner published until reservation release completes.
+                if _release_admission:
+                    await self._admission.release(pending.reservation)
+                if self._pending_launches.get(pending.vm_id) is pending:
+                    self._pending_launches.pop(pending.vm_id, None)
+
+            try:
+                await _await_cancellation_safe(commit_cleanup())
+            except asyncio.CancelledError:
+                # commit_cleanup completed before cancellation was propagated.
+                raise
+            except Exception:
+                self._pending_launches[pending.vm_id] = pending
+                if _schedule_retry:
+                    self._schedule_failed_pending_cleanup_retry(pending)
+                raise
+            return True
+
+        self._pending_launches[pending.vm_id] = pending
+        if _schedule_retry:
+            self._schedule_failed_pending_cleanup_retry(pending)
+        return False
+
+    async def _create_vm_impl(  # noqa: PLR0915
         self,
         language: Language,
         tenant_id: str,
@@ -836,45 +1131,68 @@ class VmManager:
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
         infra = await self._setup_vm_infra(language, tenant_id, task_id, reservation)
         setup_complete_time = asyncio.get_running_loop().time()
+        pending = infra.pending
 
         # Grant qemu-vm access to extra drives (snapshot creation target or read-only snapshot).
         # _setup_vm_infra only handles overlay/base images; extra drives need separate permissions.
-        if infra.workdir.use_qemu_vm_user and direct_write_target:
-            await grant_qemu_vm_file_access(direct_write_target, writable=True)
-        elif infra.workdir.use_qemu_vm_user and snapshot_drive:
-            await grant_qemu_vm_file_access(snapshot_drive, writable=False)
+        try:
+            if infra.workdir.use_qemu_vm_user and direct_write_target:
+                await grant_qemu_vm_file_access(direct_write_target, writable=True)
+            elif infra.workdir.use_qemu_vm_user and snapshot_drive:
+                await grant_qemu_vm_file_access(snapshot_drive, writable=False)
 
-        # Phase 2: Build QEMU command (create-specific params — use guest values for QEMU)
-        vdb_path = (
-            str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
-        )
-        qemu_cmd = await build_qemu_cmd(
-            self.settings,
-            self.arch,
-            infra.vm_id,
-            infra.workdir,
-            reservation.guest_memory_mb,
-            reservation.guest_cpu_cores,
-            allow_network,
-            expose_ports=expose_ports,
-            direct_write=direct_write_target is not None,
-            debug_boot=on_boot_log is not None,
-            snapshot_drive=vdb_path,
-            mem_path=mem_path,
-            mem_path_share=mem_path_share,
-        )
+            # Phase 2: Build QEMU command (create-specific params — use guest values for QEMU)
+            vdb_path = (
+                str(direct_write_target) if direct_write_target else (str(snapshot_drive) if snapshot_drive else None)
+            )
+            qemu_cmd = await build_qemu_cmd(
+                self.settings,
+                self.arch,
+                infra.vm_id,
+                infra.workdir,
+                reservation.guest_memory_mb,
+                reservation.guest_cpu_cores,
+                allow_network,
+                expose_ports=expose_ports,
+                direct_write=direct_write_target is not None,
+                debug_boot=on_boot_log is not None,
+                snapshot_drive=vdb_path,
+                mem_path=mem_path,
+                mem_path_share=mem_path_share,
+            )
+        except BaseException as error:
+            if not await self._cleanup_failed_owner(infra.vm_id):
+                raise VmPermanentError(
+                    f"Pre-boot resource cleanup was not confirmed for {infra.vm_id}",
+                    context={"vm_id": infra.vm_id, "operation": "pre_boot_resource_cleanup"},
+                ) from error
+            raise
 
         # Phase 3: Start gvproxy BEFORE QEMU
-        gvproxy_proc, gvproxy_log_task, gvproxy_start_ms = await self._start_gvproxy_for_vm(
-            infra, language, allow_network, allowed_domains, expose_ports
-        )
+        try:
+            gvproxy_proc, gvproxy_log_task, gvproxy_start_ms = await self._start_gvproxy_for_vm(
+                infra,
+                pending,
+                language,
+                allow_network,
+                allowed_domains,
+                expose_ports,
+            )
+        except BaseException as error:
+            if not await self._cleanup_failed_owner(infra.vm_id):
+                raise VmPermanentError(
+                    f"Pre-boot process cleanup was not confirmed for {infra.vm_id}",
+                    context={"vm_id": infra.vm_id, "operation": "pre_boot_cleanup"},
+                ) from error
+            raise
 
         # Phase 4: Launch QEMU (shared helper)
-        vm_created = False
+        vm: QemuVM | None = None
         try:
             qemu_start_time = asyncio.get_running_loop().time()
             vm = await self._launch_qemu_vm(
                 infra,
+                pending,
                 qemu_cmd,
                 language,
                 reservation,
@@ -922,8 +1240,6 @@ class VmManager:
                     },
                 )
 
-                await vm.destroy()
-
                 raise VmBootTimeoutError(
                     f"Guest agent not ready after {boot_timeout_seconds}s: {e}. "
                     f"qemu_running={diag.exit_code is None}, "
@@ -955,17 +1271,15 @@ class VmManager:
                 },
             )
 
-            vm_created = True
             return vm
 
-        finally:
-            if not vm_created:
-                await self._cleanup_failed_launch(
-                    infra.vm_id,
-                    gvproxy_proc=gvproxy_proc,
-                    workdir=infra.workdir,
-                    cgroup_path=infra.cgroup_path,
-                )
+        except BaseException as error:
+            if not await self._cleanup_failed_owner(infra.vm_id):
+                raise VmPermanentError(
+                    f"Boot failure cleanup was not confirmed for {infra.vm_id}",
+                    context={"vm_id": infra.vm_id, "operation": "boot_failure_cleanup"},
+                ) from error
+            raise
 
     async def restore_vm(
         self,
@@ -1010,48 +1324,56 @@ class VmManager:
             VmTransientError: Restore failed (retryable)
             VmPermanentError: Configuration error
         """
-        start_time = asyncio.get_running_loop().time()
+        async with self._launch_operation():
+            start_time = asyncio.get_running_loop().time()
 
-        # Early existence check: avoids wasting an admission slot + QEMU launch
-        # if the vmstate was evicted between check_cache() and this call (TOCTOU).
-        if not vmstate_path.exists():
-            raise VmTransientError(
-                f"vmstate file missing (evicted?): {vmstate_path}",
-                context={"vmstate_path": str(vmstate_path)},
-            )
+            # Early existence check: avoids wasting an admission slot + QEMU
+            # launch if the vmstate was evicted between check_cache() and this
+            # call (TOCTOU).
+            if not vmstate_path.exists():
+                raise VmTransientError(
+                    f"vmstate file missing (evicted?): {vmstate_path}",
+                    context={"vmstate_path": str(vmstate_path)},
+                )
 
-        if reservation is not None:
-            return await self._restore_vm_with_reservation(
-                reservation,
-                language=language,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                vmstate_path=vmstate_path,
-                snapshot_drive=snapshot_drive,
-                allow_network=allow_network,
-                allowed_domains=allowed_domains,
-                expose_ports=expose_ports,
-                start_time=start_time,
-            )
+            if reservation is not None:
+                try:
+                    return await self._restore_vm_with_reservation(
+                        reservation,
+                        language=language,
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        vmstate_path=vmstate_path,
+                        snapshot_drive=snapshot_drive,
+                        allow_network=allow_network,
+                        allowed_domains=allowed_domains,
+                        expose_ports=expose_ports,
+                        start_time=start_time,
+                    )
+                except BaseException:
+                    await self._cleanup_reservation_owners(reservation, release_admission=False)
+                    raise
 
-        async with self.reservation_context(
-            vm_id=f"{tenant_id}-{task_id}",
-            memory_mb=memory_mb,
-        ) as res:
-            return await self._restore_vm_with_reservation(
-                res,
-                language=language,
-                tenant_id=tenant_id,
-                task_id=task_id,
-                vmstate_path=vmstate_path,
-                snapshot_drive=snapshot_drive,
-                allow_network=allow_network,
-                allowed_domains=allowed_domains,
-                expose_ports=expose_ports,
-                start_time=start_time,
-            )
+            # reservation_context.__aexit__ owns owner cleanup and admission
+            # release on failure — no second sweep here.
+            async with self.reservation_context(
+                vm_id=f"{tenant_id}-{task_id}",
+                memory_mb=memory_mb,
+            ) as res:
+                return await self._restore_vm_with_reservation(
+                    res,
+                    language=language,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    vmstate_path=vmstate_path,
+                    snapshot_drive=snapshot_drive,
+                    allow_network=allow_network,
+                    allowed_domains=allowed_domains,
+                    expose_ports=expose_ports,
+                    start_time=start_time,
+                )
 
-    async def _restore_vm_with_reservation(  # noqa: PLR0915
+    async def _restore_vm_with_reservation(  # noqa: PLR0912, PLR0915
         self,
         reservation: ResourceReservation,
         *,
@@ -1068,10 +1390,19 @@ class VmManager:
         """Restore VM with an already-acquired reservation. Ownership transfers to VM on success."""
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
         infra = await self._setup_vm_infra(language, tenant_id, task_id, reservation)
+        pending = infra.pending
 
         # Grant qemu-vm read access to snapshot drive if present
-        if infra.workdir.use_qemu_vm_user and snapshot_drive:
-            await grant_qemu_vm_file_access(snapshot_drive, writable=False)
+        try:
+            if infra.workdir.use_qemu_vm_user and snapshot_drive:
+                await grant_qemu_vm_file_access(snapshot_drive, writable=False)
+        except BaseException as error:
+            if not await self._cleanup_failed_owner(infra.vm_id):
+                raise VmPermanentError(
+                    f"Pre-restore resource cleanup was not confirmed for {infra.vm_id}",
+                    context={"vm_id": infra.vm_id, "operation": "pre_restore_file_access_cleanup"},
+                ) from error
+            raise
 
         # Phase 2: Socket activation for QMP (eliminates TOCTOU race)
         # Pre-create the QMP listening socket so QEMU inherits it via pass_fds.
@@ -1083,12 +1414,20 @@ class VmManager:
         qmp_fd: int | None = None
         qemu_vm_uid = get_qemu_vm_uid()
         sudo_wraps_qemu = infra.workdir.use_qemu_vm_user and (qemu_vm_uid is None or os.getuid() != qemu_vm_uid)
-        if not sudo_wraps_qemu:
-            qmp_parent_sock = create_unix_socket(str(infra.workdir.qmp_socket))
-            qmp_fd = qmp_parent_sock.fileno()
+        try:
+            if not sudo_wraps_qemu:
+                qmp_parent_sock = create_unix_socket(str(infra.workdir.qmp_socket))
+                qmp_fd = qmp_parent_sock.fileno()
+        except BaseException as error:
+            if not await self._cleanup_failed_owner(infra.vm_id):
+                raise VmPermanentError(
+                    f"Pre-restore resource cleanup was not confirmed for {infra.vm_id}",
+                    context={"vm_id": infra.vm_id, "operation": "pre_restore_qmp_socket_cleanup"},
+                ) from error
+            raise
 
         # Phase 3-5 wrapped in try so qmp_parent_sock is always cleaned up
-        vm_created = False
+        vm: QemuVM | None = None
         gvproxy_proc: ProcessWrapper | None = None
         gvproxy_log_task: asyncio.Task[None] | None = None
         try:
@@ -1123,12 +1462,18 @@ class VmManager:
 
             # Phase 4: Start gvproxy if network topology requires it
             gvproxy_proc, gvproxy_log_task, _ = await self._start_gvproxy_for_vm(
-                infra, language, allow_network, allowed_domains, expose_ports
+                infra,
+                pending,
+                language,
+                allow_network,
+                allowed_domains,
+                expose_ports,
             )
 
             # Phase 5: Launch QEMU (shared helper) and restore snapshot
             vm = await self._launch_qemu_vm(
                 infra,
+                pending,
                 qemu_cmd,
                 language,
                 reservation,
@@ -1164,7 +1509,6 @@ class VmManager:
                         abort_check=_check_qemu_alive,
                     )
                 except TimeoutError as e:
-                    await vm.destroy()
                     raise VmTransientError(
                         f"QMP socket never appeared for {infra.vm_id}",
                         context={"vm_id": infra.vm_id, "qmp_socket": str(vm.qmp_socket)},
@@ -1183,7 +1527,6 @@ class VmManager:
                     "L1 restore failed",
                     extra={**asdict(diag), "vmstate_path": str(vmstate_path)},
                 )
-                await vm.destroy()
                 raise VmTransientError(
                     f"L1 restore failed for {infra.vm_id}: {e}",
                     context={**asdict(diag), "vmstate_path": str(vmstate_path)},
@@ -1195,10 +1538,9 @@ class VmManager:
             infra.channel._has_been_connected = True  # type: ignore[attr-defined]  # noqa: SLF001
             await infra.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
 
-            # VM is now running with REPL already warm
+            # VM is now running with REPL already warm.
+            # Admission ownership was already claimed inside _launch_qemu_vm.
             vm.l1_restored = True
-            vm.holds_admission_slot = True
-            vm.resource_reservation = reservation
 
             restore_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
             vm.timing.setup_ms = restore_ms  # L1 restore replaces cold boot + REPL warm
@@ -1221,20 +1563,17 @@ class VmManager:
                 },
             )
 
-            vm_created = True
             return vm
 
-        except BaseException:
+        except BaseException as error:
             if qmp_parent_sock is not None:
                 with suppress(OSError):
                     qmp_parent_sock.close()
-            if not vm_created:
-                await self._cleanup_failed_launch(
-                    infra.vm_id,
-                    gvproxy_proc=gvproxy_proc,
-                    workdir=infra.workdir,
-                    cgroup_path=infra.cgroup_path,
-                )
+            if not await self._cleanup_failed_owner(infra.vm_id):
+                raise VmPermanentError(
+                    f"Restore failure cleanup was not confirmed for {infra.vm_id}",
+                    context={"vm_id": infra.vm_id, "operation": "restore_failure_cleanup"},
+                ) from error
             raise
 
     async def _force_cleanup_all_resources(
@@ -1274,7 +1613,6 @@ class VmManager:
         """
         logger.info("Starting comprehensive resource cleanup", extra={"vm_id": vm_id})
         results: dict[str, bool] = {}
-        was_cancelled = False
 
         # Phase 1: Kill processes in parallel (independent operations)
         # Shield cleanup from cancellation to ensure resources are fully released
@@ -1302,20 +1640,21 @@ class VmManager:
             )
             results["qemu"] = process_results[0] if isinstance(process_results[0], bool) else False
             results["gvproxy"] = process_results[1] if isinstance(process_results[1], bool) else False
-            # Unregister from emergency cleanup registry
-            unregister_process(qemu_proc)
-            unregister_process(gvproxy_proc)
+            # Keep any unconfirmed process in the emergency registry. Removing
+            # it here would turn a failed SIGKILL/reap into an unowned orphan.
+            if results["qemu"]:
+                unregister_process(qemu_proc)
+            if results["gvproxy"]:
+                unregister_process(gvproxy_proc)
         except asyncio.CancelledError:
-            # Shield completed but outer task was cancelled - continue to Phase 2 anyway
+            # The inner shield continues cleanup, but this owner must propagate
+            # cancellation. The caller retains registry/emergency ownership and
+            # can schedule a fresh serialized attempt.
             logger.debug(
-                "Cleanup Phase 1 completed but task was cancelled, continuing to Phase 2", extra={"vm_id": vm_id}
+                "Cleanup Phase 1 is shielded after caller cancellation",
+                extra={"vm_id": vm_id},
             )
-            results["qemu"] = False
-            results["gvproxy"] = False
-            was_cancelled = True
-            # Still unregister even on cancellation
-            unregister_process(qemu_proc)
-            unregister_process(gvproxy_proc)
+            raise
 
         # Phase 2: Cleanup workdir and cgroup in parallel (after processes dead)
         # workdir.cleanup() removes overlay and sockets in one operation
@@ -1324,46 +1663,105 @@ class VmManager:
                 return True
             return await workdir.cleanup()
 
-        # Shield file cleanup from cancellation to ensure resources are fully released
-        try:
-            file_results = await asyncio.shield(
-                asyncio.gather(
-                    cleanup_workdir(),
-                    cgroup.cleanup_cgroup(
-                        cgroup_path=cgroup_path,
-                        context_id=vm_id,
-                    ),
-                    return_exceptions=True,
-                )
+        # Never remove a live QEMU's overlay, sockets, or cgroup. A retrying
+        # reaper owns those resources until process death is confirmed.
+        if not (results.get("qemu", False) and results.get("gvproxy", False)):
+            logger.error(
+                "Skipping dependent VM resource cleanup because process termination is unconfirmed",
+                extra={"vm_id": vm_id},
             )
-            results["workdir"] = file_results[0] if isinstance(file_results[0], bool) else False
-            results["cgroup"] = file_results[1] if isinstance(file_results[1], bool) else False
-        except asyncio.CancelledError:
-            logger.debug("Cleanup Phase 2 completed but task was cancelled", extra={"vm_id": vm_id})
             results["workdir"] = False
             results["cgroup"] = False
-            was_cancelled = True
+        else:
+            # Shield file cleanup from cancellation to ensure resources are fully released
+            try:
+                file_results = await asyncio.shield(
+                    asyncio.gather(
+                        cleanup_workdir(),
+                        cgroup.cleanup_cgroup(
+                            cgroup_path=cgroup_path,
+                            context_id=vm_id,
+                        ),
+                        return_exceptions=True,
+                    )
+                )
+                results["workdir"] = file_results[0] if isinstance(file_results[0], bool) else False
+                results["cgroup"] = file_results[1] if isinstance(file_results[1], bool) else False
+            except asyncio.CancelledError:
+                logger.debug("Cleanup Phase 2 is shielded after caller cancellation", extra={"vm_id": vm_id})
+                raise
 
         # Log summary
         success_count = sum(results.values())
         total_count = len(results)
-        if success_count == total_count and not was_cancelled:
+        if success_count == total_count:
             logger.info("Cleanup completed successfully", extra={"vm_id": vm_id, "results": results})
         else:
             logger.warning(
-                "Cleanup completed with errors" if not was_cancelled else "Cleanup completed (task was cancelled)",
+                "Cleanup completed with errors",
                 extra={
                     "vm_id": vm_id,
                     "results": results,
                     "success": success_count,
                     "total": total_count,
-                    "was_cancelled": was_cancelled,
                 },
             )
 
         return results
 
-    async def destroy_vm(self, vm: QemuVM) -> None:
+    def _schedule_failed_cleanup_retry(self, vm: QemuVM) -> None:
+        """Retain ownership and retry an unconfirmed process cleanup."""
+        self._schedule_cleanup_retry(vm.vm_id, lambda: self.destroy_vm(vm, _schedule_retry=False))
+
+    def _schedule_failed_pending_cleanup_retry(self, pending: _PendingLaunch) -> None:
+        """Retry cleanup for a process that failed before QemuVM handoff."""
+        self._schedule_cleanup_retry(
+            pending.vm_id, lambda: self._cleanup_pending_launch(pending, _schedule_retry=False)
+        )
+
+    def _schedule_cleanup_retry(self, key: str, attempt: Callable[[], Awaitable[bool]]) -> None:
+        """Own and retry one failed cleanup, deduped by key.
+
+        A live task under the same key is left running; otherwise a fresh reaper
+        is published and self-discards from the registry when it completes.
+        """
+        existing = self._failed_cleanup_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._retry_cleanup_forever(key, attempt))
+        self._failed_cleanup_tasks[key] = task
+
+        def discard(completed: asyncio.Task[None]) -> None:
+            if self._failed_cleanup_tasks.get(key) is completed:
+                self._failed_cleanup_tasks.pop(key, None)
+
+        task.add_done_callback(discard)
+
+    async def _retry_cleanup_forever(self, key: str, attempt: Callable[[], Awaitable[bool]]) -> None:
+        """Retry `attempt` (bounded backoff) until it confirms cleanup (True)."""
+        delay = 1.0
+        while True:
+            await asyncio.sleep(delay)
+            try:
+                if await attempt():
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception(
+                    "Cleanup reaper attempt failed",
+                    extra={"vm_id": key, "error": str(error)},
+                )
+            delay = min(delay * 2, 30.0)
+
+    async def destroy_vm(
+        self,
+        vm: QemuVM,
+        *,
+        _schedule_retry: bool = True,
+        _release_admission: bool = True,
+    ) -> bool:
         """Destroy VM and clean up resources using defensive generic cleanup.
 
         This method uses the comprehensive cleanup orchestrator to ensure
@@ -1371,42 +1769,105 @@ class VmManager:
 
         Args:
             vm: QemuVM handle to destroy
+
+        Returns:
+            True only when process, working-directory, and cgroup cleanup are
+            all confirmed. Any failed resource remains registry-owned for retry.
+
+        State contract (what callers should key on): vm.state is published as
+        DESTROYED once QEMU and gvproxy death is confirmed — even when this
+        method returns False because workdir/cgroup cleanup is still pending.
+        The bool attests full resource cleanup; DESTROYED attests process death.
         """
         try:
-            # Cancel output reader tasks (prevent pipe deadlock during cleanup)
-            if vm.qemu_log_task and not vm.qemu_log_task.done():
-                vm.qemu_log_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await vm.qemu_log_task
+            async with vm.cleanup_lock:
+                # Make direct VM APIs non-reusable before touching processes. Unlike
+                # the old destroy path, this does not claim DESTROYED yet.
+                with suppress(VmPermanentError):
+                    await vm.begin_destroy()
+                with suppress(OSError, RuntimeError):
+                    await vm.channel.close()
 
-            if vm.gvproxy_log_task and not vm.gvproxy_log_task.done():
-                vm.gvproxy_log_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await vm.gvproxy_log_task
+                cleanup_results = await self._force_cleanup_all_resources(
+                    vm_id=vm.vm_id,
+                    qemu_proc=vm.process,
+                    gvproxy_proc=vm.gvproxy_proc,
+                    workdir=vm.workdir,
+                    cgroup_path=vm.cgroup_path,
+                )
+                processes_destroyed = all(cleanup_results.get(resource) is True for resource in ("qemu", "gvproxy"))
+                await asyncio.gather(
+                    *(
+                        _finish_process_log_drain(task)
+                        for resource, task in (
+                            ("qemu", vm.qemu_log_task),
+                            ("gvproxy", vm.gvproxy_log_task),
+                        )
+                        if cleanup_results.get(resource) is True
+                    )
+                )
+                all_resources_destroyed = all(
+                    cleanup_results.get(resource) is True for resource in ("qemu", "gvproxy", "workdir", "cgroup")
+                )
+                if processes_destroyed:
+                    # Re-close the channel: an in-flight operation racing this
+                    # destroy can reconnect to QEMU's chardevs between the
+                    # first close and the process kill, resurrecting write
+                    # workers. QEMU is dead now, so one re-close reaps them.
+                    with suppress(OSError, RuntimeError):
+                        await vm.channel.close()
+                    await vm.confirm_destroyed()
+                if not all_resources_destroyed:
+                    logger.error(
+                        "VM cleanup remains owned after unconfirmed resource cleanup",
+                        extra={"vm_id": vm.vm_id, "cleanup_results": cleanup_results},
+                    )
 
-            # Destroy VM (transitions state, closes channel)
-            with suppress(VmPermanentError):
-                await vm.destroy()
+        except asyncio.CancelledError:
+            # Event-loop dictionary publication is synchronous, matching the
+            # pending->VM launch handoff. A repeated cancel cannot interrupt it.
+            self._vms[vm.vm_id] = vm
+            if _schedule_retry:
+                self._schedule_failed_cleanup_retry(vm)
+            raise
+        except Exception:
+            self._vms[vm.vm_id] = vm
+            if _schedule_retry:
+                self._schedule_failed_cleanup_retry(vm)
+            raise
 
-            # Comprehensive cleanup using defensive generic functions —
-            # always runs even if vm.destroy() raised (e.g. invalid state transition)
-            await self._force_cleanup_all_resources(
-                vm_id=vm.vm_id,
-                qemu_proc=vm.process,
-                gvproxy_proc=vm.gvproxy_proc,
-                workdir=vm.workdir,
-                cgroup_path=vm.cgroup_path,
-            )
-        finally:
-            # ALWAYS remove from registry, even on failure
-            async with self._vms_lock:
-                self._vms.pop(vm.vm_id, None)
-            # Release resource reservation only if this VM held one (prevents double-release)
-            if vm.holds_admission_slot:
-                vm.holds_admission_slot = False
-                if vm.resource_reservation is not None:
+        if all_resources_destroyed:
+
+            async def commit_cleanup() -> None:
+                # Admission is released before the VM is unpublished. No await
+                # may follow clearing the ownership fields.
+                if vm.holds_admission_slot and vm.resource_reservation is not None and _release_admission:
                     await self._admission.release(vm.resource_reservation)
-                    vm.resource_reservation = None
+                async with self._vms_lock:
+                    self._vms.pop(vm.vm_id, None)
+                    if vm.holds_admission_slot:
+                        vm.holds_admission_slot = False
+                        vm.resource_reservation = None
+
+            try:
+                await _await_cancellation_safe(commit_cleanup())
+            except asyncio.CancelledError:
+                # commit_cleanup completed before cancellation was propagated.
+                raise
+            except Exception:
+                self._vms[vm.vm_id] = vm
+                if _schedule_retry:
+                    self._schedule_failed_cleanup_retry(vm)
+                raise
+            return True
+
+        # Keep the registry entry, admission reservation, and every dependent
+        # resource. A dedicated reaper retries until the full cleanup result is
+        # confirmed, even when QEMU and gvproxy are already dead.
+        self._vms[vm.vm_id] = vm
+        if _schedule_retry:
+            self._schedule_failed_cleanup_retry(vm)
+        return False
 
     def get_base_image(self, language: str) -> Path:
         """Get base image path for language via auto-discovery.

@@ -1,9 +1,8 @@
 # guest-agent is Linux-only, so we run all Rust commands in a Docker container
 
-ifndef RUST_VERSION
-$(error RUST_VERSION is not set - invoke from root Makefile)
-endif
-RUST_IMAGE := rust:$(RUST_VERSION)-slim
+# Rust toolchain pin (version + image digest) comes from versions.lock only
+include ../versions.lock
+RUST_IMAGE := rust:$(RUST_VERSION)-slim@$(RUST_IMAGE_DIGEST)
 CARGO_VOLUME := guest-agent-cargo-$(RUST_VERSION)
 DOCKER_RUN := docker run --rm -v $(CURDIR):/workspace -v $(CARGO_VOLUME):/usr/local/cargo/registry -w /workspace $(RUST_IMAGE)
 

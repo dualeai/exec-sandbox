@@ -13,7 +13,10 @@ import asyncio
 
 import pytest
 
-from exec_sandbox.exceptions import CodeValidationError, SessionClosedError
+from exec_sandbox.exceptions import (
+    CodeValidationError,
+    SessionClosedError,
+)
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from tests.conftest import skip_on_python_312_subprocess_bug, skip_unless_hwaccel
@@ -680,10 +683,10 @@ class TestSessionOutOfBounds:
             await session.close()
 
     @pytest.mark.slow
-    async def test_sigkill_preserves_session(self, scheduler: Scheduler) -> None:
-        """SIGKILL (same signal OOM killer sends) doesn't destroy session.
+    async def test_sigkill_closes_session(self, scheduler: Scheduler) -> None:
+        """SIGKILL produces terminal exit 137 and closes the session.
 
-        Slow under TCG: REPL respawn correctness test with no timing
+        Slow under TCG: terminal-session correctness test with no timing
         assertions — works under TCG but too slow for the default suite.
         """
         async with await scheduler.session(language=Language.PYTHON) as session:
@@ -691,52 +694,25 @@ class TestSessionOutOfBounds:
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
             )
-            # SIGKILL mirrors what the OOM killer does
             result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
             assert result.exit_code == 137  # 128 + 9 (SIGKILL)
-            # Session alive, state reset (x is gone)
-            result = await session.exec("try:\n    print(x)\nexcept NameError:\n    print('state_reset')")
-            assert result.exit_code == 0
-            assert "state_reset" in result.stdout
+            assert session.closed
+            with pytest.raises(SessionClosedError):
+                await session.exec("print('must_not_run')")
 
     @pytest.mark.slow
-    async def test_oom_preserves_session(self, scheduler: Scheduler) -> None:
-        """Actual OOM-killed code doesn't destroy session — REPL respawns.
+    async def test_user_exit_137_closes_session(self, scheduler: Scheduler) -> None:
+        """A voluntary sys.exit(137) is treated as terminal, like SIGKILL.
 
-        Slow under TCG: OOM + respawn correctness test with 30s timeout —
-        generous but TCG boot overhead makes it too slow for the default suite.
-        """
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=128) as session:
-            # Allocate and write to memory in a loop. Writing forces page faults,
-            # which commits physical memory and triggers the kernel OOM killer.
-            # Plain mmap() without writes only reserves address space (overcommit_memory=0).
-            result = await session.exec(
-                "data = []\nwhile True:\n    data.append(b'x' * 10_000_000)",
-                timeout_seconds=30,
-            )
-            # OOM: SIGKILL (137), or MemoryError (non-zero), or timeout (-1) as safety net
-            assert result.exit_code != 0
-            # Session still alive — REPL respawned
-            result = await session.exec('print("alive")')
-            assert result.exit_code == 0
-            assert "alive" in result.stdout
-
-    @pytest.mark.slow
-    async def test_repeated_repl_death_preserves_session(self, scheduler: Scheduler) -> None:
-        """Session survives multiple consecutive REPL deaths.
-
-        Slow under TCG: correctness test — 3x kill+respawn cycles are
-        functional under TCG but too slow for the default suite.
+        Pins the documented reservation: numeric 137 retires the session even
+        when it did not come from a signal (guard/OOM-killer/user alike).
         """
         async with await scheduler.session(language=Language.PYTHON) as session:
-            for i in range(3):
-                # Kill REPL
-                result = await session.exec("import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
-                assert result.exit_code == 137
-                # Verify session is still usable with fresh state
-                result = await session.exec(f'print("cycle_{i}")')
-                assert result.exit_code == 0
-                assert f"cycle_{i}" in result.stdout
+            result = await session.exec("import sys; sys.exit(137)")
+            assert result.exit_code == 137
+            assert session.closed
+            with pytest.raises(SessionClosedError):
+                await session.exec("print('must_not_run')")
 
     @skip_unless_hwaccel
     async def test_exec_timeout_preserves_session(self, scheduler: Scheduler) -> None:

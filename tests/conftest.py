@@ -12,6 +12,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -22,7 +23,7 @@ from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
-from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available
+from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available, probe_cache
 from exec_sandbox.vm_manager import VmManager
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     if not os.environ.get("GITHUB_ACTIONS"):
         return None  # Use default protocol outside CI
 
+    # Let CodSpeed's protocol hook handle benchmark tests — returning True here
+    # would prevent CodSpeed from wrapping item.runtest with instrumentation,
+    # resulting in "0 benchmarked".
+    if item.get_closest_marker("benchmark") is not None:
+        return None
+
     for attempt in range(_QEMU_CRASH_MAX_RETRIES + 1):
         reports = runtestprotocol(item, nextitem=nextitem, log=False)
 
@@ -132,14 +139,27 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 
 
 # ============================================================================
-# Shared Skip Markers
+# Hardware Probe, Timeout Constants, and Skip Markers
 # ============================================================================
+
+# Probed once at import time; used for skip markers and timeout scaling.
+_hwaccel_available: bool = asyncio.run(check_hwaccel_available())
+
+# Central test-execution timeout (seconds).
+# TCG software emulation under ``pytest -n auto`` contention can inflate
+# wall-clock times 5-8x; even trivial code that takes <1s locally can
+# consume >30s.  All tests — whether they go through the Scheduler or call
+# ``vm.execute()`` directly — should derive their timeout from these
+# constants so that the budget is adjusted in exactly one place.
+_TIMEOUT_HWACCEL: int = 120
+_TIMEOUT_TCG: int = 240
+_DEFAULT_TEST_TIMEOUT: int = _TIMEOUT_HWACCEL if _hwaccel_available else _TIMEOUT_TCG
 
 # Skip marker for timing-sensitive tests that require hardware acceleration.
 # TCG (software emulation) is ~5-8x slower than KVM/HVF, making these tests
 # unreliable on GitHub Actions macOS runners (no nested virtualization).
 skip_unless_hwaccel = pytest.mark.skipif(
-    not asyncio.run(check_hwaccel_available()),
+    not _hwaccel_available,
     reason="Requires hardware acceleration (KVM/HVF) - TCG too slow for timing-sensitive tests",
 )
 
@@ -235,14 +255,28 @@ def scheduler_config(images_dir: Path) -> SchedulerConfig:
     Uses pre-built images from images/dist/ directory.
     Disables auto_download_assets since images are provided locally.
 
-    Timeout is 120s (vs library default 30s) to absorb parallel-load
+    Timeout comes from ``_DEFAULT_TEST_TIMEOUT`` to absorb parallel-load
     slowdowns: ``pytest -n auto`` runs ~10 QEMU VMs concurrently, and TCG
     emulation + L1 restore contention can inflate wall-clock times 4-5x.
     Individual tests should NOT override ``timeout_seconds`` unless they
     intentionally need a *shorter* deadline (e.g. testing the timeout
     mechanism itself).
     """
-    return SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
+    return SchedulerConfig(
+        images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=_DEFAULT_TEST_TIMEOUT
+    )
+
+
+@pytest.fixture
+def execute_timeout() -> int:
+    """Execution timeout for tests that call ``vm.execute()`` directly.
+
+    Returns ``_DEFAULT_TEST_TIMEOUT`` (``_TIMEOUT_HWACCEL`` when KVM/HVF
+    is available, ``_TIMEOUT_TCG`` under software emulation).  Use this
+    instead of hardcoding ``timeout_seconds=30`` in tests that bypass the
+    Scheduler.
+    """
+    return _DEFAULT_TEST_TIMEOUT
 
 
 @pytest.fixture
@@ -270,20 +304,20 @@ async def dual_scheduler(
 
     This ensures security properties hold regardless of QEMU backend.
 
-    Uses the same 120s default timeout as ``scheduler_config`` for hwaccel.
-    Emulation gets 240s because parallel TCG VMs on CI runners can starve
-    each other — trivial code that takes <1s locally consumed the full 120s
-    execution budget on a loaded macOS arm64 runner (cold-boot fallback +
-    TCG + ``pytest -n auto`` contention).
+    hwaccel gets ``_TIMEOUT_HWACCEL``; emulation gets ``_TIMEOUT_TCG``.
+    The emulation budget is higher because parallel TCG VMs on CI runners
+    starve each other — trivial code that takes <1s locally consumed the
+    full hwaccel budget on a loaded macOS arm64 runner (cold-boot fallback
+    + TCG + ``pytest -n auto`` contention).
     """
     if request.param == "hwaccel":
-        if not await check_hwaccel_available():
+        if not _hwaccel_available:
             pytest.skip("Hardware acceleration not available")
         monkeypatch.delenv("EXEC_SANDBOX_FORCE_EMULATION", raising=False)
-        timeout = 120
+        timeout = _TIMEOUT_HWACCEL
     else:
         monkeypatch.setenv("EXEC_SANDBOX_FORCE_EMULATION", "true")
-        timeout = 240
+        timeout = _TIMEOUT_TCG
 
     config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=timeout)
     async with Scheduler(config) as sched:
@@ -297,7 +331,7 @@ async def dual_scheduler(
 
 @pytest.fixture
 def vm_settings(images_dir: Path):
-    """Settings for VM tests with hardware acceleration."""
+    """Settings for VM tests (auto-detects KVM/HVF, falls back to TCG)."""
     return Settings(
         base_images_dir=images_dir,
         kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
@@ -306,7 +340,11 @@ def vm_settings(images_dir: Path):
 
 @pytest.fixture
 async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
-    """VmManager with hardware acceleration (started).
+    """VmManager with auto-detected acceleration (started).
+
+    Uses KVM/HVF when available, falls back to TCG.  Tests using this
+    fixture should pass ``execute_timeout`` to ``vm.execute()`` instead
+    of hardcoding a timeout — see ``_DEFAULT_TEST_TIMEOUT``.
 
     Automatically calls start() to start the overlay pool daemon,
     and stop() for cleanup.
@@ -433,6 +471,25 @@ async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def
 # ============================================================================
 
 
+def make_destroy_mock(kind: str = "confirmed") -> AsyncMock:
+    """AsyncMock for VmManager.destroy_vm mirroring the real contract
+    (vm_manager.destroy_vm): DESTROYED is published once process death is
+    confirmed, even when the bool return is False (ancillary cleanup pending).
+
+    kinds: "confirmed" (DESTROYED, True), "ancillary_pending" (DESTROYED,
+    False), "unconfirmed" (state untouched, False).
+    """
+    from exec_sandbox.vm_types import VmState
+
+    async def destroy(vm: object) -> bool:
+        if kind == "unconfirmed":
+            return False
+        vm.state = VmState.DESTROYED  # type: ignore[attr-defined]
+        return kind == "confirmed"
+
+    return AsyncMock(side_effect=destroy)
+
+
 def random_test_id() -> str:
     """Generate a unique random identifier for test isolation.
 
@@ -482,6 +539,26 @@ JS_SAFETY = (
 # ============================================================================
 # Test Utilities
 # ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _reset_probe_caches() -> Iterator[None]:
+    """Reset all system-probe caches before and after every test.
+
+    Tests that mock QEMU subprocess output (version, accelerators, sandbox)
+    populate ``probe_cache`` via the ``@_async_cached_probe`` decorator.
+    Without a post-test reset, a subsequent test on the same pytest-xdist
+    worker inherits the stale value — e.g. ``qemu_version=(8,2,0)`` from a
+    mock causes real integration tests to raise ``VmDependencyError``, or
+    ``kvm=True`` from a mock causes ``-accel kvm`` on macOS (crash).
+
+    Resetting *all* attributes (not just a subset) is intentional: it
+    eliminates the need for per-class fixtures and prevents future probes
+    from being forgotten.
+    """
+    probe_cache.reset()
+    yield
+    probe_cache.reset()
 
 
 @pytest.fixture(autouse=True)

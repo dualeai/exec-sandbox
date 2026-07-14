@@ -1,140 +1,176 @@
-"""Tests for speculative execution mitigations and timer side-channel posture.
+"""Tests for speculative execution posture and timer side-channel defenses.
 
-Validates that the guest VM runs with kernel-default speculative execution
-mitigations enabled (mitigations=auto), matching the security posture of
-AWS Lambda/Firecracker. Documents timer precision as informational baseline.
-
-CVE references:
-- CVE-2025-40300 (VMSCAPE): Spectre-BTI guest-to-host memory leak via KVM/QEMU
-  incomplete branch predictor isolation (IEEE S&P 2026, ETH Zurich)
-- Spectre v1 (CVE-2017-5753): Bounds check bypass via branch misprediction
-- Spectre v2 (CVE-2017-5715): Branch target injection
-- MDS (CVE-2018-12130): Microarchitectural data sampling
-- KernelSnitch (NDSS 2025): clock_gettime as side-channel primitive — shows
-  timer coarsening is provably ineffective (kernel data structure timing leaks)
+The guest kernel boots with mitigations=off — a deliberate density/latency
+decision (commit 5526750d): the VM boundary (KVM/HVF) is the security layer,
+not the guest kernel. x86 sysfs tests verify the runtime effect; arm64 tests
+verify readable, architecture-specific reporting. A host-side unit test pins
+the common cmdline token for both architectures.
 
 Security model:
-- Guest mitigations at kernel defaults (mitigations=auto) — same as Firecracker
-- No timer coarsening — no VM-based FaaS does it; vDSO bypasses seccomp anyway
-- Host-side hardening (SMT control, KSM disabled, perf restricted) is primary defense
-- Ref: https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md
-- Ref: https://docs.kernel.org/admin-guide/hw-vuln/spectre.html
+- Guest-side mitigations do not implement the VMSCAPE host boundary.
+  CVE-2025-40300 (Spectre-BTI via incomplete branch-predictor isolation,
+  IEEE S&P 2026) must be mitigated by a patched/configured host kernel.
+  Guest mitigations=off neither enables nor disables that host mitigation.
+- Single tenant per VM removes an in-guest cross-tenant target, but untrusted
+  code may still target the root guest-agent or guest kernel with Spectre v1
+  (CVE-2017-5753), Spectre v2 (CVE-2017-5715), or MDS (CVE-2018-12130). The
+  root guest-agent intentionally stores no long-lived platform credential, but
+  it transiently holds tenant code, environment values, and protocol state.
+  Its host channels are virtio-serial devices (guest-agent/src/constants.rs).
+- nokaslr is omitted. The x86 base currently enables CONFIG_RANDOMIZE_BASE,
+  but runtime KASLR on the direct-vmlinux PVH path is not asserted here. The
+  arm64 base has CONFIG_RANDOMIZE_BASE=n and mitigations=off leaves KPTI off;
+  that density tradeoff is explicit, not an accidental hardening claim.
+- Timer coarsening is not part of this posture: vDSO clock reads bypass
+  seccomp, and KernelSnitch (NDSS 2025) demonstrates timing leaks through
+  kernel data structures.
+- Patched/configured host controls must provide the VM boundary (including
+  VMSCAPE isolation and an appropriate SMT policy); guest KSM/perf controls
+  reduce the residual intra-guest surface.
+- The kernel cmdline posture is pinned host-side in
+  test_vm_manager.py::TestKernelCmdlineMitigations — it cannot be asserted
+  from inside the guest because guest-agent masks /proc/cmdline with a
+  /dev/null bind-mount (guest-agent/src/init.rs).
+- Ref: https://github.com/torvalds/linux/blob/v6.18/Documentation/admin-guide/hw-vuln/vmscape.rst
+- Ref: https://github.com/torvalds/linux/blob/v6.18/arch/arm64/kernel/proton-pack.c
+- Ref: https://github.com/torvalds/linux/blob/v6.18/arch/arm64/kernel/cpufeature.c
+- Ref: https://github.com/torvalds/linux/blob/v6.18/drivers/base/cpu.c
+- Ref: https://doi.org/10.14722/ndss.2025.240223 (KernelSnitch)
 
 Test categories:
-- Normal: verify mitigations are active (not "Vulnerable")
+- Normal: verify x86 runtime effect and per-arch sysfs reporting
 - Normal: informational timer precision measurement (no assertion on bounds)
 - Edge: verify side-channel defense sysctls (perf_event_paranoid, KSM)
 - Normal: document CPU vulnerability exposure transparency
 """
 
 from exec_sandbox.models import Language
+from exec_sandbox.platform_utils import HostArch, detect_host_arch
 from exec_sandbox.scheduler import Scheduler
 
+# Guest arch always equals host arch: forced emulation (TCG) emulates the SAME
+# architecture, only without hardware acceleration (see qemu_cmd.py -cpu block).
+IS_X86 = detect_host_arch() == HostArch.X86_64
+
+
+def _read_vuln_file_code(name: str) -> str:
+    """Guest code reading one /sys/devices/system/cpu/vulnerabilities file."""
+    return f"""\
+try:
+    with open('/sys/devices/system/cpu/vulnerabilities/{name}') as f:
+        val = f.read().strip()
+        print(f'STATUS:{{val}}')
+except FileNotFoundError:
+    print('NOT_FOUND')
+except PermissionError:
+    print('PERM_DENIED')
+"""
+
+
+def _extract_status(result_stdout: str, name: str) -> str:
+    """Extract the STATUS: payload; the file must exist and be readable.
+
+    CONFIG_GENERIC_CPU_VULNERABILITIES=y on both arches (vendored Alpine base
+    configs), so NOT_FOUND/PERM_DENIED are failures, not skips — a future
+    guest-side mask of /sys must fail these tests, not void them.
+    """
+    stdout = result_stdout.strip()
+    assert "STATUS:" in stdout, f"{name} sysfs file must be readable in guest, got: {stdout!r}"
+    return stdout.split("STATUS:", 1)[1]
+
+
+def _assert_mitigations_off_reached_guest(name: str, status: str) -> None:
+    """x86: status must be a hardware 'Not affected' claim or 'Vulnerable*'.
+
+    'Not affected' survives mitigations=off — bugs.c short-circuits on CPU
+    self-declaration (ARCH_CAPABILITIES: MDS_NO etc.) before mitigation state,
+    so AMD / Ice Lake+ hosts under -cpu host legitimately report it. Under TCG
+    the arch-capabilities MSR is stripped, so affected bugs report 'Vulnerable*'.
+
+    An active 'Mitigation:' string means mitigations=off silently stopped
+    reaching the guest — check the qemu_cmd.py mitigations block and
+    test_vm_manager.py::TestKernelCmdlineMitigations.
+    """
+    assert status == "Not affected" or status.startswith("Vulnerable"), (
+        f"{name}: expected 'Not affected' or 'Vulnerable*' under mitigations=off "
+        f"(density posture, commit 5526750d); got: {status!r} — if this is a "
+        f"'Mitigation:' string, mitigations=off no longer reaches the guest"
+    )
+
 
 # =============================================================================
-# Normal: Spectre/MDS mitigations active (CVE-2025-40300, CVE-2017-5715)
+# Normal: x86 runtime posture and architecture-specific sysfs reporting
 # =============================================================================
 class TestMitigationStatus:
-    """Verify CPU speculative execution mitigations are enabled in guest.
+    """Verify x86 runtime effect and architecture-specific status reporting.
 
-    With mitigations=auto (kernel default), the kernel enables mitigations
-    relevant to the actual CPU. This matches Firecracker/AWS Lambda posture.
-    CVE-2025-40300 (VMSCAPE) demonstrates guest-to-host Spectre-BTI leaks
-    when mitigations are disabled.
+    The host-side test pins the common cmdline token. x86 statuses confirm the
+    kernel honored mitigations=off; arm64 statuses are hardware/compile-time
+    dominated, so those branches validate reporting semantics without claiming
+    to prove the runtime flag took effect.
+
+    A previous guest-side cmdline test (reading /proc/cmdline) was deleted:
+    guest-agent masks /proc/cmdline with a /dev/null bind-mount
+    (guest-agent/src/init.rs), so it read "" and passed vacuously. Masking
+    itself is asserted in test_kernel_attack_surface.py::TestProcInfoLeaks.
     """
 
-    async def test_spectre_v2_mitigated(self, dual_scheduler: Scheduler) -> None:
-        """Spectre v2 (branch target injection) must not report 'Vulnerable'.
+    async def test_spectre_v2_status_matches_posture(self, dual_scheduler: Scheduler) -> None:
+        """Spectre v2 (CVE-2017-5715) status matches documented arch behavior.
 
-        CVE-2017-5715: Branch target injection enables cross-boundary
-        speculative execution. CVE-2025-40300 exploits this for guest-to-host.
+        x86: nospectre_v2 (via mitigations=off) yields 'Vulnerable*' on all
+        affected CPUs. arm64: reporting is dominated by hardware CSV2 claims
+        (proton-pack.c checks ID_AA64PFR0_EL1.CSV2 / safe-MIDR list before
+        mitigation state), so any of 'Not affected' (Apple Silicon, Graviton,
+        QEMU TCG max), 'Mitigation:*' (BHB-listed cores), or 'Vulnerable*'
+        (non-CSV2 cores) is hardware-truthful — transparency only.
         """
-        code = """\
-try:
-    with open('/sys/devices/system/cpu/vulnerabilities/spectre_v2') as f:
-        val = f.read().strip()
-        print(f'STATUS:{val}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=_read_vuln_file_code("spectre_v2"), language=Language.PYTHON)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "STATUS:" in stdout:
-            status = stdout.split("STATUS:", 1)[1]
-            assert "Vulnerable" not in status or "Mitigation" in status, (
-                f"Spectre v2 should be mitigated, got: {status}"
+        status = _extract_status(result.stdout, "spectre_v2")
+        if IS_X86:
+            _assert_mitigations_off_reached_guest("spectre_v2", status)
+        else:
+            assert status, "spectre_v2: empty sysfs status"
+
+    async def test_spectre_v1_status_matches_posture(self, dual_scheduler: Scheduler) -> None:
+        """Spectre v1 (CVE-2017-5753) status matches documented arch behavior.
+
+        x86: nospectre_v1 (via mitigations=off) yields 'Vulnerable: __user
+        pointer sanitization and usercopy barriers only; no swapgs barriers'.
+        arm64: __user pointer sanitization is compile-time and NOT runtime-
+        disableable (proton-pack.c cpu_show_spectre_v1 is unconditional), so
+        'Mitigation:*' is the permanent expected value even under
+        mitigations=off.
+        """
+        result = await dual_scheduler.run(code=_read_vuln_file_code("spectre_v1"), language=Language.PYTHON)
+        assert result.exit_code == 0
+        status = _extract_status(result.stdout, "spectre_v1")
+        if IS_X86:
+            _assert_mitigations_off_reached_guest("spectre_v1", status)
+        else:
+            assert status.startswith("Mitigation"), (
+                f"spectre_v1 on arm64 is always 'Mitigation: __user pointer "
+                f"sanitization' (compile-time, not runtime-disableable), got: {status!r}"
             )
 
-    async def test_spectre_v1_mitigated(self, dual_scheduler: Scheduler) -> None:
-        """Spectre v1 (bounds check bypass) must not report 'Vulnerable'.
+    async def test_mds_status_matches_posture(self, dual_scheduler: Scheduler) -> None:
+        """MDS (CVE-2018-12130) status matches documented arch behavior.
 
-        CVE-2017-5753: Conditional branch misprediction enables out-of-bounds
-        speculative reads. Kernel mitigates with array_index_nospec barriers.
+        x86 hwaccel: 'Not affected' on AMD / MDS_NO CPUs (hardware claim wins
+        over mitigation state in bugs.c). x86 TCG: 'Vulnerable; SMT Host state
+        unknown' — TCG strips the arch-capabilities MSR from SapphireRapids-v2
+        so the MDS_NO self-declaration never reaches the guest.
+        arm64: MDS is an x86-only bug; the weak default handler in
+        drivers/base/cpu.c always reports 'Not affected'.
         """
-        code = """\
-try:
-    with open('/sys/devices/system/cpu/vulnerabilities/spectre_v1') as f:
-        val = f.read().strip()
-        print(f'STATUS:{val}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await dual_scheduler.run(code=_read_vuln_file_code("mds"), language=Language.PYTHON)
         assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "STATUS:" in stdout:
-            status = stdout.split("STATUS:", 1)[1]
-            assert "Vulnerable" not in status or "Mitigation" in status, (
-                f"Spectre v1 should be mitigated, got: {status}"
-            )
-
-    async def test_mds_mitigated(self, dual_scheduler: Scheduler) -> None:
-        """MDS (microarchitectural data sampling) must not report 'Vulnerable'.
-
-        CVE-2018-12130: Enables reading stale data from CPU buffers.
-        Mitigation: CPU buffer clearing on context switches.
-        """
-        code = """\
-try:
-    with open('/sys/devices/system/cpu/vulnerabilities/mds') as f:
-        val = f.read().strip()
-        print(f'STATUS:{val}')
-except FileNotFoundError:
-    print('NOT_FOUND')
-except PermissionError:
-    print('PERM_DENIED')
-"""
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        stdout = result.stdout.strip()
-        if "STATUS:" in stdout:
-            status = stdout.split("STATUS:", 1)[1]
-            # "Not affected" is fine (ARM or newer Intel CPUs)
-            assert "Vulnerable" not in status or "Mitigation" in status or "Clear CPU buffers attempted" in status, (
-                f"MDS should be mitigated or not affected, got: {status}"
-            )
-
-    async def test_mitigations_not_disabled_in_cmdline(self, dual_scheduler: Scheduler) -> None:
-        """Kernel cmdline must NOT contain 'mitigations=off' or 'nokaslr'.
-
-        These were previously used for performance but disable critical
-        protections against speculative execution attacks (CVE-2025-40300).
-        """
-        code = """\
-with open('/proc/cmdline') as f:
-    cmdline = f.read().strip()
-print(f'CMDLINE:{cmdline}')
-"""
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
-        assert result.exit_code == 0
-        cmdline = result.stdout.strip().split("CMDLINE:", 1)[1]
-        assert "mitigations=off" not in cmdline, f"mitigations=off must not be in kernel cmdline: {cmdline}"
-        assert "nokaslr" not in cmdline, f"nokaslr must not be in kernel cmdline: {cmdline}"
+        status = _extract_status(result.stdout, "mds")
+        if IS_X86:
+            _assert_mitigations_off_reached_guest("mds", status)
+        else:
+            assert status == "Not affected", f"mds is x86-only, arm64 must report 'Not affected', got: {status!r}"
 
 
 # =============================================================================
@@ -144,9 +180,10 @@ class TestTimerPrecision:
     """Informational measurement of timer resolution inside the guest VM.
 
     Documents clock_gettime(CLOCK_MONOTONIC) precision as a baseline.
-    No assertion on bounds — no VM-based FaaS coarsens timers:
+    No assertion on bounds because timer coarsening is not part of this
+    sandbox's security posture:
     - vDSO maps clock_gettime into userspace, bypassing seccomp entirely
-    - KernelSnitch (NDSS 2025) shows timer coarsening is provably ineffective
+    - KernelSnitch (NDSS 2025) demonstrates kernel-data-structure timing leaks
     - Cloudflare Workers freezes timers AND isolates processes (not applicable to VMs)
     - Browser 100us coarsening (W3C High Resolution Time) is for JS event loops
     """
@@ -207,18 +244,19 @@ else:
 # Edge: Timer side-channel defense sysctls
 # =============================================================================
 class TestTimerSideChannelDefenses:
-    """Verify host-side defenses that reduce side-channel effectiveness.
+    """Verify guest hardening that reduces side-channel effectiveness.
 
-    The primary defense against speculative execution side channels in VMs
-    is host-side hardening (Firecracker prod-host-setup model), not timer
-    coarsening. These tests verify the guest-visible effects.
+    Host-side isolation remains the primary VM boundary. These tests cover the
+    complementary guest perf/KSM posture; they do not assert host setup.
     """
 
     async def test_perf_event_paranoid_blocks_perf(self, dual_scheduler: Scheduler) -> None:
-        """perf_event_paranoid >= 3 disables perf counters for all users.
+        """perf is restricted by sysctl on x86 and compiled out on arm64.
 
         Hardware performance counters are a precise side-channel primitive.
         Cross-referenced with test_kernel_attack_surface.py::TestKernelInfoLeakSysctls.
+        The final kernel has CONFIG_PERF_EVENTS=n on arm64; x86 arch Kconfig
+        force-selects it, so the runtime sysctl must be >= 3 there.
         """
         code = """\
 try:
@@ -233,21 +271,22 @@ except PermissionError:
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        if "PERF_PARANOID:" in stdout and stdout.split(":")[1].lstrip("-").isdigit():
+        if IS_X86:
+            assert "PERF_PARANOID:" in stdout and stdout.split(":", 1)[1].lstrip("-").isdigit(), (
+                f"x86 force-selects CONFIG_PERF_EVENTS; expected readable perf_event_paranoid, got: {stdout!r}"
+            )
             val = int(stdout.split(":")[1])
             assert val >= 3, f"Expected perf_event_paranoid >= 3, got {val}"
         else:
-            assert "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-                f"Expected perf_event_paranoid >= 3 or inaccessible. stdout: {stdout}"
-            )
+            assert stdout == "NOT_FOUND", f"arm64 CONFIG_PERF_EVENTS=n requires no perf sysctl, got: {stdout!r}"
 
     async def test_ksm_disabled(self, dual_scheduler: Scheduler) -> None:
         """KSM (Kernel Same-page Merging) must be disabled inside the guest.
 
         KSM enables cross-VM side channels by measuring page deduplication
-        timing. Host-side KSM (QEMU mem-merge=on) is enabled for density but
-        the guest kernel must NOT have CONFIG_KSM to prevent in-guest
-        side-channel attacks. This test verifies the guest kernel has it off.
+        timing. Host-side KSM (QEMU mem-merge=on) is enabled for density, but
+        the guest kernel has CONFIG_KSM=n. The sysfs control must therefore be
+        absent; accepting run=0 would miss an accidental KSM re-enable.
         """
         code = """\
 try:
@@ -262,17 +301,14 @@ except PermissionError:
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        # KSM run=0 means disabled, NOT_FOUND means not compiled in — both safe
-        assert "KSM_RUN:0" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected KSM disabled (run=0) or not available. stdout: {stdout}"
-        )
+        assert stdout == "NOT_FOUND", f"CONFIG_KSM=n requires /sys/kernel/mm/ksm/run to be absent, got: {stdout!r}"
 
-    async def test_guest_ksm_pages_shared_zero(self, dual_scheduler: Scheduler) -> None:
-        """Verify KSM pages_shared is 0 inside the guest.
+    async def test_guest_ksm_pages_shared_absent(self, dual_scheduler: Scheduler) -> None:
+        """Verify KSM pages_shared is absent inside the guest.
 
-        Guest kernel has CONFIG_KSM disabled, so pages_shared should be 0
-        or the file should not exist. Host-side KSM (mem-merge=on) operates
-        at the QEMU process level and is invisible to the guest.
+        Guest kernel has CONFIG_KSM=n, so pages_shared must not exist.
+        Host-side KSM (mem-merge=on) operates at the QEMU process level and is
+        invisible to the guest.
         """
         code = """\
 try:
@@ -287,8 +323,8 @@ except PermissionError:
         result = await dual_scheduler.run(code=code, language=Language.PYTHON)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
-        assert "PAGES_SHARED:0" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
-            f"Expected KSM pages_shared=0. stdout: {stdout}"
+        assert stdout == "NOT_FOUND", (
+            f"CONFIG_KSM=n requires /sys/kernel/mm/ksm/pages_shared to be absent, got: {stdout!r}"
         )
 
 
@@ -307,10 +343,10 @@ class TestCpuVulnerabilityTransparency:
         """All vulnerability status files should be readable and documented.
 
         Enumerates /sys/devices/system/cpu/vulnerabilities/ to capture the
-        full mitigation state. This is informational — some vulnerabilities
-        may report "Vulnerable" when the hypervisor/CPU lacks hardware support
-        for a specific mitigation (e.g., spec_store_bypass under HVF).
-        The critical mitigations (Spectre v1/v2, MDS) are tested individually.
+        full state. Readability (transparency) is the invariant — with
+        mitigations=off, many entries are EXPECTED to report "Vulnerable";
+        that is the configured density posture, not a regression. Per-file
+        posture semantics are tested individually in TestMitigationStatus.
         """
         code = """\
 import os
@@ -335,6 +371,8 @@ else:
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "DIR_NOT_FOUND" not in stdout, "CPU vulnerability directory should exist"
+        error_lines = [line for line in stdout.splitlines() if ":ERROR:" in line]
+        assert not error_lines, f"All CPU vulnerability files must be readable, got: {error_lines}"
         # Verify at least some vulnerability files were read (sanity check)
         lines = [line for line in stdout.splitlines() if ":" in line and "ERROR" not in line]
         assert len(lines) > 0, f"Expected vulnerability status entries. stdout: {stdout}"

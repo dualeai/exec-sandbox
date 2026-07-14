@@ -6,7 +6,6 @@
 #[macro_use]
 mod sys;
 mod device;
-mod zram;
 
 use std::ffi::CString;
 use std::fs;
@@ -314,7 +313,7 @@ fn switch_root() -> ! {
     // Stage 1: Ensure stdin is valid (open /dev/null if needed)
     let devnull = CString::new("/dev/null").unwrap();
     let stdin_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_RDONLY) };
-    if stdin_fd >= 0 && stdin_fd != 0 {
+    if stdin_fd > 0 {
         unsafe {
             libc::dup2(stdin_fd, 0);
             libc::close(stdin_fd);

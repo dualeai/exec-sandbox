@@ -1,0 +1,26 @@
+# Managed by `make upgrade` (scripts/upgrade-versions.sh). Do not edit manually.
+# KEY=VALUE, no spaces: consumed by Make (include) and parsed by shell via grep
+# (never sourced — lock values must not be executable).
+# Quarantine: releases distributed less than 7 days before generation are
+# rejected (uv equivalent: commit c6b54393).
+# Generated: 2026-07-12
+# ALPINE_VERSION: distributed 2026-06-09 (branch GA)
+ALPINE_VERSION=3.24
+# ALPINE_IMAGE_DIGEST: distributed 2026-06-16 (image build)
+ALPINE_IMAGE_DIGEST=sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+# QEMU_VERSION: distributed 2026-06-28 (tarball publication)
+QEMU_VERSION=11.0.2
+# QEMU_SHA256: distributed 2026-06-28 (tarball publication)
+QEMU_SHA256=3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5
+# RUST_VERSION: distributed 2026-06-30 (stable channel release)
+RUST_VERSION=1.96
+# RUST_IMAGE_DIGEST: distributed 2026-07-01 (image build)
+RUST_IMAGE_DIGEST=sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523
+# LINUX_VIRT_VERSION: distributed 2026-07-04 (kernel.org tarball publication)
+LINUX_VIRT_VERSION=6.18.38-r0
+# KERNEL_VERSION: distributed 2026-07-04 (ships in linux-virt above)
+KERNEL_VERSION=6.18.38
+# KERNEL_TARBALL_VERSION: distributed 2026-07-04 (derived from KERNEL_VERSION)
+KERNEL_TARBALL_VERSION=6.18.38
+# KERNEL_SHA256: distributed 2026-07-04 (kernel.org tarball publication)
+KERNEL_SHA256=ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045

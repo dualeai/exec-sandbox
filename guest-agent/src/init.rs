@@ -1,10 +1,13 @@
 //! Init-time setup: PID 1 environment, mounts, network, zombie reaping.
 
 use std::process::Command as StdCommand;
-
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use crate::constants::{NETWORK_NOTIFY, NETWORK_READY, SANDBOX_GID, SANDBOX_UID};
+use crate::constants::{
+    NETWORK_FAILED, NETWORK_NOTIFY, NETWORK_PENDING, NETWORK_READY, NETWORK_SETUP_TIMEOUT_SECONDS,
+    NETWORK_STATE, SANDBOX_GID, SANDBOX_UID, ZRAM_FAILED, ZRAM_READY, ZRAM_STATE,
+};
 
 // ============================================================================
 // Zombie reaping
@@ -71,15 +74,11 @@ pub(crate) fn setup_phase2_core() {
     apply_zram_vm_tuning();
     // Readahead tuning for virtio-blk + EROFS.
     //
-    // EROFS pcluster is 16KB (-C16384). We set readahead to 128KB (8 pclusters)
-    // to batch more data per virtio-blk request, which is a reasonable default for
-    // sequential workloads (Python/Bun startup loads .pyc/.so files in order).
-    //
-    // NOTE: Tested 16KB vs 128KB readahead during cold-start investigation
-    // (session 4). No measurable wall-time improvement — the bottleneck is
-    // macOS Mach kernel hv_trap overhead (~360µs per VM exit), not I/O batch
-    // size. Kept at 128KB as a sensible default (fewer bio submissions for
-    // sequential reads), but this is NOT a cold-start fix.
+    // EROFS pcluster is 16KB (-C16384). Readahead set to 16KB (1 pcluster)
+    // to minimize per-file readahead buffer memory. Tested 128KB vs 16KB:
+    // no measurable wall-time difference (bottleneck is Mach kernel hv_trap
+    // overhead, not I/O batch size). Lower readahead = less kernel page cache
+    // pressure from speculative reads that may never be consumed.
     //
     // Set on all vd* block devices — device naming varies by architecture
     // (ARM MMIO enumerates in reverse order), so we don't assume vda=base.
@@ -91,7 +90,7 @@ pub(crate) fn setup_phase2_core() {
         let name = entry.file_name();
         if name.to_string_lossy().starts_with("vd") {
             let path = entry.path().join("queue/read_ahead_kb");
-            let _ = std::fs::write(path, "128");
+            let _ = std::fs::write(path, "16");
         }
     }
     // /dev writes (symlinks, shm mount) must happen before mount_readonly_paths()
@@ -101,48 +100,149 @@ pub(crate) fn setup_phase2_core() {
     mount_readonly_paths();
 }
 
-/// Background zram setup: device wait, compression, mkswap, swapon, VM tuning.
-/// E3: Moved off critical path — zram is only needed under memory pressure,
-/// not for Ping/file I/O readiness.
-pub(crate) async fn setup_zram_background() {
-    tokio::task::spawn_blocking(setup_zram_swap).await.ok();
+/// Zram setup + /dev sealing, run to completion before the virtio listener
+/// opens its long-lived ports (main.rs awaits this). No guest-side deadline:
+/// the blocking worker cannot be cancelled, and abandoning it would leave an
+/// armed pressure guard and live swap inside a VM already published as failed.
+/// A wedged worker is the host boot watchdog's failure to own — it discards
+/// the VM. There is no no-swap path.
+pub(crate) async fn setup_zram_and_seal_dev() {
+    let zram_active = match tokio::task::spawn_blocking(setup_zram_swap).await {
+        Ok(ZramSetupOutcome::Active) => true,
+        Ok(ZramSetupOutcome::Failed) => {
+            log_warn!("[zram] setup failed; marking VM unavailable");
+            false
+        }
+        Err(error) => {
+            log_warn!("[zram] setup worker failed: {error}");
+            false
+        }
+    };
+    let dev_read_only = mount_readonly(c"/dev");
+    if !dev_read_only {
+        log_warn!("[zram] failed to seal /dev read-only; marking VM unavailable");
+    }
+    let state = if zram_active && dev_read_only {
+        ZRAM_READY
+    } else {
+        ZRAM_FAILED
+    };
+    ZRAM_STATE.store(state, Ordering::Release);
 }
 
 /// Background network setup: ip config + gvproxy verification.
-/// Runs on spawn_blocking (uses StdCommand for ip, I/O-bound).
-/// Marks NETWORK_READY when complete; ExecuteCode/InstallPackages gate on this.
+/// Runs on spawn_blocking (uses StdCommand for ip, I/O-bound). The blocking
+/// worker cannot be cancelled, so publish a terminal failure if it exceeds the
+/// deadline; the host will discard the VM instead of leaving a request waiting.
 pub(crate) async fn setup_network_background() {
     let t0 = crate::monotonic_ms();
-    tokio::task::spawn_blocking(|| {
-        setup_network();
-    })
+    let state = match tokio::time::timeout(
+        Duration::from_secs(NETWORK_SETUP_TIMEOUT_SECONDS),
+        tokio::task::spawn_blocking(setup_network),
+    )
     .await
-    .ok();
-    mark_network_ready();
+    {
+        Ok(Ok(Ok(()))) => NETWORK_READY,
+        Ok(Ok(Err(error))) => {
+            log_warn!("network setup failed: {error}");
+            NETWORK_FAILED
+        }
+        Ok(Err(error)) => {
+            log_warn!("network setup worker failed: {error}");
+            NETWORK_FAILED
+        }
+        Err(_) => {
+            log_warn!(
+                "network setup exceeded {}s; marking VM unavailable",
+                NETWORK_SETUP_TIMEOUT_SECONDS
+            );
+            NETWORK_FAILED
+        }
+    };
+    publish_network_state(state);
     let t_done = crate::monotonic_ms();
-    log_info!(
-        "[timing] network_ready: {}ms ({}ms elapsed)",
-        t_done,
-        t_done - t0
-    );
+    if state == NETWORK_READY {
+        log_info!(
+            "[timing] network_ready: {}ms ({}ms elapsed)",
+            t_done,
+            t_done - t0
+        );
+    } else {
+        log_warn!(
+            "[timing] network_failed: {}ms ({}ms elapsed)",
+            t_done,
+            t_done - t0
+        );
+    }
 }
 
-fn mark_network_ready() {
-    NETWORK_READY.store(true, Ordering::Release);
+fn publish_network_state(state: u8) {
+    NETWORK_STATE.store(state, Ordering::Release);
     NETWORK_NOTIFY.notify_waiters();
 }
 
-/// Wait until network setup is complete. No-op if already ready.
-pub(crate) async fn wait_for_network() {
-    if NETWORK_READY.load(Ordering::Acquire) {
-        return;
+fn current_network_state() -> Result<bool, &'static str> {
+    decode_network_state(NETWORK_STATE.load(Ordering::Acquire))
+}
+
+fn decode_network_state(state: u8) -> Result<bool, &'static str> {
+    match state {
+        NETWORK_READY => Ok(true),
+        NETWORK_FAILED => Err("network setup failed"),
+        NETWORK_PENDING => Ok(false),
+        _ => Err("network setup entered an invalid state"),
     }
+}
+
+/// Wait until network setup reaches a terminal state. Intentionally offline VMs
+/// are ready after loopback setup; a failed/stuck worker is an infrastructure
+/// error so the host can destroy and replace the VM.
+pub(crate) async fn wait_for_network() -> Result<(), &'static str> {
+    if current_network_state()? {
+        return Ok(());
+    }
+
     // Re-check after registering the notified future to avoid TOCTOU race
     let notified = NETWORK_NOTIFY.notified();
-    if NETWORK_READY.load(Ordering::Acquire) {
-        return;
+    if current_network_state()? {
+        return Ok(());
     }
-    notified.await;
+
+    tokio::time::timeout(
+        Duration::from_secs(NETWORK_SETUP_TIMEOUT_SECONDS + 1),
+        notified,
+    )
+    .await
+    .map_err(|_| "network setup readiness timed out")?;
+
+    if current_network_state()? {
+        Ok(())
+    } else {
+        Err("network setup notification arrived without a terminal state")
+    }
+}
+
+fn decode_zram_state(state: u8) -> Result<(), &'static str> {
+    match state {
+        ZRAM_READY => Ok(()),
+        ZRAM_FAILED => Err("zram safety setup failed"),
+        _ => Err("zram safety state is not terminal"),
+    }
+}
+
+/// Capped-zram setup publishes a terminal state before the virtio listener
+/// starts (main.rs awaits it), so commands check it synchronously and fail
+/// closed on anything but active swap. In particular, `swapon` cannot overlap
+/// untrusted process execution before monitor startup.
+pub(crate) fn require_memory_safety() -> Result<(), &'static str> {
+    decode_zram_state(ZRAM_STATE.load(Ordering::Acquire))
+}
+
+/// Process-spawning commands require both boot workers' outcomes. Zram is
+/// terminal before the listener starts; only network setup is still concurrent.
+pub(crate) async fn wait_for_untrusted_readiness() -> Result<(), &'static str> {
+    require_memory_safety()?;
+    wait_for_network().await
 }
 
 /// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
@@ -198,14 +298,10 @@ fn mount_readonly_paths() {
     }
 
     // A5: Removed per-mount log_info! calls — each is an expensive serial write
-    // /dev is safe to make read-only here: setup_dev_symlinks() and setup_dev_shm()
-    // run before this function. listen_virtio_serial() opens existing device files
-    // (not creating new ones), so read-only /dev doesn't block it. The background
-    // zram setup opens /dev/zram0 (an existing block device) for write — the block
-    // device layer bypasses VFS permission checks, so RO bind mount doesn't block it.
-    // The remove_file("/dev/zram0") at cleanup is already `let _ =` (ignores EROFS).
+    // /dev is sealed by setup_zram_and_seal_dev() only after zram has removed its
+    // setup-only block-device node. Untrusted execution remains gated until that
+    // read-only remount succeeds.
     for path in [
-        c"/dev",
         c"/etc/hosts",
         c"/etc/resolv.conf",
         c"/proc/sys",
@@ -237,32 +333,54 @@ fn mount_readonly_paths() {
 /// Configure loopback and eth0 network interfaces.
 /// No wait loop for eth0 — configure if present, skip if not.
 /// Called from spawn_blocking in setup_network_background().
-fn setup_network() {
-    let _ = StdCommand::new("ip")
-        .args(["link", "set", "lo", "up"])
-        .status();
+fn setup_network() -> Result<(), String> {
+    run_ip("loopback_up", &["link", "set", "lo", "up"])?;
 
     if std::path::Path::new("/sys/class/net/eth0").exists() {
-        let _ = StdCommand::new("ip")
-            .args(["link", "set", "eth0", "up"])
-            .status();
-        let _ = StdCommand::new("ip")
-            .args(["addr", "add", "192.168.127.2/24", "dev", "eth0"])
-            .status();
-        let _ = StdCommand::new("ip")
-            .args(["route", "add", "default", "via", "192.168.127.1"])
-            .status();
+        run_ip("eth0_up", &["link", "set", "eth0", "up"])?;
+        run_ip(
+            "eth0_address",
+            &["addr", "add", "192.168.127.2/24", "dev", "eth0"],
+        )?;
+        run_ip(
+            "default_route",
+            &["route", "add", "default", "via", "192.168.127.1"],
+        )?;
 
-        // Verify gvproxy connectivity. ExecuteCode/InstallPackages gate on
-        // NETWORK_READY, so network is guaranteed ready before code/package ops.
-        verify_gvproxy();
+        // Verify gvproxy connectivity. ExecuteCode/InstallPackages gate on the
+        // untrusted-readiness check (network + zram), so a failure here makes
+        // every code/package op fail rather than run without networking.
+        verify_gvproxy().map_err(str::to_string)?;
     } else {
-        log_warn!("eth0 not found, network unavailable");
+        log_info!("eth0 not found, intentionally offline network is ready");
+    }
+    Ok(())
+}
+
+fn run_ip(stage: &str, args: &[&str]) -> Result<(), String> {
+    let started = crate::monotonic_ms();
+    log_info!("[network] stage={stage} action=start at={started}ms");
+    match StdCommand::new("ip").args(args).status() {
+        Ok(status) if status.success() => {
+            log_info!(
+                "[network] stage={stage} action=complete elapsed={}ms",
+                crate::monotonic_ms() - started
+            );
+            Ok(())
+        }
+        Ok(status) => Err(format!(
+            "stage={stage} status={status} elapsed={}ms",
+            crate::monotonic_ms() - started
+        )),
+        Err(error) => Err(format!(
+            "stage={stage} spawn_failed={error} elapsed={}ms",
+            crate::monotonic_ms() - started
+        )),
     }
 }
 
 // ============================================================================
-// Deferred operations (B1, B4, B5 — moved off tiny-init critical path)
+// Deferred operations (B4, B5 — moved off tiny-init critical path)
 // ============================================================================
 
 /// B5: Create /dev/fd and /dev/std* symlinks.
@@ -326,9 +444,26 @@ pub(crate) fn ensure_repl_wrappers() {
     });
 }
 
-/// B1: Full zram device setup (moved from tiny-init).
-/// Includes: device wait, compression config, disksize, mkswap, swapon, VM tuning.
-fn setup_zram_swap() {
+/// Terminal outcome of `setup_zram_swap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZramSetupOutcome {
+    Active,
+    Failed,
+}
+
+const ZRAM_DISK_PERCENT: u64 = 40;
+const ZRAM_MEM_PERCENT: u64 = 20;
+
+fn zram_geometry(mem_kb: u64) -> (u64, u64) {
+    // Guests are hundreds of MB; u64 arithmetic on MemTotal cannot overflow.
+    let mem_bytes = mem_kb * 1024;
+    (
+        mem_bytes * ZRAM_DISK_PERCENT / 100,
+        mem_bytes * ZRAM_MEM_PERCENT / 100,
+    )
+}
+
+fn setup_zram_swap() -> ZramSetupOutcome {
     use std::io::Write;
     use std::path::Path;
     use std::thread;
@@ -339,9 +474,17 @@ fn setup_zram_swap() {
     const SYS_SWAPON: libc::c_long = 167;
     #[cfg(target_arch = "aarch64")]
     const SYS_SWAPON: libc::c_long = 224;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_SWAPOFF: libc::c_long = 168;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SWAPOFF: libc::c_long = 225;
     const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
 
-    // Wait for zram device to appear after module load (loaded by tiny-init)
+    fn reset_zram() {
+        let _ = std::fs::write("/sys/block/zram0/reset", "1");
+    }
+
+    // Wait for the built-in zram device to appear.
     // Exponential backoff: 0.5+1+2+4+8+16 = 31.5ms max
     let delays_us = [500, 1000, 2000, 4000, 8000, 16000];
     let found = {
@@ -359,82 +502,104 @@ fn setup_zram_swap() {
         ok
     };
     if !found {
-        log_warn!("[zram] device not found, skipping");
-        return;
+        log_warn!("[zram] setup failed: device not found");
+        return ZramSetupOutcome::Failed;
     }
 
-    // Compression algorithm fallback chain: lz4 -> lzo-rle -> lzo
-    let algo = ["lz4", "lzo-rle", "lzo"]
-        .iter()
-        .find(|a| std::fs::write("/sys/block/zram0/comp_algorithm", a).is_ok());
-    if algo.is_none() {
-        log_warn!("[zram] failed to set compression algorithm, skipping");
-        return;
-    }
+    let requested_algorithm = "lz4";
+    let dev = std::ffi::CString::new("/dev/zram0").unwrap();
 
-    // Kernel 6.16+: algorithm-specific tuning via sysfs
-    let _ = std::fs::write("/sys/block/zram0/algorithm_params", "level=1");
+    // Configure geometry and activate swap. Every step here is a reset-only
+    // failure — swapon is the last fallible step, so any Err leaves swap
+    // inactive and a bare reset_zram() is always the correct cleanup. The
+    // closure boundary ends exactly at swapon; guard.spawn() and remove_file
+    // below keep their own stage-specific cleanup.
+    let setup =
+        (|| -> Result<(crate::oom_guard::PreparedOomGuard, crate::oom_guard::VerifiedZramGeometry), String> {
+            // The fixed geometry and pressure guard require lz4. The kernel rejects
+            // unknown algorithms at write time, so a successful write is the selection.
+            std::fs::write("/sys/block/zram0/comp_algorithm", requested_algorithm)
+                .map_err(|_| "could not set required lz4 compression".to_string())?;
 
-    let mem_kb = read_mem_total_kb();
+            // Kernel 6.16+: algorithm-specific tuning via sysfs (best-effort).
+            let _ = std::fs::write("/sys/block/zram0/algorithm_params", "level=1");
 
-    // disksize = 40% of RAM (in bytes): mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5
-    // Reduced from 50% to lower slab metadata overhead (~10MB savings).
-    // 40% with LZ4 (~2.5x ratio) gives ~160MB usable swap on 192MB VM.
-    let zram_size = mem_kb * 2048 / 5;
-    if std::fs::write("/sys/block/zram0/disksize", zram_size.to_string()).is_err() {
-        log_warn!("[zram] failed to set disksize, skipping");
-        return;
-    }
+            let (zram_size, mem_limit) = zram_geometry(read_mem_total_kb());
 
-    // Cap compressed memory at 25% of RAM. Without this, zram accepts pages
-    // indefinitely — the kernel reclaim loop thrashes (compress/decompress)
-    // instead of triggering the OOM killer, making the VM appear hung until
-    // timeout. With mem_limit, once compressed storage is full zram returns
-    // -ENOMEM on write → swap fails → OOM fires within seconds.
-    //
-    // Sizing: 20% of RAM × 2-3x lz4 ratio ≈ 40-60% effective swap capacity.
-    // For a 192 MB VM this means ~38 MB compressed → ~76-115 MB usable swap.
-    // Reduced from 25% proportionally with disksize (40% disk / 20% mem).
-    //
-    // Refs:
-    //   - https://docs.kernel.org/admin-guide/blockdev/zram.html (mem_limit)
-    //   - https://lwn.net/Articles/612763/ (zram-full thrashing analysis)
-    let mem_limit = mem_kb * 1024 / 5; // 20% of RAM in bytes
-    let _ = std::fs::write("/sys/block/zram0/mem_limit", mem_limit.to_string());
+            // Logical swap is 40% of RAM. Compression reduces its physical backing
+            // cost; it does not increase this disksize ceiling.
+            std::fs::write("/sys/block/zram0/disksize", zram_size.to_string())
+                .map_err(|_| "could not set disksize".to_string())?;
 
-    // Build and write swap header (mkswap equivalent)
-    let header = match build_swap_header(zram_size) {
-        Some(h) => h,
-        None => {
-            log_warn!("[zram] device too small for swap, skipping");
-            return;
+            // Cap compressed backing at 20% of RAM. Logical slots remain advertised
+            // when incompressible writes fill that cap, so the PSI guard terminates
+            // the VM if reclaim then stalls at substantial zram occupancy.
+            std::fs::write("/sys/block/zram0/mem_limit", mem_limit.to_string())
+                .map_err(|e| format!("could not set mem_limit: {e}"))?;
+
+            // The mem_limit sysfs node is write-only. mm_stat field 4 is the
+            // kernel's effective, page-rounded value and is the actual invariant.
+            // PSI must also be operational before this geometry may be activated.
+            let (oom_guard, geometry) =
+                crate::oom_guard::PreparedOomGuard::prepare(mem_limit, zram_size)
+                    .map_err(|e| format!("OOM guard verification: {e}"))?;
+
+            // Build and write swap header (mkswap equivalent).
+            let header = build_swap_header(geometry.disksize)
+                .ok_or_else(|| "device too small for swap".to_string())?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/zram0")
+                .and_then(|mut f| f.write_all(&header))
+                .map_err(|e| format!("mkswap: {e}"))?;
+
+            // swapon with high priority. Returning 0 attests activation; no
+            // /proc/swaps readback needed.
+            if unsafe { libc::syscall(SYS_SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) } < 0 {
+                return Err(format!("swapon: {}", std::io::Error::last_os_error()));
+            }
+            Ok((oom_guard, geometry))
+        })();
+    let (oom_guard, geometry) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            log_warn!("[zram] setup failed: {e}");
+            reset_zram();
+            return ZramSetupOutcome::Failed;
         }
     };
-    let header_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new().write(true).open("/dev/zram0")?;
-        f.write_all(&header)
-    })();
-    if let Err(e) = header_result {
-        log_warn!("[zram] mkswap failed: {e}, skipping");
-        return;
+
+    // Start only after verified zram activation. If the dedicated thread cannot
+    // be created, immediately remove swap and reset zram rather than leave the
+    // capped geometry active without its pressure guard.
+    if let Err(e) = oom_guard.spawn() {
+        log_warn!("[zram] setup failed: could not start OOM guard: {e}");
+        let swapoff_rc = unsafe { libc::syscall(SYS_SWAPOFF, dev.as_ptr()) };
+        let reset_result = std::fs::write("/sys/block/zram0/reset", "1");
+        if swapoff_rc != 0 || reset_result.is_err() {
+            log_warn!("[zram] cleanup after guard failure failed, powering off guest");
+            crate::oom_guard::emergency_poweroff();
+        }
+        return ZramSetupOutcome::Failed;
     }
 
-    // swapon with high priority
-    let dev = std::ffi::CString::new("/dev/zram0").unwrap();
-    let ret = unsafe { libc::syscall(SYS_SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) };
-    if ret < 0 {
-        log_warn!(
-            "[zram] swapon failed (errno={}), skipping",
-            std::io::Error::last_os_error()
-        );
-        return;
-    }
+    log_info!(
+        "[zram] ready: active {} swap with PSI guard (disksize={}, mem_limit={})",
+        requested_algorithm,
+        geometry.disksize,
+        geometry.mem_limit,
+    );
 
-    // Security: remove device node after swapon
-    let _ = std::fs::remove_file("/dev/zram0");
+    // Security: remove the setup-only device node before /dev is sealed and
+    // before untrusted execution readiness is published.
+    if let Err(e) = std::fs::remove_file("/dev/zram0") {
+        log_warn!("[zram] failed to remove /dev/zram0: {e}");
+        return ZramSetupOutcome::Failed;
+    }
 
     // VM tuning for zram is pre-applied in apply_zram_vm_tuning() before
     // /proc/sys is made read-only. No sysctl writes needed here.
+    ZramSetupOutcome::Active
 }
 
 /// Build a swap header for the given device size.
@@ -448,8 +613,6 @@ fn setup_zram_swap() {
 ///
 /// Uses runtime sysconf(_SC_PAGESIZE) to support both 4KB (x86_64)
 /// and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES) kernels.
-///
-/// NOTE: Mirrored in tiny-init/src/zram.rs — keep both in sync.
 fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
     let page_size = page_size();
     let pages = (device_size / page_size).saturating_sub(1) as u32;
@@ -468,7 +631,7 @@ fn build_swap_header(device_size: u64) -> Option<Vec<u8>> {
 }
 
 // ============================================================================
-// Sysctl hardening (moved from tiny-init for boot latency; modules_disabled stays in tiny-init)
+// Sysctl hardening
 // ============================================================================
 
 /// E3: Critical sysctl — must be applied before any request handling.
@@ -534,7 +697,13 @@ fn apply_zram_vm_tuning() {
     let mem_kb = read_mem_total_kb();
 
     let _ = std::fs::write("/proc/sys/vm/page-cluster", "0");
-    let _ = std::fs::write("/proc/sys/vm/swappiness", "180");
+    // 100, not the Arch-wiki zram value of 180: that advice assumes an
+    // UNCAPPED zram. With mem_limit set, swappiness=180 makes reclaim bang
+    // exclusively on the zram wall once the cap is hit (writes fail with the
+    // swap still advertised as free), feeding the should_reclaim_retry
+    // capped-zram reclaim stall. 100 keeps file-page reclaim in the mix while
+    // the PSI/zram guard handles a confirmed allocator-stall condition.
+    let _ = std::fs::write("/proc/sys/vm/swappiness", "100");
     let _ = std::fs::write(
         "/proc/sys/vm/min_free_kbytes",
         (mem_kb * 4 / 100).to_string(),
@@ -578,14 +747,16 @@ fn read_mem_total_kb() -> u64 {
 
 /// Runtime page size from sysconf(_SC_PAGESIZE).
 /// Supports both 4KB (x86_64) and 16KB (aarch64 with CONFIG_ARM64_16K_PAGES).
-///
-/// NOTE: Mirrored in tiny-init/src/sys.rs — keep both in sync.
+/// (tiny-init/src/sys.rs keeps its own raw copy for its separate crate.)
 fn page_size() -> u64 {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    // Single checked implementation lives in oom_guard; sysconf(_SC_PAGESIZE)
+    // cannot fail on Linux, and a PID-1 panic here is a boot failure anyway.
+    crate::oom_guard::page_size().expect("sysconf(_SC_PAGESIZE)")
 }
 
 /// Verify gvproxy connectivity with exponential backoff.
-/// Blocks phase 2 completion, so ExecuteCode/InstallPackages wait for network.
+/// Runs inside the background network worker; ExecuteCode/InstallPackages wait
+/// on the untrusted-readiness gate, which reflects this probe's outcome.
 ///
 /// DNS-first verification (no fork/exec):
 /// UDP DNS query to gateway:53 — any response proves both L3 routing AND DNS proxy
@@ -595,7 +766,7 @@ fn page_size() -> u64 {
 ///
 /// If DNS fails after all retries, a single TCP probe to gateway:1 distinguishes
 /// "no L3" from "L3 ok but DNS broken" — for diagnostics only.
-fn verify_gvproxy() {
+fn verify_gvproxy() -> Result<(), &'static str> {
     use std::net::{SocketAddr, TcpStream, UdpSocket};
 
     // DNS probe: proves both L3 routing and DNS proxy readiness in one shot.
@@ -622,7 +793,7 @@ fn verify_gvproxy() {
                 let mut buf = [0u8; 512];
                 if sock.recv(&mut buf).is_ok() {
                     log_info!("Network verified via DNS (attempt {})", i + 1);
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -637,8 +808,10 @@ fn verify_gvproxy() {
     };
     if l3_ok {
         log_warn!("gvproxy L3 reachable but DNS not responding, external connectivity may fail");
+        Err("gvproxy DNS probe failed")
     } else {
         log_warn!("gvproxy unreachable (no L3), network will not work");
+        Err("gvproxy L3 probe failed")
     }
 }
 
@@ -707,5 +880,70 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::ZRAM_PENDING;
+
+    #[test]
+    fn network_state_decoder_distinguishes_all_terminal_states() {
+        assert_eq!(decode_network_state(NETWORK_PENDING), Ok(false));
+        assert_eq!(decode_network_state(NETWORK_READY), Ok(true));
+        assert_eq!(
+            decode_network_state(NETWORK_FAILED),
+            Err("network setup failed")
+        );
+    }
+
+    #[test]
+    fn network_state_decoder_rejects_unknown_values() {
+        assert!(decode_network_state(200).is_err());
+    }
+
+    #[test]
+    fn zram_geometry_is_40_percent_disk_20_percent_mem() {
+        // 1000 KiB => 1_024_000 bytes; independent literals, not the formula.
+        assert_eq!(zram_geometry(1000), (409_600, 204_800));
+        assert_eq!(zram_geometry(0), (0, 0));
+    }
+
+    #[test]
+    fn swap_header_layout_matches_swapspace2() {
+        let ps = page_size() as usize;
+
+        // Kernel rejects tiny swap: 10 usable pages is the floor.
+        assert!(build_swap_header((10 * ps) as u64).is_none());
+
+        let header = build_swap_header((12 * ps) as u64).expect("12 pages is enough");
+        assert_eq!(header.len(), ps);
+        assert_eq!(&header[ps - 10..], b"SWAPSPACE2");
+        assert_eq!(&header[1024..1028], &1u32.to_le_bytes()); // version
+        assert_eq!(&header[1028..1032], &11u32.to_le_bytes()); // last_page = 12 - 1
+    }
+
+    #[tokio::test]
+    async fn untrusted_readiness_fails_closed_on_zram_before_network() {
+        // NETWORK_STATE stays PENDING: if the zram check did not run first,
+        // this call would block on the network waiter instead of erroring.
+        ZRAM_STATE.store(ZRAM_FAILED, Ordering::Release);
+        let result = wait_for_untrusted_readiness().await;
+        assert_eq!(result, Err("zram safety setup failed"));
+        ZRAM_STATE.store(ZRAM_PENDING, Ordering::Release);
+    }
+
+    #[test]
+    fn zram_state_decoder_fails_closed_on_anything_but_active() {
+        assert_eq!(decode_zram_state(ZRAM_READY), Ok(()));
+        assert_eq!(
+            decode_zram_state(ZRAM_FAILED),
+            Err("zram safety setup failed")
+        );
+        assert_eq!(
+            decode_zram_state(ZRAM_PENDING),
+            Err("zram safety state is not terminal")
+        );
     }
 }

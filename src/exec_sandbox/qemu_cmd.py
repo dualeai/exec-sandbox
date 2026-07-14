@@ -17,6 +17,7 @@ from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
     probe_io_uring_support,
+    probe_qemu_sandbox_support,
     probe_qemu_version,
     probe_unshare_support,
 )
@@ -191,6 +192,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             parts.append("dump-guest-core=off")
         machine_type = ",".join(parts)
 
+    # Honor an explicitly configured QEMU path (e.g. CI build-from-source);
+    # otherwise the bare binary name is resolved from PATH by exec.
+    configured_qemu = settings.qemu_bin_arm if arch == HostArch.AARCH64 else settings.qemu_bin_x86
+    if configured_qemu.is_file():
+        qemu_bin = str(configured_qemu)
+
     # VM Templating: file-backed memory for COW sharing across VMs.
     # When mem_path is set, use memory-backend-file instead of anonymous RAM.
     # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED).
@@ -276,10 +283,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # TCG test suite uses. pauth-impdef=on forces the fast impdef PAC
             # algorithm (QEMU 10.0+ defaults to this for virt >= 10.0, but
             # older versions use QARMA5 which costs ~50% of TCG cycles).
-            # x86 TCG: SapphireRapids-v2 provides full Spectre/MDS mitigation
-            # flags (spec-ctrl, stibp, ssbd, arch-capabilities, md-clear,
-            # mds-no, taa-no, gds-no, rfds-no). TCG silently strips AVX-512
-            # and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
+            # x86 TCG: SapphireRapids-v2 as a modern feature baseline. Note:
+            # TCG cannot emulate the IA32_ARCH_CAPABILITIES MSR and strips the
+            # feature (warns "TCG doesn't support requested feature ...
+            # arch-capabilities", verified on QEMU 11.0.2), so hardware
+            # vulnerability self-declarations (mds-no, taa-no, ...) never reach
+            # the guest — TCG guests report MDS "Vulnerable". Irrelevant under
+            # the mitigations=off posture below. TCG also silently strips
+            # AVX-512 and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
             # also lacks 256-bit vector ops (TCG_TARGET_HAS_v256=0), so AVX2
             # is unavailable — effective ceiling is SSE4.2. On x86 hosts the
             # effective ceiling is x86_64-v3 (AVX2/FMA).
@@ -301,7 +312,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-m",
             f"{int(memory_mb)}M",  # QEMU -m requires integer MB
             "-smp",
-            str(int(cpu_cores)),  # QEMU -smp requires integer vCPU count
+            f"{int(cpu_cores)},maxcpus={int(cpu_cores)}",  # Cap maxcpus to prevent QEMU allocating extra vCPU structs
             "-kernel",
             str(kernel_path),
             "-initrd",
@@ -319,7 +330,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             #   noresume, raid, numa_balancing, i8042.*, random.trust_cpu,
             #   panic, rcupdate.rcu_expedited, edd, noautogroup, io_delay
             # =============================================================
-            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=1 swiotlb=noforce"
+            f"{console_params} root=/dev/vda rootflags=noatime rootfstype=erofs rootwait fsck.mode=skip reboot=t init=/init page_alloc.shuffle=0 swiotlb=0"
             # Disable page zeroing on alloc — KVM provides zero pages via shared zero
             # page, so guest-side zeroing is redundant for ephemeral VMs. Overrides
             # CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y at runtime. Saves 5-10% page faults.
@@ -334,8 +345,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + (" loglevel=7" if debug_boot else " quiet loglevel=0")
             # Skip timer calibration — safe in virtualized env with reliable TSC (10-30ms)
             + " no_timer_check"
-            # Keep expedited RCU after boot (built-in boot expediting covers boot phase)
-            + " rcupdate.rcu_normal_after_boot=0"
+            # Revert to normal (lazy) RCU after boot. Expedited RCU uses IPIs and
+            # per-CPU tracking for fast grace periods — useful during boot but wasteful
+            # for steady-state single-execution VMs. Normal RCU has lower memory and CPU
+            # overhead at the cost of ~10-30ms grace period latency (irrelevant for
+            # ephemeral workloads).
+            + " rcupdate.rcu_normal_after_boot=1"
             # /dev/kmsg access: on for debug, off for production
             + (" printk.devkmsg=on" if debug_boot else " printk.devkmsg=off")
             # Skip 8250 UART probing when ISA serial disabled (2-5ms, x86_64 only)
@@ -393,6 +408,44 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + (" cpuidle.governor=haltpoll" if accel_type == AccelType.KVM else " cpuidle.off=1")
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
+            # Disable CPU speculative execution mitigations in the guest kernel.
+            # VMSCAPE (CVE-2025-40300) must be mitigated by a patched/configured
+            # HOST kernel; guest mitigations=off neither enables nor disables that
+            # host defense (Linux does not apply VMSCAPE mitigation in guests).
+            # Guest-side mitigations add CPU overhead and per-CPU state without
+            # protecting a co-resident tenant (there is only one tenant per VM).
+            # This accepts residual risk to the trusted guest-agent and guest
+            # kernel from untrusted guest code.
+            # nokaslr is deliberately omitted: the x86 base config currently has
+            # CONFIG_RANDOMIZE_BASE=y, although this cmdline guard does not prove
+            # runtime randomization on the direct-vmlinux PVH boot path. The arm64
+            # base has CONFIG_RANDOMIZE_BASE=n; with mitigations=off its KPTI also
+            # remains off. That arm64 density tradeoff is accepted here rather
+            # than silently adding kpti=1 without performance evidence.
+            # The cmdline token/omission is pinned by
+            # test_vm_manager.py::TestKernelCmdlineMitigations.
+            + " mitigations=off"
+            # Limit possible CPUs to match -smp. Without this, QEMU machine types
+            # advertise many possible CPUs (virt: up to 512, microvm: up to 256),
+            # and the kernel allocates per-CPU data structures for ALL possible CPUs.
+            # nr_cpus=N caps possible CPUs, saving ~50-200KB per unused CPU slot.
+            + f" nr_cpus={int(cpu_cores)}"
+            # Disable lockup detection — saves per-CPU watchdog threads and timers.
+            # Ephemeral microVMs rely on host-side timeouts, not guest watchdogs.
+            + " nowatchdog"
+            # The guest's capped-zram safety guard uses a memory PSI stall
+            # trigger. The merged Alpine base config builds PSI in but sets
+            # CONFIG_PSI_DEFAULT_DISABLED=y (images/kernel/alpine-virt-*.config),
+            # so PSI stays off unless this explicit token is present;
+            # fail-closed zram setup verifies it.
+            + " psi=1"
+            # Disable cgroup controllers — minimal init with no systemd, no
+            # resource isolation needed inside the VM. Saves slab caches and
+            # per-CPU structures for each disabled controller.
+            + " cgroup_disable=memory,cpu,blkio,pids"
+            # Disable NUMA-aware workqueues — single-NUMA VM has no topology to
+            # optimize for. Saves per-NUMA-node workqueue pool allocation.
+            + " workqueue.disable_numa=1"
             + (" init.rw=1" if direct_write else "")
             + (" init.snap=1" if snapshot_drive else "")
             # Guest-agent log verbosity: init.quiet=0 un-gates log_info! macros
@@ -407,8 +460,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # but had NO effect — ARM VHE Stage-2 PTEs are still created lazily by hardware
     # on first guest access, regardless of host page presence.
 
-    # Layer 3: Seccomp sandbox - Linux only
-    if detect_host_os() != HostOS.MACOS:
+    # Layer 3: Seccomp sandbox — requires CONFIG_SECCOMP at QEMU compile time.
+    # Probe rather than assume: some runners (e.g. CodSpeed macro) may resolve
+    # a system QEMU built without --enable-seccomp.
+    if await probe_qemu_sandbox_support():
         qemu_args.extend(
             [
                 "-sandbox",
@@ -427,19 +482,24 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
 
     # IOThread — offloads block I/O completion (pread, qcow2 decompress) to a
-    # dedicated thread, separate from the vCPU thread. Safe and functional on
-    # all accelerators (KVM, HVF, TCG):
-    #   KVM:  ioeventfd enables zero-exit I/O kicks — clear performance win.
-    #   HVF:  no ioeventfd (no eventfd on macOS), so no cold-start benefit
-    #         (tested session 4: 9,798ms identical with/without). Bottleneck
-    #         is Mach kernel hv_trap (~360µs/exit), not QEMU I/O processing.
-    #   TCG:  software-emulated ioeventfd, moderate benefit (I/O off main loop).
+    # dedicated AioContext. Keep it for KVM/TCG, where ioeventfd or main-loop
+    # offload provides a measured benefit. On macOS/HVF there is no ioeventfd,
+    # prior cold-start testing found no benefit, and repeated post-boot read
+    # stalls localized to this disk path. Route HVF block I/O through the main
+    # loop instead. Keep the same aio=threads pool cap in both configurations so
+    # the platform conditional changes AioContext placement, not concurrency.
+    use_dedicated_iothread = not (is_macos and accel_type == AccelType.HVF)
     iothread_id = f"iothread0-{vm_id}"
-    # Cap I/O thread pool to 16 (QEMU default is 64).  With single-queue
-    # virtio-blk on qcow2, 16 is more than sufficient.  When aio=io_uring
-    # is active the pool is unused (no-op).  When aio=threads, this caps
-    # peak threads from ~72 to ~24, preventing pids.max exhaustion.
-    qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=16"])
+    # Cap I/O thread pool to 8 (QEMU default is 64).  With single-queue
+    # virtio-blk on qcow2, 8 is sufficient.  When aio=io_uring is active
+    # the pool is unused (no-op).  When aio=threads, this caps peak threads
+    # from ~72 to ~16, reducing per-VM thread count and stack memory.
+    if use_dedicated_iothread:
+        qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=8"])
+        device_iothread = f",iothread={iothread_id}"
+    else:
+        qemu_args.extend(["-object", "main-loop,id=main-loop0,thread-pool-min=0,thread-pool-max=8"])
+        device_iothread = ""
 
     # Disk configuration (EROFS base drive, serial=base)
     # Uses qcow2 overlay backed by the EROFS base image
@@ -478,7 +538,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     qemu_args.extend(
         [
             "-device",
-            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size={qs},event_idx=off",
+            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
         ]
     )
 
@@ -505,7 +565,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         qemu_args.extend(
             [
                 "-device",
-                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size={qs},event_idx=off",
+                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
             ]
         )
 
@@ -537,8 +597,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-chardev",
             f"socket,id=event0,path={workdir.event_socket},server=on,wait=off",
             # Chardev for console output - connected to virtconsole (hvc0)
+            # mux=off: no multiplexing needed since -monitor none (no QEMU monitor).
+            # Removes mux input processing layer and its per-chardev state.
             "-chardev",
-            "stdio,id=virtiocon0,mux=on,signal=off",
+            "stdio,id=virtiocon0,signal=off",
         ]
     )
 
@@ -595,13 +657,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh
     # entropy to reseed from after L1 snapshot restore. Without this, the input
     # pool after restore contains only stale (cloned) entropy.
-    # max-bytes + period: rate-limit to 1024B/100ms (10KB/s) to avoid host exhaustion.
+    # max-bytes + period: rate-limit to 256B/1000ms (0.25KB/s). Ephemeral VMs
+    # only need initial entropy reseed; continuous high-rate entropy is wasteful.
     qemu_args.extend(
         [
             "-object",
             "rng-random,id=rng0,filename=/dev/urandom",
             "-device",
-            f"virtio-rng-{virtio_suffix},rng=rng0,max-bytes=1024,period=100",
+            f"virtio-rng-{virtio_suffix},rng=rng0,max-bytes=256,period=1000",
         ]
     )
 
@@ -614,8 +677,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Mode 0: No network (default)
     #   - Explicit "-nic none" suppresses QEMU's default NIC
     #   - Without this, machine types without -nodefaults (ARM64 virt)
-    #     create a default NIC, causing the guest-agent's
-    #     verify_gvproxy() to burn ~4s in exponential-backoff retries
+    #     create a default NIC; the guest-agent then requires a reachable
+    #     gvproxy and marks the network terminally failed, so every
+    #     ExecuteCode/InstallPackages on the VM is rejected (fail-closed)
     #   - microvm already uses -nodefaults so -nic none is redundant
     #     but harmless there
     #   - See: https://www.qemu.org/docs/master/system/qemu-manpage.html
@@ -674,11 +738,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
     else:
         # Suppress QEMU's default NIC.  Without this, machine types that don't
-        # use -nodefaults (ARM64 virt) create a default virtio-net
-        # device, causing the guest-agent to detect eth0 and run verify_gvproxy()
-        # with exponential-backoff retries (~4s) before marking NETWORK_READY.
-        # ExecuteCode/InstallPackages gate on NETWORK_READY, so the default NIC
-        # adds ~4s to every cold-start execution even when no network is needed.
+        # use -nodefaults (ARM64 virt) create a default virtio-net device; the
+        # guest-agent then detects eth0 and requires a reachable gvproxy
+        # (verify_gvproxy), which fails without one — the network state goes
+        # terminal-failed and every ExecuteCode/InstallPackages on the VM is
+        # rejected by the untrusted-readiness gate. A surprise NIC now
+        # permanently fails the VM, not merely slows it.
         qemu_args.extend(["-nic", "none"])
 
     # QMP (QEMU Monitor Protocol) socket for VM control operations

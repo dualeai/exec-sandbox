@@ -15,6 +15,7 @@ async with Scheduler() as scheduler:
 ```
 
 [![CI](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml/badge.svg)](https://github.com/dualeai/exec-sandbox/actions/workflows/test.yml)
+[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/exec-sandbox?utm_source=badge)
 [![Coverage](https://img.shields.io/codecov/c/github/dualeai/exec-sandbox)](https://codecov.io/gh/dualeai/exec-sandbox)
 [![PyPI](https://img.shields.io/pypi/v/exec-sandbox)](https://pypi.org/project/exec-sandbox/)
 [![Python](https://img.shields.io/pypi/pyversions/exec-sandbox)](https://pypi.org/project/exec-sandbox/)
@@ -213,7 +214,9 @@ async with Scheduler() as scheduler:
         # VM failed to boot (guest agent not ready). Often transient (CPU contention).
         print("VM boot timed out — retry may succeed")
     except VmTransientError:
-        # Infrastructure failure (QEMU crash, REPL spawn OOM) — code never ran, safe to retry.
+        # Infrastructure failure before dispatch (connect/readiness failure) — code never ran, safe to retry.
+        # If the transport is lost AFTER dispatch, CommunicationOutcomeUnknownError is raised instead:
+        # the code may have run, so reconcile side effects before retrying.
         # VmTimeoutError is a subclass, so this must come after it.
         print("Transient VM failure, retry may succeed")
     except PackageNotAllowedError as e:
@@ -352,7 +355,7 @@ async with Scheduler(config) as scheduler:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `warm_pool_size` | 0 | Pre-started VMs per language (Python, JavaScript, Raw). Set >0 to enable |
-| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Effective ~25% higher with memory compression (zram) |
+| `default_memory_mb` | 192 | VM memory (128 MB minimum, no upper bound). Compressed swap (zram) adds ~40% logical headroom, physically capped at 20% of RAM |
 | `default_timeout_seconds` | 30 | Execution timeout (1-300s) |
 | `session_idle_timeout_seconds` | 300 | Session idle timeout (10-3600s). Auto-closes inactive sessions |
 | `images_dir` | auto | VM images directory |
@@ -364,7 +367,7 @@ async with Scheduler(config) as scheduler:
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
 | `memory_overcommit_ratio` | 5.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
 | `cpu_overcommit_ratio` | 2.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
-| `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
+| `host_memory_reserve_ratio` | 0.08 | Fraction of host memory reserved for OS (e.g., 0.08 = 8%) |
 | `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
@@ -415,7 +418,7 @@ make bench-optimizer N_VMS=250    # heavier load (recommended for tuning)
 
 VMs include automatic memory optimization (no configuration required):
 
-- **Compressed swap (zram)** - ~25% more usable memory via lz4 compression
+- **Compressed swap (zram)** - 40% of RAM as lz4-compressed swap, physically capped at 20% of RAM
 - **Memory reclamation (virtio-balloon)** - Reclaims unused guest pages on idle warm-pool VMs (192→140 MB default), reducing host memory pressure
 
 ### Memory Architecture
@@ -524,12 +527,13 @@ L3 extends L2 across machines. When an L2 snapshot is created, it's compressed w
 | `timing.execute_ms` | int | Code execution |
 | `timing.total_ms` | int | End-to-end time |
 | `warm_pool_hit` | bool | Whether a pre-started VM was used |
+| `l1_cache_hit` | bool | True if served from the L1 memory-snapshot cache |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
-Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures (QEMU crash, REPL spawn failure) raise `VmTransientError` instead of returning a result.
+Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures raise instead of returning a result: `VmTransientError` before dispatch (code never ran, safe to retry), `CommunicationOutcomeUnknownError` after dispatch (QEMU crash, REPL spawn OOM mid-flight — reconcile side effects before retrying).
 
 ```python
-# Infrastructure failures raise VmTransientError before reaching here (see Error Handling).
+# Infrastructure failures raise before reaching here (see Error Handling).
 result = await scheduler.run(code="...", language="python")
 
 if result.exit_code == 0:
@@ -558,7 +562,7 @@ Returned by `Session.list_files()`.
 |-----------|-------------|
 | `SandboxError` | Base exception for all sandbox errors |
 | `TransientError` | Retryable errors — may succeed on retry |
-| `VmTransientError` | Transport failure or guest infrastructure failure (code never ran) |
+| `VmTransientError` | Transport failure or guest infrastructure failure before dispatch (code never ran) |
 | `VmTimeoutError` | VM boot timed out |
 | `VmCapacityError` | VM pool at capacity |
 | `PermanentError` | Non-retryable errors |
@@ -567,8 +571,10 @@ Returned by `Session.list_files()`.
 | `InputValidationError` | Caller-bug errors — bad input, session stays alive |
 | `CodeValidationError` | Empty, whitespace-only, or null-byte code |
 | `EnvVarValidationError` | Invalid env var names/values (control chars, size) |
+| `OutputLimitError` | stdout/stderr exceeded guest-enforced limits (session stays alive) |
 | `SessionClosedError` | Session already closed |
 | `CommunicationError` | Guest communication failed |
+| `CommunicationOutcomeUnknownError` | Transport lost after dispatch — the code may have run; reconcile side effects before retrying |
 | `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |
@@ -578,16 +584,18 @@ Returned by `Session.list_files()`.
 
 ### Session Resilience
 
-Sessions survive user code failures, input validation errors (`InputValidationError`), and output limit errors (`OutputLimitError`). Only VM-level communication errors close a session.
+Sessions survive user code failures, input validation errors (`InputValidationError`), and output limit errors (`OutputLimitError`). VM-level communication errors, cancellation, exit 137, and a VM found dead all close a session. A closed session cannot be reused.
 
 | Failure | Exit Code | Session | State | Next `exec()` |
 |---------|-----------|---------|-------|----------------|
 | Exception (ValueError, etc.) | 1 | Alive | Preserved | Works, state intact |
-| `sys.exit(n)` | n | Alive | Preserved | Works, state intact |
+| `sys.exit(n)`, n != 137 | n | Alive | Preserved | Works, state intact |
 | Syntax error | 1 | Alive | Preserved | Works, state intact |
 | Output limit exceeded | 1 | Alive | Preserved | Works, state intact |
-| `os._exit(n)` | n | Alive | **Reset** | Works, fresh REPL |
-| Signal (SIGKILL, OOM kill) | 128 + signal | Alive | **Reset** | Works, fresh REPL |
+| `os._exit(n)`, n != 137 | n | Alive | **Reset** | Works, fresh REPL |
+| Exit 137 (for example, SIGKILL) | 137 | **Closed** | Lost | `SessionClosedError` |
+| QEMU died while delivering a result | result's code | **Closed** | Lost | `SessionClosedError` |
+| Signal other than SIGKILL | 128 + signal | Alive | **Reset** | Works, fresh REPL |
 | Timeout | -1 | Alive | **Reset** | Works, fresh REPL |
 | VM communication failure | N/A | **Closed** | Lost | `SessionClosedError` |
 
@@ -620,7 +628,7 @@ on_stdout=lambda chunk: buffer.append(chunk)  # Fast (same applies to on_boot_lo
 # warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
-default_memory_mb=192  # Code can actually use ~210-240MB thanks to compression
+default_memory_mb=192  # Code can use up to ~269MB logically (40% zram swap), physically capped at 20% of RAM
 # Don't rely on memory limits for security - use timeouts for runaway allocations
 
 # Network without domain restrictions is risky
@@ -692,7 +700,7 @@ Pre-built images from [GitHub Releases](https://github.com/dualeai/exec-sandbox/
 | `node-1.3-base` | Bun 1.3 | bun | ~57MB | Fast JavaScript/TypeScript runtime with Node.js compatibility |
 | `raw-base` | Bash | None | ~15MB | Shell scripts and custom runtimes |
 
-All images are based on **Alpine Linux 3.23** (Linux 6.18, musl libc) and include common tools for AI agent workflows.
+All images are based on **Alpine Linux** (version and kernel pinned in `versions.lock`, musl libc) and include common tools for AI agent workflows.
 
 ### Common Tools (all images)
 
