@@ -197,28 +197,37 @@ class MigrationClient:
 
         Both sender (save) and receiver (restore) MUST set the same
         capabilities, otherwise QEMU rejects with "received capability is off".
+
+        NOTE (design constraints, verified QEMU 11.0):
+        - mapped-ram is INCOMPATIBLE with multifd-compression (seekable-fd
+          requirement) AND with migration TLS. Any snapshot compression or
+          encryption for a future S3 freeze/thaw path must therefore be done
+          EXTERNALLY (client-side zstd + AEAD), not via QEMU capabilities. The
+          sanctioned in-QEMU perf recovery is the `direct-io` migration parameter
+          (O_DIRECT), gated to the full-RAM path when that lands.
+        - CPR (cpr-reboot/transfer/exec) is NOT a resume-anywhere primitive: all
+          modes are same-host only (fd/RAM handoff to a peer QEMU), so they cannot
+          back S3 freeze/thaw. Their only use here would be in-place QEMU upgrades.
+        - The migration stream format is QEMU-version-specific; a QEMU bump
+          invalidates saved snapshots (see MEMORY_SNAPSHOT_FORMAT_VERSION).
         """
         if qemu_version is None or qemu_version < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
             return
 
+        # Unified capability list (QEMU >= 11.0). Base is mapped-ram + multifd for
+        # seekable, parallel page I/O. Template mode adds x-ignore-shared to skip
+        # RAM pages backed by the shared memory-backend-file (device-state-only
+        # vmstate). mapped-ram + x-ignore-shared coexist safely only since 11.0
+        # (earlier releases null-deref on ignored blocks — the reason the floor is
+        # 11.0), so both paths share one branch-free list.
+        # Ref: QEMU commit "migration/mapped-ram: Fix x-ignore-shared snapshots"
+        #      (Pawel Zmarzly, Nov 2025; reviewed by Peter Xu, Dec 2025)
+        capabilities = [
+            {"capability": "multifd", "state": True},
+            {"capability": "mapped-ram", "state": True},
+        ]
         if use_template:
-            # VM Templating: x-ignore-shared skips RAM pages backed by shared
-            # memory-backend-file.  mapped-ram is INCOMPATIBLE with x-ignore-shared
-            # in QEMU <= 10.x: mapped-ram's bitmap code dereferences null pointers
-            # for ignored blocks, crashing with "Bad address".  Fix merged for 11.0.
-            # Ref: QEMU commit "migration/mapped-ram: Fix x-ignore-shared snapshots"
-            #      (Pawel Zmarzly, Nov 2025; reviewed by Peter Xu, Dec 2025)
-            # TODO(qemu-11): Re-enable mapped-ram + multifd alongside x-ignore-shared
-            # once QEMU >= 11.0 is the minimum version.  This will give parallel I/O
-            # for the device-state portion of the vmstate.
-            capabilities = [
-                {"capability": "x-ignore-shared", "state": True},
-            ]
-        else:
-            capabilities = [
-                {"capability": "multifd", "state": True},
-                {"capability": "mapped-ram", "state": True},
-            ]
+            capabilities.append({"capability": "x-ignore-shared", "state": True})
         resp = await self._execute(
             "migrate-set-capabilities",
             {"capabilities": capabilities},
@@ -263,6 +272,11 @@ class MigrationClient:
         # Valid = false). QEMU's hvf_handle_exception asserts isv==true, causing
         # SIGABRT. Stopping the vCPU first eliminates the race.
         # See: https://github.com/qemu/qemu/blob/master/target/arm/hvf/hvf.c
+        #
+        # NOTE (non-adoption): the background-snapshot capability (live snapshot
+        # without pausing the vCPU) is not used. It is KVM-only (needs userfaultfd
+        # write-protect) so excluded on HVF, and we snapshot idle sessions where a
+        # brief stop is cheap and full-fidelity capture wants a quiescent VM anyway.
         resp = await self._execute("stop")
         if "error" in resp:
             raise MigrationTransientError(f"stop command failed: {resp['error']}")
@@ -346,7 +360,11 @@ class MigrationClient:
                 status = resp.get("return", {}).get("status", "")
                 if status == "completed":
                     return
-                if status in ("failed", "cancelled"):
+                # "failing" (QEMU 11.0+): an error occurred and cleanup is underway;
+                # the status will transition to "failed" shortly. Treat it as terminal
+                # here so a mid-stream failure surfaces immediately instead of burning
+                # another poll interval waiting for the "failed" transition.
+                if status in ("failed", "cancelled", "failing"):
                     error_desc = resp.get("return", {}).get("error-desc", "unknown")
                     raise MigrationTransientError(f"Migration {status}: {error_desc}")
 
