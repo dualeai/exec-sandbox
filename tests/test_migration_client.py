@@ -19,6 +19,7 @@ import pytest
 from exec_sandbox import constants
 from exec_sandbox.exceptions import MigrationTransientError
 from exec_sandbox.migration_client import MigrationClient
+from exec_sandbox.qmp_exchange import _MAX_SKIPPED_MESSAGES
 
 # ============================================================================
 # Test Helpers
@@ -60,8 +61,17 @@ def _make_connected(
     reader = asyncio.StreamReader()
     writer = FakeWriter()
     if responses:
+        # QMP echoes the request id on every command response. _execute tags
+        # commands migration-1, migration-2, ... in order, so mirror that here:
+        # each non-event response carries the next sequential id (events don't
+        # consume an id). Explicitly-set ids are preserved.
+        seq = 0
         for resp in responses:
-            reader.feed_data(json.dumps(resp).encode() + b"\n")
+            tagged = dict(resp)
+            if "event" not in tagged and "id" not in tagged:
+                seq += 1
+                tagged["id"] = f"migration-{seq}"
+            reader.feed_data(json.dumps(tagged).encode() + b"\n")
     if feed_eof:
         reader.feed_eof()
     object.__setattr__(client, "_connected", True)
@@ -192,7 +202,7 @@ class TestMigrationClientExecute:
         )
 
         result = await client._execute("query-migrate")
-        assert result == {"return": {"status": "completed"}}
+        assert result["return"] == {"status": "completed"}
 
     async def test_connection_closed_raises(self) -> None:
         """Should raise when connection is closed (empty readline)."""
@@ -219,7 +229,8 @@ class TestMigrationClientExecute:
         await client._execute("stop")
 
         cmds = writer.commands
-        assert cmds[0] == {"execute": "stop"}
+        assert cmds[0]["execute"] == "stop"
+        assert cmds[0]["id"] == "migration-1"
         assert "arguments" not in cmds[0]
 
     async def test_error_response_returned(self) -> None:
@@ -249,21 +260,23 @@ class TestMigrationClientExecuteEdgeCases:
             await client._execute("test-command")
 
     async def test_event_flood_hits_safety_cap(self) -> None:
-        """32+ consecutive events without a response should raise."""
-        events = [{"event": f"EVENT_{i}", "data": {}} for i in range(33)]
+        """More skipped messages than the safety cap should raise."""
+        events = [{"event": f"EVENT_{i}", "data": {}} for i in range(_MAX_SKIPPED_MESSAGES + 1)]
         client, _reader, _writer = _make_connected(events)
 
-        with pytest.raises(MigrationTransientError, match="Too many QMP events"):
+        with pytest.raises(MigrationTransientError, match="Too many QMP messages"):
             await client._execute("query-migrate")
 
-    async def test_exactly_32_events_then_response(self) -> None:
-        """31 events + 1 response (within 32 iterations) should succeed."""
-        responses: list[dict[str, Any]] = [{"event": f"EVENT_{i}", "data": {}} for i in range(31)]
+    async def test_events_just_under_cap_then_response(self) -> None:
+        """cap-1 events + 1 response (within the cap) should succeed."""
+        responses: list[dict[str, Any]] = [
+            {"event": f"EVENT_{i}", "data": {}} for i in range(_MAX_SKIPPED_MESSAGES - 1)
+        ]
         responses.append({"return": {"status": "ok"}})
         client, _reader, _writer = _make_connected(responses)
 
         result = await client._execute("query-migrate")
-        assert result == {"return": {"status": "ok"}}
+        assert result["return"] == {"status": "ok"}
 
 
 # ============================================================================

@@ -29,8 +29,9 @@ from typing import TYPE_CHECKING, Any, Self
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_settled
+from exec_sandbox.aio_utils import await_cancellation_safe
 from exec_sandbox.exceptions import MigrationTransientError
+from exec_sandbox.qmp_exchange import qmp_id_exchange
 from exec_sandbox.socket_auth import connect_and_verify
 
 if TYPE_CHECKING:
@@ -59,6 +60,7 @@ class MigrationClient:
         "_lock",
         "_qmp_socket",
         "_reader",
+        "_request_seq",
         "_writer",
     )
 
@@ -68,6 +70,7 @@ class MigrationClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
+        self._request_seq = 0
         self._lock = asyncio.Lock()
 
     async def connect(self, timeout: float = 5.0) -> None:
@@ -137,10 +140,14 @@ class MigrationClient:
                 await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
 
     async def _cleanup_after_connect_failure(self) -> None:
-        """Finish handshake cleanup despite repeated caller cancellation."""
-        cleanup_task = asyncio.create_task(self._cleanup())
-        await await_settled(cleanup_task)
-        cleanup_task.result()
+        """Finish handshake cleanup despite repeated caller cancellation.
+
+        Runs cleanup to completion and surfaces its own error, but does not
+        drop a caller cancellation observed mid-cleanup: await_cancellation_safe
+        re-raises it so a Ctrl-C during teardown still wins over the original
+        handshake error.
+        """
+        await await_cancellation_safe(self._cleanup())
 
     async def _execute(
         self,
@@ -156,27 +163,21 @@ class MigrationClient:
         if not self._connected or self._writer is None or self._reader is None:
             raise MigrationTransientError("Not connected to QMP")
 
-        cmd: dict[str, Any] = {"execute": command}
-        if arguments:
-            cmd["arguments"] = arguments
-
+        # Tag each command with a unique id and match it on the response. The
+        # save path interleaves stop/migrate/query-migrate where a shifted
+        # response is corrupting, not benign: id-matching discards async events
+        # AND any stale reply from a prior timed-out command.
         logger.debug("QMP command: %s args=%s", command, arguments)
-        self._writer.write(json.dumps(cmd).encode() + b"\n")
-        await self._writer.drain()
-
-        # Skip async events (MIGRATION_PASS, STOP, RESUME, etc.) until command response.
-        # Cap at 32 iterations as safety rail; the outer asyncio.timeout is the primary guard.
-        async with asyncio.timeout(timeout):
-            for _ in range(32):
-                response = await self._reader.readline()
-                if not response:
-                    raise MigrationTransientError("QMP connection closed unexpectedly")
-                data: dict[str, Any] = json.loads(response)
-                if "event" not in data:
-                    logger.debug("QMP response: %s -> %s", command, data)
-                    return data
-                logger.debug("QMP event: %s data=%s", data.get("event"), data.get("data"))
-        raise MigrationTransientError("Too many QMP events without command response")
+        self._request_seq += 1
+        return await qmp_id_exchange(
+            self._reader,
+            self._writer,
+            f"migration-{self._request_seq}",
+            command,
+            arguments,
+            timeout,
+            MigrationTransientError,
+        )
 
     async def _set_capabilities(
         self,

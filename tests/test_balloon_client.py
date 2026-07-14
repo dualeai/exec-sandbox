@@ -117,8 +117,8 @@ class TestBalloonClientUnit:
         # Setup connection
         greeting = b'{"QMP": {}}\n'
         caps_response = b'{"return": {}}\n'
-        # Query response: 256MB in bytes
-        query_response = b'{"return": {"actual": 268435456}}\n'
+        # Query response: 256MB in bytes (id echoes the first _execute command)
+        query_response = b'{"return": {"actual": 268435456}, "id": "balloon-1"}\n'
         reader.readline = AsyncMock(side_effect=[greeting, caps_response, query_response])
 
         client = BalloonClient(qmp_socket, expected_uid=1000)
@@ -133,7 +133,7 @@ class TestBalloonClientUnit:
 
         greeting = b'{"QMP": {}}\n'
         caps_response = b'{"return": {}}\n'
-        error_response = b'{"error": {"class": "DeviceNotActive"}}\n'
+        error_response = b'{"error": {"class": "DeviceNotActive"}, "id": "balloon-1"}\n'
         reader.readline = AsyncMock(side_effect=[greeting, caps_response, error_response])
 
         client = BalloonClient(qmp_socket, expected_uid=1000)
@@ -148,7 +148,7 @@ class TestBalloonClientUnit:
 
         greeting = b'{"QMP": {}}\n'
         caps_response = b'{"return": {}}\n'
-        balloon_response = b'{"return": {}}\n'
+        balloon_response = b'{"return": {}, "id": "balloon-1"}\n'
         reader.readline = AsyncMock(side_effect=[greeting, caps_response, balloon_response])
 
         client = BalloonClient(qmp_socket, expected_uid=1000)
@@ -170,10 +170,11 @@ class TestBalloonClientUnit:
 
         greeting = b'{"QMP": {}}\n'
         caps_response = b'{"return": {}}\n'
-        # Query returns 256MB
-        query_response = b'{"return": {"actual": 268435456}}\n'
-        # Set target succeeds
-        balloon_response = b'{"return": {}}\n'
+        # Query returns 256MB (first _execute), then set target succeeds (second).
+        # The subsequent wait-for-target poll query exhausts the list and inflate
+        # returns the queried previous size.
+        query_response = b'{"return": {"actual": 268435456}, "id": "balloon-1"}\n'
+        balloon_response = b'{"return": {}, "id": "balloon-2"}\n'
         reader.readline = AsyncMock(side_effect=[greeting, caps_response, query_response, balloon_response])
 
         client = BalloonClient(qmp_socket, expected_uid=1000)
@@ -188,7 +189,7 @@ class TestBalloonClientUnit:
 
         greeting = b'{"QMP": {}}\n'
         caps_response = b'{"return": {}}\n'
-        balloon_response = b'{"return": {}}\n'
+        balloon_response = b'{"return": {}, "id": "balloon-1"}\n'
         reader.readline = AsyncMock(side_effect=[greeting, caps_response, balloon_response])
 
         client = BalloonClient(qmp_socket, expected_uid=1000)
