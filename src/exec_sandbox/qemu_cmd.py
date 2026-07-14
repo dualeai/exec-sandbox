@@ -89,6 +89,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Detect hardware acceleration type (centralized in detect_accel_type)
     accel_type = await detect_accel_type(force_emulation=settings.force_emulation)
+
+    # QEMU version gates several flags below (machine props, netdev reconnect,
+    # -run-with). Probe once up front; the result is cached in system_probes.
+    qemu_version = await probe_qemu_version()
     logger.info(
         "Hardware acceleration detection",
         extra={"vm_id": vm_id, "accel_type": accel_type.value, "is_macos": is_macos},
@@ -101,6 +105,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         accel = "kvm"
     else:
         # TCG software emulation fallback (~5-8x slower than KVM/HVF)
+        #
+        # NOTE (security envelope): QEMU's security policy grants the
+        # "virtualization use case" isolation guarantee only to microvm (x86) /
+        # virt (aarch64) *with* a hardware accelerator (KVM/HVF). The TCG path is
+        # explicitly NOT security-supported ("must not rely on QEMU for
+        # isolation"). It is a functional fallback for CI / trusted workloads
+        # only; prod isolation always runs on KVM or HVF.
+        # See: https://qemu-project.gitlab.io/qemu/system/security.html
         #
         # thread=single: Disable MTTCG to reduce thread count per VM. Without this,
         # each VM creates multiple threads for parallel translation, exhausting
@@ -149,10 +161,19 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         #   random.trust_cpu=on in kernel cmdline
         # mem-merge: KSM page dedup (Linux only; macOS HVF does not support it)
         mem_merge = "off" if is_macos else "on"
+        # virtio-mmio-transports=8: cap the number of virtio-mmio transport slots
+        #   (QEMU virt board default is 32). We instantiate at most 6 virtio-mmio
+        #   devices (blk-base + optional blk-snap + serial + balloon + rng +
+        #   optional net); 8 leaves headroom. Fewer empty slots means the guest's
+        #   virtio_mmio driver skips ~24 spurious MMIO magic/device-id probes at
+        #   boot and the DTB is smaller. Keep >= the live device count or QEMU aborts.
+        #   Machine property added in QEMU 11.0 — gated to avoid aborting older
+        #   local installs. See docs/system/arm/virt.rst.
+        mmio_transports = ",virtio-mmio-transports=8" if qemu_version is not None and qemu_version >= (11, 0, 0) else ""
         machine_type = (
-            f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge}"
+            f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge}{mmio_transports}"
             if is_macos
-            else f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge},dump-guest-core=off"
+            else f"virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge={mem_merge}{mmio_transports},dump-guest-core=off"
         )
     else:
         arch_suffix = "x86_64"
@@ -294,6 +315,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # also lacks 256-bit vector ops (TCG_TARGET_HAS_v256=0), so AVX2
             # is unavailable — effective ceiling is SSE4.2. On x86 hosts the
             # effective ceiling is x86_64-v3 (AVX2/FMA).
+            # NOTE (non-adoption): ARM `max,sve=off,sme=off` (individually maskable
+            # on `max` since QEMU 11.0) is not set — boot never exercises SVE/SME,
+            # so the win is ~zero (only trims per-vCPU vector-state struct size).
             # See: https://www.qemu.org/docs/master/system/i386/cpu.html
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
@@ -339,6 +363,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # (16-64KB per fault instead of 4KB), but transparent_hugepage=never
             # disables anonymous 2MB hugepages (no khugepaged, no compaction stalls).
             # File-backed large folios work regardless of this sysfs setting.
+            # NOTE (non-adoption): keeping anon THP off is deliberate for density —
+            # 2MB hugepages defeat free-page-reporting and KSM (both 4KB-granular)
+            # and add compaction stalls; enabling them would hurt host-RAM-per-VM.
             + " transparent_hugepage=never"
             # Boot verbosity: debug_boot enables full kernel/init logging for diagnostics
             # Note: loglevel=7 overrides loglevel=1 set in console_params (kernel uses last occurrence)
@@ -471,9 +498,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             ]
         )
 
-    # Determine AIO mode and QEMU version based on cached startup probes
+    # Determine AIO mode based on cached startup probes (qemu_version probed above)
     io_uring_available = await probe_io_uring_support()
-    qemu_version = await probe_qemu_version()
     aio_mode = "io_uring" if io_uring_available else "threads"
     if not io_uring_available:
         logger.debug(
@@ -503,6 +529,13 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Disk configuration (EROFS base drive, serial=base)
     # Uses qcow2 overlay backed by the EROFS base image
+    #
+    # NOTE (non-adoption): RWF_DSYNC FUA (QEMU 10.0 file-posix) is deliberately
+    # unused. It only helps cache=writethrough/directsync; cache=unsafe drops all
+    # flushes/FUA outright, which strictly dominates for discard-on-exit overlays
+    # (a host crash loses in-flight overlay writes, but the overlay is thrown away
+    # on VM exit). Switching to a flushing cache mode to gain FUA would be a large
+    # regression here.
     qemu_args.extend(
         [
             "-drive",
@@ -534,6 +567,13 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # rootfs drive, regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates
     # virtio devices in reverse declaration order, so /dev/vda != first -device on ARM.
     # D2: event_idx=off reduces interrupt coalescing overhead during boot.
+    #
+    # NOTE (non-adoption): num-queues=1 is deliberate. virtio-blk multiqueue /
+    # iothread-vq-mapping (QEMU 9.0) only pays off with many vCPUs and an
+    # I/O-bound guest saturating a single iothread. Our VMs have 1-2 vCPUs, a
+    # read-only page-cache-hot EROFS base and a tiny cache=unsafe overlay — never
+    # iothread-CPU-bound. HVF has no ioeventfd (block already routed to main-loop
+    # above) and TCG is thread=single, so extra queues buy nothing here.
     qs = constants.VIRTIO_QUEUE_SIZE
     qemu_args.extend(
         [
@@ -622,6 +662,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # See: https://bugs.launchpad.net/qemu/+bug/1639791 (early virtio console lost)
     # See: https://gist.github.com/mcastelino/aa118275991d4f561ee22dc915b9345f
     # =============================================================
+    # NOTE (non-adoption): guest-agent transport stays on virtio-serial. vhost-vsock
+    # was evaluated as an alternative; no QEMU 10.1→11.0 reliability/perf change
+    # shifts the tradeoff, and virtio-serial's named ports (cmd/event) map cleanly
+    # onto the existing guest-agent protocol.
     qemu_args.extend(
         [
             "-device",
@@ -637,6 +681,13 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     )
 
     # virtio-balloon for host memory efficiency (deflate/inflate for warm pool).
+    #
+    # NOTE (non-adoption): virtio-mem is deliberately not used in place of the
+    # balloon. It targets long-lived, resizable VMs; unplug is guest-cooperative,
+    # slow, and can partially fail, and its block size must be a power-of-two
+    # >= 2 MiB — coarse for our small -m VMs. It has no HVF support and yields no
+    # net RSS win over free-page-reporting + template-COW page sharing.
+    #
     # Disabled for ALL template VMs (save AND restore):
     #   1. Device topology must match between save and restore — QEMU migration
     #      fails with "Unknown section" if one side has balloon and the other doesn't.
@@ -697,6 +748,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     #
     # =============================================================
 
+    # NOTE (non-adoption): the in-tree passt netdev (QEMU 10.1) is not used. It
+    # lacks gvproxy's API-driven outbound-filtering and dynamic port-forward model
+    # that Modes 1-3 below depend on, so it is not a drop-in replacement.
     needs_network = allow_network or bool(expose_ports)
     if needs_network:
         # All modes use socket networking to gvproxy (fast ~300ms boot)
@@ -783,8 +837,21 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Orphan protection: kill QEMU if parent process dies (QEMU 10.2+)
     # Uses PR_SET_PDEATHSIG on Linux, kqueue on macOS/FreeBSD
+    #
+    # async-teardown=on (Linux only): fork a teardown clone that unmaps guest RAM
+    # so the main QEMU can exit without blocking on munmap. Trims destroy_vm()
+    # tail latency under mass pool recycle. macOS QEMU rejects this sub-option
+    # (only chroot/exit-with-parent/user exist there), so it is Linux-gated.
+    #
+    # NOTE (non-adoption): -run-with chroot=/user= are not used. Both require a
+    # privileged launcher (QEMU starts root, then drops), which conflicts with our
+    # unprivileged model — sudo -u qemu-vm + fd-passing (socket-activated QMP).
+    # Filesystem confinement is already provided by `unshare --mount` on Linux.
     if qemu_version is not None and qemu_version >= (10, 2, 0):
-        qemu_args.extend(["-run-with", "exit-with-parent=on"])
+        run_with_opts = "exit-with-parent=on"
+        if not is_macos:
+            run_with_opts += ",async-teardown=on"
+        qemu_args.extend(["-run-with", run_with_opts])
 
     # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
     # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation

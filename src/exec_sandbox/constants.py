@@ -402,17 +402,31 @@ Only used when socket activation is unavailable (sudo wraps QEMU, closing
 inherited fds). With socket activation, the socket is pre-created and no
 polling is needed."""
 
-MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (9, 0, 0)
+MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (11, 0, 0)
 """Minimum QEMU version for mapped-ram + multifd migration capabilities.
-Changing capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
 
-MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 3
+Floor is 11.0: it is the first release where mapped-ram coexists with
+x-ignore-shared without a null-deref ("Bad address") crash, letting the template
+and full-RAM paths share ONE unified capability list (no version fork). The
+project pins QEMU 11.0.2, so this floor is free; older local installs fall back
+to plain streaming migration. Changing capabilities requires bumping
+MEMORY_SNAPSHOT_FORMAT_VERSION."""
+
+MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 4
 """Migration format version. Bump when changing QMP capabilities or migration
 protocol to invalidate stale L1 cache entries. History:
   v1: Plain streaming format (no mapped-ram)
   v2: mapped-ram + multifd (QEMU >= 9.0)
   v3: x-ignore-shared VM templating — device-state-only vmstate + separate
       RAM file for COW sharing across VMs (QEMU >= 9.0)
+  v4: unified capability list — template path now also enables mapped-ram +
+      multifd alongside x-ignore-shared (QEMU >= 11.0 fixes the coexistence
+      crash), removing the version-forked branch.
+
+NOTE: the migration stream layout is QEMU-version- AND parameter-specific — a
+QEMU upgrade or a change to multifd-channels / direct-io (both baked into the
+mapped-ram file layout) requires restore-QEMU == save-QEMU. Any such change must
+bump this version so stale, incompatible snapshots are not restored.
 """
 
 # ============================================================================

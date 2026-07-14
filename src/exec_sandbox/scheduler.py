@@ -217,6 +217,13 @@ class Scheduler:
 
             # Initialize WarmVMPool (optional)
             if self.config.warm_pool_size > 0:
+                # The pool pre-boots one VM per language, and its startup hashes
+                # each base image (check_cache -> compute_cache_key -> get_base_image).
+                # On a fresh cache ensure_assets() fetched only kernel/initramfs, so
+                # download every pooled base image first, else start() raises
+                # VmDependencyError. Mirrors the per-run fetch in _prepare_vm.
+                if self.config.auto_download_assets:
+                    await asyncio.gather(*(fetch_base_image(language.value) for language in Language))
                 self._warm_pool = WarmVMPool(
                     self._vm_manager,
                     self.config,
@@ -701,6 +708,12 @@ class Scheduler:
         if vm is None:
             is_cold_boot = True
 
+            # Base image must be on disk before the L1 cache key hashes it
+            # (check_cache -> compute_cache_key -> get_base_image) and before
+            # cold create_vm. Skip when snapshot_path already fetched it.
+            if self.config.auto_download_assets and not snapshot_path:
+                await fetch_base_image(language)
+
             admission_start = asyncio.get_running_loop().time()
             async with self._vm_manager.reservation_context(
                 vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}",
@@ -747,11 +760,6 @@ class Scheduler:
 
                 # Cold boot fallback: L1 miss (or L1 skipped for network/boot-log)
                 if vm is None:
-                    # Auto-download base image if needed (skip when snapshot_path
-                    # is set — _get_or_create_snapshot already fetched it)
-                    if self.config.auto_download_assets and not snapshot_path:
-                        await fetch_base_image(language)
-
                     vm = await self._vm_manager.create_vm(
                         language=language,
                         tenant_id=constants.SCHEDULER_TENANT_ID,

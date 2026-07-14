@@ -101,8 +101,12 @@ cd "qemu-${QEMU_VERSION}"
 # --enable-fdt: device tree support, required for aarch64-softmmu (virt machine),
 #   harmless for x86_64. Needs libfdt-dev.
 # --enable-kvm: KVM acceleration support.
-# --enable-linux-io-uring: io_uring async I/O backend for block drives (aio=io_uring).
-#   Needs liburing-dev (>= 0.3). Falls back to aio=threads if unavailable at runtime.
+# --enable-linux-io-uring: io_uring async I/O backend. Needs liburing-dev (>= 0.3).
+#   Two benefits: (1) block drives use aio=io_uring (falls back to aio=threads if
+#   unavailable at runtime), and (2) since QEMU 10.2 the main event loop itself is
+#   io_uring-based when liburing is linked — lower syscall/wakeup overhead on fd
+#   monitoring. Keeping this flag ensures BOTH; without it the main loop silently
+#   falls back to ppoll. (probe_io_uring_support() only gates the drive aio= mode.)
 # --enable-seccomp: seccomp sandbox for QEMU process (-sandbox on).
 #   Needs libseccomp-dev (>= 2.3.0).
 # --enable-slirp: user-mode networking backend. Needs libslirp-dev.

@@ -9,6 +9,7 @@ import json
 import platform
 import shutil
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +23,7 @@ from exec_sandbox.exceptions import (
     SandboxError,
     SnapshotError,
     VmConfigError,
+    VmDependencyError,
     VmPermanentError,
     VmTimeoutError,
     VmTransientError,
@@ -839,6 +841,305 @@ class TestBaseImageFetchBeforeSnapshot:
 
             # Base image should still exist (not cleaned up on downstream failure)
             assert base_image_path.exists(), "Base image must survive downstream SnapshotError"
+
+
+class TestBaseImageFetchBeforeL1Restore:
+    """Regression tests: fetch_base_image ordering on the NO-PACKAGES path.
+
+    Companion to TestBaseImageFetchBeforeSnapshot (which covers the packages /
+    L2 disk-snapshot path). On a fresh cache, ensure_assets() at startup only
+    downloads kernel/initramfs/gvproxy — no base images. With no packages, the
+    L1 memory-snapshot check_cache() (scheduler._prepare_vm) computes a cache
+    key that hashes the base image via get_base_image(). If the cold-boot
+    fetch_base_image() runs AFTER that (the original bug), get_base_image()
+    globs an empty dir and raises VmDependencyError. The fix hoists the fetch
+    ahead of check_cache in the cold path.
+
+    NOTE: these tests keep a REAL MemorySnapshotManager (they do NOT use
+    _setup_cold_boot_mocks, which nulls it and would hide the bug entirely).
+    """
+
+    # Base image filename per language (mirrors assets.fetch_base_image mapping).
+    _BASE_FILENAME: ClassVar[dict[Language, str]] = {
+        Language.PYTHON: "python-3.14-base-{arch}.qcow2",
+        Language.JAVASCRIPT: "node-1.3-base-{arch}.qcow2",
+        Language.RAW: "raw-base-{arch}.qcow2",
+    }
+
+    @staticmethod
+    def _make_fresh_images_dir(images_dir: Path, tmp_path: Path) -> tuple[Path, str]:
+        """Isolated images dir with kernel/initramfs but NO base images."""
+        fresh_images = tmp_path / "fresh-images"
+        fresh_images.mkdir()
+        arch = "aarch64" if platform.machine() == "arm64" else platform.machine()
+        for name in images_dir.iterdir():
+            if name.name.startswith(("vmlinuz", "vmlinux", "initramfs")):
+                shutil.copy2(name, fresh_images / name.name)
+        return fresh_images, arch
+
+    @staticmethod
+    def _fresh_config(fresh: Path, tmp_path: Path, *, auto_download: bool) -> SchedulerConfig:
+        """SchedulerConfig on a fresh (base-less) images dir with isolated caches."""
+        l1 = tmp_path / "l1"
+        l2 = tmp_path / "l2"
+        l1.mkdir(exist_ok=True)
+        l2.mkdir(exist_ok=True)
+        return SchedulerConfig(
+            images_dir=fresh,
+            auto_download_assets=auto_download,
+            default_timeout_seconds=120,
+            disk_snapshot_cache_dir=l2,
+            memory_snapshot_cache_dir=l1,
+        )
+
+    @classmethod
+    def _mock_fetch(cls, fresh: Path, arch: str, calls: list[Language]):  # type: ignore[no-untyped-def]
+        """Side-effect for fetch_base_image: record the call, write a real qcow2.
+
+        Simulates the downloader landing the base image in base_images_dir so
+        the subsequent get_base_image() glob + image_hash() succeed.
+        """
+
+        async def _fetch(language: Language, **_kwargs) -> Path:  # type: ignore[no-untyped-def]
+            calls.append(language)
+            path = fresh / cls._BASE_FILENAME[language].format(arch=arch)
+            await create_test_qcow2(path)
+            return path
+
+        return _fetch
+
+    @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT])
+    async def test_no_packages_fresh_cache_fetches_before_l1(
+        self, images_dir: Path, tmp_path: Path, language: Language
+    ) -> None:
+        """PRIMARY regression: no packages + fresh cache does NOT raise VmDependencyError.
+
+        On the buggy (pre-fix) code this raises VmDependencyError from
+        check_cache -> compute_cache_key -> get_base_image. It is the whole
+        guard for this bug: confirm it FAILS before the _prepare_vm fix lands.
+
+        Parametrized over PYTHON/JAVASCRIPT (RAW omitted; the fix is
+        language-agnostic and the mock writes whichever filename it is told).
+        """
+        fresh, arch = self._make_fresh_images_dir(images_dir, tmp_path)
+        config = self._fresh_config(fresh, tmp_path, auto_download=True)
+        async with Scheduler(config) as scheduler:
+            mock_vm = MagicMock()
+            mock_vm.vm_id = f"vm-{random_test_id()}"
+            scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
+            scheduler._memory_snapshot_manager.schedule_background_save = AsyncMock()  # type: ignore[union-attr]
+            fetch_calls: list[Language] = []
+
+            with patch(
+                "exec_sandbox.scheduler.fetch_base_image",
+                side_effect=self._mock_fetch(fresh, arch, fetch_calls),
+            ):
+                vm, _ports, _cold, _started, _admission_ms = await scheduler._prepare_vm(
+                    language=language,
+                    packages=[],
+                    memory_mb=None,
+                    allow_network=False,
+                    allowed_domains=None,
+                    expose_ports=None,
+                    task_id=f"test-{random_test_id()}",
+                )
+
+            assert vm is mock_vm
+            scheduler._vm_manager.create_vm.assert_awaited_once()  # type: ignore[union-attr]
+            assert fetch_calls == [language], "fetch must run exactly once, before the L1 cache-key hash"
+
+    async def test_auto_download_disabled_missing_base_raises(self, images_dir: Path, tmp_path: Path) -> None:
+        """auto_download_assets=False + no base -> VmDependencyError; fetch NOT called.
+
+        Offline/misconfigured users must still get a clear failure — the fix
+        must not paper over genuinely missing images.
+        """
+        fresh, arch = self._make_fresh_images_dir(images_dir, tmp_path)
+        config = self._fresh_config(fresh, tmp_path, auto_download=False)
+        async with Scheduler(config) as scheduler:
+            scheduler._vm_manager.create_vm = AsyncMock()  # type: ignore[union-attr]
+            scheduler._memory_snapshot_manager.schedule_background_save = AsyncMock()  # type: ignore[union-attr]
+            fetch_calls: list[Language] = []
+
+            with patch(
+                "exec_sandbox.scheduler.fetch_base_image",
+                side_effect=self._mock_fetch(fresh, arch, fetch_calls),
+            ):
+                with pytest.raises(VmDependencyError):
+                    await scheduler._prepare_vm(
+                        language=Language.PYTHON,
+                        packages=[],
+                        memory_mb=None,
+                        allow_network=False,
+                        allowed_domains=None,
+                        expose_ports=None,
+                        task_id=f"test-{random_test_id()}",
+                    )
+
+            assert fetch_calls == [], "fetch must NOT be called when auto_download_assets=False"
+            scheduler._vm_manager.create_vm.assert_not_awaited()  # type: ignore[union-attr]
+
+    async def test_on_boot_log_debug_path_still_fetches(self, images_dir: Path, tmp_path: Path) -> None:
+        """on_boot_log set (the --debug path) skips L1 but still fetches before cold boot.
+
+        Guards the removal of the old cold-boot fetch: the debug path (which
+        skips check_cache) must now rely on the hoisted fetch. check_cache is
+        skipped, yet the base is still fetched and create_vm proceeds.
+        """
+        fresh, arch = self._make_fresh_images_dir(images_dir, tmp_path)
+        config = self._fresh_config(fresh, tmp_path, auto_download=True)
+        async with Scheduler(config) as scheduler:
+            mock_vm = MagicMock()
+            mock_vm.vm_id = f"vm-{random_test_id()}"
+            scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
+            scheduler._memory_snapshot_manager.schedule_background_save = AsyncMock()  # type: ignore[union-attr]
+            fetch_calls: list[Language] = []
+            check_spy = AsyncMock(wraps=scheduler._memory_snapshot_manager.check_cache)  # type: ignore[union-attr]
+
+            with (
+                patch(
+                    "exec_sandbox.scheduler.fetch_base_image",
+                    side_effect=self._mock_fetch(fresh, arch, fetch_calls),
+                ),
+                patch.object(scheduler._memory_snapshot_manager, "check_cache", check_spy),
+            ):
+                vm, _ports, _cold, _started, _admission_ms = await scheduler._prepare_vm(
+                    language=Language.PYTHON,
+                    packages=[],
+                    memory_mb=None,
+                    allow_network=False,
+                    allowed_domains=None,
+                    expose_ports=None,
+                    task_id=f"test-{random_test_id()}",
+                    on_boot_log=lambda _line: None,
+                )
+
+            assert vm is mock_vm
+            scheduler._vm_manager.create_vm.assert_awaited_once()  # type: ignore[union-attr]
+            check_spy.assert_not_awaited()  # L1 skipped when on_boot_log set
+            assert fetch_calls == [Language.PYTHON], "fetch must still run on the debug/no-L1 path"
+
+    async def test_warm_pool_hit_skips_fetch(self, images_dir: Path, tmp_path: Path) -> None:
+        """Warm-pool hit returns before the cold path -> no fetch, no create_vm.
+
+        Guards against a naive fix that hoists the fetch above the warm-pool
+        try: the fast path must remain download-free.
+        """
+        fresh, _arch = self._make_fresh_images_dir(images_dir, tmp_path)
+        config = self._fresh_config(fresh, tmp_path, auto_download=True)
+        async with Scheduler(config) as scheduler:
+            warm_vm = MagicMock()
+            warm_vm.vm_id = f"vm-{random_test_id()}"
+            scheduler._warm_pool = MagicMock()  # type: ignore[assignment]
+            scheduler._warm_pool.get_vm = AsyncMock(return_value=warm_vm)  # type: ignore[union-attr]
+            scheduler._warm_pool.stop = AsyncMock()  # awaited during __aexit__ shutdown  # type: ignore[union-attr]
+            scheduler._vm_manager.create_vm = AsyncMock()  # type: ignore[union-attr]
+            fetch_calls: list[Language] = []
+
+            with patch(
+                "exec_sandbox.scheduler.fetch_base_image",
+                side_effect=self._mock_fetch(fresh, "aarch64", fetch_calls),
+            ):
+                vm, _ports, is_cold, _started, _admission_ms = await scheduler._prepare_vm(
+                    language=Language.PYTHON,
+                    packages=[],
+                    memory_mb=None,
+                    allow_network=False,
+                    allowed_domains=None,
+                    expose_ports=None,
+                    task_id=f"test-{random_test_id()}",
+                )
+
+            assert vm is warm_vm
+            assert is_cold is False
+            assert fetch_calls == [], "warm-pool hit must not download the base image"
+            scheduler._vm_manager.create_vm.assert_not_awaited()  # type: ignore[union-attr]
+
+
+class TestWarmPoolStartupBaseFetch:
+    """Regression tests: base images downloaded before warm-pool startup.
+
+    WarmVMPool.start() pre-boots one VM per language and hashes each base image
+    (check_cache -> compute_cache_key -> get_base_image). On a fresh cache that
+    would raise VmDependencyError, since ensure_assets() fetched only the
+    kernel/initramfs. Scheduler.__aenter__ must fetch every pooled base image
+    first (when auto_download_assets is enabled). Same user experience as the
+    per-run fix in _prepare_vm.
+    """
+
+    @staticmethod
+    def _warm_config(fresh: Path, tmp_path: Path, *, auto_download: bool) -> SchedulerConfig:
+        l1 = tmp_path / "l1"
+        l2 = tmp_path / "l2"
+        l1.mkdir(exist_ok=True)
+        l2.mkdir(exist_ok=True)
+        return SchedulerConfig(
+            images_dir=fresh,
+            auto_download_assets=auto_download,
+            warm_pool_size=1,
+            default_timeout_seconds=120,
+            disk_snapshot_cache_dir=l2,
+            memory_snapshot_cache_dir=l1,
+        )
+
+    @staticmethod
+    def _mock_warm_pool(events: list[tuple[str, object]]) -> MagicMock:
+        """WarmVMPool stand-in that records start() ordering, no real VM boot."""
+        pool = MagicMock()
+
+        async def _start(*_args: object, **_kwargs: object) -> None:
+            events.append(("start", None))
+
+        pool.start = AsyncMock(side_effect=_start)
+        pool.stop = AsyncMock()
+        return pool
+
+    async def test_warm_pool_startup_fetches_all_bases_first(self, images_dir: Path, tmp_path: Path) -> None:
+        """auto_download=True + warm_pool_size>0 + fresh cache: every base fetched before start()."""
+        fresh, _arch = TestBaseImageFetchBeforeL1Restore._make_fresh_images_dir(images_dir, tmp_path)
+        config = self._warm_config(fresh, tmp_path, auto_download=True)
+        events: list[tuple[str, object]] = []
+
+        async def mock_fetch(language: str, **_kwargs: object) -> None:
+            events.append(("fetch", language))
+
+        mock_pool = self._mock_warm_pool(events)
+
+        with (
+            patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+            patch("exec_sandbox.scheduler.WarmVMPool", return_value=mock_pool),
+        ):
+            async with Scheduler(config):
+                pass
+
+        fetched = {lang for tag, lang in events if tag == "fetch"}
+        assert fetched == {language.value for language in Language}, "must fetch every pooled base image"
+        start_idx = next(i for i, (tag, _) in enumerate(events) if tag == "start")
+        assert all(i < start_idx for i, (tag, _) in enumerate(events) if tag == "fetch"), (
+            "all base fetches must precede WarmVMPool.start()"
+        )
+        mock_pool.start.assert_awaited_once()
+
+    async def test_warm_pool_startup_no_fetch_when_disabled(self, images_dir: Path, tmp_path: Path) -> None:
+        """auto_download=False: no fetch attempted (offline images must be provided)."""
+        fresh, _arch = TestBaseImageFetchBeforeL1Restore._make_fresh_images_dir(images_dir, tmp_path)
+        config = self._warm_config(fresh, tmp_path, auto_download=False)
+        events: list[tuple[str, object]] = []
+
+        async def mock_fetch(language: str, **_kwargs: object) -> None:
+            events.append(("fetch", language))
+
+        mock_pool = self._mock_warm_pool(events)
+
+        with (
+            patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+            patch("exec_sandbox.scheduler.WarmVMPool", return_value=mock_pool),
+        ):
+            async with Scheduler(config):
+                pass
+
+        assert [tag for tag, _ in events if tag == "fetch"] == [], "no fetch when auto_download_assets=False"
+        mock_pool.start.assert_awaited_once()
 
 
 # ============================================================================

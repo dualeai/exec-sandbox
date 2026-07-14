@@ -287,11 +287,11 @@ class TestMigrationClientExecuteEdgeCases:
 class TestMigrationClientSetCapabilities:
     """Tests for _set_capabilities (mapped-ram + multifd on QEMU >= 9.0)."""
 
-    async def test_enables_mapped_ram_for_qemu_9(self) -> None:
-        """QEMU >= 9.0 should enable mapped-ram + multifd."""
+    async def test_enables_mapped_ram_for_qemu_11(self) -> None:
+        """QEMU >= 11.0 should enable mapped-ram + multifd."""
         client, _reader, writer = _make_connected([{"return": {}}])
 
-        await client._set_capabilities((9, 2, 0))
+        await client._set_capabilities((11, 2, 0))
 
         cmds = writer.commands
         assert len(cmds) == 1
@@ -299,12 +299,25 @@ class TestMigrationClientSetCapabilities:
         cap_names = {c["capability"] for c in cmds[0]["arguments"]["capabilities"]}
         assert "multifd" in cap_names
         assert "mapped-ram" in cap_names
+        # Non-template save: no x-ignore-shared (full RAM captured).
+        assert "x-ignore-shared" not in cap_names
+
+    async def test_template_adds_x_ignore_shared(self) -> None:
+        """Template mode appends x-ignore-shared to the unified mapped-ram list."""
+        client, _reader, writer = _make_connected([{"return": {}}])
+
+        await client._set_capabilities((11, 2, 0), use_template=True)
+
+        cmds = writer.commands
+        assert len(cmds) == 1
+        cap_names = {c["capability"] for c in cmds[0]["arguments"]["capabilities"]}
+        assert cap_names == {"multifd", "mapped-ram", "x-ignore-shared"}
 
     async def test_no_capabilities_for_old_qemu(self) -> None:
-        """QEMU < 9.0 should not set capabilities."""
+        """QEMU < 11.0 should not set capabilities (falls back to plain streaming)."""
         client, _reader, writer = _make_connected()
 
-        await client._set_capabilities((8, 2, 0))
+        await client._set_capabilities((10, 2, 0))
 
         assert len(writer.commands) == 0
 
@@ -325,25 +338,25 @@ class TestMigrationClientSetCapabilities:
         )
 
         # Should not raise
-        await client._set_capabilities((9, 2, 0))
+        await client._set_capabilities((11, 2, 0))
 
 
 class TestMigrationClientSetCapabilitiesEdgeCases:
     """Edge cases for capability negotiation."""
 
-    async def test_boundary_qemu_version_9_0_0(self) -> None:
-        """Exactly QEMU 9.0.0 should enable capabilities (>= check)."""
+    async def test_boundary_qemu_version_11_0_0(self) -> None:
+        """Exactly QEMU 11.0.0 should enable capabilities (>= check)."""
         client, _reader, writer = _make_connected([{"return": {}}])
 
-        await client._set_capabilities((9, 0, 0))
+        await client._set_capabilities((11, 0, 0))
 
         assert any(c["execute"] == "migrate-set-capabilities" for c in writer.commands)
 
-    async def test_boundary_qemu_version_8_99_99(self) -> None:
-        """QEMU 8.99.99 should NOT enable capabilities (< 9.0.0)."""
+    async def test_boundary_qemu_version_10_99_99(self) -> None:
+        """QEMU 10.99.99 should NOT enable capabilities (< 11.0.0)."""
         client, _reader, writer = _make_connected()
 
-        await client._set_capabilities((8, 99, 99))
+        await client._set_capabilities((10, 99, 99))
 
         assert len(writer.commands) == 0
 
@@ -403,6 +416,26 @@ class TestMigrationClientPollMigration:
         with (
             patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
             pytest.raises(MigrationTransientError, match="cancelled"),
+        ):
+            await client._poll_migration(timeout=5.0)
+
+    async def test_poll_raises_on_failing(self) -> None:
+        """Poll should raise on 'failing' status (QEMU 11.0+ error-cleanup state).
+
+        'failing' means an error occurred and cleanup is underway (it transitions
+        to 'failed' shortly). We treat it as terminal so the failure surfaces one
+        poll interval sooner instead of waiting for the 'failed' transition.
+        """
+        client, _reader, _writer = _make_connected(
+            [
+                {"return": {"status": "active"}},
+                {"return": {"status": "failing", "error-desc": "write error"}},
+            ]
+        )
+
+        with (
+            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
+            pytest.raises(MigrationTransientError, match="failing"),
         ):
             await client._poll_migration(timeout=5.0)
 
@@ -494,13 +527,13 @@ class TestMigrationClientSaveSnapshot:
         )
 
         with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(9, 2, 0))
+            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(11, 2, 0))
 
         cmds = [c["execute"] for c in writer.commands]
         assert cmds == ["migrate-set-capabilities", "stop", "migrate", "query-migrate", "quit"]
 
     async def test_save_command_sequence_old_qemu(self) -> None:
-        """Save with QEMU < 9.0 should: stop → migrate → poll → quit (no capabilities)."""
+        """Save with QEMU < 11.0 should: stop → migrate → poll → quit (no capabilities)."""
         client, _reader, writer = _make_connected(
             [
                 {"return": {}},  # stop
@@ -638,7 +671,7 @@ class TestMigrationClientRestoreSnapshot:
         )
 
         with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(9, 2, 0))
+            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(11, 2, 0))
 
         cmds = [c["execute"] for c in writer.commands]
         assert cmds == ["migrate-set-capabilities", "migrate-incoming", "query-migrate", "cont"]
@@ -655,7 +688,7 @@ class TestMigrationClientRestoreSnapshot:
         )
 
         with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(9, 2, 0))
+            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(11, 2, 0))
 
         cmds = [c["execute"] for c in writer.commands]
         assert "quit" not in cmds
