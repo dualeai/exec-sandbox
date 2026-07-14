@@ -17,10 +17,26 @@ from pydantic import ValidationError
 from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB, MAX_CODE_SIZE
-from exec_sandbox.exceptions import AssetDownloadError, SandboxError, SnapshotError, VmConfigError, VmTimeoutError
+from exec_sandbox.exceptions import (
+    AssetDownloadError,
+    SandboxError,
+    SnapshotError,
+    VmConfigError,
+    VmPermanentError,
+    VmTimeoutError,
+    VmTransientError,
+)
 from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import create_test_qcow2, random_test_id, skip_unless_fast_balloon, skip_unless_hwaccel
+from exec_sandbox.vm_types import VmState
+from tests.conftest import (
+    create_test_qcow2,
+    make_destroy_mock,
+    random_test_id,
+    skip_unless_fast_balloon,
+    skip_unless_hwaccel,
+)
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -85,6 +101,60 @@ class TestSchedulerContextManager:
             await scheduler.run(code="print(1)", language=Language.PYTHON)
 
         assert "not started" in str(exc_info.value)
+
+    async def test_cancelled_partial_startup_waits_for_owned_rollback(self, tmp_path: Path) -> None:
+        """Repeated cancellation cannot abandon a manager started by __aenter__."""
+        scheduler = Scheduler(SchedulerConfig(images_dir=tmp_path, warm_pool_size=1))
+        manager = MagicMock()
+        manager.start = AsyncMock()
+        manager.get_active_vms.return_value = {}
+        manager_stop_entered = asyncio.Event()
+        release_manager_stop = asyncio.Event()
+
+        async def blocked_manager_stop() -> None:
+            manager_stop_entered.set()
+            await release_manager_stop.wait()
+
+        manager.stop = AsyncMock(side_effect=blocked_manager_stop)
+        memory = MagicMock()
+        memory.stop = AsyncMock()
+        warm = MagicMock()
+        warm_start_entered = asyncio.Event()
+
+        async def blocked_warm_start() -> None:
+            warm_start_entered.set()
+            await asyncio.Event().wait()
+
+        warm.start = AsyncMock(side_effect=blocked_warm_start)
+        warm.stop = AsyncMock()
+
+        with (
+            patch("exec_sandbox.scheduler.ensure_assets", new_callable=AsyncMock, return_value=tmp_path),
+            patch.object(scheduler, "_create_settings", return_value=MagicMock()),
+            patch("exec_sandbox.scheduler.VmManager", return_value=manager),
+            patch("exec_sandbox.scheduler.DiskSnapshotManager", return_value=MagicMock()),
+            patch("exec_sandbox.scheduler.MemorySnapshotManager", return_value=memory),
+            patch("exec_sandbox.scheduler.WarmVMPool", return_value=warm),
+        ):
+            startup = asyncio.create_task(scheduler.__aenter__())
+            await warm_start_entered.wait()
+            startup.cancel()
+            await manager_stop_entered.wait()
+            startup.cancel()
+            await asyncio.sleep(0)
+            assert not startup.done()
+
+            release_manager_stop.set()
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+
+        warm.stop.assert_awaited_once()
+        memory.stop.assert_awaited_once()
+        manager.stop.assert_awaited_once()
+        assert scheduler._started is False
+        assert scheduler._shutdown_task is not None
+        assert scheduler._shutdown_task.done()
+        assert not scheduler._shutdown_task.cancelled()
 
 
 class TestTimeoutValidation:
@@ -183,6 +253,178 @@ class TestCodeSizeValidation:
         with pytest.raises(Exception) as exc_info:
             await scheduler.run(code="x" * MAX_CODE_SIZE, language=Language.PYTHON)
         assert not isinstance(exc_info.value, VmConfigError)
+
+
+class TestRunTeardownConfirmation:
+    """One-shot execution must not claim success before process death is proven."""
+
+    @staticmethod
+    def _mock_run(destroyed_state: VmState) -> tuple[Scheduler, MagicMock, tuple[object, ...]]:
+        scheduler = Scheduler()
+        scheduler._started = True
+        scheduler._vm_manager = MagicMock()
+        scheduler._vm_manager.destroy_vm = make_destroy_mock(
+            "confirmed" if destroyed_state is VmState.DESTROYED else "unconfirmed"
+        )
+
+        vm = MagicMock(spec=QemuVM)
+        vm.vm_id = "one-shot-unconfirmed"
+        vm.boot_ms = 0
+        vm.overlay_ms = 0
+        vm.qemu_cmd_build_ms = 0
+        vm.gvproxy_start_ms = 0
+        vm.qemu_fork_ms = 0
+        vm.guest_wait_ms = 0
+        vm.l1_restored = False
+        vm.setup_ms = None
+        vm.state = VmState.DESTROYING
+        # `timing` is an instance attribute, invisible to spec=QemuVM.
+        vm.timing = MagicMock()
+        vm.timing.boot_retries = 0
+        vm.execute = AsyncMock(
+            return_value=ExecutionResult(
+                stdout="ok\n",
+                stderr="",
+                exit_code=0,
+                timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=1, total_ms=1),
+            )
+        )
+        prepare_start = asyncio.get_running_loop().time()
+        return scheduler, vm, (vm, [], True, prepare_start, 0)
+
+    async def test_unconfirmed_vm_cleanup_raises_instead_of_returning_result(self) -> None:
+        scheduler, vm, prepared = self._mock_run(VmState.DESTROYING)
+        with patch.object(
+            scheduler,
+            "_prepare_vm",
+            new_callable=AsyncMock,
+            return_value=prepared,
+        ):
+            with pytest.raises(VmPermanentError, match="process cleanup was not confirmed"):
+                await scheduler.run(code="print('ok')", language=Language.PYTHON)
+
+        scheduler._vm_manager.destroy_vm.assert_awaited_once_with(vm)
+
+    async def test_confirmed_process_death_returns_result_while_ancillary_cleanup_retries(self) -> None:
+        """Workdir/cgroup retry must not mask a result after process death."""
+        scheduler, vm, prepared = self._mock_run(VmState.DESTROYED)
+
+        scheduler._vm_manager.destroy_vm = make_destroy_mock("ancillary_pending")
+        with patch.object(scheduler, "_prepare_vm", new_callable=AsyncMock, return_value=prepared):
+            result = await scheduler.run(code="print('ok')", language=Language.PYTHON)
+
+        assert result.stdout == "ok\n"
+        scheduler._vm_manager.destroy_vm.assert_awaited_once_with(vm)
+
+    async def test_confirmed_vm_cleanup_returns_result(self) -> None:
+        scheduler, vm, prepared = self._mock_run(VmState.DESTROYED)
+        with patch.object(scheduler, "_prepare_vm", new_callable=AsyncMock, return_value=prepared):
+            result = await scheduler.run(code="print('ok')", language=Language.PYTHON)
+
+        assert result.stdout == "ok\n"
+        scheduler._vm_manager.destroy_vm.assert_awaited_once_with(vm)
+
+    async def test_execution_error_remains_primary_when_cleanup_is_unconfirmed(self) -> None:
+        scheduler, vm, prepared = self._mock_run(VmState.DESTROYING)
+        vm.execute.side_effect = RuntimeError("execute failed")
+        with patch.object(scheduler, "_prepare_vm", new_callable=AsyncMock, return_value=prepared):
+            with pytest.raises(RuntimeError, match="execute failed"):
+                await scheduler.run(code="print('ok')", language=Language.PYTHON)
+
+        scheduler._vm_manager.destroy_vm.assert_awaited_once_with(vm)
+
+    async def test_cancellation_remains_primary_when_cleanup_is_unconfirmed(self) -> None:
+        scheduler, vm, prepared = self._mock_run(VmState.DESTROYING)
+        vm.execute.side_effect = asyncio.CancelledError()
+        with patch.object(scheduler, "_prepare_vm", new_callable=AsyncMock, return_value=prepared):
+            with pytest.raises(asyncio.CancelledError):
+                await scheduler.run(code="print('ok')", language=Language.PYTHON)
+
+        scheduler._vm_manager.destroy_vm.assert_awaited_once_with(vm)
+
+
+class TestL1FallbackOwnership:
+    """Cold-boot fallback cannot reuse a reservation retained by an L1 reaper."""
+
+    @staticmethod
+    def _mock_prepare(restore_error: Exception) -> tuple[Scheduler, MagicMock, MagicMock]:
+        scheduler = Scheduler(SchedulerConfig(auto_download_assets=False))
+        scheduler._started = True
+        scheduler._settings = MagicMock()
+        scheduler._warm_pool = None
+
+        reservation = MagicMock()
+        reservation_context = MagicMock()
+        reservation_context.__aenter__ = AsyncMock(return_value=reservation)
+        reservation_context.__aexit__ = AsyncMock(return_value=False)
+
+        manager = MagicMock()
+        manager.reservation_context = MagicMock(return_value=reservation_context)
+        manager.restore_vm = AsyncMock(side_effect=restore_error)
+        replacement = MagicMock()
+        replacement.vm_id = "cold-boot-replacement"
+        manager.create_vm = AsyncMock(return_value=replacement)
+        manager.destroy_vm = AsyncMock(return_value=True)
+        scheduler._vm_manager = manager
+
+        memory = MagicMock()
+        memory.check_cache = AsyncMock(return_value=Path("/tmp/cached.vmstate"))
+        memory.get_l2_for_l1 = AsyncMock(return_value=None)
+        memory.schedule_background_save = AsyncMock()
+        scheduler._memory_snapshot_manager = memory
+        return scheduler, manager, reservation
+
+    async def test_unconfirmed_restore_cleanup_propagates_without_cold_boot(self) -> None:
+        scheduler, manager, _reservation = self._mock_prepare(
+            VmPermanentError("Restore failure cleanup was not confirmed")
+        )
+
+        with pytest.raises(VmPermanentError, match="cleanup was not confirmed"):
+            await scheduler._prepare_vm(
+                language=Language.PYTHON,
+                packages=[],
+                memory_mb=192,
+                allow_network=False,
+                allowed_domains=None,
+                expose_ports=None,
+                task_id="restore-cleanup-failed",
+            )
+
+        manager.create_vm.assert_not_awaited()
+
+    async def test_confirmed_transient_restore_failure_can_reuse_reservation(self) -> None:
+        scheduler, manager, reservation = self._mock_prepare(VmTransientError("migration failed"))
+
+        vm, _ports, _cold, _started, _admission_ms = await scheduler._prepare_vm(
+            language=Language.PYTHON,
+            packages=[],
+            memory_mb=192,
+            allow_network=False,
+            allowed_domains=None,
+            expose_ports=None,
+            task_id="restore-transient",
+        )
+
+        assert vm.vm_id == "cold-boot-replacement"
+        assert manager.create_vm.await_args.kwargs["reservation"] is reservation
+
+    async def test_post_create_snapshot_schedule_failure_destroys_unreturned_vm(self) -> None:
+        scheduler, manager, _reservation = self._mock_prepare(VmTransientError("restore miss"))
+        scheduler._memory_snapshot_manager.schedule_background_save.side_effect = RuntimeError("schedule failed")
+
+        with pytest.raises(RuntimeError, match="schedule failed"):
+            await scheduler._prepare_vm(
+                language=Language.PYTHON,
+                packages=[],
+                memory_mb=192,
+                allow_network=False,
+                allowed_domains=None,
+                expose_ports=None,
+                task_id="post-create-schedule-failed",
+            )
+
+        replacement = manager.create_vm.return_value
+        manager.destroy_vm.assert_awaited_once_with(replacement)
 
 
 class TestPackageValidation:
@@ -663,6 +905,87 @@ class TestSchedulerShutdownOrdering:
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         assert scheduler._started is False
 
+    async def test_shutdown_closes_public_ingress_before_pool_drain(self) -> None:
+        scheduler = self._make_scheduler()
+        pool_stop_entered = asyncio.Event()
+        release_pool_stop = asyncio.Event()
+
+        async def blocked_pool_stop() -> None:
+            pool_stop_entered.set()
+            await release_pool_stop.wait()
+
+        scheduler._warm_pool.stop.side_effect = blocked_pool_stop  # type: ignore[union-attr]
+        shutdown = asyncio.create_task(scheduler.__aexit__(None, None, None))
+        await pool_stop_entered.wait()
+
+        assert scheduler._started is False
+        with pytest.raises(SandboxError, match="not started"):
+            await scheduler.run(code="print(1)", language=Language.PYTHON)
+
+        release_pool_stop.set()
+        await asyncio.wait_for(shutdown, timeout=1)
+
+    async def test_cancelled_shutdown_waiter_does_not_cancel_owned_shutdown(self) -> None:
+        """A cancelled context waiter cannot strand the shared shutdown sequence."""
+        scheduler = self._make_scheduler()
+        pool_stop_entered = asyncio.Event()
+        release_pool_stop = asyncio.Event()
+
+        async def blocked_pool_stop() -> None:
+            pool_stop_entered.set()
+            await release_pool_stop.wait()
+
+        scheduler._warm_pool.stop.side_effect = blocked_pool_stop  # type: ignore[union-attr]
+        first_waiter = asyncio.create_task(scheduler.__aexit__(None, None, None))
+        await pool_stop_entered.wait()
+        owned_shutdown = scheduler._shutdown_task
+        assert owned_shutdown is not None
+
+        first_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_waiter
+
+        assert not owned_shutdown.cancelled()
+        scheduler._memory_snapshot_manager.stop.assert_not_awaited()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_not_awaited()  # type: ignore[union-attr]
+
+        second_waiter = asyncio.create_task(scheduler.__aexit__(None, None, None))
+        release_pool_stop.set()
+        await asyncio.wait_for(second_waiter, timeout=1)
+
+        assert scheduler._shutdown_task is owned_shutdown
+        scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_reentry_is_rejected_while_owned_shutdown_is_pending(self) -> None:
+        scheduler = self._make_scheduler()
+        pool_stop_entered = asyncio.Event()
+        release_pool_stop = asyncio.Event()
+
+        async def blocked_pool_stop() -> None:
+            pool_stop_entered.set()
+            await release_pool_stop.wait()
+
+        scheduler._warm_pool.stop.side_effect = blocked_pool_stop  # type: ignore[union-attr]
+        shutdown = asyncio.create_task(scheduler.__aexit__(None, None, None))
+        await pool_stop_entered.wait()
+
+        with pytest.raises(SandboxError, match="still shutting down"):
+            await scheduler.__aenter__()
+
+        release_pool_stop.set()
+        await shutdown
+
+    async def test_shutdown_failure_leaves_scheduler_closed(self) -> None:
+        scheduler = self._make_scheduler()
+        scheduler._vm_manager.stop.side_effect = VmPermanentError("cleanup failed")  # type: ignore[union-attr]
+
+        with pytest.raises(VmPermanentError, match="cleanup failed"):
+            await scheduler.__aexit__(None, None, None)
+
+        assert scheduler._started is False
+
     async def test_shutdown_background_save_unblocks_after_pool_drain(self) -> None:
         """Correct ordering unblocks a background save waiting on resources."""
         scheduler = self._make_scheduler()
@@ -737,6 +1060,16 @@ class TestSchedulerShutdownOrdering:
         scheduler._warm_pool.stop.side_effect = OSError("pool drain failed")  # type: ignore[union-attr]
 
         await scheduler.__aexit__(None, None, None)
+
+        scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
+
+    async def test_shutdown_warm_pool_permanent_error_continues_then_propagates(self) -> None:
+        scheduler = self._make_scheduler()
+        scheduler._warm_pool.stop.side_effect = VmPermanentError("pool cleanup unconfirmed")  # type: ignore[union-attr]
+
+        with pytest.raises(VmPermanentError, match="pool cleanup unconfirmed"):
+            await scheduler.__aexit__(None, None, None)
 
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]

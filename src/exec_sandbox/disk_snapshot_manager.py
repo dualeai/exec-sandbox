@@ -67,7 +67,7 @@ from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.qemu_vm import guest_error_to_exception
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
-from exec_sandbox.subprocess_utils import start_managed_process
+from exec_sandbox.subprocess_utils import communicate_managed_process
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -324,12 +324,13 @@ class DiskSnapshotManager(BaseCacheManager):
 
         # Verify qcow2 format (standalone ext4 snapshot, no backing file expected)
         try:
-            proc = await start_managed_process(
+            returncode, _, _ = await communicate_managed_process(
                 ["qemu-img", "check", str(snapshot_path)],
+                process_name="qemu-img-check",
+                context_id=cache_key,
             )
-            await proc.communicate()
 
-            if proc.returncode != 0:
+            if returncode != 0:
                 logger.debug("Invalid qcow2 snapshot, removing", extra={"cache_key": cache_key})
                 await aiofiles.os.remove(snapshot_path)
                 return None
@@ -577,7 +578,7 @@ class DiskSnapshotManager(BaseCacheManager):
             SnapshotError: qemu-img command failed
         """
         try:
-            proc = await start_managed_process(
+            returncode, _, stderr = await communicate_managed_process(
                 [
                     "qemu-img",
                     "create",
@@ -588,9 +589,10 @@ class DiskSnapshotManager(BaseCacheManager):
                     str(snapshot_path),
                     "512M",
                 ],
+                process_name="qemu-img-create-snapshot",
+                context_id=cache_key,
             )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
+            if returncode != 0:
                 raise QemuImgError(f"qemu-img create failed: {stderr.decode().strip()}")
         except QemuImgError as e:
             raise SnapshotError(
@@ -648,7 +650,10 @@ class DiskSnapshotManager(BaseCacheManager):
             timeout=constants.PACKAGE_INSTALL_TIMEOUT_SECONDS,
         )
 
-        hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS
+        # +8s: the install is the first guest op on a fresh network-enabled VM,
+        # so the guest's network readiness gate (worker timeout + 1) can consume
+        # up to 8s before the install's own timeout starts counting.
+        hard_timeout = constants.PACKAGE_INSTALL_TIMEOUT_SECONDS + constants.EXECUTION_TIMEOUT_MARGIN_SECONDS + 8
         total_timeout = (
             hard_timeout * constants.PACKAGE_INSTALL_MAX_RETRIES
             + constants.PACKAGE_INSTALL_RETRY_MAX_SECONDS * (constants.PACKAGE_INSTALL_MAX_RETRIES - 1)

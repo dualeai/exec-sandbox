@@ -143,13 +143,27 @@ GUEST_RECONNECT_PROBE_MAX_RETRIES: Final[int] = 5
 GUEST_RECONNECT_PROBE_DELAY: Final[float] = 0.05
 """Delay between reconnection probe retries (50ms)."""
 
-EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 8
+SIGKILL_EXIT_CODE: Final[int] = 128 + 9
+"""Exit code reported when a process died from SIGKILL (guard, OOM killer, or
+user code exiting 137). Terminal for sessions — see Session.exec."""
+
+EXECUTION_TIMEOUT_MARGIN_SECONDS: Final[int] = 10
 """Hard timeout margin above soft timeout (host watchdog protection).
 Accounts for:
 - Guest graceful termination grace period (5s SIGTERM→SIGKILL)
-- JSON serialization, network transmission, clock skew (~2s)
-- Safety buffer (~1s)
-Must be >= guest-agent TERM_GRACE_PERIOD_SECONDS (5s) + overhead."""
+- JSON serialization, transport, scheduling, and clock skew (~3s)
+- First-execution slack and final safety buffer (~2s)
+Zram readiness is terminal before the guest listener starts, so it can never
+delay a request. Network readiness gates only the first execution and usually
+resolves in well under a second; a pathologically slow (multi-second) setup on
+that first execution may trip this watchdog. The VM is then discarded and the
+caller sees CommunicationOutcomeUnknownError (after dispatch) or a boot
+timeout (before dispatch) — never a wrong result. That rare case is accepted
+instead of delaying hung-guest detection by 8s on every execution. The
+package-install path, which is always a first op on a network VM, adds its
+own gate allowance (see disk_snapshot_manager).
+This is a hard infrastructure backstop; user-code timeout semantics are
+unchanged."""
 
 SNAPSHOT_CREATION_MIN_MEMORY_MB: Final[int] = 320
 """Minimum guest memory for snapshot creation VMs (package installation).
@@ -166,7 +180,7 @@ PACKAGE_INSTALL_TIMEOUT_SECONDS: Final[int] = 300
 
 Sent to the guest agent via InstallPackagesRequest.timeout field.
 The guest enforces this as the tokio::time::timeout for the package manager process.
-Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS)."""
+Also used host-side to compute hard_timeout (+ EXECUTION_TIMEOUT_MARGIN_SECONDS + 8s first-op network gate allowance, see disk_snapshot_manager)."""
 
 PACKAGE_INSTALL_MAX_RETRIES: Final[int] = 3
 """Maximum retry attempts for transient network errors during package install."""

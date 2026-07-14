@@ -583,16 +583,18 @@ Returned by `Session.list_files()`.
 
 ### Session Resilience
 
-Sessions survive user code failures, input validation errors (`InputValidationError`), and output limit errors (`OutputLimitError`). Only VM-level communication errors close a session.
+Sessions survive user code failures, input validation errors (`InputValidationError`), and output limit errors (`OutputLimitError`). VM-level communication errors, cancellation, exit 137, and a VM found dead all close a session. A closed session cannot be reused.
 
 | Failure | Exit Code | Session | State | Next `exec()` |
 |---------|-----------|---------|-------|----------------|
 | Exception (ValueError, etc.) | 1 | Alive | Preserved | Works, state intact |
-| `sys.exit(n)` | n | Alive | Preserved | Works, state intact |
+| `sys.exit(n)`, n != 137 | n | Alive | Preserved | Works, state intact |
 | Syntax error | 1 | Alive | Preserved | Works, state intact |
 | Output limit exceeded | 1 | Alive | Preserved | Works, state intact |
-| `os._exit(n)` | n | Alive | **Reset** | Works, fresh REPL |
-| Signal (SIGKILL, OOM kill) | 128 + signal | Alive | **Reset** | Works, fresh REPL |
+| `os._exit(n)`, n != 137 | n | Alive | **Reset** | Works, fresh REPL |
+| Exit 137 (for example, SIGKILL) | 137 | **Closed** | Lost | `SessionClosedError` |
+| QEMU died while delivering a result | result's code | **Closed** | Lost | `SessionClosedError` |
+| Signal other than SIGKILL | 128 + signal | Alive | **Reset** | Works, fresh REPL |
 | Timeout | -1 | Alive | **Reset** | Works, fresh REPL |
 | VM communication failure | N/A | **Closed** | Lost | `SessionClosedError` |
 

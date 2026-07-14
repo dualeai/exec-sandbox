@@ -48,10 +48,11 @@ from typing import TYPE_CHECKING, Self
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.assets import ensure_assets, fetch_base_image
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
-from exec_sandbox.exceptions import SandboxError, VmConfigError
+from exec_sandbox.exceptions import SandboxError, VmConfigError, VmPermanentError, VmTransientError
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, TimingBreakdown
 from exec_sandbox.package_validator import PackageValidator
@@ -69,12 +70,26 @@ from exec_sandbox.system_probes import (
     warn_zswap,
 )
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_types import VmState
 from exec_sandbox.warm_vm_pool import WarmVMPool
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
 
 logger = get_logger(__name__)
+
+
+async def _wait_for_owned_task(task: asyncio.Task[None]) -> BaseException | None:
+    """Wait through repeated caller cancellation and return an owned task error.
+
+    Deliberate trade-off: caller cancellation (including Ctrl-C) is absorbed
+    until the owned task finishes, so a wedged startup rollback cannot be
+    aborted — leaked VM processes would be worse than a slow interrupt.
+    """
+    await await_settled(task)
+    if task.cancelled():
+        return asyncio.CancelledError()
+    return task.exception()
 
 
 class Scheduler:
@@ -117,6 +132,7 @@ class Scheduler:
         self._memory_snapshot_manager: MemorySnapshotManager | None = None
         self._warm_pool: WarmVMPool | None = None
         self._started = False
+        self._shutdown_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Self:
         """Start scheduler and initialize resources.
@@ -139,6 +155,20 @@ class Scheduler:
         """
         if self._started:
             raise SandboxError("Scheduler already started")
+        if self._shutdown_task is not None:
+            if not self._shutdown_task.done():
+                raise SandboxError("Scheduler is still shutting down")
+            # A completed lifecycle may be reused only after its shutdown was
+            # successful. result() preserves a prior cleanup failure.
+            self._shutdown_task.result()
+            self._shutdown_task = None
+
+        # A completed lifecycle never lends component references to the next
+        # one. This also makes a pre-manager startup failure an inert state.
+        self._vm_manager = None
+        self._snapshot_manager = None
+        self._memory_snapshot_manager = None
+        self._warm_pool = None
 
         # System limit probes: raise safe limits, warn about unsafe ones.
         raise_fd_limit()
@@ -168,29 +198,41 @@ class Scheduler:
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
 
-        # Initialize VmManager (handles backpressure internally via admission controller)
+        # Initialize VmManager (handles backpressure internally via admission controller).
+        # From this publication onward, every startup failure rolls the whole
+        # partial lifecycle back through one scheduler-owned shutdown task.
         self._vm_manager = VmManager(self._settings)
-        await self._vm_manager.start()  # Pre-warms all system probe caches
+        try:
+            await self._vm_manager.start()  # Pre-warms all system probe caches
 
-        # Initialize DiskSnapshotManager (L2 local cache always available, L3 S3 optional)
-        self._snapshot_manager = DiskSnapshotManager(self._settings, self._vm_manager)
+            # Initialize DiskSnapshotManager (L2 local cache always available, L3 S3 optional)
+            self._snapshot_manager = DiskSnapshotManager(self._settings, self._vm_manager)
 
-        # Initialize MemorySnapshotManager (L1 cache)
-        self._memory_snapshot_manager = MemorySnapshotManager(
-            self._settings,
-            self._vm_manager,
-            self._snapshot_manager,
-        )
-
-        # Initialize WarmVMPool (optional)
-        if self.config.warm_pool_size > 0:
-            self._warm_pool = WarmVMPool(
+            # Initialize MemorySnapshotManager (L1 cache)
+            self._memory_snapshot_manager = MemorySnapshotManager(
+                self._settings,
                 self._vm_manager,
-                self.config,
                 self._snapshot_manager,
-                memory_snapshot_manager=self._memory_snapshot_manager,
             )
-            await self._warm_pool.start()
+
+            # Initialize WarmVMPool (optional)
+            if self.config.warm_pool_size > 0:
+                self._warm_pool = WarmVMPool(
+                    self._vm_manager,
+                    self.config,
+                    self._snapshot_manager,
+                    memory_snapshot_manager=self._memory_snapshot_manager,
+                )
+                await self._warm_pool.start()
+        except BaseException:
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+            rollback_error = await _wait_for_owned_task(self._shutdown_task)
+            if rollback_error is not None:
+                logger.error(
+                    "Scheduler startup rollback failed",
+                    extra={"error": str(rollback_error)},
+                )
+            raise
 
         self._started = True
         logger.info("Scheduler started successfully")
@@ -199,13 +241,20 @@ class Scheduler:
     async def __aexit__(
         self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
     ) -> None:
+        """Close ingress and await one scheduler-owned shutdown operation."""
+        self._started = False
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+        await asyncio.shield(self._shutdown_task)
+
+    async def _shutdown(self) -> None:
         """Shutdown scheduler and clean up all resources.
 
         Shutdown sequence:
         1. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
         2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
-        4. Destroy any remaining active VMs
-        5. Stop VmManager (overlay pool cleanup)
+        3. Destroy any remaining active VMs
+        4. Stop VmManager (overlay pool cleanup)
 
         IMPORTANT: WarmVMPool must stop BEFORE MemorySnapshotManager. Background
         L1 save tasks (from schedule_background_save) create sacrificial VMs via
@@ -217,39 +266,57 @@ class Scheduler:
         Always completes cleanup, even on exceptions.
         """
         logger.info("Shutting down scheduler")
+        deferred_error: BaseException | None = None
+        # Snapshot this lifecycle's components. Re-entry is rejected while this
+        # task is pending, and local references make that boundary explicit.
+        warm_pool = self._warm_pool
+        memory_snapshot_manager = self._memory_snapshot_manager
+        vm_manager = self._vm_manager
 
         # Stop WarmVMPool (drains VMs, frees resource slots for background saves)
-        if self._warm_pool:
+        if warm_pool:
             logger.info("Draining warm VM pool, this may take a moment")
             try:
-                await self._warm_pool.stop()
+                await warm_pool.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
                 logger.error("WarmVMPool stop error", extra={"error": str(e)})
+            except BaseException as e:  # noqa: BLE001 - core VM cleanup must still run
+                deferred_error = e
+                logger.error("WarmVMPool stop aborted", extra={"error": str(e)})
 
         # Stop MemorySnapshotManager (wait for background saves — now has resource slots)
-        if self._memory_snapshot_manager:
+        if memory_snapshot_manager:
             logger.info("Waiting for in-flight background snapshot saves to complete")
             try:
-                await self._memory_snapshot_manager.stop()
+                await memory_snapshot_manager.stop()
             except (OSError, RuntimeError, TimeoutError) as e:
                 logger.error("MemorySnapshotManager stop error", extra={"error": str(e)})
+            except BaseException as e:  # noqa: BLE001 - core VM cleanup must still run
+                if deferred_error is None:
+                    deferred_error = e
+                logger.error("MemorySnapshotManager stop aborted", extra={"error": str(e)})
 
         # Destroy any remaining VMs
-        if self._vm_manager:
-            active_vms = self._vm_manager.get_active_vms()
+        if vm_manager:
+            active_vms = vm_manager.get_active_vms()
             if active_vms:
                 logger.warning(
                     "Destroying remaining VMs on shutdown",
                     extra={"count": len(active_vms)},
                 )
-                destroy_tasks = [self._vm_manager.destroy_vm(vm) for vm in active_vms.values()]
+                destroy_tasks = [vm_manager.destroy_vm(vm) for vm in active_vms.values()]
                 await asyncio.gather(*destroy_tasks, return_exceptions=True)
 
             # Stop VmManager (includes overlay pool cleanup)
-            await self._vm_manager.stop()
+            try:
+                await vm_manager.stop()
+            except BaseException as e:  # noqa: BLE001 - preserve after all reachable cleanup
+                if deferred_error is None:
+                    deferred_error = e
 
-        self._started = False
         logger.info("Scheduler shutdown complete")
+        if deferred_error is not None:
+            raise deferred_error
 
     async def wait_pool_ready(self, timeout: float = 120) -> None:
         """Wait until the warm pool is fully populated. No-op if pool is disabled."""
@@ -307,6 +374,9 @@ class Scheduler:
             SandboxError: Scheduler not started.
             PackageNotAllowedError: Package not in allowlist.
             VmError: VM creation or execution failed.
+            VmTransientError: Infrastructure failed before dispatch (retryable).
+            CommunicationOutcomeUnknownError: Transport lost after dispatch —
+                the code may have run; reconcile side effects before retrying.
             VmTimeoutError: VM boot timed out (guest agent not ready).
             ValueError: Too many exposed ports or invalid port numbers.
 
@@ -436,6 +506,14 @@ class Scheduler:
                 result_out.timing.teardown_ms = teardown_ms
                 result_out.timing.total_ms = round((asyncio.get_running_loop().time() - prepare_start_time) * 1000)
 
+        # destroy_vm keeps failed workdir/cgroup cleanup owned for retry, and
+        # publishes DESTROYED only after QEMU and gvproxy death is confirmed.
+        # Only that process boundary may hide a known result.
+        if vm.state is not VmState.DESTROYED:
+            raise VmPermanentError(
+                f"VM process cleanup was not confirmed for one-shot VM {vm.vm_id}",
+                context={"vm_id": vm.vm_id, "operation": "scheduler_run_teardown"},
+            )
         if result_out is None:
             raise SandboxError("Execution produced no result")
         return result_out
@@ -458,7 +536,8 @@ class Scheduler:
         State (variables, imports, functions) persists between executions.
 
         The Session owns the VM lifecycle - the VM is destroyed when the
-        session is closed (explicitly, via context manager, or by idle timeout).
+        session is closed — explicitly, via context manager, by idle timeout, or by
+        a terminal failure (cancellation, unknown outcome, exit 137, dead VM).
 
         Args:
             language: Programming language ("python", "javascript", or "raw").
@@ -528,7 +607,7 @@ class Scheduler:
             default_timeout_seconds=self.config.default_timeout_seconds,
         )
 
-    async def _prepare_vm(  # noqa: PLR0912
+    async def _prepare_vm(  # noqa: PLR0912, PLR0915
         self,
         *,
         language: str | Language,
@@ -658,7 +737,7 @@ class Scheduler:
                                 "VM restored from L1 cache",
                                 extra={"vm_id": vm.vm_id, "language": language},
                             )
-                    except Exception as e:  # noqa: BLE001 - graceful fallback to cold boot
+                    except VmTransientError as e:
                         logger.warning(
                             "L1 restore failed, falling back to cold boot",
                             extra={"language": language, "error": str(e)},
@@ -688,13 +767,20 @@ class Scheduler:
 
                     # Schedule background L1 save for next time
                     if self._memory_snapshot_manager:
-                        await self._memory_snapshot_manager.schedule_background_save(
-                            language,
-                            packages,
-                            memory,
-                            snapshot_drive=snapshot_path,
-                            allow_network=needs_network,
-                        )
+                        try:
+                            await self._memory_snapshot_manager.schedule_background_save(
+                                language,
+                                packages,
+                                memory,
+                                snapshot_drive=snapshot_path,
+                                allow_network=needs_network,
+                            )
+                        except BaseException:
+                            # The caller never receives the newly-created VM when
+                            # post-acquisition scheduling is interrupted. Return
+                            # ownership to VmManager before propagating the error.
+                            await self._vm_manager.destroy_vm(vm)
+                            raise
 
         return vm, resolved_ports, is_cold_boot, prepare_start_time, admission_ms
 

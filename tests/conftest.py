@@ -12,6 +12,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -468,6 +469,25 @@ async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def
 # ============================================================================
 # Shared test helpers
 # ============================================================================
+
+
+def make_destroy_mock(kind: str = "confirmed") -> AsyncMock:
+    """AsyncMock for VmManager.destroy_vm mirroring the real contract
+    (vm_manager.destroy_vm): DESTROYED is published once process death is
+    confirmed, even when the bool return is False (ancillary cleanup pending).
+
+    kinds: "confirmed" (DESTROYED, True), "ancillary_pending" (DESTROYED,
+    False), "unconfirmed" (state untouched, False).
+    """
+    from exec_sandbox.vm_types import VmState
+
+    async def destroy(vm: object) -> bool:
+        if kind == "unconfirmed":
+            return False
+        vm.state = VmState.DESTROYED  # type: ignore[attr-defined]
+        return kind == "confirmed"
+
+    return AsyncMock(side_effect=destroy)
 
 
 def random_test_id() -> str:

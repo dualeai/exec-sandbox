@@ -21,6 +21,7 @@ from exec_sandbox.constants import GuestErrorType
 from exec_sandbox.exceptions import (
     CodeValidationError,
     CommunicationError,
+    CommunicationOutcomeUnknownError,
     EnvVarValidationError,
     InputValidationError,
     OutputLimitError,
@@ -30,6 +31,7 @@ from exec_sandbox.exceptions import (
     VmBootTimeoutError,
     VmDependencyError,
     VmError,
+    VmOverlayError,
     VmPermanentError,
     VmQemuCrashError,
     VmTransientError,
@@ -2549,6 +2551,784 @@ class TestHostOSForVm:
 # ============================================================================
 
 
+class TestDestroyVmStatus:
+    """Unit coverage for the QEMU-termination status propagated to sessions."""
+
+    @staticmethod
+    def _mock_vm() -> MagicMock:
+        vm = MagicMock()
+        vm.vm_id = "destroy-status-vm"
+        vm.qemu_log_task = None
+        vm.gvproxy_log_task = None
+        vm.process = MagicMock()
+        vm.gvproxy_proc = None
+        vm.workdir = None
+        vm.cgroup_path = None
+        vm.holds_admission_slot = False
+        vm.resource_reservation = None
+        vm.state = VmState.DESTROYING
+        vm.begin_destroy = AsyncMock()
+
+        async def confirm() -> None:
+            # Mirror the real contract: confirm_destroyed publishes DESTROYED.
+            vm.state = VmState.DESTROYED
+
+        vm.confirm_destroyed = AsyncMock(side_effect=confirm)
+        vm.channel.close = AsyncMock()
+        vm.cleanup_lock = asyncio.Lock()
+        return vm
+
+    async def test_returns_false_when_qemu_termination_is_unconfirmed(self, unit_test_vm_manager) -> None:
+        """Registry removal must not be reported as confirmed QEMU destruction."""
+        cleanup = {"qemu": False, "gvproxy": True, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+        reservation = MagicMock()
+        vm.holds_admission_slot = True
+        vm.resource_reservation = reservation
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_cleanup_retry") as schedule_retry,
+            patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
+        ):
+            assert await unit_test_vm_manager.destroy_vm(vm) is False
+        # DESTROYED must never be published while a process is unconfirmed —
+        # session/scheduler key retirement on this state.
+        vm.confirm_destroyed.assert_not_awaited()
+        assert vm.state is VmState.DESTROYING
+        assert vm.channel.close.await_count == 1  # no re-close before confirmed death
+        assert unit_test_vm_manager.get_active_vms()[vm.vm_id] is vm
+        assert vm.holds_admission_slot is True
+        assert vm.resource_reservation is reservation
+        release.assert_not_awaited()
+        schedule_retry.assert_called_once_with(vm)
+
+    async def test_returns_false_when_gvproxy_termination_is_unconfirmed(self, unit_test_vm_manager) -> None:
+        """No process may become unowned while its termination is unconfirmed."""
+        cleanup = {"qemu": True, "gvproxy": False, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_cleanup_retry") as schedule_retry,
+        ):
+            assert await unit_test_vm_manager.destroy_vm(vm) is False
+        vm.confirm_destroyed.assert_not_awaited()
+        assert vm.state is VmState.DESTROYING
+        assert unit_test_vm_manager.get_active_vms()[vm.vm_id] is vm
+        schedule_retry.assert_called_once_with(vm)
+
+    @pytest.mark.parametrize("failed_resource", ["workdir", "cgroup"])
+    async def test_returns_false_when_one_ancillary_cleanup_is_unconfirmed(
+        self,
+        unit_test_vm_manager,
+        failed_resource: str,
+    ) -> None:
+        """Dead processes do not make an unconfirmed host resource ownerless."""
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        cleanup[failed_resource] = False
+        vm = self._mock_vm()
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_cleanup_retry") as schedule_retry,
+        ):
+            assert await unit_test_vm_manager.destroy_vm(vm) is False
+        vm.confirm_destroyed.assert_awaited_once()
+        assert vm.state is VmState.DESTROYED
+        # Channel closed once up-front and re-closed after confirmed process
+        # death (reaps write workers resurrected by a racing operation).
+        assert vm.channel.close.await_count == 2
+        assert unit_test_vm_manager.get_active_vms()[vm.vm_id] is vm
+        schedule_retry.assert_called_once_with(vm)
+
+    async def test_returns_true_when_all_resource_cleanup_is_confirmed(self, unit_test_vm_manager) -> None:
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+
+        with patch.object(
+            unit_test_vm_manager,
+            "_force_cleanup_all_resources",
+            new_callable=AsyncMock,
+            return_value=cleanup,
+        ):
+            assert await unit_test_vm_manager.destroy_vm(vm) is True
+        vm.confirm_destroyed.assert_awaited_once()
+        assert vm.state is VmState.DESTROYED
+        assert vm.channel.close.await_count == 2
+        assert vm.vm_id not in unit_test_vm_manager.get_active_vms()
+
+    async def test_confirmed_process_death_drains_late_console_evidence(self, unit_test_vm_manager) -> None:
+        """The reader must observe lines emitted during termination before unpublish."""
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+        process_dead = asyncio.Event()
+        observed: list[str] = []
+
+        async def drain_after_death() -> None:
+            await process_dead.wait()
+            observed.append("late console line")
+
+        async def cleanup_resources(**_kwargs) -> dict[str, bool]:  # type: ignore[no-untyped-def]
+            process_dead.set()
+            await asyncio.sleep(0)
+            return cleanup
+
+        vm.qemu_log_task = asyncio.create_task(drain_after_death())
+        with patch.object(unit_test_vm_manager, "_force_cleanup_all_resources", side_effect=cleanup_resources):
+            assert await unit_test_vm_manager.destroy_vm(vm) is True
+
+        assert observed == ["late console line"]
+        assert vm.qemu_log_task.done()
+
+    async def test_unconfirmed_process_keeps_its_log_drain_owned(self, unit_test_vm_manager) -> None:
+        """A live/unconfirmed QEMU keeps both process and pipe-reader ownership."""
+        cleanup = {"qemu": False, "gvproxy": True, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+        never = asyncio.Event()
+        vm.qemu_log_task = asyncio.create_task(never.wait())
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_cleanup_retry") as schedule_retry,
+        ):
+            assert await unit_test_vm_manager.destroy_vm(vm) is False
+
+        assert not vm.qemu_log_task.done()
+        schedule_retry.assert_called_once_with(vm)
+        vm.qemu_log_task.cancel()
+        await asyncio.gather(vm.qemu_log_task, return_exceptions=True)
+
+    async def test_successful_attempt_can_return_reservation_to_boot_retry(self, unit_test_vm_manager) -> None:
+        """Internal boot retry cleanup must not release its shared reservation."""
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+        reservation = MagicMock()
+        vm.holds_admission_slot = True
+        vm.resource_reservation = reservation
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
+        ):
+            assert await unit_test_vm_manager.destroy_vm(vm, _release_admission=False) is True
+
+        release.assert_not_awaited()
+        assert vm.holds_admission_slot is False
+        assert vm.resource_reservation is None
+
+    async def test_destroy_commit_finishes_release_before_double_cancellation(self, unit_test_vm_manager) -> None:
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        vm = self._mock_vm()
+        reservation = MagicMock()
+        vm.holds_admission_slot = True
+        vm.resource_reservation = reservation
+        unit_test_vm_manager._vms[vm.vm_id] = vm
+        release_entered = asyncio.Event()
+        allow_release = asyncio.Event()
+
+        async def blocked_release(_reservation) -> None:  # type: ignore[no-untyped-def]
+            release_entered.set()
+            await allow_release.wait()
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager._admission, "release", side_effect=blocked_release) as release,
+            patch.object(unit_test_vm_manager, "_schedule_failed_cleanup_retry") as schedule_retry,
+        ):
+            task = asyncio.create_task(unit_test_vm_manager.destroy_vm(vm))
+            await release_entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert unit_test_vm_manager._vms[vm.vm_id] is vm
+
+            allow_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        release.assert_awaited_once_with(reservation)
+        assert vm.vm_id not in unit_test_vm_manager._vms
+        assert vm.holds_admission_slot is False
+        assert vm.resource_reservation is None
+        schedule_retry.assert_not_called()
+
+    async def test_vm_context_exit_routes_through_manager_ownership(self, unit_test_vm_manager) -> None:
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        channel = MagicMock()
+        channel.close = AsyncMock()
+        vm = QemuVM(
+            "context-owned-vm",
+            MagicMock(),
+            None,
+            MagicMock(),
+            channel,
+            Language.PYTHON,
+            deque(maxlen=10),
+            release_callback=unit_test_vm_manager.destroy_vm,
+        )
+        reservation = MagicMock()
+        vm.holds_admission_slot = True
+        vm.resource_reservation = reservation
+        unit_test_vm_manager._vms[vm.vm_id] = vm
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
+        ):
+            async with vm:
+                pass
+
+        release.assert_awaited_once_with(reservation)
+        assert vm.vm_id not in unit_test_vm_manager._vms
+
+    async def test_retry_reaper_retries_until_process_death_is_confirmed(self, unit_test_vm_manager) -> None:
+        """The background owner stops only after destroy_vm confirms cleanup."""
+        vm = self._mock_vm()
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "destroy_vm",
+                new_callable=AsyncMock,
+                side_effect=[False, True],
+            ) as destroy,
+            patch("exec_sandbox.vm_manager.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            await unit_test_vm_manager._retry_cleanup_forever(
+                vm.vm_id, lambda: unit_test_vm_manager.destroy_vm(vm, _schedule_retry=False)
+            )
+
+        assert destroy.await_count == 2
+        assert all(call.kwargs == {"_schedule_retry": False} for call in destroy.await_args_list)
+        assert [call.args[0] for call in sleep.await_args_list] == [1.0, 2.0]
+
+    async def test_ephemeral_vm_rejects_unconfirmed_cleanup_on_success(self, unit_test_vm_manager) -> None:
+        vm = MagicMock()
+        vm.vm_id = "ephemeral-unconfirmed"
+        with (
+            patch.object(unit_test_vm_manager, "create_vm", new_callable=AsyncMock, return_value=vm),
+            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=False) as destroy,
+        ):
+            with pytest.raises(VmPermanentError, match="cleanup was not confirmed"):
+                async with unit_test_vm_manager.ephemeral_vm(
+                    Language.PYTHON,
+                    "tenant",
+                    "task",
+                ):
+                    pass
+
+        destroy.assert_awaited_once_with(vm)
+
+    async def test_stop_waits_for_cleanup_owner_instead_of_cancelling_it(self, unit_test_vm_manager) -> None:
+        """Manager shutdown cannot report success while its cleanup owner is pending."""
+        release_reaper = asyncio.Event()
+        reaper_cancelled = False
+
+        async def pending_reaper() -> None:
+            nonlocal reaper_cancelled
+            try:
+                await release_reaper.wait()
+            except asyncio.CancelledError:
+                reaper_cancelled = True
+                raise
+
+        reaper = asyncio.create_task(pending_reaper())
+        unit_test_vm_manager._failed_cleanup_tasks["pending-vm"] = reaper
+        with (
+            patch.object(unit_test_vm_manager._admission, "stop", new_callable=AsyncMock) as admission_stop,
+            patch.object(unit_test_vm_manager._overlay_pool, "stop", new_callable=AsyncMock) as overlay_stop,
+            patch(
+                "exec_sandbox.vm_manager.drain_workdir_cleanup_tasks",
+                new_callable=AsyncMock,
+            ) as drain_workdirs,
+        ):
+            stop_task = asyncio.create_task(unit_test_vm_manager.stop())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not stop_task.done()
+            assert not reaper.cancelled()
+            assert unit_test_vm_manager._stopping is True
+            admission_stop.assert_awaited_once()
+            overlay_stop.assert_not_awaited()
+
+            release_reaper.set()
+            await asyncio.wait_for(stop_task, timeout=1)
+
+        assert not reaper_cancelled
+        admission_stop.assert_awaited_once()
+        drain_workdirs.assert_awaited_once()
+        overlay_stop.assert_awaited_once()
+
+    async def test_cancelled_stop_waiter_does_not_cancel_shared_cleanup(self, unit_test_vm_manager) -> None:
+        """A later waiter can observe the same manager-owned stop task complete."""
+        release_reaper = asyncio.Event()
+
+        async def pending_reaper() -> None:
+            await release_reaper.wait()
+
+        reaper = asyncio.create_task(pending_reaper())
+        unit_test_vm_manager._failed_cleanup_tasks["pending-vm"] = reaper
+        with (
+            patch.object(unit_test_vm_manager._admission, "stop", new_callable=AsyncMock) as admission_stop,
+            patch.object(unit_test_vm_manager._overlay_pool, "stop", new_callable=AsyncMock) as overlay_stop,
+        ):
+            first_waiter = asyncio.create_task(unit_test_vm_manager.stop())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            owned_stop = unit_test_vm_manager._stop_task
+            assert owned_stop is not None
+
+            first_waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first_waiter
+            assert not owned_stop.cancelled()
+            assert not reaper.cancelled()
+            overlay_stop.assert_not_awaited()
+
+            second_waiter = asyncio.create_task(unit_test_vm_manager.stop())
+            release_reaper.set()
+            await asyncio.wait_for(second_waiter, timeout=1)
+
+        assert unit_test_vm_manager._stop_task is owned_stop
+        admission_stop.assert_awaited_once()
+        overlay_stop.assert_awaited_once()
+
+    async def test_stop_rejects_new_launch_and_waits_for_admitted_launch(self, unit_test_vm_manager) -> None:
+        """STOPPING closes ingress without losing an operation that already entered."""
+        launch_entered = asyncio.Event()
+        release_launch = asyncio.Event()
+
+        async def admitted_launch() -> None:
+            async with unit_test_vm_manager._launch_operation():
+                launch_entered.set()
+                await release_launch.wait()
+
+        launch_task = asyncio.create_task(admitted_launch())
+        await launch_entered.wait()
+        admission_stopped = asyncio.Event()
+
+        async def stop_admission() -> None:
+            admission_stopped.set()
+
+        with (
+            patch.object(unit_test_vm_manager._admission, "stop", new_callable=AsyncMock) as admission_stop,
+            patch.object(unit_test_vm_manager._overlay_pool, "stop", new_callable=AsyncMock) as overlay_stop,
+        ):
+            admission_stop.side_effect = stop_admission
+            stop_task = asyncio.create_task(unit_test_vm_manager.stop())
+            await admission_stopped.wait()
+
+            with pytest.raises(VmPermanentError, match="stopping"):
+                async with unit_test_vm_manager._launch_operation():
+                    pytest.fail("launch entered after STOPPING")
+            assert not stop_task.done()
+            admission_stop.assert_awaited_once()
+            overlay_stop.assert_not_awaited()
+
+            release_launch.set()
+            await launch_task
+            await asyncio.wait_for(stop_task, timeout=1)
+
+        overlay_stop.assert_awaited_once()
+
+
+class TestStandaloneVmDestroyStatus:
+    """The manager-free fallback must not publish success with leaked resources."""
+
+    async def test_ancillary_failure_remains_retryable(self) -> None:
+        process = MagicMock()
+        channel = MagicMock()
+        channel.close = AsyncMock()
+        workdir = MagicMock()
+        workdir.cleanup = AsyncMock(side_effect=[False, True])
+        vm = QemuVM(
+            "standalone-destroy-vm",
+            process,
+            Path("/cgroup/standalone-destroy-vm"),
+            workdir,
+            channel,
+            Language.PYTHON,
+            deque(maxlen=10),
+        )
+
+        with (
+            patch("exec_sandbox.qemu_vm.cleanup_vm_processes", new_callable=AsyncMock, return_value=True),
+            patch("exec_sandbox.qemu_vm.cgroup.cleanup_cgroup", new_callable=AsyncMock, return_value=True),
+        ):
+            assert await vm.destroy() is False
+            assert vm.state is VmState.DESTROYING
+            assert await vm.destroy() is True
+
+        assert vm.state is VmState.DESTROYED
+
+
+class TestPendingLaunchOwnership:
+    """Pre-QemuVM resources remain owned across every fallible handoff."""
+
+    @staticmethod
+    def _pending(unit_test_vm_manager):  # type: ignore[no-untyped-def]
+        infra = MagicMock()
+        infra.vm_id = "pending-launch-vm"
+        infra.workdir = MagicMock()
+        infra.cgroup_path = Path("/test/cgroup/pending-launch-vm")
+        reservation = MagicMock()
+        pending = unit_test_vm_manager._publish_pending_resources(
+            infra.vm_id, reservation, infra.workdir, infra.cgroup_path
+        )
+        infra.pending = pending
+        return infra, reservation, pending
+
+    async def test_no_owner_reservation_release_survives_repeated_cancellation(self, unit_test_vm_manager) -> None:
+        reservation = MagicMock()
+        release_entered = asyncio.Event()
+        allow_release = asyncio.Event()
+        release_finished = asyncio.Event()
+
+        async def blocked_release(_reservation) -> None:  # type: ignore[no-untyped-def]
+            release_entered.set()
+            await allow_release.wait()
+            release_finished.set()
+
+        with (
+            patch.object(
+                unit_test_vm_manager, "_detect_accel_type", new_callable=AsyncMock, return_value=AccelType.HVF
+            ),
+            patch.object(unit_test_vm_manager._admission, "acquire", new_callable=AsyncMock, return_value=reservation),
+            patch.object(unit_test_vm_manager._admission, "release", side_effect=blocked_release) as release,
+        ):
+
+            async def cancelled_reservation() -> None:
+                async with unit_test_vm_manager.reservation_context("cancelled-reservation", 192):
+                    raise asyncio.CancelledError
+
+            task = asyncio.create_task(cancelled_reservation())
+            await release_entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+
+            allow_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert release_finished.is_set()
+        release.assert_awaited_once_with(reservation)
+
+    async def test_unconfirmed_cleanup_retains_owner_and_reservation(self, unit_test_vm_manager) -> None:
+        """Dependent resources and admission stay held while process death is unconfirmed."""
+        _infra, reservation, pending = self._pending(unit_test_vm_manager)
+        cleanup = {"qemu": False, "gvproxy": True, "workdir": False, "cgroup": False}
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry") as schedule_retry,
+            patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
+        ):
+            assert await unit_test_vm_manager._cleanup_pending_launch(pending) is False
+
+        assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
+        assert pending.reservation is reservation
+        release.assert_not_awaited()
+        schedule_retry.assert_called_once_with(pending)
+
+    async def test_confirmed_attempt_cleanup_preserves_shared_reservation(self, unit_test_vm_manager) -> None:
+        """A retryable attempt can clean resources without releasing the outer reservation."""
+        _infra, reservation, pending = self._pending(unit_test_vm_manager)
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
+        ):
+            assert await unit_test_vm_manager._cleanup_failed_owner(pending.vm_id) is True
+
+        assert pending.vm_id not in unit_test_vm_manager._pending_launches
+        assert pending.reservation is reservation
+        release.assert_not_awaited()
+
+    async def test_ancillary_cleanup_failure_retains_retry_owner(self, unit_test_vm_manager) -> None:
+        """A removed process is not enough to forget leaked workdir/cgroup state."""
+        _infra, _reservation, pending = self._pending(unit_test_vm_manager)
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": False, "cgroup": False}
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry") as schedule_retry,
+            patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
+        ):
+            assert await unit_test_vm_manager._cleanup_pending_launch(pending) is False
+
+        assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
+        release.assert_not_awaited()
+        schedule_retry.assert_called_once_with(pending)
+
+    async def test_cleanup_commit_finishes_release_before_double_cancellation(self, unit_test_vm_manager) -> None:
+        _infra, _reservation, pending = self._pending(unit_test_vm_manager)
+        cleanup = {"qemu": True, "gvproxy": True, "workdir": True, "cgroup": True}
+        release_entered = asyncio.Event()
+        allow_release = asyncio.Event()
+        release_finished = asyncio.Event()
+
+        async def blocked_release(_reservation) -> None:  # type: ignore[no-untyped-def]
+            release_entered.set()
+            await allow_release.wait()
+            release_finished.set()
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager._admission, "release", side_effect=blocked_release) as release,
+            patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry") as schedule_retry,
+        ):
+            task = asyncio.create_task(unit_test_vm_manager._cleanup_pending_launch(pending))
+            await release_entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
+
+            allow_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert release_finished.is_set()
+        release.assert_awaited_once_with(pending.reservation)
+        assert pending.vm_id not in unit_test_vm_manager._pending_launches
+        schedule_retry.assert_not_called()
+
+    async def test_infra_cgroup_failure_cleans_published_expected_path(self, unit_test_vm_manager) -> None:
+        workdir = MagicMock()
+        workdir.overlay_image = Path("/tmp/pending-overlay.qcow2")
+        reservation = MagicMock()
+        observed_path: Path | None = None
+
+        async def acquire_overlay(*_args, **_kwargs) -> bool:  # type: ignore[no-untyped-def]
+            assert len(unit_test_vm_manager._pending_launches) == 1
+            return True
+
+        async def cleanup_owner(vm_id: str) -> bool:
+            nonlocal observed_path
+            pending = unit_test_vm_manager._pending_launches[vm_id]
+            observed_path = pending.cgroup_path
+            unit_test_vm_manager._pending_launches.pop(vm_id)
+            return True
+
+        with (
+            patch("exec_sandbox.vm_manager.validate_kernel_initramfs", new_callable=AsyncMock),
+            patch("exec_sandbox.vm_manager.VmWorkingDirectory.create", new_callable=AsyncMock, return_value=workdir),
+            patch.object(unit_test_vm_manager, "get_base_image", return_value=Path("/tmp/base.qcow2")),
+            patch.object(
+                unit_test_vm_manager, "_detect_accel_type", new_callable=AsyncMock, return_value=AccelType.HVF
+            ),
+            patch.object(unit_test_vm_manager._overlay_pool, "acquire", side_effect=acquire_overlay),
+            patch("exec_sandbox.vm_manager.cgroup.setup_cgroup", new_callable=AsyncMock, side_effect=OSError("cgroup")),
+            patch.object(unit_test_vm_manager, "_cleanup_failed_owner", side_effect=cleanup_owner) as cleanup,
+        ):
+            with pytest.raises(OSError, match="cgroup"):
+                await unit_test_vm_manager._setup_vm_infra(
+                    Language.PYTHON,
+                    "tenant",
+                    "task",
+                    reservation,
+                )
+
+        cleanup.assert_awaited_once()
+        assert observed_path is not None
+        assert observed_path.name.startswith("tenant-task-")
+        assert not unit_test_vm_manager._pending_launches
+
+    async def test_infra_overlay_failure_cleans_actual_cgroup_path(self, unit_test_vm_manager) -> None:
+        workdir = MagicMock()
+        workdir.overlay_image = Path("/tmp/pending-overlay.qcow2")
+        reservation = MagicMock()
+        actual_cgroup = Path("/tmp/actual-cgroup")
+        observed_path: Path | None = None
+
+        async def cleanup_owner(vm_id: str) -> bool:
+            nonlocal observed_path
+            pending = unit_test_vm_manager._pending_launches[vm_id]
+            observed_path = pending.cgroup_path
+            unit_test_vm_manager._pending_launches.pop(vm_id)
+            return True
+
+        with (
+            patch("exec_sandbox.vm_manager.validate_kernel_initramfs", new_callable=AsyncMock),
+            patch("exec_sandbox.vm_manager.VmWorkingDirectory.create", new_callable=AsyncMock, return_value=workdir),
+            patch.object(unit_test_vm_manager, "get_base_image", return_value=Path("/tmp/base.qcow2")),
+            patch.object(
+                unit_test_vm_manager, "_detect_accel_type", new_callable=AsyncMock, return_value=AccelType.HVF
+            ),
+            patch.object(
+                unit_test_vm_manager._overlay_pool,
+                "acquire",
+                new_callable=AsyncMock,
+                side_effect=VmOverlayError("overlay"),
+            ),
+            patch("exec_sandbox.vm_manager.cgroup.setup_cgroup", new_callable=AsyncMock, return_value=actual_cgroup),
+            patch.object(unit_test_vm_manager, "_cleanup_failed_owner", side_effect=cleanup_owner),
+        ):
+            with pytest.raises(VmOverlayError, match="overlay"):
+                await unit_test_vm_manager._setup_vm_infra(
+                    Language.PYTHON,
+                    "tenant",
+                    "task",
+                    reservation,
+                )
+
+        assert observed_path == actual_cgroup
+        assert not unit_test_vm_manager._pending_launches
+
+    async def test_gvproxy_is_owned_before_post_spawn_cgroup_failure(self, unit_test_vm_manager) -> None:
+        """The readiness callback publishes gvproxy before any later await can fail."""
+        infra, _reservation, pending = self._pending(unit_test_vm_manager)
+        proc = MagicMock()
+        proc.pid = 4242
+        release_log = asyncio.Event()
+
+        async def log_drain() -> None:
+            await release_log.wait()
+
+        log_task = asyncio.create_task(log_drain())
+
+        async def start_with_callback(*_args, on_process_started=None, **_kwargs):  # type: ignore[no-untyped-def]
+            assert on_process_started is not None
+            on_process_started(proc, log_task)
+            return proc, log_task
+
+        try:
+            with (
+                patch("exec_sandbox.vm_manager.start_gvproxy", side_effect=start_with_callback),
+                patch(
+                    "exec_sandbox.vm_manager.cgroup.attach_if_available",
+                    new_callable=AsyncMock,
+                    side_effect=OSError("cgroup attach failed"),
+                ),
+            ):
+                with pytest.raises(OSError, match="cgroup attach failed"):
+                    await unit_test_vm_manager._start_gvproxy_for_vm(
+                        infra,
+                        pending,
+                        Language.PYTHON,
+                        True,
+                        None,
+                        None,
+                    )
+
+            assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
+            assert pending.gvproxy_proc is proc
+            assert pending.gvproxy_log_task is log_task
+        finally:
+            release_log.set()
+            await log_task
+            unit_test_vm_manager._pending_launches.pop(pending.vm_id, None)
+
+    async def test_qemu_handoff_precedes_post_spawn_cgroup_failure(self, unit_test_vm_manager) -> None:
+        """QEMU transfers synchronously from pending owner to VM registry before cgroup await."""
+        infra, reservation, pending = self._pending(unit_test_vm_manager)
+        infra.workdir.use_qemu_vm_user = False
+        infra.channel = MagicMock()
+        proc = MagicMock()
+        proc.pid = 4343
+        release_log = asyncio.Event()
+
+        async def blocked_drain(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            await release_log.wait()
+
+        try:
+            with (
+                patch("exec_sandbox.vm_manager.cgroup.is_cgroup_available", return_value=True),
+                patch(
+                    "exec_sandbox.vm_manager.start_managed_process",
+                    new_callable=AsyncMock,
+                    return_value=proc,
+                ),
+                patch("exec_sandbox.vm_manager.drain_subprocess_output", side_effect=blocked_drain),
+                patch(
+                    "exec_sandbox.vm_manager.cgroup.attach_if_available",
+                    new_callable=AsyncMock,
+                    side_effect=OSError("qemu cgroup attach failed"),
+                ),
+            ):
+                with pytest.raises(OSError, match="qemu cgroup attach failed"):
+                    await unit_test_vm_manager._launch_qemu_vm(
+                        infra,
+                        pending,
+                        ["qemu-system-test"],
+                        Language.PYTHON,
+                        reservation,
+                    )
+
+            vm = unit_test_vm_manager._vms[pending.vm_id]
+            assert vm.process is proc
+            assert vm.resource_reservation is reservation
+            assert pending.vm_id not in unit_test_vm_manager._pending_launches
+        finally:
+            vm = unit_test_vm_manager._vms.pop(pending.vm_id, None)
+            release_log.set()
+            if vm is not None and vm.qemu_log_task is not None:
+                await vm.qemu_log_task
+
+
 class TestKernelInitramfsValidation:
     """Tests for validate_kernel_initramfs() pre-flight check."""
 
@@ -3699,7 +4479,15 @@ class TestExecuteEnvVarValidation:
 # ============================================================================
 
 
-class _ConnectRaisesChannel:
+class _FakeChannelBase:
+    """Common no-op surface so fakes survive the QEMU-death race path,
+    which calls fail_pending_operations on whichever channel is wired."""
+
+    async def fail_pending_operations(self, _reason: str) -> None:
+        return
+
+
+class _ConnectRaisesChannel(_FakeChannelBase):
     """connect() raises immediately; stream_messages() never called."""
 
     def __init__(self, error: BaseException) -> None:
@@ -3716,7 +4504,7 @@ class _ConnectRaisesChannel:
         yield  # type: ignore[unreachable]  # make it an async generator
 
 
-class _ConnectOKStreamRaisesChannel:
+class _ConnectOKStreamRaisesChannel(_FakeChannelBase):
     """connect() succeeds; stream_messages() raises immediately."""
 
     def __init__(self, error: BaseException) -> None:
@@ -3732,6 +4520,29 @@ class _ConnectOKStreamRaisesChannel:
     ) -> AsyncGenerator:
         raise self._error
         yield  # type: ignore[unreachable]  # make it an async generator
+
+
+class _HardDeadlineChannel:
+    """Connected channel whose total response-stream deadline expired."""
+
+    def __init__(self, *, command_dispatched: bool = True) -> None:
+        self.command_dispatched = command_dispatched
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_channel import StreamDeadlineExceededError
+
+        raise StreamDeadlineExceededError(
+            "total stream deadline",
+            command_dispatched=self.command_dispatched,
+        )
+        yield  # type: ignore[unreachable]
 
 
 class _GuestErrorChannel:
@@ -3777,6 +4588,74 @@ class _GuestErrorAfterOutputChannel:
         yield StreamingErrorMessage(error_type=self._error_type, message=self._message)
 
 
+class _BlockingExecutionChannel:
+    """Connected channel whose execution stream remains pending until cancelled."""
+
+    def __init__(self) -> None:
+        self.cancelled = asyncio.Event()
+        self.failed = asyncio.Event()
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        try:
+            await self.failed.wait()
+            raise CommunicationOutcomeUnknownError("event transport closed")
+            yield  # type: ignore[unreachable]
+        finally:
+            self.cancelled.set()
+
+    async def fail_pending_operations(self, _reason: str) -> None:
+        self.failed.set()
+
+
+class _ReleasedCompletionChannel:
+    """Yield a valid terminal event when the process waiter releases it."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_agent_protocol import ExecutionCompleteMessage
+
+        await self.release.wait()
+        yield ExecutionCompleteMessage(exit_code=137, execution_time_ms=321)
+
+    async def fail_pending_operations(self, _reason: str) -> None:
+        self.release.set()
+
+
+class _ImmediateCompletionChannel:
+    """Connected channel returning one successful terminal event per request."""
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_agent_protocol import ExecutionCompleteMessage
+
+        yield ExecutionCompleteMessage(exit_code=0, execution_time_ms=1)
+
+    async def fail_pending_operations(self, _reason: str) -> None:
+        pass
+
+
 class TestExecuteExceptionWrapping:
     """Unit tests for execute()'s error handling.
 
@@ -3794,6 +4673,12 @@ class TestExecuteExceptionWrapping:
         mock_process = AsyncMock()
         mock_process.returncode = None
         mock_process.communicate = AsyncMock(return_value=(b"", b""))
+
+        async def _wait_forever() -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        mock_process.wait = AsyncMock(side_effect=_wait_forever)
 
         mock_workdir = MagicMock()
         mock_workdir.overlay_image = Path("/test/overlay.qcow2")
@@ -3893,11 +4778,36 @@ class TestExecuteExceptionWrapping:
         assert isinstance(exc_info.value.__cause__, TimeoutError)
 
     async def test_timeout_from_stream(self) -> None:
-        """TimeoutError from stream_messages() wrapped as VmBootTimeoutError."""
+        """A nested transport timeout is not mislabeled as the 15s host deadline."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(TimeoutError("hard timeout")))
-        with pytest.raises(VmBootTimeoutError) as exc_info:
+        with pytest.raises(CommunicationOutcomeUnknownError) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, TimeoutError)
+        assert "transport timed out" in str(exc_info.value)
+        assert exc_info.value.context["soft_timeout_seconds"] == 5
+        assert exc_info.value.context["hard_timeout_seconds"] == 15
+        assert exc_info.value.context["timeout_phase"] == "execution"
+        assert exc_info.value.context["timeout_source"] == "nested_transport"
+
+    async def test_true_stream_deadline_is_outcome_unknown_after_dispatch(self) -> None:
+        """The 15s total deadline cannot imply that dispatched code did not run."""
+        vm = self._make_vm(_HardDeadlineChannel())
+        with pytest.raises(CommunicationOutcomeUnknownError) as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert "15s host deadline" in str(exc_info.value)
+        assert exc_info.value.context["soft_timeout_seconds"] == 5
+        assert exc_info.value.context["hard_timeout_seconds"] == 15
+        assert exc_info.value.context["timeout_margin_seconds"] == 10
+        assert exc_info.value.context["timeout_source"] == "total_stream_deadline"
+        assert exc_info.value.context["command_dispatched"] is True
+
+    async def test_stream_deadline_before_dispatch_remains_retryable(self) -> None:
+        """Registration timeout cannot be mislabeled as an unknown execution."""
+        vm = self._make_vm(_HardDeadlineChannel(command_dispatched=False))
+        with pytest.raises(VmBootTimeoutError, match="before command dispatch") as exc_info:
+            await vm.execute(code="x", timeout_seconds=5)
+        assert exc_info.value.context["command_dispatched"] is False
+        assert exc_info.value.context["timeout_source"] == "total_stream_deadline"
 
     async def test_timeout_context_has_seconds(self) -> None:
         """VmBootTimeoutError context includes timeout_seconds from caller."""
@@ -3905,6 +4815,116 @@ class TestExecuteExceptionWrapping:
         with pytest.raises(VmBootTimeoutError) as exc_info:
             await vm.execute(code="x", timeout_seconds=17)
         assert exc_info.value.context["timeout_seconds"] == 17
+        assert exc_info.value.context["timeout_phase"] == "connect"
+
+    # -- Group B2: QEMU process death races execution transport ----------------
+
+    async def test_qemu_death_wakes_blocked_execution_before_hard_timeout(self) -> None:
+        """A dead QEMU publishes outcome-unknown without waiting for 15 seconds."""
+        channel = _BlockingExecutionChannel()
+        vm = self._make_vm(channel)
+        vm.process.returncode = 17
+        vm.process.wait = AsyncMock(return_value=17)
+
+        async with asyncio.timeout(1):
+            with pytest.raises(CommunicationOutcomeUnknownError, match="QEMU exited during execution") as exc_info:
+                await vm.execute(code="x", timeout_seconds=5)
+
+        assert exc_info.value.context["exit_code"] == 17
+        assert exc_info.value.context["hard_timeout_seconds"] == 15
+        await asyncio.wait_for(channel.cancelled.wait(), timeout=1)
+
+    async def test_buffered_terminal_event_wins_process_death_race(self) -> None:
+        """A valid exit-137 terminal frame is preserved when QEMU powers off."""
+        channel = _ReleasedCompletionChannel()
+        vm = self._make_vm(channel)
+        vm.process.returncode = 0
+
+        async def _exit_and_release() -> int:
+            channel.release.set()
+            return 0
+
+        vm.process.wait = AsyncMock(side_effect=_exit_and_release)
+
+        result = await vm.execute(code="x", timeout_seconds=5)
+        assert result.exit_code == 137
+        assert result.execution_time_ms == 321
+        assert vm.state == VmState.DESTROYING
+
+    async def test_process_exit_one_turn_after_terminal_retires_vm(self) -> None:
+        """A just-completed stream cannot publish a dead VM as reusable."""
+        vm = self._make_vm(_ImmediateCompletionChannel())
+        vm.process.returncode = 0
+
+        async def _exit_next_turn() -> int:
+            await asyncio.sleep(0)
+            return 0
+
+        vm.process.wait = AsyncMock(side_effect=_exit_next_turn)
+        result = await vm.execute(code="x", timeout_seconds=5)
+
+        assert result.exit_code == 0
+        assert vm.state == VmState.DESTROYING
+
+    async def test_repeated_execution_reuses_one_process_exit_waiter(self) -> None:
+        """Successful session reuse cannot retain one subprocess waiter per exec."""
+        vm = self._make_vm(_ImmediateCompletionChannel())
+        wait_started = asyncio.Event()
+        release_exit = asyncio.Event()
+        destroying = asyncio.Event()
+        begin_destroy = vm.begin_destroy
+
+        async def controlled_exit() -> int:
+            wait_started.set()
+            await release_exit.wait()
+            return 0
+
+        async def observe_destroying() -> None:
+            await begin_destroy()
+            destroying.set()
+
+        vm.process.wait = AsyncMock(side_effect=controlled_exit)
+        vm.begin_destroy = observe_destroying  # type: ignore[method-assign]
+        for _ in range(2):
+            result = await vm.execute(code="x", timeout_seconds=5)
+            assert result.exit_code == 0
+
+        assert wait_started.is_set()
+        assert vm.process.wait.await_count == 1
+        release_exit.set()
+        await asyncio.wait_for(destroying.wait(), timeout=1)
+        assert vm.state is VmState.DESTROYING
+
+    async def test_caller_cancellation_drains_stream_but_keeps_shared_death_waiter(self) -> None:
+        """Cancelling execute cannot leak its stream task or cancel VM death ownership."""
+        channel = _BlockingExecutionChannel()
+        vm = self._make_vm(channel)
+        wait_started = asyncio.Event()
+        release_exit = asyncio.Event()
+        destroying = asyncio.Event()
+        begin_destroy = vm.begin_destroy
+
+        async def controlled_exit() -> int:
+            wait_started.set()
+            await release_exit.wait()
+            return 0
+
+        async def observe_destroying() -> None:
+            await begin_destroy()
+            destroying.set()
+
+        vm.process.wait = AsyncMock(side_effect=controlled_exit)
+        vm.begin_destroy = observe_destroying  # type: ignore[method-assign]
+        execution = asyncio.create_task(vm.execute(code="x", timeout_seconds=5))
+        await wait_started.wait()
+        execution.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        await asyncio.wait_for(channel.cancelled.wait(), timeout=1)
+        release_exit.set()
+        await asyncio.wait_for(destroying.wait(), timeout=1)
+        assert vm.state is VmState.DESTROYING
 
     # -- Group C: Must NOT be wrapped — propagate bare -------------------------
 
@@ -4644,32 +5664,39 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
     async def test_qmp_fd_not_used_with_sudo_path(self, vm_settings, workdir) -> None:
         """use_qemu_vm_user=True + different UID: sudo wraps cmd, legacy -qmp syntax."""
         workdir.use_qemu_vm_user = True
+        try:
+            # qemu_vm_uid=999, os_getuid=1000 → different user → sudo wraps
+            with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=1000):
+                cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-sudo")
 
-        # qemu_vm_uid=999, os_getuid=1000 → different user → sudo wraps
-        with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=1000):
-            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-sudo")
-
-        assert "-qmp" in cmd
-        qmp_idx = cmd.index("-qmp")
-        assert cmd[qmp_idx + 1].startswith("unix:")
-        assert "server=on,wait=off" in cmd[qmp_idx + 1]
-        assert "sudo" in cmd
+            assert "-qmp" in cmd
+            qmp_idx = cmd.index("-qmp")
+            assert cmd[qmp_idx + 1].startswith("unix:")
+            assert "server=on,wait=off" in cmd[qmp_idx + 1]
+            assert "sudo" in cmd
+        finally:
+            # This flag is part of the command fixture, not ownership of the
+            # host-created temporary directory. Do not make fixture teardown
+            # invoke a real credentialed `sudo rm` after mocked UID tests.
+            workdir.use_qemu_vm_user = False
 
     async def test_qmp_fd_skips_sudo_when_already_target_user(self, vm_settings, workdir) -> None:
         """use_qemu_vm_user=True + same UID: no sudo, socket activation works."""
         workdir.use_qemu_vm_user = True
+        try:
+            # qemu_vm_uid=999, os_getuid=999 → same user → no sudo needed
+            with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=999):
+                cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-same-user", qmp_fd=7)
 
-        # qemu_vm_uid=999, os_getuid=999 → same user → no sudo needed
-        with _qemu_cmd_mocks(qemu_vm_uid=999, os_getuid=999):
-            cmd = await self._build_cmd(vm_settings, workdir, vm_id="test-vm-qmp-same-user", qmp_fd=7)
-
-        # Socket activation syntax (no sudo blocking fds)
-        cmd_str = " ".join(cmd)
-        assert "socket,id=qmp0,fd=7,server=on,wait=off" in cmd_str
-        assert "-mon" in cmd
-        # No sudo or legacy -qmp
-        assert "sudo" not in cmd
-        assert "-qmp" not in cmd
+            # Socket activation syntax (no sudo blocking fds)
+            cmd_str = " ".join(cmd)
+            assert "socket,id=qmp0,fd=7,server=on,wait=off" in cmd_str
+            assert "-mon" in cmd
+            # No sudo or legacy -qmp
+            assert "sudo" not in cmd
+            assert "-qmp" not in cmd
+        finally:
+            workdir.use_qemu_vm_user = False
 
     async def test_qmp_fd_with_all_features(self, vm_settings, workdir) -> None:
         """Smoke test: qmp_fd + defer_incoming + allow_network + snapshot_drive."""
