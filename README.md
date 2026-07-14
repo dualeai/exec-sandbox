@@ -367,7 +367,7 @@ async with Scheduler(config) as scheduler:
 | `max_concurrent_s3_uploads` | 4 | Max concurrent background S3 uploads (1-16) |
 | `memory_overcommit_ratio` | 5.0 | Memory overcommit ratio. Budget = host_total × (1 - reserve) × ratio |
 | `cpu_overcommit_ratio` | 2.0 | CPU overcommit ratio. Budget = (host_cpus - reserve) × ratio |
-| `host_memory_reserve_ratio` | 0.1 | Fraction of host memory reserved for OS (e.g., 0.1 = 10%) |
+| `host_memory_reserve_ratio` | 0.08 | Fraction of host memory reserved for OS (e.g., 0.08 = 8%) |
 | `host_cpu_reserve_cores` | 0.5 | CPU cores reserved for host processes (fixed, not a ratio) |
 | `enable_package_validation` | True | Validate against top 10k packages (PyPI for Python, npm for JavaScript) |
 | `auto_download_assets` | True | Auto-download VM images from GitHub Releases |
@@ -527,12 +527,13 @@ L3 extends L2 across machines. When an L2 snapshot is created, it's compressed w
 | `timing.execute_ms` | int | Code execution |
 | `timing.total_ms` | int | End-to-end time |
 | `warm_pool_hit` | bool | Whether a pre-started VM was used |
+| `l1_cache_hit` | bool | True if served from the L1 memory-snapshot cache |
 | `exposed_ports` | list | Port mappings with `.internal`, `.external`, `.host`, `.url` |
 
-Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures (QEMU crash, REPL spawn failure) raise `VmTransientError` instead of returning a result.
+Exit codes follow Unix conventions: 0 = success, >128 = killed by signal N where N = exit_code - 128 (e.g., 137 = SIGKILL, 139 = SIGSEGV), -1 = execution timeout (code ran too long), other non-zero = program error. Infrastructure failures raise instead of returning a result: `VmTransientError` before dispatch (code never ran, safe to retry), `CommunicationOutcomeUnknownError` after dispatch (QEMU crash, REPL spawn OOM mid-flight — reconcile side effects before retrying).
 
 ```python
-# Infrastructure failures raise VmTransientError before reaching here (see Error Handling).
+# Infrastructure failures raise before reaching here (see Error Handling).
 result = await scheduler.run(code="...", language="python")
 
 if result.exit_code == 0:
@@ -627,7 +628,7 @@ on_stdout=lambda chunk: buffer.append(chunk)  # Fast (same applies to on_boot_lo
 # warm_pool_size=5 → 5 VMs/lang × 3 × 192MB = 2.88GB for warm pool alone
 
 # Memory can exceed configured limit due to compressed swap
-default_memory_mb=192  # Code can actually use ~210-240MB thanks to compression
+default_memory_mb=192  # Code can use up to ~269MB logically (40% zram swap), physically capped at 20% of RAM
 # Don't rely on memory limits for security - use timeouts for runaway allocations
 
 # Network without domain restrictions is risky

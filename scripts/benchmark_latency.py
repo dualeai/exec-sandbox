@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.12"
-# dependencies = ["exec-sandbox"]
-#
-# [tool.uv.sources]
-# exec-sandbox = { path = ".." }
-# ///
 """Benchmark VM latency for exec-sandbox.
 
 Measures:
 - Cold boot latency: Time to create a fresh VM and execute code
-- Warm pool latency: Time with pre-warmed VMs (sequential and concurrent)
+- Warm pool latency: Time with pre-warmed VMs (concurrent)
 
 Uses TimingBreakdown from exec-sandbox for detailed phase timings:
 - setup_ms: Infra setup (cache, overlay, cgroup) — excludes admission
@@ -22,7 +15,7 @@ Uses TimingBreakdown from exec-sandbox for detailed phase timings:
 Usage:
     uv run python scripts/benchmark_latency.py           # Quick benchmark
     uv run python scripts/benchmark_latency.py -n 20    # More iterations
-    uv run python scripts/benchmark_latency.py --pool 8 # With warm pool
+    uv run python scripts/benchmark_latency.py --pool N # With warm pool of N VMs/language
 """
 
 import argparse
@@ -33,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from operator import attrgetter
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from exec_sandbox import ExecutionResult, Scheduler, SchedulerConfig
 from exec_sandbox._logging import configure_logging
@@ -121,6 +115,9 @@ class TimingStats:
     warm_hits: int = 0
     l1_hits: int = 0
     cold_boots: int = 0
+    # Runs excluded from the lists above, reported instead of aborting:
+    failures: int = 0  # errored or non-zero exit
+    off_source: int = 0  # served by a different VM source (checked before exit code)
 
 
 def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -> None:
@@ -140,19 +137,50 @@ def collect_timing(result: ExecutionResult, stats: TimingStats, e2e_ms: float) -
         stats.cold_boots += 1
 
 
-def _collect_results(results: list[tuple[ExecutionResult, float]]) -> TimingStats:
-    """Collect timing from results, skipping failures."""
+def _vm_source(result: ExecutionResult) -> str:
+    if result.warm_pool_hit:
+        return "warm"
+    if result.l1_cache_hit:
+        return "l1"
+    return "cold"
+
+
+def _collect_results(
+    results: list[tuple[ExecutionResult, float] | None],
+    expected_source: str | None = None,
+) -> TimingStats:
+    """Collect timing from results.
+
+    Failed runs and (when expected_source is set) runs served by another VM
+    source are excluded from the samples and counted instead — a lone
+    transient failure must not abort minutes of benchmark, and a run that
+    became e.g. an L1 hit through admission queuing must not pollute cold
+    numbers.
+    """
     stats = TimingStats()
-    failures = 0
-    for result, e2e_ms in results:
+    for item in results:
+        if item is None:
+            stats.failures += 1
+            continue
+        result, e2e_ms = item
+        # Source classification first: a fallback that also failed must count
+        # as off_source, or the warm-phase purity check would miss it.
+        if expected_source is not None and _vm_source(result) != expected_source:
+            stats.off_source += 1
+            continue
         if result.exit_code != 0:
-            failures += 1
+            stats.failures += 1
             stderr_preview = result.stderr[:200].strip()
             print(f"  Warning: run failed (exit_code={result.exit_code}): {stderr_preview}")
             continue
         collect_timing(result, stats, e2e_ms)
-    if failures:
-        print(f"  Warning: {failures}/{len(results)} runs failed, excluded from stats")
+    if stats.failures:
+        print(f"  Warning: {stats.failures}/{len(results)} runs failed, excluded from stats")
+    if stats.off_source:
+        print(
+            f"  Note: {stats.off_source}/{len(results)} runs served by a non-{expected_source} "
+            "VM source, excluded from stats"
+        )
     return stats
 
 
@@ -168,6 +196,7 @@ async def benchmark_concurrent(
     *,
     memory_mb: int | None = None,
     allow_network: bool = False,
+    expected_source: str | None = None,
 ) -> TimingStats:
     """Benchmark VM boot + execution latency with concurrent requests."""
     code = CODE_MAP.get(language, "echo ok")
@@ -191,7 +220,7 @@ async def benchmark_concurrent(
 
     # Launch all requests concurrently
     results = await asyncio.gather(*[single_run() for _ in range(concurrency)])
-    return _collect_results([r for r in results if r is not None])
+    return _collect_results(list(results), expected_source=expected_source)
 
 
 # ============================================================================
@@ -342,11 +371,11 @@ def parse_args() -> argparse.Namespace:
 Examples:
   %(prog)s                            Quick benchmark (10 iterations, cold boot only)
   %(prog)s -n 20                      More iterations for stable results
-  %(prog)s --pool 8                   Enable warm pool with 8 pre-warmed VMs
+  %(prog)s --pool N                   Enable warm pool with N pre-warmed VMs per language
   %(prog)s --network                  Benchmark with network enabled (gvproxy overhead)
   %(prog)s --lang javascript          Benchmark JS only
   %(prog)s --lang python javascript   Compare Python vs JS
-  %(prog)s -n 20 --pool 8             Full benchmark
+  %(prog)s -n 20 --pool N             Full benchmark
 """,
     )
     parser.add_argument(
@@ -378,6 +407,9 @@ Examples:
     )
     args = parser.parse_args()
 
+    if args.pool > 0 and args.network:
+        parser.error("--pool cannot be combined with --network because networked requests bypass the warm pool")
+
     # Convert --lang strings to Language enum
     if args.lang is None:
         args.langs = list(ALL_LANGUAGES)
@@ -387,44 +419,66 @@ Examples:
     return args
 
 
-async def run_benchmarks(
+async def run_cold_benchmarks(
     scheduler: Scheduler,
     n: int,
-    pool: int,
     network: bool,
     langs: list[Language],
 ) -> dict[str, TimingStats]:
-    """Run all benchmarks, return results dict."""
-    all_results: dict[str, TimingStats] = {}
+    """Run cold benchmarks and reject samples from another VM source."""
+    results: dict[str, TimingStats] = {}
 
-    # Cold boot benchmarks (concurrent, per-language)
     for lang in langs:
         print(f"\nRunning {LANG_DISPLAY[lang]} cold boot benchmark ({n} concurrent)...")
-        all_results[f"Cold Boot ({LANG_DISPLAY[lang]})"] = await benchmark_concurrent(
+        stats = await benchmark_concurrent(
             scheduler,
             lang,
             n,
             memory_mb=None,  # Use scheduler default
             allow_network=network,
+            expected_source="cold",
         )
-
-    # Warm pool benchmark (if enabled)
-    if pool > 0:
-        print("\nWaiting for warm pool to replenish...")
-        await scheduler.wait_pool_ready()
-        print("Warm pool ready.")
-
-        # Use pool size as concurrency to ensure all VMs come from pool
-        for lang in langs:
-            print(f"\nRunning {LANG_DISPLAY[lang]} warm pool benchmark ({pool} concurrent = pool size)...")
-            all_results[f"Warm Pool ({LANG_DISPLAY[lang]})"] = await benchmark_concurrent(
-                scheduler,
-                lang,
-                pool,
-                allow_network=network,
+        if not stats.e2e:
+            raise RuntimeError(
+                f"Cold benchmark produced no usable samples for {lang.value}: "
+                f"failures={stats.failures}, off_source={stats.off_source}"
             )
+        results[f"Cold Boot ({LANG_DISPLAY[lang]})"] = stats
 
-    return all_results
+    return results
+
+
+async def run_warm_pool_benchmarks(
+    scheduler: Scheduler,
+    pool: int,
+    langs: list[Language],
+) -> dict[str, TimingStats]:
+    """Run warm-pool benchmarks; ANY fallback aborts the run (purity check)."""
+    results: dict[str, TimingStats] = {}
+
+    print("\nWaiting for warm pool to replenish...")
+    await scheduler.wait_pool_ready()
+
+    for lang in langs:
+        print(f"\nRunning {LANG_DISPLAY[lang]} warm pool benchmark ({pool} concurrent = pool size)...")
+        stats = await benchmark_concurrent(
+            scheduler,
+            lang,
+            pool,
+            allow_network=False,
+            expected_source="warm",
+        )
+        # The pool is sized exactly to concurrency and wait_pool_ready() ran:
+        # any fallback here is the defect bench-pool exists to surface.
+        if stats.off_source or not stats.e2e:
+            raise RuntimeError(
+                f"Warm benchmark produced fallback VM sources for {lang.value}: "
+                f"warm={stats.warm_hits}/{pool}, off_source={stats.off_source}, "
+                f"failures={stats.failures}"
+            )
+        results[f"Warm Pool ({LANG_DISPLAY[lang]})"] = stats
+
+    return results
 
 
 def print_report(all_results: dict[str, TimingStats], langs: list[Language]) -> None:
@@ -465,24 +519,37 @@ async def main() -> None:
     print("=" * 60)
     print(f"Concurrency:  {args.n}")
     if pool_enabled:
-        total_warm_pool_vms = args.pool * len(args.langs)
-        lang_names = " + ".join(LANG_DISPLAY[lang] for lang in args.langs)
+        total_warm_pool_vms = args.pool * len(ALL_LANGUAGES)
+        lang_names = " + ".join(LANG_DISPLAY[lang] for lang in ALL_LANGUAGES)
         print(
-            f"Warm pool:    {args.pool} VMs/lang x {len(args.langs)} languages ({lang_names}) = {total_warm_pool_vms} VMs"
+            f"Warm pool:    {args.pool} VMs/lang x {len(ALL_LANGUAGES)} languages "
+            f"({lang_names}) = {total_warm_pool_vms} VMs"
         )
     else:
         print("Warm pool:    disabled")
     print(f"Network:      {'enabled' if args.network else 'disabled'}")
     print(f"Memory/VM:    {DEFAULT_MEMORY_MB} MB")
 
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        auto_download_assets=False,
-        warm_pool_size=args.pool,
-    )
+    with TemporaryDirectory(prefix="exec-sandbox-benchmark-") as cache_dir:
+        memory_snapshot_cache_dir = Path(cache_dir) / "memory-snapshots"
+        cold_config = SchedulerConfig(
+            images_dir=images_dir,
+            auto_download_assets=False,
+            warm_pool_size=0,
+            memory_snapshot_cache_dir=memory_snapshot_cache_dir,
+        )
+        async with Scheduler(cold_config) as cold_scheduler:
+            all_results = await run_cold_benchmarks(cold_scheduler, args.n, args.network, args.langs)
 
-    async with Scheduler(config) as scheduler:
-        all_results = await run_benchmarks(scheduler, args.n, args.pool, args.network, args.langs)
+        if pool_enabled:
+            warm_config = SchedulerConfig(
+                images_dir=images_dir,
+                auto_download_assets=False,
+                warm_pool_size=args.pool,
+                memory_snapshot_cache_dir=memory_snapshot_cache_dir,
+            )
+            async with Scheduler(warm_config) as warm_scheduler:
+                all_results.update(await run_warm_pool_benchmarks(warm_scheduler, args.pool, args.langs))
 
     print_report(all_results, args.langs)
 

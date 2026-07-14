@@ -151,7 +151,7 @@ test-func:
 test-sudo:
 	$(call ci-monitor-run,uv run pytest tests/ -v -n auto -m "sudo" --ignore=tests/benchmarks)
 
-# Unit tests only (fast)
+# Host functional suite plus Rust/Go unit tests (excludes sudo and slow)
 test-unit:
 	$(MAKE) test-func
 	$(MAKE) --directory guest-agent test-unit
@@ -190,11 +190,14 @@ ci-diagnose:
 # Benchmarking (concurrent VM latency)
 # ============================================================================
 
+# Usage: make bench-pool [BENCH_POOL=N]  (N warm VMs per language)
+BENCH_POOL ?= 5
+
 bench:
-	uv run --script scripts/benchmark_latency.py -n 10
+	uv run python scripts/benchmark_latency.py -n 10
 
 bench-pool:
-	uv run --script scripts/benchmark_latency.py -n 10 --pool 8
+	uv run python scripts/benchmark_latency.py -n 10 --pool $(BENCH_POOL)
 
 # 2D overcommit optimizer — finds Pareto-optimal (CPU_OC, MEM_OC) configs.
 # Fires N VMs per combo across a 4x4 grid, ranks by Sharpe-like efficiency
@@ -250,7 +253,7 @@ bench-flamegraph:
 		--rate $(PYSPY_RATE) \
 		--format speedscope \
 		--output $(PYSPY_OUTPUT) \
-		-- uv run --script scripts/benchmark_latency.py -n 10
+		-- uv run python scripts/benchmark_latency.py -n 10
 	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
 	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 
@@ -262,7 +265,7 @@ bench-pool-flamegraph:
 		--rate $(PYSPY_RATE) \
 		--format speedscope \
 		--output $(PYSPY_OUTPUT) \
-		-- uv run --script scripts/benchmark_latency.py -n 10 --pool 8
+		-- uv run python scripts/benchmark_latency.py -n 10 --pool $(BENCH_POOL)
 	@echo "Flamegraph saved to $(PYSPY_OUTPUT)"
 	@echo "Open at https://speedscope.app for interactive filtering (search 'exec_sandbox')"
 
