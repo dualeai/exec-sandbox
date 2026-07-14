@@ -227,6 +227,40 @@ RUN --mount=type=cache,target=/root/.ccache \
         export PATH="/usr/local/aarch64-linux-musl-cross/bin:$PATH"; \
     fi && \
     make ARCH=${KERNEL_ARCH} ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} olddefconfig && \
+    # Fail-closed: verify the fragment survived olddefconfig. Kconfig `select`
+    # statements silently re-enable disabled options (e.g. legacy NTFS_FS
+    # selecting NTFS3_FS), and merge_config.sh -m never verifies the final
+    # config. Arch-forced exceptions are documented in exec-sandbox.config.
+    if [ "$KERNEL_ARCH" = "x86" ]; then \
+        ALLOW="CONFIG_PERF_EVENTS CONFIG_NLS CONFIG_HOTPLUG_CPU"; \
+    else \
+        ALLOW=""; \
+    fi && \
+    sed -n 's/^# \(CONFIG_[A-Z0-9_]*\) is not set$/\1/p' /tmp/exec-sandbox.config > /tmp/frag-unset.list && \
+    grep -E '^CONFIG_[A-Z0-9_]+=' /tmp/exec-sandbox.config > /tmp/frag-set.list && \
+    : > /tmp/config-violations && \
+    while IFS= read -r opt; do \
+        case " $ALLOW " in *" $opt "*) continue ;; esac; \
+        v=$(grep -E "^${opt}=" .config) && \
+            echo "REVERTED: fragment disables ${opt}, final config has ${v}" >> /tmp/config-violations || true; \
+    done < /tmp/frag-unset.list && \
+    # Wanted values must match when the symbol exists at all in the final
+    # config. Absent = arch-inapplicable or renamed upstream: tolerated but
+    # logged, so a typo'd directive is visible instead of silently inert.
+    while IFS= read -r line; do \
+        opt="${line%%=*}" && \
+        if grep -qE "^${opt}=|^# ${opt} is not set" .config; then \
+            grep -qxF "$line" .config || \
+                echo "DROPPED: fragment wants '${line}', final config disagrees" >> /tmp/config-violations; \
+        else \
+            echo "NOTE: fragment sets '${line}' but symbol is absent on this arch" >&2; \
+        fi; \
+    done < /tmp/frag-set.list && \
+    if [ -s /tmp/config-violations ]; then \
+        echo "ERROR: exec-sandbox.config did not survive merge_config.sh + olddefconfig:" >&2 && \
+        cat /tmp/config-violations >&2 && \
+        exit 1; \
+    fi && \
     export KBUILD_BUILD_TIMESTAMP='' && \
     export KBUILD_BUILD_USER='exec-sandbox' && \
     export KBUILD_BUILD_HOST='buildkit' && \

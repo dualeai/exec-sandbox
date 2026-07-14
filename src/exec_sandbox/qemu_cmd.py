@@ -277,10 +277,14 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # TCG test suite uses. pauth-impdef=on forces the fast impdef PAC
             # algorithm (QEMU 10.0+ defaults to this for virt >= 10.0, but
             # older versions use QARMA5 which costs ~50% of TCG cycles).
-            # x86 TCG: SapphireRapids-v2 provides full Spectre/MDS mitigation
-            # flags (spec-ctrl, stibp, ssbd, arch-capabilities, md-clear,
-            # mds-no, taa-no, gds-no, rfds-no). TCG silently strips AVX-512
-            # and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
+            # x86 TCG: SapphireRapids-v2 as a modern feature baseline. Note:
+            # TCG cannot emulate the IA32_ARCH_CAPABILITIES MSR and strips the
+            # feature (warns "TCG doesn't support requested feature ...
+            # arch-capabilities", verified on QEMU 11.0.2), so hardware
+            # vulnerability self-declarations (mds-no, taa-no, ...) never reach
+            # the guest — TCG guests report MDS "Vulnerable". Irrelevant under
+            # the mitigations=off posture below. TCG also silently strips
+            # AVX-512 and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
             # also lacks 256-bit vector ops (TCG_TARGET_HAS_v256=0), so AVX2
             # is unavailable — effective ceiling is SSE4.2. On x86 hosts the
             # effective ceiling is x86_64-v3 (AVX2/FMA).
@@ -398,13 +402,22 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + (" cpuidle.governor=haltpoll" if accel_type == AccelType.KVM else " cpuidle.off=1")
             # Skip deferred probe timeout (no hardware needing async probe, 0-5ms)
             + " deferred_probe_timeout=0"
-            # Disable KASLR — the VM is the security boundary, not the guest kernel.
-            # Saves ~1-2MB page table memory and speeds boot by skipping randomization.
-            + " nokaslr"
             # Disable CPU speculative execution mitigations in the guest kernel.
-            # The VM boundary (KVM/HVF) provides host isolation. Guest-side mitigations
-            # (Spectre, MDS, L1TF, etc.) add ~2-5% CPU overhead and allocate per-CPU
-            # tracking structures. Safe: host mitigations remain active.
+            # VMSCAPE (CVE-2025-40300) must be mitigated by a patched/configured
+            # HOST kernel; guest mitigations=off neither enables nor disables that
+            # host defense (Linux does not apply VMSCAPE mitigation in guests).
+            # Guest-side mitigations add CPU overhead and per-CPU state without
+            # protecting a co-resident tenant (there is only one tenant per VM).
+            # This accepts residual risk to the trusted guest-agent and guest
+            # kernel from untrusted guest code.
+            # nokaslr is deliberately omitted: the x86 base config currently has
+            # CONFIG_RANDOMIZE_BASE=y, although this cmdline guard does not prove
+            # runtime randomization on the direct-vmlinux PVH boot path. The arm64
+            # base has CONFIG_RANDOMIZE_BASE=n; with mitigations=off its KPTI also
+            # remains off. That arm64 density tradeoff is accepted here rather
+            # than silently adding kpti=1 without performance evidence.
+            # The cmdline token/omission is pinned by
+            # test_vm_manager.py::TestKernelCmdlineMitigations.
             + " mitigations=off"
             # Limit possible CPUs to match -smp. Without this, QEMU machine types
             # advertise many possible CPUs (virt: up to 512, microvm: up to 256),

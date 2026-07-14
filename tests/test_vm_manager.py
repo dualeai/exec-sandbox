@@ -1295,6 +1295,62 @@ class TestCpuidleGovernor(_QemuCmdTestBase):
 
 
 # ============================================================================
+# Unit Tests - Speculative-execution posture in kernel cmdline
+# ============================================================================
+
+# Expected tokens for the guest mitigation posture (commit 5526750d):
+# the VM boundary (KVM/HVF) is the isolation layer; guest-side mitigations add
+# CPU overhead and per-CPU state without protecting a co-resident tenant.
+# nokaslr is forbidden so the cmdline does not explicitly disable address
+# randomization. The x86 base currently enables CONFIG_RANDOMIZE_BASE, but this
+# token test does not prove runtime KASLR on the direct-vmlinux PVH path. arm64
+# has CONFIG_RANDOMIZE_BASE=n and remains without KASLR/KPTI under
+# mitigations=off; enabling arm64 KPTI is a separate performance decision.
+# Guest-side reporting companion: test_speculative_execution.py::
+# TestMitigationStatus.
+REQUIRED_CMDLINE_TOKENS = ("mitigations=off",)
+FORBIDDEN_CMDLINE_TOKENS = ("nokaslr",)
+
+
+class TestKernelCmdlineMitigations(_QemuCmdTestBase):
+    """Pin the speculative-execution posture of the built kernel cmdline.
+
+    Host-side seam: build_qemu_cmd() is pure command construction (no VM
+    boot, no image files needed). This CANNOT be asserted from inside the
+    guest — guest-agent masks /proc/cmdline with a /dev/null bind-mount
+    (guest-agent/src/init.rs), so in-guest reads return "" (a previous
+    guest-side test passed vacuously because of exactly that).
+    """
+
+    async def test_mitigation_tokens_match_posture(self, vm_settings, workdir) -> None:
+        """mitigations=off present, nokaslr absent — the density posture."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-mitigations",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        # Token-split, not substring: substring would match inside other params.
+        tokens = _extract_kernel_cmdline(cmd).split()
+        for token in REQUIRED_CMDLINE_TOKENS:
+            assert token in tokens, (
+                f"density posture requires '{token}' in kernel cmdline "
+                f"(see qemu_cmd.py mitigations block); got: {' '.join(tokens)}"
+            )
+        for token in FORBIDDEN_CMDLINE_TOKENS:
+            assert token not in tokens, (
+                f"'{token}' is forbidden: do not explicitly disable address randomization; got: {' '.join(tokens)}"
+            )
+
+
+# ============================================================================
 # Shared helpers for build_qemu_cmd() unit tests
 # ============================================================================
 

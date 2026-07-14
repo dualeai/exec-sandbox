@@ -35,6 +35,95 @@ pub(crate) async fn reap_zombies() {
 }
 
 // ============================================================================
+// OOM watchdog
+// ============================================================================
+
+/// Active watchdog that breaks the zram mem_limit reclaim livelock.
+///
+/// With a single vCPU, zram swap capped by mem_limit, and exactly one runnable
+/// task exhausting memory with incompressible data, the kernel enters a
+/// lying-swap state: zram rejects writes (-ENOMEM, mem_limit full) while
+/// /proc/swaps still reports free slots, so should_reclaim_retry() keeps
+/// retrying and the OOM killer never fires — the VM appears hung until the
+/// host timeout (observed on 10-30% of memory-exhaustion runs, kernel 6.18).
+///
+/// What breaks it (measured): cycling swappable pages. The watchdog owns a
+/// deliberately cold anonymous buffer; under pressure those pages are among
+/// the first swapped out, and touching one chunk per tick swaps them back in
+/// dirty so they get swapped out again next pass. Because the pages are
+/// near-zero (highly compressible), their zram objects land in tiny zsmalloc
+/// size classes that fit existing partial zspages — so these swap-outs
+/// succeed even when mem_limit blocks the workload's incompressible 4KB-class
+/// writes. That nonzero reclaim progress each pass keeps resetting
+/// should_reclaim_retry() toward an honest verdict, and the loop converges to
+/// a genuine OOM kill within ~1s. Passive wakeups and fresh allocations do
+/// NOT work: livelocked reclaim keeps free pages above the min watermark, so
+/// plain allocations are served from the free lists without touching swap.
+///
+/// On a healthy VM the buffer stays resident and each tick is a ~microsecond
+/// memory write. Costs: 8 MB of permanently dirty anon per VM (~4% of a
+/// 192 MB guest) that free-page-reporting can never hand back to the host,
+/// plus one wakeup per second — the price of a deterministic OOM.
+///
+/// Dedicated OS thread, not a tokio task: the async runtime's workers can be
+/// wedged by the same memory pressure.
+///
+/// SAFETY-ADJACENT INVARIANT: vm.oom_kill_allocating_task=1 is set in
+/// apply_zram_vm_tuning(). If a watchdog fault is the allocation that trips
+/// OOM, the agent survives only because it is PID 1 (tiny-init execs us
+/// without forking) and init is OOM-unkillable. If guest-agent ever runs
+/// non-PID1, this watchdog becomes agent suicide under memory pressure.
+pub(crate) fn spawn_oom_watchdog() {
+    // 8 MB buffer, 512 KB touched per 1s tick: full sweep every 16s, several
+    // zram pages recycled per tick under pressure. Buffer is swappable by
+    // design — it must be, to generate swap traffic.
+    const BUF_BYTES: usize = 8 * 1024 * 1024;
+    const CHUNK_BYTES: usize = 512 * 1024;
+    const PAGE: usize = 4096;
+
+    std::thread::Builder::new()
+        .name("oom-watchdog".into())
+        .spawn(|| {
+            let buf = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    BUF_BYTES,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if buf == libc::MAP_FAILED {
+                log_warn!("[oom-watchdog] mmap failed, watchdog disabled");
+                return;
+            }
+            let base = buf as *mut u8;
+            // Fault everything in once so the pages exist and can be swapped.
+            // Keep this buffer COMPRESSIBLE (near-zero bytes): the livelock
+            // fix depends on its zram objects fitting existing partial
+            // zspages so watchdog swap-outs succeed at the mem_limit cap.
+            // Filling it with random data would regress to the livelock.
+            for off in (0..BUF_BYTES).step_by(PAGE) {
+                unsafe { std::ptr::write_volatile(base.add(off), 1) };
+            }
+            let mut cursor = 0usize;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let end = cursor + CHUNK_BYTES;
+                for off in (cursor..end).step_by(PAGE) {
+                    // Write (not read) so the page returns to dirty-anon state
+                    // and its zram slot is freed on swap-in.
+                    unsafe { std::ptr::write_volatile(base.add(off % BUF_BYTES), 1) };
+                }
+                cursor = end % BUF_BYTES;
+            }
+        })
+        .inspect_err(|e| log_warn!("[oom-watchdog] thread spawn failed: {e}"))
+        .ok();
+}
+
+// ============================================================================
 // Init environment setup
 // ============================================================================
 
@@ -386,7 +475,9 @@ fn setup_zram_swap() {
     // indefinitely — the kernel reclaim loop thrashes (compress/decompress)
     // instead of triggering the OOM killer, making the VM appear hung until
     // timeout. With mem_limit, once compressed storage is full zram returns
-    // -ENOMEM on write → swap fails → OOM fires within seconds.
+    // -ENOMEM on write → swap fails → OOM can fire. On its own this is not
+    // fully reliable — reclaim can still livelock on the full cap (see
+    // spawn_oom_watchdog(), which closes that gap).
     //
     // Sizing: 20% of RAM × 2-3x lz4 ratio ≈ 40-60% effective swap capacity.
     // For a 192 MB VM this means ~38 MB compressed → ~76-115 MB usable swap.
@@ -530,7 +621,13 @@ fn apply_zram_vm_tuning() {
     let mem_kb = read_mem_total_kb();
 
     let _ = std::fs::write("/proc/sys/vm/page-cluster", "0");
-    let _ = std::fs::write("/proc/sys/vm/swappiness", "180");
+    // 100, not the Arch-wiki zram value of 180: that advice assumes an
+    // UNCAPPED zram. With mem_limit set, swappiness=180 makes reclaim bang
+    // exclusively on the zram wall once the cap is hit (writes fail with the
+    // swap still advertised as free), feeding the should_reclaim_retry
+    // livelock described in spawn_oom_watchdog(). 100 keeps file-page reclaim
+    // in the mix so reclaim can always make some progress or fail honestly.
+    let _ = std::fs::write("/proc/sys/vm/swappiness", "100");
     let _ = std::fs::write(
         "/proc/sys/vm/min_free_kbytes",
         (mem_kb * 4 / 100).to_string(),

@@ -198,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(init::setup_network_background());
     tokio::spawn(init::setup_zram_background());
     tokio::spawn(init::reap_zombies());
+    init::spawn_oom_watchdog();
 
     log_info!("Guest agent starting (dual ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH})...");
 
