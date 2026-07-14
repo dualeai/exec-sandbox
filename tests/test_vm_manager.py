@@ -2336,7 +2336,7 @@ class TestNetdevReconnectIntegration:
             task_id="integration",
             memory_mb=256,
             allow_network=True,
-            allowed_domains=["httpbin.org"],
+            allowed_domains=["cp.cloudflare.com"],
         )
 
         # TLS on port 443 with SNI — OutboundAllow only permits TLS
@@ -2344,8 +2344,8 @@ class TestNetdevReconnectIntegration:
         tls_connect_code = (
             "import socket, ssl\n"
             "ctx = ssl.create_default_context()\n"
-            "s = socket.create_connection(('httpbin.org', 443), timeout=10)\n"
-            "ss = ctx.wrap_socket(s, server_hostname='httpbin.org')\n"
+            "s = socket.create_connection(('cp.cloudflare.com', 443), timeout=10)\n"
+            "ss = ctx.wrap_socket(s, server_hostname='cp.cloudflare.com')\n"
             "ss.close()\n"
         )
 
@@ -2381,7 +2381,7 @@ class TestNetdevReconnectIntegration:
             # Step 4: Restart gvproxy on same socket path
             new_proc, _new_log_task = await start_gvproxy(
                 vm_id=vm.vm_id,
-                allowed_domains=["httpbin.org"],
+                allowed_domains=["cp.cloudflare.com"],
                 language=vm.language.value,
                 workdir=vm.workdir,
             )

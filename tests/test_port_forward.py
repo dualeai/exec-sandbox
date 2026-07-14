@@ -595,14 +595,20 @@ class TestPortForwardingMode2Integration:
 
     async def test_mode2_can_reach_allowed_domain(self, scheduler: Scheduler) -> None:
         """Verify Mode 2 allows outbound internet to allowed domains."""
+        # Planet-scale connectivity-check (NCSI) endpoint — no rate limits,
+        # no bot challenges, no scheduled downtime.
         result = await scheduler.run(
             code=PY_SAFETY
             + f"""
-import urllib.request, time
+import urllib.error, urllib.request, time
 for attempt in range({NET_RETRY_COUNT + 1}):
     try:
-        resp = urllib.request.urlopen('https://httpbin.org/status/200', timeout={NET_OP_TIMEOUT_S})
+        resp = urllib.request.urlopen('https://cp.cloudflare.com/generate_204', timeout={NET_OP_TIMEOUT_S})
         print(f'STATUS:{{resp.status}}')
+        break
+    except urllib.error.HTTPError as e:
+        # Any HTTP response proves the domain is reachable through the filter
+        print(f'STATUS:{{e.code}}')
         break
     except Exception as e:
         if attempt < {NET_RETRY_COUNT}:
@@ -613,11 +619,11 @@ for attempt in range({NET_RETRY_COUNT + 1}):
             language=Language.PYTHON,
             expose_ports=[PortMapping(internal=8080)],
             allow_network=True,
-            allowed_domains=["httpbin.org"],
+            allowed_domains=["cp.cloudflare.com"],
         )
 
-        # Should be able to reach httpbin.org
-        assert "STATUS:200" in result.stdout
+        # Any HTTP status = outbound path works end-to-end (DNS, SNI filter, TLS)
+        assert "STATUS:" in result.stdout
 
 
 @pytest.mark.slow
