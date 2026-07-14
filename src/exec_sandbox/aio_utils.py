@@ -32,6 +32,19 @@ async def await_settled[T](task: asyncio.Task[T]) -> asyncio.CancelledError | No
     return cancellation
 
 
+async def settle_and_report(task: asyncio.Task[object]) -> BaseException | None:
+    """Settle a rollback task (absorbing caller cancellation) and report its
+    own error, if any.
+
+    A task cancelled from outside is treated as clean (returns ``None``): a
+    cancelled rollback is not itself a failure to log. Caller cancellation is
+    absorbed — a wedged rollback must not be abortable — and re-raised by the
+    ``except`` block that owns the primary error.
+    """
+    await await_settled(task)
+    return None if task.cancelled() else task.exception()
+
+
 async def await_cancellation_safe[T](awaitable: Awaitable[T]) -> T:
     """Run ``awaitable`` to completion even if the caller is cancelled.
 

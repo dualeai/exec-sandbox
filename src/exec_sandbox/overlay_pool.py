@@ -28,7 +28,7 @@ import aiofiles.os
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_settled
+from exec_sandbox.aio_utils import settle_and_report
 from exec_sandbox.exceptions import VmOverlayError as QemuImgError
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError
 from exec_sandbox.subprocess_utils import communicate_managed_process
@@ -217,8 +217,7 @@ class OverlayPool:
             await self._start_impl(base_images)
         except BaseException:
             rollback = asyncio.create_task(self.stop())
-            await await_settled(rollback)
-            if not rollback.cancelled() and (rollback_error := rollback.exception()) is not None:
+            if (rollback_error := await settle_and_report(rollback)) is not None:
                 logger.error(
                     "Overlay pool startup rollback failed",
                     extra={"error": str(rollback_error)},
