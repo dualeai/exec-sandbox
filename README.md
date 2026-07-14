@@ -214,7 +214,9 @@ async with Scheduler() as scheduler:
         # VM failed to boot (guest agent not ready). Often transient (CPU contention).
         print("VM boot timed out — retry may succeed")
     except VmTransientError:
-        # Infrastructure failure (QEMU crash, REPL spawn OOM) — code never ran, safe to retry.
+        # Infrastructure failure before dispatch (connect/readiness failure) — code never ran, safe to retry.
+        # If the transport is lost AFTER dispatch, CommunicationOutcomeUnknownError is raised instead:
+        # the code may have run, so reconcile side effects before retrying.
         # VmTimeoutError is a subclass, so this must come after it.
         print("Transient VM failure, retry may succeed")
     except PackageNotAllowedError as e:
@@ -559,7 +561,7 @@ Returned by `Session.list_files()`.
 |-----------|-------------|
 | `SandboxError` | Base exception for all sandbox errors |
 | `TransientError` | Retryable errors — may succeed on retry |
-| `VmTransientError` | Transport failure or guest infrastructure failure (code never ran) |
+| `VmTransientError` | Transport failure or guest infrastructure failure before dispatch (code never ran) |
 | `VmTimeoutError` | VM boot timed out |
 | `VmCapacityError` | VM pool at capacity |
 | `PermanentError` | Non-retryable errors |
@@ -568,8 +570,10 @@ Returned by `Session.list_files()`.
 | `InputValidationError` | Caller-bug errors — bad input, session stays alive |
 | `CodeValidationError` | Empty, whitespace-only, or null-byte code |
 | `EnvVarValidationError` | Invalid env var names/values (control chars, size) |
+| `OutputLimitError` | stdout/stderr exceeded guest-enforced limits (session stays alive) |
 | `SessionClosedError` | Session already closed |
 | `CommunicationError` | Guest communication failed |
+| `CommunicationOutcomeUnknownError` | Transport lost after dispatch — the code may have run; reconcile side effects before retrying |
 | `GuestAgentError` | Guest agent returned error |
 | `PackageNotAllowedError` | Package not in allowlist |
 | `SnapshotError` | Snapshot operation failed |

@@ -43,14 +43,19 @@ import psutil
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.exceptions import VmOverlayError as QemuStorageDaemonError
 from exec_sandbox.process_registry import unregister_process
-from exec_sandbox.subprocess_utils import start_managed_process, wait_for_socket
+from exec_sandbox.resource_cleanup import cleanup_process
+from exec_sandbox.subprocess_utils import communicate_managed_process, start_managed_process, wait_for_socket
 
 if TYPE_CHECKING:
     from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
+
+# Cleanup must outlive a caller that abandons a partially-started daemon.
+_cleanup_tasks: set[asyncio.Task[None]] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,10 +96,12 @@ class QemuStorageDaemon:
     """
 
     __slots__ = (
+        "_cleanup_task",
         "_event_buffer",
         "_lock",
         "_process",
         "_reader",
+        "_request_seq",
         "_socket_path",
         "_started",
         "_virtual_size_cache",
@@ -108,9 +115,11 @@ class QemuStorageDaemon:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._started = False
+        self._request_seq = 0
         self._lock = asyncio.Lock()  # Serialize QMP commands
         self._virtual_size_cache: dict[str, int] = {}  # Cache base image sizes
         self._event_buffer: list[QmpEvent] = []  # Events stashed by _execute(), consumed by _wait_for_job()
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     @property
     def started(self) -> bool:
@@ -127,6 +136,10 @@ class QemuStorageDaemon:
         """
         if self._started:
             return
+        if self._process is not None:
+            # A prior failed/cancelled start still owns a daemon. Confirm its
+            # death before assigning another socket/process handle.
+            await self.stop()
 
         # Clean up orphaned daemons from previous crashes (non-critical)
         try:
@@ -149,7 +162,10 @@ class QemuStorageDaemon:
         ]
 
         try:
-            self._process = await start_managed_process(cmd)
+            self._process = await start_managed_process(
+                cmd,
+                on_process_started=lambda proc: setattr(self, "_process", proc),
+            )
 
             # Wait for socket and connect (single step to avoid TOCTOU)
             await self._wait_and_connect_qmp()
@@ -160,11 +176,18 @@ class QemuStorageDaemon:
                 extra={"socket": str(self._socket_path), "pid": self._process.pid},
             )
 
-        except Exception as e:
-            # Cleanup on failure (connection may have been established before handshake failed)
-            unregister_process(self._process)
-            await self._cleanup_connection()
-            await self._cleanup_process()
+        except BaseException as e:
+            # Publish process cleanup before another await; connection cleanup
+            # may itself be interrupted by repeated caller cancellation.
+            cleanup_task = self._ensure_cleanup_task()
+            try:
+                await self._cleanup_connection()
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # The globally-retained cleanup owner keeps retrying.
+                raise
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise QemuStorageDaemonError(f"Failed to start daemon: {e}") from e
 
     async def stop(self) -> None:
@@ -173,30 +196,26 @@ class QemuStorageDaemon:
         Idempotent: Clears event buffer and returns if not started.
         Cancellation-safe: _started is set False before any await.
         """
-        if not self._started:
+        if not self._started and self._process is None:
             self._event_buffer.clear()
             return
 
         # Set early so idempotency guard works even if we're cancelled mid-cleanup
+        was_started = self._started
         self._started = False
 
-        # Send quit command (ignore errors - daemon may already be dead)
-        with contextlib.suppress(Exception):
-            await self._execute("quit")
-
-        # Unregister before _cleanup_process() sets self._process = None
-        unregister_process(self._process)
-
         try:
-            # Close connection
-            await self._cleanup_connection()
-            await self._cleanup_process()
+            # Send quit command (ignore errors - daemon may already be dead)
+            if was_started:
+                with contextlib.suppress(Exception):
+                    await self._execute("quit")
         finally:
-            # Cleanup socket and buffer even if cancelled
-            if self._socket_path and self._socket_path.exists():
-                with contextlib.suppress(OSError):
-                    self._socket_path.unlink()
+            # Publish cleanup ownership before another await. If this stop
+            # waiter is cancelled, the global task continues retrying.
+            cleanup_task = self._ensure_cleanup_task()
+            await self._cleanup_connection()
             self._event_buffer.clear()
+            await asyncio.shield(cleanup_task)
 
         logger.info("QEMU storage daemon stopped")
 
@@ -355,41 +374,72 @@ class QemuStorageDaemon:
         if self._writer is None or self._reader is None:
             raise QemuStorageDaemonError("Not connected to QMP")
 
-        async with self._lock:
-            msg: dict[str, Any] = {"execute": command}
-            if arguments:
-                msg["arguments"] = arguments
+        self._request_seq += 1
+        request_id = f"qsd-{self._request_seq}"
 
-            self._writer.write(json.dumps(msg).encode() + b"\n")
-            await self._writer.drain()
+        async def exchange() -> dict[str, Any]:
+            async with self._lock:
+                return await self._exchange(request_id, command, arguments, timeout)
 
-            # QMP sends async events alongside responses. Read lines until we
-            # get an actual response (has "return" or "error" key), skip events.
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            while loop.time() < deadline:
-                remaining = deadline - loop.time()
-                response = await asyncio.wait_for(self._reader.readline(), timeout=max(0.1, remaining))
-                result = json.loads(response)
+        # Once a command is written, consume its identified response before
+        # propagating caller cancellation. This preserves stream alignment.
+        exchange_task = asyncio.create_task(exchange())
+        try:
+            return await asyncio.shield(exchange_task)
+        except asyncio.CancelledError:
+            await await_settled(exchange_task)
+            if not exchange_task.cancelled():
+                exchange_task.exception()
+            raise
 
-                # Stash concluded events for _wait_for_job; discard
-                # intermediate states (created, running, waiting, pending, null)
-                if "event" in result:
-                    parsed = self._parse_event(result)
-                    if parsed.status == "concluded":
-                        self._event_buffer.append(parsed)
-                    continue
+    async def _exchange(
+        self,
+        request_id: str,
+        command: str,
+        arguments: dict[str, Any] | None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Write one identified QMP command and consume its matching response."""
+        if self._writer is None or self._reader is None:
+            raise QemuStorageDaemonError("Not connected to QMP")
 
-                if "error" in result:
-                    raise QemuStorageDaemonError(
-                        result["error"].get("desc", "Unknown QMP error"),
-                        result["error"].get("class"),
-                    )
+        msg: dict[str, Any] = {"execute": command, "id": request_id}
+        if arguments:
+            msg["arguments"] = arguments
 
-                if "return" in result:
-                    return result["return"]
+        self._writer.write(json.dumps(msg).encode() + b"\n")
+        await self._writer.drain()
 
-            raise QemuStorageDaemonError(f"Timeout waiting for response to {command}")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            remaining = deadline - loop.time()
+            response = await asyncio.wait_for(self._reader.readline(), timeout=max(0.1, remaining))
+            result = json.loads(response)
+
+            if "event" in result:
+                parsed = self._parse_event(result)
+                if parsed.status == "concluded":
+                    self._event_buffer.append(parsed)
+                continue
+
+            if result.get("id") != request_id:
+                logger.warning(
+                    "Discarding unmatched QMP response",
+                    extra={"expected_id": request_id, "response_id": result.get("id")},
+                )
+                continue
+
+            if "error" in result:
+                raise QemuStorageDaemonError(
+                    result["error"].get("desc", "Unknown QMP error"),
+                    result["error"].get("class"),
+                )
+
+            if "return" in result:
+                return result["return"]
+
+        raise QemuStorageDaemonError(f"Timeout waiting for response to {command}")
 
     async def _get_image_virtual_size(self, image_path: Path) -> int:
         """Get image virtual size using qemu-img info (cached).
@@ -411,17 +461,13 @@ class QemuStorageDaemon:
         if cache_key in self._virtual_size_cache:
             return self._virtual_size_cache[cache_key]
 
-        proc = await asyncio.create_subprocess_exec(
-            "qemu-img",
-            "info",
-            "--output=json",
-            str(image_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, stderr = await communicate_managed_process(
+            ["qemu-img", "info", "--output=json", str(image_path)],
+            process_name="qemu-img-info",
+            context_id=cache_key,
         )
-        stdout, stderr = await proc.communicate()
 
-        if proc.returncode != 0:
+        if returncode != 0:
             error_msg = stderr.decode().strip() if stderr else "Unknown error"
             raise QemuStorageDaemonError(f"Failed to get image info for {image_path}: {error_msg}")
 
@@ -642,22 +688,51 @@ class QemuStorageDaemon:
         self._reader = None
         self._writer = None
 
-    async def _cleanup_process(self) -> None:
-        """Terminate and cleanup daemon process."""
+    async def _cleanup_process(self) -> bool:
+        """Terminate the daemon and clear ownership only after confirmed death."""
         if self._process is None:
-            return
+            return True
 
-        # Wait for process to exit
-        try:
-            await asyncio.wait_for(self._process.wait(), timeout=2.0)
-        except TimeoutError:
-            # Force kill
-            with contextlib.suppress(ProcessLookupError):
-                await self._process.terminate()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._process.wait(), timeout=2.0)
+        process = self._process
+        destroyed = await cleanup_process(
+            process,
+            "qemu-storage-daemon",
+            str(self._socket_path or "qsd-startup"),
+            term_timeout=2.0,
+            kill_timeout=2.0,
+        )
+        if destroyed:
+            unregister_process(process)
+            self._process = None
+        return destroyed
 
-        self._process = None
+    def _ensure_cleanup_task(self) -> asyncio.Task[None]:
+        """Return one globally-retained daemon cleanup owner."""
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return self._cleanup_task
+
+        self._cleanup_task = asyncio.create_task(self._cleanup_process_until_confirmed())
+        _cleanup_tasks.add(self._cleanup_task)
+        self._cleanup_task.add_done_callback(_cleanup_tasks.discard)
+        return self._cleanup_task
+
+    async def _cleanup_process_until_confirmed(self) -> None:
+        """Retry bounded termination attempts until process death is confirmed."""
+        delay = 1.0
+        while self._process is not None:
+            try:
+                if await self._cleanup_process():
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("QEMU storage daemon cleanup attempt failed")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+        if self._socket_path is not None:
+            with contextlib.suppress(OSError):
+                self._socket_path.unlink()
 
     async def __aenter__(self) -> Self:
         """Enter async context manager, starting the daemon."""

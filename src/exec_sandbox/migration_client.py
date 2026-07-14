@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.exceptions import MigrationTransientError
 from exec_sandbox.socket_auth import connect_and_verify
 
@@ -111,9 +112,13 @@ class MigrationClient:
                 self._connected = True
                 logger.debug("QMP connection established (migration)")
 
-            except (OSError, TimeoutError, json.JSONDecodeError) as e:
-                await self._cleanup()
-                raise MigrationTransientError(f"QMP connection failed: {e}") from e
+            except BaseException as error:  # Every failed handshake owns socket cleanup.
+                await self._cleanup_after_connect_failure()
+                if isinstance(error, asyncio.CancelledError | MigrationTransientError):
+                    raise
+                if isinstance(error, OSError | TimeoutError | json.JSONDecodeError):
+                    raise MigrationTransientError(f"QMP connection failed: {error}") from error
+                raise
 
     async def close(self) -> None:
         """Close the QMP connection."""
@@ -122,13 +127,20 @@ class MigrationClient:
 
     async def _cleanup(self) -> None:
         """Internal cleanup (must hold lock)."""
-        if self._writer is not None:
-            self._writer.close()
-            with contextlib.suppress(TimeoutError, OSError):
-                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
+        writer = self._writer
         self._reader = None
         self._writer = None
         self._connected = False
+        if writer is not None:
+            with contextlib.suppress(Exception):
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+
+    async def _cleanup_after_connect_failure(self) -> None:
+        """Finish handshake cleanup despite repeated caller cancellation."""
+        cleanup_task = asyncio.create_task(self._cleanup())
+        await await_settled(cleanup_task)
+        cleanup_task.result()
 
     async def _execute(
         self,

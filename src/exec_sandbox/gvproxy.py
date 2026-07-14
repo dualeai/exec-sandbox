@@ -6,6 +6,7 @@ the gvproxy-wrapper process that provides network connectivity with outbound fil
 
 import asyncio
 import json
+from collections.abc import Callable
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.assets import get_gvproxy_path
@@ -29,6 +30,7 @@ async def start_gvproxy(  # noqa: PLR0915
     workdir: VmWorkingDirectory,
     expose_ports: list[ExposedPort] | None = None,
     block_outbound: bool = False,
+    on_process_started: Callable[[ProcessWrapper, asyncio.Task[None] | None], None] | None = None,
 ) -> tuple[ProcessWrapper, asyncio.Task[None]]:
     r"""Start gvproxy-wrapper with outbound filtering for this VM.
 
@@ -161,10 +163,19 @@ async def start_gvproxy(  # noqa: PLR0915
             },
         )
 
+    started_proc: ProcessWrapper | None = None
+
+    def publish_process(proc: ProcessWrapper) -> None:
+        nonlocal started_proc
+        started_proc = proc
+        if on_process_started is not None:
+            on_process_started(proc, None)
+
     try:
         proc = await start_managed_process(
             gvproxy_args,
             pass_fds=(socket_fd,),
+            on_process_started=publish_process,
         )
     except (OSError, FileNotFoundError) as e:
         parent_sock.close()
@@ -177,6 +188,11 @@ async def start_gvproxy(  # noqa: PLR0915
                 "binary_path": str(gvproxy_binary),
             },
         ) from e
+    except BaseException:
+        parent_sock.close()
+        if started_proc is not None:
+            await cleanup_process(started_proc, "gvproxy", vm_id)
+        raise
 
     # Wait for gvproxy to be ready (virtualnetwork.New() must complete before QEMU connects)
     # gvproxy prints "Listening on QEMU socket" after initialization is complete
@@ -211,10 +227,16 @@ async def start_gvproxy(  # noqa: PLR0915
         )
     )
     gvproxy_log_task.add_done_callback(log_task_exception)
+    if on_process_started is not None:
+        on_process_started(proc, gvproxy_log_task)
 
     # Wait for gvproxy to signal readiness (timeout after 5 seconds)
     try:
         await asyncio.wait_for(ready_event.wait(), timeout=5.0)
+        # Grant qemu-vm user access to the socket only after gvproxy has adopted
+        # the inherited listener. The manager callback above already owns the
+        # process if this fallible await fails.
+        await grant_qemu_vm_access(socket_path)
     except TimeoutError:
         parent_sock.close()
         await cleanup_process(proc, "gvproxy", vm_id)
@@ -235,10 +257,6 @@ async def start_gvproxy(  # noqa: PLR0915
         # Close parent's copy of FD now that gvproxy is fully initialized
         # (child has its own via pass_fds, socket stays alive)
         parent_sock.close()
-
-    # Grant qemu-vm user access to socket via ACL (more secure than chmod 666)
-    # Only needed on Linux when qemu-vm user exists; skipped on macOS
-    await grant_qemu_vm_access(socket_path)
 
     logger.info(
         "gvproxy-wrapper started successfully",

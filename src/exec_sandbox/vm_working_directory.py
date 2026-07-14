@@ -13,12 +13,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_settled
 from exec_sandbox.permission_utils import sudo_rm
 
 if TYPE_CHECKING:
     from types import TracebackType
 
 logger = get_logger(__name__)
+
+_WORKDIR_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
 
 class VmWorkingDirectory:
@@ -55,8 +58,10 @@ class VmWorkingDirectory:
 
     __slots__ = (
         "_cleaned_up",
+        "_cleanup_task",
         "_custom_overlay_path",
         "_path",
+        "_retry_task",
         "_use_qemu_vm_user",
         "vm_id",
     )
@@ -80,6 +85,8 @@ class VmWorkingDirectory:
         self._path = path
         self._use_qemu_vm_user = use_qemu_vm_user
         self._cleaned_up = False
+        self._cleanup_task: asyncio.Task[bool] | None = None
+        self._retry_task: asyncio.Task[None] | None = None
         self._custom_overlay_path = custom_overlay_path
 
     @classmethod
@@ -98,10 +105,37 @@ class VmWorkingDirectory:
         """
         # Create directory in thread pool (blocking I/O)
         # mkdtemp creates with mode 0700 by default (secure)
-        path = await asyncio.to_thread(
-            tempfile.mkdtemp,
-            prefix=f"vm-{vm_id[:8]}-",  # Include truncated vm_id for debugging
+        creation_task = asyncio.create_task(
+            asyncio.to_thread(
+                tempfile.mkdtemp,
+                prefix=f"vm-{vm_id[:8]}-",  # Include truncated vm_id for debugging
+            )
         )
+        try:
+            path = await asyncio.shield(creation_task)
+        except asyncio.CancelledError:
+            # A worker thread cannot be cancelled. Wait for mkdtemp to either
+            # fail or publish its path, then remove any directory the caller
+            # can no longer receive.
+            await await_settled(creation_task)
+            if not creation_task.cancelled() and creation_task.exception() is None:
+                abandoned = cls(vm_id, Path(creation_task.result()), custom_overlay_path=custom_overlay_path)
+                cleanup_task = asyncio.create_task(abandoned.cleanup())
+                await await_settled(cleanup_task)
+                cleanup_confirmed = False
+                if not cleanup_task.cancelled():
+                    try:
+                        cleanup_confirmed = cleanup_task.result()
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean abandoned VM working directory",
+                            extra={"vm_id": vm_id, "path": str(abandoned.path)},
+                        )
+                if not cleanup_confirmed:
+                    abandoned._retain_cleanup()
+            elif not creation_task.cancelled():
+                creation_task.exception()
+            raise
 
         logger.debug(
             "Created VM working directory",
@@ -164,6 +198,62 @@ class VmWorkingDirectory:
         Returns:
             True if cleanup succeeded, False if errors occurred
         """
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup_once())
+        cleanup_task = self._cleanup_task
+        # The filesystem operation may be running in a worker thread. Do not
+        # detach it; establish its result before propagating cancellation.
+        cancellation = await await_settled(cleanup_task)
+
+        try:
+            cleaned = cleanup_task.result()
+        except Exception as error:  # noqa: BLE001 - preserve a retry owner for every failure
+            logger.error(
+                "VM working directory cleanup task failed",
+                extra={"vm_id": self.vm_id, "path": str(self._path)},
+                exc_info=error,
+            )
+            cleaned = False
+        if self._cleanup_task is cleanup_task:
+            self._cleanup_task = None
+
+        if cancellation is not None:
+            if not cleaned:
+                self._retain_cleanup()
+            raise asyncio.CancelledError
+        return cleaned
+
+    def _retain_cleanup(self) -> None:
+        """Give retry cleanup strong module ownership.
+
+        This module-level retry can coexist with VmManager's cleanup reaper
+        for the same directory (cancellation mid-destroy). That is safe:
+        cleanup() is single-flight via _cleanup_task, so concurrent owners
+        serialize on one removal attempt instead of racing rm -rf.
+        """
+        if self._retry_task is not None and not self._retry_task.done():
+            return
+        task = asyncio.create_task(_retry_workdir_cleanup(self))
+        self._retry_task = task
+        _WORKDIR_CLEANUP_TASKS.add(task)
+
+        def cleanup_done(completed: asyncio.Task[None]) -> None:
+            _WORKDIR_CLEANUP_TASKS.discard(completed)
+            if self._retry_task is completed:
+                self._retry_task = None
+            if completed.cancelled():
+                return
+            if error := completed.exception():
+                logger.error(
+                    "VM working directory cleanup task failed",
+                    extra={"vm_id": self.vm_id, "path": str(self.path)},
+                    exc_info=error,
+                )
+
+        task.add_done_callback(cleanup_done)
+
+    async def _cleanup_once(self) -> bool:
+        """Perform one retryable cleanup attempt."""
         if self._cleaned_up:
             logger.debug(
                 "VM working directory already cleaned up",
@@ -171,9 +261,8 @@ class VmWorkingDirectory:
             )
             return True
 
-        self._cleaned_up = True
-
         if not self._path.exists():
+            self._cleaned_up = True
             logger.debug(
                 "VM working directory already removed",
                 extra={"vm_id": self.vm_id, "path": str(self._path)},
@@ -194,8 +283,16 @@ class VmWorkingDirectory:
                     return False
             else:
                 # Normal cleanup via shutil.rmtree (async via thread pool)
-                await asyncio.to_thread(shutil.rmtree, self._path, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, self._path)
 
+            if self._path.exists():
+                logger.error(
+                    "VM working directory still exists after cleanup",
+                    extra={"vm_id": self.vm_id, "path": str(self._path)},
+                )
+                return False
+
+            self._cleaned_up = True
             logger.debug(
                 "VM working directory cleaned up",
                 extra={"vm_id": self.vm_id, "path": str(self._path)},
@@ -226,5 +323,31 @@ class VmWorkingDirectory:
         _exc_tb: TracebackType | None,
     ) -> bool:
         """Exit async context manager - cleanup directory."""
-        await self.cleanup()
+        if not await self.cleanup():
+            self._retain_cleanup()
         return False  # Don't suppress exceptions
+
+
+async def _retry_workdir_cleanup(workdir: VmWorkingDirectory) -> None:
+    """Retain a directory owner until removal is confirmed."""
+    delay = 0.05
+    while not await workdir.cleanup():
+        logger.error(
+            "Retrying abandoned VM working directory cleanup",
+            extra={"vm_id": workdir.vm_id, "path": str(workdir.path), "retry_delay_seconds": delay},
+        )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 5.0)
+
+
+async def drain_workdir_cleanup_tasks() -> None:
+    """Wait until every module-owned abandoned-directory retry is finished."""
+    while True:
+        tasks = tuple(task for task in _WORKDIR_CLEANUP_TASKS if not task.done())
+        if not tasks:
+            _WORKDIR_CLEANUP_TASKS.difference_update(task for task in _WORKDIR_CLEANUP_TASKS if task.done())
+            if not _WORKDIR_CLEANUP_TASKS:
+                return
+            await asyncio.sleep(0)
+            continue
+        await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))

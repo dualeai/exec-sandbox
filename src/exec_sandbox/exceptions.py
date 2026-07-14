@@ -19,11 +19,14 @@ Hierarchy:
     │   │   ├── VmConfigError          ← invalid configuration
     │   │   └── VmDependencyError      ← missing binary/image
     │   ├── PackageInstallPermanentError ← permanent package install failure
-    │   └── SessionClosedError         ← session already closed
+    │   ├── SessionClosedError         ← session already closed
+    │   └── OutputLimitError           ← stdout/stderr exceeded guest limits
     ├── InputValidationError (caller-bug marker base)
     │   ├── CodeValidationError       ← empty/null-byte code
     │   └── EnvVarValidationError     ← control chars, size limits
-    ├── OutputLimitError              ← stdout/stderr exceeded guest limits
+    ├── CommunicationOutcomeUnknownError ← transport lost after dispatch;
+    │                                     deliberately neither transient nor
+    │                                     permanent — reconcile before retry
     └── ... (other existing exceptions)
 
 Backward Compatibility:
@@ -100,6 +103,9 @@ class VmTransientError(TransientError):
 
     Base class for VM errors that are potentially recoverable,
     such as resource contention, CPU overload, or transient failures.
+    For execution, this class is raised only when the code provably never
+    ran (failure before dispatch); transport loss after dispatch raises
+    CommunicationOutcomeUnknownError instead.
     """
 
 
@@ -271,6 +277,16 @@ class CommunicationError(SandboxError):
 
     Raised when communication with the guest VM fails, including
     connection errors, protocol errors, or guest agent unavailability.
+    """
+
+
+class CommunicationOutcomeUnknownError(SandboxError):
+    """Communication failed after dispatch, so command outcome is unknown.
+
+    This deliberately is neither transient nor permanent: automatically
+    retrying may duplicate externally visible side effects, while treating it
+    as a caller/configuration error would also be false. Callers must decide
+    how to reconcile the unknown outcome.
     """
 
 

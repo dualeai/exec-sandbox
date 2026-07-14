@@ -16,6 +16,7 @@ import secrets
 import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -66,6 +67,86 @@ class TestQemuStorageDaemonUnit:
         daemon = QemuStorageDaemon()
         with pytest.raises(QemuStorageDaemonError, match="not started"):
             await daemon.create_overlay(Path("/fake/base.qcow2"), Path("/fake/out.qcow2"))
+
+    async def test_cancelled_exchange_drains_identified_response_before_next_command(self) -> None:
+        """Cancellation cannot shift the shared QMP response stream."""
+        daemon = QemuStorageDaemon()
+        first_read = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def readline() -> bytes:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_read.set()
+                await release_first.wait()
+                return b'{"return":{"command":1},"id":"qsd-1"}\n'
+            return b'{"return":{"command":2},"id":"qsd-2"}\n'
+
+        reader = MagicMock()
+        reader.readline = readline
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        daemon._reader = reader
+        daemon._writer = writer
+
+        first = asyncio.create_task(daemon._execute("first"))
+        await first_read.wait()
+        first.cancel()
+        await asyncio.sleep(0)
+        assert not first.done()
+
+        release_first.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        assert await daemon._execute("second") == {"command": 2}
+        sent = [json.loads(call.args[0]) for call in writer.write.call_args_list]
+        assert [message["id"] for message in sent] == ["qsd-1", "qsd-2"]
+
+    async def test_cleanup_owner_retries_until_process_death_is_confirmed(self) -> None:
+        daemon = QemuStorageDaemon()
+        daemon._process = MagicMock()
+        attempts = 0
+
+        async def cleanup(_self: QemuStorageDaemon) -> bool:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                daemon._process = None
+                return True
+            return False
+
+        with (
+            patch.object(QemuStorageDaemon, "_cleanup_process", side_effect=cleanup, autospec=True),
+            patch("exec_sandbox.qemu_storage_daemon.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            await daemon._ensure_cleanup_task()
+
+        assert attempts == 2
+        sleep.assert_awaited_once_with(1.0)
+
+    async def test_start_does_not_overwrite_retained_partial_process(self) -> None:
+        daemon = QemuStorageDaemon()
+        retained = MagicMock()
+        daemon._process = retained
+
+        with (
+            patch.object(
+                QemuStorageDaemon,
+                "stop",
+                new_callable=AsyncMock,
+                side_effect=QemuStorageDaemonError("cleanup pending"),
+            ) as stop,
+            patch("exec_sandbox.qemu_storage_daemon.start_managed_process", new_callable=AsyncMock) as spawn,
+        ):
+            with pytest.raises(QemuStorageDaemonError, match="cleanup pending"):
+                await daemon.start()
+
+        stop.assert_awaited_once_with()
+        spawn.assert_not_awaited()
+        assert daemon._process is retained
 
     async def test_stop_without_start_is_safe(self) -> None:
         """Stopping un-started daemon is a no-op (idempotent)."""

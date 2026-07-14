@@ -12,7 +12,7 @@ import os
 import shutil
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -315,6 +315,35 @@ class TestOverlayPoolStaleCleanup:
 
 class TestOverlayPoolErrorHandling:
     """Tests for error handling - mocks needed to simulate failures."""
+
+    async def test_cancelled_start_rolls_back_started_daemon(self, tmp_path: Path) -> None:
+        from exec_sandbox.overlay_pool import OverlayPool
+
+        pool = OverlayPool(pool_size=1, pool_dir=tmp_path / "pool")
+        daemon = MagicMock()
+        daemon.start = AsyncMock()
+        daemon.stop = AsyncMock()
+        daemon.started = True
+        creation_entered = asyncio.Event()
+
+        async def blocked_create(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            creation_entered.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch("exec_sandbox.overlay_pool.QemuStorageDaemon", return_value=daemon),
+            patch.object(pool, "_cleanup_stale_pool_dirs", return_value=0),
+            patch.object(pool, "_create_and_enqueue", side_effect=blocked_create),
+        ):
+            startup = asyncio.create_task(pool.start([Path("/tmp/base.qcow2")]))
+            await creation_entered.wait()
+            startup.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+
+        daemon.stop.assert_awaited_once_with()
+        assert pool._daemon is None
+        assert pool._started is False
 
     @pytest.fixture
     def mock_pool(self, tmp_path: Path) -> types.SimpleNamespace:

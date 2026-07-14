@@ -4,6 +4,7 @@ Tests the balloon memory control client without requiring actual VMs.
 Uses mocked QMP socket responses.
 """
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ class TestBalloonClientUnit:
 
     async def test_connect_capabilities_error(self, qmp_socket: Path, mock_connect_and_verify: Any) -> None:
         """Test connection failure when capabilities negotiation fails."""
-        _mock, reader, _writer = mock_connect_and_verify
+        _mock, reader, writer = mock_connect_and_verify
 
         greeting = b'{"QMP": {"version": {"qemu": {"micro": 0, "minor": 0, "major": 10}}}}\n'
         error_response = b'{"error": {"class": "CommandNotFound", "desc": "Unknown command"}}\n'
@@ -64,6 +65,50 @@ class TestBalloonClientUnit:
         client = BalloonClient(qmp_socket, expected_uid=1000)
         with pytest.raises(BalloonError, match="QMP capabilities failed"):
             await client.connect()
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_awaited_once()
+        assert client._writer is None
+
+    async def test_connect_cancellation_waits_for_handshake_cleanup(
+        self,
+        qmp_socket: Path,
+        mock_connect_and_verify: Any,
+    ) -> None:
+        """A failed __aenter__ cannot retain an open QMP writer."""
+        _mock, reader, writer = mock_connect_and_verify
+        greeting_entered = asyncio.Event()
+        close_entered = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def blocked_greeting() -> bytes:
+            greeting_entered.set()
+            await asyncio.Event().wait()
+            return b""
+
+        async def blocked_wait_closed() -> None:
+            close_entered.set()
+            await release_close.wait()
+
+        reader.readline = AsyncMock(side_effect=blocked_greeting)
+        writer.wait_closed = AsyncMock(side_effect=blocked_wait_closed)
+        client = BalloonClient(qmp_socket, expected_uid=1000)
+        connect = asyncio.create_task(client.connect())
+        await asyncio.wait_for(greeting_entered.wait(), timeout=1)
+        connect.cancel()
+        await asyncio.wait_for(close_entered.wait(), timeout=1)
+        connect.cancel()
+        await asyncio.sleep(0)
+        assert not connect.done()
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await connect
+
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_awaited_once()
+        assert client._reader is None
+        assert client._writer is None
+        assert client._connected is False
 
     async def test_query_balloon_returns_mb(self, qmp_socket: Path, mock_connect_and_verify: Any) -> None:
         """Test balloon query returns memory in MB."""
