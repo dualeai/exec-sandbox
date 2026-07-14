@@ -1195,6 +1195,46 @@ class _QemuCmdTestBase:
             await wd.cleanup()
 
 
+class TestQemuExecutableSelection(_QemuCmdTestBase):
+    """argv[0] honors a configured QEMU path, else falls back to the PATH basename."""
+
+    async def test_command_uses_configured_qemu_path(self, vm_settings, workdir, tmp_path: Path) -> None:
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        configured = tmp_path / "qemu-system-aarch64"
+        configured.write_bytes(b"")
+        settings = vm_settings.model_copy(update={"qemu_bin_arm": configured})
+        with _qemu_cmd_mocks(host_os=HostOS.MACOS, accel_type=AccelType.HVF):
+            cmd = await build_qemu_cmd(
+                settings=settings,
+                arch=HostArch.AARCH64,
+                vm_id="exact-qemu-executable",
+                workdir=workdir,
+                memory_mb=192,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert cmd[0] == str(configured)
+
+    async def test_command_falls_back_to_path_basename(self, vm_settings, workdir) -> None:
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        settings = vm_settings.model_copy(update={"qemu_bin_arm": Path("/missing/qemu-system-aarch64")})
+        with _qemu_cmd_mocks(host_os=HostOS.MACOS, accel_type=AccelType.HVF):
+            cmd = await build_qemu_cmd(
+                settings=settings,
+                arch=HostArch.AARCH64,
+                vm_id="exact-qemu-executable",
+                workdir=workdir,
+                memory_mb=192,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        assert cmd[0] == "qemu-system-aarch64"
+
+
 # ============================================================================
 # Unit Tests - cpuidle Governor Per Accel Type
 # ============================================================================
@@ -1820,6 +1860,57 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
     tsc=reliable (x86-only), -nodefaults (microvm-only),
     dump-guest-core=off (Linux-only).
     """
+
+    @pytest.mark.parametrize(
+        "host_os, accel_type, expected_object, expect_device_iothread",
+        [
+            pytest.param(
+                HostOS.MACOS,
+                AccelType.HVF,
+                "main-loop,id=main-loop0,thread-pool-min=0,thread-pool-max=8",
+                False,
+                id="macos-hvf-main-loop",
+            ),
+            pytest.param(
+                HostOS.LINUX,
+                AccelType.KVM,
+                "iothread,id=iothread0-test-vm-platform-io,thread-pool-min=0,thread-pool-max=8",
+                True,
+                id="linux-kvm-dedicated-iothread",
+            ),
+        ],
+    )
+    async def test_block_aio_context_is_platform_specific(
+        self,
+        vm_settings,
+        workdir,
+        host_os: HostOS,
+        accel_type: AccelType,
+        expected_object: str,
+        expect_device_iothread: bool,
+    ) -> None:
+        """macOS/HVF uses the capped main-loop pool; KVM retains IOThread."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks(host_os=host_os, accel_type=accel_type, io_uring=False):
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.AARCH64,
+                vm_id="test-vm-platform-io",
+                workdir=workdir,
+                memory_mb=256,
+                cpu_cores=1,
+                allow_network=False,
+            )
+
+        objects = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-object"]
+        devices = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-device"]
+        base_device = next(device for device in devices if "serial=base" in device)
+        base_drive = cmd[cmd.index("-drive") + 1]
+
+        assert expected_object in objects
+        assert ("iothread=" in base_device) == expect_device_iothread
+        assert "aio=threads" in base_drive
 
     @pytest.mark.parametrize(
         "qemu_sandbox, expect_sandbox",

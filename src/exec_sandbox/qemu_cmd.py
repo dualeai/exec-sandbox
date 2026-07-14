@@ -192,6 +192,12 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             parts.append("dump-guest-core=off")
         machine_type = ",".join(parts)
 
+    # Honor an explicitly configured QEMU path (e.g. CI build-from-source);
+    # otherwise the bare binary name is resolved from PATH by exec.
+    configured_qemu = settings.qemu_bin_arm if arch == HostArch.AARCH64 else settings.qemu_bin_x86
+    if configured_qemu.is_file():
+        qemu_bin = str(configured_qemu)
+
     # VM Templating: file-backed memory for COW sharing across VMs.
     # When mem_path is set, use memory-backend-file instead of anonymous RAM.
     # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED).
@@ -476,19 +482,24 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
 
     # IOThread — offloads block I/O completion (pread, qcow2 decompress) to a
-    # dedicated thread, separate from the vCPU thread. Safe and functional on
-    # all accelerators (KVM, HVF, TCG):
-    #   KVM:  ioeventfd enables zero-exit I/O kicks — clear performance win.
-    #   HVF:  no ioeventfd (no eventfd on macOS), so no cold-start benefit
-    #         (tested session 4: 9,798ms identical with/without). Bottleneck
-    #         is Mach kernel hv_trap (~360µs/exit), not QEMU I/O processing.
-    #   TCG:  software-emulated ioeventfd, moderate benefit (I/O off main loop).
+    # dedicated AioContext. Keep it for KVM/TCG, where ioeventfd or main-loop
+    # offload provides a measured benefit. On macOS/HVF there is no ioeventfd,
+    # prior cold-start testing found no benefit, and repeated post-boot read
+    # stalls localized to this disk path. Route HVF block I/O through the main
+    # loop instead. Keep the same aio=threads pool cap in both configurations so
+    # the platform conditional changes AioContext placement, not concurrency.
+    use_dedicated_iothread = not (is_macos and accel_type == AccelType.HVF)
     iothread_id = f"iothread0-{vm_id}"
     # Cap I/O thread pool to 8 (QEMU default is 64).  With single-queue
     # virtio-blk on qcow2, 8 is sufficient.  When aio=io_uring is active
     # the pool is unused (no-op).  When aio=threads, this caps peak threads
     # from ~72 to ~16, reducing per-VM thread count and stack memory.
-    qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=8"])
+    if use_dedicated_iothread:
+        qemu_args.extend(["-object", f"iothread,id={iothread_id},thread-pool-min=0,thread-pool-max=8"])
+        device_iothread = f",iothread={iothread_id}"
+    else:
+        qemu_args.extend(["-object", "main-loop,id=main-loop0,thread-pool-min=0,thread-pool-max=8"])
+        device_iothread = ""
 
     # Disk configuration (EROFS base drive, serial=base)
     # Uses qcow2 overlay backed by the EROFS base image
@@ -527,7 +538,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     qemu_args.extend(
         [
             "-device",
-            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base,iothread={iothread_id},num-queues=1,queue-size={qs},event_idx=off",
+            f"virtio-blk-{virtio_suffix},drive=hd0,serial=base{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
         ]
     )
 
@@ -554,7 +565,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         qemu_args.extend(
             [
                 "-device",
-                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap,iothread={iothread_id},num-queues=1,queue-size={qs},event_idx=off",
+                f"virtio-blk-{virtio_suffix},drive=hd1,serial=snap{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
             ]
         )
 
