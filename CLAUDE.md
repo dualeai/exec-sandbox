@@ -2,6 +2,17 @@
 
 See @README for project overview and @Makefile for available commands for this project.
 
+## Writing — Orwell’s six rules
+
+For prose—not code, identifiers, commands, exact quotations, or error text—follow George Orwell’s rules from “Politics and the English Language”:
+
+1. Avoid stock metaphors, similes, and other figures of speech.
+2. Prefer a short, familiar word when it is equally precise.
+3. Cut every word that adds no meaning.
+4. Prefer active voice when it is clearer.
+5. Prefer everyday English to foreign phrases, needless scientific terms, or jargon; keep exact technical terms when precision requires them.
+6. Break any rule before making the prose unclear, inaccurate, unsafe, or unnatural.
+
 ## Code search — use `seek`
 
 Prefer `seek` over grep/ripgrep for code search. It returns BM25-ranked results with context and symbol tags.
