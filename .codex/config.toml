@@ -1,0 +1,8 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+model_reasoning_effort = "max"
+plan_mode_reasoning_effort = "max"
+project_doc_fallback_filenames = ["CLAUDE.md"]
+sandbox_mode = "danger-full-access"
