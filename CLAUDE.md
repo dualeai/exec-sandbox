@@ -2,6 +2,8 @@
 
 See @README for project overview and @Makefile for available commands for this project.
 
+Always use ASD-STE100 Simplified Technical English in responses to the user.
+
 ## Writing — Orwell’s six rules
 
 For prose—not code, identifiers, commands, exact quotations, or error text—follow George Orwell’s rules from “Politics and the English Language”:
