@@ -1,54 +1,59 @@
-# RunsOn runner profiles — diversify EC2 instance families for faster spot allocation.
-# Docs: https://runs-on.com/configuration/runner-profiles/
+# RunsOn runner profiles — diversify eligible EC2 capacity.
+# Docs: https://runs-on.com/docs/runners/labels/
+#       https://runs-on.com/docs/runners/custom/
 #
-# RAM range: cpu×2 to cpu×4 (1:2–1:4 ratio). AWS Fleet picks lowest spot price
-# within that band. Without a floor, Fleet picks t4g.nano (0.5GB) and OOMs.
-# r-series (1:8) excluded — never matches the 1:4 ceiling.
+# Family entries are prefixes: c9 admits c9g, c9gd, and other matching variants.
+# The image selects the architecture; CPU, RAM, regional offerings, and capacity
+# further constrain selection. Listing a generation does not force its use.
+#
+# The 2–4 GiB per vCPU band avoids tiny burstable instances and excludes R-series
+# shapes at these CPU counts. Job labels can override profile defaults.
+# Family-list order does not prioritize newer generations.
 
 runners:
   # ARM64 (Graviton) — compute + general-purpose + burstable
   1cpu-linux-arm64: &arm64
     cpu: 1
-    ram: [ 2, 4 ]
+    ram: [2, 4]
     image: ubuntu24-full-arm64
-    family: [ "c7g", "m7g", "r7g", "c8g", "m8g", "t4g" ]
+    family: ["c7", "m7", "r7", "c8", "m8", "t4g", "c9", "m9", "r9"]
 
   2cpu-linux-arm64:
     <<: *arm64
     cpu: 2
-    ram: [ 4, 8 ]
+    ram: [4, 8]
 
   4cpu-linux-arm64:
     <<: *arm64
     cpu: 4
-    ram: [ 8, 16 ]
+    ram: [8, 16]
 
   8cpu-linux-arm64:
     <<: *arm64
     cpu: 8
-    ram: [ 16, 32 ]
+    ram: [16, 32]
 
   # x64 — Intel + AMD
-  # Note: nested-virt (KVM) only works on c8i, m8i, r8i (Intel Xeon 6).
-  # RunsOn intersects this list with nested-virt-capable families at runtime,
-  # so jobs with /nested-virt effectively use {c8i, m8i, r8i} only.
+  # /nested-virt further restricts selection to supported x64 instance types;
+  # the profile's CPU/RAM filters still apply.
+  # https://runs-on.com/docs/runners/capabilities/nested-virtualization/
   1cpu-linux-x64: &x64
     cpu: 1
-    ram: [ 2, 4 ]
+    ram: [2, 4]
     image: ubuntu24-full-x64
-    family: [ "c7i", "m7i", "r7i", "c7a", "m7a", "c8i", "m8i", "r8i", "c8a", "m8a" ]
+    family: ["c7", "m7", "r7", "c8", "m8", "r8", "c9", "m9", "r9"]
 
   2cpu-linux-x64:
     <<: *x64
     cpu: 2
-    ram: [ 4, 8 ]
+    ram: [4, 8]
 
   4cpu-linux-x64:
     <<: *x64
     cpu: 4
-    ram: [ 8, 16 ]
+    ram: [8, 16]
 
   8cpu-linux-x64:
     <<: *x64
     cpu: 8
-    ram: [ 16, 32 ]
+    ram: [16, 32]
