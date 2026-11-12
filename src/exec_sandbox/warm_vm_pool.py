@@ -215,7 +215,8 @@ class WarmVMPool:
         # 15ms boot stagger below gives the kernel time to complete the I/O.
         if self.memory_snapshot_manager:
             for language in Language:
-                vmstate = await self.memory_snapshot_manager.check_cache(language, [], constants.DEFAULT_MEMORY_MB)
+                key = await self.memory_snapshot_manager.compute_cache_key(self.spec_for(language), l2_path=None)
+                vmstate = await self.memory_snapshot_manager.check_cache(key)
                 if vmstate:
                     advise_willneed(vmstate)
 
@@ -290,28 +291,27 @@ class WarmVMPool:
             },
         )
 
-    async def get_vm(
-        self,
-        language: Language,
-        packages: list[str],
-    ) -> QemuVM | None:
+    def spec_for(self, language: Language) -> VmSpec:
+        """The one VM shape this pool holds for a language: VmSpec defaults
+        (no packages, no network)."""
+        return VmSpec(language=language)
+
+    async def get_vm(self, spec: VmSpec) -> QemuVM | None:
         """Get warm VM if eligible (no wait for availability).
 
-        Eligibility: packages=[] (default image only)
+        Eligibility: the request's spec equals the pool's spec for its language.
         Graceful degradation: Pool empty → return None (cold boot fallback)
 
         Side-effect: Triggers background replenishment
 
         Args:
-            language: Programming language enum
-            packages: Package list (must be empty for warm pool)
+            spec: Creation settings of the requested VM
 
         Returns:
             Warm VM if available, None otherwise
         """
-        # Only serve default-image executions
-        if packages:
-            logger.debug("Warm pool ineligible (custom packages)", extra={"language": language.value})
+        if spec != self.spec_for(spec.language):
+            logger.debug("Warm pool ineligible (spec differs from pool)", extra={"language": spec.language.value})
             return None
 
         vm: QemuVM | None = None
@@ -320,23 +320,23 @@ class WarmVMPool:
             # Skip VMs whose QEMU died while pooled: the process-exit watcher
             # flips state to DESTROYING, and L1-restored VMs (no watcher)
             # expose death via process.returncode. Handing one out fails the
-            # caller (VmPermanentError from the execute state gate, or a
+            # caller (InternalError from the execute state gate, or a
             # connect failure for the returncode-only case) instead of
             # cold-boot fallback; the health check only evicts every 15s.
             while True:
-                vm = self.pools[language].get_nowait()
+                vm = self.pools[spec.language].get_nowait()
                 if vm.state is VmState.READY and vm.process.returncode is None:
                     break
                 logger.warning(
                     "Discarding dead warm VM at checkout",
                     extra={
-                        "language": language.value,
+                        "language": spec.language.value,
                         "vm_id": vm.vm_id,
                         "vm_state": vm.state.value,
                         "returncode": vm.process.returncode,
                     },
                 )
-                self._schedule_replenishment(language)
+                self._schedule_replenishment(spec.language)
                 dead_vm = vm
                 vm = None
                 try:
@@ -344,33 +344,28 @@ class WarmVMPool:
                 except Exception:
                     logger.exception(
                         "Failed to destroy dead warm VM at checkout",
-                        extra={"language": language.value, "vm_id": dead_vm.vm_id},
+                        extra={"language": spec.language.value, "vm_id": dead_vm.vm_id},
                     )
-
-            # Deflate balloon to restore memory before code execution.
-            # Skip for L1-restored VMs: no balloon device (COW file-backed memory).
-            if not vm.l1_restored:
-                await self._deflate_balloon(vm)
 
             logger.debug(
                 "Warm VM allocated",
                 extra={
                     "debug_category": "lifecycle",
-                    "language": language.value,
+                    "language": spec.language.value,
                     "vm_id": vm.vm_id,
-                    "pool_remaining": self.pools[language].qsize(),
+                    "pool_remaining": self.pools[spec.language].qsize(),
                 },
             )
 
             # Trigger background replenishment (fire-and-forget)
-            self._schedule_replenishment(language)
+            self._schedule_replenishment(spec.language)
 
             return vm
 
         except asyncio.QueueEmpty:
             logger.warning(
                 "Warm pool exhausted (cold boot fallback)",
-                extra={"language": language.value, "pool_size": self.pool_size_per_language},
+                extra={"language": spec.language.value, "pool_size": self.pool_size_per_language},
             )
             return None
 
@@ -380,13 +375,13 @@ class WarmVMPool:
             # than leaving a live, unreachable owner outside both pool and caller.
             if vm is None:
                 raise
-            self._schedule_replenishment(language)
+            self._schedule_replenishment(spec.language)
             try:
                 await self.vm_manager.destroy_vm(vm)
             except BaseException:
                 logger.exception(
                     "Failed to destroy warm VM after interrupted checkout",
-                    extra={"language": language.value, "vm_id": vm.vm_id},
+                    extra={"language": spec.language.value, "vm_id": vm.vm_id},
                 )
             raise
 
@@ -564,27 +559,14 @@ class WarmVMPool:
                 # Pre-warm REPL at full memory (hides ~10s Python/Bun startup on HVF).
                 await self._warm_repl(vm, language)
 
-                # index=0 only: save L1 for future restores (one-time sacrificial save)
+                # index=0 only: make the L1 entry for future restores and refills.
+                # A background save boots its own VM and saves a template (RAM
+                # shared copy-on-write by every restore); it is a no-op when the
+                # entry exists, and dedups with the scheduler's saves of the key.
                 if self.memory_snapshot_manager and index == 0:
-                    l1_hit = await self.memory_snapshot_manager.check_cache(
-                        language,
-                        [],
-                        constants.DEFAULT_MEMORY_MB,
-                    )
-                    if not l1_hit:
-                        saved = await self.memory_snapshot_manager.save_snapshot(
-                            vm,
-                            language,
-                            [],
-                            constants.DEFAULT_MEMORY_MB,
-                        )
-                        if saved:
-                            # VM is dead after save — boot replacement (now from L1 cache)
-                            with contextlib.suppress(Exception):
-                                await self.vm_manager.destroy_vm(vm)
-                            vm = await self._boot_warm_vm(language, index)
-                            if not vm.l1_restored:
-                                await self._warm_repl(vm, language)
+                    spec = self.spec_for(language)
+                    key = await self.memory_snapshot_manager.compute_cache_key(spec, l2_path=None)
+                    await self.memory_snapshot_manager.schedule_background_save(spec, key=key, snapshot_drive=None)
 
             await self._prepare_and_enqueue_vm(vm, language, repl_is_ready=True)
             logger.info(
@@ -631,38 +613,27 @@ class WarmVMPool:
         """
         tenant_id = constants.WARM_POOL_TENANT_ID
         task_id = f"warm-{language.value}-{index}"
+        spec = self.spec_for(language)
 
-        async with self.vm_manager.reservation_context(
-            vm_id=f"{tenant_id}-{task_id}",
-            memory_mb=constants.DEFAULT_MEMORY_MB,
-        ) as reservation:
-            # Try L1 restore first (REPL already warm — skip _warm_repl)
+        async with self.vm_manager.reservation_context(spec, vm_id=f"{tenant_id}-{task_id}") as reservation:
+            # Try L1 restore first (REPL already warm — skip _warm_repl).
+            # The pool's spec has no packages: no L2 layer.
             if self.memory_snapshot_manager:
-                try:
-                    vmstate = await self.memory_snapshot_manager.check_cache(
-                        language,
-                        [],
-                        constants.DEFAULT_MEMORY_MB,
+                vm = await self.memory_snapshot_manager.restore(
+                    spec,
+                    key=await self.memory_snapshot_manager.compute_cache_key(spec, l2_path=None),
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    snapshot_drive=None,
+                    expose_ports=None,
+                    reservation=reservation,
+                )
+                if vm is not None:
+                    logger.debug(
+                        "L1 cache hit for warm pool VM",
+                        extra={"language": language.value, "vm_id": vm.vm_id},
                     )
-                    if vmstate:
-                        vm = await self.vm_manager.restore_vm(
-                            language,
-                            tenant_id,
-                            task_id,
-                            vmstate_path=vmstate,
-                            memory_mb=constants.DEFAULT_MEMORY_MB,
-                            reservation=reservation,
-                        )
-                        logger.debug(
-                            "L1 cache hit for warm pool VM",
-                            extra={"language": language.value, "vm_id": vm.vm_id},
-                        )
-                        return vm
-                except VmTransientError as e:
-                    logger.warning(
-                        "L1 restore failed for warm pool, falling back to cold boot",
-                        extra={"language": language.value, "error": str(e)},
-                    )
+                    return vm
 
             # Fall back to L2/cold boot
             snapshot_path = None
@@ -684,12 +655,9 @@ class WarmVMPool:
                     )
 
             return await self.vm_manager.create_vm(
-                language=language,
+                spec,
                 tenant_id=tenant_id,
                 task_id=task_id,
-                memory_mb=constants.DEFAULT_MEMORY_MB,
-                allow_network=False,
-                allowed_domains=None,
                 snapshot_drive=snapshot_path,
                 reservation=reservation,
                 retry_profile=constants.RETRY_BACKGROUND,

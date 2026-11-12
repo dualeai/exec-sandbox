@@ -19,20 +19,62 @@ from exec_sandbox.permission_utils import (
     chown_async,
     chown_to_qemu_vm,
     ensure_traversable,
-    get_acl,
     get_mode,
-    get_owner,
     get_qemu_vm_uid,
     grant_qemu_vm_access,
     grant_qemu_vm_file_access,
+    private_tree_problem,
     probe_qemu_vm_user,
     probe_sudo_as_qemu_vm,
-    remove_acl_user,
     set_acl_user,
     sudo_rm,
-    verify_user_access,
 )
 from tests.conftest import skip_unless_linux, skip_unless_macos
+
+
+def read_acl(path: Path) -> dict[str, str]:
+    """ACL entries of a file from getfacl, e.g. {'user::': 'rw-', 'user:qemu-vm': 'rw-'}."""
+    out = subprocess.run(["getfacl", "-p", str(path)], capture_output=True, text=True, check=True).stdout
+    entries = [line.split(":") for line in out.splitlines() if line and not line.startswith("#")]
+    return {f"{kind}:{name}" if name else f"{kind}::": perms for kind, name, perms, *_ in entries}
+
+
+class TestPrivateTreeProblem:
+    """The folder above a private one: root or this user, no group or other write unless sticky."""
+
+    @staticmethod
+    def _problem(root: Path) -> tuple[str, str] | None:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            return private_tree_problem(root, fd, forbidden=0o077)
+        finally:
+            os.close(fd)
+
+    def test_private_folder_passes(self, tmp_path: Path) -> None:
+        root = tmp_path / "root"
+        root.mkdir(mode=0o700)
+        assert self._problem(root) is None
+
+    def test_parent_of_another_user_is_refused(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Its owner can put another folder in place of the root. A stat stands in for the
+        other user's folder (making one needs root)."""
+        root = tmp_path / "root"
+        root.mkdir(mode=0o700)
+        parent, other = root.resolve().parent, os.geteuid() + 1
+        lstat = Path.lstat
+
+        def lstat_as_other(path: Path) -> os.stat_result:
+            st = lstat(path)
+            if path != parent:
+                return st
+            return os.stat_result(
+                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, other, st.st_gid, st.st_size, 0, 0, 0)
+            )
+
+        monkeypatch.setattr(Path, "lstat", lstat_as_other)
+        problem = self._problem(root)
+        assert problem is not None
+        assert f"is in {parent} (uid {other}," in problem[0]
 
 
 class TestGetQemuVmUid:

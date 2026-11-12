@@ -191,23 +191,19 @@ class TestPythonPayloadIntegrity:
 
         # Pre-compute expected
         expected_data = generate_ascii_pattern(size_bytes)
-        expected_hash = bytes_hash(expected_data)
+        expected_hash = hashlib.sha256(expected_data).hexdigest()
 
         # Generate code
         code = python_code_for_ascii_pattern(size_bytes)
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=TIMEOUT_SECONDS,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=TIMEOUT_SECONDS)
 
         assert result.exit_code == 0, f"[{size_name}] Execution failed: {result.stderr}"
 
         # Strip trailing newline (runtime may add one)
         stdout = result.stdout.rstrip("\n")
         actual_data = stdout.encode("utf-8")
-        actual_hash = bytes_hash(actual_data)
+        actual_hash = hashlib.sha256(actual_data).hexdigest()
 
         assert len(actual_data) == size_bytes, f"[{size_name}] Size mismatch: {len(actual_data)} vs {size_bytes}"
 
@@ -231,18 +227,15 @@ class TestPythonStreamingIntegrity:
         def on_stdout(chunk: str) -> None:
             streamed_chunks.append(chunk)
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=TIMEOUT_SECONDS,
-            on_stdout=on_stdout,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=TIMEOUT_SECONDS, on_stdout=on_stdout
         )
 
         assert result.exit_code == 0
 
         # Verify streamed data (strip trailing newline)
         streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
-        streamed_hash = bytes_hash(streamed_data)
+        streamed_hash = hashlib.sha256(streamed_data).hexdigest()
 
         assert len(streamed_data) == size_bytes, f"[{size_name}] Streamed size: {len(streamed_data)} vs {size_bytes}"
 
@@ -267,20 +260,16 @@ class TestJavaScriptPayloadIntegrity:
         """Verify JavaScript payload integrity."""
         size_name, size_bytes = small_payload_size
 
-        expected_hash = bytes_hash(generate_ascii_pattern(size_bytes))
+        expected_hash = hashlib.sha256(generate_ascii_pattern(size_bytes)).hexdigest()
         code = javascript_code_for_ascii_pattern(size_bytes)
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-            timeout_seconds=TIMEOUT_SECONDS,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code, timeout_seconds=TIMEOUT_SECONDS)
 
         assert result.exit_code == 0, f"[JS-{size_name}] Execution failed: {result.stderr}"
 
         # Strip trailing newline (runtime may add one)
         stdout = result.stdout.rstrip("\n")
-        actual_hash = bytes_hash(stdout.encode("utf-8"))
+        actual_hash = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
 
         assert len(stdout) == size_bytes, f"[JS-{size_name}] Size: {len(stdout)} vs {size_bytes}"
 
@@ -313,18 +302,14 @@ sys.stdout.write(encoded)
 sys.stdout.flush()
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=TIMEOUT_SECONDS,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=TIMEOUT_SECONDS)
 
         assert result.exit_code == 0
 
         import base64
 
         actual_binary = base64.b64decode(result.stdout)
-        actual_hash = bytes_hash(actual_binary)
+        actual_hash = hashlib.sha256(actual_binary).hexdigest()
 
         assert len(actual_binary) == size_bytes, f"[Binary-{size_name}] Size: {len(actual_binary)} vs {size_bytes}"
 
@@ -361,11 +346,7 @@ sys.stdout.write(data)
 sys.stdout.flush()
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=TIMEOUT_SECONDS,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=TIMEOUT_SECONDS)
 
         assert result.exit_code == 0
 
@@ -406,21 +387,18 @@ class TestRawPayloadIntegrity:
     async def test_raw_repeated_char(self, scheduler: Scheduler, repeat_char: str, count: int) -> None:
         """Verify RAW shell can output repeated characters correctly."""
         expected_data = (repeat_char * count).encode("utf-8")
-        expected_hash = bytes_hash(expected_data)
+        expected_hash = hashlib.sha256(expected_data).hexdigest()
 
         # Use head -c for exact byte count
         code = f"yes '{repeat_char}' | tr -d '\\n' | head -c {count}"
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
 
         assert result.exit_code == 0
 
         # Strip trailing newline (shell may add one)
         stdout = result.stdout.rstrip("\n")
-        actual_hash = bytes_hash(stdout.encode("utf-8"))
+        actual_hash = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
 
         assert len(stdout) == count, f"[RAW-{count}] Size: {len(stdout)} vs {count}"
 
@@ -486,11 +464,7 @@ class TestStreamingThroughput:
             nonlocal streamed_bytes
             streamed_bytes += len(chunk.encode("utf-8"))
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.RAW,
-            on_stdout=on_stdout,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), code, on_stdout=on_stdout)
 
         # Use execute_ms (host-measured execution phase) — excludes VM
         # preparation (warm pool lookup, L1 restore, cold boot) which is
@@ -516,11 +490,7 @@ class TestStreamingThroughput:
             nonlocal streamed_bytes
             streamed_bytes += len(chunk)
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.RAW,
-            on_stdout=on_stdout,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), code, on_stdout=on_stdout)
 
         # Use execute_ms (host-measured execution phase) — excludes VM
         # preparation (warm pool lookup, L1 restore, cold boot) which is
@@ -559,17 +529,14 @@ class TestStreamingStress:
 
                 return on_stdout
 
-            result = await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=30,
-                on_stdout=make_callback(chunks),
+            result = await run_once(
+                scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30, on_stdout=make_callback(chunks)
             )
 
             assert result.exit_code == 0, f"Iteration {i} failed: {result.stderr}"
 
             streamed_data = "".join(chunks).rstrip("\n").encode("utf-8")
-            actual_hash = bytes_hash(streamed_data)
+            actual_hash = hashlib.sha256(streamed_data).hexdigest()
 
             assert actual_hash == expected_hash, f"Iteration {i} corrupted!"
 
@@ -594,11 +561,8 @@ for i in range(1000):
         def on_stderr(chunk: str) -> None:
             stderr_chunks.append(chunk)
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=on_stdout,
-            on_stderr=on_stderr,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=on_stdout, on_stderr=on_stderr
         )
 
         assert result.exit_code == 0, f"Interleave test failed: {result.stderr}"

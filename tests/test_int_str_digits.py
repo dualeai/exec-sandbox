@@ -26,9 +26,8 @@ class TestIntStrDigitsNormal:
 
     async def test_limit_is_disabled(self, scheduler: Scheduler) -> None:
         """PYTHONINTMAXSTRDIGITS=0 is set (0 means unlimited)."""
-        result = await scheduler.run(
-            code="import sys; print(sys.get_int_max_str_digits())",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), "import sys; print(sys.get_int_max_str_digits())"
         )
 
         assert result.exit_code == 0
@@ -36,20 +35,14 @@ class TestIntStrDigitsNormal:
 
     async def test_int_to_str_5000_digits(self, scheduler: Scheduler) -> None:
         """Convert a 5000-digit integer to string (above default 4300 limit)."""
-        result = await scheduler.run(
-            code="print(len(str(10**4999)))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(len(str(10**4999)))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "5000"
 
     async def test_str_to_int_5000_digits(self, scheduler: Scheduler) -> None:
         """Convert a 5000-digit string to integer (above default 4300 limit)."""
-        result = await scheduler.run(
-            code="x = int('9' * 5000); print(len(str(x)))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "x = int('9' * 5000); print(len(str(x)))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "5000"
@@ -66,11 +59,7 @@ def fib(n):
 result = str(fib(100000))
 print(len(result))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=30,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         assert result.exit_code == 0
         # fib(100000) has 20899 digits
@@ -86,20 +75,14 @@ class TestIntStrDigitsEdgeCases:
 
     async def test_exactly_4300_digits(self, scheduler: Scheduler) -> None:
         """Exactly 4300 digits — would be the max under default limit."""
-        result = await scheduler.run(
-            code="x = int('9' * 4300); print(len(str(x)))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "x = int('9' * 4300); print(len(str(x)))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "4300"
 
     async def test_4301_digits(self, scheduler: Scheduler) -> None:
         """4301 digits — first value that breaks under the default limit."""
-        result = await scheduler.run(
-            code="x = int('9' * 4301); print(len(str(x)))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "x = int('9' * 4301); print(len(str(x)))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "4301"
@@ -112,10 +95,7 @@ print(len(hex(x)))
 print(len(bin(x)))
 print(len(oct(x)))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         lines = result.stdout.strip().splitlines()
@@ -131,11 +111,7 @@ y = x * x
 z = y + x
 print("OK", len(str(z)))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=30,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         assert result.exit_code == 0
         assert "OK" in result.stdout
@@ -154,40 +130,28 @@ original = '9' * 10000
 result = str(int(original))
 print(result == original)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "True" in result.stdout
 
     async def test_repr_large_int(self, scheduler: Scheduler) -> None:
         """repr() goes through the same int->str path."""
-        result = await scheduler.run(
-            code="print(len(repr(10**5000)))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(len(repr(10**5000)))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "5001"
 
     async def test_fstring_large_int(self, scheduler: Scheduler) -> None:
         """f-string formatting triggers int->str conversion."""
-        result = await scheduler.run(
-            code="x = 10**5000; print(len(f'{x}'))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "x = 10**5000; print(len(f'{x}'))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "5001"
 
     async def test_format_large_int(self, scheduler: Scheduler) -> None:
         """format() with decimal spec triggers int->str conversion."""
-        result = await scheduler.run(
-            code="x = 10**5000; print(len(format(x, 'd')))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "x = 10**5000; print(len(format(x, 'd')))")
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "5001"
@@ -201,10 +165,7 @@ print(s[-2:])
 print(s[0])
 print(len(s))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         lines = result.stdout.strip().splitlines()
@@ -227,10 +188,7 @@ x = 10**99999
 s = str(x)
 print(len(s))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "100000"
@@ -273,10 +231,7 @@ try:
 except ValueError:
     print("VALUE_ERROR")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "VALUE_ERROR" in result.stdout

@@ -51,31 +51,6 @@ def _get_major_minor_version() -> str:
 # ============================================================================
 
 
-@pytest.fixture
-def fake_aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set fake AWS credentials required by moto/boto3."""
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-
-
-@pytest.fixture
-def moto_s3_server(fake_aws_env):
-    """Start a moto S3 server, create the default bucket, and yield (endpoint_url, sync_client).
-
-    Server is stopped on teardown.
-    """
-    server = ThreadedMotoServer(port=0)
-    server.start()
-    endpoint_url = f"http://localhost:{server._server.server_port}"
-    s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
-    s3_sync.create_bucket(Bucket="test-snapshots")
-    yield endpoint_url, s3_sync
-    server.stop()
-
-
 # ============================================================================
 # Unit Tests - Cache Key Computation
 # ============================================================================

@@ -58,10 +58,11 @@ from exec_sandbox.guest_channel import (
     StreamResult,
     consume_stream,
 )
-from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, TimingBreakdown
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
 from exec_sandbox.platform_utils import detect_host_os
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
 from exec_sandbox.system_probes import detect_accel_type
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, VmState
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
@@ -219,12 +220,15 @@ class QemuVM:
     def __init__(
         self,
         vm_id: str,
+        *,
         process: "ProcessWrapper",
         cgroup_path: Path | None,
         workdir: VmWorkingDirectory,
         channel: GuestChannel,
-        language: Language,
+        spec: VmSpec,
         console_lines: deque[str],
+        base_image: Path,
+        packages_image: Path | None,
         gvproxy_proc: "ProcessWrapper | None" = None,
         qemu_log_task: asyncio.Task[None] | None = None,
         gvproxy_log_task: asyncio.Task[None] | None = None,
@@ -250,8 +254,10 @@ class QemuVM:
         self.cgroup_path = cgroup_path
         self.workdir = workdir
         self.channel = channel
-        self.language = language
+        self.spec = spec
         self.console_lines = console_lines
+        self.base_image = base_image
+        self.packages_image = packages_image
         self.gvproxy_proc = gvproxy_proc
         self.qemu_log_task = qemu_log_task
         self.gvproxy_log_task = gvproxy_log_task
@@ -562,7 +568,7 @@ class QemuVM:
 
         try:
             request = ExecuteCodeRequest(
-                language=self.language,
+                language=self.spec.language,
                 code=code,
                 timeout=timeout_seconds,
                 env_vars=env_vars or {},
@@ -691,7 +697,7 @@ class QemuVM:
                 external_cpu_time_ms=external_cpu_ms or None,  # Host-measured
                 external_memory_peak_mb=external_mem_mb or None,  # Host-measured
                 external_cpu_nr_throttled=external_nr_throttled,  # Host-measured
-                timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=0, total_ms=0, connect_ms=connect_ms),
+                timing=TimingBreakdown(execute_ms=0, connect_ms=connect_ms),
                 spawn_ms=result.spawn_ms,  # Guest-reported granular timing
                 process_ms=result.process_ms,  # Guest-reported granular timing
             )
@@ -710,7 +716,7 @@ class QemuVM:
         except asyncio.CancelledError:
             logger.warning(
                 "Code execution cancelled",
-                extra={"vm_id": self.vm_id, "language": self.language},
+                extra={"vm_id": self.vm_id, "language": self.spec.language},
             )
             # Re-raise to propagate cancellation
             raise

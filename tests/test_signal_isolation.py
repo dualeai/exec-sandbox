@@ -20,6 +20,8 @@ References:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -43,7 +45,7 @@ os.kill(os.getpid(), signal.SIGUSR1)
 print(f"RECEIVED:{len(received)}")
 print(f"SIGNUM:{received[0]}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "RECEIVED:1" in result.stdout
         # SIGUSR1 = 10 on Linux (guest), regardless of host platform
@@ -64,7 +66,7 @@ signal.signal(signal.SIGTERM, handler)
 os.kill(os.getpid(), signal.SIGTERM)
 print(f"CAUGHT:{caught}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "CAUGHT:True" in result.stdout
 
@@ -88,7 +90,7 @@ else:
     else:
         print(f"CHILD_EXIT:{os.WEXITSTATUS(status)}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "CHILD_KILLED:signal=9" in result.stdout
 
@@ -101,7 +103,7 @@ print(f"MY_PGID:{my_pgid}")
 print(f"MY_PID:{os.getpid()}")
 print(f"PGID_NOT_1:{my_pgid != 1}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "PGID_NOT_1:True" in result.stdout
 
@@ -117,7 +119,7 @@ except ProcessLookupError:
 except PermissionError:
     print("NO_PERM")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "EXISTS" in result.stdout
 
@@ -138,7 +140,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -152,7 +154,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -166,7 +168,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -180,7 +182,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -194,7 +196,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -226,7 +228,7 @@ print(f"ALLOWED:{sorted(allowed)}")
 if unexpected:
     print(f"UNEXPECTED:{unexpected}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # 30 blocked (all except SIGCONT)
         assert "BLOCKED:30" in result.stdout
@@ -252,17 +254,14 @@ print(f"RT_BLOCKED:{blocked}")
 if unexpected:
     print(f"RT_UNEXPECTED:{unexpected}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "RT_BLOCKED:5" in result.stdout
         assert "RT_UNEXPECTED:" not in result.stdout
 
     async def test_shell_kill_pid1_blocked(self, scheduler: Scheduler) -> None:
         """`kill -9 1` from bash fails with permission error."""
-        result = await scheduler.run(
-            code="kill -9 1 2>&1; echo exit=$?",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "kill -9 1 2>&1; echo exit=$?")
         assert result.exit_code == 0
         assert "exit=1" in result.stdout or "ermission" in result.stdout or "not permitted" in result.stdout
 
@@ -280,7 +279,7 @@ class TestSignalBypassAttempts:
         (same_thread_group check) from kill(-1). So on a minimal VM, this is
         essentially a no-op. The key assertion is that PID 1 survives.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # kill(-1, SIGKILL) excludes PID 1 and the calling process itself
             r1 = await session.exec("""\
 import os, signal
@@ -314,7 +313,7 @@ signal.signal(signal.SIGTERM, handler)
 os.kill(0, signal.SIGTERM)
 print(f"CAUGHT_OWN:{caught}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "CAUGHT_OWN:True" in result.stdout
 
@@ -330,7 +329,7 @@ except PermissionError:
 except ProcessLookupError:
     print("blocked:ESRCH")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked:" in result.stdout
 
@@ -346,7 +345,7 @@ except ProcessLookupError:
 except PermissionError:
     print("EPERM")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "ESRCH" in result.stdout
 
@@ -359,7 +358,7 @@ ret = libc.kill(1, 9)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "ret=-1" in result.stdout
         # EPERM = 1
@@ -385,7 +384,7 @@ ret = libc.syscall(NR_TGKILL, 1, 1, 9)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         if "SKIP:" in result.stdout:
             return
@@ -427,7 +426,7 @@ ret = libc.syscall(NR_RT_SIGQUEUEINFO, 1, 15, ctypes.byref(si_buf))
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         if "SKIP:" in result.stdout:
             return
@@ -468,7 +467,7 @@ else:
     else:
         print("unexpected_success")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -500,7 +499,7 @@ except PermissionError:
 except ProcessLookupError:
     print("blocked:ESRCH")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # Either broadcast succeeded (safe, PID 1 excluded) or blocked
         assert "BROADCAST_OK:" in result.stdout or "blocked:" in result.stdout
@@ -519,7 +518,7 @@ try {
     }
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -545,7 +544,7 @@ except PermissionError:
 except FileNotFoundError:
     print("blocked:ENOENT")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -561,7 +560,7 @@ except PermissionError:
 except FileNotFoundError:
     print("blocked:ENOENT")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -583,7 +582,7 @@ except FileNotFoundError:
 except OSError as e:
     print(f"blocked:errno={e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked:" in result.stdout
 
@@ -602,7 +601,7 @@ except PermissionError:
 except FileNotFoundError:
     print("blocked:ENOENT")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -620,7 +619,7 @@ except FileNotFoundError:
 except OSError as e:
     print(f"blocked:errno={e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -641,7 +640,7 @@ except FileNotFoundError:
 except OSError as e:
     print(f"blocked:errno={e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -662,7 +661,7 @@ except FileNotFoundError:
 except OSError as e:
     print(f"blocked:errno={e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -680,7 +679,7 @@ if ret == -1:
 else:
     print("unexpected_success")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked:" in result.stdout
 
@@ -698,13 +697,13 @@ if ret == -1:
 else:
     print(f"unexpected_success:ret={ret}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked:" in result.stdout
 
     async def test_guest_agent_survives_signal_storm(self, scheduler: Scheduler) -> None:
         """Session: 31 signal attempts all fail (except SIGCONT), then print("STILL_ALIVE") succeeds."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Send all 31 standard signals to PID 1
             # SIGCONT (18) is allowed cross-UID by Linux -- harmless, only resumes stopped processes
             storm = """\

@@ -48,12 +48,9 @@ class TestZramConfiguration:
     ) -> None:
         """A cold 192 MiB VM exposes the required effective zram geometry."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=192, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="zram-config-192mb",
-            memory_mb=192,
-            allow_network=False,
-            allowed_domains=None,
         )
         try:
             result = await vm.execute(
@@ -119,8 +116,10 @@ print('PASS: effective zram geometry')
 
     async def test_compression_actually_compresses(self, scheduler: Scheduler) -> None:
         """zram should achieve real compression on compressible data."""
-        result = await scheduler.run(
-            code="""
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import gc
 gc.collect()
 
@@ -168,7 +167,6 @@ if final_orig > initial_orig:
 else:
     print('PASS: No swap used (data fit in RAM)')
 """,
-            language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
@@ -179,8 +177,10 @@ class TestZramMemoryExpansion:
 
     async def test_allocate_well_beyond_physical_ram(self, scheduler: Scheduler) -> None:
         """VM should allocate well beyond available RAM using zram."""
-        result = await scheduler.run(
-            code="""
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import gc
 gc.collect()
 
@@ -219,7 +219,6 @@ except MemoryError:
     print(f'FAIL: MemoryError after {allocated}MB')
     raise
 """,
-            language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS" in result.stdout
@@ -227,8 +226,10 @@ except MemoryError:
 
     async def test_memory_survives_repeated_cycles(self, scheduler: Scheduler) -> None:
         """Memory allocation should work reliably across multiple cycles."""
-        result = await scheduler.run(
-            code="""
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import gc
 
 def allocate_and_verify(size_mb, pattern_byte):
@@ -262,7 +263,6 @@ for cycle in range(3):
 
 print('PASS: All 3 allocation cycles completed without corruption')
 """,
-            language=Language.PYTHON,
         )
         assert result.exit_code == 0, f"Failed: {result.stderr}"
         assert "PASS: All 3 allocation cycles" in result.stdout
@@ -318,19 +318,19 @@ class TestZramMemLimit:
         """A cold-boot execution under incompressible pressure returns 137 fast."""
         config = self._pressure_config(images_dir, tmp_path)
         async with Scheduler(config) as scheduler:
-            cold = await asyncio.wait_for(
-                scheduler.run(
-                    code=_INCOMPRESSIBLE_PRESSURE,
-                    language=Language.PYTHON,
-                    memory_mb=192,
+            cold, cold_startup, _ = await asyncio.wait_for(
+                run_timed(
+                    scheduler,
+                    VmSpec(language=Language.PYTHON, memory_mb=192),
+                    _INCOMPRESSIBLE_PRESSURE,
                     timeout_seconds=60,
                 ),
                 timeout=30,
             )
             assert cold.exit_code == 137, cold.stderr
             assert "WORKLOAD_STARTED" in cold.stdout
-            assert cold.warm_pool_hit is False
-            assert cold.l1_cache_hit is False
+            assert cold_startup.warm_pool_hit is False
+            assert cold_startup.l1_cache_hit is False
 
     @skip_unless_macos_arm64
     async def test_incompressible_pressure_retires_l1_restored_192mb_vm(
@@ -384,7 +384,6 @@ class TestConcurrentVMs:
         are too slow.
         """
         config = SchedulerConfig(
-            default_memory_mb=256,
             default_timeout_seconds=90,
             images_dir=images_dir,
         )
@@ -413,7 +412,7 @@ with open('/proc/swaps') as f:
 
 print(f'PASS: 180MB allocated, swap_used={swap_used}MB')
 """
-            tasks = [sched.run(code=code, language=Language.PYTHON) for _ in range(3)]
+            tasks = [run_once(sched, VmSpec(language=Language.PYTHON, memory_mb=256), code) for _ in range(3)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # All should succeed

@@ -13,6 +13,8 @@ References:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 class TestMultiprocessingPool:
@@ -30,10 +32,7 @@ with Pool(processes=2) as pool:
     result = pool.map(square, [1, 2, 3, 4, 5])
 print(result)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert result.stdout.strip() == "[1, 4, 9, 16, 25]"
@@ -47,10 +46,7 @@ with Pool(processes=2) as pool:
     result = pool.map(lambda x: x ** 2, [1, 2, 3])
 print(result)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert result.stdout.strip() == "[1, 4, 9]"
@@ -61,10 +57,7 @@ print(result)
 import os
 print(os.path.isdir('/dev/shm'))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert result.stdout.strip() == "True"

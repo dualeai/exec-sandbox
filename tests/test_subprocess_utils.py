@@ -4,16 +4,20 @@ Tests drain_subprocess_output with real subprocesses.
 No mocks - spawns actual processes.
 """
 
+import ast
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import exec_sandbox
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.subprocess_utils import (
     communicate_managed_process,
     drain_subprocess_output,
+    start_drain,
     start_managed_process,
     wait_for_socket,
 )
@@ -33,6 +37,47 @@ async def create_process(cmd: list[str]) -> ProcessWrapper:
         stderr=asyncio.subprocess.PIPE,
     )
     return ProcessWrapper(proc)
+
+
+_SPAWN_CALLS = {
+    ("asyncio", "create_subprocess_exec"),
+    ("asyncio", "create_subprocess_shell"),
+    *(("subprocess", name) for name in ("run", "Popen", "check_output", "check_call", "call")),
+}
+
+
+class TestChildEnv:
+    """Child processes never inherit the instance keyring or cloud credentials."""
+
+    def test_every_spawn_site_passes_env(self) -> None:
+        """AST walk over the package: each spawn call passes env= (a new site cannot forget it)."""
+        missing: list[str] = []
+        sites = 0
+        for path in sorted(Path(exec_sandbox.__file__).parent.rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                    continue
+                if (ast.unparse(node.func.value), node.func.attr) not in _SPAWN_CALLS:
+                    continue
+                sites += 1
+                if not any(keyword.arg == "env" for keyword in node.keywords):
+                    missing.append(f"{path.name}:{node.lineno}")
+        assert sites > 0
+        assert missing == []
+
+    async def test_managed_child_does_not_see_secrets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", "secret-keyring")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-aws")
+        monkeypatch.setenv("CHILD_ENV_PROBE", "kept")
+
+        returncode, stdout, _ = await communicate_managed_process(
+            ["/usr/bin/env"], process_name="env", context_id="test-child-env"
+        )
+
+        assert returncode == 0
+        assert b"CHILD_ENV_PROBE=kept" in stdout
+        assert b"secret-keyring" not in stdout
+        assert b"secret-aws" not in stdout
 
 
 class TestStartManagedProcess:

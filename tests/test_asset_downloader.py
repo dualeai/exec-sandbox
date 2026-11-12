@@ -21,42 +21,55 @@ else:
 
 from exec_sandbox.asset_downloader import (
     AsyncPooch,
+    UserDir,
     decompress_zstd,
-    get_cache_dir,
     get_current_arch,
     get_gvproxy_suffix,
-    os_cache,
+    get_user_dir,
     retrieve,
-    untar,
 )
-from exec_sandbox.exceptions import AssetDownloadError, AssetNotFoundError
-from exec_sandbox.hash_utils import IncrementalHasher, bytes_hash
-from exec_sandbox.lock_utils import file_lock
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
+from exec_sandbox.hash_utils import IncrementalHasher, file_hash
+from exec_sandbox.lock_utils import file_lock, try_file_lock
 from exec_sandbox.platform_utils import HostOS
 
 
-class TestGetCacheDir:
-    """Tests for get_cache_dir function."""
+class _CompatClientResponse(aiohttp.ClientResponse):
+    """aioresponses 0.7.9 builds ClientResponse without the ``stream_writer``
+    argument that aiohttp >= 3.14 requires (it reads ``stream_writer.output_size``
+    when ``writer`` is None). Supply a writer whose output size is 0.
+    """
+
+    def __init__(self, method, url, **kwargs):  # type: ignore[no-untyped-def]  # mirrors aiohttp's signature
+        kwargs.setdefault("stream_writer", SimpleNamespace(output_size=0))
+        super().__init__(method, url, **kwargs)
+
+
+aioresponses_core.ClientResponse = _CompatClientResponse  # type: ignore[misc]  # default response_class
+
+
+class TestUserDirCache:
+    """Tests for get_user_dir(kind=UserDir.CACHE)."""
 
     def test_returns_path(self):
         """Should return a Path object."""
-        result = get_cache_dir()
+        result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
         assert isinstance(result, Path)
 
-    def test_default_app_name(self):
-        """Should use exec-sandbox as default app name."""
-        result = get_cache_dir()
+    def test_project_app_name(self):
+        """Should use the app name exec-sandbox."""
+        result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
         assert "exec-sandbox" in str(result)
 
     def test_custom_app_name(self):
         """Should use custom app name when provided."""
-        result = get_cache_dir("custom-app")
+        result = get_user_dir(kind=UserDir.CACHE, app_name="custom-app")
         assert "custom-app" in str(result)
 
     def test_env_override(self):
         """Should respect EXEC_SANDBOX_CACHE_DIR environment variable."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom/path"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("/custom/path")
 
     @pytest.mark.parametrize(
@@ -71,32 +84,24 @@ class TestGetCacheDir:
         """Should use platform-appropriate cache directory."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=host_os):
             with patch.dict("os.environ", {}, clear=True):
-                assert expected_substr in str(get_cache_dir())
+                assert expected_substr in str(get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox"))
 
     def test_linux_xdg_cache_home(self):
         """Should respect XDG_CACHE_HOME on Linux."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg/cache"}):
-                result = get_cache_dir()
+                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
                 assert result == Path("/xdg/cache/exec-sandbox")
 
 
-class TestGetCacheDirReExport:
-    """Tests for get_cache_dir re-export from platform_utils."""
+class TestGetUserDirReExport:
+    """Tests for get_user_dir re-export from platform_utils."""
 
     def test_reexport_identity(self):
-        """get_cache_dir in asset_downloader is the same object as in platform_utils."""
-        from exec_sandbox.platform_utils import get_cache_dir as platform_get_cache_dir
+        """get_user_dir in asset_downloader is the same object as in platform_utils."""
+        from exec_sandbox.platform_utils import get_user_dir as platform_get_user_dir
 
-        assert get_cache_dir is platform_get_cache_dir
-
-
-class TestOsCache:
-    """Tests for os_cache alias function."""
-
-    def test_alias_for_get_cache_dir(self):
-        """os_cache should be an alias for get_cache_dir."""
-        assert os_cache("test") == get_cache_dir("test")
+        assert get_user_dir is platform_get_user_dir
 
 
 class TestGetCurrentArch:

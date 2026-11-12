@@ -556,6 +556,7 @@ async def probe_qemu_accelerators() -> set[str]:
             "help",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
@@ -614,6 +615,7 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
@@ -677,6 +679,7 @@ async def probe_qemu_sandbox_support() -> bool:
             "none",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
 
         try:
@@ -783,6 +786,7 @@ async def check_kvm_available() -> bool:
             f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode != 0:
@@ -843,6 +847,7 @@ async def check_hvf_available() -> bool:
             "kern.hv_support",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
@@ -961,6 +966,7 @@ async def _check_tsc_deadline_macos() -> bool:
             "machdep.cpu.features",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode == 0:
@@ -1042,6 +1048,7 @@ except Exception:
             probe_script,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         await asyncio.wait_for(proc.wait(), timeout=5)
 
@@ -1105,6 +1112,7 @@ async def probe_unshare_support() -> bool:
             "/usr/bin/true",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
 

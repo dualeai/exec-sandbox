@@ -13,6 +13,8 @@ Two independent defense layers are tested:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # =============================================================================
 # Network layer: gvproxy blocks direct DNS to external resolvers
@@ -40,11 +42,8 @@ try:
 except Exception as e:
     print(f"BLOCKED:{type(e).__name__}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
         )
         assert "BLOCKED:" in result.stdout, (
             f"Expected raw TCP to 8.8.8.8:53 to be blocked by gvproxy.\n"
@@ -79,11 +78,8 @@ except Exception as e:
 finally:
     sock.close()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
         )
         assert "BLOCKED:" in result.stdout, (
             f"Expected UDP DNS to 8.8.8.8:53 to be blocked/timeout.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -94,11 +90,10 @@ finally:
 
         No alternative route exists that could bypass gvproxy filtering.
         """
-        result = await scheduler.run(
-            code="ip route show default",
-            language=Language.RAW,
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.RAW, allow_network=True, allowed_domains=["cp.cloudflare.com"]),
+            "ip route show default",
         )
         assert "192.168.127.1" in result.stdout, (
             f"Expected default route via gvproxy gateway 192.168.127.1.\n"
@@ -151,7 +146,7 @@ else:
     os.close(fd)
     print("open_blocked=none")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert "statvfs_rdonly=True" in result.stdout, (
             f"Expected /etc/resolv.conf to be on a read-only mount.\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )

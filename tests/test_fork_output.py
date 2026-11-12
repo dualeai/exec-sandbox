@@ -22,6 +22,8 @@ import asyncio
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -45,10 +47,7 @@ for p in pids:
     except ChildProcessError: pass
 print(f"PARENT_DONE:{len(pids)}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "PARENT_DONE:20" in result.stdout
@@ -68,10 +67,7 @@ for p in pids:
     except ChildProcessError: pass
 print(f"PARENT_DONE:{len(pids)}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "PARENT_DONE:20" in result.stdout
@@ -87,10 +83,7 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("PARENT_COMPUTED")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "PARENT_COMPUTED" in result.stdout
@@ -113,17 +106,14 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("PARENT_OUTPUT")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "PARENT_OUTPUT" in result.stdout
 
     async def test_repl_reuse_after_fork(self, scheduler: Scheduler) -> None:
         """Session: first exec forks children, second exec runs normal code."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             r1 = await session.exec(
                 """\
 import os, sys
@@ -152,17 +142,14 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("PARENT_OK")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "PARENT_OK" in result.stdout
 
     async def test_repl_reuse_after_sleeping_fork(self, scheduler: Scheduler) -> None:
         """Session: children sleep 2s then sys.exit(); next exec must not be corrupted."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             r1 = await session.exec(
                 """\
 import os, sys, time
@@ -205,10 +192,7 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("NESTED_OK")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "NESTED_OK" in result.stdout
@@ -224,10 +208,7 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("STDERR_OK")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "STDERR_OK" in result.stdout
@@ -244,10 +225,7 @@ _, status = os.waitpid(pid, 0)
 child_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
 print(f"CHILD_EXIT:{child_code}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "CHILD_EXIT:" in result.stdout
@@ -266,10 +244,7 @@ with open('/tmp/fork_ipc.txt') as f:
     data = f.read()
 print(f"IPC:{data}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "IPC:CHILD_WROTE" in result.stdout
@@ -296,10 +271,7 @@ for p in pids:
     except ChildProcessError: pass
 print(f"RAPID_DONE:{len(pids)}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RAPID_DONE:50" in result.stdout
@@ -324,10 +296,7 @@ finally:
         except ChildProcessError: pass
 print(f"FORK_RESULT:forked={len(pids)},limited={hit_limit}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "FORK_RESULT:forked=" in result.stdout
@@ -344,10 +313,7 @@ if pid == 0:
 os.waitpid(pid, 0)
 print("INJECTION_SAFE")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INJECTION_SAFE" in result.stdout

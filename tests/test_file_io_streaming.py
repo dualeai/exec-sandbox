@@ -60,7 +60,7 @@ class TestStreamingLargeFiles:
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_30mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             await session.write_file("large_30mb.bin", content)
             await session.read_file("large_30mb.bin", destination=dest)
 
@@ -112,7 +112,7 @@ class TestConcurrentFileTransfers:
         files = {f"concurrent_{i}.bin": os.urandom(size) for i in range(5)}
         expected_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write all 5 concurrently
             await asyncio.gather(*(session.write_file(name, data) for name, data in files.items()))
 
@@ -131,7 +131,7 @@ class TestConcurrentFileTransfers:
         files = {f"read_concurrent_{i}.bin": os.urandom(size) for i in range(5)}
         expected_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write sequentially
             for name, data in files.items():
                 await session.write_file(name, data)
@@ -159,7 +159,7 @@ class TestConcurrentFileTransfers:
         write_files = {f"new_write_{i}.bin": os.urandom(size) for i in range(3)}
         write_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in write_files.items()}
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Pre-write files for the read phase
             for name, data in read_files.items():
                 await session.write_file(name, data)
@@ -210,7 +210,7 @@ class TestStreamingMemoryEfficiency:
         size = 30 * 1024 * 1024
         content = os.urandom(size)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             await session.write_file("mem_test_30mb.bin", content)
 
             # Read /proc/meminfo to check available memory
@@ -249,7 +249,7 @@ class TestStreamingMemoryEfficiency:
         """
         size = 20 * 1024 * 1024
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             for i in range(3):
                 content = os.urandom(size)
                 expected_hash = hashlib.sha256(content).hexdigest()
@@ -300,7 +300,7 @@ class TestStreamingMemoryEfficiency:
             print(f'pid={pid}')
         """)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             # Start background memory monitor
             start_result = await session.exec(monitor_code)
             assert start_result.exit_code == 0, f"Monitor start failed: {start_result.stderr}"
@@ -353,7 +353,7 @@ class TestStreamingMemoryEfficiency:
         content = os.urandom(size)
         dest = tmp_path / "read_mem_test_30mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             await session.write_file("read_mem_test_30mb.bin", content)
             await session.read_file("read_mem_test_30mb.bin", destination=dest)
 
@@ -414,7 +414,7 @@ class TestStreamingMemoryEfficiency:
             print(f'pid={pid}')
         """)
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             # First write the file to read back
             await session.write_file("peak_read_30mb.bin", content)
 
@@ -566,7 +566,7 @@ class TestInterleavedSuccessFailure:
         read_data = os.urandom(size)
         read_hash = hashlib.sha256(read_data).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Pre-write a file for reading
             await session.write_file("for_reading.bin", read_data)
 
@@ -625,7 +625,7 @@ class TestInterleavedSuccessFailure:
 
     async def test_concurrent_list_with_writes(self, scheduler: Scheduler) -> None:
         """Concurrent list_files during writes — list sees consistent state."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write some initial files
             for i in range(3):
                 await session.write_file(f"file_{i}.txt", f"content_{i}".encode())
@@ -674,7 +674,7 @@ class TestFileTransferThroughput:
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=256) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=256)) as session:
             start = time.perf_counter()
             await session.write_file("bench.bin", content)
             elapsed = time.perf_counter() - start
@@ -697,7 +697,7 @@ class TestFileTransferThroughput:
         expected_hash = hashlib.sha256(expected_content).hexdigest()
         dest = tmp_path / "bench_dl.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=256) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=256)) as session:
             # Generate deterministic file in guest
             await session.exec(f"open('bench.bin','wb').write(bytes(range(256)) * {size // 256})")
             start = time.perf_counter()

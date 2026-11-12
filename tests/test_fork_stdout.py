@@ -24,6 +24,8 @@ Integration tests require QEMU + images (run 'make build-images').
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 class TestForkStdoutCapture:
@@ -50,10 +52,7 @@ os.waitpid(pid, 0)
 print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "CHILD_OK" in result.stdout, f"Child output missing: {result.stdout}"
@@ -78,10 +77,7 @@ else:
     print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "CHILD_FELL_THROUGH" in result.stdout, f"Child output missing: {result.stdout}"
@@ -104,10 +100,7 @@ os.waitpid(pid, 0)
 print("PARENT_BASELINE")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "CHILD_BASELINE" in result.stdout, f"Child output missing: {result.stdout}"
@@ -138,10 +131,7 @@ os.waitpid(pid, 0)
 print("PARENT_PRESENT")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         # Child output is lost because os._exit() doesn't flush Python buffers
@@ -169,10 +159,7 @@ print(f"CHILD_EXIT:{child_exit}")
 print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "CHILD_EXIT:42" in result.stdout, f"Child exit code not preserved: {result.stdout}"
@@ -209,10 +196,7 @@ print(f"EXIT_NONE:{exit_none}")
 print(f"EXIT_NOARG:{exit_noarg}")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "EXIT_NONE:0" in result.stdout, f"sys.exit(None) should be exit 0: {result.stdout}"
@@ -237,10 +221,7 @@ print(f"CHILD_EXIT:{child_exit}")
 print("PARENT_CONTINUES")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "PARENT_CONTINUES" in result.stdout, f"Parent output missing: {result.stdout}"
@@ -266,10 +247,7 @@ for i in range(3):
 print("PARENT_ALL_DONE")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         for i in range(3):
@@ -309,10 +287,7 @@ os.waitpid(pid, 0)
 print("PARENT_OK")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "GRANDCHILD_OK" in result.stdout, f"Grandchild output missing: {result.stdout}"
@@ -341,10 +316,7 @@ os.waitpid(pid, 0)
 print("PARENT_AFTER_CHILD")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         # Verify all 200 lines are present
@@ -372,10 +344,7 @@ os.waitpid(pid, 0)
 print("PARENT_STDOUT")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "CHILD_STDOUT" in result.stdout, f"Child stdout missing: {result.stdout}"
@@ -405,10 +374,7 @@ os.waitpid(pid, 0)
 print("PARENT_DONE")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, (
             f"Expected parent exit_code 0, got {result.exit_code} "
@@ -436,10 +402,7 @@ os.waitpid(pid, 0)
 print(f"x:{x}")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
         assert "x:42" in result.stdout, f"REPL state corrupted: {result.stdout}"

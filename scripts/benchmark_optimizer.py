@@ -48,7 +48,7 @@ import psutil
 from scipy.interpolate import RBFInterpolator  # type: ignore[reportMissingImports]
 from scipy.optimize import minimize  # type: ignore[reportMissingImports]
 
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_CPU_OVERCOMMIT_RATIO, DEFAULT_MEMORY_OVERCOMMIT_RATIO
 from exec_sandbox.models import Language
@@ -306,16 +306,17 @@ async def _run_single(scheduler: Scheduler, idx: int, lang: Language, code: str)
     """Run a single VM and return timing/status."""
     t0 = time.monotonic()
     try:
-        result = await scheduler.run(code=code, language=lang)
+        async with await scheduler.new(VmSpec(language=lang)) as vm:
+            result = await vm.exec(code)
+            startup = vm.startup_timing
         elapsed = time.monotonic() - t0
-        t = result.timing
         return VMResult(
             idx=idx,
             ok=result.exit_code == 0,
             elapsed_ms=round(elapsed * 1000),
-            setup_ms=t.setup_ms,
-            admission_ms=t.admission_ms or 0,
-            exec_ms=t.boot_ms + t.execute_ms,
+            setup_ms=startup.setup_ms,
+            admission_ms=startup.admission_ms,
+            exec_ms=startup.boot_ms + result.timing.execute_ms,
         )
     except Exception as exc:
         elapsed = time.monotonic() - t0

@@ -49,13 +49,27 @@ from exec_sandbox.validation import (
     clear_kernel_validation_cache,
     validate_kernel_initramfs,
 )
-from exec_sandbox.vm_manager import _validate_identifier
+from exec_sandbox.vm_manager import VmManager, _validate_identifier
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VALID_STATE_TRANSITIONS, AccelType, VmState
+from exec_sandbox.vm_working_directory import VmWorkingDirectory
 from tests.conftest import skip_unless_hwaccel, skip_unless_linux, skip_unless_macos
+
+# Home disks of test workdirs (no VM runs here, so no file is created)
+_HOME_DIR = Path(tempfile.gettempdir())
 
 # ============================================================================
 # Unit Tests - VM State Machine
 # ============================================================================
+
+
+# The x86 CPU model is a cross-host contract (a state saved on one host loads on
+# another only with the same model): written out here, never derived from qemu_cmd.
+_X86_MODEL = (
+    "qemu64-v1,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,+xsaveopt,+cx16,+lahf_lm,"
+    "+popcnt,+sse4.1,+sse4.2,+ssse3,+rdrand,+rdseed,+hypervisor,-svm,-vmx"
+)
+_X86_KVM_PV = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
 
 
 class TestVmState:
@@ -761,7 +775,7 @@ class TestNetdevReconnect:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-reconnect-9-2")
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-9-2", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)):
                 cmd = await build_qemu_cmd(
@@ -769,9 +783,7 @@ class TestNetdevReconnect:
                     arch=detect_host_arch(),
                     vm_id="test-vm-reconnect-9-2",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=True,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
                 )
 
             # Find the netdev argument
@@ -793,13 +805,13 @@ class TestNetdevReconnect:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-reconnect-8-x")
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-8-x", home_dir=_HOME_DIR)
         try:
             with (
                 patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(8, 2, 0)),
                 # Bypass ARM64 TCG version guard — this test targets netdev reconnect logic,
                 # not acceleration selection. On ARM64 TCG runners, QEMU < 9.0.4 triggers
-                # VmDependencyError before reaching the netdev code path.
+                # ConfigError HOST_DEPENDENCY before reaching the netdev code path.
                 patch("exec_sandbox.qemu_cmd.detect_accel_type", return_value=AccelType.HVF),
             ):
                 cmd = await build_qemu_cmd(
@@ -807,9 +819,7 @@ class TestNetdevReconnect:
                     arch=detect_host_arch(),
                     vm_id="test-vm-reconnect-8-x",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=True,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
                 )
 
             # Find the netdev argument
@@ -831,7 +841,7 @@ class TestNetdevReconnect:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-reconnect-10")
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-10", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 0, 0)):
                 cmd = await build_qemu_cmd(
@@ -839,9 +849,7 @@ class TestNetdevReconnect:
                     arch=detect_host_arch(),
                     vm_id="test-vm-reconnect-10",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=True,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
                 )
 
             # Find the netdev argument
@@ -863,7 +871,7 @@ class TestNetdevReconnect:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-reconnect-unknown")
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-unknown", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=None):
                 cmd = await build_qemu_cmd(
@@ -871,9 +879,7 @@ class TestNetdevReconnect:
                     arch=detect_host_arch(),
                     vm_id="test-vm-reconnect-unknown",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=True,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
                 )
 
             # Find the netdev argument
@@ -894,7 +900,7 @@ class TestNetdevReconnect:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-reconnect-7")
+        workdir = await VmWorkingDirectory.create("test-vm-reconnect-7", home_dir=_HOME_DIR)
         try:
             with (
                 patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(7, 2, 0)),
@@ -906,9 +912,7 @@ class TestNetdevReconnect:
                     arch=detect_host_arch(),
                     vm_id="test-vm-reconnect-7",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=True,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
                 )
 
             # Find the netdev argument
@@ -929,7 +933,7 @@ class TestNetdevReconnect:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-no-network")
+        workdir = await VmWorkingDirectory.create("test-vm-no-network", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)):
                 cmd = await build_qemu_cmd(
@@ -937,9 +941,7 @@ class TestNetdevReconnect:
                     arch=detect_host_arch(),
                     vm_id="test-vm-no-network",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=False,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 )
 
             # Should not have any netdev argument
@@ -967,7 +969,7 @@ class TestQemuNicNone:
     async def workdir(self):
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        wd = await VmWorkingDirectory.create("test-vm-nic-none")
+        wd = await VmWorkingDirectory.create("test-vm-nic-none", home_dir=_HOME_DIR)
         try:
             yield wd
         finally:
@@ -1010,9 +1012,7 @@ class TestQemuNicNone:
                 arch=detect_host_arch(),
                 vm_id="test-vm-nic-none",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=allow_network,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=allow_network),
                 expose_ports=expose_ports,
             )
 
@@ -1042,9 +1042,7 @@ class TestQemuNicNone:
                 arch=HostArch.X86_64,
                 vm_id="test-vm-nic-none",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert "-nic" in cmd
@@ -1069,7 +1067,7 @@ class TestRunWithExitParent:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-2")
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-2", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 2, 0)):
                 cmd = await build_qemu_cmd(
@@ -1077,9 +1075,7 @@ class TestRunWithExitParent:
                     arch=detect_host_arch(),
                     vm_id="test-vm-exit-parent-10-2",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=False,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 )
 
             idx = cmd.index("-run-with")
@@ -1092,7 +1088,7 @@ class TestRunWithExitParent:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-1")
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-10-1", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(10, 1, 0)):
                 cmd = await build_qemu_cmd(
@@ -1100,9 +1096,7 @@ class TestRunWithExitParent:
                     arch=detect_host_arch(),
                     vm_id="test-vm-exit-parent-10-1",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=False,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 )
 
             assert "-run-with" not in cmd
@@ -1114,7 +1108,7 @@ class TestRunWithExitParent:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-unknown")
+        workdir = await VmWorkingDirectory.create("test-vm-exit-parent-unknown", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=None):
                 cmd = await build_qemu_cmd(
@@ -1122,9 +1116,7 @@ class TestRunWithExitParent:
                     arch=detect_host_arch(),
                     vm_id="test-vm-exit-parent-unknown",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=False,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 )
 
             assert "-run-with" not in cmd
@@ -1146,7 +1138,7 @@ class TestSmpCpuCores:
         from exec_sandbox.qemu_cmd import build_qemu_cmd
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        workdir = await VmWorkingDirectory.create(f"test-smp-{cpu_cores}")
+        workdir = await VmWorkingDirectory.create(f"test-smp-{cpu_cores}", home_dir=_HOME_DIR)
         try:
             with patch("exec_sandbox.qemu_cmd.probe_qemu_version", return_value=(9, 2, 0)):
                 cmd = await build_qemu_cmd(
@@ -1154,9 +1146,7 @@ class TestSmpCpuCores:
                     arch=detect_host_arch(),
                     vm_id=f"test-smp-{cpu_cores}",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=cpu_cores,
-                    allow_network=False,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=cpu_cores, allow_network=False),
                 )
 
             # Find -smp value (maxcpus capped to prevent QEMU allocating extra vCPU structs)
@@ -1182,7 +1172,7 @@ class _QemuCmdTestBase:
     async def workdir(self):
         from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
-        wd = await VmWorkingDirectory.create("test-vm")
+        wd = await VmWorkingDirectory.create("test-vm", home_dir=_HOME_DIR)
         try:
             yield wd
         finally:
@@ -1204,9 +1194,7 @@ class TestQemuExecutableSelection(_QemuCmdTestBase):
                 arch=HostArch.AARCH64,
                 vm_id="exact-qemu-executable",
                 workdir=workdir,
-                memory_mb=192,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=192, cpu_cores=1, allow_network=False),
             )
 
         assert cmd[0] == str(configured)
@@ -1221,9 +1209,7 @@ class TestQemuExecutableSelection(_QemuCmdTestBase):
                 arch=HostArch.AARCH64,
                 vm_id="exact-qemu-executable",
                 workdir=workdir,
-                memory_mb=192,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=192, cpu_cores=1, allow_network=False),
             )
 
         assert cmd[0] == "qemu-system-aarch64"
@@ -1261,9 +1247,7 @@ class TestCpuidleGovernor(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-cpuidle",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         cmdline = _extract_kernel_cmdline(cmd)
@@ -1291,9 +1275,7 @@ class TestCpuidleGovernor(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-cpuidle",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         cmdline = _extract_kernel_cmdline(cmd)
@@ -1318,9 +1300,7 @@ class TestCpuidleGovernor(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-cpuidle",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         cmdline = _extract_kernel_cmdline(cmd)
@@ -1368,9 +1348,7 @@ class TestKernelCmdlineMitigations(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-mitigations",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         # Token-split, not substring: substring would match inside other params.
@@ -1399,9 +1377,7 @@ class TestKernelCmdlinePressureStallInformation(_QemuCmdTestBase):
                 arch=arch,
                 vm_id="test-vm-memory-psi",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         tokens = _extract_kernel_cmdline(cmd).split()
@@ -1487,7 +1463,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.KVM,
                 True,
                 HostOS.LINUX,
-                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=on,dump-guest-core=off",
+                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=on,dump-guest-core=off,memory-backend=mem0",
                 id="x86-kvm-tsc-linux",
             ),
             pytest.param(
@@ -1495,7 +1471,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.KVM,
                 False,
                 HostOS.LINUX,
-                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=on,dump-guest-core=off",
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=on,dump-guest-core=off,memory-backend=mem0",
                 id="x86-kvm-notsc-linux",
             ),
             pytest.param(
@@ -1503,7 +1479,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.HVF,
                 True,
                 HostOS.MACOS,
-                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off",
+                "microvm,acpi=off,x-option-roms=off,pit=off,pic=off,rtc=off,isa-serial=off,mem-merge=off,memory-backend=mem0",
                 id="x86-hvf-tsc-macos",
             ),
             pytest.param(
@@ -1511,7 +1487,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.TCG,
                 False,
                 HostOS.LINUX,
-                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=on,dump-guest-core=off",
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=on,dump-guest-core=off,memory-backend=mem0",
                 id="x86-tcg-linux",
             ),
             pytest.param(
@@ -1519,7 +1495,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.TCG,
                 False,
                 HostOS.MACOS,
-                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off",
+                "microvm,acpi=off,x-option-roms=off,isa-serial=off,mem-merge=off,memory-backend=mem0",
                 id="x86-tcg-macos",
             ),
             pytest.param(
@@ -1527,7 +1503,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.KVM,
                 False,
                 HostOS.LINUX,
-                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=on,dump-guest-core=off",
+                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=on,dump-guest-core=off,memory-backend=mem0",
                 id="arm64-kvm-linux",
             ),
             pytest.param(
@@ -1535,13 +1511,14 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 AccelType.HVF,
                 False,
                 HostOS.MACOS,
-                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off",
+                "virt,virtualization=off,highmem=off,gic-version=3,its=off,dtb-randomness=off,mem-merge=off,memory-backend=mem0",
                 id="arm64-hvf-macos",
             ),
         ],
     )
     async def test_machine_type(
         self,
+        *,
         vm_settings,
         workdir,
         arch: HostArch,
@@ -1559,9 +1536,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 arch=arch,
                 vm_id="test-vm-machine-type",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert _extract_machine_type(cmd) == expected_machine_type
@@ -1584,9 +1559,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-machine-type",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         tsc_mock.assert_not_awaited()
@@ -1616,9 +1589,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-machine-type",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         tsc_mock.assert_awaited_once()
@@ -1641,9 +1612,7 @@ class TestMachineTypeSelection(_QemuCmdTestBase):
                 arch=HostArch.AARCH64,
                 vm_id="test-vm-machine-type",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         tsc_mock.assert_not_awaited()
@@ -1684,9 +1653,7 @@ class TestConsoleSelection(_QemuCmdTestBase):
                 arch=arch,
                 vm_id="test-vm-console",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         cmdline = _extract_kernel_cmdline(cmd)
@@ -1712,9 +1679,19 @@ class TestCpuModelSelection(_QemuCmdTestBase):
             pytest.param(HostArch.AARCH64, AccelType.HVF, "host", id="arm64-hvf"),
             pytest.param(HostArch.AARCH64, AccelType.KVM, "host", id="arm64-kvm"),
             pytest.param(HostArch.AARCH64, AccelType.TCG, "max,pauth-impdef=on", id="arm64-tcg"),
-            pytest.param(HostArch.X86_64, AccelType.KVM, "host,-svm,-vmx", id="x86-kvm"),
-            pytest.param(HostArch.X86_64, AccelType.HVF, "host,-svm,-vmx", id="x86-hvf"),
-            pytest.param(HostArch.X86_64, AccelType.TCG, "SapphireRapids-v2", id="x86-tcg"),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.KVM,
+                f"{_X86_MODEL},{_X86_KVM_PV},+tsc-deadline,vendor=GenuineIntel,enforce",
+                id="x86-kvm",
+            ),
+            pytest.param(
+                HostArch.X86_64,
+                AccelType.HVF,
+                f"{_X86_MODEL},+tsc-deadline,vendor=GenuineIntel,enforce",
+                id="x86-hvf",
+            ),
+            pytest.param(HostArch.X86_64, AccelType.TCG, f"{_X86_MODEL},vendor=GenuineIntel,enforce", id="x86-tcg"),
         ],
     )
     async def test_cpu_model(
@@ -1728,15 +1705,16 @@ class TestCpuModelSelection(_QemuCmdTestBase):
         """CPU model string matches expected value."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks(accel_type=accel_type):
+        with (
+            _qemu_cmd_mocks(accel_type=accel_type),
+            patch("exec_sandbox.qemu_cmd.detect_host_x86_vendor", return_value="GenuineIntel"),
+        ):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=arch,
                 vm_id="test-vm-cpu-model",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert _extract_cpu_model(cmd) == expected_cpu
@@ -1778,9 +1756,7 @@ class TestAccelString(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-accel",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert _extract_accel(cmd) == expected_accel
@@ -1833,9 +1809,7 @@ class TestArm64TcgVersionGuard(_QemuCmdTestBase):
                     arch=HostArch.AARCH64,
                     vm_id="test-vm-arm64-tcg",
                     workdir=workdir,
-                    memory_mb=256,
-                    cpu_cores=1,
-                    allow_network=False,
+                    spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 )
                 assert isinstance(cmd, list)
 
@@ -1874,6 +1848,7 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
     )
     async def test_block_aio_context_is_platform_specific(
         self,
+        *,
         vm_settings,
         workdir,
         host_os: HostOS,
@@ -1890,9 +1865,7 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
                 arch=HostArch.AARCH64,
                 vm_id="test-vm-platform-io",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         objects = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-object"]
@@ -1921,9 +1894,7 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-platform-flags",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert ("-sandbox" in cmd) == expect_sandbox
@@ -1945,34 +1916,34 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
                 arch=arch,
                 vm_id="test-vm-platform-flags",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         cmdline = _extract_kernel_cmdline(cmd)
         assert ("8250.nr_uarts=0" in cmdline) == expect_uarts
 
     @pytest.mark.parametrize(
-        "arch, expect_tsc",
+        "arch, accel, expect_tsc",
         [
-            pytest.param(HostArch.X86_64, True, id="x86-has-tsc"),
-            pytest.param(HostArch.AARCH64, False, id="arm64-no-tsc"),
+            pytest.param(HostArch.X86_64, AccelType.KVM, False, id="x86-kvm-uses-kvmclock"),
+            pytest.param(HostArch.X86_64, AccelType.TCG, True, id="x86-tcg-pins-tsc"),
+            pytest.param(HostArch.AARCH64, AccelType.KVM, False, id="arm64-no-tsc"),
         ],
     )
-    async def test_tsc_clocksource(self, vm_settings, workdir, arch: HostArch, expect_tsc: bool) -> None:
-        """tsc=reliable clocksource=tsc in cmdline on x86, absent on arm64."""
+    async def test_tsc_clocksource(
+        self, vm_settings, workdir, arch: HostArch, accel: AccelType, expect_tsc: bool
+    ) -> None:
+        """x86 KVM keeps kvm-clock (D2: survives a load on a host with another TSC rate);
+        x86 without KVM pins the TSC; arm64 never sets TSC flags."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
-        with _qemu_cmd_mocks():
+        with _qemu_cmd_mocks(accel_type=accel):
             cmd = await build_qemu_cmd(
                 settings=vm_settings,
                 arch=arch,
                 vm_id="test-vm-platform-flags",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         cmdline = _extract_kernel_cmdline(cmd)
@@ -1996,9 +1967,7 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
                 arch=arch,
                 vm_id="test-vm-platform-flags",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert ("-nodefaults" in cmd) == expect_nodefaults
@@ -2030,9 +1999,7 @@ class TestPlatformConditionalFlags(_QemuCmdTestBase):
                 arch=arch,
                 vm_id="test-vm-platform-flags",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         machine = _extract_machine_type(cmd)
@@ -2057,9 +2024,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 snapshot_drive="/tmp/snap.qcow2",
             )
 
@@ -2068,6 +2033,65 @@ class TestOptionalFeatures(_QemuCmdTestBase):
         # init.snap=1 in cmdline
         cmdline = _extract_kernel_cmdline(cmd)
         assert "init.snap=1" in cmdline
+
+    @pytest.mark.parametrize(("direct_write", "expect_read_only"), [(False, True), (True, False)])
+    async def test_snapshot_drive_read_only_outside_build(
+        self, vm_settings, workdir, direct_write: bool, expect_read_only: bool
+    ) -> None:
+        """The shared L2 drive (hd1) is read-only, except while the L2 snapshot is built."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.X86_64,
+                vm_id="test-vm-optional",
+                workdir=workdir,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
+                snapshot_drive="/tmp/snap.qcow2",
+                direct_write=direct_write,
+            )
+
+        drives = [arg for arg in cmd if arg.startswith("file=")]
+        hd1 = next(d for d in drives if "id=hd1," in d)
+        assert ("read-only=on" in hd1.split(",")) == expect_read_only
+
+    async def test_home_disk_drive(self, vm_settings, workdir) -> None:
+        """Every VM has its private raw home disk (serial=home, hd2), never a shared one."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=HostArch.AARCH64,
+                vm_id="test-vm-home",
+                workdir=workdir,
+                spec=VmSpec(language=Language.PYTHON, disk_mb=512),
+            )
+
+        hd2 = next(arg for arg in cmd if "id=hd2," in arg).split(",")
+        assert f"file={workdir.home_disk}" in hd2
+        assert "format=raw" in hd2
+        assert "file.locking=off" not in hd2
+        assert any("drive=hd2,serial=home" in arg for arg in cmd)
+
+    @pytest.mark.parametrize("arch", [HostArch.X86_64, HostArch.AARCH64])
+    async def test_one_vm_shape_mem0_no_balloon(self, vm_settings, workdir, arch: HostArch) -> None:
+        """Every VM: RAM is the explicit backend mem0 and there is no balloon (#62)."""
+        from exec_sandbox.qemu_cmd import build_qemu_cmd
+
+        with _qemu_cmd_mocks():
+            cmd = await build_qemu_cmd(
+                settings=vm_settings,
+                arch=arch,
+                vm_id="test-vm-shape",
+                workdir=workdir,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
+            )
+
+        assert "memory-backend-ram,id=mem0,size=256M" in cmd
+        assert "memory-backend=mem0" in _extract_machine_type(cmd)
+        assert not any("balloon" in arg for arg in cmd)
 
     async def test_no_snapshot_drive(self, vm_settings, workdir) -> None:
         """Without snapshot_drive, no second drive or init.snap."""
@@ -2079,9 +2103,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert not any("serial=snap" in arg for arg in cmd)
@@ -2098,9 +2120,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 defer_incoming=True,
             )
 
@@ -2117,9 +2137,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert "-incoming" not in cmd
@@ -2134,9 +2152,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 debug_boot=True,
             )
 
@@ -2155,9 +2171,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 debug_boot=False,
             )
 
@@ -2176,9 +2190,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 direct_write=True,
             )
 
@@ -2195,9 +2207,7 @@ class TestOptionalFeatures(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-optional",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                 direct_write=False,
             )
 
@@ -2223,9 +2233,7 @@ class TestUnshareNamespaces(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-unshare",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert cmd[0] == "unshare"
@@ -2246,13 +2254,11 @@ class TestUnshareNamespaces(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-unshare",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=True,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=True),
             )
 
         assert cmd[0] == "unshare"
-        assert "--net" not in cmd
+        assert "--net" in cmd
         assert "--pid" in cmd
         assert "--fork" in cmd
 
@@ -2266,9 +2272,7 @@ class TestUnshareNamespaces(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-unshare",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert cmd[0] != "unshare"
@@ -2284,9 +2288,7 @@ class TestUnshareNamespaces(_QemuCmdTestBase):
                 arch=HostArch.X86_64,
                 vm_id="test-vm-unshare",
                 workdir=workdir,
-                memory_mb=256,
-                cpu_cores=1,
-                allow_network=False,
+                spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
             )
 
         assert cmd[0] != "unshare"
@@ -2323,12 +2325,9 @@ class TestNetdevReconnectIntegration:
         from exec_sandbox.models import Language
 
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("cp.cloudflare.com",)),
             tenant_id="test-reconnect",
             task_id="integration",
-            memory_mb=256,
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],
         )
 
         # TLS on port 443 with SNI — OutboundAllow only permits TLS
@@ -2374,7 +2373,7 @@ class TestNetdevReconnectIntegration:
             new_proc, _new_log_task = await start_gvproxy(
                 vm_id=vm.vm_id,
                 allowed_domains=["cp.cloudflare.com"],
-                language=vm.language.value,
+                language=vm.spec.language.value,
                 workdir=vm.workdir,
             )
             vm.gvproxy_proc = new_proc
@@ -2419,12 +2418,9 @@ class TestNetdevReconnectIntegration:
         from exec_sandbox.models import Language
 
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("example.com",)),
             tenant_id="test-dns-reconnect",
             task_id="dns-integration",
-            memory_mb=256,
-            allow_network=True,
-            allowed_domains=["example.com"],
         )
 
         dns_code = "import socket\nip = socket.gethostbyname('example.com')\nprint(f'DNS_OK:{ip}')"
@@ -2456,7 +2452,7 @@ class TestNetdevReconnectIntegration:
             new_proc, _ = await start_gvproxy(
                 vm_id=vm.vm_id,
                 allowed_domains=["example.com"],
-                language=vm.language.value,
+                language=vm.spec.language.value,
                 workdir=vm.workdir,
             )
             vm.gvproxy_proc = new_proc
@@ -2874,12 +2870,14 @@ class TestDestroyVmStatus:
         channel.close = AsyncMock()
         vm = QemuVM(
             "context-owned-vm",
-            MagicMock(),
-            None,
-            MagicMock(),
-            channel,
-            Language.PYTHON,
-            deque(maxlen=10),
+            process=MagicMock(),
+            cgroup_path=None,
+            workdir=MagicMock(),
+            channel=channel,
+            spec=VmSpec(language=Language.PYTHON),
+            console_lines=deque(maxlen=10),
+            base_image=Path("/test/base.qcow2"),
+            packages_image=None,
             release_callback=unit_test_vm_manager.destroy_vm,
         )
         reservation = MagicMock()
@@ -2929,11 +2927,20 @@ class TestDestroyVmStatus:
             patch.object(unit_test_vm_manager, "create_vm", new_callable=AsyncMock, return_value=vm),
             patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=False) as destroy,
         ):
-            with pytest.raises(VmPermanentError, match="cleanup was not confirmed"):
+            with pytest.raises(
+                InternalError,
+                check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED,
+                match="cleanup was not confirmed",
+            ):
                 async with unit_test_vm_manager.ephemeral_vm(
-                    Language.PYTHON,
-                    "tenant",
-                    "task",
+                    VmSpec(language=Language.PYTHON),
+                    tenant_id="tenant",
+                    task_id="task",
+                    retry_profile=constants.RETRY_BACKGROUND,
+                    direct_write_target=None,
+                    snapshot_drive=None,
+                    mem_path=None,
+                    mem_path_share=False,
                 ):
                     pass
 
@@ -3065,12 +3072,14 @@ class TestStandaloneVmDestroyStatus:
         workdir.cleanup = AsyncMock(side_effect=[False, True])
         vm = QemuVM(
             "standalone-destroy-vm",
-            process,
-            Path("/cgroup/standalone-destroy-vm"),
-            workdir,
-            channel,
-            Language.PYTHON,
-            deque(maxlen=10),
+            process=process,
+            cgroup_path=Path("/cgroup/standalone-destroy-vm"),
+            workdir=workdir,
+            channel=channel,
+            spec=VmSpec(language=Language.PYTHON),
+            console_lines=deque(maxlen=10),
+            base_image=Path("/test/base.qcow2"),
+            packages_image=None,
         )
 
         with (
@@ -3120,7 +3129,9 @@ class TestPendingLaunchOwnership:
         ):
 
             async def cancelled_reservation() -> None:
-                async with unit_test_vm_manager.reservation_context("cancelled-reservation", 192):
+                async with unit_test_vm_manager.reservation_context(
+                    VmSpec(language=Language.PYTHON), vm_id="cancelled-reservation"
+                ):
                     raise asyncio.CancelledError
 
             task = asyncio.create_task(cancelled_reservation())
@@ -3301,10 +3312,12 @@ class TestPendingLaunchOwnership:
         ):
             with pytest.raises(OSError, match="cgroup"):
                 await unit_test_vm_manager._setup_vm_infra(
-                    Language.PYTHON,
+                    VmSpec(language=Language.PYTHON),
                     "tenant",
                     "task",
                     reservation,
+                    base_image=Path("/fake/base.qcow2"),
+                    home_template=None,
                 )
 
         cleanup.assert_awaited_once()
@@ -3386,9 +3399,7 @@ class TestPendingLaunchOwnership:
                     await unit_test_vm_manager._start_gvproxy_for_vm(
                         infra,
                         pending,
-                        Language.PYTHON,
-                        True,
-                        None,
+                        VmSpec(language=Language.PYTHON, allow_network=True),
                         None,
                     )
 
@@ -3431,15 +3442,21 @@ class TestPendingLaunchOwnership:
                     await unit_test_vm_manager._launch_qemu_vm(
                         infra,
                         pending,
-                        ["qemu-system-test"],
-                        Language.PYTHON,
-                        reservation,
+                        qemu_cmd=["qemu-system-test"],
+                        spec=VmSpec(language=Language.PYTHON),
+                        packages_image=None,
+                        reservation=reservation,
+                        on_boot_log=None,
+                        gvproxy_proc=None,
+                        gvproxy_log_task=None,
+                        pass_fds=(),
                     )
 
             vm = unit_test_vm_manager._vms[pending.vm_id]
             assert vm.process is proc
             assert vm.resource_reservation is reservation
             assert pending.vm_id not in unit_test_vm_manager._pending_launches
+            assert proc.drain_task is vm.qemu_log_task  # cleanup never reads the pipes the drain task reads
         finally:
             vm = unit_test_vm_manager._vms.pop(pending.vm_id, None)
             release_log.set()
@@ -3622,12 +3639,9 @@ class TestVmManagerIntegration:
     async def test_create_and_destroy_vm(self, vm_manager) -> None:
         """Create and destroy a VM."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-1",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3640,12 +3654,9 @@ class TestVmManagerIntegration:
     async def test_vm_execute_code(self, vm_manager, execute_timeout) -> None:
         """Execute code in a VM."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-1",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3669,12 +3680,9 @@ class TestVmManagerIntegration:
         # Create 2 VMs concurrently
         create_tasks = [
             vm_manager.create_vm(
-                language=Language.PYTHON,
+                VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
                 tenant_id="test",
                 task_id=f"test-{i}",
-                memory_mb=256,
-                allow_network=False,
-                allowed_domains=None,
             )
             for i in range(2)
         ]
@@ -3712,12 +3720,9 @@ class TestAllImageTypes:
         from exec_sandbox.system_probes import check_hvf_available, check_kvm_available
 
         vm = await vm_manager.create_vm(
-            language=Language.RAW,
+            VmSpec(language=Language.RAW, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-hwaccel",
             task_id="verify-hwaccel",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3776,8 +3781,20 @@ class TestAllImageTypes:
             kvm_available = await check_kvm_available()
             hvf_available = await check_hvf_available()
 
-            # ARM64 uses plain "host"; x86_64 disables nested virt flags (CVE-2024-50115)
-            expected_cpu = "host" if detect_host_arch() == HostArch.AARCH64 else "host,-svm,-vmx"
+            # ARM64 uses plain "host"; x86_64 uses the fixed AVX2-level model (the cross-host contract)
+            expected_cpu = "host"
+            if detect_host_arch() == HostArch.X86_64:
+                kvm = await check_kvm_available()
+                tsc = await check_tsc_deadline()
+                expected_cpu = ",".join(
+                    [
+                        _X86_MODEL,
+                        *([_X86_KVM_PV] if kvm else []),
+                        *(["+tsc-deadline"] if tsc else []),
+                        f"vendor={detect_host_x86_vendor()}",
+                        "enforce",
+                    ]
+                )
 
             if hvf_available:
                 # macOS with HVF available should use HVF (Hypervisor.framework)
@@ -3805,12 +3822,9 @@ class TestAllImageTypes:
     ) -> None:
         """VM boots and guest agent responds for all image types."""
         vm = await vm_manager.create_vm(
-            language=language,
+            VmSpec(language=language, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id=f"health-check-{language.value}",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3836,12 +3850,9 @@ class TestAllImageTypes:
     ) -> None:
         """VM executes code and returns correct output for all image types."""
         vm = await vm_manager.create_vm(
-            language=language,
+            VmSpec(language=language, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id=f"execute-{language.value}",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3875,12 +3886,9 @@ class TestEmulationMode:
         2. -cpu is NOT 'host' (should be an emulated CPU like 'cortex-a57' or 'qemu64')
         """
         vm = await emulation_vm_manager.create_vm(
-            language=Language.RAW,
+            VmSpec(language=Language.RAW, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-emulation",
             task_id="verify-tcg",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3956,12 +3964,9 @@ class TestEmulationMode:
     ) -> None:
         """VM boots successfully with forced software emulation."""
         vm = await emulation_vm_manager.create_vm(
-            language=language,
+            VmSpec(language=language, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-emulation",
             task_id=f"emulation-boot-{language.value}",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -3981,12 +3986,9 @@ class TestEmulationMode:
     ) -> None:
         """VM executes code correctly with forced software emulation."""
         vm = await emulation_vm_manager.create_vm(
-            language=language,
+            VmSpec(language=language, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-emulation",
             task_id=f"emulation-exec-{language.value}",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -4436,7 +4438,7 @@ class TestExecuteStateRace:
         vm._state = VmState.READY
         vm._state_lock = asyncio.Lock()
         vm.vm_id = "test-vm-123"
-        vm.language = "python"
+        vm.spec = VmSpec(language=Language.PYTHON)
 
         # Use a real state change to trigger the race condition check
         # We patch the state after transition to EXECUTING
@@ -4467,7 +4469,7 @@ class TestExecuteStateRace:
         vm._state = VmState.READY
         vm._state_lock = asyncio.Lock()
         vm.vm_id = "test-vm-123"
-        vm.language = "python"
+        vm.spec = VmSpec(language=Language.PYTHON)
 
         def change_state_to_destroyed():
             """Side effect that simulates destroy() completing."""
@@ -4503,7 +4505,7 @@ class TestExecuteEnvVarValidation:
         vm._state = VmState.READY
         vm._state_lock = asyncio.Lock()
         vm.vm_id = "test-vm-envvar"
-        vm.language = Language.PYTHON
+        vm.spec = VmSpec(language=Language.PYTHON)
         return vm
 
     # -- Control characters (core bug) ------------------------------------
@@ -5420,8 +5422,10 @@ class TestWaitForGuest:
             cgroup_path=None,
             workdir=mock_workdir,
             channel=mock_channel,
-            language="python",
+            spec=VmSpec(language=Language.PYTHON),
             console_lines=deque(maxlen=100),
+            base_image=Path("/test/base.qcow2"),
+            packages_image=None,
         )
 
     async def _wait_with_alive_process(self, vm: QemuVM, alive: asyncio.Event, timeout: float = 5) -> None:
@@ -5769,9 +5773,7 @@ class TestQmpSocketActivation(_QemuCmdTestBase):
             arch=HostArch.X86_64,
             vm_id=vm_id,
             workdir=workdir,
-            memory_mb=256,
-            cpu_cores=1,
-            allow_network=allow_network,
+            spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=allow_network),
             **kwargs,
         )
 

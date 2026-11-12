@@ -26,10 +26,11 @@ import json
 
 import pytest
 
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # Slow under TCG: psutil correctness tests inside guest — package install
 # requires snapshot VM (slow under TCG). All assertions are correctness-only
@@ -40,12 +41,12 @@ PSUTIL_PACKAGES = ["psutil==7.2.1"]
 
 # The default memory allocated to each VM by the scheduler (QEMU -m flag).
 # We use this to cross-validate psutil.virtual_memory().total inside the guest.
-_DEFAULT_MEMORY_MB = SchedulerConfig().default_memory_mb
+_DEFAULT_MEMORY_MB = VmSpec(language=Language.PYTHON).memory_mb
 
 # Kernel reserves memory for its own data structures (page tables, slab caches,
 # reserved memory regions).  On a minimal Alpine Linux VM this overhead is
 # typically 20-40 MB, so /proc/meminfo MemTotal < QEMU -m value.
-# Kernel 6.18 on microvm with virtio_balloon + zram modules loaded shows
+# Kernel 6.18 on microvm with zram module loaded shows
 # ~38 MB overhead on 128 MB VMs. We cap at 30% for small VMs so a severe
 # regression (e.g., QEMU allocating half the requested memory) does not pass.
 _KERNEL_OVERHEAD_MB = 50
@@ -75,11 +76,7 @@ import psutil
 count = psutil.cpu_count(logical=True)
 print(f'CPU_COUNT:{count}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("CPU_COUNT:")[1].strip())
         assert count == DEFAULT_VM_CPU_CORES, f"Expected {DEFAULT_VM_CPU_CORES} vCPU(s) (QEMU -smp), got {count}"
@@ -91,11 +88,7 @@ import psutil
 count = psutil.cpu_count(logical=False)
 print(f'PHYSICAL_CPUS:{count}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         val = result.stdout.split("PHYSICAL_CPUS:")[1].strip()
         assert val != "None", "Expected physical CPU count, got None"
@@ -108,11 +101,7 @@ import psutil
 pct = psutil.cpu_percent(interval=0.1)
 print(f'CPU_PERCENT:{pct}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         pct = float(result.stdout.split("CPU_PERCENT:")[1].strip())
         assert 0.0 <= pct <= 100.0
@@ -126,11 +115,7 @@ print(f'USER:{t.user}')
 print(f'SYSTEM:{t.system}')
 print(f'IDLE:{t.idle}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         for label in ("USER:", "SYSTEM:", "IDLE:"):
             val = float(result.stdout.split(label)[1].split("\n")[0])
@@ -145,11 +130,7 @@ print(f'USER_PCT:{tp.user}')
 print(f'SYSTEM_PCT:{tp.system}')
 print(f'IDLE_PCT:{tp.idle}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         for label in ("USER_PCT:", "SYSTEM_PCT:", "IDLE_PCT:"):
             val = float(result.stdout.split(label)[1].split("\n")[0])
@@ -165,11 +146,7 @@ print(f'INTERRUPTS:{stats.interrupts}')
 print(f'SOFT_INTERRUPTS:{stats.soft_interrupts}')
 print(f'SYSCALLS:{stats.syscalls}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         ctx = int(result.stdout.split("CTX_SWITCHES:")[1].split("\n")[0])
         assert ctx >= 0
@@ -186,11 +163,7 @@ else:
     # Some VMs don't expose frequency — that's fine
     print('HAS_FREQ:False')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "HAS_FREQ:" in result.stdout
 
@@ -203,11 +176,7 @@ print(f'LOAD1:{load1}')
 print(f'LOAD5:{load5}')
 print(f'LOAD15:{load15}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         for label in ("LOAD1:", "LOAD5:", "LOAD15:"):
             val = float(result.stdout.split(label)[1].split("\n")[0])
@@ -231,11 +200,7 @@ print(f'PERCENT:{mem.percent}')
 print(f'USED:{mem.used}')
 print(f'FREE:{mem.free}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         total_bytes = int(result.stdout.split("TOTAL:")[1].split("\n")[0])
         total_mb = total_bytes / (1024 * 1024)
@@ -269,11 +234,7 @@ import json
 print(f'FIELDS:{json.dumps(fields)}')
 print(f'FIELD_COUNT:{len(fields)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("FIELD_COUNT:")[1].strip())
         # Linux should expose at least buffers and cached
@@ -291,11 +252,7 @@ print(f'SWAP_PERCENT:{swap.percent}')
 print(f'SWAP_SIN:{swap.sin}')
 print(f'SWAP_SOUT:{swap.sout}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         total = int(result.stdout.split("SWAP_TOTAL:")[1].split("\n")[0])
         # VM has zram swap
@@ -322,11 +279,8 @@ import psutil
 total_mb = psutil.virtual_memory().total / (1024 * 1024)
 print(f'TOTAL_MB:{total_mb:.1f}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-            memory_mb=memory_mb,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES, memory_mb=memory_mb), code
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         total_mb = float(result.stdout.split("TOTAL_MB:")[1].strip())
@@ -351,11 +305,7 @@ print(f'USED:{usage.used}')
 print(f'FREE:{usage.free}')
 print(f'PERCENT:{usage.percent}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         total = int(result.stdout.split("TOTAL:")[1].split("\n")[0])
         assert total > 0
@@ -374,11 +324,7 @@ usage = psutil.disk_usage('/home/user')
 print(f'TOTAL:{usage.total}')
 print(f'FREE:{usage.free}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         total = int(result.stdout.split("TOTAL:")[1].split("\n")[0])
         assert total > 0
@@ -398,11 +344,7 @@ print(f'HAS_ROOT:{"/" in mountpoints}')
 for p in parts:
     print(f'PART:{p.mountpoint}|{p.fstype}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("COUNT:")[1].split("\n")[0])
         assert count >= 1
@@ -423,11 +365,7 @@ else:
     # /dev/vda removed — psutil may return None, that's acceptable
     print('HAS_IO:False')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "HAS_IO:" in result.stdout
 
@@ -448,11 +386,7 @@ print(f'IFACE_COUNT:{len(interfaces)}')
 print(f'HAS_LO:{"lo" in interfaces}')
 print(f'INTERFACES:{",".join(interfaces)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("IFACE_COUNT:")[1].split("\n")[0])
         assert count >= 1
@@ -467,11 +401,7 @@ for name, st in stats.items():
     print(f'NIC:{name}|isup={st.isup}|mtu={st.mtu}')
 print(f'NIC_COUNT:{len(stats)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("NIC_COUNT:")[1].strip())
         assert count >= 1
@@ -490,11 +420,7 @@ if counters is not None:
 else:
     print('HAS_NET_IO:False')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "HAS_NET_IO:" in result.stdout
 
@@ -510,11 +436,7 @@ except psutil.AccessDenied:
     # Non-root may get AccessDenied — that's acceptable
     print('NET_CONN:ACCESS_DENIED')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "NET_CONN:" in result.stdout
 
@@ -536,11 +458,7 @@ print(f'STATUS:{proc.status()}')
 print(f'UID:{proc.uids().real}')
 print(f'MATCHES_OS_PID:{proc.pid == os.getpid()}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "MATCHES_OS_PID:True" in result.stdout
         assert "STATUS:" in result.stdout
@@ -554,11 +472,7 @@ mem = proc.memory_info()
 print(f'RSS:{mem.rss}')
 print(f'VMS:{mem.vms}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         rss = int(result.stdout.split("RSS:")[1].split("\n")[0])
         vms = int(result.stdout.split("VMS:")[1].split("\n")[0])
@@ -573,11 +487,7 @@ proc = psutil.Process()
 pct = proc.memory_percent(memtype='rss')
 print(f'MEM_PERCENT:{pct}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         pct = float(result.stdout.split("MEM_PERCENT:")[1].strip())
         assert 0.0 < pct <= 100.0
@@ -591,11 +501,7 @@ times = proc.cpu_times()
 print(f'USER:{times.user}')
 print(f'SYSTEM:{times.system}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         user = float(result.stdout.split("USER:")[1].split("\n")[0])
         assert user >= 0.0
@@ -622,11 +528,7 @@ with proc.oneshot():
 import json
 print(f'ONESHOT:{json.dumps(info)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         data = json.loads(result.stdout.split("ONESHOT:")[1].strip())
         assert data["pid"] > 0
@@ -643,11 +545,7 @@ d['memory_info'] = str(d['memory_info'])
 d['cpu_times'] = str(d['cpu_times'])
 print(f'AS_DICT:{json.dumps(d)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         data = json.loads(result.stdout.split("AS_DICT:")[1].strip())
         assert data["pid"] > 0
@@ -665,11 +563,7 @@ print(f'HAS_PID_1:{1 in pids}')
 procs = list(psutil.process_iter(['pid', 'name']))
 print(f'ITER_COUNT:{len(procs)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         pid_count = int(result.stdout.split("PID_COUNT:")[1].split("\n")[0])
         assert pid_count >= 1
@@ -690,11 +584,7 @@ print(f'HAS_PARENT:{parent is not None}')
 if parent:
     print(f'PARENT_PID:{parent.pid}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "CHILDREN_COUNT:" in result.stdout
         assert "HAS_PARENT:" in result.stdout
@@ -707,11 +597,7 @@ proc = psutil.Process()
 cwd = proc.cwd()
 print(f'CWD:{cwd}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         cwd = result.stdout.split("CWD:")[1].strip()
         assert len(cwd) > 0
@@ -738,11 +624,7 @@ try:
 except psutil.AccessDenied:
     print('PSUTIL_DUMPABLE:blocked')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "HAS_PATH:True" in result.stdout
         # Parse ENV_COUNT from the line (not the whole output)
@@ -772,11 +654,7 @@ with open(fname) as fh:
     print(f'OPEN_COUNT:{len(files)}')
     print(f'FOUND_FILE:{fname in paths}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("OPEN_COUNT:")[1].split("\n")[0])
         assert count >= 1, "Expected at least one open file"
@@ -805,11 +683,7 @@ else:
         # Acceptable if /proc/[pid]/io is restricted
         print('IO_OK:ACCESS_DENIED')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "IO_OK:" in result.stdout
 
@@ -821,11 +695,7 @@ proc = psutil.Process()
 print(f'NUM_THREADS:{proc.num_threads()}')
 print(f'NUM_FDS:{proc.num_fds()}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         threads = int(result.stdout.split("NUM_THREADS:")[1].split("\n")[0])
         assert threads >= 1
@@ -842,11 +712,7 @@ print(f'THREAD_COUNT:{len(threads)}')
 for t in threads[:3]:
     print(f'THREAD:{t.id}|user={t.user_time}|sys={t.system_time}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("THREAD_COUNT:")[1].split("\n")[0])
         assert count >= 1
@@ -870,11 +736,7 @@ temps = psutil.sensors_temperatures()
 print(f'TYPE:{type(temps).__name__}')
 print(f'COUNT:{len(temps)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "TYPE:dict" in result.stdout
 
@@ -886,11 +748,7 @@ fans = psutil.sensors_fans()
 print(f'TYPE:{type(fans).__name__}')
 print(f'COUNT:{len(fans)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "TYPE:dict" in result.stdout
 
@@ -901,11 +759,7 @@ import psutil
 battery = psutil.sensors_battery()
 print(f'BATTERY:{battery}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "BATTERY:None" in result.stdout
 
@@ -925,11 +779,7 @@ now = time.time()
 print(f'BOOT_TIME:{boot}')
 print(f'REASONABLE:{0 < boot <= now}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "REASONABLE:True" in result.stdout
 
@@ -940,11 +790,7 @@ import psutil
 users = psutil.users()
 print(f'USER_COUNT:{len(users)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "USER_COUNT:" in result.stdout
 
@@ -955,11 +801,7 @@ import psutil
 print(f'PID1_EXISTS:{psutil.pid_exists(1)}')
 print(f'BOGUS_PID:{psutil.pid_exists(999999)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # PID 1 hidden by hidepid=2 (root-owned, invisible to UID 1000)
         assert "PID1_EXISTS:False" in result.stdout
@@ -1004,11 +846,8 @@ all_ok = all(v is not None for v in info.values())
 print(f'ALL_OK:{all_ok}')
 print(f'OVERVIEW:{json.dumps(info)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-            timeout_seconds=30,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code, timeout_seconds=30
         )
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ALL_OK:True" in result.stdout, f"Some psutil values missing:\n{result.stdout}"
@@ -1053,11 +892,7 @@ print(f'SYS_TOTAL_MB:{sys_mem.total / 1024 / 1024:.0f}')
 print(f'SYS_AVAIL_MB:{sys_mem.available / 1024 / 1024:.0f}')
 print(f'JUPYTER_OK:True')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "JUPYTER_OK:True" in result.stdout
         rss = float(result.stdout.split("RSS_MB:")[1].split("\n")[0])
@@ -1094,11 +929,7 @@ print(f'AVAIL_MB:{avail_mb:.1f}')
 print(f'NUM_WORKERS:{num_workers}')
 print(f'ML_DETECT_OK:True')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ML_DETECT_OK:True" in result.stdout
         cpu = int(result.stdout.split("CPU_COUNT:")[1].split("\n")[0])
@@ -1130,11 +961,7 @@ print(f'PROC_COUNT:{len(procs)}')
 pid1_found = any(p['pid'] == 1 for p in procs)
 print(f'PID1_FOUND:{pid1_found}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("PROC_COUNT:")[1].split("\n")[0])
         assert count >= 1
@@ -1177,10 +1004,6 @@ print(f'PID1_FOUND:{pid1_found}')
     )
     async def test_one_liner_checks(self, scheduler: Scheduler, code: str, check: str) -> None:
         """Quick smoke tests for common psutil one-liner patterns."""
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=PSUTIL_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert check in result.stdout

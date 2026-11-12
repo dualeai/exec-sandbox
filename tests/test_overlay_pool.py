@@ -12,9 +12,12 @@ import os
 import shutil
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from exec_sandbox.vm_spec import VmSpec
 
 # ============================================================================
 # Unit Tests - Pure Logic (no I/O, no mocks)
@@ -924,11 +927,7 @@ class TestOverlayPoolIntegration:
         from exec_sandbox.models import Language
 
         # vm_manager fixture already calls start() and stop()
-        vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
-            tenant_id="test",
-            task_id="pool-test",
-        )
+        vm = await vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="pool-test")
 
         try:
             result = await vm.execute("print('hello from pool')", timeout_seconds=execute_timeout)
@@ -951,9 +950,7 @@ class TestOverlayPoolIntegration:
             vms = []
             for i in range(3):
                 vm = await vm_manager.create_vm(
-                    language=Language.PYTHON,
-                    tenant_id="test",
-                    task_id=f"exhaust-{i}",
+                    VmSpec(language=Language.PYTHON), tenant_id="test", task_id=f"exhaust-{i}"
                 )
                 vms.append(vm)
 

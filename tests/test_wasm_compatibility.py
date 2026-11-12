@@ -26,6 +26,8 @@ See:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -55,7 +57,7 @@ console.log("ADD:" + inst.exports.add(3, 4));
 console.log("ADD_ZERO:" + inst.exports.add(0, 0));
 console.log("ADD_NEG:" + inst.exports.add(-1, 1));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ADD:7" in result.stdout
         assert "ADD_ZERO:0" in result.stdout
@@ -78,7 +80,7 @@ const bytes = new Uint8Array([
 const { instance } = await WebAssembly.instantiate(bytes);
 console.log("ANSWER:" + instance.exports.answer());
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ANSWER:42" in result.stdout
 
@@ -102,7 +104,7 @@ console.log("MUL:" + inst.exports.mul(6, 7));
 console.log("MUL_ZERO:" + inst.exports.mul(99, 0));
 console.log("MUL_NEG:" + inst.exports.mul(-3, 5));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "MUL:42" in result.stdout
         assert "MUL_ZERO:0" in result.stdout
@@ -140,7 +142,7 @@ const inst = new WebAssembly.Instance(mod);
 console.log("ADD:" + inst.exports.add(10, 3));
 console.log("SUB:" + inst.exports.sub(10, 3));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ADD:13" in result.stdout
         assert "SUB:7" in result.stdout
@@ -182,7 +184,7 @@ console.log("LOAD:" + inst.exports.load(0));
 inst.exports.store(4, 99999);
 console.log("LOAD4:" + inst.exports.load(4));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "LOAD:12345" in result.stdout
         assert "LOAD4:99999" in result.stdout
@@ -198,7 +200,7 @@ console.log("V0:" + view[0]);
 console.log("V1:" + view[1]);
 console.log("BYTES:" + mem.buffer.byteLength);
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "V0:42" in result.stdout
         assert "V1:100" in result.stdout
@@ -213,7 +215,7 @@ const old = mem.grow(2);
 console.log("OLD_PAGES:" + old);
 console.log("AFTER:" + (mem.buffer.byteLength / 65536));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "BEFORE:1" in result.stdout
         assert "OLD_PAGES:1" in result.stdout
@@ -264,7 +266,7 @@ const inst = new WebAssembly.Instance(mod, imports);
 inst.exports.run();
 console.log("RECEIVED:" + received);
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RECEIVED:1234" in result.stdout
 
@@ -282,7 +284,7 @@ class TestWasmApi:
 const valid = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 console.log("VALID:" + WebAssembly.validate(valid));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "VALID:true" in result.stdout
 
@@ -292,7 +294,7 @@ console.log("VALID:" + WebAssembly.validate(valid));
 const garbage = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
 console.log("INVALID:" + WebAssembly.validate(garbage));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INVALID:false" in result.stdout
 
@@ -306,7 +308,7 @@ try {
   console.log("ERROR:" + e.constructor.name);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "ERROR:CompileError" in result.stdout
 
@@ -319,7 +321,7 @@ console.log("GET0:" + table.get(0));
 table.grow(3);
 console.log("AFTER_GROW:" + table.length);
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "LENGTH:2" in result.stdout
         assert "GET0:null" in result.stdout
@@ -342,7 +344,7 @@ try {
   console.log("WRITE:rejected");
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "INIT:10" in result.stdout
         assert "MUTATED:99" in result.stdout
@@ -376,7 +378,7 @@ console.log("IS_MODULE:" + (mod instanceof WebAssembly.Module));
 const inst = new WebAssembly.Instance(mod);
 console.log("F:" + inst.exports.f());
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "IS_MODULE:true" in result.stdout
         assert "F:7" in result.stdout
@@ -396,7 +398,7 @@ const { module, instance } = await WebAssembly.instantiateStreaming(resp);
 console.log("HAS_MODULE:" + (module instanceof WebAssembly.Module));
 console.log("G:" + instance.exports.g());
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "HAS_MODULE:true" in result.stdout
         assert "G:9" in result.stdout
@@ -434,7 +436,7 @@ const bytes = new Uint8Array([
 ]);
 console.log("SIMD_VALID:" + WebAssembly.validate(bytes));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "SIMD_VALID:true" in result.stdout
 
@@ -496,7 +498,7 @@ inst.exports.add_vecs();
 const r = [view[8], view[9], view[10], view[11]];
 console.log("SIMD_RESULT:" + r.join(","));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "SIMD_RESULT:11,22,33,44" in result.stdout
 
@@ -544,7 +546,7 @@ try {
   console.log("CAUGHT:" + e.message);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "CAUGHT:wasm_exception" in result.stdout
 
@@ -557,7 +559,7 @@ class TestWasmSession:
 
     async def test_wasm_instance_persists_across_exec(self, scheduler: Scheduler) -> None:
         """Compile in one exec(), use in the next."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             # First exec: compile and instantiate
             r1 = await session.exec("""\
 const bytes = new Uint8Array([
@@ -603,7 +605,7 @@ console.log("WRAP:" + inst.exports.add(2147483647, 1));
 // Large negative + large negative wraps through zero
 console.log("NEG_WRAP:" + inst.exports.add(-2147483648, -1));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "WRAP:-2147483648" in result.stdout
         assert "NEG_WRAP:2147483647" in result.stdout
@@ -643,7 +645,7 @@ try {
   console.log("NEG:" + e.constructor.name);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "VALID:0" in result.stdout
         assert "OOB:RuntimeError" in result.stdout
@@ -666,7 +668,7 @@ try {
 }
 console.log("PAGES:" + (mem.buffer.byteLength / 65536));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "GROW1:1" in result.stdout
         # Either returns -1 (spec) or throws RangeError (JSC)
@@ -700,7 +702,7 @@ try {
   console.log("TYPE:" + e.constructor.name);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # Missing imports should throw LinkError or TypeError
         assert "LINK:" in result.stdout
@@ -731,7 +733,7 @@ try {
   console.log("TRAP:" + e.constructor.name);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "TRAP:RuntimeError" in result.stdout
 
@@ -755,7 +757,7 @@ try {
   console.log("STACK:" + e.constructor.name);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "STACK:RangeError" in result.stdout
 
@@ -789,7 +791,7 @@ try {
   console.log("OVERFLOW:" + e.constructor.name);
 }
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "DIV:3" in result.stdout
         assert "ZERO:RuntimeError" in result.stdout
@@ -822,7 +824,7 @@ b.exports.store(0, 222);
 console.log("A:" + a.exports.load(0));
 console.log("B:" + b.exports.load(0));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "A:111" in result.stdout
         assert "B:222" in result.stdout

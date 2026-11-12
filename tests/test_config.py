@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.platform_utils import get_cache_dir
+from exec_sandbox.platform_utils import UserDir, get_user_dir
 
 # ============================================================================
 # Config Validation
@@ -25,13 +25,15 @@ class TestSchedulerConfigValidation:
         """SchedulerConfig has sensible defaults."""
         config = SchedulerConfig()
         assert config.warm_pool_size == 0
-        assert config.default_memory_mb == 192
         assert config.default_timeout_seconds == 30
         assert config.images_dir is None
-        assert config.disk_snapshot_cache_dir == get_cache_dir() / "disk-snapshots"
+        assert (
+            config.disk_snapshot_cache_dir
+            == get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "disk-snapshots"
+        )
         assert config.s3_bucket is None
         assert config.s3_region == "us-east-1"
-        assert config.s3_prefix == "snapshots/"
+        assert config.s3_snapshot_prefix == "snapshots/"
         assert config.enable_package_validation is True
 
     def test_warm_pool_size_range(self) -> None:
@@ -47,20 +49,6 @@ class TestSchedulerConfigValidation:
         # Invalid: negative
         with pytest.raises(ValidationError):
             SchedulerConfig(warm_pool_size=-1)
-
-    def test_default_memory_mb_range(self) -> None:
-        """default_memory_mb must be >= 128."""
-        # Valid: min
-        config = SchedulerConfig(default_memory_mb=128)
-        assert config.default_memory_mb == 128
-
-        # Valid: large value (no upper bound)
-        config = SchedulerConfig(default_memory_mb=8192)
-        assert config.default_memory_mb == 8192
-
-        # Invalid: < 128
-        with pytest.raises(ValidationError):
-            SchedulerConfig(default_memory_mb=127)
 
     def test_default_timeout_seconds_range(self) -> None:
         """default_timeout_seconds must be 1-300."""
@@ -99,11 +87,11 @@ class TestSchedulerConfigS3:
         config = SchedulerConfig(
             s3_bucket="my-bucket",
             s3_region="eu-west-1",
-            s3_prefix="cache/",
+            s3_snapshot_prefix="cache/",
         )
         assert config.s3_bucket == "my-bucket"
         assert config.s3_region == "eu-west-1"
-        assert config.s3_prefix == "cache/"
+        assert config.s3_snapshot_prefix == "cache/"
 
     def test_s3_disabled_by_default(self) -> None:
         """S3 is disabled when bucket is None."""
@@ -126,8 +114,8 @@ class TestSchedulerConfigCacheDir:
             assert str(config.disk_snapshot_cache_dir).startswith("/env/cache")
             assert str(config.memory_snapshot_cache_dir).startswith("/env/cache")
 
-    def test_explicit_override_bypasses_get_cache_dir(self) -> None:
-        """Explicit path overrides get_cache_dir() factory default."""
+    def test_explicit_override_bypasses_user_cache_dir(self) -> None:
+        """Explicit path overrides the get_user_dir(kind=UserDir.CACHE) factory default."""
         config = SchedulerConfig(
             disk_snapshot_cache_dir=Path("/explicit/disk"),
             memory_snapshot_cache_dir=Path("/explicit/memory"),

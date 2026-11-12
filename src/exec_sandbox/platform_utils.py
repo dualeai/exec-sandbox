@@ -12,13 +12,25 @@ import ctypes
 import ctypes.util
 import os
 import platform
-from enum import Enum, auto
+import pwd
+import subprocess
+from enum import Enum, StrEnum, auto
 from functools import cache
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Final
 
 import psutil
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+_CHILD_ENV_BLACKLIST: Final = (
+    "EXEC_SANDBOX", "KEY", "SECRET", "TOKEN", "PASS", "PWD", "CRED", "AUTH", "URL", "PROXY", "DSN", "CONN", "HEADER",
+)  # fmt: skip
+
+
+def child_env() -> dict[str, str]:
+    """Library env minus every EXEC_SANDBOX_* var and every var whose name suggests a secret,
+    URL or proxy; no child needs one."""
+    return {k: v for k, v in os.environ.items() if not any(word in k.upper() for word in _CHILD_ENV_BLACKLIST)}
 
 
 class HostOS(Enum):
@@ -61,6 +73,10 @@ def detect_host_os() -> HostOS:
     return HostOS.UNKNOWN
 
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
 class HostArch(Enum):
     """Supported host CPU architectures."""
 
@@ -100,6 +116,43 @@ def detect_host_arch() -> HostArch:
     return HostArch.UNKNOWN
 
 
+@cache
+def detect_host_x86_vendor() -> str:
+    """CPUID vendor of the host CPU ("GenuineIntel" or "AuthenticAMD").
+
+    x86 guests get the host vendor (KVM runs best with matching vendors). A
+    non-x86 host runs x86 guests under TCG and gets qemu64's own vendor.
+    """
+    if detect_host_arch() != HostArch.X86_64:
+        return "AuthenticAMD"
+    if detect_host_os() == HostOS.MACOS:
+        return subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.vendor"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=child_env(),
+        ).stdout.strip()
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("vendor_id"):
+            return line.split(":", 1)[1].strip()
+    return "AuthenticAMD"
+
+
+def kernel_image_path(kernel_dir: Path, arch: HostArch) -> Path:
+    """Return the kernel image QEMU boots for this architecture.
+
+    x86_64 prefers the uncompressed vmlinux (PVH direct boot, ~50ms faster) when
+    present; other cases use vmlinuz. Shared by the QEMU command builder and the
+    L1 cache key so the key always fingerprints the kernel actually booted.
+    """
+    arch_suffix = "aarch64" if arch == HostArch.AARCH64 else "x86_64"
+    vmlinux_path = kernel_dir / f"vmlinux-{arch_suffix}"
+    if arch == HostArch.X86_64 and vmlinux_path.exists():
+        return vmlinux_path
+    return kernel_dir / f"vmlinuz-{arch_suffix}"
+
+
 def get_os_name() -> str:
     """Get OS name string for binary naming conventions.
 
@@ -118,57 +171,87 @@ def get_os_name() -> str:
             raise ValueError("Unsupported OS")
 
 
-def get_arch_name(convention: Literal["kernel", "go"] = "kernel") -> str:
-    """Get architecture string for naming conventions.
-
-    Args:
-        convention: "kernel" for x86_64/aarch64 (Linux kernel style),
-                   "go" for amd64/arm64 (Go toolchain style)
+def get_arch_name() -> str:
+    """Get the host architecture in the Linux kernel's names.
 
     Returns:
-        Architecture string in requested convention
+        "x86_64" or "aarch64"
 
     Raises:
         ValueError: If running on unsupported architecture
     """
     arch = detect_host_arch()
-    match (convention, arch):
-        case ("go", HostArch.X86_64):
-            return "amd64"
-        case ("go", HostArch.AARCH64):
-            return "arm64"
-        case ("kernel", HostArch.X86_64):
+    match arch:
+        case HostArch.X86_64:
             return "x86_64"
-        case ("kernel", HostArch.AARCH64):
+        case HostArch.AARCH64:
             return "aarch64"
         case _:
             raise ValueError(f"Unsupported architecture: {arch}")
 
 
-def get_cache_dir(app_name: str = "exec-sandbox") -> Path:
-    """Get platform-specific cache directory.
+class UserDir(StrEnum):
+    """Kind of per-user folder. The cost of lost files decides where each kind goes."""
+
+    CACHE = "cache"
+    """Files the library can make again (images, snapshots). macOS may delete files in
+    ~/Library/Caches when the disk is nearly full, and users clear ~/.cache freely."""
+
+    DATA = "data"
+    """Files the library cannot make again (the "local" instance store)."""
+
+
+# kind -> (override env var, folder under the macOS home, XDG env var, folder under the home elsewhere)
+_USER_DIR_RULES: Final[dict[UserDir, tuple[str | None, tuple[str, ...], str, tuple[str, ...]]]] = {
+    UserDir.CACHE: ("EXEC_SANDBOX_CACHE_DIR", ("Library", "Caches"), "XDG_CACHE_HOME", (".cache",)),
+    UserDir.DATA: (None, ("Library", "Application Support"), "XDG_DATA_HOME", (".local", "share")),
+}
+
+
+def get_user_dir(*, kind: UserDir, app_name: str) -> Path:
+    """Get the per-user folder of this kind for the app.
 
     Returns:
-        - macOS: ~/Library/Caches/<app_name>/
-        - Linux: ~/.cache/<app_name>/ (or $XDG_CACHE_HOME/<app_name>/)
+        - macOS: ~/Library/Caches/<app_name>/ or ~/Library/Application Support/<app_name>/
+        - Linux: $XDG_CACHE_HOME/<app_name>/ or $XDG_DATA_HOME/<app_name>/ when the value is an
+          absolute path; else ~/.cache/<app_name>/ or ~/.local/share/<app_name>/
+        - Other: ~/.cache/<app_name>/ or ~/.local/share/<app_name>/
 
-    Override with EXEC_SANDBOX_CACHE_DIR environment variable.
+    "~" is Path.home() (HOME when it is set). Override CACHE with the EXEC_SANDBOX_CACHE_DIR
+    environment variable. DATA has no override here: callers take theirs from settings
+    (instance_store_dir). For a path that ignores the environment, use get_account_dir.
     """
-    if env_path := os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
+    return _user_dir(kind=kind, app_name=app_name, home=Path.home(), env=os.environ)
+
+
+def get_account_dir(*, kind: UserDir, app_name: str) -> Path:
+    """The default per-user folder of this kind for the effective user: the home from the user
+    database, and no environment override (HOME, XDG_*, EXEC_SANDBOX_CACHE_DIR are ignored).
+
+    Every process of one account gets the same path, whatever its environment (an IDE task,
+    a shell, another HOME): use it for a lock those processes must share. A process under
+    `sudo` (also `sudo -E`) runs as root and gets root's folder.
+    """
+    return _user_dir(kind=kind, app_name=app_name, home=Path(pwd.getpwuid(os.geteuid()).pw_dir), env={})
+
+
+def _user_dir(*, kind: UserDir, app_name: str, home: Path, env: Mapping[str, str]) -> Path:
+    override_env, macos_parts, xdg_env, home_parts = _USER_DIR_RULES[kind]
+    if override_env and (env_path := env.get(override_env)):
         return Path(env_path)
 
     match detect_host_os():
         case HostOS.MACOS:
-            return Path.home() / "Library" / "Caches" / app_name
+            return home.joinpath(*macos_parts, app_name)
         case HostOS.LINUX:
-            # XDG_CACHE_HOME takes precedence if set
-            xdg_cache = os.environ.get("XDG_CACHE_HOME")
-            if xdg_cache:
-                return Path(xdg_cache) / app_name
-            return Path.home() / ".cache" / app_name
+            # XDG Base Directory spec: an empty or relative value is invalid and is ignored
+            xdg_home = env.get(xdg_env, "")
+            if Path(xdg_home).is_absolute():
+                return Path(xdg_home) / app_name
+            return home.joinpath(*home_parts, app_name)
         case _:
             # Fallback for other platforms
-            return Path.home() / ".cache" / app_name
+            return home.joinpath(*home_parts, app_name)
 
 
 # ---------------------------------------------------------------------------

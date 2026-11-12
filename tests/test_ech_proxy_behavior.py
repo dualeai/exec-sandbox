@@ -20,6 +20,8 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 from .conftest import (
     JS_SAFETY,
@@ -242,11 +244,8 @@ async def test_ech_allowed(
 ) -> None:
     """TLS connection to allowed domain succeeds through proxy."""
     code = _get_connection_code(language, domain, tls_version)
-    result = await scheduler.run(
-        code=code,
-        language=language,
-        allow_network=True,
-        allowed_domains=allowed_domains,
+    result = await run_once(
+        scheduler, VmSpec(language=language, allow_network=True, allowed_domains=allowed_domains), code
     )
     assert "CONNECTED" in result.stdout, (
         f"{language.value} TLS {tls_version} to {domain} should succeed.\n"
@@ -292,11 +291,8 @@ async def test_ech_blocked(
 ) -> None:
     """TLS connection to non-allowed domain is blocked."""
     code = _get_connection_code(language, domain, tls_version, retries=False)
-    result = await scheduler.run(
-        code=code,
-        language=language,
-        allow_network=True,
-        allowed_domains=allowed_domains,
+    result = await run_once(
+        scheduler, VmSpec(language=language, allow_network=True, allowed_domains=allowed_domains), code
     )
     assert "BLOCKED" in result.stdout, (
         f"{language.value} TLS {tls_version} to {domain} should be blocked.\n"
@@ -348,11 +344,8 @@ async def test_curl_advanced_tls(
 ) -> None:
     """curl connects with advanced TLS handshake parameters."""
     code = _curl_tls_code(domain, tls_version, extra_flags)
-    result = await scheduler.run(
-        code=code,
-        language=Language.RAW,
-        allow_network=True,
-        allowed_domains=[domain],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.RAW, allow_network=True, allowed_domains=[domain]), code
     )
     assert "CONNECTED" in result.stdout, (
         f"curl ({extra_flags}) to {domain} should succeed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -377,11 +370,8 @@ async def test_tls_version_diagnostic(
 ) -> None:
     """Python ssl reports the expected TLS version was negotiated."""
     code = _python_tls_code(domain, tls_version)
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=[domain],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=[domain]), code
     )
     assert f"CONNECTED:{expected_proto}" in result.stdout, (
         f"Expected {expected_proto} with {domain} (forced {tls_version}).\n"
@@ -433,11 +423,8 @@ async def test_curl_verbose_tls_negotiation(
         f'https://{domain}/ -o /dev/null 2>&1 | grep "SSL connection using" '
         f'&& echo "CONNECTED" || echo "BLOCKED"'
     )
-    result = await scheduler.run(
-        code=code,
-        language=Language.RAW,
-        allow_network=True,
-        allowed_domains=[domain],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.RAW, allow_network=True, allowed_domains=[domain]), code
     )
     assert "CONNECTED" in result.stdout, (
         f"curl TLS {tls_version} should connect to {domain}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -470,11 +457,12 @@ try {{
     console.log("BLOCKED:one:" + e.name);
 }}"""
     )
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-        allow_network=True,
-        allowed_domains=[ECH_DOMAIN_CLOUDFLARE, ECH_DOMAIN_ONE],
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.JAVASCRIPT, allow_network=True, allowed_domains=[ECH_DOMAIN_CLOUDFLARE, ECH_DOMAIN_ONE]
+        ),
+        code,
     )
     assert "CONNECTED:cloudflare:" in result.stdout, (
         f"Bun should connect to {ECH_DOMAIN_CLOUDFLARE}.\nstdout: {result.stdout}\nstderr: {result.stderr}"

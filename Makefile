@@ -58,7 +58,7 @@ install-seek:
 	@curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
 
 install-deps:
-	uv sync --extra dev --extra s3
+	uv sync --extra dev --extra s3 --extra cli
 
 # Build QEMU from source (Linux CI only — Ubuntu 24.04 ships 8.2.2 with ARM64 TCG bugs)
 # Usage: make build-qemu [QEMU_PREFIX=~/qemu-build]

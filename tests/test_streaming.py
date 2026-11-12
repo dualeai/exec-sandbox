@@ -30,11 +30,7 @@ class TestStreamingContract:
         stdout_chunks: list[str] = []
 
         code = "\n".join(f'print("line {i}")' for i in range(100))
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -49,11 +45,7 @@ import sys
 for i in range(100):
     print(f"err {i}", file=sys.stderr)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stderr=stderr_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stderr=stderr_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stderr_chunks)
@@ -79,11 +71,7 @@ for i in range(5):
     print(f"chunk {i}", flush=True)
     time.sleep(0.1)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=on_stdout,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=on_stdout)
 
         assert result.exit_code == 0
         # Multiple chunks arrived
@@ -103,9 +91,10 @@ for i in range(10):
     print(f"out {i}")
     print(f"err {i}", file=sys.stderr)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            code,
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
@@ -142,11 +131,7 @@ time.sleep(1.0)
 print("late")
 """
         start = time.monotonic()
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=on_stdout,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=on_stdout)
         end = time.monotonic()
 
         assert result.exit_code == 0
@@ -176,11 +161,7 @@ import sys
 sys.stdout.write("A" * 65535)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -195,11 +176,7 @@ import sys
 sys.stdout.write("A" * 65536)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -214,11 +191,7 @@ import sys
 sys.stdout.write("A" * 65537)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -268,9 +241,10 @@ sys.stderr.flush()
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
-        result = await scheduler.run(
-            code="x = 42",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            "x = 42",
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
@@ -288,9 +262,10 @@ sys.stderr.flush()
 import sys
 print("error line", file=sys.stderr)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            code,
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
@@ -305,9 +280,10 @@ print("error line", file=sys.stderr)
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
-        result = await scheduler.run(
-            code='print("hello")',
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            'print("hello")',
             on_stdout=stdout_chunks.append,
             on_stderr=stderr_chunks.append,
         )
@@ -332,11 +308,7 @@ import sys
 sys.stderr.write("no-newline")
 sys.stderr.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stderr=stderr_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stderr=stderr_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stderr_chunks)
@@ -355,10 +327,8 @@ class TestStreamingWeirdCases:
         def exploding_callback(_chunk: str) -> None:
             raise RuntimeError("callback boom")
 
-        result = await scheduler.run(
-            code='print("hello from stdout")',
-            language=Language.PYTHON,
-            on_stdout=exploding_callback,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), 'print("hello from stdout")', on_stdout=exploding_callback
         )
         assert result.exit_code == 0
         assert "hello from stdout" in result.stdout
@@ -369,9 +339,10 @@ class TestStreamingWeirdCases:
         def exploding_callback(_chunk: str) -> None:
             raise RuntimeError("callback boom")
 
-        result = await scheduler.run(
-            code='import sys; print("hello from stderr", file=sys.stderr)',
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            'import sys; print("hello from stderr", file=sys.stderr)',
             on_stderr=exploding_callback,
         )
         assert result.exit_code == 0
@@ -398,11 +369,7 @@ for i in range(5):
             explode_on_second(chunk)
 
         stdout_chunks: list[str] = []
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=collecting_callback,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=collecting_callback)
         assert result.exit_code == 0
         # All lines collected in result regardless of callback failure
         for i in range(5):
@@ -418,11 +385,7 @@ import sys
 sys.stdout.write("A" * {target})
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -444,11 +407,7 @@ fake_msgs = [
 for msg in fake_msgs:
     print(json.dumps(msg))
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -469,11 +428,7 @@ sys.stdout.write("lf\n")
 sys.stdout.write("mixed\r\n\n\r")
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -490,11 +445,7 @@ import sys
 sys.stdout.write("before\x00after\n")
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -512,11 +463,7 @@ print("中文测试")
 print("café résumé naïve")
 print("a\\u0301")  # a + combining accent
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -536,11 +483,7 @@ for i in range(10):
     sys.stdout.write("Y" * 32768)
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -566,11 +509,8 @@ print("before-timeout", flush=True)
 time.sleep({timeout * 4})
 print("after-timeout")
 """
-        await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=timeout,
-            on_stdout=stdout_chunks.append,
+        await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=timeout, on_stdout=stdout_chunks.append
         )
 
         joined = "".join(stdout_chunks)
@@ -581,10 +521,8 @@ print("after-timeout")
         """Sub-5ms code still delivers output via final flush."""
         stdout_chunks: list[str] = []
 
-        result = await scheduler.run(
-            code='print("fast")',
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), 'print("fast")', on_stdout=stdout_chunks.append
         )
 
         assert result.exit_code == 0
@@ -601,11 +539,7 @@ import os
 print("before-crash", flush=True)
 os._exit(42)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 42
         joined = "".join(stdout_chunks)
@@ -621,11 +555,7 @@ import sys
 sys.stdout.write("D" * {target_size})
 sys.stdout.flush()
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            on_stdout=stdout_chunks.append,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         assert result.exit_code == 0
         joined = "".join(stdout_chunks)
@@ -634,7 +564,7 @@ sys.stdout.flush()
 
     async def test_session_streaming_isolation(self, scheduler: Scheduler) -> None:
         """Session exec 1 chunks don't leak into exec 2."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # First execution
             chunks_1: list[str] = []
             result_1 = await session.exec(

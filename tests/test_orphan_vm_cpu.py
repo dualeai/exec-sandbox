@@ -30,6 +30,7 @@ from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_vm_processes
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import skip_unless_hwaccel
 from tests.cpu_helpers import (
     assert_cpu_idle,
@@ -79,12 +80,9 @@ class TestOrphanVmCpu:
         POLLHUP and back off, keeping CPU usage minimal.
         """
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-orphan",
             task_id="idle-test",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -109,12 +107,9 @@ class TestOrphanVmCpu:
         Tests that both QEMU and gvproxy processes stay idle when orphaned.
         """
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("example.com",)),
             tenant_id="test-orphan-net",
             task_id="idle-net-test",
-            memory_mb=256,
-            allow_network=True,
-            allowed_domains=["example.com"],
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -149,12 +144,9 @@ class TestOrphanVmCpu:
             # Create VMs concurrently
             create_tasks = [
                 vm_manager.create_vm(
-                    language=Language.PYTHON,
+                    VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
                     tenant_id="test-multi-orphan",
                     task_id=f"vm-{i}",
-                    memory_mb=256,
-                    allow_network=False,
-                    allowed_domains=None,
                 )
                 for i in range(num_vms)
             ]
@@ -185,12 +177,9 @@ class TestOrphanVmCpu:
         the backoff mechanism prevents CPU spikes.
         """
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-orphan-time",
             task_id="extended-test",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -221,12 +210,9 @@ class TestDestroyProcessCleanup:
     async def test_destroy_kills_qemu_process(self, vm_manager: VmManager) -> None:
         """QemuVM.destroy() should terminate the QEMU process."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-destroy",
             task_id="kill-test",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -246,12 +232,9 @@ class TestDestroyProcessCleanup:
     async def test_destroy_kills_gvproxy_process(self, vm_manager: VmManager) -> None:
         """QemuVM.destroy() should terminate the gvproxy process."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("example.com",)),
             tenant_id="test-destroy-net",
             task_id="kill-gvproxy-test",
-            memory_mb=256,
-            allow_network=True,
-            allowed_domains=["example.com"],
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"

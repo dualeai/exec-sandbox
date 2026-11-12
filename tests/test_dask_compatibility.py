@@ -30,6 +30,8 @@ See:
 from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 from .conftest import skip_unless_hwaccel
 
@@ -60,11 +62,7 @@ from dask.system import cpu_count
 count = cpu_count()
 print(f'DASK_CPU:{count}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("DASK_CPU:")[1].strip())
         assert count == DEFAULT_VM_CPU_CORES, (
@@ -79,11 +77,7 @@ print(f'FN:{cpu_count()}')
 print(f'CONST:{CPU_COUNT}')
 print(f'MATCH:{cpu_count() == CPU_COUNT}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "MATCH:True" in result.stdout
 
@@ -109,11 +103,7 @@ bag = db.from_sequence(range(100), npartitions=4)
 result = bag.map(lambda x: x ** 2).sum().compute(scheduler='synchronous')
 print(f'RESULT:{result}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(100)) = 99*100*199/6 = 328350
         assert "RESULT:328350" in result.stdout
@@ -127,11 +117,7 @@ bag = db.from_sequence(range(100), npartitions=4)
 result = bag.map(lambda x: x ** 2).sum().compute(scheduler='threads')
 print(f'RESULT:{result}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RESULT:328350" in result.stdout
 
@@ -144,11 +130,7 @@ bag = db.from_sequence(range(1000), npartitions=16)
 result = bag.map(lambda x: x * 2).filter(lambda x: x % 3 == 0).sum().compute(scheduler='threads')
 print(f'RESULT:{result}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x*2 for x in range(1000) if (x*2) % 3 == 0)
         # = sum(2*x for x in range(1000) if x % 3 == 0)
@@ -182,11 +164,7 @@ def mul(x, y):
 result = mul(add(1, 2), add(3, 4)).compute(scheduler='synchronous')
 print(f'RESULT:{result}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "RESULT:21" in result.stdout
 
@@ -205,11 +183,7 @@ total = dask.delayed(sum)(tasks)
 result = total.compute(scheduler='threads')
 print(f'RESULT:{result}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(10)) = 9*10*19/6 = 285
         assert "RESULT:285" in result.stdout
@@ -245,11 +219,7 @@ high_scores = (
 print(f'COUNT:{len(high_scores)}')
 print(f'NAMES:{sorted(high_scores)}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "COUNT:4" in result.stdout
         assert "NAMES:['alice', 'bob', 'dave', 'eve']" in result.stdout
@@ -271,11 +241,7 @@ result = bag.map(lambda x: x ** 2).sum().compute(scheduler='threads')
 print(f'NPARTITIONS:{CPU_COUNT}')
 print(f'RESULT:{result}')
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            packages=DASK_PACKAGES,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         npartitions = int(result.stdout.split("NPARTITIONS:")[1].split("\n")[0])
         assert npartitions >= 1

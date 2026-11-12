@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, overload
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
-from exec_sandbox.platform_utils import ProcessWrapper
+from exec_sandbox.platform_utils import ProcessWrapper, child_env
 from exec_sandbox.process_registry import register_process, unregister_process
 from exec_sandbox.resource_cleanup import cleanup_process
 
@@ -63,6 +63,7 @@ async def start_managed_process(
                 start_new_session=True,
                 preexec_fn=preexec_fn,
                 pass_fds=pass_fds,
+                env=child_env(),
             )
         )
         # Registration and the optional domain owner callback are synchronous:

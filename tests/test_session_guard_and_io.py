@@ -64,9 +64,10 @@ from exec_sandbox.guest_channel import (
     OperationInbox,
     UnixSocketChannel,
 )
-from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, TimingBreakdown
-from exec_sandbox.qemu_vm import QemuVM
+from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, StartupTiming, TimingBreakdown
+from exec_sandbox.qemu_vm import QemuVM, local_path_error
 from exec_sandbox.session import Session
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 from tests.conftest import make_destroy_mock
 
@@ -91,10 +92,44 @@ def _make_exec_result(exit_code: int = 0) -> ExecutionResult:
         execution_time_ms=1,
         external_cpu_time_ms=None,
         external_memory_peak_mb=None,
-        timing=TimingBreakdown(setup_ms=0, boot_ms=0, execute_ms=1, total_ms=1, connect_ms=0),
+        timing=TimingBreakdown(execute_ms=1, connect_ms=0),
         spawn_ms=None,
         process_ms=None,
     )
+
+
+_STARTUP = StartupTiming(
+    total_ms=1,
+    admission_ms=0,
+    setup_ms=1,
+    boot_ms=0,
+    warm_pool_hit=True,
+    l1_cache_hit=False,
+    l1_restore_ms=None,
+    overlay_ms=0,
+    qemu_cmd_build_ms=0,
+    gvproxy_start_ms=0,
+    qemu_fork_ms=0,
+    guest_wait_ms=0,
+    boot_retries=0,
+    instance_load_ms=None,
+)
+
+
+def _closed_buffer() -> io.BytesIO:
+    buffer = io.BytesIO()
+    buffer.close()
+    return buffer
+
+
+class _SizeIgnoringReader(io.RawIOBase):
+    """A binary stream that breaks the read contract: bytes whatever the size asked."""
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        return b"chunk"
 
 
 def _make_session(
@@ -122,6 +157,11 @@ def _make_session(
     session = Session(
         vm=mock_vm,
         vm_manager=mock_vm_manager,
+        spec=VmSpec(language=Language.PYTHON),
+        startup_timing=_STARTUP,
+        instances=None,
+        instance=None,
+        new_instance_id=None,
         idle_timeout_seconds=idle_timeout_seconds,
         default_timeout_seconds=default_timeout_seconds,
     )
@@ -179,6 +219,83 @@ class TestExecTimeoutValidation:
         await session.exec("print(1)", timeout_seconds=10)
         mock_vm.execute.assert_called_once()
         assert mock_vm.execute.call_args.kwargs["timeout_seconds"] == 10
+
+
+class TestExecCodeSizeValidation:
+    """Code size is checked in Session.exec() before anything reaches the guest."""
+
+    async def test_code_exceeds_limit_rejected(self) -> None:
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="Code too large"):
+            await session.exec("x" * (MAX_CODE_SIZE + 1))
+        mock_vm.execute.assert_not_called()
+
+    async def test_code_at_limit_accepted(self) -> None:
+        session, mock_vm, _ = _make_session()
+        await session.exec("x" * MAX_CODE_SIZE)
+        mock_vm.execute.assert_called_once()
+
+    async def test_startup_timing_and_spec_exposed(self) -> None:
+        session, _, _ = _make_session()
+        assert session.startup_timing is _STARTUP
+        assert session.spec == VmSpec(language=Language.PYTHON)
+
+
+# ============================================================================
+# save() — which failures close the session
+# ============================================================================
+
+
+def _error(cls: type[SandboxError], code: ErrorCode, context: dict[str, Any] | None) -> SandboxError:
+    """An error of `cls` with `code` (RouteError takes its two extra fields)."""
+    if cls is RouteError:
+        return RouteError("injected", code=code, required={}, found={}, context=context, hint=None, instance_id=None)
+    return cls("injected", code=code, context=context, hint=None, instance_id=None)
+
+
+class TestSaveCloseRule:
+    """save() closes the session by error code, not by class: a failed migration closes it
+    unless the VM runs again (context["vm_resumed"]); a local disk or store failure
+    (TransientError too) leaves the VM running, so the session stays open."""
+
+    @pytest.mark.parametrize(
+        ("cls", "code", "context", "closes"),
+        [
+            pytest.param(TransientError, ErrorCode.MIGRATION_FAILED, {"vm_resumed": False}, True, id="failed"),
+            pytest.param(TransientError, ErrorCode.MIGRATION_FAILED, {"vm_resumed": True}, False, id="failed-resumed"),
+            pytest.param(ConfigError, ErrorCode.MIGRATION_UNSUPPORTED, None, True, id="unsupported"),
+            pytest.param(
+                ConfigError, ErrorCode.MIGRATION_UNSUPPORTED, {"vm_resumed": True}, False, id="unsupported-resumed"
+            ),
+            pytest.param(TransientError, ErrorCode.LOCAL_DISK, None, False, id="local-disk"),
+            pytest.param(TransientError, ErrorCode.INSTANCE_STORE_UNAVAILABLE, None, False, id="store"),
+        ],
+    )
+    async def test_close_rule(
+        self, cls: type[SandboxError], code: ErrorCode, context: dict[str, Any] | None, closes: bool
+    ) -> None:
+        _, mock_vm, mock_vm_manager = _make_session()
+        error = _error(cls, code, context)
+        instances = AsyncMock()
+        instances.save = AsyncMock(side_effect=error)
+        session = Session(
+            vm=mock_vm,
+            vm_manager=mock_vm_manager,
+            spec=VmSpec(language=Language.PYTHON),
+            startup_timing=_STARTUP,
+            instances=instances,
+            instance=None,
+            new_instance_id=None,
+            idle_timeout_seconds=300,
+            default_timeout_seconds=30,
+        )
+
+        with pytest.raises(cls, check=lambda e: e is error):
+            await session.save()
+
+        assert session.closed is closes
+        assert mock_vm_manager.destroy_vm.await_count == (1 if closes else 0)
+        await session.close()
 
 
 # ============================================================================

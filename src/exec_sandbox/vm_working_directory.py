@@ -59,38 +59,32 @@ class VmWorkingDirectory:
     __slots__ = (
         "_cleaned_up",
         "_cleanup_task",
-        "_custom_overlay_path",
+        "_home_dir",
         "_path",
         "_retry_task",
         "_use_qemu_vm_user",
         "vm_id",
     )
 
-    def __init__(
-        self,
-        vm_id: str,
-        path: Path,
-        use_qemu_vm_user: bool = False,
-        custom_overlay_path: Path | None = None,
-    ) -> None:
+    def __init__(self, vm_id: str, path: Path, *, home_dir: Path) -> None:
         """Initialize working directory (private - use create() classmethod).
 
         Args:
             vm_id: VM identifier for logging
             path: Directory path (must already exist)
-            use_qemu_vm_user: Whether files will be owned by qemu-vm user
-            custom_overlay_path: Override overlay path (for skip_overlay mode)
+            home_dir: Directory for the home disk file: host disk, not the
+                (often tmpfs) temp directory that holds `path`
         """
         self.vm_id = vm_id
         self._path = path
-        self._use_qemu_vm_user = use_qemu_vm_user
+        self._use_qemu_vm_user = False
         self._cleaned_up = False
         self._cleanup_task: asyncio.Task[bool] | None = None
         self._retry_task: asyncio.Task[None] | None = None
-        self._custom_overlay_path = custom_overlay_path
+        self._home_dir = home_dir
 
     @classmethod
-    async def create(cls, vm_id: str, custom_overlay_path: Path | None = None) -> Self:
+    async def create(cls, vm_id: str, *, home_dir: Path) -> Self:
         """Create a new working directory atomically.
 
         Uses tempfile.mkdtemp() for secure, atomic directory creation with
@@ -98,7 +92,7 @@ class VmWorkingDirectory:
 
         Args:
             vm_id: VM identifier for logging and directory naming
-            custom_overlay_path: Override overlay path (for skip_overlay mode)
+            home_dir: Directory for the home disk file (see __init__)
 
         Returns:
             VmWorkingDirectory instance with directory created
@@ -119,7 +113,7 @@ class VmWorkingDirectory:
             # can no longer receive.
             await await_settled(creation_task)
             if not creation_task.cancelled() and creation_task.exception() is None:
-                abandoned = cls(vm_id, Path(creation_task.result()), custom_overlay_path=custom_overlay_path)
+                abandoned = cls(vm_id, Path(creation_task.result()), home_dir=home_dir)
                 cleanup_task = asyncio.create_task(abandoned.cleanup())
                 await await_settled(cleanup_task)
                 cleanup_confirmed = False
@@ -142,7 +136,7 @@ class VmWorkingDirectory:
             extra={"vm_id": vm_id, "path": path},
         )
 
-        return cls(vm_id, Path(path), custom_overlay_path=custom_overlay_path)
+        return cls(vm_id, Path(path), home_dir=home_dir)
 
     @property
     def path(self) -> Path:
@@ -151,13 +145,17 @@ class VmWorkingDirectory:
 
     @property
     def overlay_image(self) -> Path:
-        """Path to qcow2 overlay image.
-
-        Returns custom path if set via constructor (for skip_overlay mode), otherwise default.
-        """
-        if self._custom_overlay_path is not None:
-            return self._custom_overlay_path
+        """Path to qcow2 overlay image."""
         return self._path / "overlay.qcow2"
+
+    @property
+    def home_disk(self) -> Path:
+        """Path to the raw sparse home disk (serial=home, mounted on /home/user).
+
+        Kept out of the working directory: that directory is often a host tmpfs
+        (/tmp), where the disk would take host RAM.
+        """
+        return self._home_dir / f"{self._path.name}.img"
 
     @property
     def cmd_socket(self) -> str:
@@ -260,6 +258,9 @@ class VmWorkingDirectory:
                 extra={"vm_id": self.vm_id, "path": str(self._path)},
             )
             return True
+
+        # The home disk lives outside the working directory (the host owns it)
+        await asyncio.to_thread(self.home_disk.unlink, missing_ok=True)
 
         if not self._path.exists():
             self._cleaned_up = True

@@ -13,6 +13,8 @@ Test categories:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 def _py_tcp_server_code(response: str, bind: str = "127.0.0.1") -> str:
@@ -67,10 +69,7 @@ class TestLoopbackInterfaceUp:
 
     async def test_loopback_up_shell(self, scheduler: Scheduler) -> None:
         """ip addr show lo reports state UP and 127.0.0.1."""
-        result = await scheduler.run(
-            code="ip addr show lo",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "ip addr show lo")
         assert result.exit_code == 0
         assert "UP" in result.stdout
         assert "127.0.0.1" in result.stdout
@@ -85,7 +84,7 @@ addr = s.getsockname()
 s.close()
 print(f"bound:{addr[0]}:{addr[1]}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "bound:127.0.0.1:" in result.stdout
 
@@ -99,7 +98,7 @@ const addr = server.address();
 console.log('bound:' + addr.address + ':' + addr.port);
 server.close();
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
         assert "bound:127.0.0.1:" in result.stdout
 
@@ -138,7 +137,7 @@ async def main():
 
 asyncio.run(main())
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "sent:PING recv:PONG" in result.stdout
 
@@ -157,7 +156,7 @@ const body = await res.text();
 server.close();
 console.log('status:' + res.status + ' body:' + body);
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
         assert "status:200" in result.stdout
         assert "body:HELLO_FROM_SERVER" in result.stdout
@@ -176,7 +175,7 @@ done
 wait $LISTENER_PID 2>/dev/null || true
 cat /tmp/nc_out
 """
-        result = await scheduler.run(code=code, language=Language.RAW)
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
         assert result.exit_code == 0
         assert "SHELL_PING" in result.stdout
 
@@ -189,20 +188,16 @@ class TestLoopbackWithoutNetwork:
 
     async def test_python_loopback_no_network(self, scheduler: Scheduler) -> None:
         """TCP loopback works with allow_network=False (no gvproxy, no eth0)."""
-        result = await scheduler.run(
-            code=_py_tcp_server_code("NO_NET_OK"),
-            language=Language.PYTHON,
-            allow_network=False,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, allow_network=False), _py_tcp_server_code("NO_NET_OK")
         )
         assert result.exit_code == 0
         assert "NO_NET_OK" in result.stdout
 
     async def test_javascript_loopback_no_network(self, scheduler: Scheduler) -> None:
         """fetch('http://127.0.0.1:...') works with allow_network=False."""
-        result = await scheduler.run(
-            code=_js_http_fetch_code("NO_NET_JS"),
-            language=Language.JAVASCRIPT,
-            allow_network=False,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT, allow_network=False), _js_http_fetch_code("NO_NET_JS")
         )
         assert result.exit_code == 0
         assert "NO_NET_JS" in result.stdout
@@ -216,9 +211,8 @@ class TestLoopbackEdgeCases:
 
     async def test_python_bind_0000_connect_localhost(self, scheduler: Scheduler) -> None:
         """Bind 0.0.0.0, connect via 127.0.0.1 — common server pattern."""
-        result = await scheduler.run(
-            code=_py_tcp_server_code("WILDCARD_OK", bind="0.0.0.0"),
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), _py_tcp_server_code("WILDCARD_OK", bind="0.0.0.0")
         )
         assert result.exit_code == 0
         assert "WILDCARD_OK" in result.stdout
@@ -231,15 +225,16 @@ results = socket.getaddrinfo('localhost', 80, socket.AF_INET, socket.SOCK_STREAM
 addrs = [r[4][0] for r in results]
 print('resolved:' + ','.join(addrs))
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "127.0.0.1" in result.stdout
 
     async def test_javascript_localhost_string_resolves(self, scheduler: Scheduler) -> None:
         """fetch('http://localhost:...') works — validates /etc/hosts config."""
-        result = await scheduler.run(
-            code=_js_http_fetch_code("LOCALHOST_STR", fetch_host="localhost"),
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            _js_http_fetch_code("LOCALHOST_STR", fetch_host="localhost"),
         )
         assert result.exit_code == 0
         assert "LOCALHOST_STR" in result.stdout
@@ -261,7 +256,7 @@ s2.bind(('127.0.0.1', port))
 s2.close()
 print(f"reuse_ok:{port}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "reuse_ok:" in result.stdout
 
@@ -290,7 +285,7 @@ recv_sock.close()
 send_sock.close()
 print(f"udp:{data.decode()} from:{addr[0]}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "udp:UDP_PING" in result.stdout
         assert "from:127.0.0.1" in result.stdout
@@ -336,7 +331,7 @@ async def main():
 
 asyncio.run(main())
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "SERVER_A" in result.stdout
         assert "SERVER_B" in result.stdout
@@ -376,7 +371,7 @@ const resp = await Promise.race([
 server.stop();
 console.log('bun_tcp:' + resp);
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
         assert "bun_tcp:BUN_TCP_PONG" in result.stdout
 
@@ -402,7 +397,7 @@ except OSError as e:
     else:
         print(f"unexpected_error:{e.errno}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -416,7 +411,7 @@ port = s.getsockname()[1]
 s.close()
 print(f"ephemeral:{port}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "ephemeral:" in result.stdout
         # Ephemeral ports are OS-assigned from the unprivileged range (> 1024)

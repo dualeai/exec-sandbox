@@ -51,7 +51,7 @@ class TestPathEdgeCases:
     async def test_unicode_in_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Unicode characters in filename work."""
         dest = tmp_path / "unicode.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("日本語.txt", b"konnichiwa")
             await session.read_file("日本語.txt", destination=dest)
             assert dest.read_bytes() == b"konnichiwa"
@@ -59,7 +59,7 @@ class TestPathEdgeCases:
     async def test_deeply_nested_mkdir_p(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Deeply nested path creates intermediate directories."""
         dest = tmp_path / "deep.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("a/b/c/d/deep.txt", b"deep")
             await session.read_file("a/b/c/d/deep.txt", destination=dest)
             assert dest.read_bytes() == b"deep"
@@ -67,7 +67,7 @@ class TestPathEdgeCases:
     async def test_hidden_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Hidden files (dot prefix) work."""
         dest = tmp_path / "hidden.bin"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file(".hidden", b"secret")
             await session.read_file(".hidden", destination=dest)
             assert dest.read_bytes() == b"secret"
@@ -75,7 +75,7 @@ class TestPathEdgeCases:
     async def test_dots_in_filename(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Multiple dots in filename work."""
         dest = tmp_path / "file.tar.gz"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("file.tar.gz", b"compressed")
             await session.read_file("file.tar.gz", destination=dest)
             assert dest.read_bytes() == b"compressed"
@@ -84,7 +84,7 @@ class TestPathEdgeCases:
         """Exactly 255-char filename works (POSIX max)."""
         name = "a" * 251 + ".txt"  # 255 chars total
         dest = tmp_path / "long_name.bin"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file(name, b"long name")
             await session.read_file(name, destination=dest)
             assert dest.read_bytes() == b"long name"
@@ -108,7 +108,7 @@ class TestContentEdgeCases:
     async def test_empty_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Empty file write/read roundtrip."""
         dest = tmp_path / "empty.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("empty.txt", b"")
             await session.read_file("empty.txt", destination=dest)
             assert dest.read_bytes() == b""
@@ -116,7 +116,7 @@ class TestContentEdgeCases:
     async def test_single_byte(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Single byte write/read roundtrip."""
         dest = tmp_path / "one.bin"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("one.bin", b"\x42")
             await session.read_file("one.bin", destination=dest)
             assert dest.read_bytes() == b"\x42"
@@ -124,7 +124,7 @@ class TestContentEdgeCases:
     async def test_overwrite_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Second write overwrites first content."""
         dest = tmp_path / "overwrite.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("overwrite.txt", b"first")
             await session.write_file("overwrite.txt", b"second")
             await session.read_file("overwrite.txt", destination=dest)
@@ -168,7 +168,7 @@ class TestWriteFileInputTypes:
     async def test_write_from_bytes(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """write_file accepts bytes directly."""
         dest = tmp_path / "from_bytes.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("from_bytes.txt", b"byte data")
             await session.read_file("from_bytes.txt", destination=dest)
             assert dest.read_bytes() == b"byte data"
@@ -218,7 +218,7 @@ class TestFileIoSessionLifecycle:
 
     async def test_file_ops_after_close_raises(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """File operations after session.close() raise SessionClosedError."""
-        session = await scheduler.session(language=Language.PYTHON)
+        session = await scheduler.new(VmSpec(language=Language.PYTHON))
         await session.close()
 
         with pytest.raises(SessionClosedError):
@@ -232,7 +232,7 @@ class TestFileIoSessionLifecycle:
 
     async def test_write_file_before_exec(self, scheduler: Scheduler) -> None:
         """write_file works immediately after session creation (before any exec)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("early.txt", b"early bird")
             result = await session.exec("print(open('early.txt').read())")
             assert "early bird" in result.stdout
@@ -240,7 +240,7 @@ class TestFileIoSessionLifecycle:
     async def test_file_persists_across_execs(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Files written persist across multiple exec calls."""
         dest = tmp_path / "persist.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("persist.txt", b"persistent data")
             await session.exec("x = 1")  # Unrelated exec
             await session.exec("y = 2")  # Another unrelated exec
@@ -249,7 +249,7 @@ class TestFileIoSessionLifecycle:
 
     async def test_files_and_state_coexist(self, scheduler: Scheduler) -> None:
         """File I/O and REPL state coexist."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("data.txt", b"42")
             await session.exec("x = 100")
             result = await session.exec("print(x + int(open('data.txt').read()))")
@@ -267,13 +267,13 @@ class TestListFiles:
 
     async def test_list_empty_root(self, scheduler: Scheduler) -> None:
         """list_files on fresh sandbox root returns a list (may have pre-existing files)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             files = await session.list_files()
             assert isinstance(files, list)
 
     async def test_list_after_writes(self, scheduler: Scheduler) -> None:
         """list_files shows written files."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("a.txt", b"a")
             await session.write_file("b.txt", b"bb")
             files = await session.list_files()
@@ -283,7 +283,7 @@ class TestListFiles:
 
     async def test_list_subdirectory(self, scheduler: Scheduler) -> None:
         """list_files on a subdirectory."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("subdir/x.txt", b"x")
             await session.write_file("subdir/y.txt", b"yy")
             files = await session.list_files("subdir")
@@ -331,7 +331,7 @@ class TestListFilesSparseDefense:
 
     async def test_regular_file_size_matches_content(self, scheduler: Scheduler) -> None:
         """Regular file with known content reports exact byte count."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             content = b"hello world"  # 11 bytes
             await session.write_file("regular.txt", content)
             files = await session.list_files()
@@ -342,7 +342,7 @@ class TestListFilesSparseDefense:
         """Binary file reports exact byte count."""
         import os
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             content = os.urandom(4097)  # Just over one page
             await session.write_file("binary.bin", content)
             files = await session.list_files()
@@ -351,7 +351,7 @@ class TestListFilesSparseDefense:
 
     async def test_empty_file_size_zero(self, scheduler: Scheduler) -> None:
         """Empty file reports size 0."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("empty.txt", b"")
             files = await session.list_files()
             file_map = {f.name: f for f in files}
@@ -359,7 +359,7 @@ class TestListFilesSparseDefense:
 
     async def test_directory_size_zero(self, scheduler: Scheduler) -> None:
         """Directories report size 0."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.exec("import os; os.makedirs('/home/user/mydir', exist_ok=True)")
             files = await session.list_files()
             file_map = {f.name: f for f in files}
@@ -373,7 +373,7 @@ class TestListFilesSparseDefense:
         os.truncate() sets apparent size (metadata.len()) without allocating
         pages on tmpfs. min(len, blocks*512) deflates this to 0.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.exec("open('/home/user/sparse', 'w').close()")
             await session.exec("import os; os.truncate('/home/user/sparse', 10 * 1024 * 1024)")
             files = await session.list_files()
@@ -387,7 +387,7 @@ class TestListFilesSparseDefense:
         Write 4KB at offset 0, then truncate to 1MB. Only the 4KB should be
         reflected (blocks*512 >= 4096, apparent size = 1MB, min = 4096).
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
 import os
 with open('/home/user/partial', 'wb') as f:
@@ -414,7 +414,7 @@ print(f'ACTUAL:{s.st_blocks * 512}')
 
         min(1, 4096) = 1 — the len() side wins for small real files.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("tiny.txt", b"x")
             files = await session.list_files()
             file_map = {f.name: f for f in files}
@@ -422,7 +422,7 @@ print(f'ACTUAL:{s.st_blocks * 512}')
 
     async def test_symlink_in_listing(self, scheduler: Scheduler) -> None:
         """Symlinks appear in listing (size may be 0 on tmpfs due to inline storage)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("target.txt", b"data")
             await session.exec("import os; os.symlink('/home/user/target.txt', '/home/user/link.txt')")
             files = await session.list_files()
@@ -435,7 +435,7 @@ print(f'ACTUAL:{s.st_blocks * 512}')
 
     async def test_multiple_sparse_files_all_deflated(self, scheduler: Scheduler) -> None:
         """Creating many sparse files — all report 0 in listing."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
 import os
 for i in range(10):
@@ -453,7 +453,7 @@ for i in range(10):
 
     async def test_sparse_then_fill_reports_real_size(self, scheduler: Scheduler) -> None:
         """Create sparse file, then write real data — size should reflect real data."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
 import os
 # Create sparse
@@ -480,7 +480,7 @@ with open('/home/user/fill_me', 'wb') as f:
         actual bytes on tmpfs. Without the min(len, blocks*512) fix, list_files
         would report 107,374,182,400 bytes.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
 import os
 open('/home/user/huge', 'w').close()
@@ -505,7 +505,7 @@ print(f'BLOCKS:{s.st_blocks}')
         because sparse holes expand to zeroes on read. This test verifies listing
         deflation doesn't break read_file.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
 import os
 # Create small sparse file (256 bytes apparent)
@@ -570,7 +570,7 @@ class TestWriteAbortRecovery:
         """
         target = "aborted_partial.bin"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             vm = session._vm
             channel = vm.channel
 
@@ -603,7 +603,7 @@ class TestWriteAbortRecovery:
         """
         target = "bad_chunk.bin"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             vm = session._vm
             channel = vm.channel
 
@@ -652,7 +652,7 @@ class TestWriteAbortRecovery:
         After aborting a write mid-transfer (no file_end), the session
         must still support normal write_file, read_file, and exec operations.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             vm = session._vm
             channel = vm.channel
 

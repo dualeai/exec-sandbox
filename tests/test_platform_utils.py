@@ -5,8 +5,11 @@ No mocks - spawns actual processes.
 """
 
 import asyncio
+import os
 import platform
+import pwd
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,12 +19,15 @@ from exec_sandbox.platform_utils import (
     HostArch,
     HostOS,
     ProcessWrapper,
+    UserDir,
     detect_host_arch,
     detect_host_os,
+    get_account_dir,
     get_arch_name,
-    get_cache_dir,
     get_os_name,
+    get_user_dir,
 )
+from exec_sandbox.subprocess_utils import start_drain
 from tests.conftest import (
     skip_unless_aarch64,
     skip_unless_linux,
@@ -147,103 +153,75 @@ class TestGetArchName:
     """Tests for get_arch_name helper function."""
 
     @skip_unless_x86_64
-    def test_kernel_convention_x86_64(self) -> None:
-        """get_arch_name returns 'x86_64' for kernel convention on x86_64."""
-        assert get_arch_name("kernel") == "x86_64"
+    def test_kernel_name_x86_64(self) -> None:
+        """get_arch_name returns 'x86_64' on x86_64."""
+        assert get_arch_name() == "x86_64"
 
     @skip_unless_aarch64
-    def test_kernel_convention_aarch64(self) -> None:
-        """get_arch_name returns 'aarch64' for kernel convention on ARM64."""
-        assert get_arch_name("kernel") == "aarch64"
-
-    @skip_unless_x86_64
-    def test_go_convention_x86_64(self) -> None:
-        """get_arch_name returns 'amd64' for Go convention on x86_64."""
-        assert get_arch_name("go") == "amd64"
-
-    @skip_unless_aarch64
-    def test_go_convention_aarch64(self) -> None:
-        """get_arch_name returns 'arm64' for Go convention on ARM64."""
-        assert get_arch_name("go") == "arm64"
-
-    def test_default_convention_is_kernel(self) -> None:
-        """get_arch_name defaults to kernel convention."""
-        assert get_arch_name() == get_arch_name("kernel")
+    def test_kernel_name_aarch64(self) -> None:
+        """get_arch_name returns 'aarch64' on ARM64."""
+        assert get_arch_name() == "aarch64"
 
 
 # ============================================================================
-# get_cache_dir
+# get_user_dir(kind=CACHE)
 # ============================================================================
 
 
-class TestGetCacheDir:
-    """Tests for get_cache_dir function."""
+class TestUserDirCache:
+    """Tests for get_user_dir(kind=UserDir.CACHE)."""
 
     # --- Normal cases ---
 
-    def test_returns_path(self) -> None:
-        """Result is a Path."""
-        result = get_cache_dir()
-        assert isinstance(result, Path)
+    @pytest.mark.parametrize(
+        ("host_os", "expected"),
+        [
+            pytest.param(HostOS.MACOS, "/home/u/Library/Caches/exec-sandbox", id="macos-library-caches"),
+            pytest.param(HostOS.LINUX, "/home/u/.cache/exec-sandbox", id="linux-dot-cache"),
+            pytest.param(HostOS.UNKNOWN, "/home/u/.cache/exec-sandbox", id="unknown-falls-back-to-dot-cache"),
+        ],
+    )
+    def test_default_per_os(self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS, expected: str) -> None:
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: host_os)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+        assert get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") == Path(expected)
 
-    def test_default_app_name(self) -> None:
-        """Contains 'exec-sandbox' by default."""
-        result = get_cache_dir()
-        assert "exec-sandbox" in str(result)
-
-    def test_custom_app_name(self) -> None:
+    def test_custom_app_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Respects custom app name."""
-        result = get_cache_dir("my-app")
-        assert "my-app" in str(result)
-
-    def test_macos_uses_library_caches(self) -> None:
-        """macOS uses ~/Library/Caches."""
-        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.MACOS):
-            with patch.dict("os.environ", {}, clear=True):
-                result = get_cache_dir()
-                assert "Library/Caches" in str(result)
-
-    def test_linux_uses_dot_cache(self) -> None:
-        """Linux uses ~/.cache."""
-        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
-            with patch.dict("os.environ", {}, clear=True):
-                result = get_cache_dir()
-                assert ".cache" in str(result)
-
-    def test_unknown_platform_fallback(self) -> None:
-        """Unknown OS falls back to ~/.cache."""
-        with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.UNKNOWN):
-            with patch.dict("os.environ", {}, clear=True):
-                result = get_cache_dir()
-                assert ".cache" in str(result)
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+        assert get_user_dir(kind=UserDir.CACHE, app_name="my-app") == Path("/home/u/.cache/my-app")
 
     # --- Env var overrides ---
 
     def test_exec_sandbox_cache_dir_override(self) -> None:
         """EXEC_SANDBOX_CACHE_DIR overrides everything."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("/custom")
 
     def test_xdg_cache_home_on_linux(self) -> None:
         """XDG_CACHE_HOME on Linux → /xdg/exec-sandbox."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg"}, clear=True):
-                result = get_cache_dir()
+                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
                 assert result == Path("/xdg/exec-sandbox")
 
     def test_xdg_cache_home_ignored_on_macos(self) -> None:
         """XDG_CACHE_HOME is ignored on macOS."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.MACOS):
-            with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg"}, clear=True):
-                result = get_cache_dir()
-                assert "Library/Caches" in str(result)
-                assert "/xdg" not in str(result)
+            with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg", "HOME": "/home/u"}, clear=True):
+                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
+                assert result == Path("/home/u/Library/Caches/exec-sandbox")
 
     def test_exec_sandbox_cache_dir_takes_priority_over_xdg(self) -> None:
         """EXEC_SANDBOX_CACHE_DIR wins over XDG_CACHE_HOME."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/override", "XDG_CACHE_HOME": "/xdg"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("/override")
 
     # --- Edge cases ---
@@ -251,33 +229,110 @@ class TestGetCacheDir:
     def test_empty_xdg_cache_home_ignored(self) -> None:
         """Empty XDG_CACHE_HOME is falsy, falls through to ~/.cache default."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
-            with patch.dict("os.environ", {"XDG_CACHE_HOME": ""}, clear=True):
-                result = get_cache_dir()
-                assert ".cache" in str(result)
+            with patch.dict("os.environ", {"XDG_CACHE_HOME": "", "HOME": "/home/u"}, clear=True):
+                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
+                assert result == Path("/home/u/.cache/exec-sandbox")
 
     def test_path_with_spaces(self) -> None:
         """Path with spaces is preserved."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/path with spaces/cache"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("/path with spaces/cache")
 
     def test_path_with_unicode(self) -> None:
         """Path with unicode characters is preserved."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/données/caché"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("/données/caché")
 
     def test_trailing_slash_normalized(self) -> None:
         """Path normalizes trailing slashes."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom/path/"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("/custom/path")
 
     def test_relative_env_path(self) -> None:
         """Relative path from env is used as-is."""
         with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "relative/path"}):
-            result = get_cache_dir()
+            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
             assert result == Path("relative/path")
+
+
+# ============================================================================
+# get_user_dir(kind=DATA)
+# ============================================================================
+
+
+class TestUserDirData:
+    """Tests for get_user_dir(kind=UserDir.DATA)."""
+
+    def test_macos_application_support(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.MACOS)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.setenv("XDG_DATA_HOME", "/xdg")  # not used on macOS
+        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/Library/Application Support/app")
+
+    def test_linux_absolute_xdg(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.setenv("XDG_DATA_HOME", "/xdg/data")
+        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/xdg/data/app")
+
+    @pytest.mark.parametrize("xdg", ["relative/data", "./data", ""])
+    def test_linux_relative_or_empty_xdg_ignored(self, monkeypatch: pytest.MonkeyPatch, xdg: str) -> None:
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.setenv("XDG_DATA_HOME", xdg)
+        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/.local/share/app")
+
+    @pytest.mark.parametrize("host_os", [HostOS.LINUX, HostOS.UNKNOWN])
+    def test_without_xdg(self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS) -> None:
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: host_os)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/.local/share/app")
+
+    def test_cache_override_not_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EXEC_SANDBOX_CACHE_DIR moves caches, never data the library cannot make again."""
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
+        monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", "/cache")
+        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/.local/share/app")
+        assert get_user_dir(kind=UserDir.CACHE, app_name="app") == Path("/cache")
+
+    def test_cache_and_data_apart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+        assert get_user_dir(kind=UserDir.DATA, app_name="app") != get_user_dir(kind=UserDir.CACHE, app_name="app")
+
+    @pytest.mark.parametrize(
+        ("host_os", "data", "cache"),
+        [
+            (HostOS.MACOS, "/accounts/me/Library/Application Support/x", "/accounts/me/Library/Caches/x"),
+            (HostOS.LINUX, "/accounts/me/.local/share/x", "/accounts/me/.cache/x"),
+            (HostOS.UNKNOWN, "/accounts/me/.local/share/x", "/accounts/me/.cache/x"),
+        ],
+        ids=["macos", "linux", "unknown"],
+    )
+    def test_account_dir_ignores_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS, data: str, cache: str
+    ) -> None:
+        """get_account_dir: the home of the effective user in the user database; HOME, XDG_* and
+        EXEC_SANDBOX_CACHE_DIR (absolute paths, so get_user_dir would take them) change nothing."""
+        real_getpwuid = pwd.getpwuid
+
+        def getpwuid(uid: int) -> pwd.struct_passwd:
+            entry = real_getpwuid(os.getuid())
+            return pwd.struct_passwd((*entry[:5], "/accounts/me" if uid == 4242 else "/accounts/other", entry.pw_shell))
+
+        monkeypatch.setattr(pwd, "getpwuid", getpwuid)
+        monkeypatch.setattr(os, "geteuid", lambda: 4242)
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: host_os)
+        for name, value in [("HOME", "/env/home"), ("XDG_DATA_HOME", "/env/xdg-data"),
+                            ("XDG_CACHE_HOME", "/env/xdg-cache"), ("EXEC_SANDBOX_CACHE_DIR", "/env/cache")]:  # fmt: skip
+            monkeypatch.setenv(name, value)
+        assert get_account_dir(kind=UserDir.DATA, app_name="x") == Path(data)
+        assert get_account_dir(kind=UserDir.CACHE, app_name="x") == Path(cache)
 
 
 # ============================================================================

@@ -445,15 +445,21 @@ class DiskSnapshotManager(BaseCacheManager):
                     package_domains = None
 
                 # Step 3-5: Boot VM, install packages, shutdown — ephemeral_vm handles lifecycle
-                async with self.vm_manager.ephemeral_vm(
-                    language,
-                    tenant_id,
-                    task_id,
+                build_spec = VmSpec(
+                    language=Language(language),
                     memory_mb=effective_memory_mb,
                     allow_network=True,
-                    allowed_domains=package_domains,
-                    direct_write_target=snapshot_path,
+                    allowed_domains=tuple(package_domains) if package_domains is not None else None,
+                )
+                async with self.vm_manager.ephemeral_vm(
+                    build_spec,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    direct_write_target=build_path,
+                    snapshot_drive=None,
                     retry_profile=constants.RETRY_BACKGROUND,
+                    mem_path=None,
+                    mem_path_share=False,
                 ) as vm:
                     # Install packages with death monitoring (asyncio.wait)
                     death_task = asyncio.create_task(self._monitor_vm_death(vm, cache_key))

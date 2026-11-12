@@ -31,21 +31,21 @@ class TestSessionNormal:
     """Happy path tests for session state persistence and basic functionality."""
 
     async def test_session_returns_session_object(self, scheduler: Scheduler) -> None:
-        """scheduler.session() returns a Session object."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        """scheduler.new() returns a Session object."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session is not None
             assert not session.closed
 
     async def test_basic_exec(self, scheduler: Scheduler) -> None:
         """Basic exec returns output and exit code."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec('print("hi")')
             assert result.exit_code == 0
             assert "hi" in result.stdout
 
     async def test_python_variable_persistence(self, scheduler: Scheduler) -> None:
         """Python variables persist across exec calls."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -56,7 +56,7 @@ class TestSessionNormal:
 
     async def test_python_import_persistence(self, scheduler: Scheduler) -> None:
         """Python imports persist across exec calls."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("import json")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -67,7 +67,7 @@ class TestSessionNormal:
 
     async def test_python_function_persistence(self, scheduler: Scheduler) -> None:
         """Python function definitions persist across exec calls."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec('def greet(n): return f"hi {n}"')
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -78,7 +78,7 @@ class TestSessionNormal:
 
     async def test_python_class_persistence(self, scheduler: Scheduler) -> None:
         """Python class definitions persist across exec calls."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec('class Dog:\n  sound="woof"')
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -89,7 +89,7 @@ class TestSessionNormal:
 
     async def test_python_accumulate_state(self, scheduler: Scheduler) -> None:
         """Python state accumulates across multiple exec calls."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("items = []")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -105,7 +105,7 @@ class TestSessionNormal:
 
     async def test_js_variable_persistence(self, scheduler: Scheduler) -> None:
         """JavaScript variables persist across exec calls."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             setup = await session.exec("var x = 42;")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -116,7 +116,7 @@ class TestSessionNormal:
 
     async def test_js_function_persistence(self, scheduler: Scheduler) -> None:
         """JavaScript function definitions persist across exec calls."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             setup = await session.exec("function greet(n) { return 'hi ' + n; }")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -127,7 +127,7 @@ class TestSessionNormal:
 
     async def test_ts_typed_variable_persistence(self, scheduler: Scheduler) -> None:
         """TypeScript typed variables persist across exec calls."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             setup = await session.exec("let x: number = 10;")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -138,7 +138,7 @@ class TestSessionNormal:
 
     async def test_ts_interface_reuse_across_execs(self, scheduler: Scheduler) -> None:
         """TypeScript interface defined in one exec is usable in the next."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             s1 = await session.exec("interface Item { name: string; qty: number }")
             assert s1.exit_code == 0, (
                 f"interface exec timed out or failed: exit_code={s1.exit_code}, stderr={s1.stderr!r}"
@@ -153,7 +153,7 @@ class TestSessionNormal:
 
     async def test_shell_env_var_persistence(self, scheduler: Scheduler) -> None:
         """Shell environment variables persist across exec calls."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             setup = await session.exec("export FOO=bar")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -164,7 +164,7 @@ class TestSessionNormal:
 
     async def test_shell_cwd_persistence(self, scheduler: Scheduler) -> None:
         """Shell working directory persists across exec calls."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             setup = await session.exec("cd /tmp")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -175,7 +175,7 @@ class TestSessionNormal:
 
     async def test_shell_function_persistence(self, scheduler: Scheduler) -> None:
         """Shell function definitions persist across exec calls."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             setup = await session.exec('greet() { echo "hi $1"; }')
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -186,7 +186,7 @@ class TestSessionNormal:
 
     async def test_multiple_sequential_execs(self, scheduler: Scheduler) -> None:
         """Multiple sequential execs all succeed."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             for i in range(10):
                 result = await session.exec(f"print({i})")
                 assert result.exit_code == 0
@@ -195,7 +195,7 @@ class TestSessionNormal:
 
     async def test_exec_count_increments(self, scheduler: Scheduler) -> None:
         """exec_count tracks successful executions."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session.exec_count == 0
             r1 = await session.exec("print(1)")
             assert r1.exit_code == 0, f"exec timed out or failed: exit_code={r1.exit_code}, stderr={r1.stderr!r}"
@@ -210,7 +210,7 @@ class TestSessionNormal:
     async def test_streaming_callbacks(self, scheduler: Scheduler) -> None:
         """on_stdout callback receives streaming chunks."""
         chunks: list[str] = []
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(
                 'print("hello world")',
                 on_stdout=chunks.append,
@@ -221,7 +221,7 @@ class TestSessionNormal:
     async def test_stderr_streaming(self, scheduler: Scheduler) -> None:
         """on_stderr callback receives stderr chunks."""
         chunks: list[str] = []
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(
                 'import sys; sys.stderr.write("oops\\n")',
                 on_stderr=chunks.append,
@@ -230,7 +230,7 @@ class TestSessionNormal:
 
     async def test_env_vars_passed(self, scheduler: Scheduler) -> None:
         """Environment variables are passed to execution."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(
                 'import os; print(os.environ["FOO"])',
                 env_vars={"FOO": "bar"},
@@ -240,19 +240,19 @@ class TestSessionNormal:
 
     async def test_timing_populated(self, scheduler: Scheduler) -> None:
         """Timing breakdown is populated."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec("print(1)")
             assert result.timing.execute_ms > 0
-            assert result.timing.total_ms > 0
+            assert session.startup_timing.total_ms > 0
 
     async def test_closed_starts_false(self, scheduler: Scheduler) -> None:
         """Fresh session is not closed."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session.closed is False
 
     async def test_context_manager(self, scheduler: Scheduler) -> None:
         """Context manager closes session on exit."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session.vm_id  # VM is assigned
             assert not session.closed
         assert session.closed
@@ -266,7 +266,7 @@ class TestSessionEdgeCases:
 
     async def test_nonzero_exit_preserves_session(self, scheduler: Scheduler) -> None:
         """Non-zero exit code doesn't close the session."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec("raise ValueError('test')")
             assert result.exit_code == 1, (
                 f"expected ValueError (exit_code=1), got exit_code={result.exit_code}, stderr={result.stderr!r}"
@@ -279,7 +279,7 @@ class TestSessionEdgeCases:
 
     async def test_nonzero_exit_preserves_state(self, scheduler: Scheduler) -> None:
         """State survives across an error."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -295,7 +295,7 @@ class TestSessionEdgeCases:
 
     async def test_sys_exit_preserves_state(self, scheduler: Scheduler) -> None:
         """sys.exit() is caught by wrapper, state preserved."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 99")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -308,7 +308,7 @@ class TestSessionEdgeCases:
 
     async def test_syntax_error_preserves_state(self, scheduler: Scheduler) -> None:
         """SyntaxError doesn't destroy state."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -338,7 +338,7 @@ class TestSessionEdgeCases:
 
     async def test_overwrite_variable(self, scheduler: Scheduler) -> None:
         """Variables can be overwritten."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 1")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -349,13 +349,13 @@ class TestSessionEdgeCases:
 
     async def test_close_idempotent(self, scheduler: Scheduler) -> None:
         """close() can be called multiple times."""
-        session = await scheduler.session(language=Language.PYTHON)
+        session = await scheduler.new(VmSpec(language=Language.PYTHON))
         await session.close()
         await session.close()  # No error
 
     async def test_rapid_execs(self, scheduler: Scheduler) -> None:
         """Multiple rapid execs all succeed."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             for i in range(5):
                 result = await session.exec(f"print({i})")
                 assert result.exit_code == 0
@@ -368,10 +368,7 @@ class TestSessionEdgeCases:
         940s total timeout (3 x 308s attempts) under TCG software emulation,
         especially with concurrent load on CI runners.
         """
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            packages=["requests==2.32.3"],
-        ) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, packages=["requests==2.32.3"])) as session:
             result = await session.exec("import requests; print(requests.__version__)")
             assert result.exit_code == 0
             assert "2.32" in result.stdout
@@ -385,7 +382,7 @@ class TestSessionWeirdCases:
 
     async def test_fake_sentinel_on_stderr(self, scheduler: Scheduler) -> None:
         """Fake sentinel in user stderr doesn't confuse the real sentinel."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec('import sys; sys.stderr.write("__SENTINEL_fake_0__\\n")')
             # Should complete normally (unique sentinel ID prevents confusion)
             result = await session.exec('print("alive")')
@@ -394,7 +391,7 @@ class TestSessionWeirdCases:
 
     async def test_unicode_variable_names(self, scheduler: Scheduler) -> None:
         """Unicode variable names and multi-byte UTF-8 code work."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Use actual multi-byte UTF-8 (café has 2-byte é) to test byte-count protocol
             setup = await session.exec("café = 42")
             assert setup.exit_code == 0, (
@@ -406,7 +403,7 @@ class TestSessionWeirdCases:
 
     async def test_os_exit_kills_repl(self, scheduler: Scheduler) -> None:
         """os._exit() kills REPL, next exec works with fresh state."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -420,7 +417,7 @@ class TestSessionWeirdCases:
 
     async def test_background_thread_survives(self, scheduler: Scheduler) -> None:
         """Background daemon thread doesn't interfere with session."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec(
                 "import threading, time\n"
                 "def bg(): time.sleep(60)\n"
@@ -436,7 +433,7 @@ class TestSessionWeirdCases:
 
     async def test_subprocess_popen_survives_across_execs(self, scheduler: Scheduler) -> None:
         """subprocess.Popen child survives across exec() calls (VM persists)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Exec 1: spawn a long-lived subprocess, capture its PID
             result = await session.exec("import subprocess\np = subprocess.Popen(['sleep', '60'])\nprint(p.pid)")
             assert result.exit_code == 0
@@ -456,7 +453,7 @@ class TestSessionWeirdCases:
     @skip_on_python_312_subprocess_bug
     async def test_daemon_double_fork_survives_across_execs(self, scheduler: Scheduler) -> None:
         """Double-fork daemon survives across exec() calls, reparented to PID 1."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Exec 1: classic double-fork + setsid to create a daemon.
             # The daemon resets PR_SET_DUMPABLE so its /proc entry is visible —
             # the REPL sets dumpable=0 for ptrace protection, and forked children
@@ -518,14 +515,14 @@ class TestSessionWeirdCases:
 
     async def test_shell_pipe_in_session(self, scheduler: Scheduler) -> None:
         """Shell pipes work in session."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec("echo hello | tr a-z A-Z")
             assert result.exit_code == 0
             assert "HELLO" in result.stdout
 
     async def test_shell_background_job(self, scheduler: Scheduler) -> None:
         """Shell background job doesn't block session."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             await session.exec("sleep 60 &")
             result = await session.exec("echo ok")
             assert result.exit_code == 0
@@ -533,42 +530,42 @@ class TestSessionWeirdCases:
 
     async def test_shell_bash_array(self, scheduler: Scheduler) -> None:
         """Bash indexed arrays work (fails under busybox ash)."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec('arr=(one two three); echo "${arr[1]}"')
             assert result.exit_code == 0
             assert "two" in result.stdout
 
     async def test_shell_bash_associative_array(self, scheduler: Scheduler) -> None:
         """Bash associative arrays work (fails under busybox ash)."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec('declare -A map; map[key]="value"; echo "${map[key]}"')
             assert result.exit_code == 0
             assert "value" in result.stdout
 
     async def test_shell_bash_trap(self, scheduler: Scheduler) -> None:
         """Bash EXIT trap fires (silent failure under busybox ash)."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec("(trap 'echo TRAP_FIRED' EXIT; echo body)")
             assert result.exit_code == 0
             assert "TRAP_FIRED" in result.stdout
 
     async def test_shell_bash_process_substitution(self, scheduler: Scheduler) -> None:
         """Bash process substitution works (syntax error under busybox ash)."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec("cat <(echo hello)")
             assert result.exit_code == 0
             assert "hello" in result.stdout
 
     async def test_shell_bash_regex(self, scheduler: Scheduler) -> None:
         """Bash [[ =~ ]] regex matching works (syntax error under busybox ash)."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec('[[ "2025-01-15" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && echo MATCH')
             assert result.exit_code == 0
             assert "MATCH" in result.stdout
 
     async def test_shell_bash_here_string(self, scheduler: Scheduler) -> None:
         """Bash here-strings work (syntax error under busybox ash)."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec('read -r word <<< "hello world"; echo "$word"')
             assert result.exit_code == 0
             assert "hello" in result.stdout
@@ -580,7 +577,7 @@ class TestSessionWeirdCases:
         user text + sentinel concatenated on the same line. The guest agent must
         find the sentinel anywhere in the line (not just at the start).
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write to stderr WITHOUT trailing newline — sentinel may concatenate
             result = await session.exec('import sys; sys.stderr.write("no-newline")')
             assert result.exit_code == 0
@@ -596,7 +593,7 @@ class TestSessionWeirdCases:
         Before the fix, a key like FOO'BAR would produce broken code:
         environ['FOO'BAR'] (unmatched quote).
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(
                 'import os; print(os.environ["FOO\'BAR"])',
                 env_vars={"FOO'BAR": "works"},
@@ -610,7 +607,7 @@ class TestSessionWeirdCases:
         Shell export syntax requires POSIX identifier keys ([a-zA-Z_][a-zA-Z0-9_]*).
         Keys with spaces or special chars would produce broken syntax.
         """
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             # Key "BAD KEY" has a space — invalid for shell export
             # Should not crash, just skip the invalid key
             result = await session.exec(
@@ -622,7 +619,7 @@ class TestSessionWeirdCases:
 
     async def test_deep_recursion(self, scheduler: Scheduler) -> None:
         """RecursionError doesn't kill session."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec("def f(): f()\ntry:\n    f()\nexcept RecursionError:\n    pass")
             # RecursionError caught - session alive
             result = await session.exec('print("alive")')
@@ -638,15 +635,17 @@ class TestSessionOutOfBounds:
 
     async def test_exec_after_close(self, scheduler: Scheduler) -> None:
         """exec() after close() raises SessionClosedError."""
-        session = await scheduler.session(language=Language.PYTHON)
+        session = await scheduler.new(VmSpec(language=Language.PYTHON))
         await session.close()
         with pytest.raises(SessionClosedError):
             await session.exec("print(1)")
 
     async def test_idle_timeout_auto_closes(self, scheduler: Scheduler) -> None:
         """Session auto-closes after idle timeout."""
-        session = await scheduler.session(
-            language=Language.PYTHON,
+        session = await scheduler.new(
+            VmSpec(
+                language=Language.PYTHON,
+            ),
             idle_timeout_seconds=10,  # Use minimum allowed
         )
         try:
@@ -661,10 +660,7 @@ class TestSessionOutOfBounds:
 
     async def test_idle_timeout_reset_on_exec(self, scheduler: Scheduler) -> None:
         """Idle timer resets on each exec."""
-        session = await scheduler.session(
-            language=Language.PYTHON,
-            idle_timeout_seconds=10,
-        )
+        session = await scheduler.new(VmSpec(language=Language.PYTHON), idle_timeout_seconds=10)
         try:
             # First exec spawns the REPL (~4-5s on cold boot).
             # Run it under the original 10s timeout before switching
@@ -691,7 +687,7 @@ class TestSessionOutOfBounds:
         Slow under TCG: terminal-session correctness test with no timing
         assertions — works under TCG but too slow for the default suite.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -709,7 +705,7 @@ class TestSessionOutOfBounds:
         Pins the documented reservation: numeric 137 retires the session even
         when it did not come from a signal (guard/OOM-killer/user alike).
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec("import sys; sys.exit(137)")
             assert result.exit_code == 137
             assert session.closed
@@ -723,7 +719,7 @@ class TestSessionOutOfBounds:
         Requires hwaccel: 2s timeout — TCG (~5-8x slower) cannot complete
         REPL boot and timeout semantics within the deadline.
         """
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Timeout returns result with exit_code=-1 (not an exception)
             result = await session.exec("import time; time.sleep(60)", timeout_seconds=2)
             assert result.exit_code == -1
@@ -738,7 +734,7 @@ class TestSessionOutOfBounds:
         sessions = []
         try:
             for _ in range(3):
-                s = await scheduler.session(language=Language.PYTHON)
+                s = await scheduler.new(VmSpec(language=Language.PYTHON))
                 sessions.append(s)
 
             # All sessions work independently
@@ -768,7 +764,7 @@ class TestSessionReconnect:
     @pytest.mark.slow
     async def test_state_survives_reconnect(self, scheduler: Scheduler) -> None:
         """State persists across guest agent reconnect (~13s idle)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -782,7 +778,7 @@ class TestSessionReconnect:
     @pytest.mark.slow
     async def test_multiple_reconnects_preserve_state(self, scheduler: Scheduler) -> None:
         """State persists across multiple reconnect cycles."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 1")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
@@ -804,7 +800,7 @@ class TestSessionConcurrency:
 
     async def test_concurrent_execs_serialized(self, scheduler: Scheduler) -> None:
         """Concurrent exec() calls are serialized (no interleaved output)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             results = await asyncio.gather(
                 session.exec("print('a' * 100)"),
                 session.exec("print('b' * 100)"),
@@ -815,11 +811,11 @@ class TestSessionConcurrency:
 
     async def test_session_plus_run_coexist(self, scheduler: Scheduler) -> None:
         """Session and run() work simultaneously (separate VMs)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Run both in parallel
             session_result, run_result = await asyncio.gather(
                 session.exec('print("session")'),
-                scheduler.run(code='print("run")', language=Language.PYTHON),
+                run_once(scheduler, VmSpec(language=Language.PYTHON), 'print("run")'),
             )
             assert session_result.exit_code == 0
             assert "session" in session_result.stdout
@@ -835,40 +831,34 @@ class TestWorkingDirectory:
 
     async def test_python_cwd(self, scheduler: Scheduler) -> None:
         """Python REPL starts in /home/user."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec("import os; print(os.getcwd())")
             assert result.exit_code == 0
             assert "/home/user" in result.stdout
 
     async def test_javascript_cwd(self, scheduler: Scheduler) -> None:
         """JavaScript REPL starts in /home/user."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             result = await session.exec("console.log(process.cwd());")
             assert result.exit_code == 0
             assert "/home/user" in result.stdout
 
     async def test_shell_cwd(self, scheduler: Scheduler) -> None:
         """Shell REPL starts in /home/user."""
-        async with await scheduler.session(language=Language.RAW) as session:
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
             result = await session.exec("pwd")
             assert result.exit_code == 0
             assert "/home/user" in result.stdout
 
     async def test_run_python_cwd(self, scheduler: Scheduler) -> None:
-        """scheduler.run() also uses /home/user as cwd."""
-        result = await scheduler.run(
-            code="import os; print(os.getcwd())",
-            language=Language.PYTHON,
-        )
+        """run_once() also uses /home/user as cwd."""
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.getcwd())")
         assert result.exit_code == 0
         assert "/home/user" in result.stdout
 
     async def test_run_shell_cwd(self, scheduler: Scheduler) -> None:
-        """scheduler.run() shell also uses /home/user as cwd."""
-        result = await scheduler.run(
-            code="pwd",
-            language=Language.RAW,
-        )
+        """run_once() shell also uses /home/user as cwd."""
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "pwd")
         assert result.exit_code == 0
         assert "/home/user" in result.stdout
 
@@ -889,10 +879,7 @@ class TestLazyCloudpickle:
 
     async def test_simple_code_works(self, scheduler: Scheduler) -> None:
         """Simple print works without triggering cloudpickle."""
-        result = await scheduler.run(
-            code="print('hello')",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
         assert result.exit_code == 0
         assert "hello" in result.stdout
 
@@ -910,10 +897,7 @@ p.start()
 p.join(timeout=10)
 print(f"exit_code={p.exitcode}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "exit_code=0" in result.stdout
 
@@ -929,10 +913,7 @@ with multiprocessing.Pool(2) as pool:
     results = pool.map(square, [1, 2, 3, 4])
 print(results)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "[1, 4, 9, 16]" in result.stdout
 
@@ -942,10 +923,7 @@ print(results)
 import sys
 print('cloudpickle' in sys.modules)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "False" in result.stdout
 
@@ -962,9 +940,6 @@ p.start()
 p.join(timeout=10)
 print('cloudpickle' in sys.modules)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "True" in result.stdout

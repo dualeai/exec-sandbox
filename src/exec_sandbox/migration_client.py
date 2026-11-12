@@ -228,102 +228,114 @@ class MigrationClient:
         # AND any stale reply from a prior timed-out command.
         logger.debug("QMP command: %s args=%s", command, arguments)
         self._request_seq += 1
-        return await qmp_id_exchange(
-            self._reader,
-            self._writer,
-            f"migration-{self._request_seq}",
-            command,
-            arguments,
-            timeout,
-            MigrationTransientError,
-        )
+        try:
+            return await qmp_id_exchange(
+                self._reader,
+                self._writer,
+                request_id=f"migration-{self._request_seq}",
+                command=command,
+                arguments=arguments,
+                timeout=timeout,
+                error_factory=lambda message: _failed(message, context=None),
+            )
+        except (TimeoutError, json.JSONDecodeError) as e:
+            raise _failed(f"QMP {command} failed: {e!r}", context=None) from e
 
     async def _set_capabilities(
         self,
         qemu_version: tuple[int, int, int] | None,
-        use_template: bool = False,
+        *,
+        use_template: bool,
     ) -> None:
         """Configure migration capabilities for file: transport.
 
-        On QEMU >= 9.0, enables mapped-ram + multifd for parallel page I/O.
         mapped-ram maps RAM pages to fixed offsets in the file (seekable),
-        multifd enables multi-threaded transfer.
-
-        When use_template=True, also enables x-ignore-shared: QEMU skips RAM
-        pages backed by shared memory during migration, saving only device state.
-        This is the key mechanism for VM Templating (COW memory sharing).
+        multifd enables multi-threaded transfer. x-ignore-shared is always sent
+        with an explicit state: on for templates (QEMU skips RAM pages backed by
+        the shared memory-backend-file and saves only device state), off
+        otherwise, so a capability left on by an earlier command cannot leak in.
         Ref: https://www.qemu.org/docs/master/system/vm-templating.html
 
         Both sender (save) and receiver (restore) MUST set the same
         capabilities, otherwise QEMU rejects with "received capability is off".
+        There is no legacy fallback: a QEMU below the floor, or one that refuses
+        a capability, raises ConfigError MIGRATION_UNSUPPORTED.
 
         NOTE (design constraints, verified QEMU 11.0):
-        - mapped-ram is INCOMPATIBLE with multifd-compression (seekable-fd
-          requirement) AND with migration TLS. Any snapshot compression or
-          encryption for a future S3 freeze/thaw path must therefore be done
-          EXTERNALLY (client-side zstd + AEAD), not via QEMU capabilities. The
-          sanctioned in-QEMU perf recovery is the `direct-io` migration parameter
-          (O_DIRECT), gated to the full-RAM path when that lands.
-        - CPR (cpr-reboot/transfer/exec) is NOT a resume-anywhere primitive: all
-          modes are same-host only (fd/RAM handoff to a peer QEMU), so they cannot
-          back S3 freeze/thaw. Their only use here would be in-place QEMU upgrades.
-        - The migration stream format is QEMU-version-specific; a QEMU bump
-          invalidates saved snapshots (see MEMORY_SNAPSHOT_FORMAT_VERSION).
+        - mapped-ram does not work with multifd-compression (seekable-fd
+          requirement) or with migration TLS. Saved instances are compressed and
+          encrypted outside QEMU (zstd + AEAD in exec_sandbox.instance), not via
+          QEMU capabilities.
+        - CPR (cpr-reboot/transfer/exec) is not a resume-anywhere primitive: all
+          modes are same-host only (fd/RAM handoff to a peer QEMU).
+        - The migration stream can change between QEMU versions. The L1 cache key
+          includes the QEMU version (see MEMORY_SNAPSHOT_FORMAT_VERSION). A saved
+          instance has no such check: QEMU accepts or refuses its state at
+          restore (then RouteError INSTANCE_HOST_MISMATCH).
+
+        Raises:
+            ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
         """
         if qemu_version is None or qemu_version < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
-            return
+            floor = ".".join(map(str, constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION))
+            found = ".".join(map(str, qemu_version)) if qemu_version else "unknown"
+            raise _unsupported(f"QEMU {found} is below the migration floor {floor}")
 
-        # Unified capability list (QEMU >= 11.0). Base is mapped-ram + multifd for
-        # seekable, parallel page I/O. Template mode adds x-ignore-shared to skip
-        # RAM pages backed by the shared memory-backend-file (device-state-only
-        # vmstate). mapped-ram + x-ignore-shared coexist safely only since 11.0
-        # (earlier releases null-deref on ignored blocks — the reason the floor is
-        # 11.0), so both paths share one branch-free list.
+        # mapped-ram + x-ignore-shared coexist safely only since 11.0 (earlier
+        # releases null-deref on ignored blocks — the reason the floor is 11.0).
         # Ref: QEMU commit "migration/mapped-ram: Fix x-ignore-shared snapshots"
         #      (Pawel Zmarzly, Nov 2025; reviewed by Peter Xu, Dec 2025)
         capabilities = [
             {"capability": "multifd", "state": True},
             {"capability": "mapped-ram", "state": True},
+            {"capability": "x-ignore-shared", "state": use_template},
         ]
-        if use_template:
-            capabilities.append({"capability": "x-ignore-shared", "state": True})
         resp = await self._execute(
             "migrate-set-capabilities",
-            {"capabilities": capabilities},
+            arguments={"capabilities": capabilities},
+            timeout=_QMP_TIMEOUT,
         )
         if "error" in resp:
-            # Non-fatal: QEMU will use legacy precopy streaming format (no mapped-ram).
-            # MEMORY_SNAPSHOT_FORMAT_VERSION in the cache key prevents stale entries.
-            logger.warning(
-                "Failed to set migration capabilities, falling back to legacy streaming",
-                extra={"error": resp["error"], "qemu_version": qemu_version},
-            )
+            raise _unsupported(f"migrate-set-capabilities failed: {resp['error']}")
 
     async def save_snapshot(
         self,
         vmstate_path: Path,
-        qemu_version: tuple[int, int, int] | None = None,
-        timeout: float = constants.MEMORY_SNAPSHOT_SAVE_TIMEOUT_SECONDS,
-        use_template: bool = False,
+        *,
+        qemu_version: tuple[int, int, int] | None,
+        timeout: float,
+        use_template: bool,
+        keep_running: bool,
+        while_paused: Callable[[], Awaitable[None]] | None,
     ) -> None:
-        """Save VM state to file. VM pauses and then quit is sent.
+        """Save VM state to file.
 
-        After this call, the QEMU process will exit.
+        The vCPUs stop, QEMU writes the state, and success is reported only when
+        query-migrate shows "completed". `while_paused` then runs with the VM
+        still stopped (e.g. copy a disk that must match the saved RAM). Then QEMU
+        quits, or, with keep_running=True, the VM resumes (cont) and can be saved
+        again later.
+        On a failure after `stop`, the VM resumes, best effort: QEMU can refuse
+        `cont` (for example while the migration finalizes), so the VM can stay
+        paused. A SandboxError raised there gets context["vm_resumed"] (True when
+        `cont` succeeded). Keep the VM only then; replace it after any other
+        failed save.
 
         When use_template=True, x-ignore-shared is enabled: QEMU saves only
         device state (CPU registers, virtio rings, etc.), skipping RAM pages
         that are backed by shared memory-backend-file. The resulting vmstate
         is small (~100KB-1MB) instead of the full guest memory dump.
 
-        With mapped-ram + multifd (QEMU >= 9.0), QEMU can finish writing the
-        vmstate file and exit before our first query-migrate poll. If the connection
-        is lost during polling but the vmstate file exists with non-zero size,
-        treat it as success (QEMU exited after completing the save).
-
         Raises:
-            MigrationTransientError: Save failed
+            ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
+            TransientError: MIGRATION_FAILED: save failed
+            Any error that `while_paused` raises (the VM resumes first, best effort).
         """
-        await self._set_capabilities(qemu_version, use_template=use_template)
+        try:
+            await self._set_capabilities(qemu_version, use_template=use_template)
+        except SandboxError as e:
+            e.context["vm_resumed"] = True  # nothing stopped it: the VM runs on
+            raise
 
         # Stop vCPU before migration to avoid HVF assertion crash.
         # On ARM64 HVF, if the vCPU is running when migration starts, the pause
@@ -336,102 +348,133 @@ class MigrationClient:
         # without pausing the vCPU) is not used. It is KVM-only (needs userfaultfd
         # write-protect) so excluded on HVF, and we snapshot idle sessions where a
         # brief stop is cheap and full-fidelity capture wants a quiescent VM anyway.
-        resp = await self._execute("stop")
-        if "error" in resp:
-            raise MigrationTransientError(f"stop command failed: {resp['error']}")
+        resp = await self._execute("stop", arguments=None, timeout=_QMP_TIMEOUT)
+        if "error" in resp:  # QEMU refused to stop: the VM runs on
+            raise _failed(f"stop command failed: {resp['error']}", context={"vm_resumed": True})
 
-        # Start migration to file
-        uri = f"file:{vmstate_path}"
-        resp = await self._execute("migrate", {"uri": uri})
-        if "error" in resp:
-            raise MigrationTransientError(f"migrate command failed: {resp['error']}")
-
-        # Poll until migration completes.
-        # With mapped-ram + multifd, QEMU can finish saving and exit before our
-        # first query-migrate poll. This causes ConnectionResetError (socket level)
-        # or MigrationTransientError("QMP connection closed unexpectedly") from _execute().
-        # If the vmstate file exists with non-zero size, treat as success.
         try:
-            await self._poll_migration(timeout)
-        except (MigrationTransientError, ConnectionResetError, BrokenPipeError, OSError, TimeoutError) as e:
-            if vmstate_path.exists() and vmstate_path.stat().st_size > 0:
-                logger.info(
-                    "QEMU exited during migration poll (save likely completed)",
-                    extra={"vmstate_path": str(vmstate_path), "error": str(e)},
-                )
-            else:
-                raise MigrationTransientError(f"Connection lost during save and no vmstate file: {e}") from e
+            resp = await self._execute("migrate", arguments={"uri": f"file:{vmstate_path}"}, timeout=_QMP_TIMEOUT)
+            if "error" in resp:
+                raise _failed(f"migrate command failed: {resp['error']}", context=None)
+            await self._poll_migration(timeout, lambda message: _failed(message, context=None))
+            if while_paused is not None:
+                await while_paused()
+        except Exception as e:
+            resumed = await self._resume_after_failed_save()
+            if not resumed:  # the VM may stay paused, whatever failed: the caller must replace it
+                raise _failed(f"Save failed and the VM did not resume: {e}", context={"vm_resumed": False}) from e
+            if isinstance(e, SandboxError):
+                e.context["vm_resumed"] = True  # the VM runs on: a caller may keep it
+            raise
 
-        # Send quit to terminate QEMU (VM state is saved)
-        with contextlib.suppress(MigrationTransientError, OSError):
-            await self._execute("quit", timeout=2.0)
+        if keep_running:
+            resp = await self._execute("cont", arguments=None, timeout=_QMP_TIMEOUT)
+            if "error" in resp:
+                raise _failed(f"cont after save failed: {resp['error']}", context=None)
+        else:
+            # QEMU may close the socket before it answers quit.
+            with contextlib.suppress(TransientError, OSError):
+                await self._execute("quit", timeout=2.0, arguments=None)
 
-        logger.info("VM state saved", extra={"vmstate_path": str(vmstate_path)})
+        logger.info("VM state saved", extra={"vmstate_path": str(vmstate_path), "keep_running": keep_running})
+
+    async def _resume_after_failed_save(self) -> bool:
+        """Leave the VM running: cancel a migration that may still be active
+        (timeout), then resume the vCPUs that save_snapshot stopped. True when
+        QEMU accepted `cont`; False: the VM can stay paused (e.g. cont refused
+        while the migration finalizes), so the caller replaces it."""
+        resumed = False
+        for command in ("migrate_cancel", "cont"):
+            with contextlib.suppress(TransientError, OSError):
+                resp = await self._execute(command, timeout=2.0, arguments=None)
+                if "error" in resp:
+                    logger.warning(
+                        "QMP command after failed save refused", extra={"command": command, "error": resp["error"]}
+                    )
+                elif command == "cont":
+                    resumed = True
+        return resumed
 
     async def restore_snapshot(
         self,
         vmstate_path: Path,
-        qemu_version: tuple[int, int, int] | None = None,
-        timeout: float = constants.MEMORY_SNAPSHOT_RESTORE_TIMEOUT_SECONDS,
-        use_template: bool = False,
+        *,
+        qemu_version: tuple[int, int, int] | None,
+        timeout: float,
+        use_template: bool,
     ) -> None:
         """Restore VM from file. Precondition: QEMU started with -incoming defer.
 
-        After this call, the VM is running (cont sent).
+        After this call, the VM is running (cont sent). exit-on-error=false keeps
+        QEMU alive when it rejects the stream, so the error text is read from
+        query-migrate and the caller owns the teardown.
 
         When use_template=True, x-ignore-shared is enabled: QEMU loads only
         device state from the vmstate file, skipping RAM (already present via
         file-backed memory-backend-file with MAP_PRIVATE COW mapping).
 
         Raises:
-            MigrationTransientError: Restore failed
+            RouteError: MIGRATION_REJECTED: QEMU refused the saved state
+            ConfigError: MIGRATION_UNSUPPORTED: QEMU below the floor or capability refused
+            TransientError: MIGRATION_FAILED: QMP failure or timeout
         """
         await self._set_capabilities(qemu_version, use_template=use_template)
 
-        # Load migration stream
-        uri = f"file:{vmstate_path}"
-        resp = await self._execute("migrate-incoming", {"uri": uri})
+        resp = await self._execute(
+            "migrate-incoming",
+            arguments={"uri": f"file:{vmstate_path}", "exit-on-error": False},
+            timeout=_QMP_TIMEOUT,
+        )
         if "error" in resp:
-            raise MigrationTransientError(f"migrate-incoming command failed: {resp['error']}")
+            raise _rejected(f"migrate-incoming command failed: {resp['error']}", qemu_version=qemu_version)
 
-        # Poll until migration completes
-        await self._poll_migration(timeout)
+        await self._poll_migration(timeout, lambda message: _rejected(message, qemu_version=qemu_version))
 
         # Resume the VM
-        resp = await self._execute("cont")
+        resp = await self._execute("cont", arguments=None, timeout=_QMP_TIMEOUT)
         if "error" in resp:
-            raise MigrationTransientError(f"cont command failed: {resp['error']}")
+            raise _failed(f"cont command failed: {resp['error']}", context=None)
 
         logger.info("VM state restored", extra={"vmstate_path": str(vmstate_path)})
 
-    async def _poll_migration(self, timeout: float) -> None:
+    async def _poll_migration(
+        self,
+        timeout: float,
+        failure: Callable[[str], SandboxError],
+    ) -> None:
         """Poll query-migrate at 5ms intervals until completed/failed.
 
         Raises:
-            MigrationTransientError: Migration failed or timed out
+            SandboxError: failure(message) when the migration reached
+                failed/cancelled/failing (with QEMU's error-desc)
+            TransientError: MIGRATION_FAILED: query-migrate failed or timed out
         """
-        async with asyncio.timeout(timeout):
-            while True:
-                resp = await self._execute("query-migrate", timeout=5.0)
-                if "error" in resp:
-                    raise MigrationTransientError(f"query-migrate failed: {resp['error']}")
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    resp = await self._execute("query-migrate", timeout=5.0, arguments=None)
+                    if "error" in resp:
+                        raise _failed(f"query-migrate failed: {resp['error']}", context=None)
 
-                status = resp.get("return", {}).get("status", "")
-                if status == "completed":
-                    return
-                # "failing" (QEMU 11.0+): an error occurred and cleanup is underway;
-                # the status will transition to "failed" shortly. Treat it as terminal
-                # here so a mid-stream failure surfaces immediately instead of burning
-                # another poll interval waiting for the "failed" transition.
-                if status in ("failed", "cancelled", "failing"):
-                    error_desc = resp.get("return", {}).get("error-desc", "unknown")
-                    raise MigrationTransientError(f"Migration {status}: {error_desc}")
+                    status = resp.get("return", {}).get("status", "")
+                    if status == "completed":
+                        return
+                    # "failing" (QEMU 11.0+): an error occurred and cleanup is underway;
+                    # the status will transition to "failed" shortly. Treat it as terminal
+                    # here so a mid-stream failure surfaces immediately instead of burning
+                    # another poll interval waiting for the "failed" transition.
+                    if status in ("failed", "cancelled", "failing"):
+                        error_desc = resp.get("return", {}).get("error-desc", "unknown")
+                        raise failure(f"Migration {status}: {error_desc}")
 
-                await asyncio.sleep(constants.MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS)
+                    await asyncio.sleep(constants.MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS)
+        except TimeoutError as e:
+            # Only the deadline: _execute turns its own timeouts into MIGRATION_FAILED
+            raise _failed(f"Migration did not complete within {timeout:.0f}s", context=None) from e
 
     async def __aenter__(self) -> Self:
         """Enter async context manager, connecting to QMP."""
-        await self.connect()
+        await self.connect(timeout=_CONNECT_TIMEOUT_SECONDS)
         return self
 
     async def __aexit__(

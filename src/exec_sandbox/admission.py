@@ -29,7 +29,10 @@ import ctypes
 import ctypes.util
 import functools
 import math
+import os
+import shutil
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
@@ -63,19 +66,16 @@ CapacitySource = Literal["manual", "cgroup", "psutil", "none", "unknown"]
 
 @dataclass(frozen=True)
 class ResourceReservation:
-    """Tracks resources reserved by a single VM admission.
-
-    Carries both effective limits (used by cgroup/ulimit enforcers and budget
-    tracking) and guest values (used by QEMU -m/-smp).
+    """Tracks resources reserved by a single VM admission: the effective limits
+    (guest + overhead) that budget tracking counts, and the home disk size.
     """
 
     vm_id: str
     # Effective limits (guest + overhead) — used by cgroup/ulimit enforcers and budget tracking
     memory_mb: float
     cpu_cores: float
-    # Guest values — used by QEMU (-m, -smp)
-    guest_memory_mb: float
-    guest_cpu_cores: float
+    # Home disk size (sparse file: the guest can fill it up to this)
+    disk_mb: float
     # Unique key in _reservations dict — prevents collision when
     # multiple VMs share the same vm_id string (e.g. concurrent requests
     # with the same tenant_id + task_id).
@@ -193,7 +193,11 @@ class ResourceAdmissionController:
         host_cpu_count: float | None = None,
         available_memory_floor_mb: int = 0,
         host_cpu_reserve_cores: float = DEFAULT_HOST_CPU_RESERVE_CORES,
+        disk_dir: Path,
+        disk_free_floor_mb: int,
     ) -> None:
+        self._disk_dir = disk_dir
+        self._disk_free_floor_mb = disk_free_floor_mb
         self._memory_overcommit_ratio = memory_overcommit_ratio
         self._cpu_overcommit_ratio = cpu_overcommit_ratio
         self._host_memory_reserve_ratio = host_memory_reserve_ratio
@@ -214,8 +218,13 @@ class ResourceAdmissionController:
         # Current allocations (protected by _condition's lock)
         self._allocated_memory_mb: float = 0.0
         self._allocated_cpu: float = 0.0
+        self._allocated_disk_mb: float = 0.0
+        # Home disk name -> bytes it shares with its L1 template at clone time
+        self._shared_disk_bytes: dict[str, int] = {}
         self._allocated_vm_slots: int = 0
         self._reservations: dict[str, ResourceReservation] = {}
+        # (memory, cpu, disk) of each blocked acquire -> how many wait with it
+        self._waiting: Counter[tuple[float, float, float]] = Counter()
 
         # Condition for blocking acquire / signaling release
         self._condition = asyncio.Condition()
@@ -474,11 +483,15 @@ class ResourceAdmissionController:
         cpu_cores: float,
         timeout: float,
         use_tcg: bool = False,
+        *,
+        disk_mb: int,
     ) -> ResourceReservation:
         """Acquire resources for a VM, blocking if insufficient.
 
-        Checks all three gates under lock. Blocks on asyncio.Condition if
-        insufficient resources. Raises VmCapacityError after timeout.
+        Checks all gates under lock (memory, CPU, available memory, memory
+        pressure, home disk space). Blocks on asyncio.Condition if resources are
+        insufficient. Raises at once when the request exceeds the whole memory or
+        CPU budget, after `timeout` otherwise, or when the controller stops.
 
         Args:
             vm_id: VM identifier (for logging, does not need to be unique)
@@ -548,18 +561,31 @@ class ResourceAdmissionController:
             },
         )
 
+        request = (total_memory_mb, total_cpu, float(disk_mb))
         try:
             async with asyncio.timeout(timeout):
                 async with self._condition:
-                    await self._condition.wait_for(lambda: self._stopped or self._can_admit(total_memory_mb, total_cpu))
+                    self._waiting[request] += 1
+                    try:
+                        await self._condition.wait_for(
+                            lambda: self._stopped or self._can_admit(total_memory_mb, total_cpu, disk_mb)
+                        )
+                    finally:  # the lock is held again here, also on timeout
+                        self._waiting[request] -= 1
+                        if not self._waiting[request]:
+                            del self._waiting[request]
                     if self._stopped:
-                        raise VmCapacityError(
+                        raise InvalidInputError(
                             f"Admission controller stopped while waiting for VM {vm_id}",
+                            code=ErrorCode.SCHEDULER_STATE,
                             context={"vm_id": vm_id},
+                            hint=None,
+                            instance_id=None,
                         )
                     # Resources available - commit reservation
                     self._allocated_memory_mb += total_memory_mb
                     self._allocated_cpu += total_cpu
+                    self._allocated_disk_mb += disk_mb
                     self._allocated_vm_slots += 1
                     self._reservations[reservation.reservation_id] = reservation
 
@@ -575,6 +601,9 @@ class ResourceAdmissionController:
                             "vm_slots": self._allocated_vm_slots,
                         },
                     )
+                    # One release can free room for several waiters: pass the wake-up on.
+                    if self._waiting:
+                        self._condition.notify(1)
                     return reservation
 
         except TimeoutError:
@@ -626,6 +655,7 @@ class ResourceAdmissionController:
 
             self._allocated_memory_mb -= reservation.memory_mb
             self._allocated_cpu -= reservation.cpu_cores
+            self._allocated_disk_mb -= reservation.disk_mb
             self._allocated_vm_slots -= 1
             del self._reservations[reservation.reservation_id]
 
@@ -633,6 +663,7 @@ class ResourceAdmissionController:
             if self._allocated_vm_slots == 0:
                 self._allocated_memory_mb = 0.0
                 self._allocated_cpu = 0.0
+                self._allocated_disk_mb = 0.0
 
             logger.debug(
                 "Resource reservation released",
@@ -647,13 +678,17 @@ class ResourceAdmissionController:
                 },
             )
 
-            # Wake exactly 1 waiter — all VMs request identical resources
-            # (DEFAULT_VM_CPU_CORES + overhead), so freeing 1 slot can only
-            # satisfy 1 waiter.  Eliminates O(N²) thundering herd under burst
-            # load (500 waiters x 500 releases = 250k wasted wakeups).
-            # Gate 3 recovery (external memory pressure drop) is handled by
-            # _self_wake_loop which still uses notify_all() every 10s.
-            self._condition.notify(1)
+            # One waiter when all waiters ask for the same size: the first fits
+            # whenever any does, and each admission wakes the next (acquire), so
+            # a large release still admits several. No O(N²) thundering herd
+            # under burst load (500 waiters x 500 releases = 250k wasted wakeups).
+            # Mixed sizes (VmSpec): the first waiter may be too large while a
+            # smaller one fits, so all re-check. Gate 3 recovery (external memory
+            # pressure drop) is handled by _self_wake_loop (notify_all() every 10s).
+            if len(self._waiting) > 1:
+                self._condition.notify_all()
+            else:
+                self._condition.notify(1)
 
     def effective_max_vms(
         self,
@@ -700,12 +735,13 @@ class ResourceAdmissionController:
             return max_by_memory
         return min(max_by_memory, max_by_cpu)
 
-    def _can_admit(self, memory_mb: float, cpu_cores: float) -> bool:
+    def _can_admit(self, memory_mb: float, cpu_cores: float, disk_mb: float) -> bool:
         """Check if all admission gates pass.
 
         Args:
             memory_mb: Total memory needed (guest + overhead)
             cpu_cores: CPU cores needed
+            disk_mb: Home disk size needed
 
         Returns:
             True if all gates pass
@@ -757,4 +793,55 @@ class ResourceAdmissionController:
             logger.debug("Gate 3b (memory pressure) blocked")
             return False
 
+        # Gate 4: Home disk space (statvfs + one stat per disk, cached 100ms)
+        disk = self._probe_disk()
+        if disk is not None:
+            free_mb, written_mb = disk
+            unwritten_mb = max(0.0, self._allocated_disk_mb - written_mb)
+            if free_mb - unwritten_mb - disk_mb < self._disk_free_floor_mb:
+                logger.debug(
+                    "Gate 4 (home disk space) blocked",
+                    extra={
+                        "requested_disk_mb": disk_mb,
+                        "free_mb": round(free_mb),
+                        "admitted_unwritten_mb": round(unwritten_mb),
+                        "floor_mb": self._disk_free_floor_mb,
+                    },
+                )
+                return False
+
         return True
+
+    def note_shared_blocks(self, disk_name: str, shared_bytes: int) -> None:
+        """A home disk cloned from an L1 template: its first `shared_bytes` of
+        allocation take no free space yet (copy-on-write), so they are not
+        counted as written."""
+        self._shared_disk_bytes[disk_name] = shared_bytes
+
+    @_ttl_cache(_PROBE_CACHE_TTL_SECONDS)
+    def _probe_disk(self) -> tuple[float, float] | None:
+        """Free space of disk_dir and the space its home disks use, in MB.
+
+        Only this controller's disks are in disk_dir (one folder per manager),
+        so their allocated blocks are what admitted guests have written. Blocks
+        a clone still shares with its template are not written (the guest can
+        still need that space when it overwrites them). Saved-instance work
+        files (disk_dir/instances/) use free space too; this gate reserves none
+        for them.
+        """
+        try:
+            free = shutil.disk_usage(self._disk_dir).free
+            written = 0
+            present: set[str] = set()
+            with os.scandir(self._disk_dir) as entries:
+                for entry in entries:
+                    if entry.name.endswith(".img"):
+                        with contextlib.suppress(FileNotFoundError):  # VM destroyed meanwhile
+                            allocated = entry.stat(follow_symlinks=False).st_blocks * 512
+                            written += max(0, allocated - self._shared_disk_bytes.get(entry.name, 0))
+                            present.add(entry.name)
+        except OSError:
+            return None
+        for gone in self._shared_disk_bytes.keys() - present:
+            del self._shared_disk_bytes[gone]
+        return free / (1024 * 1024), written / (1024 * 1024)

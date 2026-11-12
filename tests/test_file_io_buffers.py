@@ -19,6 +19,7 @@ import pytest
 from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
 
 _CHUNK = FILE_TRANSFER_CHUNK_SIZE
 
@@ -38,7 +39,7 @@ class TestBufferRoundtrip:
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "out.bin"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", io.BytesIO(content))
             await session.read_file("test.bin", destination=dest)
 
@@ -50,7 +51,7 @@ class TestBufferRoundtrip:
         content = os.urandom(4096)
         buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", content)
             await session.read_file("test.bin", destination=buf)
 
@@ -62,7 +63,7 @@ class TestBufferRoundtrip:
         expected_hash = hashlib.sha256(content).hexdigest()
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", io.BytesIO(content))
             await session.read_file("test.bin", destination=read_buf)
 
@@ -87,7 +88,7 @@ class TestBufferRoundtrip:
         expected_hash = hashlib.sha256(content).hexdigest()
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file(f"size_{label}.bin", io.BytesIO(content))
             await session.read_file(f"size_{label}.bin", destination=read_buf)
 
@@ -112,7 +113,7 @@ class TestBufferEdgeCases:
         buf.seek(6)  # Skip "prefix"
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", buf)
             await session.read_file("test.bin", destination=read_buf)
 
@@ -124,7 +125,7 @@ class TestBufferEdgeCases:
         dest = io.BytesIO(b"old")
         dest.seek(3)  # Position at end of "old"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", content)
             await session.read_file("test.bin", destination=dest)
 
@@ -132,7 +133,7 @@ class TestBufferEdgeCases:
 
     async def test_empty_bytesio_write(self, scheduler: Scheduler) -> None:
         """Empty BytesIO write creates empty file, list_files shows size=0."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("empty.bin", io.BytesIO(b""))
             files = await session.list_files()
             matching = [f for f in files if f.name == "empty.bin"]
@@ -142,7 +143,7 @@ class TestBufferEdgeCases:
     async def test_make_executable_via_bytesio(self, scheduler: Scheduler) -> None:
         """Write shell script from BytesIO with make_executable, exec succeeds."""
         script = b"#!/bin/sh\necho hello_from_bytesio"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("run.sh", io.BytesIO(script), make_executable=True)
             result = await session.exec(
                 "import subprocess; print(subprocess.check_output('./run.sh').decode().strip())"
@@ -153,7 +154,7 @@ class TestBufferEdgeCases:
         """asyncio.gather with multiple BytesIO writes/reads — no cross-contamination."""
         contents = {f"file_{i}.bin": os.urandom(1024) for i in range(4)}
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write all files
             for name, data in contents.items():
                 await session.write_file(name, io.BytesIO(data))
@@ -176,7 +177,7 @@ class TestBufferEdgeCases:
         data_c = os.urandom(2048)
         data_d = os.urandom(2048)
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Concurrent writes: 2 from BytesIO, 2 from bytes
             await asyncio.gather(
                 session.write_file("a.bin", io.BytesIO(data_a)),
@@ -222,7 +223,7 @@ class TestNonStandardStreams:
         stream = io.BufferedReader(raw)
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", stream)  # type: ignore[arg-type]
             await session.read_file("test.bin", destination=read_buf)
 
@@ -236,7 +237,7 @@ class TestNonStandardStreams:
         spool.seek(0)
         read_buf = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", spool)  # type: ignore[arg-type]
             await session.read_file("test.bin", destination=read_buf)
 
@@ -286,7 +287,7 @@ class TestBufferOwnership:
         """After write_file, caller's BytesIO is still usable."""
         buf = io.BytesIO(b"hello")
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", buf)
 
         # Buffer should still be open and readable
@@ -297,7 +298,7 @@ class TestBufferOwnership:
         """After read_file, caller's BytesIO is still usable."""
         dest = io.BytesIO()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.bin", b"hello")
             await session.read_file("test.bin", destination=dest)
 

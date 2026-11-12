@@ -1,0 +1,81 @@
+"""VmSpec: the public, frozen object that holds what a VM is made of."""
+
+import pytest
+from pydantic import ValidationError
+
+from exec_sandbox import constants
+from exec_sandbox.models import Language, PortMapping
+from exec_sandbox.vm_spec import VmSpec
+
+
+class TestVmSpec:
+    def test_defaults(self) -> None:
+        spec = VmSpec(language=Language.PYTHON)
+        assert (spec.memory_mb, spec.cpu_cores, spec.disk_mb) == (
+            constants.DEFAULT_MEMORY_MB,
+            constants.DEFAULT_VM_CPU_CORES,
+            constants.DEFAULT_DISK_MB,
+        )
+        assert (spec.packages, spec.allow_network, spec.allowed_domains, spec.expose_ports) == ((), False, None, ())
+
+    def test_packages_are_canonical(self) -> None:
+        """Package order never changes the VM: the spec sorts them."""
+        assert VmSpec(language=Language.PYTHON, packages=("b==1", "a==2")).packages == ("a==2", "b==1")
+        assert VmSpec(language=Language.PYTHON, packages=("b==1", "a==2")) == VmSpec(
+            language=Language.PYTHON, packages=("a==2", "b==1")
+        )
+
+    @pytest.mark.parametrize(
+        ("allow_network", "ports", "expected"),
+        [
+            (False, (), False),
+            (True, (), True),
+            (False, (PortMapping(internal=8080),), True),
+        ],
+    )
+    def test_network_device(self, allow_network: bool, ports: tuple[PortMapping, ...], expected: bool) -> None:
+        """Network access or an exposed port adds the virtio-net device."""
+        spec = VmSpec(language=Language.PYTHON, allow_network=allow_network, expose_ports=ports)
+        assert spec.has_network_device is expected
+
+    def test_int_port_is_internal_port(self) -> None:
+        spec = VmSpec(language=Language.PYTHON, expose_ports=[8080, PortMapping(internal=9000, external=3000)])
+        assert spec.expose_ports == (PortMapping(internal=8080), PortMapping(internal=9000, external=3000))
+
+    def test_frozen_and_hashable(self) -> None:
+        """A catalogue of specs can be dict keys; a spec never changes after creation."""
+        spec = VmSpec(language=Language.PYTHON, expose_ports=[8080])
+        assert hash(spec) == hash(VmSpec(language="python", expose_ports=[8080]))
+        with pytest.raises(ValidationError):
+            spec.memory_mb = 1024  # type: ignore[misc]
+
+    def test_json_round_trip(self) -> None:
+        """A saved instance stores the spec as JSON and rebuilds the same VM from it."""
+        spec = VmSpec(
+            language=Language.RAW, memory_mb=512, packages=("a",), expose_ports=[80], allowed_domains=("x.y",)
+        )
+        assert VmSpec.model_validate_json(spec.model_dump_json()) == spec
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            pytest.param({"memory_mb": constants.MIN_MEMORY_MB - 1}, id="memory-below-min"),
+            pytest.param({"disk_mb": constants.MIN_DISK_MB - 1}, id="disk-below-min"),
+            pytest.param({"cpu_cores": 0}, id="no-cpu"),
+            pytest.param({"expose_ports": list(range(1, constants.MAX_EXPOSED_PORTS + 2))}, id="too-many-ports"),
+            pytest.param({"expose_ports": None}, id="ports-not-a-sequence"),
+            pytest.param({"language": "cobol"}, id="unknown-language"),
+            pytest.param({"memroy_mb": 256}, id="typo-field"),
+            pytest.param({"allowed_domains": ["pypi.org", "bad..domain"]}, id="domain-empty-label"),
+            pytest.param({"allowed_domains": ["example.123"]}, id="domain-numeric-tld"),
+            pytest.param({"allowed_domains": ["(a|b)*.com"]}, id="domain-regex"),
+        ],
+    )
+    def test_invalid(self, fields: dict[str, object]) -> None:
+        with pytest.raises(ValidationError):
+            VmSpec.model_validate({"language": "python", **fields})
+
+    @pytest.mark.parametrize("memory_mb", [constants.MIN_MEMORY_MB, 65536])
+    def test_memory_bounds_accept(self, memory_mb: int) -> None:
+        """MIN_MEMORY_MB is the floor; there is no ceiling (the host admission decides)."""
+        assert VmSpec(language=Language.PYTHON, memory_mb=memory_mb).memory_mb == memory_mb

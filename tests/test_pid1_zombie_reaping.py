@@ -17,7 +17,8 @@ Integration tests require QEMU + images (run 'make build-images').
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_on_python_312_subprocess_bug
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, skip_on_python_312_subprocess_bug
 
 
 class TestPid1ZombieReaping:
@@ -62,10 +63,7 @@ with open('/tmp/orphan_ppid.txt') as f:
 print(f'ORPHAN_PPID:{orphan_ppid}')
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
         # Orphan should be reparented to PID 1 (guest-agent)
@@ -118,10 +116,7 @@ for entry in os.listdir('/proc'):
 print(f'ZOMBIE_COUNT:{zombie_count}')
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
         assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies, got: {result.stdout}"
@@ -177,10 +172,7 @@ print(f'ZOMBIE_COUNT:{zombie_count}')
 print('ORPHANS_CREATED:10')
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
         assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after 10 orphans, got: {result.stdout}"
@@ -231,10 +223,7 @@ print(f'ZOMBIE_COUNT:{zombie_count}')
 print('RAPID_SPAWNS:50')
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
         assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies after rapid spawning, got: {result.stdout}"
@@ -282,10 +271,7 @@ done
 echo "ZOMBIE_COUNT:$zombie_count"
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
 
         assert result.exit_code == 0, f"Execution failed: {result.stderr}"
         assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies from shell orphans, got: {result.stdout}"

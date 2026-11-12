@@ -6,6 +6,7 @@ Patterns are matched against both DNS queries and TLS SNI.
 
 import json
 import re
+from collections.abc import Sequence
 
 from exec_sandbox.constants import NPM_PACKAGE_DOMAINS, PYTHON_PACKAGE_DOMAINS
 
@@ -18,7 +19,7 @@ _DOMAIN_LABEL_PATTERN = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])
 _DOMAIN_MAX_LENGTH = 253
 
 
-def _validate_domain(domain: str) -> None:
+def validate_domain(domain: str) -> None:
     """Validate domain is RFC 1035 compliant.
 
     Prevents regex injection and ReDoS attacks by ensuring domains contain
@@ -61,7 +62,7 @@ def _validate_domain(domain: str) -> None:
         raise ValueError(f"TLD must be alphabetic only: {tld!r} in {domain!r}")
 
 
-def create_outbound_patterns(domains: list[str]) -> list[str]:
+def create_outbound_patterns(domains: Sequence[str]) -> list[str]:
     """Create OutboundAllow regex patterns from domain list.
 
     Each pattern matches the domain and all its subdomains, with optional
@@ -85,7 +86,7 @@ def create_outbound_patterns(domains: list[str]) -> list[str]:
     for domain in domains:
         # Security: Validate domain format before constructing regex
         # Prevents ReDoS attacks and regex injection
-        _validate_domain(domain)
+        validate_domain(domain)
         patterns.append(
             # Match domain AND all subdomains: (.*\.)? makes prefix optional
             # Matches both "pypi.org" and "www.pypi.org"

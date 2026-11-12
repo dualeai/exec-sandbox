@@ -9,17 +9,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import os
 from typing import TYPE_CHECKING, ClassVar, Self
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.hash_utils import crc32
-from exec_sandbox.lock_utils import file_lock
+from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.lock_utils import try_file_lock
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
 logger = get_logger(__name__)
+
+# In-process digest cache: path -> (file_stamp, sha256 hex). One entry per path.
+_IMAGE_DIGEST_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def file_stamp(stat: os.stat_result) -> str:
+    """One version of a file for the in-process caches: inode, mtime and size. A
+    rebuilt or replaced file gets a new stamp."""
+    return f"{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
 
 
 class BaseCacheManager:
@@ -154,15 +165,40 @@ class BaseCacheManager:
 
     @staticmethod
     def image_hash(path: Path) -> str:
-        """Stat-based fingerprint of a file for change detection (O(1), no read).
+        """SHA-256 content digest of a file (identity of a base image, kernel or L2 layer).
 
-        Hashes mtime_ns + file size to detect rebuilds without reading file
-        content. Sufficient for detecting image rebuilds (which always change
-        mtime) but not for detecting content tampering.
-        Returns "missing0" if file does not exist.
+        The digest is the same on every host for the same bytes, so cache keys
+        built from it can be shared across hosts (an mtime-based fingerprint
+        differs per host). The file is read once; the digest is cached in memory
+        and in a ``<file>.sha256`` sidecar keyed by inode, mtime and size, so a
+        rebuilt file is re-hashed. Blocking: async callers use asyncio.to_thread.
+        Returns "missing0" if the file does not exist.
         """
         try:
             stat = path.stat()
-            return crc32(f"{stat.st_mtime_ns}:{stat.st_size}")
         except OSError:
             return "missing0"
+        stamp = file_stamp(stat)
+        cached = _IMAGE_DIGEST_CACHE.get(str(path))
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        sidecar = path.with_name(f"{path.name}.sha256")
+        try:
+            sidecar_stamp, sidecar_digest = sidecar.read_text().split()
+            if sidecar_stamp == stamp:
+                _IMAGE_DIGEST_CACHE[str(path)] = (stamp, sidecar_digest)
+                return sidecar_digest
+        except (OSError, ValueError):
+            pass
+        try:
+            with path.open("rb") as f:
+                digest = hashlib.file_digest(f, "sha256").hexdigest()
+        except FileNotFoundError:
+            return "missing0"  # Removed between stat and open (eviction)
+        _IMAGE_DIGEST_CACHE[str(path)] = (stamp, digest)
+        # Best effort: the image directory may be read-only (installed assets).
+        with contextlib.suppress(OSError):
+            tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
+            tmp.write_text(f"{stamp} {digest}")
+            tmp.replace(sidecar)
+        return digest

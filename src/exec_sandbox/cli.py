@@ -6,16 +6,20 @@ Usage:
     echo "print(1)" | sbx -        # Run from stdin
     sbx -l python -p pandas==3.0.1 'import pandas; print(pandas.__version__)'
 
-Multi-input (V2):
+Multi-input (each source in its own VM, all at the same time):
     sbx 'print(1)' 'print(2)'      # Multiple inline codes
     sbx script1.py script2.py      # Multiple files
-    sbx -j 5 *.py                  # Concurrent with limit
+
+Saved instances:
+    sbx run --instance my-vm -c 'x = 41'          # Makes instance my-vm, saves it
+    sbx run --instance my-vm -c 'print(x + 1)'    # Continues it: prints 42, saves it
+    sbx instance list | describe ID | rm ID...
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import contextlib
 import logging
 import os
 import signal
@@ -23,30 +27,50 @@ import sys
 import termios
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable, Generator
+
+    from exec_sandbox import Session
+    from exec_sandbox.instance.manager import InstanceAdmin
+    from exec_sandbox.settings import InstanceStoreKind
 
 import click
+from click.core import ParameterSource
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError, computed_field
+from pydantic_core import to_json
 
 from exec_sandbox import (
+    ErrorAction,
+    ErrorCode,
     ExecutionResult,
+    ExposedPort,
+    InstanceGoneError,
+    InstanceNotSavedWarning,
+    InstanceRef,
+    InvalidInputError,
     Language,
-    PackageNotAllowedError,
     PortMapping,
     SandboxError,
     Scheduler,
     SchedulerConfig,
-    VmTimeoutError,
+    StartupTiming,
+    VmSpec,
     __version__,
     constants,
 )
+from exec_sandbox._imports import require_cli_keyring, require_instance_admin
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.assets import PrefetchResult, prefetch_all_assets
+from exec_sandbox.dns_filter import validate_domain
+from exec_sandbox.instance.ids import check_instance_id
+from exec_sandbox.platform_utils import UserDir, get_account_dir
 from exec_sandbox.process_registry import force_kill_all, get_tracked_count
+from exec_sandbox.settings import Settings
 
 
 def _create_terminal_monitor(stop_event: threading.Event) -> None:
@@ -540,7 +564,335 @@ def _make_boot_log_callback(debug: bool) -> Callable[[str], None] | None:
     return _on_boot_log
 
 
+def _make_spec(
+    *,
+    language: Language,
+    memory: int,
+    packages: list[str],
+    network: bool,
+    allowed_domains: list[str],
+    expose_ports: list[PortMapping] | None,
+) -> VmSpec:
+    """VmSpec from the CLI flags (empty flag lists mean "none"). A value the VmSpec refuses
+    (-m below its minimum, more --expose than its maximum) raises click.UsageError (exit 2)
+    with one line that names the option: callers make the spec before any VM starts."""
+    try:
+        return VmSpec(
+            language=language,
+            memory_mb=memory,
+            packages=tuple(packages),
+            allow_network=network,
+            allowed_domains=tuple(allowed_domains) if allowed_domains else None,
+            expose_ports=tuple(expose_ports or ()),
+        )
+    except ValidationError as e:
+        options = dict(_SPEC_OPTIONS.values())  # VmSpec field -> option name
+        problems = [
+            f"'{options[err['loc'][0]]}': {err['msg']}" if err["loc"] and err["loc"][0] in options else err["msg"]
+            for err in e.errors(include_url=False)
+        ]
+        raise click.UsageError(f"Invalid VM options: {'; '.join(problems)}.") from None
+
+
+# ============================================================================
+# Settings (EXEC_SANDBOX_* variables)
+# ============================================================================
+
+
+@contextlib.contextmanager
+def _valid_settings() -> Generator[None]:
+    """Exit 2, with no traceback, when the Settings or SchedulerConfig built inside are not valid.
+
+    One line for each invalid field: its name, why, and the type of the value.
+    Never the value: instance_keyring is a secret.
+    """
+    try:
+        yield
+    except ValidationError as e:
+        fields = [
+            f"    {'.'.join(map(str, err['loc'])) or e.title}: {err['msg']} (got {type(err['input']).__name__})"
+            for err in e.errors(include_url=False)
+        ]
+        message = format_error("Invalid settings", "Correct these EXEC_SANDBOX_* variables or options, then run again:")
+        click.echo("\n".join([message, *fields]), err=True)
+        raise click.exceptions.Exit(EXIT_CLI_ERROR) from None
+
+
+def _env_settings() -> Settings:
+    """The EXEC_SANDBOX_* settings, checked before any VM or store opens (see _valid_settings)."""
+    with _valid_settings():
+        return Settings()
+
+
+# ============================================================================
+# Saved instances (sbx run --instance, sbx instance)
+# ============================================================================
+
+_SPEC_OPTIONS: dict[str, tuple[str, str]] = {
+    "language": ("language", "--language"),
+    "packages": ("packages", "--package"),
+    "memory": ("memory_mb", "--memory"),
+    "network": ("allow_network", "--network"),
+    "allowed_domains": ("allowed_domains", "--allow-domain"),
+    "expose_ports": ("expose_ports", "--expose"),
+}
+"""Options of `sbx run` that shape the VM: click parameter name -> (VmSpec field, option name)."""
+
+_ACTION_ADVICE: dict[ErrorAction, str] = {
+    ErrorAction.RETRY: "Run the same command again later.",
+    ErrorAction.VERIFY: "It is not known what this run did: the code may have run, or the save may have "
+    "landed (or another save won). Check before you run again; for an instance, read the generation "
+    "with 'sbx instance describe {id}'.",
+    ErrorAction.RESTART: "Run the command again.",
+    ErrorAction.FIX_INPUT: "Correct the command, then run again.",
+    ErrorAction.FIX_CONFIG: "Correct the settings, then run again.",
+    ErrorAction.ROUTE: "Run it on a host with the needed values "
+    "(CPU, accelerator, QEMU, guest images, exec-sandbox release, memory and CPU budget). "
+    "Do not remove a saved instance for this error: its data is good.",
+    ErrorAction.RECREATE: "This instance cannot be used again. "
+    "Remove it with 'sbx instance rm {id}', then run again to make a new one.",
+    ErrorAction.REPORT: "This is a bug or a broken host: report it with the output of a run with "
+    "EXEC_SANDBOX_LOG_LEVEL=DEBUG.",
+}
+"""What the user does next, for each action."""
+
+_PREFETCH_ADVICE = "Check the network, then download the VM images with 'sbx prefetch' and run again."
+
+_CODE_ADVICE: dict[ErrorCode, list[str]] = {
+    ErrorCode.HOST_DEPENDENCY: [
+        "Install or fix the host dependency the message names "
+        "(QEMU: brew install qemu on macOS, the distribution's qemu packages on Linux)."
+    ],
+    ErrorCode.ASSET_DOWNLOAD: [_PREFETCH_ADVICE],
+    ErrorCode.ASSET_NOT_FOUND: [_PREFETCH_ADVICE],
+    ErrorCode.PACKAGE_NOT_ALLOWED: [
+        "Only packages from the top 10,000 PyPI/npm packages are allowed for security reasons.",
+        "Check spelling of package name",
+        "Use --no-validation to bypass (not recommended)",
+    ],
+    ErrorCode.VM_BOOT_TIMEOUT: [
+        "The VM failed to start before code could run: boot timeouts are often transient (CPU contention).",
+        "Check system load and available resources",
+    ],
+}
+"""Extra advice for some codes, printed before the action's advice."""
+
+_INSTANCE_IDS = TypeAdapter(list[str])
+
+
+def _valid_instance_id(value: str) -> str:
+    """The id unchanged; an id that breaks the library's id rule is a usage error (exit 2)."""
+    try:
+        return check_instance_id(value)
+    except InvalidInputError as e:
+        raise click.BadParameter(f"'{value}': {e.message}") from e
+
+
+def _instance_id_param(_ctx: click.Context, _param: click.Parameter, value: str | None) -> str | None:
+    """Click callback: check an instance id before any VM or store opens."""
+    return None if value is None else _valid_instance_id(value)
+
+
+def _domains_param(_ctx: click.Context, _param: click.Parameter, value: tuple[str, ...]) -> tuple[str, ...]:
+    """Click callback: the VmSpec domain rule as a usage error (exit 2), before any VM starts."""
+    for domain in value:
+        try:
+            validate_domain(domain)
+        except ValueError as e:
+            raise click.BadParameter(f"{domain!r}: {e}") from None
+    return value
+
+
+def _instance_ids_param(_ctx: click.Context, _param: click.Parameter, value: tuple[str, ...]) -> tuple[str, ...]:
+    """Click callback: check each instance id before the store opens."""
+    return tuple(_valid_instance_id(item) for item in value)
+
+
+def _instance_store(settings: Settings) -> tuple[InstanceStoreKind, SecretStr | None]:
+    """Store and keyring of the CLI's saved instances.
+
+    The store is EXEC_SANDBOX_INSTANCE_STORE, else "local" (EXEC_SANDBOX_INSTANCE_STORE_DIR,
+    else the user's data folder). The keyring is EXEC_SANDBOX_INSTANCE_KEYRING; else, for the
+    local store only, the key in the OS keyring (made at the first use; the lock of that step
+    is in the account's data folder, get_account_dir). The s3 store needs the variable:
+    without it, opening the store fails with ConfigError INSTANCE_CONFIG. Raises ConfigError
+    INSTANCE_CONFIG when the OS keyring step fails (cli_keyring.open_local_keyring), ConfigError
+    EXTRA_MISSING when the cli extra lacks keyring or cryptography.
+    """
+    store: InstanceStoreKind = settings.instance_store or "local"
+    if store != "local" or settings.instance_keyring is not None:
+        return store, settings.instance_keyring
+    require_cli_keyring()
+    from exec_sandbox import cli_keyring  # noqa: PLC0415 - the cli extra, checked by require_cli_keyring
+
+    service, username = cli_keyring.KEYRING_SERVICE, cli_keyring.KEYRING_USERNAME
+
+    # The lock must be shared by every process of this account (one keyring entry per account)
+    local = cli_keyring.open_local_keyring(data_dir=get_account_dir(kind=UserDir.DATA, app_name="exec-sandbox"))
+    if local.created:
+        click.echo(
+            click.style(
+                f'Made a new instance key in the OS keyring (entry "{service}" / "{username}").\n'
+                "  Keep a copy in a safe place: without this key, no saved instance opens again.\n"
+                f"  Show it with: keyring get {service} {username}\n"
+                "  On another host or in a container, set EXEC_SANDBOX_INSTANCE_KEYRING to it.",
+                fg="yellow",
+            ),
+            err=True,
+        )
+    return store, SecretStr(local.text)
+
+
+def _scheduler_config(*, timeout: int, no_validation: bool, instances: bool) -> SchedulerConfig:
+    """SchedulerConfig of `sbx run`.
+
+    The instance store opens only for --instance: without it, instance_store=None wins over
+    EXEC_SANDBOX_INSTANCE_STORE. Invalid EXEC_SANDBOX_* variables or options exit 2 here,
+    before any VM starts (the Scheduler reads the variables again).
+    """
+    settings = _env_settings()
+    store, keyring = _instance_store(settings) if instances else (None, None)
+    with _valid_settings():
+        return SchedulerConfig(
+            default_timeout_seconds=timeout,
+            enable_package_validation=not no_validation,
+            instance_store=store,
+            instance_keyring=keyring,
+        )
+
+
+def _spec_flags(ctx: click.Context, *, source: str) -> frozenset[str]:
+    """VmSpec fields that the command line sets: the options given, and the language of a file extension."""
+    fields = {
+        field
+        for param, (field, _) in _SPEC_OPTIONS.items()
+        if ctx.get_parameter_source(param) is ParameterSource.COMMANDLINE
+    }
+    if detect_language(source) is not None:
+        fields.add("language")
+    return frozenset(fields)
+
+
+def _check_saved_spec(*, instance_id: str, saved: VmSpec, wanted: VmSpec, flag_fields: frozenset[str]) -> None:
+    """Refuse options that ask for another VM than the saved instance (its VmSpec is fixed when it is made).
+
+    Only the fields in `flag_fields` count: an option not given takes the saved value.
+    """
+    conflicts = [
+        f"{option} {to_json(getattr(wanted, field)).decode()} (saved: {to_json(getattr(saved, field)).decode()})"
+        for field, option in _SPEC_OPTIONS.values()
+        if field in flag_fields and getattr(wanted, field) != getattr(saved, field)
+    ]
+    if conflicts:
+        raise click.UsageError(
+            f"Instance {instance_id} has other VM settings: {'; '.join(conflicts)}. "
+            "Remove these options to use the saved values, or use another --instance id."
+        )
+
+
+async def _open_session(
+    scheduler: Scheduler,
+    *,
+    spec: VmSpec,
+    instance_id: str | None,
+    flag_fields: frozenset[str],
+    on_boot_log: Callable[[str], None] | None,
+) -> Session:
+    """A new VM from `spec`. With an instance id: describe_instance first; the saved instance
+    (reuse) if it exists, else a new VM whose first save makes the instance with that id.
+    Options that ask for another VM than the saved one raise click.UsageError (exit 2)
+    before any VM starts."""
+    if instance_id is None:
+        return await scheduler.new(spec, on_boot_log=on_boot_log)
+    try:
+        info = await scheduler.describe_instance(instance_id)
+    except InstanceGoneError as e:
+        if e.code is not ErrorCode.INSTANCE_NOT_FOUND:  # never make a new one over a damaged instance
+            raise
+        return await scheduler.new(spec, on_boot_log=on_boot_log, instance_id=instance_id)
+    if info.spec is not None:  # None: this keyring lacks the instance's key, and reuse() says so
+        _check_saved_spec(instance_id=instance_id, saved=info.spec, wanted=spec, flag_fields=flag_fields)
+    return await scheduler.reuse(instance_id)
+
+
+async def _download_and_save(
+    vm: Session,
+    *,
+    download_files: tuple[tuple[str, str], ...],
+    instance_id: str | None,
+    result: ExecutionResult,
+    quiet: bool,
+) -> tuple[InstanceRef | None, list[SandboxError]]:
+    """After the code ran: the downloads, then (with an instance id) the save.
+
+    A failed download stops the downloads after it, not the save, and a failed save
+    does not hide the result: both errors come back, for the caller to print after
+    the result. The save runs after any exit code >= 0, and stderr tells what
+    happened to it. No save after a timeout (exit -1: the guest stopped the REPL) or
+    when the VM stopped (the session is closed).
+    """
+    failures: list[SandboxError] = []
+    try:
+        # Stream directly to disk — zero memory overhead
+        for guest_path, local_path in download_files:
+            local = Path(local_path)
+            await vm.read_file(guest_path, destination=local)
+            if not quiet:
+                file_size = local.stat().st_size
+                click.echo(
+                    click.style(f"  Downloaded: {guest_path} -> {local_path} ({file_size} bytes)", dim=True), err=True
+                )
+    except SandboxError as e:
+        failures.append(e)
+    if instance_id is None:
+        return None, failures
+    loaded = vm.instance
+    kept = f"it stays at generation {loaded.generation}" if loaded else "no instance was made"
+    if _timed_out(result):
+        click.echo(click.style(f"Instance {instance_id} not saved: the code timed out; {kept}.", fg="yellow"), err=True)
+        return None, failures
+    if vm.closed:
+        click.echo(click.style(f"Instance {instance_id} not saved: the VM stopped; {kept}.", fg="yellow"), err=True)
+        return None, failures
+    try:
+        saved = await vm.save()
+    except SandboxError as e:
+        failures.append(e)
+        return None, failures
+    if not quiet:
+        verb = "Saved" if loaded else "Created"
+        click.echo(
+            click.style(f"{verb} instance {saved.instance_id}, generation {saved.generation}", dim=True), err=True
+        )
+    return saved, failures
+
+
+def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
+    """Print an error with its advice (never key material); return its exit code.
+
+    One path for every error: its code and action, its message, its hint, the
+    extra advice of its code (_CODE_ADVICE: install, prefetch, package allow-list,
+    boot timeout), then the advice of its action. After a run that saved (`saved`,
+    for a failed download) the action's advice gives way to a note: a new run
+    starts from the saved state and runs the code again on it.
+
+    Exit code: _error_exit_code.
+    """
+    suggestions = [error.hint] if error.hint else []
+    suggestions += _CODE_ADVICE.get(error.code, [])
+    if saved is not None:
+        suggestions.append(
+            f"This run saved instance {saved.instance_id} at generation {saved.generation}. "
+            "A new run starts from that state: it runs the code again on it."
+        )
+    else:
+        suggestions.append(_ACTION_ADVICE[error.action].format(id=error.instance_id or "ID"))
+    click.echo(format_error(f"{error.code} ({error.action})", error.message, suggestions), err=True)
+    return _error_exit_code(action=error.action, code=error.code)
+
+
 async def run_code(
+    *,
     code: str,
     language: Language,
     packages: list[str],
@@ -553,14 +905,22 @@ async def run_code(
     json_output: bool,
     quiet: bool,
     no_validation: bool,
-    upload_files: tuple[tuple[str, str], ...] = (),
-    download_files: tuple[tuple[str, str], ...] = (),
-    debug: bool = False,
+    upload_files: tuple[tuple[str, str], ...],
+    download_files: tuple[tuple[str, str], ...],
+    debug: bool,
+    instance_id: str | None,
+    flag_fields: frozenset[str],
 ) -> int:
     """Execute code in sandbox and return exit code.
 
-    When upload_files or download_files are provided, uses a session to keep the
-    VM alive for file I/O. Otherwise, uses scheduler.run() for full timing breakdown.
+    One VM for the whole call: uploads, the execution, downloads, then (with an
+    instance id) the save. Downloads come before the save: a save that fails can
+    close the session. After the code ran, a failed download does not stop the
+    save, and the result (the JSON too) is printed before the errors of the
+    downloads and the save; the first of these errors sets the exit code (see
+    _report_error: 2 for FIX_INPUT and FIX_CONFIG, 124 for VM_BOOT_TIMEOUT, else 125).
+    Without an error, the code's exit code, or 124 when the code timed out (_run_exit_code).
+    VM options the VmSpec refuses raise click.UsageError (exit 2) before the scheduler starts.
 
     Args:
         code: Code to execute
@@ -578,15 +938,16 @@ async def run_code(
         upload_files: Files to upload before execution (local_path, guest_path)
         download_files: Files to download after execution (guest_path, local_path)
         debug: Enable boot log streaming to stderr
+        instance_id: Saved instance to continue (reuse), or to make when it does not exist
+        flag_fields: VmSpec fields that command-line options set (compared with a saved instance)
 
     Returns:
         Exit code to return from CLI
     """
-    config = SchedulerConfig(
-        default_timeout_seconds=timeout,
-        default_memory_mb=memory,
-        enable_package_validation=not no_validation,
-    )
+    spec = _make_spec(
+        language=language, memory=memory, packages=packages, network=network,
+        allowed_domains=allowed_domains, expose_ports=expose_ports,
+    )  # fmt: skip
 
     # Streaming callbacks for non-JSON output
     def on_stdout(chunk: str) -> None:
@@ -600,29 +961,22 @@ async def run_code(
     on_boot_log = _make_boot_log_callback(debug)
 
     try:
+        config = _scheduler_config(timeout=timeout, no_validation=no_validation, instances=instance_id is not None)
         async with Scheduler(config) as scheduler:
-            if upload_files or download_files:
-                # Session path: keeps VM alive for file I/O
-                async with await scheduler.session(
-                    language=language,
-                    packages=list(packages) if packages else None,
-                    memory_mb=memory,
-                    allow_network=network,
-                    allowed_domains=list(allowed_domains) if allowed_domains else None,
-                    expose_ports=expose_ports,  # type: ignore[arg-type]
-                    on_boot_log=on_boot_log,
-                ) as session:
-                    # Upload files
+            start = time.perf_counter()
+            vm = await _open_session(
+                scheduler, spec=spec, instance_id=instance_id, flag_fields=flag_fields, on_boot_log=on_boot_log
+            )
+            with warnings.catch_warnings():
+                # _download_and_save tells the user when a run saves nothing
+                warnings.simplefilter("ignore", InstanceNotSavedWarning)
+                async with vm:
                     for local_path, guest_path in upload_files:
-                        await session.write_file(guest_path, Path(local_path))
+                        await vm.write_file(guest_path, Path(local_path))
                         if not quiet:
-                            click.echo(
-                                click.style(f"  Uploaded: {local_path} -> {guest_path}", dim=True),
-                                err=True,
-                            )
+                            click.echo(click.style(f"  Uploaded: {local_path} -> {guest_path}", dim=True), err=True)
 
-                    # Execute code
-                    result = await session.exec(
+                    result = await vm.exec(
                         code,
                         timeout_seconds=timeout,
                         env_vars=env_vars if env_vars else None,
@@ -696,17 +1050,25 @@ async def run_multiple(
         no_validation: Skip package validation
 
     Returns:
-        Maximum exit code from all sources (or EXIT_SANDBOX_ERROR on infrastructure failure)
+        Exit code to return from CLI (the _report_error one when the scheduler fails)
     """
-    config = SchedulerConfig(
-        default_timeout_seconds=timeout,
-        default_memory_mb=memory,
-        enable_package_validation=not no_validation,
-    )
-
+    # Every spec before the scheduler starts: options the VmSpec refuses exit 2 (click.UsageError)
+    specs = [
+        _make_spec(
+            language=src.language,
+            memory=memory,
+            packages=packages,
+            network=network,
+            allowed_domains=allowed_domains,
+            expose_ports=expose_ports,
+        )
+        for src in sources
+    ]
+    config = _scheduler_config(timeout=timeout, no_validation=no_validation, instances=False)
     on_boot_log = _make_boot_log_callback(debug)
 
     results: list[MultiSourceResult] = []
+    errors: dict[int, SandboxError] = {}  # source index -> why the source has no run
     total_passed = 0
     total_failed = 0
     start_time = time.perf_counter()
@@ -716,37 +1078,24 @@ async def run_multiple(
             # Create tasks for all sources
             async def run_one(idx: int, src: SourceInput) -> MultiSourceResult:
                 try:
-                    result = await scheduler.run(
-                        code=src.code,
-                        language=src.language,
-                        packages=list(packages) if packages else None,
-                        timeout_seconds=timeout,
-                        memory_mb=memory,
-                        allow_network=network,
-                        allowed_domains=list(allowed_domains) if allowed_domains else None,
-                        expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
-                        env_vars=env_vars if env_vars else None,
-                        on_boot_log=on_boot_log,
-                    )
-                    return MultiSourceResult(
-                        index=idx,
-                        source=src.label,
+                    start = time.perf_counter()
+                    async with await scheduler.new(specs[idx], on_boot_log=on_boot_log) as vm:
+                        result = await vm.exec(
+                            src.code, timeout_seconds=timeout, env_vars=env_vars if env_vars else None
+                        )
+                        startup, exposed_ports = vm.startup_timing, vm.exposed_ports
+                    run = OneShotRun(
                         result=result,
-                        error=None,
+                        startup=startup,
+                        exposed_ports=exposed_ports,
+                        instance=None,
+                        total_ms=round((time.perf_counter() - start) * 1000),
                     )
-                except VmTimeoutError:
-                    return MultiSourceResult(
-                        index=idx,
-                        source=src.label,
-                        result=None,
-                        error="Execution timed out",
-                    )
+                    return MultiSourceResult(index=idx, source=src.label, run=run, error=None, code=None, action=None)
                 except SandboxError as e:
+                    errors[idx] = e
                     return MultiSourceResult(
-                        index=idx,
-                        source=src.label,
-                        result=None,
-                        error=str(e.message),
+                        index=idx, source=src.label, run=None, error=e.message, code=e.code, action=e.action
                     )
 
             tasks = [run_one(i, src) for i, src in enumerate(sources)]
@@ -831,13 +1180,20 @@ def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool, *,
 # ============================================================================
 
 
-@click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
+class _OrderedGroup(click.Group):
+    """A command group whose help lists the commands in the order they are defined, not sorted."""
+
+    def list_commands(self, ctx: click.Context) -> list[str]:  # noqa: ARG002 - click's signature
+        return list(self.commands)
+
+
+@click.group(cls=_OrderedGroup, invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, "-V", "--version", prog_name="exec-sandbox")
 @click.pass_context
 def cli(ctx: click.Context) -> None:
-    """exec-sandbox: Execute code in isolated VM sandboxes.
+    """exec-sandbox: run untrusted code in isolated QEMU microVMs.
 
-    Run 'sbx run --help' or 'sbx prefetch --help' for subcommand details.
+    'sbx ARGS...' without a command name is 'sbx run ARGS...'.
     """
     # If no subcommand provided and no arguments, show help
     if ctx.invoked_subcommand is None:
@@ -849,36 +1205,73 @@ def cli(ctx: click.Context) -> None:
 # ============================================================================
 
 
-@cli.command(name="run", context_settings={"help_option_names": ["-h", "--help"]})
+# Printed after the options of 'sbx run --help': rules to look up, not to read first.
+_RUN_EPILOG = """\
+Saved instances (--instance ID, one source only):
+
+\b
+  - The first run makes the instance; each later run continues it:
+    memory, processes and the files in /home/user.
+  - Each run saves after the uploads, the code and the downloads,
+    also when the code exits with an error or a download fails. A
+    timeout, a stopped VM, or an error of an upload or of the run
+    (for example OUTPUT_LIMIT) saves nothing.
+  - -l, -p, -m, --network, --allow-domain and --expose are fixed when
+    the instance is made. Leave them out to use the saved values; another
+    value exits with code 2 before a VM starts.
+  - Store: a folder on this host (EXEC_SANDBOX_INSTANCE_STORE_DIR,
+    else the user's data folder). Key: EXEC_SANDBOX_INSTANCE_KEYRING,
+    else the OS keyring. EXEC_SANDBOX_INSTANCE_STORE=s3 uses the S3
+    settings and needs EXEC_SANDBOX_INSTANCE_KEYRING.
+
+Exit codes: the code's own exit code (0-255); 2 for a usage error and for
+FIX_INPUT or FIX_CONFIG errors; 124 when the code times out or the VM
+does not boot in time; 125 for other errors; 130 after Ctrl+C.
+"""
+
+
+# Options in groups: code, run, VM, network, files, saved instance, output.
+@cli.command(name="run", epilog=_RUN_EPILOG, context_settings={"help_option_names": ["-h", "--help"]})
 @click.argument("sources", nargs=-1)
-@click.option(
-    "-l",
-    "--language",
-    type=click.Choice(["python", "javascript", "raw"], case_sensitive=False),
-    help="Programming language (auto-detected from file extension)",
-)
 @click.option(
     "-c",
     "--code",
     "inline_codes",
     multiple=True,
-    help="Code to execute (repeatable, alternative to SOURCES)",
+    help="Code to run (repeatable, in place of SOURCES)",
+)
+@click.option(
+    "-l",
+    "--language",
+    type=click.Choice(["python", "javascript", "raw"], case_sensitive=False),
+    help="Language of the code (default: from the file extension, else python)",
+)
+@click.option("-t", "--timeout", default=30, show_default=True, help="Timeout in seconds (1-300)")
+@click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
+@click.option(
+    "-m", "--memory", default=constants.DEFAULT_MEMORY_MB, show_default=True, help="Memory in MB (128 or more)"
 )
 @click.option("-p", "--package", "packages", multiple=True, help="Package to install (repeatable)")
-@click.option("-t", "--timeout", default=30, show_default=True, help="Timeout in seconds")
-@click.option("-m", "--memory", default=constants.DEFAULT_MEMORY_MB, show_default=True, help="Memory in MB")
-@click.option("-e", "--env", "env_vars", multiple=True, help="Environment variable KEY=VALUE (repeatable)")
-@click.option("--network", is_flag=True, help="Enable network access")
-@click.option("--allow-domain", "allowed_domains", multiple=True, help="Allowed domain (repeatable)")
+@click.option("--no-validation", is_flag=True, help="Skip the package allow-list check")
+@click.option(
+    "--network",
+    is_flag=True,
+    help="Turn on outbound network. Without --allow-domain: python reaches PyPI only, javascript npm only, "
+    "raw any host",
+)
+@click.option(
+    "--allow-domain",
+    "allowed_domains",
+    multiple=True,
+    callback=_domains_param,
+    help="Allowed domain and its subdomains (repeatable; needs --network)",
+)
 @click.option(
     "--expose",
     "expose_ports",
     multiple=True,
-    help="Expose port: INTERNAL or INTERNAL:EXTERNAL or INTERNAL:EXTERNAL/PROTOCOL (repeatable)",
+    help="Expose port: INTERNAL[:EXTERNAL][/tcp|udp] (repeatable)",
 )
-@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
-@click.option("-q", "--quiet", is_flag=True, help="Suppress progress output")
-@click.option("--no-validation", is_flag=True, help="Skip package validation")
 @click.option(
     "--upload",
     "upload_files",
@@ -889,10 +1282,32 @@ def cli(ctx: click.Context) -> None:
     "--download",
     "download_files",
     multiple=True,
-    help="Download file GUEST:LOCAL or GUEST (repeatable)",
+    help="Download file GUEST:LOCAL, or GUEST to ./basename(GUEST) (repeatable)",
 )
-@click.option("--debug", is_flag=True, help="Enable DEBUG logging and stream kernel/init boot logs to stderr")
+@click.option(
+    "--instance",
+    "instance_id",
+    metavar="ID",
+    callback=_instance_id_param,
+    help="Saved instance to continue or make, then save (see below). ID: 1 to 64 of a-z 0-9 . _ - (first a-z or 0-9)",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Output as JSON: one object (result, startup, exposed_ports, instance, total_ms), "
+    "or an array for several sources",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Hide progress output")
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Turn on DEBUG logging, and show the kernel and init boot logs on stderr (skips the warm pool and L1)",
+)
+@click.pass_context
 def run_command(
+    ctx: click.Context,
+    *,
     sources: tuple[str, ...],
     language: str | None,
     inline_codes: tuple[str, ...],
@@ -909,45 +1324,31 @@ def run_command(
     upload_files: tuple[str, ...],
     download_files: tuple[str, ...],
     debug: bool,
+    instance_id: str | None,
 ) -> NoReturn:
-    """Execute code in an isolated VM sandbox.
+    """Run code in an isolated VM.
 
-    SOURCES can be one or more of:
+    SOURCES can be one or more of (several run at the same time, each in its own VM):
 
     \b
       - Inline code:  sbx run 'print("hello")'
       - File path:    sbx run script.py
       - Stdin:        echo 'print(1)' | sbx run -
 
-    Multiple sources run concurrently:
-
-    \b
-      sbx run 'print(1)' 'print(2)' script.py    # Run 3 sources
-
-    Language is auto-detected from file extension (.py, .js, .sh)
-    or defaults to Python. Use -l to override for all sources.
-
-    File I/O uses colon-separated paths (LOCAL:GUEST / GUEST:LOCAL):
-
-    \b
-      --upload LOCAL:GUEST      Upload local file to sandbox
-      --download GUEST:LOCAL    Download sandbox file to local path
-      --download GUEST          Download to ./basename(GUEST)
+    The file extension (.py, .js, .mjs, .sh) gives the language, else Python.
+    -l sets the language of all sources.
 
     Examples:
 
     \b
-      sbx run 'print("hello")'                              # Simple Python
-      sbx run -l javascript 'console.log("hi")'             # Explicit language
-      sbx run script.py                                     # Run file
-      sbx run -p requests==2.32.5 'import requests; ...'    # With package
+      sbx run -l javascript 'console.log("hi")'             # Set the language
+      sbx run -p requests==2.32.5 'import requests; ...'    # With a package
       sbx run --network --allow-domain api.example.com script.py
-      echo 'print(42)' | sbx run -                          # From stdin
       sbx run --json 'print("test")' | jq .                 # JSON output
-      sbx run -c 'print(1)' -c 'print(2)'                   # Multiple via -c flag
+      sbx run -c 'print(1)' -c 'print(2)'                   # Several -c sources
       sbx run --upload ./data.csv:data.csv -c "print(open('data.csv').read())"
-      sbx run --download output.csv:./out.csv -c "open('output.csv','w').write('data')"
-      sbx run --download output.csv -c "open('output.csv','w').write('data')"
+      sbx run --instance my-vm -c 'x = 41'                  # Make and save my-vm
+      sbx run --instance my-vm -c 'print(x + 1)'            # Continue it: prints 42
     """
     configure_logging(quiet=quiet, level=logging.DEBUG if debug else None)
 
@@ -990,6 +1391,9 @@ def run_command(
     # File I/O requires exactly one source
     if (parsed_uploads or parsed_downloads) and len(resolved_sources) != 1:
         raise click.UsageError("--upload/--download requires exactly one source.")
+    # Sources run in parallel VMs: their saves of one instance would conflict
+    if instance_id is not None and len(resolved_sources) != 1:
+        raise click.UsageError("--instance requires exactly one source.")
 
     if len(resolved_sources) == 1:
         src_input = resolved_sources[0]
@@ -1010,6 +1414,8 @@ def run_command(
                 upload_files=parsed_uploads,
                 download_files=parsed_downloads,
                 debug=debug,
+                instance_id=instance_id,
+                flag_fields=_spec_flags(ctx, source=all_sources[0]) if instance_id is not None else frozenset(),
             )
         )
     else:
@@ -1032,6 +1438,106 @@ def run_command(
         )
 
     sys.exit(exit_code)
+
+
+# ============================================================================
+# Instance Commands
+# ============================================================================
+
+
+async def _instance_admin(action: Callable[[InstanceAdmin], Awaitable[int]]) -> int:
+    """Run `action` on the CLI's instance store; print errors; return the exit code.
+
+    Only the store and the keyring open: no Scheduler, no VM, no image download.
+    """
+    try:
+        settings = _env_settings()
+        store, keyring = _instance_store(settings)
+        opened = settings.model_copy(update={"instance_store": store, "instance_keyring": keyring})
+        async with require_instance_admin(store=store)(opened) as admin:
+            return await action(admin)
+    except SandboxError as e:
+        return _report_error(e, saved=None)
+
+
+@cli.group(name="instance", cls=_OrderedGroup, context_settings={"help_option_names": ["-h", "--help"]})
+def instance_group() -> None:
+    """List, describe and remove saved instances.
+
+    'sbx run --instance ID' makes and saves them. The store is the same: a
+    folder on this host (EXEC_SANDBOX_INSTANCE_STORE_DIR, else the user's
+    data folder) with its key in EXEC_SANDBOX_INSTANCE_KEYRING, else in the
+    OS keyring; or S3 with EXEC_SANDBOX_INSTANCE_STORE=s3 and
+    EXEC_SANDBOX_INSTANCE_KEYRING. These commands start no VM.
+
+    Exit codes: 2 for invalid settings, a bad id, or a FIX_INPUT or FIX_CONFIG
+    error; 125 for the other errors.
+    """
+
+
+@instance_group.command(name="list", context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--json", "json_output", is_flag=True, help="Output as a JSON array")
+def instance_list_command(*, json_output: bool) -> NoReturn:
+    """Show the id of each saved instance, one on each line.
+
+    An id can have no current state (a first save that did not finish, or a
+    removal that did not finish): 'sbx instance describe' then fails, and
+    'sbx instance rm' removes what is left.
+    """
+    configure_logging()
+
+    async def show(admin: InstanceAdmin) -> int:
+        ids = [instance_id async for instance_id in admin.list_ids()]
+        if json_output:
+            click.echo(_INSTANCE_IDS.dump_json(ids, indent=2).decode())
+        else:
+            for instance_id in ids:
+                click.echo(instance_id)
+        return EXIT_SUCCESS
+
+    sys.exit(_run_with_interrupt_handling(_instance_admin(show)))
+
+
+@instance_group.command(name="describe", context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("instance_id", metavar="ID", callback=_instance_id_param)
+def instance_describe_command(*, instance_id: str) -> NoReturn:
+    """Show what the store holds for one saved instance, as JSON.
+
+    Generation, recent commits and key id; also the VM settings (spec) and the
+    host it was saved on when this keyring has the instance's key (verified).
+    Without the key, "verified" is false and nothing checks the other fields.
+    """
+    configure_logging()
+
+    async def show(admin: InstanceAdmin) -> int:
+        info = await admin.describe(instance_id)
+        click.echo(info.model_dump_json(indent=2))
+        return EXIT_SUCCESS
+
+    sys.exit(_run_with_interrupt_handling(_instance_admin(show)))
+
+
+@instance_group.command(name="rm", context_settings={"help_option_names": ["-h", "--help"]})
+@click.argument("instance_ids", metavar="ID...", nargs=-1, required=True, callback=_instance_ids_param)
+def instance_rm_command(*, instance_ids: tuple[str, ...]) -> NoReturn:
+    """Remove saved instances.
+
+    Prints each id it removed. An id with no instance is not an error (the
+    objects left under that id are removed too): the exit code is 0 when all
+    the instances are gone. The ids are removed in order; the first error
+    stops the command.
+    """
+    configure_logging()
+
+    async def remove(admin: InstanceAdmin) -> int:
+        for instance_id in instance_ids:
+            if await admin.delete(instance_id):
+                click.echo(instance_id)
+            else:
+                click.echo(f"No instance {instance_id}.", err=True)
+        return EXIT_SUCCESS
+
+    sys.exit(_run_with_interrupt_handling(_instance_admin(remove)))
 
 
 # ============================================================================
@@ -1103,7 +1609,7 @@ def _display_prefetch_result(result: PrefetchResult, quiet: bool) -> None:
 # ============================================================================
 
 # Known subcommands and flags that should NOT trigger implicit 'run'
-_KNOWN_SUBCOMMANDS = {"prefetch", "run", "--help", "-h", "--version", "-V"}
+_KNOWN_SUBCOMMANDS = {"instance", "prefetch", "run", "--help", "-h", "--version", "-V"}
 
 
 def main() -> NoReturn:

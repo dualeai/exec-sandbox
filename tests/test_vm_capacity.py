@@ -69,28 +69,16 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
     """When at capacity, create_vm blocks until slot available (not fails).
 
     The admission controller should cause blocking behavior rather than raising
-    VmCapacityError immediately.
+    TransientError CAPACITY immediately.
     """
     # Create first VM (budget=3.0, each VM=1.25 effective)
-    vm1 = await capacity_vm_manager.create_vm(
-        language=Language.PYTHON,
-        tenant_id="test",
-        task_id="task-1",
-    )
+    vm1 = await capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-1")
 
-    vm2 = await capacity_vm_manager.create_vm(
-        language=Language.PYTHON,
-        tenant_id="test",
-        task_id="task-2",
-    )
+    vm2 = await capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-2")
 
     # Start third creation (should block, not fail)
     create_task = asyncio.create_task(
-        capacity_vm_manager.create_vm(
-            language=Language.PYTHON,
-            tenant_id="test",
-            task_id="task-3",
-        )
+        capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-3")
     )
 
     # Give it time to potentially complete (should stay blocked)
@@ -112,70 +100,55 @@ async def test_create_vm_blocks_at_capacity(capacity_vm_manager: VmManager) -> N
 
 async def test_admission_released_on_destroy(capacity_vm_manager: VmManager) -> None:
     """Resources must be released when VM is destroyed."""
-    slots_before = capacity_vm_manager.admission._allocated_vm_slots
+    slots_before = capacity_vm_manager._admission._allocated_vm_slots
 
     # Create VM (acquires resources)
-    vm = await capacity_vm_manager.create_vm(
-        language=Language.PYTHON,
-        tenant_id="test",
-        task_id="task-1",
-    )
+    vm = await capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-1")
 
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before + 1
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_before + 1
     assert vm.holds_admission_slot is True
 
     # Destroy VM (releases resources)
     await capacity_vm_manager.destroy_vm(vm)
 
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_before
     assert vm.holds_admission_slot is False
 
 
 async def test_admission_released_on_create_failure(capacity_vm_manager: VmManager) -> None:
     """Resources must be released when create_vm fails mid-way."""
-    slots_before = capacity_vm_manager.admission._allocated_vm_slots
+    slots_before = capacity_vm_manager._admission._allocated_vm_slots
 
     # Mock _create_vm_impl to fail after resources acquired
-    with patch.object(capacity_vm_manager, "_create_vm_impl", side_effect=VmOverlayError("mock failure")):
-        with pytest.raises(VmOverlayError, match="mock failure"):
-            await capacity_vm_manager.create_vm(
-                language=Language.PYTHON,
-                tenant_id="test",
-                task_id="task-1",
-            )
+    failure = TransientError("mock failure", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None)
+    with patch.object(capacity_vm_manager, "_create_vm_impl", side_effect=failure):
+        with pytest.raises(TransientError, check=lambda e: e is failure):
+            await capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-1")
 
     # Resources should be restored
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_before
 
 
 async def test_double_destroy_does_not_double_release(capacity_vm_manager: VmManager) -> None:
     """Calling destroy_vm twice must not corrupt resource count."""
-    slots_before = capacity_vm_manager.admission._allocated_vm_slots
+    slots_before = capacity_vm_manager._admission._allocated_vm_slots
 
-    vm = await capacity_vm_manager.create_vm(
-        language=Language.PYTHON,
-        tenant_id="test",
-        task_id="task-1",
-    )
+    vm = await capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-1")
 
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before + 1
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_before + 1
 
     # First destroy
     await capacity_vm_manager.destroy_vm(vm)
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_before
 
     # Second destroy should be safe (no-op for resources)
     await capacity_vm_manager.destroy_vm(vm)
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_before, "Double destroy corrupted resource count"
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_before, "Double destroy corrupted resource count"
 
 
 async def test_vm_holds_admission_flag_set_correctly(capacity_vm_manager: VmManager) -> None:
     """Verify holds_admission_slot flag is set on successful creation."""
-    vm = await capacity_vm_manager.create_vm(
-        language=Language.PYTHON,
-        tenant_id="test",
-        task_id="task-1",
-    )
+    vm = await capacity_vm_manager.create_vm(VmSpec(language=Language.PYTHON), tenant_id="test", task_id="task-1")
 
     assert vm.holds_admission_slot is True
     assert vm.resource_reservation is not None
@@ -207,30 +180,28 @@ async def test_no_capacity_errors_under_load(images_dir: Path) -> None:
     total_runs = 10
 
     async with Scheduler(config) as scheduler:
-        tasks = [scheduler.run(code="print('ok')", language=Language.PYTHON) for _ in range(total_runs)]
+        tasks = [run_once(scheduler, VmSpec(language=Language.PYTHON), "print('ok')") for _ in range(total_runs)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for r in results:
-            if isinstance(r, VmCapacityError):
+            if isinstance(r, SandboxError) and r.code is ErrorCode.CAPACITY:
                 capacity_errors += 1
 
-    assert capacity_errors == 0, f"Got {capacity_errors} VmCapacityError - regression in capacity tracking"
+    assert capacity_errors == 0, f"Got {capacity_errors} CAPACITY errors - regression in capacity tracking"
 
 
 @pytest.mark.slow
 async def test_many_sequential_create_destroy_cycles(capacity_vm_manager: VmManager) -> None:
     """Verify resource count stays consistent after many create/destroy cycles."""
-    slots_initial = capacity_vm_manager.admission._allocated_vm_slots
+    slots_initial = capacity_vm_manager._admission._allocated_vm_slots
     cycles = 20
 
     for i in range(cycles):
         vm = await capacity_vm_manager.create_vm(
-            language=Language.PYTHON,
-            tenant_id="test",
-            task_id=f"task-{i}",
+            VmSpec(language=Language.PYTHON), tenant_id="test", task_id=f"task-{i}"
         )
         await capacity_vm_manager.destroy_vm(vm)
 
-    assert capacity_vm_manager.admission._allocated_vm_slots == slots_initial, (
+    assert capacity_vm_manager._admission._allocated_vm_slots == slots_initial, (
         f"Resource count drifted after {cycles} cycles"
     )

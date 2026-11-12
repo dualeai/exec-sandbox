@@ -10,6 +10,7 @@ from io import BytesIO
 
 from exec_sandbox.models import Language
 from exec_sandbox.vm_manager import VmManager  # noqa: TC001
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 
 # Guest agent READ_TIMEOUT_MS is 18000ms (18 seconds)
@@ -38,12 +39,9 @@ class TestGuestAgentReconnect:
         proper timeout detection (unlike blocking I/O which ignores timeouts).
         """
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-reconnect",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -86,12 +84,9 @@ class TestGuestAgentReconnect:
         repeated idle periods.
         """
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-multi-reconnect",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -129,12 +124,9 @@ class TestWriteFileAfterIdleTimeout:
     async def test_write_file_after_idle_timeout(self, vm_manager: VmManager, execute_timeout: int) -> None:
         """write_file succeeds after a single idle timeout cycle."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-write-after-idle",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:
@@ -173,12 +165,9 @@ class TestWriteFileAfterIdleTimeout:
     async def test_write_file_after_multiple_idle_timeouts(self, vm_manager: VmManager, execute_timeout: int) -> None:
         """write_file survives 3 consecutive idle timeout cycles."""
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-write-multi-idle",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         try:

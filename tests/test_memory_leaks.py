@@ -22,10 +22,11 @@ import psutil
 import pytest
 
 from exec_sandbox import Scheduler, SchedulerConfig, constants
-from exec_sandbox.exceptions import OutputLimitError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.guest_channel import OP_QUEUE_DEPTH
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.warm_vm_pool import Language
-from tests.conftest import skip_unless_hwaccel
+from tests.conftest import run_once, skip_unless_hwaccel
 
 # Use half CPU count for max concurrency - avoids boot timeouts under load
 _MAX_CONCURRENT = (os.cpu_count() or 4) // 2 or 1
@@ -82,7 +83,7 @@ async def _warmup_and_baseline(
     docstring for full rationale.
     """
     async with Scheduler(config) as scheduler:
-        await scheduler.run(code=code, language=Language.PYTHON, allow_network=allow_network)
+        await run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=allow_network), code)
     process = psutil.Process()
     gc.collect()
     baseline_rss = process.memory_info().rss
@@ -137,7 +138,7 @@ async def test_no_memory_leak_without_network(iterations: int, scheduler_config:
     process, baseline_rss = await _warmup_and_baseline(scheduler_config)
 
     async with Scheduler(scheduler_config) as scheduler:
-        tasks = [scheduler.run(code="print('ok')", language=Language.PYTHON) for _ in range(iterations)]
+        tasks = [run_once(scheduler, VmSpec(language=Language.PYTHON), "print('ok')") for _ in range(iterations)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         _assert_success_rate(results, iterations, check_exit_code=True)
@@ -179,7 +180,7 @@ async def test_no_memory_leak_with_network(iterations: int, images_dir: Path) ->
 
     async with Scheduler(config) as scheduler:
         tasks = [
-            scheduler.run(code=_NETWORK_TEST_CODE, language=Language.PYTHON, allow_network=True)
+            run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=True), _NETWORK_TEST_CODE)
             for _ in range(iterations)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -303,7 +304,7 @@ async def _file_io_cycle(scheduler: Scheduler, index: int, size_bytes: int, tmp_
     """Write and read back a file in a fresh session."""
     content = os.urandom(size_bytes)
     dest = tmp_dir / f"leak_test_{index}.bin"
-    async with await scheduler.session(language=Language.PYTHON) as session:
+    async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
         await session.write_file(f"leak_test_{index}.bin", content)
         await session.read_file(f"leak_test_{index}.bin", destination=dest)
         assert dest.stat().st_size == len(content)
@@ -379,7 +380,7 @@ async def test_no_memory_leak_file_io_in_session(
     size_bytes = file_io_size_mb * 1024 * 1024
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Warm-up iteration: populates Pydantic caches, zstd contexts, etc.
             warmup_content = os.urandom(size_bytes)
             warmup_dest = tmp_path / "warmup.bin"
@@ -441,7 +442,7 @@ async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: Schedule
     dest = tmp_path / "peak_test.bin"
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             tracker.start(baseline_rss)
             content = os.urandom(size_bytes)
             await session.write_file("peak_test.bin", content)
@@ -500,7 +501,7 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
         tracker.start(baseline_rss)
 
         tasks = [
-            scheduler.run(code=code, language=Language.PYTHON, allow_network=allow_network)
+            run_once(scheduler, VmSpec(language=Language.PYTHON, allow_network=allow_network), code)
             for _ in range(concurrent_vms)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -547,7 +548,7 @@ async def test_peak_ram_read_file(file_io_size_mb: int, scheduler_config: Schedu
     content = os.urandom(size_bytes)
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write first (not measured)
             await session.write_file("peak_read_test.bin", content)
 
@@ -616,7 +617,7 @@ async def test_peak_ram_concurrent_file_io(
     async def session_cycle(scheduler: Scheduler, idx: int) -> None:
         src = sources[idx]
         dest = tmp_path / f"concurrent_{idx}.bin"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file(f"concurrent_{idx}.bin", src)
             await session.read_file(f"concurrent_{idx}.bin", destination=dest)
             assert dest.stat().st_size == size_bytes
@@ -665,7 +666,7 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, scheduler_confi
     size_bytes = file_io_size_mb * 1024 * 1024
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             content = os.urandom(size_bytes)
             tracemalloc.start()
             try:
@@ -700,7 +701,7 @@ async def test_tracemalloc_peak_write_file_from_path(
     src.write_bytes(os.urandom(size_bytes))
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             tracemalloc.start()
             try:
                 await session.write_file("tracemalloc_path_write.bin", src)
@@ -734,7 +735,7 @@ async def test_tracemalloc_peak_read_file(
     dest = tmp_path / "tracemalloc_read.bin"
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("tracemalloc_read.bin", content)
 
             tracemalloc.start()
@@ -789,7 +790,7 @@ async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: Sche
     tracker = PeakMemoryTracker()
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             tracker.start(baseline_rss)
             await session.write_file("large_file.bin", src)
             await session.read_file("large_file.bin", destination=dest)
@@ -836,7 +837,7 @@ async def test_bytes_vs_path_memory_difference(
 
     # Measure bytes input peak
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             content = src.read_bytes()
             tracemalloc.start()
             try:
@@ -848,7 +849,7 @@ async def test_bytes_vs_path_memory_difference(
 
     # Measure Path input peak
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             tracemalloc.start()
             try:
                 await session.write_file("compare_path.bin", src)

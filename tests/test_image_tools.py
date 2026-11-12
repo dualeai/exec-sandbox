@@ -8,6 +8,8 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # =============================================================================
 # Tool availability tests using Language.RAW (shell commands)
@@ -40,10 +42,7 @@ RAW_IMAGE_TOOLS = [
 @pytest.mark.parametrize("tool,command", RAW_IMAGE_TOOLS, ids=[t[0] for t in RAW_IMAGE_TOOLS])
 async def test_raw_tool_available(scheduler: Scheduler, tool: str, command: str) -> None:
     """Tool is installed in RAW image and returns exit code 0."""
-    result = await scheduler.run(
-        code=command,
-        language=Language.RAW,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.RAW), command)
 
     assert result.exit_code == 0, (
         f"Tool '{tool}' failed in raw image.\n"
@@ -75,10 +74,7 @@ PYTHON_IMAGE_TOOLS = [
 @pytest.mark.parametrize("tool,code", PYTHON_IMAGE_TOOLS, ids=[t[0] for t in PYTHON_IMAGE_TOOLS])
 async def test_python_tool_available(scheduler: Scheduler, tool: str, code: str) -> None:
     """Tool is installed in Python image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
     assert result.exit_code == 0, (
         f"Tool '{tool}' failed in python image.\n"
@@ -100,10 +96,7 @@ JAVASCRIPT_IMAGE_TOOLS = [
 @pytest.mark.parametrize("tool,code", JAVASCRIPT_IMAGE_TOOLS, ids=[t[0] for t in JAVASCRIPT_IMAGE_TOOLS])
 async def test_javascript_tool_available(scheduler: Scheduler, tool: str, code: str) -> None:
     """Tool is installed in JavaScript image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
     assert result.exit_code == 0, (
         f"Tool '{tool}' failed in javascript image.\n"
@@ -128,10 +121,7 @@ RAW_FUNCTIONAL_TESTS = [
 @pytest.mark.parametrize("name,command,expected", RAW_FUNCTIONAL_TESTS, ids=[t[0] for t in RAW_FUNCTIONAL_TESTS])
 async def test_raw_functional(scheduler: Scheduler, name: str, command: str, expected: str) -> None:
     """Shell command works correctly in RAW image."""
-    result = await scheduler.run(
-        code=command,
-        language=Language.RAW,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.RAW), command)
 
     assert result.exit_code == 0, (
         f"Command failed: {name}\nCommand: {command}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
@@ -149,10 +139,7 @@ PYTHON_FUNCTIONAL_TESTS = [
 @pytest.mark.parametrize("name,code,expected", PYTHON_FUNCTIONAL_TESTS, ids=[t[0] for t in PYTHON_FUNCTIONAL_TESTS])
 async def test_python_functional(scheduler: Scheduler, name: str, code: str, expected: str) -> None:
     """Python code works correctly in Python image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
     assert result.exit_code == 0, (
         f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"
@@ -172,10 +159,7 @@ JAVASCRIPT_FUNCTIONAL_TESTS = [
 )
 async def test_javascript_functional(scheduler: Scheduler, name: str, code: str, expected: str) -> None:
     """JavaScript code works correctly in JavaScript image."""
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-    )
+    result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
     assert result.exit_code == 0, (
         f"Code failed: {name}\nCode: {code}\nExit code: {result.exit_code}\nStderr: {result.stderr}"

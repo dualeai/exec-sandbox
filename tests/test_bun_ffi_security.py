@@ -23,6 +23,8 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # =============================================================================
 # Normal: bun:ffi module is importable from user code
@@ -53,7 +55,7 @@ const ffi = require('bun:ffi');
 console.log('dlopen_type=' + typeof ffi.dlopen);
 console.log('FFIType_type=' + typeof ffi.FFIType);
 """
-        result = await dual_scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         stdout = result.stdout.strip()
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "dlopen_type=function" in stdout, f"stdout: {stdout}"
@@ -69,7 +71,7 @@ console.log('FFIType_type=' + typeof ffi.FFIType);
 const ffi = await import('bun:ffi');
 console.log('dlopen_type=' + typeof ffi.dlopen);
 """
-        result = await dual_scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         stdout = result.stdout.strip()
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "dlopen_type=function" in stdout, f"stdout: {stdout}"
@@ -90,7 +92,7 @@ const pid = libc.symbols.getpid();
 console.log('pid=' + pid);
 console.log('pid_valid=' + (pid > 0));
 """
-        result = await dual_scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         stdout = result.stdout.strip()
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "pid_valid=true" in stdout, f"stdout: {stdout}"
@@ -138,7 +140,7 @@ if (fd >= 0) {
     libc.symbols.close(fd);
 }
 """
-        result = await dual_scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         stdout = result.stdout.strip()
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "fd_valid=true" in stdout, f"stdout: {stdout}"

@@ -8,23 +8,30 @@ import random
 import sys
 import tempfile
 import time
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import boto3
 import pytest
 from _pytest.runner import runtestprotocol
+from moto.server import ThreadedMotoServer
 
+from exec_sandbox._logging import LIBRARY_LOGGER_NAME
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
+from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
+from exec_sandbox.models import ExecutionResult, ExposedPort, StartupTiming
 from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
-from exec_sandbox.system_probes import check_fast_balloon_available, check_hwaccel_available, probe_cache
+from exec_sandbox.system_probes import check_hwaccel_available, check_tsc_deadline, probe_cache
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_spec import VmSpec
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +301,7 @@ async def scheduler(scheduler_config: SchedulerConfig) -> AsyncGenerator[Schedul
 
     Usage:
         async def test_something(scheduler: Scheduler) -> None:
-            result = await scheduler.run(code="print(1)", language=Language.PYTHON)
+            result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(1)")
     """
     async with Scheduler(scheduler_config) as sched:
         yield sched
@@ -480,6 +487,44 @@ async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def
 # ============================================================================
 
 
+class ExecOptions(TypedDict, total=False):
+    """Session.exec() options a test passes (only those; the public defaults apply)."""
+
+    timeout_seconds: int | None
+    env_vars: dict[str, str] | None
+    on_stdout: Callable[[str], None] | None
+    on_stderr: Callable[[str], None] | None
+
+
+class RunOnceOptions(ExecOptions, total=False):
+    """Options of run_once and run_timed: the exec() options, plus on_boot_log for new()."""
+
+    on_boot_log: Callable[[str], None] | None
+
+
+async def run_once(scheduler: Scheduler, spec: VmSpec, code: str, **options: Unpack[RunOnceOptions]) -> ExecutionResult:
+    """One VM, one exec(), then close: the one-shot pattern for tests.
+
+    Only the options a caller passes are forwarded, so the public defaults apply.
+    """
+    return (await run_timed(scheduler, spec, code, **options)).result
+
+
+class TimedRun(NamedTuple):
+    result: ExecutionResult
+    startup: StartupTiming
+    exposed_ports: list[ExposedPort]
+
+
+async def run_timed(scheduler: Scheduler, spec: VmSpec, code: str, **options: Unpack[RunOnceOptions]) -> TimedRun:
+    """run_once, plus how the VM started and its exposed ports (read before close)."""
+    on_boot_log = options.pop("on_boot_log", None)
+    exec_options = cast("ExecOptions", options)
+    async with await scheduler.new(spec, on_boot_log=on_boot_log) as vm:
+        result = await vm.exec(code, **exec_options)
+        return TimedRun(result=result, startup=vm.startup_timing, exposed_ports=vm.exposed_ports)
+
+
 def make_destroy_mock(kind: str = "confirmed") -> AsyncMock:
     """AsyncMock for VmManager.destroy_vm mirroring the real contract
     (vm_manager.destroy_vm): DESTROYED is published once process death is
@@ -609,3 +654,78 @@ class NonSeekableIO(io.RawIOBase):
 
     def seekable(self) -> bool:
         return False
+
+
+# Object store (moto server, S3 API) shared by the L3 cache and instance store tests
+@pytest.fixture
+def fake_aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set fake AWS credentials required by moto/boto3."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+
+@pytest.fixture
+def moto_s3_server(fake_aws_env):
+    """Start a moto S3 server, create the default bucket, and yield (endpoint_url, sync_client).
+
+    Server is stopped on teardown.
+    """
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    host, port = server.get_host_and_port()
+    endpoint_url = f"http://{host}:{port}"
+    s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
+    s3_sync.create_bucket(Bucket="test-snapshots")
+    yield endpoint_url, s3_sync
+    server.stop()
+
+
+def l1_hit(vm_manager: Any, tmp_path: Path) -> MemorySnapshotManager:
+    """A real L1 manager (its restore() runs) whose lookup finds an entry in tmp_path."""
+    memory = MemorySnapshotManager(Settings(memory_snapshot_cache_dir=tmp_path), vm_manager)
+    vmstate = tmp_path / "cached.vmstate"
+    vmstate.write_bytes(b"vmstate")
+    memory.compute_cache_key = AsyncMock(return_value="cached")  # type: ignore[method-assign]
+    memory.check_cache = AsyncMock(return_value=vmstate)  # type: ignore[method-assign]
+    return memory
+
+
+async def wait_l1_saves(scheduler: Scheduler) -> None:
+    """Until the scheduler's background L1 saves in flight have ended (the next new() can hit L1)."""
+    manager = scheduler._memory_snapshot_manager  # pyright: ignore[reportPrivateUsage]  # the one seam
+    assert manager is not None
+    await manager.wait_saves()
+
+
+@pytest.fixture
+async def s3_proxy(moto_s3_server, monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[Any]:
+    """Fault-injecting S3 proxy in front of moto, in the test's event loop (tests/s3_faults.py).
+
+    Yields an S3Proxy: point a store at `proxy.endpoint_url` and `proxy.prefix` (fresh per test);
+    `proxy.bucket` reads and writes moto directly. SDK retries are off for clients made during the
+    test (AWS_MAX_ATTEMPTS=1; the store's head client has its own setting of 1): one store call is
+    one HTTP request, so a rule applies once per call and no test waits for SDK backoff.
+    """
+    from tests.s3_faults import Bucket, S3Proxy
+
+    endpoint_url, s3 = moto_s3_server
+    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "1")
+    async with S3Proxy.start(upstream=endpoint_url, bucket=Bucket(s3)) as proxy:
+        yield proxy
+
+
+@pytest.fixture
+async def instance_env(
+    s3_proxy, short_tmp_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Any]:
+    """Saved instances without QEMU (tests/instance_support.py): yields an InstanceEnv, the real
+    InstanceManager on a store behind `s3_proxy`, fake VMs whose QMP sockets live under a short
+    path, and the bytes each commit saved. Only the QEMU version probe is replaced (no binary needed)."""
+    from tests.instance_support import InstanceEnv, qemu_floor
+
+    monkeypatch.setattr("exec_sandbox.instance.manager.probe_qemu_version", qemu_floor)
+    async with InstanceEnv.open(proxy=s3_proxy, root=short_tmp_dir, tmp=tmp_path) as env:
+        yield env

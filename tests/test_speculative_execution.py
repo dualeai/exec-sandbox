@@ -47,6 +47,8 @@ Test categories:
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, detect_host_arch
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 # Guest arch always equals host arch: forced emulation (TCG) emulates the SAME
 # architecture, only without hardware acceleration (see qemu_cmd.py -cpu block).
@@ -125,7 +127,7 @@ class TestMitigationStatus:
         QEMU TCG max), 'Mitigation:*' (BHB-listed cores), or 'Vulnerable*'
         (non-CSV2 cores) is hardware-truthful — transparency only.
         """
-        result = await dual_scheduler.run(code=_read_vuln_file_code("spectre_v2"), language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("spectre_v2"))
         assert result.exit_code == 0
         status = _extract_status(result.stdout, "spectre_v2")
         if IS_X86:
@@ -143,7 +145,7 @@ class TestMitigationStatus:
         'Mitigation:*' is the permanent expected value even under
         mitigations=off.
         """
-        result = await dual_scheduler.run(code=_read_vuln_file_code("spectre_v1"), language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("spectre_v1"))
         assert result.exit_code == 0
         status = _extract_status(result.stdout, "spectre_v1")
         if IS_X86:
@@ -164,7 +166,7 @@ class TestMitigationStatus:
         arm64: MDS is an x86-only bug; the weak default handler in
         drivers/base/cpu.c always reports 'Not affected'.
         """
-        result = await dual_scheduler.run(code=_read_vuln_file_code("mds"), language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _read_vuln_file_code("mds"))
         assert result.exit_code == 0
         status = _extract_status(result.stdout, "mds")
         if IS_X86:
@@ -232,7 +234,7 @@ if deltas:
 else:
     print("NO_DELTAS")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # Informational only — just verify measurement succeeded
         assert "MIN_DELTA_NS:" in result.stdout or "NO_DELTAS" in result.stdout, (
@@ -268,7 +270,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if IS_X86:
@@ -298,7 +300,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout == "NOT_FOUND", f"CONFIG_KSM=n requires /sys/kernel/mm/ksm/run to be absent, got: {stdout!r}"
@@ -320,7 +322,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout == "NOT_FOUND", (
@@ -367,7 +369,7 @@ else:
             except (PermissionError, OSError) as e:
                 print(f'{name}:ERROR:{e}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "DIR_NOT_FOUND" not in stdout, "CPU vulnerability directory should exist"

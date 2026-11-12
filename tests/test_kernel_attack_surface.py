@@ -30,6 +30,8 @@ Test categories:
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import HostArch, detect_host_arch
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 IS_X86 = detect_host_arch() == HostArch.X86_64
 
@@ -61,7 +63,7 @@ ret = libc.syscall(nr, 5, ctypes.byref(attr), 128)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 or ENOSYS=38 (both acceptable — blocked or syscall unavailable)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -85,7 +87,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert "VALUE:2" in stdout or "NOT_FOUND" in stdout or "PERM_DENIED" in stdout, (
@@ -110,7 +112,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout == "NOT_FOUND", (
@@ -146,7 +148,7 @@ if ret >= 0:
     os.close(ret)
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         ret_val = int(stdout.split("ret=")[1].split()[0])
@@ -170,7 +172,7 @@ ret = libc.syscall(nr, 0, ctypes.byref(params))
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         errno_val = int(stdout.rsplit("errno=", 1)[1])
@@ -206,7 +208,7 @@ except PermissionError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # Socket creation may succeed (AF_NETLINK doesn't always require CAP_NET_ADMIN).
@@ -244,7 +246,7 @@ except PermissionError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # Operation should fail at socket creation or sendto
         assert "SENT" not in result.stdout, (
@@ -276,7 +278,7 @@ except PermissionError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout or "ERROR:" in result.stdout, (
             f"AF_PACKET socket should be blocked. stdout: {result.stdout}"
@@ -314,7 +316,7 @@ except OSError as e:
     # EAFNOSUPPORT=97 (address family not supported) is also safe
     print(f"blocked:errno={e.errno}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # With CONFIG_VSOCK=n (custom kernel): EAFNOSUPPORT (blocked:errno=97)
         # With CONFIG_VSOCK=y: may succeed if vsock device present, or EPERM
@@ -349,7 +351,7 @@ err = ctypes.get_errno()
 os.rmdir("/tmp/cg")
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_ADMIN), ENODEV=19 (cgroup v1 fs not available),
         # ENOENT=2 (cgroup subsystem not found)
@@ -378,7 +380,7 @@ else:
         for e in entries:
             print(f"FOUND:{e}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout in {"NO_DIR", "EMPTY"}, f"cgroupfs should not be mounted inside VM. Found: {stdout}"
@@ -405,7 +407,7 @@ else:
     for f in found:
         print(f)
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "WRITABLE:" not in result.stdout, f"release_agent should not be writable. stdout: {result.stdout}"
 
@@ -444,7 +446,7 @@ if ret == 0:
 else:
     print(f"UNSHARE:blocked errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "UNSHARE:ok" in stdout:
@@ -470,7 +472,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # Value 0 blocks user namespace creation entirely
@@ -489,7 +491,7 @@ ret = libc.unshare(0x00020000)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 (requires CAP_SYS_ADMIN outside user namespace)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -517,7 +519,7 @@ ret = libc.ptrace(16, 1, 0, 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 (different UID + YAMA) or ESRCH=3 (process not ptraceable)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -548,7 +550,7 @@ libc = ctypes.CDLL("libc.so.6", use_errno=True)
 dumpable = libc.prctl(3, 0, 0, 0, 0)
 print(f"DUMPABLE:{dumpable}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # PR_SET_DUMPABLE must be 0 to prevent ptrace from other UID 1000 processes
         assert "DUMPABLE:0" in result.stdout, f"Expected dumpable=0. stdout: {result.stdout}"
@@ -574,7 +576,7 @@ except FileNotFoundError:
 except PermissionError:
     print('YAMA:perm_denied')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # YAMA scope >= 2 blocks ptrace for non-CAP_SYS_PTRACE processes
@@ -625,15 +627,16 @@ if suid_files:
 else:
     print("NO_SUID_BINARIES")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # If SUID binaries exist, no_new_privs still protects us,
         # but ideally there should be none
         if "SUID:" in result.stdout:
             # Verify no_new_privs is set (defense-in-depth)
-            nnp_result = await dual_scheduler.run(
-                code='with open("/proc/self/status") as f:\n    for l in f:\n        if l.startswith("NoNewPrivs:"): print(l.strip())',
-                language=Language.PYTHON,
+            nnp_result = await run_once(
+                dual_scheduler,
+                VmSpec(language=Language.PYTHON),
+                'with open("/proc/self/status") as f:\n    for l in f:\n        if l.startswith("NoNewPrivs:"): print(l.strip())',
             )
             assert "NoNewPrivs:\t1" in nnp_result.stdout, (
                 f"SUID binaries exist and no_new_privs is not set! SUID files: {result.stdout}"
@@ -654,7 +657,7 @@ with open("/proc/self/status") as f:
             print(f"NO_NEW_PRIVS:{val}")
             break
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "NO_NEW_PRIVS:1" in result.stdout, f"Expected no_new_privs=1. stdout: {result.stdout}"
 
@@ -698,7 +701,7 @@ except PermissionError:
 except FileNotFoundError:
     print("NOT_FOUND")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout == "NOT_FOUND", f"CONFIG_KALLSYMS=n requires /proc/kallsyms to be absent, got: {stdout!r}"
@@ -717,7 +720,7 @@ except FileNotFoundError:
 except OSError as e:
     print(f"ERROR:{e.errno}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "READ:" not in result.stdout, f"/proc/kcore should not be readable. stdout: {result.stdout}"
 
@@ -736,7 +739,7 @@ except PermissionError:
 except FileNotFoundError:
     print("NOT_FOUND")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "BLOCKED" in result.stdout or "NOT_FOUND" in result.stdout
 
@@ -763,7 +766,7 @@ with open('/proc/mounts') as f:
     else:
         print('HIDEPID:no_proc_mount')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "HIDEPID:enabled" in result.stdout, f"stdout: {result.stdout}"
 
@@ -785,7 +788,7 @@ except FileNotFoundError:
 except PermissionError:
     print('LISTDIR:EPERM')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "EXISTS:False" in result.stdout
         assert "LISTDIR:ENOENT" in result.stdout
@@ -809,7 +812,7 @@ with open(f'/proc/{pid}/status') as f:
     status = f.read()
 print(f'OWN_PID_STATUS:{"Name:" in status}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "SELF_STATUS:True" in result.stdout
         assert "OWN_PID_STATUS:True" in result.stdout
@@ -842,7 +845,7 @@ for p in paths:
     except FileNotFoundError:
         print(f'{p}:ENOENT')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         lines = result.stdout.strip().splitlines()
         # One status line per masked path — truncated output must fail, not
@@ -880,7 +883,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         assert stdout == "NOT_FOUND", (
@@ -908,7 +911,7 @@ if ret >= 0:
 else:
     print(f"BLOCKED:errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # userfaultfd should be blocked (EPERM=1 or ENOSYS=38)
@@ -927,7 +930,7 @@ ret = libc.syscall(nr, 0, -1, 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # keyctl may succeed (returns keyring ID) or fail (ENOSYS/EPERM).
         # We can't block it without seccomp, but we document its availability.
@@ -951,7 +954,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         # modules_disabled=1 means module loading is permanently blocked
@@ -976,7 +979,7 @@ ret = libc.syscall(nr, -1, b"", 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_MODULE or modules_disabled=1)
         # ENOSYS=38 (CONFIG_MODULES=n — syscall doesn't exist, even stronger)
@@ -1000,7 +1003,7 @@ ret = libc.syscall(nr, 0, 0, 0, 0)
 err = ctypes.get_errno()
 print(f"ret={ret} errno={err}")
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_BOOT) or ENOSYS=38 (not compiled into kernel)
         errno_val = int(result.stdout.strip().rsplit("errno=", 1)[1])
@@ -1025,7 +1028,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "PROTECTED_SYMLINKS:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected protected_symlinks=1. stdout: {result.stdout}"
@@ -1041,7 +1044,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "PROTECTED_HARDLINKS:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected protected_hardlinks=1. stdout: {result.stdout}"
@@ -1057,7 +1060,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PROTECTED_FIFOS:" in stdout and stdout.split(":")[1].isdigit():
@@ -1076,7 +1079,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "PROTECTED_REGULAR:" in stdout and stdout.split(":")[1].isdigit():
@@ -1095,7 +1098,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "SUID_DUMPABLE:0" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected suid_dumpable=0. stdout: {result.stdout}"
@@ -1122,7 +1125,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "DMESG_RESTRICT:1" in result.stdout or "INACCESSIBLE" in result.stdout, (
             f"Expected dmesg_restrict=1. stdout: {result.stdout}"
@@ -1145,7 +1148,7 @@ except FileNotFoundError:
 except PermissionError:
     print('PERM_DENIED')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if IS_X86:
@@ -1172,7 +1175,7 @@ try:
 except (FileNotFoundError, PermissionError):
     print('INACCESSIBLE')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "KPTR_RESTRICT:" in stdout and stdout.split(":")[1].isdigit():
@@ -1222,10 +1225,7 @@ finally:
     except Exception:
         pass
 """
-        result = await dual_scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         stdout = result.stdout.strip()
         if "STOPPED:" in stdout:

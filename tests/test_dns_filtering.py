@@ -13,6 +13,8 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 from .conftest import (
     JS_SAFETY,
@@ -257,11 +259,8 @@ async def test_outbound_filtering(
     """
     code = get_connection_test_code(language, test_domain, retries=should_connect)
 
-    result = await scheduler.run(
-        code=code,
-        language=language,
-        allow_network=True,
-        allowed_domains=allowed_domains,
+    result = await run_once(
+        scheduler, VmSpec(language=language, allow_network=True, allowed_domains=allowed_domains), code
     )
 
     if should_connect:
@@ -297,11 +296,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["pypi.org"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["pypi.org"]), code
     )
 
     assert "STATUS:200" in result.stdout, (
@@ -323,11 +319,14 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["pypi.org"],  # Only pypi allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["pypi.org"],  # Only pypi allowed
+        ),
+        code,
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -354,10 +353,13 @@ except OSError as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=False,  # Network disabled
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=False,  # Network disabled
+        ),
+        code,
     )
 
     assert "NO_NETWORK:" in result.stdout or "RESOLVED:" not in result.stdout, (
@@ -375,16 +377,13 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
     no bot challenges, no scheduled downtime. No ``-f``: any HTTP response
     proves the path works end-to-end (DNS, SNI filter, TLS).
     """
-    result = await scheduler.run(
-        code=(
-            f"timeout {NET_SAFETY_TIMEOUT_S} curl -s"
-            f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
-            f" --retry {NET_RETRY_COUNT} --retry-connrefused -o /dev/null"
-            " https://cp.cloudflare.com/generate_204 && echo 'SUCCESS' || echo 'FAILED'"
-        ),
-        language=Language.RAW,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler,
+        VmSpec(language=Language.RAW, allow_network=True, allowed_domains=["cp.cloudflare.com"]),
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -s"
+        f" --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
+        f" --retry {NET_RETRY_COUNT} --retry-connrefused -o /dev/null"
+        " https://cp.cloudflare.com/generate_204 && echo 'SUCCESS' || echo 'FAILED'",
     )
 
     assert "SUCCESS" in result.stdout, (
@@ -394,11 +393,14 @@ async def test_outbound_filtering_raw_allowed(scheduler: Scheduler) -> None:
 
 async def test_outbound_filtering_raw_blocked(scheduler: Scheduler) -> None:
     """Test that blocked domain fails with RAW language."""
-    result = await scheduler.run(
-        code=f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
-        language=Language.RAW,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # google.com not allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.RAW,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # google.com not allowed
+        ),
+        f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf --connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S} https://google.com/ && echo 'SUCCESS' || echo 'BLOCKED'",
     )
 
     assert "BLOCKED" in result.stdout, (
@@ -423,11 +425,14 @@ try {{
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.JAVASCRIPT,
-        allow_network=True,
-        allowed_domains=["registry.npmjs.org"],  # google.com not allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.JAVASCRIPT,
+            allow_network=True,
+            allowed_domains=["registry.npmjs.org"],  # google.com not allowed
+        ),
+        code,
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -456,11 +461,14 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # Allowed, but only on TLS
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # Allowed, but only on TLS
+        ),
+        code,
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -490,11 +498,14 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # google.com NOT allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # google.com NOT allowed
+        ),
+        code,
     )
 
     # DNS should be blocked for non-allowed domains
@@ -522,11 +533,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
     # Allowed domain should resolve to a real IP
@@ -564,16 +572,19 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        # Mode 1: has expose_ports but no allow_network — wait, this tests
-        # via scheduler.run which doesn't expose Mode 1 directly.
-        # Instead, we test with empty allowlist + block semantics:
-        # allowed_domains=[] means no OutboundAllow patterns = all outbound blocked
-        # when combined with the VM manager's Mode 1 detection
-        allowed_domains=[],  # No domains allowed = no patterns passed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            # Mode 1: has expose_ports but no allow_network — wait, this tests
+            # via scheduler.run which doesn't expose Mode 1 directly.
+            # Instead, we test with empty allowlist + block semantics:
+            # allowed_domains=[] means no OutboundAllow patterns = all outbound blocked
+            # when combined with the VM manager's Mode 1 detection
+            allowed_domains=[],  # No domains allowed = no patterns passed
+        ),
+        code,
     )
 
     # With empty allowlist and allow_network=True, gvproxy has no -outbound-allow
@@ -608,11 +619,14 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # Allowed, but only TLS
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # Allowed, but only TLS
+        ),
+        code,
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -644,11 +658,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
     assert "RESOLVED:" in result.stdout, (
@@ -686,11 +697,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
     assert "RESOLVED:" in result.stdout, (
@@ -727,11 +735,14 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT in allowlist
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT in allowlist
+        ),
+        code,
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -765,11 +776,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
     )
 
     assert "BLOCKED:" in result.stdout, (
@@ -801,11 +809,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=many_domains,
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=many_domains), code
     )
 
     assert "CONNECTED" in result.stdout, f"Large allowlist failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -827,11 +832,8 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["xn--nxasmq5b.com"],
+    result = await run_once(
+        scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["xn--nxasmq5b.com"]), code
     )
 
     # Should either connect or be blocked, not crash
@@ -856,11 +858,14 @@ except Exception as e:
 """
     )
 
-    result = await scheduler.run(
-        code=code,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # .local not in allowlist
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # .local not in allowlist
+        ),
+        code,
     )
 
     # .local should be blocked (not in allowlist, and doesn't resolve via DNS)
@@ -885,11 +890,10 @@ except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
 """
     )
-    result = await scheduler.run(
-        code=code_allowed,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],
+    result = await run_once(
+        scheduler,
+        VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]),
+        code_allowed,
     )
     assert "CONNECTED" in result.stdout, (
         f"Allowed domain should connect.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -909,11 +913,14 @@ except Exception as e:
     print(f"BLOCKED:{{type(e).__name__}}")
 """
     )
-    result = await scheduler.run(
-        code=code_blocked,
-        language=Language.PYTHON,
-        allow_network=True,
-        allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT allowed
+    result = await run_once(
+        scheduler,
+        VmSpec(
+            language=Language.PYTHON,
+            allow_network=True,
+            allowed_domains=["cp.cloudflare.com"],  # pypi.org NOT allowed
+        ),
+        code_blocked,
     )
     assert "BLOCKED:" in result.stdout, (
         f"pypi.org should be blocked when only cp.cloudflare.com allowed.\nstdout: {result.stdout}\nstderr: {result.stderr}"

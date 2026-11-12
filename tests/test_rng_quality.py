@@ -24,6 +24,8 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -54,7 +56,7 @@ class TestKernelEntropyHealth:
     )
     async def test_entropy_pool_seeded(self, scheduler: Scheduler, language: Language, code: str) -> None:
         """CRNG has 256 bits entropy (random.trust_cpu=on working)."""
-        result = await scheduler.run(code=code, language=language)
+        result = await run_once(scheduler, VmSpec(language=language), code)
 
         assert result.exit_code == 0
         entropy = int(result.stdout.strip())
@@ -76,7 +78,7 @@ print(f"TIME_MS:{elapsed_ms:.2f}")
 # Should complete in <100ms, blocking would take seconds
 print("PASS" if elapsed_ms < 100 else "FAIL_BLOCKED")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout, "getrandom() blocked - entropy starvation"
@@ -128,7 +130,7 @@ for attempt in range(3):
 else:
     print("FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -156,7 +158,7 @@ print(f"ENTROPY:{entropy:.6f}")
 # Perfect random = 8.0 bits/byte, >7.9 is excellent
 print("PASS" if entropy > 7.9 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -190,7 +192,7 @@ print(f"SERIAL_CORR:{corr:.6f}")
 # Should be very close to 0 (< 0.01 in absolute value)
 print("PASS" if abs(corr) < 0.01 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -210,7 +212,7 @@ print(f"COMPRESS_RATIO:{ratio:.4f}")
 # Weak RNG may have patterns that compress better
 print("PASS" if ratio > 0.99 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -250,7 +252,7 @@ for attempt in range(3):
 else:
     print("FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -285,7 +287,7 @@ for _ in range(100):
 
 print("PASS")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -306,7 +308,7 @@ for _ in range(100):
 print(f"UNIQUE_HASHES:{len(hashes)}")
 print("PASS" if len(hashes) == 100 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -331,7 +333,7 @@ console.log(`UUID_LEN:${uuid.length}`);
 
 console.log(buf1.length === 1024 && !same && uuid.length === 36 ? "PASS" : "FAIL");
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -352,7 +354,7 @@ const ratio = compressed.length / data.length;
 console.log(`RATIO:${ratio.toFixed(4)}`);
 console.log(ratio > 0.99 ? "PASS" : "FAIL");
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -371,7 +373,7 @@ else
     echo "FAIL"
 fi
 """
-        result = await scheduler.run(code=code, language=Language.RAW)
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -400,8 +402,8 @@ print(hashlib.sha256(data).hexdigest())
 """
         # Run same code in two separate VMs
         results = await asyncio.gather(
-            scheduler.run(code=code, language=Language.PYTHON),
-            scheduler.run(code=code, language=Language.PYTHON),
+            run_once(scheduler, VmSpec(language=Language.PYTHON), code),
+            run_once(scheduler, VmSpec(language=Language.PYTHON), code),
         )
 
         hashes = [r.stdout.strip() for r in results]
@@ -424,7 +426,7 @@ print(hashlib.sha256(data).hexdigest())
         # (pytest -n auto + 5 concurrent VMs can exceed thread limits)
         hashes: list[str] = []
         for _ in range(3):
-            result = await scheduler.run(code=code, language=Language.PYTHON)
+            result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
             hashes.append(result.stdout.strip())
 
         assert len(hashes) == 3
@@ -462,7 +464,7 @@ print(f"MAX_RUN:{max_run}")
 # Runs > 6 indicate a broken RNG
 print("PASS" if max_run <= 6 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -487,7 +489,7 @@ print(f"MAX_PROPORTION:{proportion:.6f}")
 # Allow up to 2x expected (0.0078) for statistical variation
 print("PASS" if proportion < 0.008 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout
@@ -510,7 +512,7 @@ print(f"ONES_RATIO:{ratio:.6f}")
 # Should be very close to 0.5 (within 0.001 for 8M samples)
 print("PASS" if 0.499 < ratio < 0.501 else "FAIL")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "PASS" in result.stdout

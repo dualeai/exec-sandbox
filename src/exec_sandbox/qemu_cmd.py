@@ -8,10 +8,10 @@ import os
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import VmDependencyError
+from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.permission_utils import get_qemu_vm_uid
-from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os
+from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_os, detect_host_x86_vendor, kernel_image_path
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import (
     check_tsc_deadline,
@@ -20,11 +20,42 @@ from exec_sandbox.system_probes import (
     probe_qemu_sandbox_support,
     probe_qemu_version,
     probe_unshare_support,
+    qemu_system_binary,
 )
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import AccelType
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 logger = get_logger(__name__)
+
+# x86 guests see one fixed CPU, not the host's, so a saved instance loads on
+# any host that has these flags: an AVX2-level (x86-64-v3) flag list on a
+# versioned base model (QEMU has no x86-64-vN model). With `enforce`, QEMU
+# refuses to start on a host that lacks a flag, instead of hiding it from a
+# guest that already uses it (an instance saved on a newer host). Hosts older
+# than Haswell / Zen 1 cannot run it. +hypervisor lets the guest find KVM
+# (kvm-clock, see the kernel command line). -svm,-vmx: no nested virtualization
+# (CVE-2024-50115).
+# rdrand/rdseed: entropy without a host round trip (TCG emulates both).
+# xsaveopt: every AVX2-level host has it, and under TCG a guest with xsave but
+# no xsaveopt hangs before the first console line (measured, QEMU 11.1.3).
+_X86_CPU_FLAGS = (
+    "qemu64-v1,+avx,+avx2,+bmi1,+bmi2,+f16c,+fma,+abm,+movbe,+xsave,+xsaveopt,+cx16,+lahf_lm,"
+    "+popcnt,+sse4.1,+sse4.2,+ssse3,+rdrand,+rdseed,+hypervisor,-svm,-vmx"
+)
+# Hypercall paravirt features that named models leave off (KVM only).
+_X86_KVM_PV_FLAGS = "+kvm-pv-ipi,+kvm-pv-tlb-flush,+kvm-pv-sched-yield,+kvm-poll-control,+kvm-asyncpf-int"
+
+
+def _x86_cpu(accel_type: AccelType, *, tsc_deadline: bool) -> str:
+    """-cpu value for x86 guests (the fixed model above). tsc-deadline follows the pit/pic/rtc=off machine choice."""
+    parts = [_X86_CPU_FLAGS]
+    if accel_type == AccelType.KVM:
+        parts.append(_X86_KVM_PV_FLAGS)
+    if tsc_deadline:
+        parts.append("+tsc-deadline")
+    parts += [f"vendor={detect_host_x86_vendor()}", "enforce"]
+    return ",".join(parts)
 
 
 async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
@@ -32,9 +63,8 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     arch: HostArch,
     vm_id: str,
     workdir: VmWorkingDirectory,
-    memory_mb: float,
-    cpu_cores: float,
-    allow_network: bool,
+    spec: VmSpec,
+    *,
     expose_ports: list[ExposedPort] | None = None,
     direct_write: bool = False,
     debug_boot: bool = False,
@@ -193,7 +223,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         # replaces PIT as the timer source). Without TSC_DEADLINE, PIT/PIC
         # must remain enabled or the kernel hangs (no timer/interrupt source).
         # TCG never provides TSC_DEADLINE; KVM/HVF may lack it in nested VMs.
-        tsc_available = False
         if accel_type in (AccelType.KVM, AccelType.HVF):
             tsc_available = await check_tsc_deadline()
             if not tsc_available:
@@ -217,51 +246,48 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             parts.append("dump-guest-core=off")
         machine_type = ",".join(parts)
 
-    # Honor an explicitly configured QEMU path (e.g. CI build-from-source);
-    # otherwise the bare binary name is resolved from PATH by exec.
-    configured_qemu = settings.qemu_bin_arm if arch == HostArch.AARCH64 else settings.qemu_bin_x86
-    if configured_qemu.is_file():
-        qemu_bin = str(configured_qemu)
+    # The configured QEMU path when it exists (e.g. CI build-from-source), else the bare
+    # name from PATH: the binary the version and accelerator probes ran.
+    qemu_bin = qemu_system_binary(settings, arch=arch)
 
-    # VM Templating: file-backed memory for COW sharing across VMs.
-    # When mem_path is set, use memory-backend-file instead of anonymous RAM.
-    # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED).
-    # Template restore: share=off,readonly=on,rom=off (MAP_PRIVATE = COW).
+    # One VM shape, so every VM can be saved and loaded: guest RAM is always the
+    # explicit backend "mem0", so the RAM block has one name in every saved state
+    # and any VM's state loads into any other VM. Anonymous RAM for cold boots
+    # and loads; a file for L1 templates (VM Templating, COW sharing across VMs):
+    # template save share=on (QEMU writes guest RAM to the file via MAP_SHARED),
+    # template restore share=off,readonly=on,rom=off (MAP_PRIVATE = COW).
     # Ref: https://www.qemu.org/docs/master/system/vm-templating.html
-    mem_backend_args: list[str] = []
-    if mem_path is not None:
-        if mem_path_share:
-            # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED)
-            backend_opts = f"memory-backend-file,id=mem0,size={int(memory_mb)}M,mem-path={mem_path},share=on"
-        else:
-            # Template restore: share=off (MAP_PRIVATE = COW), readonly=on (open
-            # file O_RDONLY for safety), rom=off (don't mark memory as ROM — guest
-            # must be able to write).
-            # Ref: https://www.qemu.org/docs/master/system/vm-templating.html
-            backend_opts = (
-                f"memory-backend-file,id=mem0,size={int(memory_mb)}M,mem-path={mem_path},share=off,readonly=on,rom=off"
-            )
-        mem_backend_args = ["-object", backend_opts]
-        machine_type += ",memory-backend=mem0"
+    if mem_path is None:
+        backend_opts = f"memory-backend-ram,id=mem0,size={spec.memory_mb}M"
+    elif mem_path_share:
+        # Template save: share=on (QEMU writes guest RAM to file via MAP_SHARED)
+        backend_opts = f"memory-backend-file,id=mem0,size={spec.memory_mb}M,mem-path={mem_path},share=on"
+    else:
+        # Template restore: share=off (MAP_PRIVATE = COW), readonly=on (open
+        # file O_RDONLY for safety), rom=off (don't mark memory as ROM — guest
+        # must be able to write).
+        # Ref: https://www.qemu.org/docs/master/system/vm-templating.html
+        backend_opts = (
+            f"memory-backend-file,id=mem0,size={spec.memory_mb}M,mem-path={mem_path},share=off,readonly=on,rom=off"
+        )
+    mem_backend_args = ["-object", backend_opts]
+    machine_type += ",memory-backend=mem0"
 
     # Auto-discover kernel and initramfs based on architecture
     # Note: existence validated in create_vm() before calling this method
     # Prefer uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster)
     # QEMU auto-detects PVH ELF note and skips kernel decompression
-    vmlinux_path = settings.kernel_path / f"vmlinux-{arch_suffix}"
-    vmlinuz_path = settings.kernel_path / f"vmlinuz-{arch_suffix}"
-    kernel_path = vmlinux_path if arch == HostArch.X86_64 and vmlinux_path.exists() else vmlinuz_path
+    kernel_path = kernel_image_path(settings.kernel_path, arch)
     initramfs_path = settings.kernel_path / f"initramfs-{arch_suffix}"
 
     # Layer 5: Linux namespaces (optional - requires capabilities or user namespaces)
+    # QEMU always gets its own network namespace, also with network access: QEMU
+    # needs no host network. Guest traffic goes through gvproxy over a filesystem
+    # Unix socket, which a namespace does not cut. QEMU itself then reaches no
+    # host network.
     cmd: list[str] = []
     if detect_host_os() != HostOS.MACOS and await probe_unshare_support():
-        if allow_network:
-            unshare_args = ["unshare", "--pid", "--mount", "--uts", "--ipc", "--fork"]
-            cmd.extend([*unshare_args, "--"])
-        else:
-            unshare_args = ["unshare", "--pid", "--net", "--mount", "--uts", "--ipc", "--fork"]
-            cmd.extend([*unshare_args, "--"])
+        cmd.extend(["unshare", "--pid", "--net", "--mount", "--uts", "--ipc", "--fork", "--"])
 
     # Build QEMU command arguments
     # Determine if we're using microvm (requires -nodefaults to avoid BIOS fallback)
@@ -308,39 +334,27 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # TCG test suite uses. pauth-impdef=on forces the fast impdef PAC
             # algorithm (QEMU 10.0+ defaults to this for virt >= 10.0, but
             # older versions use QARMA5 which costs ~50% of TCG cycles).
-            # x86 TCG: SapphireRapids-v2 as a modern feature baseline. Note:
-            # TCG cannot emulate the IA32_ARCH_CAPABILITIES MSR and strips the
-            # feature (warns "TCG doesn't support requested feature ...
-            # arch-capabilities", verified on QEMU 11.0.2), so hardware
-            # vulnerability self-declarations (mds-no, taa-no, ...) never reach
-            # the guest — TCG guests report MDS "Vulnerable". Irrelevant under
-            # the mitigations=off posture below. TCG also silently strips
-            # AVX-512 and AMX (not emulated). On ARM64 hosts the aarch64 TCG backend
-            # also lacks 256-bit vector ops (TCG_TARGET_HAS_v256=0), so AVX2
-            # is unavailable — effective ceiling is SSE4.2. On x86 hosts the
-            # effective ceiling is x86_64-v3 (AVX2/FMA).
+            # x86 (every accel): the fixed AVX2-level model, see _x86_cpu.
             # NOTE (non-adoption): ARM `max,sve=off,sme=off` (individually maskable
             # on `max` since QEMU 11.0) is not set — boot never exercises SVE/SME,
             # so the win is ~zero (only trims per-vCPU vector-state struct size).
             # See: https://www.qemu.org/docs/master/system/i386/cpu.html
             # See: https://gitlab.com/qemu-project/qemu/-/issues/844
             (
-                "host"
-                if accel_type in (AccelType.HVF, AccelType.KVM) and arch == HostArch.AARCH64
-                else "host,-svm,-vmx"
+                _x86_cpu(accel_type, tsc_deadline=tsc_available)
+                if arch == HostArch.X86_64
+                else "host"
                 if accel_type in (AccelType.HVF, AccelType.KVM)
                 else "max,pauth-impdef=on"
-                if arch == HostArch.AARCH64
-                else "SapphireRapids-v2"
             ),
-            *mem_backend_args,  # Empty for anonymous RAM, or -object memory-backend-file for COW
+            *mem_backend_args,  # -object memory-backend-{ram,file},id=mem0
             "-M",
             machine_type,
             "-no-reboot",
             "-m",
-            f"{int(memory_mb)}M",  # QEMU -m requires integer MB
+            f"{spec.memory_mb}M",
             "-smp",
-            f"{int(cpu_cores)},maxcpus={int(cpu_cores)}",  # Cap maxcpus to prevent QEMU allocating extra vCPU structs
+            f"{spec.cpu_cores},maxcpus={spec.cpu_cores}",  # Cap maxcpus to prevent QEMU allocating extra vCPU structs
             "-kernel",
             str(kernel_path),
             "-initrd",
@@ -460,7 +474,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             # advertise many possible CPUs (virt: up to 512, microvm: up to 256),
             # and the kernel allocates per-CPU data structures for ALL possible CPUs.
             # nr_cpus=N caps possible CPUs, saving ~50-200KB per unused CPU slot.
-            + f" nr_cpus={int(cpu_cores)}"
+            + f" nr_cpus={spec.cpu_cores}"
             # Disable lockup detection — saves per-CPU watchdog threads and timers.
             # Ephemeral microVMs rely on host-side timeouts, not guest watchdogs.
             + " nowatchdog"
@@ -481,8 +495,11 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             + (" init.snap=1" if snapshot_drive else "")
             # Guest-agent log verbosity: init.quiet=0 un-gates log_info! macros
             + (" init.quiet=0" if debug_boot else " init.quiet=1")
-            # Explicit TSC clocksource selection, skip probing (5-10ms, x86_64 only)
-            + (" tsc=reliable clocksource=tsc" if arch == HostArch.X86_64 else ""),
+            # x86 under KVM uses kvm-clock: KVM rewrites its scale after a load
+            # on a host with another TSC rate; a forced TSC clocksource would run
+            # at the wrong rate there. Without KVM (TCG, HVF) there is no kvm-clock:
+            # pin the TSC and skip clocksource probing (5-10ms).
+            + (" tsc=reliable clocksource=tsc" if arch == HostArch.X86_64 and accel_type != AccelType.KVM else ""),
         ]
     )
 
@@ -613,6 +630,32 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             ]
         )
 
+    # Home disk (serial=home): raw sparse file of spec.disk_mb, private to this
+    # VM, formatted by tiny-init and mounted on /home/user. Every VM has one (one
+    # VM shape). Same I/O limits as the base drive; default file locking (unlike
+    # the shared base and L2 files, nothing else opens it).
+    qemu_args.extend(
+        [
+            "-drive",
+            f"file={workdir.home_disk},"
+            f"format=raw,"
+            f"if=none,"
+            f"id=hd2,"
+            f"cache=unsafe,"
+            f"aio={aio_mode},"
+            f"discard=unmap,"
+            f"detect-zeroes=unmap,"
+            f"werror=report,"
+            f"rerror=report,"
+            f"bps={constants.DISK_BPS_LIMIT},"
+            f"bps_max={constants.DISK_BPS_BURST},"
+            f"iops={constants.DISK_IOPS_LIMIT},"
+            f"iops_max={constants.DISK_IOPS_BURST}",
+            "-device",
+            f"virtio-blk-{virtio_suffix},drive=hd2,serial=home{device_iothread},num-queues=1,queue-size={qs},event_idx=off",
+        ]
+    )
+
     # Display/console configuration
     # -nographic: headless mode
     # -monitor none: disable QEMU monitor (it uses stdio by default with -nographic,
@@ -735,7 +778,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # NOTE (non-adoption): the in-tree passt netdev (QEMU 10.1) is not used. It
     # lacks gvproxy's API-driven outbound-filtering and dynamic port-forward model
     # that Modes 1-3 below depend on, so it is not a drop-in replacement.
-    needs_network = allow_network or bool(expose_ports)
+    needs_network = spec.allow_network or bool(expose_ports)
     if needs_network:
         # All modes use socket networking to gvproxy (fast ~300ms boot)
         # Build netdev options with reconnect for socket resilience
@@ -752,9 +795,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
         mode_desc = (
             "Mode 1 (port-forward only, no internet)"
-            if expose_ports and not allow_network
+            if expose_ports and not spec.allow_network
             else "Mode 2 (port-forward + internet)"
-            if expose_ports and allow_network
+            if expose_ports and spec.allow_network
             else "Mode 3 (internet only)"
         )
         logger.info(
@@ -762,7 +805,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             extra={
                 "vm_id": vm_id,
                 "expose_ports": [(p.internal, p.external) for p in expose_ports] if expose_ports else None,
-                "allow_network": allow_network,
+                "allow_network": spec.allow_network,
             },
         )
 

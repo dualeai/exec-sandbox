@@ -15,6 +15,8 @@ import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -25,40 +27,35 @@ class TestNonRootIdentity:
 
     async def test_shell_whoami(self, scheduler: Scheduler) -> None:
         """Shell REPL reports 'user' identity."""
-        result = await scheduler.run(code="whoami", language=Language.RAW)
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "whoami")
         assert result.exit_code == 0
         assert result.stdout.strip() == "user"
 
     async def test_shell_id(self, scheduler: Scheduler) -> None:
         """Shell REPL reports uid=1000, gid=1000."""
-        result = await scheduler.run(code="id", language=Language.RAW)
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "id")
         assert result.exit_code == 0
         assert "uid=1000" in result.stdout
         assert "gid=1000" in result.stdout
 
     async def test_python_uid(self, scheduler: Scheduler) -> None:
         """Python REPL runs as UID 1000."""
-        result = await scheduler.run(
-            code="import os; print(os.getuid())",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.getuid())")
         assert result.exit_code == 0
         assert result.stdout.strip() == "1000"
 
     async def test_python_gid(self, scheduler: Scheduler) -> None:
         """Python REPL runs as GID 1000."""
-        result = await scheduler.run(
-            code="import os; print(os.getgid())",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.getgid())")
         assert result.exit_code == 0
         assert result.stdout.strip() == "1000"
 
     async def test_javascript_uid(self, scheduler: Scheduler) -> None:
         """JavaScript REPL runs as UID 1000."""
-        result = await scheduler.run(
-            code="const { execSync } = require('child_process'); console.log(execSync('id -u').toString().trim())",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "const { execSync } = require('child_process'); console.log(execSync('id -u').toString().trim())",
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "1000"
@@ -72,34 +69,25 @@ class TestNonRootExecution:
 
     async def test_python_hello_world(self, scheduler: Scheduler) -> None:
         """Basic Python execution works as non-root."""
-        result = await scheduler.run(
-            code='print("hello from sandbox")',
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), 'print("hello from sandbox")')
         assert result.exit_code == 0
         assert "hello from sandbox" in result.stdout
 
     async def test_javascript_hello_world(self, scheduler: Scheduler) -> None:
         """Basic JavaScript execution works as non-root."""
-        result = await scheduler.run(
-            code='console.log("hello from sandbox")',
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), 'console.log("hello from sandbox")')
         assert result.exit_code == 0
         assert "hello from sandbox" in result.stdout
 
     async def test_shell_hello_world(self, scheduler: Scheduler) -> None:
         """Basic shell execution works as non-root."""
-        result = await scheduler.run(
-            code='echo "hello from sandbox"',
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), 'echo "hello from sandbox"')
         assert result.exit_code == 0
         assert "hello from sandbox" in result.stdout
 
     async def test_python_session_state_persistence(self, scheduler: Scheduler) -> None:
         """State persists across exec calls in non-root session."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.exec("x = 42")
             result = await session.exec("print(x)")
             assert result.exit_code == 0
@@ -114,7 +102,7 @@ class TestNonRootFileIO:
 
     async def test_write_file_then_read_in_repl(self, scheduler: Scheduler) -> None:
         """Files written by guest-agent (root) are readable by REPL (UID 1000)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("test.txt", b"hello from root")
             result = await session.exec('print(open("test.txt").read())')
             assert result.exit_code == 0
@@ -122,7 +110,7 @@ class TestNonRootFileIO:
 
     async def test_repl_creates_file_then_read_file(self, scheduler: Scheduler) -> None:
         """Files created by REPL (UID 1000) are readable by guest-agent (root)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec('open("created_by_repl.txt", "w").write("hello from repl")')
             assert result.exit_code == 0
 
@@ -136,7 +124,7 @@ class TestNonRootFileIO:
 
     async def test_repl_file_owned_by_uid_1000(self, scheduler: Scheduler) -> None:
         """Files created by REPL are owned by UID 1000."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(
                 "import os; open('myfile.txt', 'w').write('x'); print(os.stat('myfile.txt').st_uid)"
             )
@@ -145,9 +133,10 @@ class TestNonRootFileIO:
 
     async def test_home_dir_writable(self, scheduler: Scheduler) -> None:
         """REPL can write to /home/user (owned by UID 1000)."""
-        result = await scheduler.run(
-            code="import os; open('/home/user/test_write.txt', 'w').write('ok'); print('success')",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; open('/home/user/test_write.txt', 'w').write('ok'); print('success')",
         )
         assert result.exit_code == 0
         assert "success" in result.stdout
@@ -162,10 +151,8 @@ class TestNonRootPackages:
     @pytest.mark.slow
     async def test_pip_install_and_import(self, scheduler: Scheduler) -> None:
         """Packages installed by root are importable by non-root REPL."""
-        result = await scheduler.run(
-            code="import six; print(six.__version__)",
-            language=Language.PYTHON,
-            packages=["six==1.17.0"],
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON, packages=["six==1.17.0"]), "import six; print(six.__version__)"
         )
         assert result.exit_code == 0
         assert "1.17.0" in result.stdout
@@ -179,10 +166,7 @@ class TestNonRootPrivilegeBlocked:
 
     async def test_mount_blocked(self, scheduler: Scheduler) -> None:
         """mount(2) requires CAP_SYS_ADMIN — blocked for non-root."""
-        result = await scheduler.run(
-            code="mount -t tmpfs none /mnt 2>&1; echo exit=$?",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "mount -t tmpfs none /mnt 2>&1; echo exit=$?")
         assert result.exit_code == 0  # Shell itself succeeds
         # mount fails with EPERM
         assert "ermission" in result.stdout or "exit=32" in result.stdout or "exit=1" in result.stdout
@@ -195,16 +179,15 @@ libc = ctypes.CDLL("libc.so.6", use_errno=True)
 ret = libc.mount(b"none", b"/mnt", b"tmpfs", 0, None)
 print(f"ret={ret} errno={ctypes.get_errno()}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM = 1
         assert "errno=1" in result.stdout
 
     async def test_write_to_root_owned_dir_blocked(self, scheduler: Scheduler) -> None:
         """Writing to root-owned directories fails for UID 1000."""
-        result = await scheduler.run(
-            code="touch /usr/local/bin/evil 2>&1; echo exit=$?",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "touch /usr/local/bin/evil 2>&1; echo exit=$?"
         )
         assert "exit=1" in result.stdout or "ermission" in result.stdout
 
@@ -218,7 +201,7 @@ fd = libc.open(b"/usr/local/bin/evil", 0x41, 0o644)
 err = ctypes.get_errno()
 print(f"fd={fd} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EROFS = 30 (read-only filesystem)
         assert "errno=30" in result.stdout
@@ -232,15 +215,16 @@ with open("/proc/self/status") as f:
             print(line.strip())
             break
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "NoNewPrivs:\t1" in result.stdout
 
     async def test_kill_pid1_blocked(self, scheduler: Scheduler) -> None:
         """Non-root cannot signal PID 1 (guest-agent)."""
-        result = await scheduler.run(
-            code="import os, signal, errno\ntry:\n    os.kill(1, signal.SIGTERM)\n    print('unexpected_success')\nexcept PermissionError:\n    print('blocked')",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os, signal, errno\ntry:\n    os.kill(1, signal.SIGTERM)\n    print('unexpected_success')\nexcept PermissionError:\n    print('blocked')",
         )
         assert result.exit_code == 0
         assert "blocked" in result.stdout
@@ -263,7 +247,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -279,7 +263,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -294,7 +278,7 @@ try:
 except PermissionError:
     print("blocked")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -311,7 +295,7 @@ err = ctypes.get_errno()
 # EPERM=1 or ENOENT=2 (both acceptable — permission check happens first)
 print(f"ret={ret} errno={err}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         # EPERM=1 (no CAP_SYS_MODULE), ENOENT=2, or ENOSYS=38 (CONFIG_MODULES=n)
         assert "errno=1" in result.stdout or "errno=2" in result.stdout or "errno=38" in result.stdout

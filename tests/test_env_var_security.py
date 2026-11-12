@@ -34,9 +34,10 @@ class TestEnvVarSecurityIntegration:
 
     async def test_tab_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:
         """Tab character in env var value is allowed."""
-        result = await dual_scheduler.run(
-            code="import os; print(repr(os.environ.get('FOO')))",
-            language=Language.PYTHON,
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; print(repr(os.environ.get('FOO')))",
             env_vars={"FOO": "col1\tcol2"},
         )
         assert result.exit_code == 0
@@ -44,9 +45,10 @@ class TestEnvVarSecurityIntegration:
 
     async def test_utf8_allowed_by_guest(self, dual_scheduler: Scheduler) -> None:
         """UTF-8 characters in env var value are allowed."""
-        result = await dual_scheduler.run(
-            code="import os; print(os.environ.get('GREETING'))",
-            language=Language.PYTHON,
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; print(os.environ.get('GREETING'))",
             env_vars={"GREETING": "Hello 世界"},
         )
         assert result.exit_code == 0
@@ -160,9 +162,10 @@ class TestEnvVarSecurityIntegration:
 
     async def test_custom_env_var_works(self, dual_scheduler: Scheduler) -> None:
         """Custom env vars are passed to executed code."""
-        result = await dual_scheduler.run(
-            code="import os; print(os.environ.get('MY_VAR', 'not set'))",
-            language=Language.PYTHON,
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; print(os.environ.get('MY_VAR', 'not set'))",
             env_vars={"MY_VAR": "hello_world"},
         )
         assert result.exit_code == 0
@@ -170,14 +173,15 @@ class TestEnvVarSecurityIntegration:
 
     async def test_multiple_env_vars_work(self, dual_scheduler: Scheduler) -> None:
         """Multiple custom env vars work correctly."""
-        result = await dual_scheduler.run(
-            code="""
+        result = await run_once(
+            dual_scheduler,
+            VmSpec(language=Language.PYTHON),
+            """
 import os
 print(os.environ.get('VAR1'))
 print(os.environ.get('VAR2'))
 print(os.environ.get('VAR3'))
 """,
-            language=Language.PYTHON,
             env_vars={"VAR1": "one", "VAR2": "two", "VAR3": "three"},
         )
         assert result.exit_code == 0
@@ -199,12 +203,9 @@ class TestGuestAgentControlCharValidation:
         from exec_sandbox.qemu_vm import QemuVM  # noqa: TC001
 
         vm: QemuVM = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-control-char",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
         try:
             yield vm

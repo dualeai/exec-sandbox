@@ -13,19 +13,22 @@ Security:
 """
 
 import asyncio
-import grp
+import ctypes
+import ctypes.util
+import errno
 import os
 import pwd
+import stat
+import sys
 from functools import lru_cache
 from pathlib import Path
 
-import aiofiles.os
-
 from exec_sandbox._logging import get_logger
-from exec_sandbox.platform_utils import HostOS, ProcessWrapper, detect_host_os
+from exec_sandbox.platform_utils import HostOS, ProcessWrapper, child_env, detect_host_os
 
-# Minimum number of parts in an ACL entry (type:name:perms)
-_ACL_ENTRY_MIN_PARTS = 3
+# macOS <sys/acl.h>
+_ACL_TYPE_EXTENDED = 0x00000100
+_ACL_FIRST_ENTRY = 0
 
 logger = get_logger(__name__)
 
@@ -40,10 +43,114 @@ class _ProbeCache:
     qemu_vm_user: bool | None = None
     sudo_as_qemu_vm: bool | None = None  # Can run commands as qemu-vm via sudo
     setfacl_available: bool | None = None
-    getfacl_available: bool | None = None
 
 
 _probe_cache = _ProbeCache()
+
+
+# =============================================================================
+# Private folders (local instance store, home disk folder)
+# =============================================================================
+
+
+def private_dir_problem(root: Path, st: os.stat_result, *, forbidden: int) -> tuple[str, str] | None:
+    """Why `root` (its lstat result `st`) is not a safe folder of this user: (problem, fix).
+
+    None when it is a real folder (not a symlink), owned by this user, with
+    none of the `forbidden` mode bits set. Callers raise their own error class.
+    """
+    uid = os.geteuid()
+    if not stat.S_ISDIR(st.st_mode):
+        return "is a symlink or not a folder", "Use a real folder, not a link to one."
+    if st.st_uid != uid:
+        return (
+            f"belongs to uid {st.st_uid}, not to this user (uid {uid})",
+            f"A folder made with sudo belongs to root: run `sudo chown -R {uid} {root}`, or use a folder of this user.",
+        )
+    if st.st_mode & forbidden:
+        return f"has mode {oct(stat.S_IMODE(st.st_mode))}: group or others have access", f"Run `chmod 700 {root}`."
+    return None
+
+
+def private_tree_problem(root: Path, fd: int, *, forbidden: int) -> tuple[str, str] | None:
+    """Why the folder open at `fd` (opened through the path `root`) is not safe: (problem, fix).
+
+    private_dir_problem of the open folder, then:
+    - no ACL entry on it: mode bits do not show ACL entries, and a parent with an
+      inheritable ACL gives them to each new folder (macOS);
+    - the real path of `root` still names the open folder (same device and inode);
+    - no folder above it that another user can change (OpenSSH StrictModes, auth.c
+      safe_path): each one belongs to root or this user, and has no group or other
+      write bit, unless it is sticky (as /tmp: others cannot rename what they do
+      not own). Else another user can put another folder in its place.
+    Raises OSError when a check cannot run. Callers raise their own error class.
+    """
+    st = os.fstat(fd)
+    if problem := private_dir_problem(root, st, forbidden=forbidden):
+        return problem
+    if has_extended_acl(fd):
+        return (
+            "has ACL entries, which can give other users access",
+            f"Remove them with `chmod -R -N {root}` (macOS) or `setfacl -R -b {root}` (Linux), "
+            "and make the folder in a parent folder without inheritable ACL entries.",
+        )
+    real = root.resolve(strict=True)
+    at_real = real.stat()
+    if (at_real.st_dev, at_real.st_ino) != (st.st_dev, st.st_ino):
+        return "was moved or replaced during its check", "Find out who else can change its parent folders."
+    uid = os.geteuid()
+    for parent in real.parents:
+        pst = parent.lstat()
+        mode = pst.st_mode
+        if (
+            not stat.S_ISDIR(mode)
+            or pst.st_uid not in (0, uid)
+            or (mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX)
+        ):
+            return (
+                f"is in {parent} (uid {pst.st_uid}, mode {oct(stat.S_IMODE(mode))}), which another user can change",
+                f"Use a folder whose parent folders only root and this user can write, or run `chmod go-w {parent}`.",
+            )
+    return None
+
+
+def has_extended_acl(fd: int) -> bool:
+    """True when the file open at `fd` has ACL entries beyond its mode bits.
+
+    macOS: acl_get_fd_np(fd, ACL_TYPE_EXTENDED) from libc (sys/acl.h). With no ACL
+    it returns NULL and errno ENOENT, the same as gnulib (lib/acl-errno-valid.c,
+    lib/file-has-acl.c, which coreutils `ls` uses); an ACL with no entry is no ACL.
+    Linux: the kernel keeps an access ACL with more than the 3 base entries, or a
+    default ACL, in the xattr system.posix_acl_access or system.posix_acl_default
+    (acl(5)); a base-only ACL is never stored. A filesystem without ACLs has none.
+    """
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_get_fd_np.argtypes = (ctypes.c_int, ctypes.c_int)
+        libc.acl_get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+        libc.acl_free.argtypes = (ctypes.c_void_p,)
+        acl = libc.acl_get_fd_np(fd, _ACL_TYPE_EXTENDED)
+        if not acl:
+            err = ctypes.get_errno()
+            if err in (errno.ENOENT, errno.ENOTSUP, errno.EOPNOTSUPP):  # no ACL, or a filesystem without ACLs
+                return False
+            raise OSError(err, os.strerror(err))
+        try:
+            entry = ctypes.c_void_p()
+            return libc.acl_get_entry(acl, _ACL_FIRST_ENTRY, ctypes.byref(entry)) == 0  # 0: an entry, -1: none
+        finally:
+            libc.acl_free(acl)
+    if sys.platform == "linux":
+        for name in ("system.posix_acl_access", "system.posix_acl_default"):
+            try:
+                os.getxattr(fd, name)
+            except OSError as e:
+                if e.errno in (errno.ENODATA, errno.EOPNOTSUPP):
+                    continue
+                raise
+            return True
+    return False
 
 
 # =============================================================================
@@ -106,6 +213,7 @@ async def probe_qemu_vm_user() -> bool:
             "qemu-vm",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         await asyncio.wait_for(proc.wait(), timeout=5)
         _probe_cache.qemu_vm_user = proc.returncode == 0
@@ -160,6 +268,7 @@ async def probe_sudo_as_qemu_vm() -> bool:
             "/bin/true",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         await asyncio.wait_for(proc.wait(), timeout=5)
         _probe_cache.sudo_as_qemu_vm = proc.returncode == 0
@@ -254,6 +363,7 @@ async def set_acl_user(path: Path, user: str, perms: str = "rw") -> bool:
             str(path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -515,6 +625,7 @@ async def sudo_exec(
             start_new_session=start_new_session,
             stdout=stdout,
             stderr=stderr,
+            env=child_env(),
         )
     )
 
@@ -627,13 +738,7 @@ async def grant_qemu_vm_file_access(path: Path, *, writable: bool = False) -> bo
     Returns:
         True if access was granted, False if any step failed
     """
-    # Make parent directories traversable (a+x) up to root
-    current = path.parent
-    dirs_to_chmod: list[Path] = []
-    while current != current.parent:
-        dirs_to_chmod.append(current)
-        current = current.parent
-    if not await ensure_traversable(dirs_to_chmod):
+    if not await ensure_traversable(path):
         return False
 
     if writable:
@@ -641,17 +746,39 @@ async def grant_qemu_vm_file_access(path: Path, *, writable: bool = False) -> bo
     return await chmod_async(path, "a+r")
 
 
-async def ensure_traversable(dirs: list[Path]) -> bool:
-    """Ensure directories are traversable (a+x) for qemu-vm user.
+async def grant_qemu_vm_private_file_access(path: Path) -> bool:
+    """Grant qemu-vm read+write on a private (0600) file by ACL, plus parent traversal.
 
-    Args:
-        dirs: List of directory paths
+    The host keeps owning the file (it can still read, copy and delete it
+    without sudo); other accounts get nothing. Needs setfacl.
 
     Returns:
-        True if all directories were made traversable, False if any failed
+        True if access was granted, False if any step failed
     """
+    if not await ensure_traversable(path):
+        return False
+    return await set_acl_user(path, "qemu-vm", "rw")
+
+
+async def ensure_traversable(path: Path) -> bool:
+    """Make every folder above `path` traversable (a+x) for the qemu-vm user, innermost
+    first; the filesystem root is left as it is.
+
+    Checks the mode of each folder first and spawns `chmod a+x` only when an
+    execute bit is missing (every VM start checks ~6 parents; most already pass).
+
+    Args:
+        path: File whose parent folders qemu-vm must traverse
+
+    Returns:
+        True if all folders were made traversable, False if any failed
+    """
+    all_x = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
     success = True
-    for dir_path in dirs:
+    for dir_path in list(path.parents)[:-1]:
+        mode = get_mode(dir_path)
+        if mode is not None and mode & all_x == all_x:
+            continue
         if not await chmod_async(dir_path, "a+x"):
             success = False
     return success

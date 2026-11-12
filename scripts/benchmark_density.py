@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import psutil
 
-from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.constants import DEFAULT_CPU_OVERCOMMIT_RATIO, DEFAULT_MEMORY_OVERCOMMIT_RATIO
 from exec_sandbox.models import Language
@@ -393,7 +393,6 @@ async def measure_density(  # noqa: PLR0915
         warm_pool_size=0,  # Cold boot everything for fair measurement
         cpu_overcommit_ratio=overcommit_cpu,
         memory_overcommit_ratio=overcommit_mem,
-        default_memory_mb=memory_mb,
     )
 
     boot_latencies: list[int] = []
@@ -413,7 +412,7 @@ async def measure_density(  # noqa: PLR0915
             nonlocal boot_errors
             t0 = time.monotonic()
             try:
-                session = await scheduler.session(language=language, memory_mb=memory_mb)
+                session = await scheduler.new(VmSpec(language=language, memory_mb=memory_mb))
                 sessions.append(session)
                 boot_latencies.append(round((time.monotonic() - t0) * 1000))
             except Exception as e:

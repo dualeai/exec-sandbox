@@ -8,16 +8,20 @@ import asyncio
 import contextlib
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import VmPermanentError, VmTransientError
+from exec_sandbox.exceptions import ErrorCode, InternalError, TransientError
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import Language
+from exec_sandbox.settings import Settings
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 
-from .conftest import skip_unless_hwaccel
+from .conftest import l1_hit, skip_unless_hwaccel
 from .cpu_helpers import (
     CPU_CONSECUTIVE_SPIKE_THRESHOLD,
     CPU_MAX_CONSECUTIVE_SPIKES,
@@ -58,7 +62,7 @@ class TestGetVmLiveness:
         pool.pools[Language.PYTHON].put_nowait(healthy)
         unit_test_vm_manager.destroy_vm = AsyncMock(return_value=True)
 
-        vm = await pool.get_vm(Language.PYTHON, packages=[])
+        vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
 
         assert vm is healthy
         unit_test_vm_manager.destroy_vm.assert_awaited_once_with(dead)
@@ -75,7 +79,7 @@ class TestGetVmLiveness:
         unit_test_vm_manager.destroy_vm = AsyncMock(side_effect=OSError("destroy failed"))
 
         with patch.object(pool, "_schedule_replenishment") as replenish:
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
 
         assert vm is healthy
         unit_test_vm_manager.destroy_vm.assert_awaited_once_with(dead)
@@ -92,7 +96,7 @@ class TestGetVmLiveness:
         pool.pools[Language.PYTHON].put_nowait(dead)
         unit_test_vm_manager.destroy_vm = AsyncMock(return_value=True)
 
-        vm = await pool.get_vm(Language.PYTHON, packages=[])
+        vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
 
         assert vm is None  # queue exhausted after discard -> cold boot fallback
         unit_test_vm_manager.destroy_vm.assert_awaited_once_with(dead)
@@ -373,6 +377,10 @@ class TestWarmVMPoolOwnership:
             assert await pool._boot_warm_vm(Language.PYTHON, 0) is replacement
 
         assert create.await_args.kwargs["reservation"] is reservation
+        # The pool's spec has no packages: its L1 key and its restore have no L2 layer
+        memory.compute_cache_key.assert_awaited_once_with(pool.spec_for(Language.PYTHON), l2_path=None)  # type: ignore[attr-defined]
+        assert restore.await_args.kwargs["snapshot_drive"] is None
+        assert (tmp_path / "cached.vmstate").exists()  # not refused by QEMU: kept
 
     async def test_stop_cancels_replenishment_before_final_pool_drain(self, unit_test_vm_manager) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -402,6 +410,45 @@ class TestWarmVMPoolOwnership:
 
         assert pool.pools[Language.PYTHON].empty()
         destroy.assert_awaited_once_with(vm)
+
+
+class TestWarmVMPoolL1Entry:
+    """At start, a language without an L1 entry gets one from a background save; pool VMs stay."""
+
+    async def test_empty_l1_schedules_background_save_and_keeps_index0_vm(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        memory = MemorySnapshotManager(Settings(memory_snapshot_cache_dir=tmp_path), unit_test_vm_manager)
+        memory.compute_cache_key = AsyncMock(return_value="empty")  # type: ignore[method-assign]  # no image to hash
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1), memory_snapshot_manager=memory)
+        vms = {language: MagicMock(vm_id=f"cold-{language.value}", l1_restored=False) for language in Language}
+
+        async def cold_boot(language: Language, _index: int) -> MagicMock:
+            return vms[language]
+
+        with (
+            patch.object(pool, "_boot_warm_vm", side_effect=cold_boot) as boot,
+            patch.object(pool, "_warm_repl", new_callable=AsyncMock),
+            patch("exec_sandbox.warm_vm_pool.cgroup.reclaim_memory", new_callable=AsyncMock),
+            patch.object(memory, "schedule_background_save", new_callable=AsyncMock, return_value=None) as save,
+            patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy,
+        ):
+            await pool.start()
+            try:
+                # One save per language (its index-0 VM), a template entry without an L2 layer
+                assert sorted(
+                    (call.args[0].language, call.kwargs["snapshot_drive"]) for call in save.await_args_list
+                ) == [(language, None) for language in sorted(Language)]
+                assert all(call.args[0] == pool.spec_for(call.args[0].language) for call in save.await_args_list)
+                assert all(call.kwargs["key"] == "empty" for call in save.await_args_list)
+                # The pool VM is not saved, destroyed or booted again: it is the one in the pool
+                assert boot.await_count == len(Language)
+                destroy.assert_not_awaited()
+                assert all(pool.pools[language].get_nowait() is vms[language] for language in Language)
+            finally:
+                await pool.stop()
 
 
 class TestLanguageEnum:
@@ -772,7 +819,7 @@ class TestWarmVMPoolIntegration:
 
         try:
             # Get VM from pool (should be instant)
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
 
             assert vm is not None
             assert vm.vm_id is not None
@@ -792,7 +839,7 @@ class TestWarmVMPoolIntegration:
         await pool.start()
 
         try:
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
             # First execution should be fast — REPL was pre-warmed
@@ -818,7 +865,7 @@ class TestWarmVMPoolIntegration:
 
         try:
             # Get VM with packages - should return None
-            vm = await pool.get_vm(Language.PYTHON, packages=["pandas==2.0.0"])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON).model_copy(update={"packages": ("pandas==2.0.0",)}))
             assert vm is None
 
         finally:
@@ -850,7 +897,7 @@ class TestHealthcheckIntegration:
 
         try:
             # Get a VM from pool
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
             # Health check should pass for a freshly booted VM
@@ -972,7 +1019,7 @@ class TestHealthcheckIntegration:
 
         try:
             # Get a VM from pool
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
             # Verify it's healthy first
@@ -1007,20 +1054,14 @@ class TestHealthcheckIntegration:
 
         # Create 2 VMs manually (warm pool only creates 1 per language with max_concurrent=4)
         vm1 = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="mixed-test-1",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
         vm2 = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="mixed-test-2",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         config = SchedulerConfig(warm_pool_size=1)
@@ -1063,12 +1104,9 @@ class TestHealthcheckIntegration:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         vm = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="checkout-kill",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
         config = SchedulerConfig(warm_pool_size=1)
         pool = WarmVMPool(vm_manager, config)
@@ -1083,7 +1121,7 @@ class TestHealthcheckIntegration:
                 break
             await asyncio.sleep(0.1)
 
-        checked_out = await pool.get_vm(Language.PYTHON, packages=[])
+        checked_out = await pool.get_vm(pool.spec_for(Language.PYTHON))
         assert checked_out is None
 
     async def test_health_check_pool_removes_killed_vm(self, vm_manager) -> None:
@@ -1098,20 +1136,14 @@ class TestHealthcheckIntegration:
 
         # Create 2 VMs manually
         vm1 = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="pool-test-1",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
         vm2 = await vm_manager.create_vm(
-            language=Language.PYTHON,
+            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="pool-test-2",
-            memory_mb=256,
-            allow_network=False,
-            allowed_domains=None,
         )
 
         config = SchedulerConfig(warm_pool_size=1)
@@ -1236,7 +1268,7 @@ class TestHealthcheckIntegration:
         await pool.start()
 
         try:
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
             # Kill VM immediately (no delay) to maximize chance of race
@@ -1275,7 +1307,7 @@ class TestHealthcheckIntegration:
         await pool.start()
 
         try:
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
             # Kill VM
@@ -1571,7 +1603,7 @@ class TestPostExecutionCpuIdle:
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            vm = await pool.get_vm(lang, packages=[])
+            vm = await pool.get_vm(pool.spec_for(lang))
             assert vm is not None, f"No warm VM available for {lang.value}"
 
             result = await vm.execute(code=code, timeout_seconds=30)
@@ -1595,7 +1627,7 @@ class TestPostExecutionCpuIdle:
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None, "No warm VM available for Python"
 
             # ~100KB of output
@@ -1623,7 +1655,7 @@ class TestPostExecutionCpuIdle:
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None, "No warm VM available for Python"
 
             result = await vm.execute(
@@ -1650,7 +1682,7 @@ class TestPostExecutionCpuIdle:
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None, "No warm VM available for Python"
 
             for i in range(3):

@@ -8,7 +8,9 @@ probe cache, self-wake timer, and graceful degradation.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -37,10 +39,12 @@ from tests.conftest import skip_unless_linux, skip_unless_macos
 
 # Shorthand for test acquire calls
 _CPU = DEFAULT_VM_CPU_CORES
+_DISK_DIR = Path(tempfile.gettempdir())  # gate 4 sees real free space; requests are disk_mb=0
 _TIMEOUT = RESOURCE_ADMISSION_TIMEOUT_SECONDS
 
 
 def _make_controller(
+    *,
     host_memory_mb: float = 16_000.0,
     host_cpu_count: float = 8.0,
     memory_overcommit: float = DEFAULT_MEMORY_OVERCOMMIT_RATIO,
@@ -51,6 +55,8 @@ def _make_controller(
 ) -> ResourceAdmissionController:
     """Create an admission controller with known host resources (no psutil)."""
     return ResourceAdmissionController(
+        disk_dir=_DISK_DIR,
+        disk_free_floor_mb=0,
         memory_overcommit_ratio=memory_overcommit,
         cpu_overcommit_ratio=cpu_overcommit,
         host_memory_reserve_ratio=reserve_ratio,
@@ -125,11 +131,11 @@ async def test_memory_gate_blocks_when_budget_exhausted() -> None:
 
     reservations = []
     for i in range(n_fit):
-        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         reservations.append(r)
 
     # Next should block (budget exhausted)
-    acquire_task = asyncio.create_task(ctrl.acquire("vm-block", memory_mb=256, cpu_cores=_CPU, timeout=1.0))
+    acquire_task = asyncio.create_task(ctrl.acquire("vm-block", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
 
@@ -164,11 +170,11 @@ async def test_cpu_gate_blocks_when_budget_exhausted() -> None:
         cpu_reserve_cores=0.0,
     )
 
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
-    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
+    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
 
     # 3rd should block (2.5 + 1.25 = 3.75 > 3.0)
-    acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, timeout=1.0))
+    acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=1.0))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
 
@@ -199,11 +205,11 @@ async def test_multi_core_vms_consume_proportional_budget() -> None:
         cpu_reserve_cores=0.0,
     )
 
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=2.0, timeout=_TIMEOUT)
-    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, timeout=_TIMEOUT)
+    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT)
+    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT)
 
     # 3rd 2-core VM should block (4.5 + 2.25 = 6.75 > 5.0)
-    acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, timeout=0.3))
+    acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=0.3))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
 
@@ -231,14 +237,14 @@ async def test_mixed_core_vms_share_budget() -> None:
     )
 
     # 1-core (1.25 eff) + 2-core (2.25 eff) = 3.50 (fits in 4.0 budget)
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, timeout=_TIMEOUT)
-    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, timeout=_TIMEOUT)
+    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT)
+    r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=2.0, disk_mb=0, timeout=_TIMEOUT)
 
     assert ctrl._allocated_cpu == pytest.approx(3.5)
     assert ctrl._cpu_budget - ctrl._allocated_cpu == pytest.approx(0.5)
 
     # Even a 1-core VM should block now (1.25 > 0.50 remaining)
-    acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, timeout=0.3))
+    acquire_task = asyncio.create_task(ctrl.acquire("vm-3", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=0.3))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
 
@@ -263,14 +269,14 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
 
     reservations = []
     for i in range(8):
-        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=1.0, timeout=_TIMEOUT)
+        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT)
         reservations.append(r)
 
     assert ctrl._allocated_cpu == pytest.approx(10.0)
     assert ctrl._cpu_budget - ctrl._allocated_cpu == pytest.approx(0.0)
 
     # 9th should block
-    acquire_task = asyncio.create_task(ctrl.acquire("vm-block", memory_mb=256, cpu_cores=1.0, timeout=0.3))
+    acquire_task = asyncio.create_task(ctrl.acquire("vm-block", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=0.3))
     await asyncio.sleep(0.1)
     assert not acquire_task.done()
 
@@ -336,10 +342,10 @@ async def test_tcg_adds_extra_memory_overhead() -> None:
     """use_tcg=True adds DEFAULT_TCG_TB_CACHE_SIZE_MB to the reservation."""
     ctrl = _make_controller()
 
-    r_kvm = await ctrl.acquire("vm-kvm", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT, use_tcg=False)
+    r_kvm = await ctrl.acquire("vm-kvm", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=False)
     assert r_kvm.memory_mb == 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB
 
-    r_tcg = await ctrl.acquire("vm-tcg", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT, use_tcg=True)
+    r_tcg = await ctrl.acquire("vm-tcg", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT, use_tcg=True)
     assert r_tcg.memory_mb == 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
 
     await ctrl.release(r_kvm)
@@ -356,7 +362,7 @@ async def test_release_frees_resources() -> None:
     ctrl = _make_controller()
     before_slots = ctrl._allocated_vm_slots
 
-    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
     assert ctrl._allocated_vm_slots == 1
 
     await ctrl.release(r)
@@ -368,7 +374,7 @@ async def test_release_frees_resources() -> None:
 async def test_double_release_is_idempotent() -> None:
     """Releasing the same reservation twice is safe (no-op)."""
     ctrl = _make_controller()
-    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
     await ctrl.release(r)
     # Second release should be a no-op
     await ctrl.release(r)
@@ -399,8 +405,8 @@ async def test_concurrent_same_vm_id_no_collision() -> None:
     ctrl = _make_controller()
 
     # Acquire two reservations with the same vm_id (simulates concurrent requests)
-    r1 = await ctrl.acquire("same-id", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
-    r2 = await ctrl.acquire("same-id", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    r1 = await ctrl.acquire("same-id", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
+    r2 = await ctrl.acquire("same-id", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
 
     # Both should have different reservation_ids
     assert r1.reservation_id != r2.reservation_id
@@ -429,6 +435,8 @@ async def test_psutil_failure_degrades_to_unlimited() -> None:
     """
     # Construct WITHOUT providing host resources (simulates needing psutil)
     ctrl = ResourceAdmissionController(
+        disk_dir=_DISK_DIR,
+        disk_free_floor_mb=0,
         memory_overcommit_ratio=DEFAULT_MEMORY_OVERCOMMIT_RATIO,
         cpu_overcommit_ratio=DEFAULT_CPU_OVERCOMMIT_RATIO,
         host_memory_reserve_ratio=DEFAULT_HOST_MEMORY_RESERVE_RATIO,
@@ -445,9 +453,9 @@ async def test_psutil_failure_degrades_to_unlimited() -> None:
         patch.object(type(ctrl), "_probe_memory_pressure", return_value=None),
     ):
         # Can acquire any amount of memory/CPU (no budget limit, no Gate 3a/3b)
-        r1 = await ctrl.acquire("vm-1", memory_mb=10_000, cpu_cores=_CPU, timeout=_TIMEOUT)
-        r2 = await ctrl.acquire("vm-2", memory_mb=10_000, cpu_cores=_CPU, timeout=_TIMEOUT)
-        r3 = await ctrl.acquire("vm-3", memory_mb=10_000, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r1 = await ctrl.acquire("vm-1", memory_mb=10_000, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
+        r2 = await ctrl.acquire("vm-2", memory_mb=10_000, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
+        r3 = await ctrl.acquire("vm-3", memory_mb=10_000, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
 
     assert ctrl._allocated_vm_slots == 3
 
@@ -468,7 +476,7 @@ async def test_counters_snap_to_zero_when_empty() -> None:
 
     # Acquire and release many times
     for i in range(50):
-        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         await ctrl.release(r)
 
     assert ctrl._allocated_vm_slots == 0
@@ -484,6 +492,8 @@ async def test_counters_snap_to_zero_when_empty() -> None:
 async def test_cgroup_memory_limit_used_as_capacity() -> None:
     """When cgroup memory limit detected, it becomes host_memory_mb."""
     ctrl = ResourceAdmissionController(
+        disk_dir=_DISK_DIR,
+        disk_free_floor_mb=0,
         memory_overcommit_ratio=1.0,
         cpu_overcommit_ratio=1.0,
         host_memory_reserve_ratio=0.1,
@@ -505,6 +515,8 @@ async def test_cgroup_memory_limit_used_as_capacity() -> None:
 async def test_cgroup_falls_through_to_psutil_when_unlimited() -> None:
     """When cgroup returns None, psutil is used as fallback."""
     ctrl = ResourceAdmissionController(
+        disk_dir=_DISK_DIR,
+        disk_free_floor_mb=0,
         memory_overcommit_ratio=1.0,
         cpu_overcommit_ratio=1.0,
         host_memory_reserve_ratio=0.1,
@@ -607,7 +619,7 @@ async def test_floor_allows_when_sufficient_available() -> None:
 
     # System has 2048MB, request needs ~384MB, leaving 1664MB > 512MB floor → allow
     with _mock_system_memory(2048.0):
-        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         assert r.vm_id == "vm-1"
         await ctrl.release(r)
 
@@ -630,7 +642,7 @@ async def test_floor_zero_allows_when_available_sufficient() -> None:
 
     # System has 2048MB, request needs ~384MB → 2048 - 384 >= 0 → allow
     with _mock_system_memory(2048.0):
-        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         assert r.vm_id == "vm-1"
         await ctrl.release(r)
 
@@ -643,7 +655,7 @@ async def test_probe_failure_allows_admission() -> None:
         patch("exec_sandbox.admission.read_container_available_memory_mb", return_value=None),
         patch("exec_sandbox.admission.psutil.virtual_memory", side_effect=OSError("no psutil")),
     ):
-        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         assert r.vm_id == "vm-1"
         await ctrl.release(r)
 
@@ -657,7 +669,7 @@ async def test_cgroup_probe_preferred_over_psutil() -> None:
         patch("exec_sandbox.admission.read_container_available_memory_mb", return_value=2048.0),
         patch("exec_sandbox.admission.psutil.virtual_memory") as mock_psutil,
     ):
-        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         mock_psutil.assert_not_called()
         await ctrl.release(r)
 
@@ -668,7 +680,7 @@ async def test_floor_recovery_wakes_waiters() -> None:
 
     # Start with low memory — acquire will block in wait_for loop
     with _mock_dynamic_system_memory(100.0) as available_mb:
-        acquire_task = asyncio.create_task(ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=5.0))
+        acquire_task = asyncio.create_task(ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=5.0))
         await asyncio.sleep(0.1)
         assert not acquire_task.done()
 
@@ -691,7 +703,7 @@ async def test_floor_setting_accessible() -> None:
 
     # Trigger a probe by acquiring (which calls _can_admit → _probe_available_memory)
     with _mock_system_memory(2048.0):
-        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         assert ctrl._probe_available_memory() == pytest.approx(2048.0)
 
     assert ctrl._available_memory_floor_mb == 512
@@ -768,7 +780,7 @@ async def test_self_wake_timer_unblocks_gate3_waiters() -> None:
 
         # Acquire blocks because 100MB < 384MB needed
         acquire_task = asyncio.create_task(
-            ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=5.0),
+            ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=5.0),
         )
         await asyncio.sleep(0.05)
         assert not acquire_task.done()
@@ -851,7 +863,7 @@ class TestMemoryPressureGate:
             _mock_system_memory(8192.0),
             patch.object(type(ctrl), "_probe_memory_pressure", return_value=False),
         ):
-            r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+            r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
             assert r.vm_id == "vm-1"
             await ctrl.release(r)
 
@@ -863,7 +875,7 @@ class TestMemoryPressureGate:
             _mock_system_memory(8192.0),
             patch.object(type(ctrl), "_probe_memory_pressure", return_value=None),
         ):
-            r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+            r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
             assert r.vm_id == "vm-1"
             await ctrl.release(r)
 
@@ -881,7 +893,7 @@ class TestMemoryPressureGate:
         ):
             # Blocks because pressure=True
             acquire_task = asyncio.create_task(
-                ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=5.0),
+                ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=5.0),
             )
             await asyncio.sleep(0.1)
             assert not acquire_task.done()
@@ -903,7 +915,7 @@ class TestMemoryPressureGate:
             _mock_system_memory(2048.0),
             patch.object(type(ctrl), "_probe_memory_pressure", return_value=False),
         ):
-            r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+            r = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
             assert ctrl._probe_memory_pressure() is False
 
         await ctrl.release(r)
@@ -1065,34 +1077,36 @@ async def test_two_controllers_share_system_memory() -> None:
     # Simulate 2048MB system available — enough for a few VMs (384MB each)
     with _mock_dynamic_system_memory(2048.0) as available_mb:
         # Controller A grabs a VM — system available drops
-        r_a = await ctrl_a.acquire("vm-a1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_a = await ctrl_a.acquire("vm-a1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         available_mb[0] -= 384.0  # 2048 → 1664
         _invalidate_probe_caches(ctrl_a, ctrl_b)
 
         # Controller B grabs a VM — system available drops further
-        r_b = await ctrl_b.acquire("vm-b1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_b = await ctrl_b.acquire("vm-b1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         available_mb[0] -= 384.0  # 1664 → 1280
         _invalidate_probe_caches(ctrl_a, ctrl_b)
 
         # Both can still go (plenty of system memory left)
-        r_a2 = await ctrl_a.acquire("vm-a2", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_a2 = await ctrl_a.acquire("vm-a2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         available_mb[0] -= 384.0  # 1280 → 896
         _invalidate_probe_caches(ctrl_a, ctrl_b)
 
-        r_b2 = await ctrl_b.acquire("vm-b2", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_b2 = await ctrl_b.acquire("vm-b2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         available_mb[0] -= 384.0  # 896 → 512
         _invalidate_probe_caches(ctrl_a, ctrl_b)
 
         # Now system only has 512MB — next VM needs 384MB, leaving 128MB
         # With floor=0, 512 - 384 = 128 >= 0, so this still passes
-        r_a3 = await ctrl_a.acquire("vm-a3", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_a3 = await ctrl_a.acquire("vm-a3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         available_mb[0] -= 384.0  # 512 → 128
         _invalidate_probe_caches(ctrl_a, ctrl_b)
 
         # 128MB left — request needs 384MB → 128 - 384 < 0 → Gate 3a rejects
         # Gate 1/2 still pass (each controller has 21600MB budget, only used ~1152)
-        with pytest.raises(VmCapacityError, match="Resource admission timeout"):
-            await ctrl_b.acquire("vm-b3", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"
+        ):
+            await ctrl_b.acquire("vm-b3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
     await ctrl_a.release(r_a)
     await ctrl_a.release(r_a2)
@@ -1111,12 +1125,12 @@ async def test_controller_release_unblocks_other_controller() -> None:
 
     with _mock_dynamic_system_memory(500.0) as available_mb:  # tight — only 1 VM fits
         # Controller A grabs the only VM that fits
-        r_a = await ctrl_a.acquire("vm-a1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_a = await ctrl_a.acquire("vm-a1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
         available_mb[0] -= 384.0  # 500 → 116
 
         # Controller B blocks (116 - 384 < 0)
         acquire_b = asyncio.create_task(
-            ctrl_b.acquire("vm-b1", memory_mb=256, cpu_cores=_CPU, timeout=5.0),
+            ctrl_b.acquire("vm-b1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=5.0),
         )
         await asyncio.sleep(0.1)
         assert not acquire_b.done()
@@ -1256,8 +1270,8 @@ async def test_probe_failure_removes_cross_process_protection() -> None:
         patch.object(type(ctrl_b), "_probe_memory_pressure", return_value=None),
     ):
         # Both can acquire freely — no cross-process protection
-        r_a = await ctrl_a.acquire("vm-a", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
-        r_b = await ctrl_b.acquire("vm-b", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r_a = await ctrl_a.acquire("vm-a", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
+        r_b = await ctrl_b.acquire("vm-b", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
 
     await ctrl_a.release(r_a)
     await ctrl_b.release(r_b)
@@ -1269,15 +1283,15 @@ async def test_probe_failure_removes_cross_process_protection() -> None:
 
 
 async def test_stop_unblocks_waiting_acquires() -> None:
-    """stop() immediately unblocks blocked acquire() callers with VmCapacityError."""
+    """stop() immediately unblocks blocked acquire() callers with InvalidInputError SCHEDULER_STATE."""
     # Tight budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
     ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
 
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, timeout=_TIMEOUT)
+    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=_TIMEOUT)
 
     # Second acquire blocks (no CPU left)
     acquire_task = asyncio.create_task(
-        ctrl.acquire("vm-2", memory_mb=256, cpu_cores=1.0, timeout=120.0),
+        ctrl.acquire("vm-2", memory_mb=256, cpu_cores=1.0, disk_mb=0, timeout=120.0),
     )
     await asyncio.sleep(0.05)
     assert not acquire_task.done()
@@ -1359,3 +1373,141 @@ async def test_psutil_error_in_probe_degrades_gracefully() -> None:
         patch("exec_sandbox.admission.psutil.virtual_memory", side_effect=RuntimeError("platform error")),
     ):
         assert ctrl._probe_available_memory() is None
+
+
+# ============================================================================
+# Gate 4: home disk space
+# ============================================================================
+
+
+class TestDiskGate:
+    """Sparse home disks: what admitted guests have not written yet still counts as taken."""
+
+    @staticmethod
+    def _controller(disk_dir: Path, *, floor_mb: int) -> ResourceAdmissionController:
+        return ResourceAdmissionController(
+            disk_dir=disk_dir,
+            disk_free_floor_mb=floor_mb,
+            memory_overcommit_ratio=1.0,
+            cpu_overcommit_ratio=1.0,
+            host_memory_reserve_ratio=0.0,
+            host_memory_mb=1_000_000.0,
+            host_cpu_count=1000.0,
+        )
+
+    async def test_unwritten_admitted_disks_block_until_released(self, tmp_path: Path) -> None:
+        """Free 3000 MB, floor 500: one 2000 MB disk fits, a second waits for the release."""
+        ctrl = self._controller(tmp_path, floor_mb=500)
+        with patch.object(ResourceAdmissionController, "_probe_disk", return_value=(3000.0, 0.0)):
+            first = await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_TIMEOUT)
+            with pytest.raises(
+                TransientError,
+                check=lambda e: e.code is ErrorCode.CAPACITY,
+                match="Home disks: 2000MB requested, 2000MB admitted",
+            ):
+                await ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=0.2)
+            await ctrl.release(first)
+            await ctrl.release(await ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_TIMEOUT))
+
+    async def test_written_blocks_are_not_counted_twice(self, tmp_path: Path) -> None:
+        """A guest that wrote its whole disk took it from free space: no second count."""
+        ctrl = self._controller(tmp_path, floor_mb=500)
+        with patch.object(ResourceAdmissionController, "_probe_disk", return_value=(5000.0, 0.0)):
+            await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_TIMEOUT)
+        # vm-1 wrote all 2000 MB: free dropped from 5000 to 3000, written is 2000.
+        with patch.object(ResourceAdmissionController, "_probe_disk", return_value=(3000.0, 2000.0)):
+            await ctrl.acquire("vm-2", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=_TIMEOUT)
+
+    def test_cloned_disk_shared_blocks_are_not_written(self, tmp_path: Path) -> None:
+        """A clone's blocks shared with its L1 template take no space until overwritten."""
+        (tmp_path / "vm.img").write_bytes(b"x" * 4 * 1024 * 1024)
+        ctrl = self._controller(tmp_path, floor_mb=0)
+        ctrl.note_shared_blocks("vm.img", (tmp_path / "vm.img").stat().st_blocks * 512)
+        probe = ctrl._probe_disk()  # pyright: ignore[reportPrivateUsage]
+        assert probe is not None
+        assert probe[1] == 0
+        (tmp_path / "vm.img").unlink()
+        _invalidate_probe_caches(ctrl)
+        ctrl._probe_disk()  # pyright: ignore[reportPrivateUsage]  # sees the disk gone: forgets its note
+        (tmp_path / "vm.img").write_bytes(b"y" * 4 * 1024 * 1024)  # a new, fully written disk, same name
+        _invalidate_probe_caches(ctrl)
+        probe = ctrl._probe_disk()  # pyright: ignore[reportPrivateUsage]
+        assert probe is not None
+        assert 4 <= probe[1] < 5  # counted in full: the old shared-blocks note did not stay
+
+    async def test_unreadable_disk_dir_skips_the_gate(self, tmp_path: Path) -> None:
+        """No free-space figure (disk_dir gone): the gate admits, it does not block every VM."""
+        ctrl = self._controller(tmp_path / "gone", floor_mb=10**9)
+        reservation = await ctrl.acquire("vm-1", memory_mb=1, cpu_cores=_CPU, disk_mb=2000, timeout=0.2)
+        await ctrl.release(reservation)
+
+    def test_probe_reads_free_space_and_written_blocks(self, tmp_path: Path) -> None:
+        (tmp_path / "vm.img").write_bytes(b"x" * 4 * 1024 * 1024)
+        (tmp_path / "other.file").write_bytes(b"x" * 4 * 1024 * 1024)  # not a home disk
+        probe = self._controller(tmp_path, floor_mb=0)._probe_disk()  # pyright: ignore[reportPrivateUsage]
+        assert probe is not None
+        free_mb, written_mb = probe
+        assert free_mb > 0
+        assert 4 <= written_mb < 5
+
+
+# ============================================================================
+# Wake-up with mixed request sizes (VmSpec sizes differ)
+# ============================================================================
+
+
+async def _until_waiting(ctrl: ResourceAdmissionController, count: int) -> None:
+    """Until `count` acquire() calls block in the controller (order by fact, not by sleep)."""
+    for _ in range(5000):  # the controller has no waiter event: poll its counter (5 s at most)
+        if sum(ctrl._waiting.values()) >= count:  # pyright: ignore[reportPrivateUsage]
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"{count} waiters never blocked")
+
+
+class TestMixedSizeWakeUp:
+    """A release must reach the waiters that now fit, not only the first in line."""
+
+    _PROMPT = 2.0  # well under the 10 s self-wake: only a real wake-up admits in time
+
+    async def test_small_waiter_behind_large_one_is_admitted(self) -> None:
+        h = 256
+        budget = 2 * (h + DEFAULT_VM_MEMORY_OVERHEAD_MB)
+        ctrl = _make_controller(host_memory_mb=budget, memory_overcommit=1.0, reserve_ratio=0.0, cpu_overcommit=100.0)
+        held = [
+            await ctrl.acquire(f"hold-{i}", memory_mb=h, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT) for i in range(2)
+        ]
+        large = asyncio.create_task(
+            ctrl.acquire(
+                "large", memory_mb=2 * h + DEFAULT_VM_MEMORY_OVERHEAD_MB, cpu_cores=_CPU, disk_mb=0, timeout=30
+            )
+        )
+        await _until_waiting(ctrl, 1)  # the large one waits first
+        small = asyncio.create_task(ctrl.acquire("small", memory_mb=h, cpu_cores=_CPU, disk_mb=0, timeout=30))
+        await _until_waiting(ctrl, 2)
+
+        await ctrl.release(held[0])
+
+        await ctrl.release(await asyncio.wait_for(small, self._PROMPT))
+        assert not large.done()
+        large.cancel()
+        await ctrl.release(held[1])
+
+    async def test_one_large_release_admits_several_same_size_waiters(self) -> None:
+        s = 192
+        budget = 3 * (s + DEFAULT_VM_MEMORY_OVERHEAD_MB)
+        ctrl = _make_controller(host_memory_mb=budget, memory_overcommit=1.0, reserve_ratio=0.0, cpu_overcommit=100.0)
+        big = await ctrl.acquire(
+            "big", memory_mb=3 * s + 2 * DEFAULT_VM_MEMORY_OVERHEAD_MB, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT
+        )
+        waiters = [
+            asyncio.create_task(ctrl.acquire(f"w-{i}", memory_mb=s, cpu_cores=_CPU, disk_mb=0, timeout=30))
+            for i in range(3)
+        ]
+        await _until_waiting(ctrl, 3)
+
+        await ctrl.release(big)
+
+        for reservation in await asyncio.wait_for(asyncio.gather(*waiters), self._PROMPT):
+            await ctrl.release(reservation)
+        assert not ctrl._waiting  # pyright: ignore[reportPrivateUsage]

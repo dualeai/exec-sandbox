@@ -18,6 +18,8 @@ CIS Benchmark Section 6.1.x compliance:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -39,7 +41,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -56,7 +58,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -73,7 +75,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -90,23 +92,19 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     async def test_create_file_in_etc(self, scheduler: Scheduler) -> None:
         """Creating new files in /etc is blocked (tests dir write permission)."""
-        result = await scheduler.run(
-            code="touch /etc/evil 2>&1; echo exit=$?",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "touch /etc/evil 2>&1; echo exit=$?")
         assert "exit=1" in result.stdout or "ermission" in result.stdout
 
     async def test_shell_redirect_to_etc_hosts(self, scheduler: Scheduler) -> None:
         """Shell redirect to /etc/hosts fails."""
-        result = await scheduler.run(
-            code='echo "0.0.0.0 evil" >> /etc/hosts 2>&1; echo exit=$?',
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), 'echo "0.0.0.0 evil" >> /etc/hosts 2>&1; echo exit=$?'
         )
         assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
 
@@ -123,23 +121,21 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     async def test_tee_append_hosts(self, scheduler: Scheduler) -> None:
         """tee -a /etc/hosts fails (GTFOBins tee write vector)."""
-        result = await scheduler.run(
-            code="echo '0.0.0.0 evil' | tee -a /etc/hosts 2>&1; echo exit=$?",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "echo '0.0.0.0 evil' | tee -a /etc/hosts 2>&1; echo exit=$?"
         )
         assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
 
     async def test_dd_overwrite_hosts(self, scheduler: Scheduler) -> None:
         """dd of=/etc/hosts fails (GTFOBins dd write vector)."""
-        result = await scheduler.run(
-            code="echo '0.0.0.0 evil' | dd of=/etc/hosts 2>&1; echo exit=$?",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "echo '0.0.0.0 evil' | dd of=/etc/hosts 2>&1; echo exit=$?"
         )
         assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
 
@@ -166,15 +162,15 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     async def test_hardlink_etc_passwd_write(self, scheduler: Scheduler) -> None:
         """Write through hard link to /etc/passwd is blocked.
 
-        Hard link creation always fails (EXDEV: /home/user is tmpfs, /etc is
-        rootfs — different filesystems). Fallback tests /etc/passwd directly.
+        Hard link creation always fails (EXDEV: /home/user is the home disk, /etc
+        is rootfs — different filesystems). Fallback tests /etc/passwd directly.
         With RO bind remount, raises OSError (EROFS) instead of PermissionError.
         """
         code = """\
@@ -193,7 +189,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -210,7 +206,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -227,7 +223,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -246,7 +242,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -265,7 +261,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -274,9 +270,10 @@ except (PermissionError, OSError):
 
         cp to existing file uses O_WRONLY|O_TRUNC — tests file-level write perms.
         """
-        result = await scheduler.run(
-            code="echo '0.0.0.0 evil' > /tmp/evil_hosts && cp /tmp/evil_hosts /etc/hosts 2>&1; echo exit=$?",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.RAW),
+            "echo '0.0.0.0 evil' > /tmp/evil_hosts && cp /tmp/evil_hosts /etc/hosts 2>&1; echo exit=$?",
         )
         assert "exit=1" in result.stdout or "ermission" in result.stdout or "Read-only" in result.stdout
 
@@ -301,7 +298,7 @@ try:
 except socket.gaierror:
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -325,7 +322,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -344,15 +341,16 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     async def test_sed_inplace_etc(self, scheduler: Scheduler) -> None:
         """sed -i on /etc/resolv.conf fails (creates temp + rename in /etc)."""
-        result = await scheduler.run(
-            code="sed -i 's/nameserver.*/nameserver 1.2.3.4/' /etc/resolv.conf 2>&1; echo exit=$?",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.RAW),
+            "sed -i 's/nameserver.*/nameserver 1.2.3.4/' /etc/resolv.conf 2>&1; echo exit=$?",
         )
         assert (
             "exit=1" in result.stdout
@@ -377,15 +375,14 @@ else:
     os.close(fd)
     print("unexpected_success")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
     async def test_sed_inplace_hosts(self, scheduler: Scheduler) -> None:
         """sed -i on /etc/hosts fails (creates temp + rename in /etc)."""
-        result = await scheduler.run(
-            code="sed -i 's/localhost/evil/' /etc/hosts 2>&1; echo exit=$?",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "sed -i 's/localhost/evil/' /etc/hosts 2>&1; echo exit=$?"
         )
         assert (
             "exit=1" in result.stdout
@@ -414,7 +411,7 @@ else:
     os.close(fd)
     print("unexpected_success")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -439,7 +436,7 @@ if r.returncode != 0:
 else:
     print("unexpected_success")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -456,7 +453,7 @@ try:
 except (PermissionError, OSError):
     print('blocked')
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -477,7 +474,7 @@ except (PermissionError, OSError):
 finally:
     os.close(fd)
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -498,7 +495,7 @@ except (PermissionError, OSError):
 finally:
     os.close(fd)
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout
 
@@ -515,6 +512,6 @@ if r.returncode != 0:
 else:
     print("unexpected_success")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "blocked" in result.stdout

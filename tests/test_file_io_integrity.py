@@ -18,6 +18,7 @@ import pytest
 from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
 
 # =============================================================================
 # TestFileIoRoundtrip - Write -> Read with SHA256 verification
@@ -56,7 +57,7 @@ class TestFileIoRoundtrip:
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / f"roundtrip_{label}.bin"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file(f"roundtrip_{label}.bin", content)
             await session.read_file(f"roundtrip_{label}.bin", destination=dest)
 
@@ -82,7 +83,7 @@ class TestFileContentTypes:
         content = b"Hello, World! The quick brown fox jumps over the lazy dog. 0123456789"
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("ascii.txt", content)
             await session.read_file("ascii.txt", destination=tmp_path / "ascii.txt")
 
@@ -95,7 +96,7 @@ class TestFileContentTypes:
         content = os.urandom(4096)
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("binary.bin", content)
             await session.read_file("binary.bin", destination=tmp_path / "binary.bin")
 
@@ -108,7 +109,7 @@ class TestFileContentTypes:
         content = text.encode("utf-8")
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("utf8.txt", content)
             await session.read_file("utf8.txt", destination=tmp_path / "utf8.txt")
 
@@ -121,7 +122,7 @@ class TestFileContentTypes:
         content = b"before\x00middle\x00\x00after\x00"
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("nulls.bin", content)
             await session.read_file("nulls.bin", destination=tmp_path / "nulls.bin")
 
@@ -134,7 +135,7 @@ class TestFileContentTypes:
         content = bytes(range(256))
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("all_bytes.bin", content)
             await session.read_file("all_bytes.bin", destination=tmp_path / "all_bytes.bin")
 
@@ -148,7 +149,7 @@ class TestFileContentTypes:
         content = b"unix\nwindows\r\nold-mac\rtrailing\n"
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("newlines.txt", content)
             await session.read_file("newlines.txt", destination=tmp_path / "newlines.txt")
 
@@ -173,7 +174,7 @@ class TestCrossOperationVerification:
         """File written via write_file is readable by session.exec."""
         content = b"Hello from write_file API"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("message.txt", content)
 
             result = await session.exec(
@@ -186,7 +187,7 @@ class TestCrossOperationVerification:
     async def test_exec_writes_then_read_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """File written by session.exec is readable via read_file."""
         dest = tmp_path / "from_exec.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec(
                 'with open("/home/user/from_exec.txt", "wb") as f:\n    f.write(b"Hello from exec")'
             )
@@ -201,7 +202,7 @@ class TestCrossOperationVerification:
         original = b"original content"
         dest = tmp_path / "modify_me.txt"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write original via API
             await session.write_file("modify_me.txt", original)
 
@@ -224,7 +225,7 @@ class TestCrossOperationVerification:
         content = os.urandom(2048)
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("check.bin", content)
 
             result = await session.exec(
@@ -250,7 +251,7 @@ class TestFileIoBasicOperations:
         """Written file appears in list_files output."""
         content = b"listed content"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("listed.txt", content)
             entries = await session.list_files()
 
@@ -267,7 +268,7 @@ class TestFileIoBasicOperations:
         content = b"nested content"
         dest = tmp_path / "nested_file.txt"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("subdir/nested/file.txt", content)
             await session.read_file("subdir/nested/file.txt", destination=dest)
 
@@ -275,7 +276,7 @@ class TestFileIoBasicOperations:
 
     async def test_list_subdirectory(self, scheduler: Scheduler) -> None:
         """list_files on a subdirectory returns its contents."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("mydir/a.txt", b"aaa")
             await session.write_file("mydir/b.txt", b"bb")
             entries = await session.list_files("mydir")
@@ -287,7 +288,7 @@ class TestFileIoBasicOperations:
     async def test_overwrite_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Overwriting a file replaces its content entirely."""
         dest = tmp_path / "overwrite.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("overwrite.txt", b"first version")
             await session.write_file("overwrite.txt", b"second version")
             await session.read_file("overwrite.txt", destination=dest)
@@ -298,7 +299,7 @@ class TestFileIoBasicOperations:
         """File written with make_executable=True can be executed."""
         script = b"#!/bin/sh\necho EXEC_OK\n"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("run.sh", script, make_executable=True)
 
             result = await session.exec(

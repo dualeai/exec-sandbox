@@ -605,116 +605,208 @@ class TestMigrationClientSaveSnapshot:
             ]
         )
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(11, 2, 0))
+        with _fast_poll():
+            await client.save_snapshot(
+                Path("/tmp/my-snapshot.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                while_paused=None,
+                use_template=False,
+                keep_running=False,
+            )
 
-        cmds = [c["execute"] for c in writer.commands]
-        assert cmds == ["migrate-set-capabilities", "stop", "migrate", "query-migrate", "quit"]
+        cmds = writer.commands
+        assert [c["execute"] for c in cmds] == ["migrate-set-capabilities", "stop", "migrate", "query-migrate", "quit"]
+        assert cmds[2]["arguments"]["uri"] == "file:/tmp/my-snapshot.vmstate"
 
-    async def test_save_command_sequence_old_qemu(self) -> None:
-        """Save with QEMU < 11.0 should: stop → migrate → poll → quit (no capabilities)."""
+    async def test_keep_running_resumes_instead_of_quit(self) -> None:
+        """keep_running=True: cont after completed, never quit (VM can be saved again)."""
         client, _reader, writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
                 {"return": {}},  # stop
                 {"return": {}},  # migrate
                 {"return": {"status": "completed"}},  # query-migrate
-                {"return": {}},  # quit
+                {"return": {}},  # cont
             ]
         )
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 2, 0))
+        with _fast_poll():
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                keep_running=True,
+                while_paused=None,
+                use_template=False,
+            )
 
-        cmds = [c["execute"] for c in writer.commands]
-        assert cmds == ["stop", "migrate", "query-migrate", "quit"]
+        assert [c["execute"] for c in writer.commands][-2:] == ["query-migrate", "cont"]
 
-    async def test_save_migrate_error(self) -> None:
-        """Save should raise on migrate command error."""
+    async def test_keep_running_cont_error_raises(self) -> None:
         client, _reader, _writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
+                {"return": {}},  # stop
+                {"return": {}},  # migrate
+                {"return": {"status": "completed"}},  # query-migrate
+                {"error": {"class": "GenericError", "desc": "cannot resume"}},  # cont
+            ]
+        )
+
+        with (
+            _fast_poll(),
+            pytest.raises(
+                TransientError, match="cont after save failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ),
+        ):
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                keep_running=True,
+                while_paused=None,
+                use_template=False,
+            )
+
+    async def test_migrate_error_resumes_vm(self) -> None:
+        """A failed save cancels the migration and resumes the stopped VM."""
+        client, _reader, writer = _make_connected(
+            [
+                {"return": {}},  # migrate-set-capabilities
                 {"return": {}},  # stop
                 {"error": {"class": "GenericError", "desc": "cannot migrate"}},  # migrate
+                {"return": {}},  # migrate_cancel
+                {"return": {}},  # cont
             ]
         )
 
-        with pytest.raises(MigrationTransientError, match="migrate command failed"):
-            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 0, 0))
+        with pytest.raises(
+            TransientError, match="migrate command failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+        ) as exc:
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                while_paused=None,
+                use_template=False,
+                keep_running=False,
+            )
 
-    async def test_save_migrate_uri_format(self) -> None:
-        """migrate command uses file: URI format."""
+        assert [c["execute"] for c in writer.commands][-2:] == ["migrate_cancel", "cont"]
+        assert exc.value.context["vm_resumed"] is True  # the caller may keep the VM
+
+    async def test_refused_cont_after_failed_save_keeps_original_error(self) -> None:
         client, _reader, writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
+                {"return": {}},  # stop
+                {"return": {}},  # migrate
+                {"return": {"status": "failing", "error-desc": "write error"}},  # query-migrate
+                {"return": {}},  # migrate_cancel
+                {"error": {"class": "GenericError", "desc": "Migration is not finalized yet"}},  # cont
+            ]
+        )
+
+        with (
+            _fast_poll(),
+            pytest.raises(
+                TransientError, match="write error", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ) as exc,
+        ):
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                while_paused=None,
+                use_template=False,
+                keep_running=False,
+            )
+
+        assert [c["execute"] for c in writer.commands][-1] == "cont"
+        assert exc.value.context["vm_resumed"] is False  # the VM can stay paused: the caller replaces it
+
+    @pytest.mark.parametrize("cont", ["accepted", "refused"])
+    async def test_while_paused_failure_resumes_or_reports_a_paused_vm(self, cont: str) -> None:
+        """A hook failure (e.g. the home copy hits ENOSPC): with the VM running again the
+        hook's error stays; with cont refused, a typed error says the VM may stay paused."""
+        client, _reader, writer = _make_connected(
+            [
+                {"return": {}},  # migrate-set-capabilities
                 {"return": {}},  # stop
                 {"return": {}},  # migrate
                 {"return": {"status": "completed"}},  # query-migrate
-                {"return": {}},  # quit
+                {"return": {}},  # migrate_cancel
+                {"return": {}} if cont == "accepted" else {"error": {"class": "GenericError", "desc": "busy"}},
             ]
         )
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.save_snapshot(Path("/tmp/my-snapshot.vmstate"), qemu_version=(8, 0, 0))
+        async def copy_home() -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
 
-        migrate_cmd = next(c for c in writer.commands if c["execute"] == "migrate")
-        assert migrate_cmd["arguments"]["uri"] == "file:/tmp/my-snapshot.vmstate"
+        expected = OSError if cont == "accepted" else TransientError
+        with _fast_poll(), pytest.raises(expected) as exc:
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                while_paused=copy_home,
+                use_template=False,
+                keep_running=True,
+            )
+        assert [c["execute"] for c in writer.commands][-2:] == ["migrate_cancel", "cont"]  # resume tried
+        if cont == "accepted":
+            assert exc.value.errno == errno.ENOSPC  # the hook's own error
+        else:
+            assert isinstance(exc.value, TransientError)
+            assert exc.value.code is ErrorCode.MIGRATION_FAILED
+            assert exc.value.context["vm_resumed"] is False
 
-
-class TestMigrationClientSaveEdgeCases:
-    """Edge cases for save_snapshot."""
-
-    async def test_save_stop_error_raises(self) -> None:
-        """stop command error should raise MigrationTransientError."""
-        client, _reader, _writer = _make_connected(
+    async def test_refused_stop_leaves_the_vm_running(self) -> None:
+        client, _reader, writer = _make_connected(
             [
-                {"error": {"class": "GenericError", "desc": "already stopped"}},  # stop
+                {"return": {}},  # migrate-set-capabilities
+                {"error": {"class": "GenericError", "desc": "cannot stop"}},  # stop
             ]
         )
+        with pytest.raises(
+            TransientError, match="stop command failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+        ) as exc:
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                while_paused=None,
+                use_template=False,
+                keep_running=True,
+            )
+        assert exc.value.context["vm_resumed"] is True
+        assert "cont" not in [c["execute"] for c in writer.commands]  # nothing was stopped
 
-        with pytest.raises(MigrationTransientError, match="stop command failed"):
-            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 0, 0))
-
-    async def test_save_qemu_exits_early_with_vmstate(self, tmp_path: Path) -> None:
-        """QEMU exits during poll but vmstate exists → treat as success."""
+    async def test_lost_connection_is_failure_even_with_file(self, tmp_path: Path) -> None:
+        """QEMU gone before "completed" is a failure, even if the file has bytes
+        (mapped-ram pre-sizes the file, so its size proves nothing)."""
         vmstate_path = tmp_path / "test.vmstate"
-        vmstate_path.write_bytes(b"migration stream data")
-
-        # stop + migrate succeed, then EOF on query-migrate (QEMU exited)
+        vmstate_path.write_bytes(b"partial migration stream")
         client, reader, _writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
                 {"return": {}},  # stop
                 {"return": {}},  # migrate
             ]
         )
         reader.feed_eof()  # QEMU exits — readline returns b""
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            # Should NOT raise — vmstate file exists
-            await client.save_snapshot(vmstate_path, qemu_version=(8, 0, 0))
+        with _fast_poll(), pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await client.save_snapshot(
+                vmstate_path, qemu_version=_QEMU, timeout=5.0, while_paused=None, use_template=False, keep_running=False
+            )
 
-    async def test_save_qemu_exits_early_no_vmstate_raises(self, tmp_path: Path) -> None:
-        """QEMU exits during poll and no vmstate → raise error."""
-        vmstate_path = tmp_path / "missing.vmstate"
-        # File does NOT exist
-
-        # stop + migrate succeed, then EOF on query-migrate (QEMU exited)
-        client, reader, _writer = _make_connected(
-            [
-                {"return": {}},  # stop
-                {"return": {}},  # migrate
-            ]
-        )
-        reader.feed_eof()  # QEMU exits
-
-        with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="Connection lost during save"),
-        ):
-            await client.save_snapshot(vmstate_path, qemu_version=(8, 0, 0))
-
-    async def test_save_quit_error_suppressed(self) -> None:
-        """quit command error after save is suppressed (VM already exiting)."""
-        # stop + migrate + query-migrate succeed, then EOF on quit (QEMU already gone)
+    async def test_quit_error_suppressed(self) -> None:
+        """quit after a completed save may lose the socket: not an error."""
         client, reader, writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
                 {"return": {}},  # stop
                 {"return": {}},  # migrate
                 {"return": {"status": "completed"}},  # query-migrate
@@ -722,12 +814,17 @@ class TestMigrationClientSaveEdgeCases:
         )
         reader.feed_eof()  # QEMU exits before quit response
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            # Should NOT raise — quit error is suppressed
-            await client.save_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 0, 0))
+        with _fast_poll():
+            await client.save_snapshot(
+                Path("/tmp/t.vmstate"),
+                qemu_version=_QEMU,
+                timeout=5.0,
+                while_paused=None,
+                use_template=False,
+                keep_running=False,
+            )
 
-        cmds = [c["execute"] for c in writer.commands]
-        assert "quit" in cmds
+        assert writer.commands[-1]["execute"] == "quit"
 
 
 # ============================================================================
@@ -749,33 +846,20 @@ class TestMigrationClientRestoreSnapshot:
             ]
         )
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(11, 2, 0))
+        with _fast_poll():
+            await client.restore_snapshot(
+                Path("/tmp/snapshot.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False
+            )
 
-        cmds = [c["execute"] for c in writer.commands]
-        assert cmds == ["migrate-set-capabilities", "migrate-incoming", "query-migrate", "cont"]
-
-    async def test_restore_does_not_quit(self) -> None:
-        """Restore should NOT send 'quit' (save sends quit, restore doesn't)."""
-        client, _reader, writer = _make_connected(
-            [
-                {"return": {}},  # migrate-set-capabilities
-                {"return": {}},  # migrate-incoming
-                {"return": {"status": "completed"}},  # query-migrate
-                {"return": {}},  # cont
-            ]
-        )
-
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(11, 2, 0))
-
-        cmds = [c["execute"] for c in writer.commands]
-        assert "quit" not in cmds
+        cmds = writer.commands
+        assert [c["execute"] for c in cmds] == ["migrate-set-capabilities", "migrate-incoming", "query-migrate", "cont"]
+        # exit-on-error=false: QEMU stays up on a bad stream so the error can be read
+        assert cmds[1]["arguments"] == {"uri": "file:/tmp/snapshot.vmstate", "exit-on-error": False}
 
     async def test_restore_cont_error(self) -> None:
-        """Restore should raise on 'cont' command error."""
         client, _reader, _writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
                 {"return": {}},  # migrate-incoming
                 {"return": {"status": "completed"}},  # query-migrate
                 {"error": {"class": "GenericError", "desc": "cannot resume"}},  # cont

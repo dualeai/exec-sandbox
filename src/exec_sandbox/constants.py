@@ -377,11 +377,11 @@ MEMORY_SNAPSHOT_MIN_QEMU_VERSION: Final[tuple[int, int, int]] = (11, 0, 0)
 Floor is 11.0: it is the first release where mapped-ram coexists with
 x-ignore-shared without a null-deref ("Bad address") crash, letting the template
 and full-RAM paths share ONE unified capability list (no version fork). The
-project pins QEMU 11.0.2, so this floor is free; older local installs fall back
-to plain streaming migration. Changing capabilities requires bumping
-MEMORY_SNAPSHOT_FORMAT_VERSION."""
+QEMU pin in versions.lock is above this floor, so it is free. Below the floor,
+save and restore raise ConfigError MIGRATION_UNSUPPORTED (no legacy fallback). Changing
+capabilities requires bumping MEMORY_SNAPSHOT_FORMAT_VERSION."""
 
-MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 4
+MEMORY_SNAPSHOT_FORMAT_VERSION: Final[int] = 5
 """Migration format version. Bump when changing QMP capabilities or migration
 protocol to invalidate stale L1 cache entries. History:
   v1: Plain streaming format (no mapped-ram)
@@ -549,6 +549,14 @@ DEFAULT_VM_CPU_CORES: Final[int] = 1
 - QEMU -smp (guest-visible vCPU count)
 - cgroup cpu.max quota (host-side CPU time enforcement)
 - Admission controller budget (capacity planning)"""
+
+DEFAULT_DISK_MB: Final[int] = 1024
+"""Default size of a VM's home disk (/home/user, ext4 on a raw sparse file).
+Only blocks the guest writes take host space; usable space is ~95% of it."""
+
+MIN_DISK_MB: Final[int] = 128
+"""Smallest home disk: the ext4 journal, the REPL files and the files of a few
+runs (packages live in the read-only L2 layer, not here)."""
 
 DEFAULT_VM_MEMORY_OVERHEAD_MB: Final[int] = 80
 """QEMU + gvproxy process memory overhead added to guest memory for admission and cgroup limits.

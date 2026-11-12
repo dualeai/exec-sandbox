@@ -53,10 +53,7 @@ for i in range(999):
     print('x' * 1000)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         # Should have substantial output (just under 1MB limit)
@@ -69,11 +66,7 @@ for i in range(10000):
     print(i)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=30,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         assert result.exit_code == 0
         # Should contain first and last numbers
@@ -86,10 +79,7 @@ for i in range(10000):
         long_string = "x" * 10000
         code = f"print('{long_string}')"
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "x" * 100 in result.stdout  # At least some of it
@@ -104,10 +94,7 @@ print("Quote: \"hello\"")
 print("Unicode: café ñ 你好 🎉")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "Tab:" in result.stdout
@@ -121,10 +108,7 @@ print("\033[31mRed text\033[0m")
 print("\033[1mBold text\033[0m")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         # ANSI codes should pass through
@@ -139,10 +123,7 @@ for i in range(100):
     print(f"err{i}", file=sys.stderr)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "out0" in result.stdout
@@ -152,30 +133,21 @@ for i in range(100):
 
     async def test_bom_prefix_stripped_python(self, scheduler: Scheduler) -> None:
         """UTF-8 BOM (U+FEFF) before Python code is stripped, execution succeeds."""
-        result = await scheduler.run(
-            code="\ufeffprint('hello')",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "\ufeffprint('hello')")
 
         assert result.exit_code == 0
         assert "hello" in result.stdout
 
     async def test_bom_prefix_stripped_javascript(self, scheduler: Scheduler) -> None:
         """UTF-8 BOM (U+FEFF) before JavaScript code is stripped, execution succeeds."""
-        result = await scheduler.run(
-            code="\ufeffconsole.log('hello')",
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "\ufeffconsole.log('hello')")
 
         assert result.exit_code == 0
         assert "hello" in result.stdout
 
     async def test_bom_prefix_stripped_raw(self, scheduler: Scheduler) -> None:
         """UTF-8 BOM (U+FEFF) before shell code is stripped, execution succeeds."""
-        result = await scheduler.run(
-            code="\ufeffecho hello",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "\ufeffecho hello")
 
         assert result.exit_code == 0
         assert "hello" in result.stdout
@@ -228,10 +200,7 @@ sys.stdout.buffer.write(b"\\nDONE\\n")
 sys.stdout.buffer.flush()
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         # Should complete without hanging
         assert result.exit_code == 0
@@ -244,11 +213,7 @@ while True:
     pass
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=3,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
 
         # Should be killed by timeout, not hang forever
         # Exit code varies (137 for SIGKILL, or timeout-specific)
@@ -267,11 +232,7 @@ while True:
     print("spam")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=3,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
 
         # Should be killed by timeout
         exec_time = result.execution_time_ms or 0
@@ -289,11 +250,7 @@ time.sleep(60)
 print("done", flush=True)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=3,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
 
         # Should timeout before sleep completes
         # Note: "starting" may or may not be captured depending on streaming timing
@@ -307,10 +264,7 @@ sys.exit(0)
 print("should not print")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
         assert "should not print" not in result.stdout
@@ -322,10 +276,7 @@ import os
 os._exit(42)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 42
 
@@ -351,11 +302,7 @@ signal.signal(signal.SIGTERM, handler)
 print("READY", flush=True)
 time.sleep(60)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=2,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=2)
 
         # Verify SIGTERM was sent (not SIGKILL)
         assert "RECEIVED_SIGTERM" in result.stdout
@@ -376,10 +323,7 @@ import os
 import signal
 os.kill(os.getpid(), signal.SIGSEGV)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         # SIGSEGV = signal 11, exit_code = 128 + 11 = 139
         assert result.exit_code == 139
@@ -395,11 +339,7 @@ os.kill(os.getpid(), signal.SIGSEGV)
 print("STARTING", flush=True)
 print("DONE", flush=True)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=30,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         assert result.exit_code == 0
         assert "STARTING" in result.stdout
@@ -421,9 +361,12 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 print("IGNORING_SIGTERM", flush=True)
 time.sleep(60)
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+            ),
+            code,
             timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
@@ -448,9 +391,12 @@ sh -c 'sh -c "sleep 60" & sleep 60' &
 echo NESTED_SPAWNED
 wait
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.RAW,
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.RAW,
+            ),
+            code,
             timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
@@ -470,9 +416,12 @@ wait
         # If process group fails: wait blocks for 60s (test timeout)
         code = "sleep 60 & sleep 60 & sleep 60 & echo SPAWNED && wait"
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.RAW,
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.RAW,
+            ),
+            code,
             timeout_seconds=2,  # Host adds bounded readiness/grace watchdog margin
         )
 
@@ -500,9 +449,12 @@ for _ in range(3):
 print("SPAWNED", flush=True)
 time.sleep(60)  # Wait to be killed
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+            ),
+            code,
             timeout_seconds=15,  # Must exceed cold Python start (~8s) + code import time
         )
 
@@ -536,11 +488,7 @@ except MemoryError:
     print("MEMORY_ERROR")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            memory_mb=256,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, memory_mb=256), code)
 
         # Should either get MemoryError or be OOM-killed
         assert "MEMORY_ERROR" in result.stdout or result.exit_code != 0
@@ -563,11 +511,7 @@ except RecursionError:
     print("RECURSION_ERROR")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=30,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=30)
 
         # Should hit recursion limit
         assert "RECURSION_ERROR" in result.stdout or "RESULT:" in result.stdout
@@ -592,10 +536,7 @@ finally:
             pass
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         # Should hit fd limit or succeed
         assert "OPENED:" in result.stdout or "FD_LIMIT:" in result.stdout
@@ -608,10 +549,7 @@ result = subprocess.run(["echo", "hello from subprocess"], capture_output=True, 
 print(f"SUBPROCESS:{result.stdout.strip()}")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         # Subprocesses may or may not be allowed
         # Should not hang or crash either way
@@ -631,10 +569,7 @@ def broken(
     print("missing closing paren"
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code != 0
         assert "SyntaxError" in result.stderr or "syntax" in result.stderr.lower()
@@ -645,10 +580,7 @@ def broken(
 import nonexistent_module_xyz123
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code != 0
         assert "ModuleNotFoundError" in result.stderr or "No module" in result.stderr
@@ -659,10 +591,7 @@ import nonexistent_module_xyz123
 print(undefined_variable_xyz)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code != 0
         assert "NameError" in result.stderr
@@ -673,10 +602,7 @@ print(undefined_variable_xyz)
 x = 1 / 0
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code != 0
         assert "ZeroDivisionError" in result.stderr
@@ -688,10 +614,7 @@ with open("/nonexistent/path/to/file.txt") as f:
     print(f.read())
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code != 0
         assert "FileNotFoundError" in result.stderr or "No such file" in result.stderr
@@ -709,10 +632,7 @@ with open("/etc/passwd", "w") as f:
     f.write("test")
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         # Writing to EROFS rootfs should fail even as root
         assert result.exit_code != 0
@@ -741,11 +661,7 @@ time.sleep(10)
 print("DONE", flush=True)
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=3,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
 
         # Should be killed by timeout - "DONE" should not appear
         assert "DONE" not in result.stdout
@@ -765,10 +681,7 @@ function broken( {
 }
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code != 0
 
@@ -778,10 +691,7 @@ function broken( {
 console.log(undefinedVariable);
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         # Bun may print undefined or throw ReferenceError
         assert result.exit_code != 0 or "undefined" in result.stdout.lower()
@@ -796,10 +706,7 @@ async function main() {
 main();
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "ASYNC_DONE" in result.stdout
@@ -810,10 +717,7 @@ main();
 Promise.reject(new Error("test rejection"));
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         # Should handle rejection gracefully
         # Exit code depends on Bun's behavior
@@ -829,7 +733,7 @@ console.log('now_type=' + typeof performance.now);
 const t = performance.now();
 console.log('is_number=' + (typeof t === 'number' && t > 0));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "type=object" in result.stdout
         assert "now_type=function" in result.stdout
@@ -846,9 +750,10 @@ class TestJavaScriptDynamicImport:
 
     async def test_dynamic_import_builtin(self, scheduler: Scheduler) -> None:
         """Dynamic import of a built-in module."""
-        result = await scheduler.run(
-            code="const path = await import('path'); console.log(path.join('a','b'));",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "const path = await import('path'); console.log(path.join('a','b'));",
         )
 
         assert result.exit_code == 0
@@ -856,9 +761,10 @@ class TestJavaScriptDynamicImport:
 
     async def test_dynamic_import_destructured(self, scheduler: Scheduler) -> None:
         """Destructured dynamic import."""
-        result = await scheduler.run(
-            code="const { join } = await import('path'); console.log(join('a','b'));",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "const { join } = await import('path'); console.log(join('a','b'));",
         )
 
         assert result.exit_code == 0
@@ -872,10 +778,7 @@ const url = await import('url');
 console.log(path.join('a','b'));
 console.log(typeof url.parse);
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "a/b" in result.stdout
@@ -890,10 +793,7 @@ async function f() {
 }
 console.log(await f());
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         # UUID format: 8-4-4-4-12 hex chars = 36 chars total
@@ -903,9 +803,10 @@ console.log(await f());
 
     async def test_dynamic_import_computed_specifier(self, scheduler: Scheduler) -> None:
         """Dynamic import with a computed (variable) specifier."""
-        result = await scheduler.run(
-            code="const mod = 'path'; const p = await import(mod); console.log(typeof p.join);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "const mod = 'path'; const p = await import(mod); console.log(typeof p.join);",
         )
 
         assert result.exit_code == 0
@@ -917,10 +818,7 @@ console.log(await f());
 const [p, u] = await Promise.all([import('path'), import('url')]);
 console.log(typeof p.join, typeof u.parse);
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert result.stdout.strip().count("function") == 2
@@ -932,17 +830,14 @@ const imported = await import('path');
 const required = require('path');
 console.log(imported.join === required.join);
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "true" in result.stdout
 
     async def test_dynamic_import_session_persistence(self, scheduler: Scheduler) -> None:
         """Imported module persists across session exec() calls."""
-        async with await scheduler.session(language=Language.JAVASCRIPT) as session:
+        async with await scheduler.new(VmSpec(language=Language.JAVASCRIPT)) as session:
             r1 = await session.exec("var path = await import('path');")
             assert r1.exit_code == 0
 
@@ -959,10 +854,7 @@ const s = "import()";
 const path = await import('path');
 console.log(path.join('a','b'));
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "a/b" in result.stdout
@@ -973,10 +865,7 @@ console.log(path.join('a','b'));
 function reimport(x) { return x; }
 console.log(reimport(42));
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "42" in result.stdout
@@ -985,9 +874,8 @@ console.log(reimport(42));
 
     async def test_dynamic_import_nonexistent_module(self, scheduler: Scheduler) -> None:
         """Dynamic import of non-existent module fails."""
-        result = await scheduler.run(
-            code="await import('nonexistent_xyz_module');",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), "await import('nonexistent_xyz_module');"
         )
 
         assert result.exit_code != 0
@@ -999,10 +887,7 @@ import('nonexistent_xyz');
 await new Promise(r => setTimeout(r, 200));
 console.log("after");
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code != 0
 
@@ -1017,9 +902,8 @@ class TestTypeScriptSupport:
 
     async def test_ts_type_annotation(self, scheduler: Scheduler) -> None:
         """Basic type annotation on variable."""
-        result = await scheduler.run(
-            code="const x: number = 42; console.log(x);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), "const x: number = 42; console.log(x);"
         )
 
         assert result.exit_code == 0
@@ -1027,9 +911,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_interface(self, scheduler: Scheduler) -> None:
         """Interface definition and typed object."""
-        result = await scheduler.run(
-            code='interface User { name: string; age: number } const u: User = { name: "Alice", age: 30 }; console.log(u.name, u.age);',
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            'interface User { name: string; age: number } const u: User = { name: "Alice", age: 30 }; console.log(u.name, u.age);',
         )
 
         assert result.exit_code == 0
@@ -1038,9 +923,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_generic_function(self, scheduler: Scheduler) -> None:
         """Generic function with type parameter."""
-        result = await scheduler.run(
-            code="function identity<T>(x: T): T { return x; } console.log(identity(7));",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "function identity<T>(x: T): T { return x; } console.log(identity(7));",
         )
 
         assert result.exit_code == 0
@@ -1048,9 +934,8 @@ class TestTypeScriptSupport:
 
     async def test_ts_enum(self, scheduler: Scheduler) -> None:
         """TypeScript enum."""
-        result = await scheduler.run(
-            code="enum Color { Red, Green, Blue } console.log(Color.Green);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), "enum Color { Red, Green, Blue } console.log(Color.Green);"
         )
 
         assert result.exit_code == 0
@@ -1058,9 +943,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_type_alias(self, scheduler: Scheduler) -> None:
         """Type alias."""
-        result = await scheduler.run(
-            code='type Pair = [number, string]; const p: Pair = [1, "hello"]; console.log(p[0], p[1]);',
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            'type Pair = [number, string]; const p: Pair = [1, "hello"]; console.log(p[0], p[1]);',
         )
 
         assert result.exit_code == 0
@@ -1069,9 +955,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_as_cast(self, scheduler: Scheduler) -> None:
         """'as' type assertion."""
-        result = await scheduler.run(
-            code='const x: unknown = "hello"; console.log((x as string).length);',
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            'const x: unknown = "hello"; console.log((x as string).length);',
         )
 
         assert result.exit_code == 0
@@ -1081,9 +968,8 @@ class TestTypeScriptSupport:
 
     async def test_ts_generic_arrow_function(self, scheduler: Scheduler) -> None:
         """Generic arrow function (valid with 'ts' loader, ambiguous with 'tsx')."""
-        result = await scheduler.run(
-            code='const id = <T>(x: T): T => x; console.log(id("hi"));',
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), 'const id = <T>(x: T): T => x; console.log(id("hi"));'
         )
 
         assert result.exit_code == 0
@@ -1091,9 +977,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_optional_chaining_with_types(self, scheduler: Scheduler) -> None:
         """Optional chaining with typed objects."""
-        result = await scheduler.run(
-            code='const o: { a?: { b?: number } } = {}; console.log(o?.a?.b ?? "none");',
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            'const o: { a?: { b?: number } } = {}; console.log(o?.a?.b ?? "none");',
         )
 
         assert result.exit_code == 0
@@ -1101,9 +988,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_type_only_constructs_stripped(self, scheduler: Scheduler) -> None:
         """Type-only constructs are erased, no runtime footprint."""
-        result = await scheduler.run(
-            code="type Foo = { x: number }; const f: Foo = { x: 1 }; console.log(f.x);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "type Foo = { x: number }; const f: Foo = { x: 1 }; console.log(f.x);",
         )
 
         assert result.exit_code == 0
@@ -1111,9 +999,8 @@ class TestTypeScriptSupport:
 
     async def test_ts_plain_js_still_works(self, scheduler: Scheduler) -> None:
         """Plain JavaScript is unaffected by the 'ts' loader (regression guard)."""
-        result = await scheduler.run(
-            code="var arr = [1, 2, 3]; console.log(arr.length);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), "var arr = [1, 2, 3]; console.log(arr.length);"
         )
 
         assert result.exit_code == 0
@@ -1121,9 +1008,10 @@ class TestTypeScriptSupport:
 
     async def test_ts_top_level_await_with_types(self, scheduler: Scheduler) -> None:
         """Top-level await combined with TypeScript annotations."""
-        result = await scheduler.run(
-            code="const r: number = await Promise.resolve(42); console.log(r);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.JAVASCRIPT),
+            "const r: number = await Promise.resolve(42); console.log(r);",
         )
 
         assert result.exit_code == 0
@@ -1131,9 +1019,8 @@ class TestTypeScriptSupport:
 
     async def test_ts_empty_object_type(self, scheduler: Scheduler) -> None:
         """Empty object type annotation."""
-        result = await scheduler.run(
-            code="const x: {} = {}; console.log(typeof x);",
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), "const x: {} = {}; console.log(typeof x);"
         )
 
         assert result.exit_code == 0
@@ -1150,10 +1037,7 @@ inner.set("key", [[1, "a"], [2, "b"]]);
 m.set("outer", inner);
 console.log(m.get("outer")!.get("key")![0][1]);
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "a" in result.stdout
@@ -1167,10 +1051,7 @@ inc(); inc(); inc();
 const result: string = `count=${count}`;
 console.log(result);
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
         assert "count=3" in result.stdout
@@ -1178,9 +1059,8 @@ console.log(result);
     async def test_ts_types_are_erased_at_runtime(self, scheduler: Scheduler) -> None:
         """Types are erased — no runtime type checking (by design)."""
         # "number" annotation but assigned a string via `as any` — runs fine
-        result = await scheduler.run(
-            code='const x: number = "hello" as any; console.log(typeof x);',
-            language=Language.JAVASCRIPT,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.JAVASCRIPT), 'const x: number = "hello" as any; console.log(typeof x);'
         )
 
         assert result.exit_code == 0
@@ -1190,10 +1070,7 @@ console.log(result);
 
     async def test_ts_invalid_syntax(self, scheduler: Scheduler) -> None:
         """Invalid TypeScript syntax is rejected."""
-        result = await scheduler.run(
-            code="const x: = 42;",
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "const x: = 42;")
 
         assert result.exit_code != 0
 
@@ -1206,29 +1083,22 @@ class TestRawEdgeCases:
 
     async def test_raw_command_not_found(self, scheduler: Scheduler) -> None:
         """Non-existent command."""
-        result = await scheduler.run(
-            code="nonexistent_command_xyz123",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "nonexistent_command_xyz123")
 
         assert result.exit_code != 0
         assert "not found" in result.stderr.lower() or "command not found" in result.stderr.lower()
 
     async def test_raw_pipe(self, scheduler: Scheduler) -> None:
         """Shell pipe."""
-        result = await scheduler.run(
-            code="echo 'hello world' | tr 'a-z' 'A-Z'",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo 'hello world' | tr 'a-z' 'A-Z'")
 
         assert result.exit_code == 0
         assert "HELLO WORLD" in result.stdout
 
     async def test_raw_redirect(self, scheduler: Scheduler) -> None:
         """Shell redirect."""
-        result = await scheduler.run(
-            code="echo 'test' > /tmp/test.txt && cat /tmp/test.txt",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "echo 'test' > /tmp/test.txt && cat /tmp/test.txt"
         )
 
         assert result.exit_code == 0
@@ -1236,10 +1106,7 @@ class TestRawEdgeCases:
 
     async def test_raw_environment_variable(self, scheduler: Scheduler) -> None:
         """Shell environment variable."""
-        result = await scheduler.run(
-            code="MY_VAR='hello' && echo $MY_VAR",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "MY_VAR='hello' && echo $MY_VAR")
 
         # Shell variable expansion
         assert result.exit_code == 0
@@ -1248,9 +1115,8 @@ class TestRawEdgeCases:
 
     async def test_raw_shebang_awk(self, scheduler: Scheduler) -> None:
         """AWK shebang executes via kernel binfmt_script."""
-        result = await scheduler.run(
-            code='#!/usr/bin/awk -f\nBEGIN { print "shebang_awk_ok" }',
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), '#!/usr/bin/awk -f\nBEGIN { print "shebang_awk_ok" }'
         )
 
         assert result.exit_code == 0
@@ -1258,29 +1124,22 @@ class TestRawEdgeCases:
 
     async def test_raw_shebang_sh(self, scheduler: Scheduler) -> None:
         """Shell shebang via temp file."""
-        result = await scheduler.run(
-            code="#!/bin/sh\necho shebang_sh_ok",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho shebang_sh_ok")
 
         assert result.exit_code == 0
         assert "shebang_sh_ok" in result.stdout
 
     async def test_raw_shebang_bash(self, scheduler: Scheduler) -> None:
         """Bash shebang via temp file."""
-        result = await scheduler.run(
-            code="#!/bin/bash\necho shebang_bash_ok",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/bash\necho shebang_bash_ok")
 
         assert result.exit_code == 0
         assert "shebang_bash_ok" in result.stdout
 
     async def test_raw_shebang_sed(self, scheduler: Scheduler) -> None:
         """Sed shebang processes input."""
-        result = await scheduler.run(
-            code="#!/bin/sh\necho hello | sed 's/hello/world/'",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho hello | sed 's/hello/world/'"
         )
 
         assert result.exit_code == 0
@@ -1288,28 +1147,20 @@ class TestRawEdgeCases:
 
     async def test_raw_shebang_nonzero_exit(self, scheduler: Scheduler) -> None:
         """Non-zero exit code propagates through temp-file wrapper."""
-        result = await scheduler.run(
-            code="#!/bin/sh\nexit 42",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\nexit 42")
 
         assert result.exit_code == 42
 
     async def test_raw_shebang_stderr(self, scheduler: Scheduler) -> None:
         """Stderr output from shebanged script."""
-        result = await scheduler.run(
-            code="#!/bin/sh\necho err_msg >&2",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho err_msg >&2")
 
         assert "err_msg" in result.stderr
 
     async def test_raw_shebang_env_vars(self, scheduler: Scheduler) -> None:
         """Exported env vars are inherited by shebanged subprocess."""
-        result = await scheduler.run(
-            code="#!/bin/sh\necho $MY_VAR",
-            language=Language.RAW,
-            env_vars={"MY_VAR": "from_env"},
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho $MY_VAR", env_vars={"MY_VAR": "from_env"}
         )
 
         assert result.exit_code == 0
@@ -1317,18 +1168,14 @@ class TestRawEdgeCases:
 
     async def test_raw_shebang_empty_body(self, scheduler: Scheduler) -> None:
         """Shebang with empty body is valid."""
-        result = await scheduler.run(
-            code="#!/bin/sh\n",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\n")
 
         assert result.exit_code == 0
 
     async def test_raw_shebang_special_chars(self, scheduler: Scheduler) -> None:
         """Special characters are preserved (heredoc quoting prevents expansion)."""
-        result = await scheduler.run(
-            code="#!/bin/sh\necho 'quotes \"double\" $dollar `backtick`'",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "#!/bin/sh\necho 'quotes \"double\" $dollar `backtick`'"
         )
 
         assert result.exit_code == 0
@@ -1337,48 +1184,35 @@ class TestRawEdgeCases:
 
     async def test_raw_shebang_sentinel_in_code(self, scheduler: Scheduler) -> None:
         """Sentinel collision in code is handled."""
-        result = await scheduler.run(
-            code='#!/bin/sh\necho "_EXEC_SANDBOX_EOF_"',
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), '#!/bin/sh\necho "_EXEC_SANDBOX_EOF_"')
 
         assert result.exit_code == 0
         assert "_EXEC_SANDBOX_EOF_" in result.stdout
 
     async def test_raw_shebang_nonexistent_interpreter(self, scheduler: Scheduler) -> None:
         """Non-existent interpreter fails with non-zero exit."""
-        result = await scheduler.run(
-            code="#!/usr/bin/nonexistent_interp_xyz\necho hello",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "#!/usr/bin/nonexistent_interp_xyz\necho hello"
         )
 
         assert result.exit_code != 0
 
     async def test_raw_shebang_no_newline(self, scheduler: Scheduler) -> None:
         """Shebang with no trailing newline and no body."""
-        result = await scheduler.run(
-            code="#!/bin/sh",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "#!/bin/sh")
 
         assert result.exit_code == 0
 
     async def test_raw_no_shebang_hash_comment(self, scheduler: Scheduler) -> None:
         """Plain # comment is not treated as shebang."""
-        result = await scheduler.run(
-            code="# just a comment\necho hello",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "# just a comment\necho hello")
 
         assert result.exit_code == 0
         assert "hello" in result.stdout
 
     async def test_raw_shebang_with_leading_space(self, scheduler: Scheduler) -> None:
         """Leading space means no shebang detection; eval path used."""
-        result = await scheduler.run(
-            code="  #!/bin/sh\necho hello",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "  #!/bin/sh\necho hello")
 
         # Leading space: bash treats #! as comment, echo runs normally
         assert result.exit_code == 0
@@ -1386,9 +1220,8 @@ class TestRawEdgeCases:
 
     async def test_raw_shebang_multiline_output(self, scheduler: Scheduler) -> None:
         """AWK shebang producing multiline output."""
-        result = await scheduler.run(
-            code="#!/usr/bin/awk -f\nBEGIN { for(i=1;i<=100;i++) print i }",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "#!/usr/bin/awk -f\nBEGIN { for(i=1;i<=100;i++) print i }"
         )
 
         assert result.exit_code == 0
@@ -1401,9 +1234,10 @@ class TestRawEdgeCases:
         """AWK shebang with BEGIN, pattern, and END blocks."""
         # Use a shell wrapper to pipe input into the awk script, since
         # a bare awk with an END block reads stdin (hangs without input).
-        result = await scheduler.run(
-            code='#!/bin/sh\nprintf "line1\\nline2\\n" | awk \'BEGIN{print "start"} /line/{print "matched:"$0} END{print "end"}\'',
-            language=Language.RAW,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.RAW),
+            '#!/bin/sh\nprintf "line1\\nline2\\n" | awk \'BEGIN{print "start"} /line/{print "matched:"$0} END{print "end"}\'',
         )
 
         assert result.exit_code == 0
@@ -1423,39 +1257,32 @@ class TestHomeEnvironmentNormal:
 
     async def test_raw_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
         """Raw shell $HOME equals /home/user."""
-        result = await scheduler.run(code="echo $HOME", language=Language.RAW)
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME")
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
     async def test_python_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
         """Python os.environ['HOME'] equals /home/user."""
-        result = await scheduler.run(
-            code="import os; print(os.environ['HOME'])",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.environ['HOME'])")
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
     async def test_javascript_home_is_sandbox_root(self, scheduler: Scheduler) -> None:
         """JavaScript process.env.HOME equals /home/user."""
-        result = await scheduler.run(
-            code="console.log(process.env.HOME)",
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log(process.env.HOME)")
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
     async def test_raw_tilde_expansion(self, scheduler: Scheduler) -> None:
         """Tilde expands to /home/user in raw shell."""
-        result = await scheduler.run(code="echo ~", language=Language.RAW)
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo ~")
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
     async def test_raw_home_writable(self, scheduler: Scheduler) -> None:
         """Files can be created under $HOME."""
-        result = await scheduler.run(
-            code="echo ok > $HOME/test_home.txt && cat $HOME/test_home.txt",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "echo ok > $HOME/test_home.txt && cat $HOME/test_home.txt"
         )
         assert result.exit_code == 0
         assert "ok" in result.stdout
@@ -1466,29 +1293,21 @@ class TestHomeEnvironmentEdge:
 
     async def test_raw_home_persists_across_executions(self, scheduler: Scheduler) -> None:
         """HOME stays /home/user on second execution in same session."""
-        result = await scheduler.run(
-            code="echo $HOME; echo $HOME",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME; echo $HOME")
         assert result.exit_code == 0
         lines = [line for line in result.stdout.strip().split("\n") if line.strip()]
         assert all(line.strip() == "/home/user" for line in lines)
 
     async def test_raw_subprocess_inherits_home(self, scheduler: Scheduler) -> None:
         """Child processes inherit correct HOME."""
-        result = await scheduler.run(
-            code="bash -c 'echo $HOME'",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "bash -c 'echo $HOME'")
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
     async def test_raw_env_vars_coexist_with_home(self, scheduler: Scheduler) -> None:
         """Custom env_vars don't clobber HOME."""
-        result = await scheduler.run(
-            code="echo $HOME $MY_VAR",
-            language=Language.RAW,
-            env_vars={"MY_VAR": "hello"},
+        result = await run_once(
+            scheduler, VmSpec(language=Language.RAW), "echo $HOME $MY_VAR", env_vars={"MY_VAR": "hello"}
         )
         assert result.exit_code == 0
         assert "/home/user" in result.stdout
@@ -1496,9 +1315,8 @@ class TestHomeEnvironmentEdge:
 
     async def test_python_pathlib_home(self, scheduler: Scheduler) -> None:
         """pathlib.Path.home() returns /home/user."""
-        result = await scheduler.run(
-            code="from pathlib import Path; print(Path.home())",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), "from pathlib import Path; print(Path.home())"
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
@@ -1509,9 +1327,10 @@ class TestHomeEnvironmentWeird:
 
     async def test_raw_home_matches_passwd(self, scheduler: Scheduler) -> None:
         """$HOME matches the home dir in /etc/passwd for uid=1000."""
-        result = await scheduler.run(
-            code="echo HOME=$HOME; awk -F: '$3==1000{print \"passwd=\"$6}' /etc/passwd",
-            language=Language.RAW,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.RAW),
+            "echo HOME=$HOME; awk -F: '$3==1000{print \"passwd=\"$6}' /etc/passwd",
         )
         assert result.exit_code == 0
         assert "HOME=/home/user" in result.stdout
@@ -1519,18 +1338,14 @@ class TestHomeEnvironmentWeird:
 
     async def test_raw_cd_tilde_pwd(self, scheduler: Scheduler) -> None:
         """cd ~ + pwd returns /home/user."""
-        result = await scheduler.run(
-            code="cd ~ && pwd",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "cd ~ && pwd")
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
 
     async def test_python_expanduser(self, scheduler: Scheduler) -> None:
         """os.path.expanduser('~') returns /home/user."""
-        result = await scheduler.run(
-            code="import os; print(os.path.expanduser('~'))",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.path.expanduser('~'))"
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "/home/user"
@@ -1541,19 +1356,16 @@ class TestHomeEnvironmentOutOfBounds:
 
     async def test_raw_user_can_override_home(self, scheduler: Scheduler) -> None:
         """User can override HOME via env_vars (not blocked)."""
-        result = await scheduler.run(
-            code="echo $HOME",
-            language=Language.RAW,
-            env_vars={"HOME": "/tmp"},
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME", env_vars={"HOME": "/tmp"})
         assert result.exit_code == 0
         assert result.stdout.strip() == "/tmp"
 
     async def test_python_user_can_override_home(self, scheduler: Scheduler) -> None:
         """User can override HOME via env_vars in Python."""
-        result = await scheduler.run(
-            code="import os; print(os.environ['HOME'])",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import os; print(os.environ['HOME'])",
             env_vars={"HOME": "/tmp"},
         )
         assert result.exit_code == 0
@@ -1576,7 +1388,7 @@ try:
 except EOFError:
     print("CAUGHT_EOF")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "CAUGHT_EOF" in result.stdout
 
@@ -1587,7 +1399,7 @@ import sys
 data = sys.stdin.read()
 print(repr(data))
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "''" in result.stdout
 
@@ -1600,16 +1412,13 @@ for line in sys.stdin:
     count += 1
 print(f"COUNT={count}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "COUNT=0" in result.stdout
 
     async def test_shell_read_eof(self, scheduler: Scheduler) -> None:
         """Shell read returns failure at EOF, allowing fallback."""
-        result = await scheduler.run(
-            code='read var || echo "NO_INPUT"',
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), 'read var || echo "NO_INPUT"')
         assert result.exit_code == 0
         assert "NO_INPUT" in result.stdout
 
@@ -1619,7 +1428,7 @@ print(f"COUNT={count}")
 const d = process.stdin.read();
 console.log(String(d));
 """
-        result = await scheduler.run(code=code, language=Language.JAVASCRIPT)
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
         assert "null" in result.stdout
 
@@ -1636,7 +1445,7 @@ except EOFError:
     print("CAUGHT")
 print("CONTINUED")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "CAUGHT" in result.stdout
         assert "CONTINUED" in result.stdout
@@ -1649,7 +1458,7 @@ a = sys.stdin.read()
 b = sys.stdin.read()
 print(f"A={repr(a)} B={repr(b)}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "A=''" in result.stdout
         assert "B=''" in result.stdout
@@ -1661,7 +1470,7 @@ import sys
 data = sys.stdin.buffer.read()
 print(repr(data))
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "b''" in result.stdout
 
@@ -1672,13 +1481,13 @@ import sys
 line = sys.stdin.readline()
 print(repr(line))
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "''" in result.stdout
 
     async def test_session_reuse_after_stdin_read(self, scheduler: Scheduler) -> None:
         """REPL protocol channel is unaffected after user code reads stdin."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             r1 = await session.exec("import sys; sys.stdin.read()")
             assert r1.exit_code == 0
 
@@ -1698,7 +1507,7 @@ fd = sys.stdin.fileno()
 print(f"FD={fd}")
 print(f"TYPE={type(fd).__name__}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "TYPE=int" in result.stdout
 
@@ -1708,7 +1517,7 @@ print(f"TYPE={type(fd).__name__}")
 import sys
 print(f"ISATTY={sys.stdin.isatty()}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "ISATTY=False" in result.stdout
 
@@ -1721,7 +1530,7 @@ try:
 except json.JSONDecodeError:
     print("JSON_DECODE_ERROR")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "JSON_DECODE_ERROR" in result.stdout
 
@@ -1732,16 +1541,13 @@ import select, sys
 r, _, _ = select.select([sys.stdin], [], [], 0)
 print(f"READABLE={len(r) > 0}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "READABLE=True" in result.stdout
 
     async def test_shell_wc_stdin_zero(self, scheduler: Scheduler) -> None:
         """wc -l with no file arg reads stdin (/dev/null), reports 0 lines."""
-        result = await scheduler.run(
-            code="wc -l",
-            language=Language.RAW,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.RAW), "wc -l")
         assert result.exit_code == 0
         assert "0" in result.stdout
 
@@ -1764,11 +1570,7 @@ try:
 except Exception as e:
     print(f"ERROR={type(e).__name__}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=3,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
         # SIGALRM (signal 14) kills the REPL process → exit_code = 128 + 14 = 142.
         # On slow hosts, the 3s host timeout may fire first → exit_code = -1.
         assert result.exit_code in (142, -1)
@@ -1782,7 +1584,7 @@ try:
 except Exception as e:
     print(f"ERROR={type(e).__name__}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "UnsupportedOperation" in result.stdout
 
@@ -1804,11 +1606,7 @@ except PermissionError:
 except Exception as e:
     print(f"ERROR={type(e).__name__}")
 """
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-            timeout_seconds=3,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=3)
         # Either blocks until SIGALRM kills the REPL (128+14=142), permission denied,
         # or the 3s host timeout fires first on slow hosts (exit_code=-1).
         assert result.exit_code in (142, -1) or "PERMISSION_ERROR" in result.stdout
@@ -1822,6 +1620,6 @@ for line in fileinput.input("-"):
     count += 1
 print(f"COUNT={count}")
 """
-        result = await scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "COUNT=0" in result.stdout

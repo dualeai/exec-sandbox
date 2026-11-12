@@ -20,7 +20,8 @@ import pytest
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_hwaccel
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, run_timed, skip_unless_hwaccel, wait_l1_saves
 
 # Code that reads urandom IMMEDIATELY — before any entropy can accumulate
 # from CPU jitter / interrupts / etc.
@@ -67,26 +68,25 @@ class TestL1SnapshotRNG:
     async def test_l1_restored_vms_different_random(self, l1_scheduler: Scheduler) -> None:
         """Two VMs restored from the same L1 snapshot must produce different random."""
         # Step 1: Prime the L1 cache with a cold boot
-        prime_result = await l1_scheduler.run(code="print('prime')", language=Language.PYTHON)
+        prime_result = await run_once(l1_scheduler, VmSpec(language=Language.PYTHON), "print('prime')")
         assert prime_result.exit_code == 0
 
         # Step 2: Wait for background L1 save to complete
         # The scheduler schedules a background save after first cold boot.
         # We need it to finish before the next calls can hit L1 cache.
-        assert l1_scheduler._memory_snapshot_manager is not None
-        for task in list(l1_scheduler._memory_snapshot_manager._in_flight_saves.values()):
-            await task
+        await wait_l1_saves(l1_scheduler)
 
         # Step 3: Run two VMs concurrently — both should restore from L1
-        results = await asyncio.gather(
-            l1_scheduler.run(code=IMMEDIATE_URANDOM, language=Language.PYTHON),
-            l1_scheduler.run(code=IMMEDIATE_URANDOM, language=Language.PYTHON),
+        runs = await asyncio.gather(
+            run_timed(l1_scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM),
+            run_timed(l1_scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM),
         )
+        results = [run.result for run in runs]
 
         # Verify both came from L1 restore
-        for i, r in enumerate(results):
-            assert r.exit_code == 0, f"VM {i} failed: {r.stderr}"
-            assert r.l1_cache_hit, f"VM {i} did NOT come from L1 restore (test is invalid without L1)"
+        for i, run in enumerate(runs):
+            assert run.result.exit_code == 0, f"VM {i} failed: {run.result.stderr}"
+            assert run.startup.l1_cache_hit, f"VM {i} did NOT come from L1 restore (test is invalid without L1)"
 
         # Step 4: Assert RNG uniqueness — this is the bug reproduction
         hashes = [r.stdout.strip() for r in results]
@@ -101,20 +101,18 @@ class TestL1SnapshotRNG:
     async def test_l1_restored_vms_sequential_different_random(self, l1_scheduler: Scheduler) -> None:
         """Even sequential L1 restores must produce different random — no state replay."""
         # Step 1: Prime L1 cache
-        prime_result = await l1_scheduler.run(code="print('prime')", language=Language.PYTHON)
+        prime_result = await run_once(l1_scheduler, VmSpec(language=Language.PYTHON), "print('prime')")
         assert prime_result.exit_code == 0
 
         # Step 2: Wait for L1 save
-        assert l1_scheduler._memory_snapshot_manager is not None
-        for task in list(l1_scheduler._memory_snapshot_manager._in_flight_saves.values()):
-            await task
+        await wait_l1_saves(l1_scheduler)
 
         # Step 3: Run 3 VMs sequentially from L1
         hashes: list[str] = []
         for i in range(3):
-            result = await l1_scheduler.run(code=IMMEDIATE_URANDOM, language=Language.PYTHON)
+            result, startup, _ports = await run_timed(l1_scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM)
             assert result.exit_code == 0, f"VM {i} failed: {result.stderr}"
-            assert result.l1_cache_hit, f"VM {i} did NOT come from L1 restore"
+            assert startup.l1_cache_hit, f"VM {i} did NOT come from L1 restore"
             hashes.append(result.stdout.strip())
 
         # All three must be unique

@@ -15,6 +15,8 @@ from exec_sandbox.port_forward import (
     resolve_port_mappings,
 )
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, run_timed
 
 from .conftest import (
     NET_OP_TIMEOUT_S,
@@ -490,8 +492,10 @@ class TestPortForwardingMode1Integration:
         """
         # Start a simple HTTP server in the VM on port 8080
         # Use dynamic external port allocation
-        result = await scheduler.run(
-            code="""
+        _result, _startup, ports = await run_timed(
+            scheduler,
+            VmSpec(language=Language.PYTHON, allow_network=False, expose_ports=[PortMapping(internal=8080)]),
+            """
 import http.server
 import socketserver
 import threading
@@ -505,57 +509,66 @@ with socketserver.TCPServer(("", 8080), handler) as httpd:
     thread.join(timeout=5)
 print("server_started")
 """,
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=False,
         )
 
         # Verify the result has exposed ports
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 8080
-        assert result.exposed_ports[0].external >= 1024
-        assert result.exposed_ports[0].host == "127.0.0.1"
+        assert len(ports) == 1
+        assert ports[0].internal == 8080
+        assert ports[0].external >= 1024
+        assert ports[0].host == "127.0.0.1"
 
     async def test_mode1_explicit_external_port(self, scheduler: Scheduler) -> None:
         """Test Mode 1 with explicit external port mapping."""
         # Use a specific external port
         (external_port,) = allocate_ephemeral_ports(1)
 
-        result = await scheduler.run(
-            code="print('hello')",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080, external=external_port)],
-            allow_network=False,
+        _result, _startup, ports = await run_timed(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=False,
+                expose_ports=[PortMapping(internal=8080, external=external_port)],
+            ),
+            "print('hello')",
         )
 
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 8080
-        assert result.exposed_ports[0].external == external_port
+        assert len(ports) == 1
+        assert ports[0].internal == 8080
+        assert ports[0].external == external_port
 
     async def test_mode1_multiple_ports(self, scheduler: Scheduler) -> None:
         """Test Mode 1 with multiple port mappings."""
-        result = await scheduler.run(
-            code="print('multi-port test')",
-            language=Language.PYTHON,
-            expose_ports=[
-                PortMapping(internal=8080),
-                PortMapping(internal=8081),
-                PortMapping(internal=9000),
-            ],
-            allow_network=False,
+        _result, _startup, ports = await run_timed(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=False,
+                expose_ports=[
+                    PortMapping(internal=8080),
+                    PortMapping(internal=8081),
+                    PortMapping(internal=9000),
+                ],
+            ),
+            "print('multi-port test')",
         )
 
-        assert len(result.exposed_ports) == 3
-        internals = {p.internal for p in result.exposed_ports}
+        assert len(ports) == 3
+        internals = {p.internal for p in ports}
         assert internals == {8080, 8081, 9000}
         # All external ports should be unique
-        externals = [p.external for p in result.exposed_ports]
+        externals = [p.external for p in ports]
         assert len(set(externals)) == 3
 
     async def test_mode1_no_internet_access(self, scheduler: Scheduler) -> None:
         """Verify Mode 1 blocks outbound internet (restrict=on)."""
-        result = await scheduler.run(
-            code="""
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=False,  # No internet!
+                expose_ports=[PortMapping(internal=8080)],
+            ),
+            """
 import urllib.request
 import socket
 socket.setdefaulttimeout(3)
@@ -565,9 +578,6 @@ try:
 except Exception as e:
     print(f'BLOCKED: {type(e).__name__}')
 """,
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=False,  # No internet!
         )
 
         # Should be blocked - no internet in Mode 1
@@ -580,25 +590,35 @@ class TestPortForwardingMode2Integration:
 
     async def test_mode2_port_forwarding_with_internet(self, scheduler: Scheduler) -> None:
         """Test Mode 2: expose_ports + allow_network both enabled."""
-        result = await scheduler.run(
-            code="print('mode2 test')",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=5000)],
-            allow_network=True,
-            allowed_domains=["example.com"],
+        _result, _startup, ports = await run_timed(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=True,
+                allowed_domains=["example.com"],
+                expose_ports=[PortMapping(internal=5000)],
+            ),
+            "print('mode2 test')",
         )
 
         # Should have exposed port
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 5000
-        assert result.exposed_ports[0].external >= 1024
+        assert len(ports) == 1
+        assert ports[0].internal == 5000
+        assert ports[0].external >= 1024
 
     async def test_mode2_can_reach_allowed_domain(self, scheduler: Scheduler) -> None:
         """Verify Mode 2 allows outbound internet to allowed domains."""
         # Planet-scale connectivity-check (NCSI) endpoint — no rate limits,
         # no bot challenges, no scheduled downtime.
-        result = await scheduler.run(
-            code=PY_SAFETY
+        result = await run_once(
+            scheduler,
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=True,
+                allowed_domains=["cp.cloudflare.com"],
+                expose_ports=[PortMapping(internal=8080)],
+            ),
+            PY_SAFETY
             + f"""
 import urllib.error, urllib.request, time
 for attempt in range({NET_RETRY_COUNT + 1}):
@@ -616,10 +636,6 @@ for attempt in range({NET_RETRY_COUNT + 1}):
             continue
         print(f'ERROR:{{type(e).__name__}}:{{e}}')
 """,
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=True,
-            allowed_domains=["cp.cloudflare.com"],
         )
 
         # Any HTTP status = outbound path works end-to-end (DNS, SNI filter, TLS)
@@ -633,8 +649,10 @@ class TestPortForwardingConnectivity:
     async def test_host_can_connect_to_exposed_tcp_port(self, scheduler: Scheduler) -> None:
         """Start a TCP server in VM and verify host can connect."""
         # Start a simple echo server
-        result = await scheduler.run(
-            code="""
+        result, _startup, ports = await run_timed(
+            scheduler,
+            VmSpec(language=Language.PYTHON, allow_network=False, expose_ports=[PortMapping(internal=9999)]),
+            """
 import socket
 import sys
 
@@ -658,28 +676,24 @@ except socket.timeout:
 finally:
     server.close()
 """,
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=9999)],
-            allow_network=False,
         )
 
         # The server started and listened
         assert "LISTENING" in result.stdout
         # Verify we got the exposed port info
-        assert len(result.exposed_ports) == 1
-        assert result.exposed_ports[0].internal == 9999
+        assert len(ports) == 1
+        assert ports[0].internal == 9999
 
     async def test_result_contains_url_helper(self, scheduler: Scheduler) -> None:
         """Test that ExposedPort.url property works correctly."""
-        result = await scheduler.run(
-            code="print('url test')",
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=3000)],
-            allow_network=False,
+        _result, _startup, ports = await run_timed(
+            scheduler,
+            VmSpec(language=Language.PYTHON, allow_network=False, expose_ports=[PortMapping(internal=3000)]),
+            "print('url test')",
         )
 
-        assert len(result.exposed_ports) == 1
-        port = result.exposed_ports[0]
+        assert len(ports) == 1
+        port = ports[0]
         assert port.url == f"http://127.0.0.1:{port.external}"
 
 
@@ -698,9 +712,8 @@ class TestSessionExposedPorts:
 
     async def test_session_single_port(self, scheduler: Scheduler) -> None:
         """Session with one exposed port has correct exposed_ports."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
         ) as session:
             assert len(session.exposed_ports) == 1
             assert session.exposed_ports[0].internal == 8080
@@ -709,13 +722,15 @@ class TestSessionExposedPorts:
 
     async def test_session_multiple_ports(self, scheduler: Scheduler) -> None:
         """Session with multiple exposed ports has all entries with unique externals."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[
-                PortMapping(internal=8080),
-                PortMapping(internal=8081),
-                PortMapping(internal=9000),
-            ],
+        async with await scheduler.new(
+            VmSpec(
+                language=Language.PYTHON,
+                expose_ports=[
+                    PortMapping(internal=8080),
+                    PortMapping(internal=8081),
+                    PortMapping(internal=9000),
+                ],
+            )
         ) as session:
             assert len(session.exposed_ports) == 3
             internals = {p.internal for p in session.exposed_ports}
@@ -726,9 +741,8 @@ class TestSessionExposedPorts:
     async def test_session_explicit_external_port(self, scheduler: Scheduler) -> None:
         """Session with explicit external port preserves it."""
         (external_port,) = allocate_ephemeral_ports(1)
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080, external=external_port)],
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080, external=external_port)])
         ) as session:
             assert len(session.exposed_ports) == 1
             assert session.exposed_ports[0].internal == 8080
@@ -736,9 +750,8 @@ class TestSessionExposedPorts:
 
     async def test_session_ports_available_before_exec(self, scheduler: Scheduler) -> None:
         """Exposed ports are populated immediately, before any exec() call."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
         ) as session:
             # Check before any exec()
             assert len(session.exposed_ports) == 1
@@ -750,14 +763,13 @@ class TestSessionExposedPorts:
 
     async def test_session_no_ports_returns_empty(self, scheduler: Scheduler) -> None:
         """Session without expose_ports has empty exposed_ports."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session.exposed_ports == []
 
     async def test_session_ports_stable_across_execs(self, scheduler: Scheduler) -> None:
         """Exposed ports remain the same across multiple exec() calls."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
+        async with await scheduler.new(
+            VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)])
         ) as session:
             ports_before = session.exposed_ports
             await session.exec("x = 1")
@@ -771,11 +783,13 @@ class TestSessionExposedPorts:
 
     async def test_session_ports_with_network(self, scheduler: Scheduler) -> None:
         """Session with expose_ports and allow_network=True (Mode 2) has correct ports."""
-        async with await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-            allow_network=True,
-            allowed_domains=["example.com"],
+        async with await scheduler.new(
+            VmSpec(
+                language=Language.PYTHON,
+                allow_network=True,
+                allowed_domains=["example.com"],
+                expose_ports=[PortMapping(internal=8080)],
+            )
         ) as session:
             assert len(session.exposed_ports) == 1
             assert session.exposed_ports[0].internal == 8080
@@ -787,10 +801,7 @@ class TestSessionExposedPorts:
 
     async def test_session_ports_after_close(self, scheduler: Scheduler) -> None:
         """Exposed ports are still readable after session is closed."""
-        session = await scheduler.session(
-            language=Language.PYTHON,
-            expose_ports=[PortMapping(internal=8080)],
-        )
+        session = await scheduler.new(VmSpec(language=Language.PYTHON, expose_ports=[PortMapping(internal=8080)]))
         try:
             ports_before_close = session.exposed_ports
             assert len(ports_before_close) == 1

@@ -2,6 +2,7 @@
 
 import asyncio
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -11,13 +12,16 @@ import pytest
 import exec_sandbox.vm_working_directory as workdir_module
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
+# Home disks of test workdirs (no VM runs here, so no file is created)
+_HOME_DIR = Path(tempfile.gettempdir())
+
 
 class TestVmWorkingDirectoryCreate:
     """Test VmWorkingDirectory.create() method."""
 
     async def test_create_makes_directory(self):
         """create() creates a directory that exists."""
-        workdir = await VmWorkingDirectory.create("test-vm-123")
+        workdir = await VmWorkingDirectory.create("test-vm-123", home_dir=_HOME_DIR)
         try:
             assert workdir.path.exists()
             assert workdir.path.is_dir()
@@ -26,7 +30,7 @@ class TestVmWorkingDirectoryCreate:
 
     async def test_create_sets_vm_id(self):
         """create() stores the vm_id."""
-        workdir = await VmWorkingDirectory.create("test-vm-456")
+        workdir = await VmWorkingDirectory.create("test-vm-456", home_dir=_HOME_DIR)
         try:
             assert workdir.vm_id == "test-vm-456"
         finally:
@@ -34,7 +38,7 @@ class TestVmWorkingDirectoryCreate:
 
     async def test_create_uses_prefix(self):
         """create() uses vm_id prefix in directory name."""
-        workdir = await VmWorkingDirectory.create("test-vm-789")
+        workdir = await VmWorkingDirectory.create("test-vm-789", home_dir=_HOME_DIR)
         try:
             # Directory name should start with "vm-test-vm-" (prefix + truncated vm_id)
             assert workdir.path.name.startswith("vm-test-vm-")
@@ -54,7 +58,7 @@ class TestVmWorkingDirectoryCreate:
             return str(abandoned)
 
         with patch("exec_sandbox.vm_working_directory.tempfile.mkdtemp", side_effect=blocked_mkdtemp):
-            creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-create"))
+            creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-create", home_dir=_HOME_DIR))
             await asyncio.wait_for(asyncio.to_thread(created.wait), timeout=1)
             creation.cancel()
             release_thread.set()
@@ -90,7 +94,7 @@ class TestVmWorkingDirectoryCreate:
             patch("exec_sandbox.vm_working_directory.tempfile.mkdtemp", side_effect=blocked_mkdtemp),
             patch.object(VmWorkingDirectory, "cleanup", new=cleanup_once_then_succeed),
         ):
-            creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-retry"))
+            creation = asyncio.create_task(VmWorkingDirectory.create("cancelled-retry", home_dir=_HOME_DIR))
             await asyncio.wait_for(asyncio.to_thread(created.wait), timeout=1)
             creation.cancel()
             release_thread.set()
@@ -107,7 +111,7 @@ class TestVmWorkingDirectoryCreate:
         """Shutdown cannot return while a module-owned directory retry is pending."""
         path = tmp_path / "drained-retry"
         path.mkdir()
-        workdir = VmWorkingDirectory("drained-retry", path)
+        workdir = VmWorkingDirectory("drained-retry", path, home_dir=_HOME_DIR)
         cleanup_entered = asyncio.Event()
         allow_cleanup = asyncio.Event()
 
@@ -136,7 +140,7 @@ class TestVmWorkingDirectoryProperties:
 
     async def test_overlay_image_property(self):
         """overlay_image returns correct path."""
-        workdir = await VmWorkingDirectory.create("test-vm-overlay")
+        workdir = await VmWorkingDirectory.create("test-vm-overlay", home_dir=_HOME_DIR)
         try:
             assert workdir.overlay_image == workdir.path / "overlay.qcow2"
         finally:
@@ -144,7 +148,7 @@ class TestVmWorkingDirectoryProperties:
 
     async def test_cmd_socket_is_string(self):
         """cmd_socket returns string path (for QEMU args)."""
-        workdir = await VmWorkingDirectory.create("test-vm-cmd")
+        workdir = await VmWorkingDirectory.create("test-vm-cmd", home_dir=_HOME_DIR)
         try:
             assert isinstance(workdir.cmd_socket, str)
             assert workdir.cmd_socket == str(workdir.path / "cmd.sock")
@@ -153,7 +157,7 @@ class TestVmWorkingDirectoryProperties:
 
     async def test_event_socket_is_string(self):
         """event_socket returns string path (for QEMU args)."""
-        workdir = await VmWorkingDirectory.create("test-vm-event")
+        workdir = await VmWorkingDirectory.create("test-vm-event", home_dir=_HOME_DIR)
         try:
             assert isinstance(workdir.event_socket, str)
             assert workdir.event_socket == str(workdir.path / "event.sock")
@@ -162,7 +166,7 @@ class TestVmWorkingDirectoryProperties:
 
     async def test_qmp_socket_is_path(self):
         """qmp_socket returns Path."""
-        workdir = await VmWorkingDirectory.create("test-vm-qmp")
+        workdir = await VmWorkingDirectory.create("test-vm-qmp", home_dir=_HOME_DIR)
         try:
             assert isinstance(workdir.qmp_socket, Path)
             assert workdir.qmp_socket == workdir.path / "qmp.sock"
@@ -171,7 +175,7 @@ class TestVmWorkingDirectoryProperties:
 
     async def test_gvproxy_socket_is_path(self):
         """gvproxy_socket returns Path."""
-        workdir = await VmWorkingDirectory.create("test-vm-gvproxy")
+        workdir = await VmWorkingDirectory.create("test-vm-gvproxy", home_dir=_HOME_DIR)
         try:
             assert isinstance(workdir.gvproxy_socket, Path)
             assert workdir.gvproxy_socket == workdir.path / "gvproxy.sock"
@@ -184,7 +188,7 @@ class TestVmWorkingDirectorySocketPathLengths:
 
     async def test_cmd_socket_under_limit(self):
         """cmd_socket path is under 108-byte Unix limit."""
-        workdir = await VmWorkingDirectory.create("test-vm-length")
+        workdir = await VmWorkingDirectory.create("test-vm-length", home_dir=_HOME_DIR)
         try:
             assert len(workdir.cmd_socket) < 108
         finally:
@@ -192,7 +196,7 @@ class TestVmWorkingDirectorySocketPathLengths:
 
     async def test_event_socket_under_limit(self):
         """event_socket path is under 108-byte Unix limit."""
-        workdir = await VmWorkingDirectory.create("test-vm-length")
+        workdir = await VmWorkingDirectory.create("test-vm-length", home_dir=_HOME_DIR)
         try:
             assert len(workdir.event_socket) < 108
         finally:
@@ -200,7 +204,7 @@ class TestVmWorkingDirectorySocketPathLengths:
 
     async def test_qmp_socket_under_limit(self):
         """qmp_socket path is under 108-byte Unix limit."""
-        workdir = await VmWorkingDirectory.create("test-vm-length")
+        workdir = await VmWorkingDirectory.create("test-vm-length", home_dir=_HOME_DIR)
         try:
             assert len(str(workdir.qmp_socket)) < 108
         finally:
@@ -208,7 +212,7 @@ class TestVmWorkingDirectorySocketPathLengths:
 
     async def test_gvproxy_socket_under_limit(self):
         """gvproxy_socket path is under 108-byte Unix limit."""
-        workdir = await VmWorkingDirectory.create("test-vm-length")
+        workdir = await VmWorkingDirectory.create("test-vm-length", home_dir=_HOME_DIR)
         try:
             assert len(str(workdir.gvproxy_socket)) < 108
         finally:
@@ -220,14 +224,14 @@ class TestVmWorkingDirectoryCleanup:
 
     async def test_cleanup_removes_directory(self):
         """cleanup() removes the directory."""
-        workdir = await VmWorkingDirectory.create("test-vm-cleanup")
+        workdir = await VmWorkingDirectory.create("test-vm-cleanup", home_dir=_HOME_DIR)
         path = workdir.path
         await workdir.cleanup()
         assert not path.exists()
 
     async def test_cleanup_removes_files_inside(self):
         """cleanup() removes files inside the directory."""
-        workdir = await VmWorkingDirectory.create("test-vm-cleanup-files")
+        workdir = await VmWorkingDirectory.create("test-vm-cleanup-files", home_dir=_HOME_DIR)
         path = workdir.path
         # Create a test file
         (path / "testfile.txt").write_text("test content")
@@ -236,19 +240,19 @@ class TestVmWorkingDirectoryCleanup:
 
     async def test_cleanup_is_idempotent(self):
         """cleanup() can be called multiple times safely."""
-        workdir = await VmWorkingDirectory.create("test-vm-idempotent")
+        workdir = await VmWorkingDirectory.create("test-vm-idempotent", home_dir=_HOME_DIR)
         assert await workdir.cleanup() is True
         assert await workdir.cleanup() is True  # Second call succeeds
 
     async def test_cleanup_returns_true_on_success(self):
         """cleanup() returns True on success."""
-        workdir = await VmWorkingDirectory.create("test-vm-success")
+        workdir = await VmWorkingDirectory.create("test-vm-success", home_dir=_HOME_DIR)
         result = await workdir.cleanup()
         assert result is True
 
     async def test_cleanup_returns_true_if_already_removed(self):
         """cleanup() returns True if directory already removed."""
-        workdir = await VmWorkingDirectory.create("test-vm-removed")
+        workdir = await VmWorkingDirectory.create("test-vm-removed", home_dir=_HOME_DIR)
         # Manually remove directory
         import shutil
 
@@ -260,7 +264,8 @@ class TestVmWorkingDirectoryCleanup:
     async def test_failed_sudo_cleanup_remains_retryable(self, tmp_path: Path):
         path = tmp_path / "retryable"
         path.mkdir()
-        workdir = VmWorkingDirectory("retryable", path, use_qemu_vm_user=True)
+        workdir = VmWorkingDirectory("retryable", path, home_dir=_HOME_DIR)
+        workdir.use_qemu_vm_user = True
         attempts = 0
 
         async def sudo_rm_side_effect(_path: Path) -> bool:
@@ -281,7 +286,7 @@ class TestVmWorkingDirectoryCleanup:
         """Cancellation cannot detach a failed rmtree worker and lose ownership."""
         path = tmp_path / "cancelled-cleanup"
         path.mkdir()
-        workdir = VmWorkingDirectory("cancelled-cleanup", path)
+        workdir = VmWorkingDirectory("cancelled-cleanup", path, home_dir=_HOME_DIR)
         worker_entered = threading.Event()
         release_worker = threading.Event()
         retry_done = asyncio.Event()
@@ -322,7 +327,7 @@ class TestVmWorkingDirectoryContextManager:
 
     async def test_context_manager_creates_directory(self):
         """Context manager creates directory on entry."""
-        workdir = await VmWorkingDirectory.create("test-vm-ctx")
+        workdir = await VmWorkingDirectory.create("test-vm-ctx", home_dir=_HOME_DIR)
         async with workdir:
             assert workdir.path.exists()
         # After exit, directory should be cleaned up
@@ -330,7 +335,7 @@ class TestVmWorkingDirectoryContextManager:
 
     async def test_context_manager_cleans_up_on_exit(self):
         """Context manager cleans up on exit."""
-        workdir = await VmWorkingDirectory.create("test-vm-ctx-exit")
+        workdir = await VmWorkingDirectory.create("test-vm-ctx-exit", home_dir=_HOME_DIR)
         path = workdir.path
         async with workdir:
             assert path.exists()
@@ -338,7 +343,7 @@ class TestVmWorkingDirectoryContextManager:
 
     async def test_context_manager_cleans_up_on_exception(self):
         """Context manager cleans up even on exception."""
-        workdir = await VmWorkingDirectory.create("test-vm-ctx-exc")
+        workdir = await VmWorkingDirectory.create("test-vm-ctx-exc", home_dir=_HOME_DIR)
         path = workdir.path
         with pytest.raises(RuntimeError):
             async with workdir:
@@ -347,7 +352,7 @@ class TestVmWorkingDirectoryContextManager:
 
     async def test_context_manager_does_not_suppress_exceptions(self):
         """Context manager does not suppress exceptions."""
-        workdir = await VmWorkingDirectory.create("test-vm-ctx-no-suppress")
+        workdir = await VmWorkingDirectory.create("test-vm-ctx-no-suppress", home_dir=_HOME_DIR)
         with pytest.raises(ValueError):
             async with workdir:
                 raise ValueError("Should propagate")
@@ -358,7 +363,7 @@ class TestVmWorkingDirectoryQemuVmUser:
 
     async def test_use_qemu_vm_user_defaults_false(self):
         """use_qemu_vm_user defaults to False."""
-        workdir = await VmWorkingDirectory.create("test-vm-user-default")
+        workdir = await VmWorkingDirectory.create("test-vm-user-default", home_dir=_HOME_DIR)
         try:
             assert workdir.use_qemu_vm_user is False
         finally:
@@ -366,7 +371,7 @@ class TestVmWorkingDirectoryQemuVmUser:
 
     async def test_use_qemu_vm_user_can_be_set(self):
         """use_qemu_vm_user can be set."""
-        workdir = await VmWorkingDirectory.create("test-vm-user-set")
+        workdir = await VmWorkingDirectory.create("test-vm-user-set", home_dir=_HOME_DIR)
         try:
             workdir.use_qemu_vm_user = True
             assert workdir.use_qemu_vm_user is True
@@ -376,7 +381,7 @@ class TestVmWorkingDirectoryQemuVmUser:
     @pytest.mark.sudo
     async def test_cleanup_with_qemu_vm_user_uses_sudo(self):
         """cleanup() uses sudo when use_qemu_vm_user is True."""
-        workdir = await VmWorkingDirectory.create("test-vm-user-sudo")
+        workdir = await VmWorkingDirectory.create("test-vm-user-sudo", home_dir=_HOME_DIR)
         workdir.use_qemu_vm_user = True
 
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
@@ -393,3 +398,22 @@ class TestVmWorkingDirectoryQemuVmUser:
             assert args[0] == "sudo"
             assert args[1] == "rm"
             assert args[2] == "-rf"
+
+
+class TestHomeDisk:
+    """The home disk lives in home_dir (host disk), named after the workdir."""
+
+    async def test_home_disk_outside_workdir(self, tmp_path: Path) -> None:
+        workdir = await VmWorkingDirectory.create("test-vm-home", home_dir=tmp_path)
+        try:
+            assert workdir.home_disk == tmp_path / f"{workdir.path.name}.img"
+            assert workdir.home_disk.parent != workdir.path
+        finally:
+            await workdir.cleanup()
+
+    async def test_cleanup_removes_home_disk(self, tmp_path: Path) -> None:
+        workdir = await VmWorkingDirectory.create("test-vm-home-cleanup", home_dir=tmp_path)
+        workdir.home_disk.write_bytes(b"disk")
+        assert await workdir.cleanup() is True
+        assert not workdir.home_disk.exists()
+        assert not workdir.path.exists()
