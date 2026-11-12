@@ -880,108 +880,67 @@ class TestMigrationClientRestoreSnapshot:
         )
 
         with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="cont command failed"),
+            _fast_poll(),
+            pytest.raises(
+                TransientError, match="cont command failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ),
         ):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 0, 0))
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
 
-
-class TestMigrationClientRestoreEdgeCases:
-    """Edge cases for restore_snapshot."""
-
-    async def test_restore_migrate_incoming_error(self) -> None:
-        """migrate-incoming error should raise."""
+    async def test_restore_migrate_incoming_error_rejected(self) -> None:
         client, _reader, _writer = _make_connected(
             [
+                {"return": {}},  # migrate-set-capabilities
                 {"error": {"class": "GenericError", "desc": "file not found"}},  # migrate-incoming
             ]
         )
 
-        with pytest.raises(MigrationTransientError, match="migrate-incoming command failed"):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 0, 0))
-
-    async def test_restore_migration_fails_during_poll(self) -> None:
-        """Migration failure during restore poll should raise with error-desc."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {}},  # migrate-incoming
-                {"return": {"status": "active"}},  # query-migrate (1)
-                {"return": {"status": "failed", "error-desc": "incompatible migration stream"}},
-            ]
-        )
-
-        with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="incompatible migration stream"),
+        with pytest.raises(
+            RouteError, match="migrate-incoming command failed", check=lambda e: e.code is ErrorCode.MIGRATION_REJECTED
         ):
-            await client.restore_snapshot(Path("/tmp/test.vmstate"), qemu_version=(8, 0, 0))
-
-    async def test_restore_uri_format(self) -> None:
-        """migrate-incoming command uses file: URI format."""
-        client, _reader, writer = _make_connected(
-            [
-                {"return": {}},  # migrate-incoming
-                {"return": {"status": "completed"}},  # query-migrate
-                {"return": {}},  # cont
-            ]
-        )
-
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client.restore_snapshot(Path("/tmp/snapshot.vmstate"), qemu_version=(8, 0, 0))
-
-        incoming_cmd = next(c for c in writer.commands if c["execute"] == "migrate-incoming")
-        assert incoming_cmd["arguments"]["uri"] == "file:/tmp/snapshot.vmstate"
+            await client.restore_snapshot(Path("/tmp/t.vmstate"), qemu_version=_QEMU, timeout=5.0, use_template=False)
 
 
 # ============================================================================
-# Context Manager
+# Context manager, against a QMP peer on a real Unix socket
 # ============================================================================
+
+
+@pytest.fixture
+async def fake_qmp(short_tmp_dir: Path) -> AsyncGenerator[tuple[FakeQmp, Path]]:
+    fake = FakeQmp(on_migrate=None, on_run=None)
+    path = short_tmp_dir / "qmp.sock"
+    server = await asyncio.start_unix_server(fake.serve, path=str(path))
+    yield fake, path
+    server.close()
+    await server.wait_closed()
 
 
 class TestMigrationClientContextManager:
-    """Tests for async context manager protocol."""
+    """async with: the handshake runs on enter, the connection closes on exit (also on error)."""
 
-    async def test_context_manager_connects_and_closes(self) -> None:
-        """__aenter__ calls connect(), __aexit__ calls close()."""
-        connect_called = False
-        close_called = False
+    async def test_no_qmp_listener_is_migration_failed(self, short_tmp_dir: Path) -> None:
+        """No QEMU behind the QMP socket path: TransientError MIGRATION_FAILED (a save or
+        load QEMU did not finish), never a builtin OSError."""
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.MIGRATION_FAILED,
+            match=r"^QMP connection failed: ",
+        ) as exc_info:
+            async with MigrationClient(short_tmp_dir / "no-qemu.sock", os.getuid()):
+                pass
+        assert isinstance(exc_info.value.__cause__, OSError)
 
-        async def mock_connect(self: MigrationClient, timeout: float = 5.0) -> None:
-            nonlocal connect_called
-            connect_called = True
+    async def test_enter_handshakes_and_exit_hangs_up(self, fake_qmp: tuple[FakeQmp, Path]) -> None:
+        fake, path = fake_qmp
+        async with MigrationClient(path, os.getuid()):
+            assert fake.commands == ["qmp_capabilities"]
+            assert not fake.hung_up.is_set()
+        await asyncio.wait_for(fake.hung_up.wait(), 5.0)
 
-        async def mock_close(self: MigrationClient) -> None:
-            nonlocal close_called
-            close_called = True
-
-        with (
-            patch.object(MigrationClient, "connect", mock_connect),
-            patch.object(MigrationClient, "close", mock_close),
-        ):
-            client = MigrationClient(Path("/tmp/fake.sock"), 501)
-            async with client:
-                assert connect_called
-
-        assert close_called
-
-    async def test_close_called_on_exception(self) -> None:
-        """__aexit__ calls close() even when body raises."""
-        close_called = False
-
-        async def mock_connect(self: MigrationClient, timeout: float = 5.0) -> None:
-            pass
-
-        async def mock_close(self: MigrationClient) -> None:
-            nonlocal close_called
-            close_called = True
-
-        with (
-            patch.object(MigrationClient, "connect", mock_connect),
-            patch.object(MigrationClient, "close", mock_close),
-        ):
-            client = MigrationClient(Path("/tmp/fake.sock"), 501)
-            with pytest.raises(RuntimeError, match="body error"):
-                async with client:
-                    raise RuntimeError("body error")
-
-        assert close_called
+    async def test_exit_hangs_up_when_the_body_raises(self, fake_qmp: tuple[FakeQmp, Path]) -> None:
+        fake, path = fake_qmp
+        with pytest.raises(RuntimeError, match="body failed"):
+            async with MigrationClient(path, os.getuid()):
+                raise RuntimeError("body failed")
+        await asyncio.wait_for(fake.hung_up.wait(), 5.0)

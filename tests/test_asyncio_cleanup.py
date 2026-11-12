@@ -107,7 +107,7 @@ class TestFireAndForgetTaskTracking:
         for _ in range(3):
             task = asyncio.create_task(background_work())
             tasks.add(task)
-            task.add_done_callback(lambda t: tasks.discard(t))
+            task.add_done_callback(tasks.discard)
 
         # Wait for all to complete
         await asyncio.gather(*list(tasks), return_exceptions=True)
@@ -131,7 +131,7 @@ class TestFireAndForgetTaskTracking:
 
         task = asyncio.create_task(long_running())
         tasks.add(task)
-        task.add_done_callback(lambda t: tasks.discard(t))
+        task.add_done_callback(tasks.discard)
 
         # Wait for task to start before cancelling
         await task_started.wait()
@@ -271,7 +271,7 @@ class TestFullLifecycleCleanup:
         for _ in range(3):
             task = asyncio.create_task(mock_replenish())
             replenish_tasks.add(task)
-            task.add_done_callback(lambda t: replenish_tasks.discard(t))
+            task.add_done_callback(replenish_tasks.discard)
 
         # Wait for all tasks to start
         await all_started.wait()
@@ -316,7 +316,7 @@ class TestPython314AsyncioCleanup:
         for _ in range(5):
             task = asyncio.create_task(work())
             tasks.add(task)
-            task.add_done_callback(lambda t: tasks.discard(t))
+            task.add_done_callback(tasks.discard)
 
         # Cancel and await all - the correct pattern
         tasks_to_cancel = list(tasks)

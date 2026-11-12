@@ -4798,15 +4798,14 @@ class TestExecuteEnvVarValidation:
             ),
         ],
     )
-    async def test_valid_env_vars_no_error(self, vm, env_vars: dict[str, str]) -> None:
-        """Valid env vars pass validation (ExecuteCodeRequest succeeds).
-
-        We expect some downstream error (VmTransientError from I/O) but
-        crucially NOT EnvVarValidationError.
-        """
-        with pytest.raises(Exception) as exc_info:
-            await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
-        assert not isinstance(exc_info.value, EnvVarValidationError)
+    async def test_valid_env_vars_no_error(self, env_vars: dict[str, str]) -> None:
+        """Valid env vars pass validation: the request reaches the guest with them, and
+        the execution returns its result."""
+        channel = _RecordingCompletionChannel()
+        vm = TestExecuteExceptionWrapping._make_vm(channel)
+        result = await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
+        assert result.exit_code == 0
+        assert [request.env_vars for request in channel.requests] == [env_vars]
 
     # -- Weird / adversarial ------------------------------------------------
 
@@ -4993,6 +4992,29 @@ class _ReleasedCompletionChannel:
 
     async def fail_pending_operations(self, _reason: str) -> None:
         self.release.set()
+
+
+class _RecordingCompletionChannel:
+    """Connected channel that keeps each request and answers it with exit code 0."""
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    async def connect(self, timeout_seconds: float) -> None:
+        pass
+
+    async def stream_messages(
+        self,
+        request: object,
+        timeout: int,
+    ) -> AsyncGenerator:
+        from exec_sandbox.guest_agent_protocol import ExecutionCompleteMessage
+
+        self.requests.append(request)
+        yield ExecutionCompleteMessage(exit_code=0, execution_time_ms=1)
+
+    async def fail_pending_operations(self, _reason: str) -> None:
+        pass
 
 
 class _ImmediateCompletionChannel:

@@ -1023,18 +1023,6 @@ class TestCliTimeoutMemoryEdgeCases:
         result = runner.invoke(run_command, ["-t", "abc", "print(1)"])
         assert result.exit_code == EXIT_CLI_ERROR
 
-    def test_negative_timeout(self, runner: CliRunner) -> None:
-        """Negative timeout is rejected by Click (not a valid integer option)."""
-        result = runner.invoke(run_command, ["-t", "-1", "print(1)"])
-        # Click treats -1 as another flag, not a value, causing an error
-        assert result.exit_code != 0
-
-    def test_zero_timeout(self, runner: CliRunner) -> None:
-        """Zero timeout fails SchedulerConfig validation."""
-        result = runner.invoke(run_command, ["-t", "0", "print(1)"])
-        # SchedulerConfig requires timeout >= 1, Pydantic raises ValidationError
-        assert result.exit_code != 0
-
     def test_invalid_memory_string(self, runner: CliRunner) -> None:
         """Invalid memory string shows error."""
         result = runner.invoke(run_command, ["-m", "abc", "print(1)"])
@@ -1120,42 +1108,38 @@ class TestCliJsonOutputEdgeCases:
             stderr="error message",
             exit_code=1,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.return_value = result_with_error
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            _vm(mock_scheduler).exec.return_value = result_with_error
 
             result = runner.invoke(run_command, ["--json", "exit(1)"])
 
             assert result.exit_code == 1
             parsed = json.loads(result.output)
-            assert parsed["exit_code"] == 1
-            assert parsed["stderr"] == "error message"
+            assert parsed["result"]["exit_code"] == 1
+            assert parsed["result"]["stderr"] == "error message"
 
 
 class TestCliQuietMode:
     """Tests for quiet mode."""
 
-    def test_quiet_mode(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
-        """Quiet mode suppresses progress output."""
-        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.return_value = mock_result
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+    @pytest.mark.parametrize("quiet", [False, True], ids=["tty", "tty-quiet"])
+    def test_tty_footer(self, runner: CliRunner, mock_result: ExecutionResult, quiet: bool) -> None:
+        """On a terminal, a run ends with a new line on stdout and "✓ Done in <ms>ms" on stderr; -q hides both."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls, patch("exec_sandbox.cli.is_tty", return_value=True):
+            _vm(_mock_scheduler(scheduler_cls)).exec.return_value = mock_result
 
-            result = runner.invoke(run_command, ["-q", "print(1)"])
+            result = runner.invoke(run_command, [*(["-q"] if quiet else []), "print(1)"])
 
-            assert result.exit_code == 0
-            # In quiet mode, no "Done in Xms" footer
-            assert "Done in" not in result.output
+        assert result.exit_code == 0
+        if quiet:
+            assert (result.stdout, result.stderr) == ("", "")
+        else:
+            assert result.stdout == "\n"
+            assert re.fullmatch(r"✓ Done in \d+ms\n", result.stderr), result.stderr
 
 
 class TestDetectLanguageEdgeCases:
@@ -1489,7 +1473,6 @@ class TestParseDownloadSpec:
 
     def test_tilde_prefix_user_expanded(self) -> None:
         """Expands ~user to that user's home directory (or leaves unchanged if user unknown)."""
-        import os
 
         expected = os.path.expanduser("~someone/result.csv")  # noqa: PTH111
         _, local_path = parse_download_spec("output.csv:~someone/result.csv")

@@ -717,7 +717,7 @@ class TestEvictOldestSnapshot:
             meta.write_text("{}")
             # Set atime to different times (older = smaller)
             atime = time.time() - (100 - i * 10)
-            os.utime(vmstate, (atime, vmstate.stat().st_mtime))
+            os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
 
         await manager._evict_oldest_snapshot()
 
@@ -743,7 +743,7 @@ class TestEvictOldestSnapshot:
             vmstate.write_bytes(b"data")
             meta.write_text("{}")
             atime = time.time() - (100 - i * 10)
-            os.utime(vmstate, (atime, vmstate.stat().st_mtime))
+            os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
 
         # Hold flock on "locked" entry
         lock_path = manager.cache_dir / "locked.vmstate.lock"
@@ -905,6 +905,7 @@ class TestComputeCacheKeyEdgeCases:
     async def _compute_key(
         self,
         manager: MemorySnapshotManager,
+        *,
         language: Language = Language.PYTHON,
         packages: list[str] | None = None,
         memory_mb: int = 512,
@@ -1016,6 +1017,7 @@ class TestCheckCacheEdgeCases:
     async def _populate(
         self,
         manager: MemorySnapshotManager,
+        *,
         language: Language = Language.PYTHON,
         packages: list[str] | None = None,
         memory_mb: int = 512,
@@ -1126,9 +1128,9 @@ class TestCheckCacheEdgeCases:
         vmstate, _meta = await self._populate(manager)
         # Set old atime
         old_atime = time.time() - 3600
-        os.utime(vmstate, (old_atime, vmstate.stat().st_mtime))
+        os.utime(vmstate, (old_atime,) * 2)  # mtime too: relatime resets an atime older than mtime
 
-        await manager.check_cache(Language.PYTHON, [], 512)
+        await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
 
         new_atime = vmstate.stat().st_atime
         assert new_atime > old_atime
@@ -1241,7 +1243,7 @@ class TestDoSaveEdgeCases:
         old_meta = manager.cache_dir / "old.vmstate.meta"
         old_vmstate.write_bytes(b"old data")
         old_meta.write_text("{}")
-        os.utime(old_vmstate, (time.time() - 1000, old_vmstate.stat().st_mtime))
+        os.utime(old_vmstate, (time.time() - 1000,) * 2)  # mtime too: relatime resets an atime older than mtime
 
         vm = MagicMock()
         vm.qmp_socket = Path("/tmp/fake.sock")
@@ -1561,19 +1563,54 @@ class TestScheduleBackgroundSaveEdgeCases:
             patch.object(manager.vm_manager, "create_vm", new=AsyncMock(return_value=mock_vm)),
             patch.object(manager.vm_manager, "destroy_vm", new=AsyncMock()) as mock_destroy,
         ):
-            task = await manager.schedule_background_save(Language.PYTHON, [], 512)
+            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
             assert task is not None
             await asyncio.gather(task, return_exceptions=True)
             await asyncio.sleep(0)
 
             mock_destroy.assert_called_once_with(mock_vm)
 
+    async def test_entry_saved_before_lock_boots_no_vm(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
+    ) -> None:
+        """The entry appears between check_cache and the save lock: the save stops, no VM boots."""
+        key = await manager.compute_cache_key(
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
+        )
+        (manager.cache_dir / f"{key}.vmstate").write_bytes(b"already saved")  # no meta yet: check_cache misses
+
+        with patch.object(manager.vm_manager, "create_vm", new=AsyncMock()) as create:
+            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
+            assert task is not None
+            await task
+
+        create.assert_not_awaited()
+
+    async def test_save_lock_held_by_other_process_boots_no_vm(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
+    ) -> None:
+        """Another process saves this key (holds its flock): the save skips, no VM boots."""
+        key = await manager.compute_cache_key(
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
+        )
+        fd = (manager.cache_dir / f"{key}.vmstate.lock").open("w")
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with patch.object(manager.vm_manager, "create_vm", new=AsyncMock()) as create:
+                task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
+                assert task is not None
+                await task
+        finally:
+            fd.close()
+
+        create.assert_not_awaited()
+
     async def test_returns_task_handle(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """schedule_background_save returns task handle for monitoring."""
         with patch.object(manager.vm_manager, "create_vm", new=AsyncMock(side_effect=RuntimeError("fail"))):
-            task = await manager.schedule_background_save(Language.PYTHON, [], 512)
+            task = await _schedule_save(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
             assert isinstance(task, asyncio.Task)
             await asyncio.gather(task, return_exceptions=True)
 
@@ -1645,7 +1682,7 @@ class TestEvictOldestSnapshotEdgeCases:
             vmstate = manager.cache_dir / f"{name}.vmstate"
             vmstate.write_bytes(b"data")
             atime = time.time() - (500 - i * 100)  # e1 oldest, e5 newest
-            os.utime(vmstate, (atime, vmstate.stat().st_mtime))
+            os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
 
         await manager._evict_oldest_snapshot()
         assert not (manager.cache_dir / "e1.vmstate").exists()
@@ -1658,7 +1695,7 @@ class TestEvictOldestSnapshotEdgeCases:
             vmstate = manager.cache_dir / f"{name}.vmstate"
             vmstate.write_bytes(b"data")
             atime = time.time() - (300 - ord(name) * 10)
-            os.utime(vmstate, (atime, vmstate.stat().st_mtime))
+            os.utime(vmstate, (atime,) * 2)  # mtime too: relatime resets an atime older than mtime
 
         await manager._evict_oldest_snapshot()
 

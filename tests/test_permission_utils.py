@@ -86,11 +86,22 @@ class TestGetQemuVmUid:
         result = get_qemu_vm_uid()
         assert result is None or isinstance(result, int)
 
-    def test_cached_result(self) -> None:
-        """get_qemu_vm_uid result is cached (lru_cache)."""
-        result1 = get_qemu_vm_uid()
-        result2 = get_qemu_vm_uid()
-        assert result1 == result2
+    def test_cached_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One passwd lookup for many calls: each socket check calls it."""
+        lookups: list[str] = []
+
+        def getpwnam(name: str) -> pwd.struct_passwd:
+            lookups.append(name)
+            raise KeyError(name)
+
+        get_qemu_vm_uid.cache_clear()
+        monkeypatch.setattr(pwd, "getpwnam", getpwnam)
+        try:
+            assert get_qemu_vm_uid() is None
+            assert get_qemu_vm_uid() is None
+        finally:
+            get_qemu_vm_uid.cache_clear()
+        assert lookups == ["qemu-vm"]
 
 
 class TestProbeQemuVmUser:

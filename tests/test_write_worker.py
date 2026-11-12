@@ -166,6 +166,7 @@ class TestWriteWorkerErrorHandling:
     @pytest.mark.asyncio
     async def test_writer_method_error(
         self,
+        *,
         channel: UnixSocketChannel,
         caplog: pytest.LogCaptureFixture,
         mock_attr: str,
@@ -267,6 +268,7 @@ class TestIsConnected:
     @pytest.mark.asyncio
     async def test_is_connected_truth_table(
         self,
+        *,
         channel: UnixSocketChannel,
         has_reader: bool,
         has_writer: bool,

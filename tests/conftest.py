@@ -73,24 +73,39 @@ _QEMU_CRASH_MAX_RETRIES = 5
 _QEMU_CRASH_BACKOFF_BASE_S = 2  # exponential: 2s, 4s, 8s, 16s, 32s
 _QEMU_CRASH_JITTER_MAX_S = 10.0  # uniform random jitter [0, 10s)
 
-# Exact substrings from QEMU's stderr/console that indicate retryable failures.
-# Thread exhaustion: "Resource temporarily unavailable" / "SIGABRT"
-# VM timeouts under TCG contention: VmBootTimeoutError (host watchdog) and
-# VmTransientError (guest agent unresponsive). These are classified as
-# "may succeed on retry" by the exception hierarchy (exceptions.py).
-_QEMU_RETRYABLE_SIGNATURES = (
-    "Resource temporarily unavailable",
-    "SIGABRT",
-    "VmBootTimeoutError",
-    "VmTransientError",
-)
+# The one text signature: QEMU aborted (thread exhaustion ends in SIGABRT). Not the EAGAIN
+# text "Resource temporarily unavailable": any EAGAIN has it (the BlockingIOError of a held
+# file lock, for example), and a QEMU fork that hits EAGAIN is QEMU_CRASHED (by code).
+_QEMU_RETRYABLE_SIGNATURES = ("SIGABRT",)
+
+# VM timeouts and crashes under TCG contention or thread exhaustion: a TransientError
+# with one of these codes (boot timeout, QEMU exit, guest agent unresponsive). By code,
+# never by text: the other TransientError codes (store, disk, capacity, downloads) and a
+# wrong code under pytest.raises(check=...) fail at once. pytest_runtest_makereport
+# marks such a report with this user property.
+_QEMU_RETRYABLE_CODES = frozenset({ErrorCode.VM_BOOT_TIMEOUT, ErrorCode.QEMU_CRASHED, ErrorCode.GUEST_UNAVAILABLE})
+_QEMU_RETRYABLE_PROPERTY = "qemu_retryable_code"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Mark a report that failed with a retryable QEMU error code (read by _is_retryable_qemu_crash)."""
+    report = yield
+    error = call.excinfo.value if call.excinfo is not None else None
+    if isinstance(error, TransientError) and error.code in _QEMU_RETRYABLE_CODES:
+        report.user_properties.append((_QEMU_RETRYABLE_PROPERTY, error.code.value))
+    return report
 
 
 def _is_retryable_qemu_crash(reports: list[pytest.TestReport]) -> bool:
-    """Check if any test phase failed with a retryable QEMU crash signature."""
+    """Check if any test phase failed with a retryable QEMU error code or crash signature."""
     for report in reports:
         if not report.failed:
             continue
+        if any(name == _QEMU_RETRYABLE_PROPERTY for name, _value in report.user_properties):
+            return True
         if not report.longrepr:
             continue
         text = str(report.longrepr)
@@ -616,14 +631,19 @@ def _reset_probe_caches() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def setup_test_environment():
-    """Set up test environment variables."""
-    os.environ["ENVIRONMENT"] = "development"
-    os.environ["LOG_LEVEL"] = "DEBUG"
+def _restore_library_logger() -> Iterator[None]:
+    """Give every test the library logger as the import left it.
+
+    CLI tests run configure_logging (a handler, and ERROR level with -q). On the same
+    pytest-xdist worker, a later caplog test would then see no record below ERROR.
+    """
+    lib_logger = logging.getLogger(LIBRARY_LOGGER_NAME)
+    level, handlers = lib_logger.level, list(lib_logger.handlers)
     yield
-    # Cleanup
-    os.environ.pop("ENVIRONMENT", None)
-    os.environ.pop("LOG_LEVEL", None)
+    lib_logger.setLevel(level)
+    for handler in [h for h in lib_logger.handlers if h not in handlers]:
+        lib_logger.removeHandler(handler)
+        handler.close()
 
 
 # ============================================================================

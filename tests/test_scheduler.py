@@ -1707,24 +1707,7 @@ class TestSchedulerShutdownOrdering:
     # Deadlock / out-of-bounds
     # ------------------------------------------------------------------
 
-    async def test_old_ordering_would_deadlock(self) -> None:
-        """Reversed order (memory_snapshot first) deadlocks because the gate is never set."""
-        gate = asyncio.Event()
-
-        async def memory_snapshot_stop() -> None:
-            await gate.wait()  # Blocks forever — warm_pool hasn't freed slots yet
-
-        async def warm_pool_stop() -> None:
-            gate.set()
-
-        # Manually call in the OLD (buggy) order
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(memory_snapshot_stop(), timeout=0.5)
-
-        # Warm pool stop would have freed the gate — but it never ran
-        assert not gate.is_set()
-
-    async def test_shutdown_with_real_admission_controller(self) -> None:
+    async def test_shutdown_with_real_admission_controller(self, tmp_path: Path) -> None:
         """End-to-end test with a real ResourceAdmissionController.
 
         Uses a tight memory budget so two pool VMs fully exhaust capacity,
@@ -2523,6 +2506,7 @@ class TestPackageInstallation:
     @pytest.mark.parametrize("language,packages,code,expected_outputs,memory_mb", PACKAGE_INSTALL_TEST_CASES)
     async def test_package_install_and_import(
         self,
+        *,
         scheduler: Scheduler,
         language: Language,
         packages: list[str],
