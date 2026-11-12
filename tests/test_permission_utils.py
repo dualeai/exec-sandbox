@@ -271,63 +271,117 @@ class TestGetOwner:
 class TestCanAccess:
     """Tests for can_access function."""
 
-    async def test_readable_file(self, tmp_path: Path) -> None:
+    def test_readable_file(self, tmp_path: Path) -> None:
         """can_access returns True for readable file."""
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
         test_file.chmod(0o644)
 
-        assert await can_access(test_file, os.R_OK) is True
+        assert can_access(test_file, os.R_OK) is True
 
-    async def test_nonexistent_file(self, tmp_path: Path) -> None:
+    def test_nonexistent_file(self, tmp_path: Path) -> None:
         """can_access returns False for nonexistent file."""
         nonexistent = tmp_path / "nonexistent.txt"
 
-        assert await can_access(nonexistent, os.R_OK) is False
+        assert can_access(nonexistent, os.R_OK) is False
 
-    async def test_write_access(self, tmp_path: Path) -> None:
+    def test_write_access(self, tmp_path: Path) -> None:
         """can_access checks write permission."""
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
-        assert await can_access(test_file, os.W_OK) is True
+        assert can_access(test_file, os.W_OK) is True
 
 
 class TestEnsureTraversable:
-    """Tests for ensure_traversable function."""
+    """ensure_traversable(path): a+x on every folder above `path` but the filesystem root,
+    innermost first, and only where an execute bit is missing. chmod_async is recorded, not
+    run, for the folders above tmp_path: they belong to the system."""
 
-    async def test_adds_execute_permission(self, tmp_path: Path) -> None:
-        """ensure_traversable adds a+x to directories."""
-        test_dir = tmp_path / "testdir"
-        test_dir.mkdir()
-        test_dir.chmod(0o700)
+    @staticmethod
+    async def _chmods(path: Path, *, tmp_path: Path, result: bool) -> tuple[bool, list[Path]]:
+        """ensure_traversable(path): (its result, the folders chmod a+x ran on, in order).
 
-        result = await ensure_traversable([test_dir])
+        A real chmod for a folder in tmp_path when `result` is True; else `result`."""
+        done: list[Path] = []
 
-        assert result is True
-        mode = test_dir.stat().st_mode & 0o777
-        assert mode & 0o001  # Other execute bit
+        async def chmod(dir_path: Path, mode: str) -> bool:
+            assert mode == "a+x"
+            done.append(dir_path)
+            if result and dir_path.is_relative_to(tmp_path):
+                return await chmod_async(dir_path, mode)
+            return result
 
-    async def test_multiple_directories(self, tmp_path: Path) -> None:
-        """ensure_traversable handles multiple directories."""
-        dir1 = tmp_path / "dir1"
-        dir2 = tmp_path / "dir2"
-        dir1.mkdir()
-        dir2.mkdir()
-        dir1.chmod(0o700)
-        dir2.chmod(0o700)
+        with patch("exec_sandbox.permission_utils.chmod_async", side_effect=chmod):
+            ok = await ensure_traversable(path)
+        return ok, done
 
-        result = await ensure_traversable([dir1, dir2])
+    async def test_folder_without_x_gets_it(self, tmp_path: Path) -> None:
+        """A 0o700 folder above the file ends 0o711."""
+        folder = tmp_path / "private"
+        folder.mkdir()
+        folder.chmod(0o700)
 
-        assert result is True
-        assert dir1.stat().st_mode & 0o001
-        assert dir2.stat().st_mode & 0o001
+        ok, done = await self._chmods(folder / "file.qcow2", tmp_path=tmp_path, result=True)
 
-    async def test_empty_list(self) -> None:
-        """ensure_traversable handles empty list."""
-        result = await ensure_traversable([])
+        assert ok is True
+        assert done[0] == folder
+        assert folder.stat().st_mode & 0o777 == 0o711
 
-        assert result is True
+    async def test_every_folder_but_the_root_innermost_first(self, tmp_path: Path) -> None:
+        """No folder has an execute bit (get_mode stands in): chmod runs on each folder from
+        the file's parent up to a folder in the root, never on the root itself."""
+        deep = tmp_path / "a" / "b"
+        deep.mkdir(parents=True)
+
+        with patch("exec_sandbox.permission_utils.get_mode", return_value=0o600):
+            ok, done = await self._chmods(deep / "file.qcow2", tmp_path=tmp_path, result=True)
+
+        assert ok is True
+        assert done[:3] == [deep, tmp_path / "a", tmp_path]
+        assert done[-1].parent == Path(tmp_path.anchor)
+        assert Path(tmp_path.anchor) not in done
+
+    async def test_traversable_folder_spawns_no_chmod(self, tmp_path: Path) -> None:
+        """A folder that already has a+x is checked, not changed."""
+        folder = tmp_path / "open"
+        folder.mkdir()
+        folder.chmod(0o711)
+
+        ok, done = await self._chmods(folder / "file.qcow2", tmp_path=tmp_path, result=True)
+
+        assert ok is True
+        assert folder not in done
+        assert folder.stat().st_mode & 0o777 == 0o711
+
+    async def test_folder_without_other_x_is_fixed(self, tmp_path: Path) -> None:
+        """Only o+x missing: chmod a+x runs, and the folder ends 0o751."""
+        folder = tmp_path / "group-only"
+        folder.mkdir()
+        folder.chmod(0o750)
+
+        ok, done = await self._chmods(folder / "file.qcow2", tmp_path=tmp_path, result=True)
+
+        assert ok is True
+        assert done[0] == folder
+        assert folder.stat().st_mode & 0o777 == 0o751
+
+    async def test_failed_chmod_returns_false_after_the_other_folders(self, tmp_path: Path) -> None:
+        """One chmod fails: False, and the folders above it are still tried."""
+        deep = tmp_path / "a" / "b"
+        deep.mkdir(parents=True)
+
+        with patch("exec_sandbox.permission_utils.get_mode", return_value=0o600):
+            ok, done = await self._chmods(deep / "file.qcow2", tmp_path=tmp_path, result=False)
+
+        assert ok is False
+        assert done[:3] == [deep, tmp_path / "a", tmp_path]
+
+    async def test_file_in_the_root_changes_nothing(self, tmp_path: Path) -> None:
+        """Only the filesystem root is above the file: nothing to do."""
+        ok, done = await self._chmods(Path(tmp_path.anchor) / "file.qcow2", tmp_path=tmp_path, result=True)
+
+        assert (ok, done) == (True, [])
 
 
 class TestAclOperations:
@@ -790,32 +844,22 @@ class TestGrantQemuVmFileAccess:
 
         assert result is False
 
-    # ---- Parent directory computation ----
+    # ---- Parent directory traversal ----
 
-    async def test_collects_all_ancestors(self, tmp_path: Path) -> None:
-        """Traversal collects every directory from parent up to root."""
-        deep = tmp_path / "l1" / "l2" / "l3"
-        deep.mkdir(parents=True)
-        test_file = deep / "file.qcow2"
+    async def test_traversal_is_asked_for_the_file(self, tmp_path: Path) -> None:
+        """ensure_traversable gets the file itself: it walks the folders above it."""
+        test_file = tmp_path / "l1" / "file.qcow2"
+        test_file.parent.mkdir()
         test_file.write_bytes(b"\x00")
-
-        collected: list[Path] = []
-
-        async def spy_ensure(dirs: list[Path]) -> bool:
-            collected.extend(dirs)
-            return True
 
         with patch(
             "exec_sandbox.permission_utils.ensure_traversable",
-            side_effect=spy_ensure,
-        ):
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as ensure:
             await grant_qemu_vm_file_access(test_file, writable=False)
 
-        # Must include immediate parent and all ancestors
-        assert deep in collected
-        assert (tmp_path / "l1" / "l2") in collected
-        assert (tmp_path / "l1") in collected
-        assert tmp_path in collected
+        ensure.assert_awaited_once_with(test_file)
 
     async def test_file_at_shallow_path(self, tmp_path: Path) -> None:
         """File directly in tmp_path still works."""
@@ -830,30 +874,6 @@ class TestGrantQemuVmFileAccess:
             result = await grant_qemu_vm_file_access(test_file, writable=False)
 
         assert result is True
-
-    async def test_traversal_order_innermost_first(self, tmp_path: Path) -> None:
-        """Parent dirs are collected innermost-first (child before parent)."""
-        nested = tmp_path / "a" / "b"
-        nested.mkdir(parents=True)
-        test_file = nested / "f.qcow2"
-        test_file.write_bytes(b"\x00")
-
-        collected: list[Path] = []
-
-        async def spy_ensure(dirs: list[Path]) -> bool:
-            collected.extend(dirs)
-            return True
-
-        with patch(
-            "exec_sandbox.permission_utils.ensure_traversable",
-            side_effect=spy_ensure,
-        ):
-            await grant_qemu_vm_file_access(test_file, writable=False)
-
-        # b must come before a (innermost first)
-        idx_b = collected.index(nested)
-        idx_a = collected.index(tmp_path / "a")
-        assert idx_b < idx_a
 
 
 # =============================================================================

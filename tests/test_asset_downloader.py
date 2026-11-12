@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
+import os
+import subprocess
 import sys
+import threading
 import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
+from typing import IO, Any
 from unittest.mock import patch
 
 import aiohttp
+import aioresponses.core as aioresponses_core
 import pytest
 from aioresponses import aioresponses
 
@@ -139,7 +147,7 @@ class TestRetrieve:
     async def test_downloads_and_caches(self, tmp_path: Path):
         """Should download file and cache it locally."""
         content = b"hello world"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         with aioresponses() as m:
             m.get(
@@ -156,10 +164,56 @@ class TestRetrieve:
             assert path.exists()
             assert path.read_bytes() == content
 
+    async def test_download_hashes_writes_and_closes_off_the_event_loop(self, tmp_path: Path):
+        """Each downloaded chunk is hashed and written in a worker thread (one job per
+        chunk): a page-cache write can wait for writeback, never on the event loop thread.
+        The temp file also closes in a worker thread: on NFS, close writes back every
+        dirty page of the image just downloaded."""
+        content = os.urandom(64 * 1024 + 4096)  # more than one 64 KiB block
+        known_hash = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        loop_thread = threading.get_ident()
+        threads: dict[str, list[int]] = {"update": [], "write": [], "close": []}
+        real_update = IncrementalHasher.update
+        real_open = Path.open
+
+        def update(hasher: IncrementalHasher, data: bytes) -> None:
+            threads["update"].append(threading.get_ident())
+            real_update(hasher, data)
+
+        def spied_open(self: Path, *args: Any, **kwargs: Any) -> IO[Any]:
+            stream = real_open(self, *args, **kwargs)
+            if self.name.endswith(".tmp"):
+                real_write, real_close = stream.write, stream.close
+
+                def write(data: bytes) -> int:
+                    threads["write"].append(threading.get_ident())
+                    return real_write(data)
+
+                def close() -> None:
+                    threads["close"].append(threading.get_ident())
+                    real_close()
+
+                stream.write = write  # type: ignore[method-assign]
+                stream.close = close  # type: ignore[method-assign]
+            return stream
+
+        with (
+            aioresponses() as m,
+            patch.object(IncrementalHasher, "update", autospec=True, side_effect=update),
+            patch.object(Path, "open", spied_open),
+        ):
+            m.get("https://example.com/big.bin", body=content)
+            path = await retrieve(url="https://example.com/big.bin", known_hash=known_hash, path=tmp_path)
+
+        assert path.read_bytes() == content
+        for step, step_threads in threads.items():
+            assert step_threads, step
+            assert loop_thread not in step_threads, step
+
     async def test_uses_cache_on_second_call(self, tmp_path: Path):
         """Should use cached file on second call without re-downloading."""
         content = b"cached content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         with aioresponses() as m:
             m.get("https://example.com/cached.txt", body=content)
@@ -256,7 +310,7 @@ class TestRetrieve:
     async def test_processor_is_called(self, tmp_path: Path):
         """Should call processor function after download."""
         content = b"original content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         # Track if processor was called
         processor_called = False
@@ -288,7 +342,7 @@ class TestRetrieve:
     async def test_redownloads_on_hash_mismatch(self, tmp_path: Path):
         """Should re-download when cached file has wrong hash."""
         content = b"correct content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         # Pre-populate cache with wrong content
         cached_file = tmp_path / "cached.txt"
@@ -389,7 +443,7 @@ class TestAsyncPooch:
     async def test_fetch_downloads_file(self, tmp_path: Path):
         """Should download file from registry."""
         content = b"registry content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         pooch = AsyncPooch(
             path=tmp_path,
@@ -563,7 +617,7 @@ class TestAsyncPooch:
     async def test_fetch_fallback_to_configured_version(self, tmp_path: Path):
         """Should use configured version when _resolved_version is not set."""
         content = b"fallback content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         pooch = AsyncPooch(
             path=tmp_path,
@@ -584,7 +638,7 @@ class TestAsyncPooch:
     async def test_fetch_uses_resolved_version_from_github(self, tmp_path: Path):
         """Should use actual tag from GitHub API instead of configured version."""
         content = b"resolved version content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
 
         pooch = AsyncPooch(
             path=tmp_path,
@@ -775,6 +829,45 @@ class TestFileLock:
 
 
 # ============================================================================
+# file_hash unit tests
+# ============================================================================
+
+
+class TestFileHash:
+    """Tests for hash_utils.file_hash."""
+
+    async def test_hashes_off_the_event_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """file_hash returns the file's digest, and no hashing (nor reading) runs on the
+        event loop thread: one worker-thread job for the whole file."""
+        data = os.urandom(3 * 256 * 1024 + 5)
+        path = tmp_path / "blob"
+        path.write_bytes(data)
+        expected = hashlib.sha256(data).hexdigest()
+        loop_thread = threading.get_ident()
+        update_threads: list[int] = []
+        real_new = hashlib.new
+
+        class RecordingHash:
+            """hashlib.new stand-in: records the thread of each update()."""
+
+            def __init__(self, name: str) -> None:
+                self._hash = real_new(name)
+
+            def update(self, chunk: bytes) -> None:
+                update_threads.append(threading.get_ident())
+                self._hash.update(chunk)
+
+            def hexdigest(self) -> str:
+                return self._hash.hexdigest()
+
+        monkeypatch.setattr(hashlib, "new", RecordingHash)
+
+        assert await file_hash(path, "sha256") == expected
+        assert update_threads
+        assert loop_thread not in update_threads
+
+
+# ============================================================================
 # Concurrent retrieve tests — regression for EC2 race condition
 # ============================================================================
 
@@ -797,7 +890,7 @@ class TestConcurrentRetrieve:
         """
         original = b"concurrent decompression test content"
         compressed = zstd.compress(original)
-        compressed_hash = bytes_hash(compressed)
+        compressed_hash = hashlib.sha256(compressed).hexdigest()
         url = "https://example.com/concurrent.txt.zst"
 
         with aioresponses() as m:
@@ -826,7 +919,7 @@ class TestConcurrentRetrieve:
     async def test_concurrent_same_url_no_processor(self, tmp_path: Path, concurrency: int):
         """Concurrent retrieve() without processor should not corrupt the file."""
         content = b"concurrent download no processor"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
         url = "https://example.com/concurrent-plain.txt"
 
         with aioresponses() as m:
@@ -852,7 +945,7 @@ class TestConcurrentRetrieve:
     async def test_concurrent_different_urls_not_serialized(self, tmp_path: Path, concurrency: int):
         """Concurrent retrieves of different URLs should run in parallel."""
         pairs = [(f"https://example.com/file-{i}.txt", f"content for file {i}".encode()) for i in range(concurrency)]
-        hashes = {url: bytes_hash(body) for url, body in pairs}
+        hashes = {url: hashlib.sha256(body).hexdigest() for url, body in pairs}
 
         with aioresponses() as m:
             for url, body in pairs:
@@ -878,7 +971,7 @@ class TestConcurrentRetrieve:
     async def test_concurrent_first_fails_rest_succeed(self, tmp_path: Path, concurrency: int):
         """When one concurrent retrieve fails, the others should still succeed."""
         content = b"success content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
         url_fail = "https://example.com/fail.txt"
         ok_urls = [f"https://example.com/ok-{i}.txt" for i in range(concurrency - 1)]
 
@@ -913,7 +1006,7 @@ class TestConcurrentRetrieve:
         should_download is False but hash verification fails.
         """
         content = b"correct content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
         url = "https://example.com/corrupted.txt"
 
         # Pre-write a corrupted file so file_lock yields False
@@ -940,7 +1033,7 @@ class TestConcurrentRetrieve:
         should_proceed=True even though the file exists.
         """
         content = b"fresh download content"
-        content_hash = bytes_hash(content)
+        content_hash = hashlib.sha256(content).hexdigest()
         url = "https://example.com/empty-target.txt"
 
         # Pre-create an empty file — file_lock should yield True

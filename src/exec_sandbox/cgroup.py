@@ -33,16 +33,17 @@ References:
 - pids.max limits both processes AND threads (goroutines in Go)
 """
 
+import asyncio
 import contextlib
+import errno
+import functools
 import shlex
 from pathlib import Path
 from typing import Final
 
-import aiofiles
-import aiofiles.os
-
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import VmDependencyError
+from exec_sandbox.aio_utils import run_to_end
+from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 logger = get_logger(__name__)
@@ -363,21 +364,14 @@ def is_cgroup_available(cgroup_path: Path | None) -> bool:
 # =============================================================================
 
 
-async def _write_cgroup_optional(path: Path, value: str) -> bool:
+def _write_cgroup_optional(path: Path, value: str) -> None:
     """Write to a cgroup control file, silently ignoring if unsupported.
 
     Used for optional cgroup features (memory.high, memory.oom.group,
     memory.zswap.writeback) that may not exist on older kernels.
-
-    Returns:
-        True if written successfully, False if file doesn't exist or write failed.
     """
-    try:
-        async with aiofiles.open(path, "w") as f:
-            await f.write(value)
-        return True
-    except (FileNotFoundError, OSError):
-        return False
+    with contextlib.suppress(OSError):
+        path.write_text(value)
 
 
 # =============================================================================
@@ -414,59 +408,18 @@ async def setup_cgroup(
     Note:
         Gracefully degrades to no resource limits on Docker Desktop (read-only /sys/fs/cgroup)
         or environments without cgroup v2 support.
+
+        One worker-thread job: mkdir and the cgroup.subtree_control write take
+        the kernel's cgroup locks, which other cgroup work can hold for long. A
+        cancel waits for the job: the owner's cleanup (rmdir of the path it
+        published) never runs while the job still makes the hierarchy.
     """
-    tenant_cgroup = Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/{tenant_id}")
-    cgroup_path = tenant_cgroup / vm_id
+    cgroup_path = Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/{tenant_id}") / vm_id
 
     try:
-        # Create tenant cgroup and enable controllers for nested VM cgroups
-        # In cgroup v2, subtree_control only affects immediate children,
-        # so we must enable controllers at each level of the hierarchy
-        await aiofiles.os.makedirs(tenant_cgroup, exist_ok=True)
-        async with aiofiles.open(tenant_cgroup / "cgroup.subtree_control", "w") as f:
-            await f.write("+memory +cpu +pids")
-
-        # Create VM cgroup
-        await aiofiles.os.makedirs(cgroup_path, exist_ok=True)
-
-        # Apply effective memory limit (pre-computed by admission controller)
-        memory_max_bytes = cgroup_memory_mb * 1024 * 1024
-        async with aiofiles.open(cgroup_path / "memory.max", "w") as f:
-            await f.write(str(memory_max_bytes))
-
-        # Soft memory limit at 85% of max — triggers kernel reclaim before OOM.
-        # Creates a buffer zone: between high and max, the kernel aggressively
-        # reclaims (page cache eviction, zswap compression) without killing.
-        memory_high_bytes = int(memory_max_bytes * 0.85)
-        await _write_cgroup_optional(cgroup_path / "memory.high", str(memory_high_bytes))
-
-        # Kill entire cgroup as a unit on OOM (QEMU + gvproxy together).
-        # Without this, OOM may kill only gvproxy, leaving QEMU orphaned.
-        await _write_cgroup_optional(cgroup_path / "memory.oom.group", "1")
-
-        # Prevent zswap from writing back to disk swap — keeps VM latency
-        # predictable.  Without this, under host pressure zswap may evict
-        # compressed pages to disk, causing multi-ms stalls.
-        await _write_cgroup_optional(cgroup_path / "memory.zswap.writeback", "0")
-
-        # Apply effective CPU limit (pre-computed by admission controller)
-        cpu_quota = int(CGROUP_CPU_PERIOD_US * cgroup_cpu_cores)
-        async with aiofiles.open(cgroup_path / "cpu.max", "w") as f:
-            await f.write(f"{cpu_quota} {CGROUP_CPU_PERIOD_US}")
-
-        # Set PID limit (fork bomb prevention)
-        async with aiofiles.open(cgroup_path / "pids.max", "w") as f:
-            await f.write(str(CGROUP_PIDS_LIMIT))
-
-        # Sanity-check that we can open cgroup.procs for writing.
-        # This validates the VFS permission (check 1 in module docstring) but
-        # NOT the common-ancestor check (check 2), which fires at write() time
-        # inside the kernel's cgroup_attach_task().  If the orchestrator is
-        # outside the delegated subtree, this passes but attach_to_cgroup()
-        # fails later — attach_if_available() handles that gracefully.
-        async with aiofiles.open(cgroup_path / "cgroup.procs", "a") as f:
-            pass  # Just test we can open for writing
-
+        await run_to_end(
+            functools.partial(_create_cgroup, cgroup_path, memory_mb=cgroup_memory_mb, cpu_cores=cgroup_cpu_cores)
+        )
     except OSError as e:
         # Gracefully degrade if cgroups unavailable (e.g., Docker Desktop, CI runners)
         # Note: PermissionError is a subclass of OSError
@@ -476,9 +429,60 @@ async def setup_cgroup(
                 extra={"vm_id": vm_id, "path": str(cgroup_path), "errno": e.errno},
             )
             return Path(f"/tmp/cgroup-{vm_id}")  # noqa: S108
-        raise VmDependencyError(f"Failed to setup cgroup: {e}") from e
+        raise ConfigError(
+            f"Failed to setup cgroup: {e}", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
+        ) from e
 
     return cgroup_path
+
+
+def _create_cgroup(cgroup_path: Path, *, memory_mb: int, cpu_cores: float) -> None:
+    """setup_cgroup's file work (blocking)."""
+    tenant_cgroup = cgroup_path.parent
+
+    # Create tenant cgroup and enable controllers for nested VM cgroups
+    # In cgroup v2, subtree_control only affects immediate children,
+    # so we must enable controllers at each level of the hierarchy
+    tenant_cgroup.mkdir(parents=True, exist_ok=True)
+    (tenant_cgroup / "cgroup.subtree_control").write_text("+memory +cpu +pids")
+
+    # Create VM cgroup
+    cgroup_path.mkdir(exist_ok=True)
+
+    # Apply effective memory limit (pre-computed by admission controller)
+    memory_max_bytes = memory_mb * 1024 * 1024
+    (cgroup_path / "memory.max").write_text(str(memory_max_bytes))
+
+    # Soft memory limit at 85% of max — triggers kernel reclaim before OOM.
+    # Creates a buffer zone: between high and max, the kernel aggressively
+    # reclaims (page cache eviction, zswap compression) without killing.
+    memory_high_bytes = int(memory_max_bytes * 0.85)
+    _write_cgroup_optional(cgroup_path / "memory.high", str(memory_high_bytes))
+
+    # Kill entire cgroup as a unit on OOM (QEMU + gvproxy together).
+    # Without this, OOM may kill only gvproxy, leaving QEMU orphaned.
+    _write_cgroup_optional(cgroup_path / "memory.oom.group", "1")
+
+    # Prevent zswap from writing back to disk swap — keeps VM latency
+    # predictable.  Without this, under host pressure zswap may evict
+    # compressed pages to disk, causing multi-ms stalls.
+    _write_cgroup_optional(cgroup_path / "memory.zswap.writeback", "0")
+
+    # Apply effective CPU limit (pre-computed by admission controller)
+    cpu_quota = int(CGROUP_CPU_PERIOD_US * cpu_cores)
+    (cgroup_path / "cpu.max").write_text(f"{cpu_quota} {CGROUP_CPU_PERIOD_US}")
+
+    # Set PID limit (fork bomb prevention)
+    (cgroup_path / "pids.max").write_text(str(CGROUP_PIDS_LIMIT))
+
+    # Sanity-check that we can open cgroup.procs for writing.
+    # This validates the VFS permission (check 1 in module docstring) but
+    # NOT the common-ancestor check (check 2), which fires at write() time
+    # inside the kernel's cgroup_attach_task().  If the orchestrator is
+    # outside the delegated subtree, this passes but attach_to_cgroup()
+    # fails later — attach_if_available() handles that gracefully.
+    with (cgroup_path / "cgroup.procs").open("a"):
+        pass  # Just test we can open for writing
 
 
 # =============================================================================
@@ -566,7 +570,7 @@ async def attach_if_available(cgroup_path: Path | None, pid: int | None) -> bool
 # =============================================================================
 
 
-async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int | None, int | None]:
+def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int | None, int | None]:
     """Read external CPU time, peak memory, and CPU throttle count from cgroup v2.
 
     Args:
@@ -575,8 +579,11 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
     Returns:
         Tuple of (cpu_time_ms, peak_memory_mb, nr_throttled)
         Returns (None, None, None) if cgroup not available or read fails
+
+    Sync, called on the event loop: the kernel answers these small cgroupfs
+    reads at once (no disk).
     """
-    if not cgroup_path or not await aiofiles.os.path.exists(cgroup_path):
+    if not cgroup_path or not cgroup_path.exists():
         return (None, None, None)
 
     cpu_time_ms: int | None = None
@@ -586,9 +593,8 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
     try:
         # Read cpu.stat for usage_usec (microseconds) and nr_throttled
         cpu_stat_file = cgroup_path / "cpu.stat"
-        if await aiofiles.os.path.exists(cpu_stat_file):
-            async with aiofiles.open(cpu_stat_file) as f:
-                cpu_stat = await f.read()
+        if cpu_stat_file.exists():
+            cpu_stat = cpu_stat_file.read_text()
             for line in cpu_stat.splitlines():
                 if line.startswith("usage_usec"):
                     usage_usec = int(line.split()[1])
@@ -598,9 +604,8 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
 
         # Read memory.peak for peak memory usage (bytes)
         memory_peak_file = cgroup_path / "memory.peak"
-        if await aiofiles.os.path.exists(memory_peak_file):
-            async with aiofiles.open(memory_peak_file) as f:
-                peak_bytes = int((await f.read()).strip())
+        if memory_peak_file.exists():
+            peak_bytes = int(memory_peak_file.read_text().strip())
             peak_memory_mb = peak_bytes // (1024 * 1024)  # Convert to MB
 
     except (OSError, ValueError) as e:
@@ -692,36 +697,40 @@ async def cleanup_cgroup(cgroup_path: Path | None, context_id: str) -> bool:
 
     Returns:
         True if cgroup cleaned successfully, False if issues occurred
+
+    One worker-thread job for a real cgroup: each PID move waits like
+    attach_to_cgroup, and rmdir takes the kernel's cgroup lock. A cancel
+    waits for the job (see setup_cgroup).
     """
     if cgroup_path is None:
         return True
 
-    try:
-        # For non-cgroup paths (fallback dummy), just try rmdir
-        if not is_cgroup_available(cgroup_path):
-            with contextlib.suppress(FileNotFoundError, OSError):
-                await aiofiles.os.rmdir(cgroup_path)
-            return True
+    # For non-cgroup paths (fallback dummy), just try rmdir
+    if not is_cgroup_available(cgroup_path):
+        with contextlib.suppress(OSError):
+            cgroup_path.rmdir()
+        return True
 
+    return await run_to_end(functools.partial(_remove_cgroup, cgroup_path, context_id=context_id))
+
+
+def _remove_cgroup(cgroup_path: Path, *, context_id: str) -> bool:
+    """cleanup_cgroup's file work for a real cgroup (blocking)."""
+    try:
         # Move all PIDs to parent cgroup first (required before rmdir)
         parent_procs = cgroup_path.parent / "cgroup.procs"
         procs_file = cgroup_path / "cgroup.procs"
 
-        if await aiofiles.os.path.exists(parent_procs) and await aiofiles.os.path.exists(procs_file):
-            async with aiofiles.open(procs_file) as f:
-                pids = (await f.read()).strip().split("\n")
+        if parent_procs.exists() and procs_file.exists():
+            pids = procs_file.read_text().strip().split("\n")
 
             for pid in pids:
                 if pid:
-                    try:
-                        async with aiofiles.open(parent_procs, "w") as f:
-                            await f.write(pid)
-                    except (OSError, PermissionError):
-                        # PID may have already exited
-                        pass
+                    with contextlib.suppress(OSError):  # PID may have already exited
+                        parent_procs.write_text(pid)
 
         # Now safe to remove cgroup directory
-        await aiofiles.os.rmdir(cgroup_path)
+        cgroup_path.rmdir()
         logger.debug(
             "cgroup removed",
             extra={"context_id": context_id, "path": str(cgroup_path)},

@@ -1185,13 +1185,35 @@ class TestErrorCases:
     async def test_find_asset_handles_permission_error_gracefully(self, tmp_path: Path) -> None:
         """Permission errors during path check are handled."""
         # This test verifies the code doesn't crash on permission errors
-        # In practice, aiofiles.os.path.exists handles this
+        # In practice, os.path.exists handles this (returns False)
         with (
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}),
-            patch("aiofiles.os.path.exists", side_effect=PermissionError("denied")),
+            patch("exec_sandbox.assets.os.path.exists", side_effect=PermissionError("denied")),
         ):
             with pytest.raises(PermissionError):
                 await _find_asset("vmlinuz-x86_64")
+
+    async def test_find_asset_looks_off_the_event_loop(self, tmp_path: Path) -> None:
+        """The search folders include the caller's (a network disk can take ms per stat):
+        every existence check runs in a worker thread, not on the event loop thread."""
+        (tmp_path / "vmlinuz-x86_64").touch()
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+        real_exists = os.path.exists
+
+        def exists(path: str | os.PathLike[str]) -> bool:
+            threads.append(threading.get_ident())
+            return real_exists(path)
+
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}),
+            patch("exec_sandbox.assets.os.path.exists", side_effect=exists),
+        ):
+            assert await _find_asset("vmlinuz-x86_64", override=tmp_path) == tmp_path / "vmlinuz-x86_64"
+            assert await _find_images_dir(override=tmp_path) == tmp_path
+
+        assert threads
+        assert loop_thread not in threads
 
 
 # =============================================================================

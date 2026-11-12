@@ -23,43 +23,80 @@ import asyncio
 import errno
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 from exec_sandbox import __version__, constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import run_to_end
 from exec_sandbox.base_cache_manager import BaseCacheManager
+from exec_sandbox.exceptions import ErrorCode, TransientError
 from exec_sandbox.guest_agent_protocol import WarmReplAckMessage, WarmReplRequest
-from exec_sandbox.hash_utils import crc64
-from exec_sandbox.migration_client import MigrationClient
+from exec_sandbox.hash_utils import fingerprint
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, rejected_by_qemu
 from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_file_access
-from exec_sandbox.platform_utils import HostArch, detect_host_arch
+from exec_sandbox.platform_utils import HostArch, detect_host_arch, kernel_image_path
+from exec_sandbox.sparse_file import clone_sparse, data_ranges, flush_to_disk
 from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
-    from exec_sandbox.models import Language
+    from exec_sandbox.admission import ResourceReservation
+    from exec_sandbox.models import ExposedPort
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.settings import Settings
     from exec_sandbox.vm_manager import VmManager
+    from exec_sandbox.vm_spec import VmSpec
 
 logger = get_logger(__name__)
 
 
-def _sha256_file(path: Path) -> str:
-    """Compute SHA-256 hex digest of a file in 1 MB chunks.
+_DIGEST_BLOCK = 64 * 1024
+_ZERO_BLOCK = bytes(_DIGEST_BLOCK)
 
-    Sync function, meant to be called via ``asyncio.to_thread`` so the
-    event loop stays responsive (~0.1 ms blocked instead of ~60 ms for a
-    typical 100 MB vmstate file).
+
+def _vmstate_digest(path: Path) -> str:
+    """SHA-256 hex digest of the file's size, then of each non-zero 64 KiB block
+    with its offset (the size fixes each block's length).
+
+    A mapped-ram vmstate is sparse (a 140 MB file can hold 3 MB of data): holes
+    are skipped (SEEK_DATA), not read. A hole and a zero block hash alike, so a
+    copy that changes the hole layout keeps the digest. Without SEEK_DATA every
+    block is read. Sync: callers use asyncio.to_thread.
     """
     sha256 = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            sha256.update(chunk)
+        fd = f.fileno()
+        size = os.fstat(fd).st_size
+        sha256.update(size.to_bytes(8, "big"))
+        try:
+            ranges = list(data_ranges(fd, size, grain=_DIGEST_BLOCK))
+        except OSError:
+            ranges = [(0, size)]
+        for start, end in ranges:
+            for offset in range(start, end, _DIGEST_BLOCK):
+                block = os.pread(fd, _DIGEST_BLOCK, offset)
+                if block != _ZERO_BLOCK[: len(block)]:
+                    sha256.update(offset.to_bytes(8, "big") + block)
     return sha256.hexdigest()
+
+
+def _flush_files(paths: list[Path]) -> None:
+    """flush_to_disk each file. A file this process may not open (a RAM template
+    QEMU made as qemu-vm) is logged and skipped: it keeps only page-cache
+    durability (a power loss can tear it). Sync: callers use asyncio.to_thread."""
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except PermissionError:
+            logger.warning("L1 entry file not flushed (no access)", extra={"path": str(path)})
+            continue
+        try:
+            flush_to_disk(fd)
+        finally:
+            os.close(fd)
 
 
 @dataclass(frozen=True)

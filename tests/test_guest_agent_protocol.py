@@ -16,9 +16,7 @@ from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
-    FileChunkRequest,
     FileChunkResponseMessage,
-    FileEndRequest,
     FileEntryInfo,
     FileListMessage,
     FileReadCompleteMessage,
@@ -873,54 +871,6 @@ class TestWriteFileRequest:
         restored = WriteFileRequest.model_validate_json(json_str)
         assert restored.path == "f.txt"
         assert restored.op_id == "test"
-
-
-class TestFileChunkRequest:
-    """Tests for FileChunkRequest model."""
-
-    def test_basic_chunk(self) -> None:
-        """FileChunkRequest with valid fields."""
-        req = FileChunkRequest(op_id="abc123", data="SGVsbG8=")
-        assert req.action == "file_chunk"
-        assert req.op_id == "abc123"
-        assert req.data == "SGVsbG8="
-
-    def test_data_max_length(self) -> None:
-        """FileChunkRequest accepts data at max length (200K)."""
-        large_data = "A" * 200_000
-        req = FileChunkRequest(op_id="test", data=large_data)
-        assert len(req.data) == 200_000
-
-    def test_data_exceeds_max_length(self) -> None:
-        """FileChunkRequest rejects data exceeding max length."""
-        too_large = "A" * 200_001
-        with pytest.raises(ValidationError):
-            FileChunkRequest(op_id="test", data=too_large)
-
-    def test_serialize_to_json(self) -> None:
-        """FileChunkRequest serializes to JSON."""
-        req = FileChunkRequest(op_id="abc", data="AQID")
-        json_str = req.model_dump_json()
-        restored = FileChunkRequest.model_validate_json(json_str)
-        assert restored.op_id == "abc"
-        assert restored.data == "AQID"
-
-
-class TestFileEndRequest:
-    """Tests for FileEndRequest model."""
-
-    def test_basic_end(self) -> None:
-        """FileEndRequest with valid fields."""
-        req = FileEndRequest(op_id="abc123")
-        assert req.action == "file_end"
-        assert req.op_id == "abc123"
-
-    def test_serialize_to_json(self) -> None:
-        """FileEndRequest serializes to JSON."""
-        req = FileEndRequest(op_id="xyz")
-        json_str = req.model_dump_json()
-        restored = FileEndRequest.model_validate_json(json_str)
-        assert restored.op_id == "xyz"
 
 
 class TestReadFileRequest:

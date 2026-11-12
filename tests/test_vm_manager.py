@@ -2482,7 +2482,7 @@ class TestTwoLayerKvmDetection:
         """KVM detection fails if QEMU doesn't have KVM compiled in."""
         # Mock Layer 1 passing (kernel check)
         with (
-            patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=True),
+            patch.object(Path, "exists", return_value=True),  # /dev/kvm
             patch("exec_sandbox.system_probes.can_access", return_value=True),
             patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
         ):
@@ -2504,7 +2504,7 @@ class TestTwoLayerKvmDetection:
     async def test_kvm_passes_when_both_layers_pass(self) -> None:
         """KVM detection passes when both kernel and QEMU verify KVM."""
         with (
-            patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=True),
+            patch.object(Path, "exists", return_value=True),  # /dev/kvm
             patch("exec_sandbox.system_probes.can_access", return_value=True),
             patch("exec_sandbox.system_probes.asyncio.create_subprocess_exec") as mock_exec,
         ):
@@ -2526,7 +2526,7 @@ class TestTwoLayerKvmDetection:
     @skip_unless_linux
     async def test_kvm_fails_when_dev_kvm_missing(self) -> None:
         """KVM detection fails early if /dev/kvm doesn't exist."""
-        with patch("exec_sandbox.system_probes.aiofiles.os.path.exists", return_value=False):
+        with patch.object(Path, "exists", return_value=False):  # no /dev/kvm
             probe_cache.reset("kvm")
             result = await check_kvm_available()
             assert result is False
@@ -3494,7 +3494,7 @@ class TestKernelInitramfsValidation:
         await validate_kernel_initramfs(vm_settings.kernel_path, arch)
 
         # Second call - should use cache, mock should NOT be called
-        with patch("exec_sandbox.validation.aiofiles.os.path.exists", new_callable=AsyncMock) as mock_exists:
+        with patch("exec_sandbox.validation.os.path.exists") as mock_exists:
             await validate_kernel_initramfs(vm_settings.kernel_path, arch)
             mock_exists.assert_not_called()
 
@@ -4028,11 +4028,8 @@ class TestTscDeadlineLinux:
 vendor_id	: GenuineIntel
 flags		: fpu vme de pse tsc msr pae mce cx8 apic sep tsc_deadline_timer sse sse2
 """
-            mock_file = AsyncMock()
-            mock_file.__aenter__.return_value.read = AsyncMock(return_value=cpuinfo_content)
-
-            with patch("aiofiles.os.path.exists", return_value=True):
-                with patch("aiofiles.open", return_value=mock_file):
+            with patch.object(Path, "exists", return_value=True):
+                with patch.object(Path, "read_text", return_value=cpuinfo_content):
                     result = await _check_tsc_deadline_linux()
                     assert result is True
         finally:
@@ -4052,11 +4049,8 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep tsc_deadline_timer sse sse2
 vendor_id	: GenuineIntel
 flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
 """
-            mock_file = AsyncMock()
-            mock_file.__aenter__.return_value.read = AsyncMock(return_value=cpuinfo_content)
-
-            with patch("aiofiles.os.path.exists", return_value=True):
-                with patch("aiofiles.open", return_value=mock_file):
+            with patch.object(Path, "exists", return_value=True):
+                with patch.object(Path, "read_text", return_value=cpuinfo_content):
                     result = await _check_tsc_deadline_linux()
                     assert result is False
         finally:
@@ -4072,7 +4066,7 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
         try:
             probe_cache.reset("tsc_deadline")
 
-            with patch("aiofiles.os.path.exists", return_value=False):
+            with patch.object(Path, "exists", return_value=False):
                 result = await _check_tsc_deadline_linux()
                 assert result is False
         finally:
@@ -4088,8 +4082,8 @@ flags		: fpu vme de pse tsc msr pae mce cx8 apic sep sse sse2
         try:
             probe_cache.reset("tsc_deadline")
 
-            with patch("aiofiles.os.path.exists", return_value=True):
-                with patch("aiofiles.open", side_effect=OSError("Permission denied")):
+            with patch.object(Path, "exists", return_value=True):
+                with patch.object(Path, "read_text", side_effect=OSError("Permission denied")):
                     result = await _check_tsc_deadline_linux()
                     assert result is False
         finally:

@@ -6,10 +6,11 @@ task-cancelled / task-error / cancellation + task-error (chained).
 """
 
 import asyncio
+import threading
 
 import pytest
 
-from exec_sandbox.aio_utils import await_cancellation_safe, await_settled
+from exec_sandbox.aio_utils import await_cancellation_safe, await_settled, run_to_end
 
 
 async def _wait_and_return(gate: asyncio.Event, value: str = "done") -> str:
@@ -122,3 +123,52 @@ class TestAwaitCancellationSafe:
         assert len(observed) == 1
         assert isinstance(observed[0], RuntimeError)
         assert str(observed[0]) == "task failed"
+
+
+class TestRunToEnd:
+    async def test_returns_the_result_of_the_call(self) -> None:
+        assert await run_to_end(lambda: "ok") == "ok"
+
+    async def test_cancel_waits_for_the_job(self) -> None:
+        """A cancelled caller gets its CancelledError only once the worker job has ended."""
+        release, finished = threading.Event(), threading.Event()
+
+        def job() -> None:
+            release.wait(10)
+            finished.set()
+
+        caller = asyncio.create_task(run_to_end(job))
+        await asyncio.sleep(0.01)
+        caller.cancel()
+        await asyncio.sleep(0.05)
+        assert not caller.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert finished.is_set()
+
+    def test_loop_shutdown_lets_the_job_end_before_the_owner_cleans_up(self) -> None:
+        """asyncio.run cancels every task left at its end. A job run as a task (to_thread)
+        is cancelled then too, while its thread still runs, and its owner cleans up first;
+        the executor future of run_to_end is not a task."""
+        events: list[str] = []
+        release = threading.Event()
+
+        def job() -> None:
+            release.wait(10)
+            events.append("job ended")
+
+        async def owner() -> None:
+            try:
+                await run_to_end(job)
+            finally:
+                events.append("owner cleanup")
+
+        async def main() -> None:
+            owner_task = asyncio.create_task(owner())  # left running: asyncio.run cancels it
+            await asyncio.sleep(0.01)
+            threading.Timer(0.1, release.set).start()
+            assert not owner_task.done()
+
+        asyncio.run(main())
+        assert events == ["job ended", "owner cleanup"]

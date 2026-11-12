@@ -63,9 +63,9 @@ pub(crate) async fn spawn_repl(
             );
             c.env("PYTHONINTMAXSTRDIGITS", "0");
             c.env("PYTHONSAFEPATH", "1");
-            // Redirect .pyc writes to writable tmpfs. Stdlib uses pre-compiled .pyc
-            // from the image; user-installed packages get cached here for the session.
-            c.env("PYTHONPYCACHEPREFIX", "/home/user/.pycache");
+            // No PYTHONPYCACHEPREFIX: with a prefix, CPython reads .pyc only under it
+            // and recompiles the stdlib (precompiled next to its sources in the image)
+            // at every start. L2 packages ship .pyc (uv --compile-bytecode).
             // Replace musl's slow default malloc with jemalloc (~30% Python startup speedup).
             // musl's allocator uses a global lock; Python calls malloc ~26k times during init.
             // Note: inherited by subprocesses (uv, etc.) — harmless but visible.

@@ -27,9 +27,9 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, Self
 from uuid import uuid4
 
-import aiofiles.os
 from tenacity import (
     AsyncRetrying,
     before_sleep_log,

@@ -6,13 +6,12 @@ No runtime network calls, catalogs bundled in container.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
 
-import aiofiles
-
-from exec_sandbox.exceptions import PackageNotAllowedError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language  # noqa: TC001 - Used at runtime (language.value)
 
 # Package name extraction pattern
@@ -65,14 +64,15 @@ class PackageValidator:
         pypi_path = pypi_allow_list_path or catalogs_dir / "pypi_top_10k.json"
         npm_path = npm_allow_list_path or catalogs_dir / "npm_top_10k.json"
 
-        allow_lists = {
-            "python": await cls._load_allow_list(pypi_path),
-            "javascript": await cls._load_allow_list(npm_path),
-        }
-        return cls(allow_lists)
+        # One worker-thread job: reading and parsing both files takes about 2 ms
+        return cls(await asyncio.to_thread(cls._load_allow_lists, pypi_path, npm_path))
+
+    @classmethod
+    def _load_allow_lists(cls, pypi_path: Path, npm_path: Path) -> dict[str, set[str]]:
+        return {"python": cls._load_allow_list(pypi_path), "javascript": cls._load_allow_list(npm_path)}
 
     @staticmethod
-    async def _load_allow_list(path: Path) -> set[str]:
+    def _load_allow_list(path: Path) -> set[str]:
         """Load allow-list from bundled JSON file.
 
         Args:
@@ -81,9 +81,7 @@ class PackageValidator:
         Returns:
             Set of allowed package names (lowercase for case-insensitive matching)
         """
-        async with aiofiles.open(path) as f:
-            content = await f.read()
-        packages: list[str] = json.loads(content)
+        packages: list[str] = json.loads(path.read_text())
         return {pkg.lower() for pkg in packages}
 
     def validate(self, packages: list[str], language: Language) -> None:

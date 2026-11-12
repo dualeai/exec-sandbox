@@ -130,15 +130,18 @@ resource contention (background save runs concurrently with user execution)
 it can take 2-3x longer. 120s is generous since this is used for background
 L1 saves and warm pool pre-warm — latency doesn't matter, only success."""
 
-GUEST_RECONNECT_PROBE_TIMEOUT: Final[float] = 0.5
-"""Timeout per ping probe when verifying guest is ready after reconnection.
+GUEST_RECONNECT_PROBE_TIMEOUTS: Final[tuple[float, ...]] = (0.05, 0.1, 0.25, 0.5, 1.0, 1.0)
+"""Timeout of each ping probe attempt when verifying guest is ready after reconnection.
 
 After close()+connect(), QEMU's chardev socket accepts before the guest agent
 has reopened its virtio-serial port fds. Data sent in this window is silently
-dropped. A lightweight PingRequest confirms the guest is actually listening."""
+dropped. A lightweight PingRequest confirms the guest is actually listening.
 
-GUEST_RECONNECT_PROBE_MAX_RETRIES: Final[int] = 5
-"""Maximum reconnection probe attempts before raising TimeoutError."""
+The timeouts grow: when QEMU accepts before the guest reopens its port, the
+first ping is lost (seen on 1 in 4 to 6 L1 restores under 16 concurrent
+restores), and a short first wait finds that in 50ms instead of 500ms. The next
+pong comes in 20-35ms. A slow (not lost) pong gets the longer later waits; the
+sum (2.9s) is above the old budget of 5 attempts of 0.5s."""
 
 GUEST_RECONNECT_PROBE_DELAY: Final[float] = 0.05
 """Delay between reconnection probe retries (50ms)."""

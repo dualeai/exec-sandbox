@@ -181,8 +181,14 @@ class TestOverlayPoolPureLogic:
         from exec_sandbox.overlay_pool import OverlayPool
 
         pool = OverlayPool(pool_size=5, pool_dir=tmp_path / "pool")
+        real_mkdir = Path.mkdir
 
-        with patch("aiofiles.os.makedirs", side_effect=PermissionError("Access denied")):
+        def mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            if path == pool._pool_dir:
+                raise PermissionError("Access denied")
+            real_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", autospec=True, side_effect=mkdir):
             await pool.start([Path("/fake/base.qcow2")])
 
         # Daemon is started (for on-demand creation)

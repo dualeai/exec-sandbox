@@ -19,19 +19,18 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import aiofiles.os
-
 from exec_sandbox import __version__
 from exec_sandbox._logging import get_logger
 from exec_sandbox.asset_downloader import (
     AsyncPooch,
     decompress_zstd,
-    get_cache_dir,
     get_current_arch,
     get_gvproxy_suffix,
 )
+from exec_sandbox.exceptions import ConfigError, ErrorCode
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import chmod_executable
+from exec_sandbox.platform_utils import UserDir, get_user_dir
 
 logger = get_logger(__name__)
 
@@ -191,19 +190,19 @@ async def fetch_kernel(arch: str | None = None, override: Path | None = None) ->
 
     # Check each search path in priority order.
     # Within each directory, prefer vmlinux (PVH direct boot, x86_64 only).
-    for directory in _get_search_paths(override):
-        for name in candidates:
-            path = directory / name
-            if await aiofiles.os.path.exists(path):
-                logger.debug("Using cached kernel", extra={"arch": arch, "path": str(path)})
-                return path
+    local = await asyncio.to_thread(
+        _first_existing, [directory / name for directory in _get_search_paths(override) for name in candidates]
+    )
+    if local is not None:
+        logger.debug("Using cached kernel", extra={"arch": arch, "path": str(local)})
+        return local
 
     # Not found locally, download from GitHub
     await ensure_registry_loaded()
     assets = get_assets()
 
     # Try preferred kernel from registry (vmlinux for x86_64, then vmlinuz)
-    download_candidates = [n for n in candidates if n.endswith(".zst")]
+    download_candidates = [f"{name}.zst" for name in candidates]
     for name in download_candidates:
         if name in assets.registry:
             logger.debug("Fetching kernel", extra={"arch": arch, "file": name})
@@ -294,38 +293,37 @@ async def get_gvproxy_path(override: Path | None = None) -> Path | None:
     Returns:
         Path to the gvproxy-wrapper binary if found, None otherwise.
     """
-    suffix = get_gvproxy_suffix()
-    fname = f"gvproxy-wrapper-{suffix}"
+    return await _find_gvproxy(override, arch=get_current_arch())
+
+
+async def _find_gvproxy(override: Path | None, *, arch: str) -> Path | None:
+    """The gvproxy-wrapper binary of this OS for `arch`, in get_gvproxy_path's order; None if not found."""
+    fname = f"gvproxy-wrapper-{get_gvproxy_suffix(arch)}"
 
     # 0. Check override path first if provided
-    if override:
-        binary_path = override / fname
-        if await aiofiles.os.path.exists(binary_path):
-            return binary_path
+    candidates = [override / fname] if override else []
 
     # 1. Check repo-relative path (dev mode - prioritized for local builds)
     repo_root = Path(__file__).parent.parent.parent
-    binary_path = repo_root / "gvproxy-wrapper" / "bin" / fname
-
-    if await aiofiles.os.path.exists(binary_path):
-        return binary_path
+    candidates.append(repo_root / "gvproxy-wrapper" / "bin" / fname)
 
     # 2-4. Fall back to standard asset cache lookup
-    return await _find_asset(fname, override)
+    return await asyncio.to_thread(_first_existing, [*candidates, *_asset_candidates(fname, override)])
 
 
-async def fetch_gvproxy(override: Path | None = None) -> Path:
+async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
     """
-    Fetch gvproxy-wrapper binary for the current platform.
+    Fetch gvproxy-wrapper binary of this OS for an architecture.
 
     Args:
-        override: Explicit path to search first (from SchedulerConfig.images_dir).
+        override: Explicit path to search first (from SchedulerConfig.images_dir), or None.
+        arch: Architecture ("x86_64" or "aarch64").
 
     Returns:
         Path to the gvproxy-wrapper binary (executable).
     """
     # Check local paths first
-    if local_path := await get_gvproxy_path(override):
+    if local_path := await _find_gvproxy(override, arch=arch):
         logger.debug("Using cached gvproxy-wrapper", extra={"path": str(local_path)})
         # Ensure executable
         await chmod_executable(local_path)
@@ -500,10 +498,7 @@ async def _find_images_dir(override: Path | None = None) -> Path | None:
     Returns:
         Path to images directory if found, None otherwise.
     """
-    for path in _get_search_paths(override):
-        if await aiofiles.os.path.exists(path):
-            return path
-    return None
+    return await asyncio.to_thread(_first_existing, _get_search_paths(override))
 
 
 async def _find_asset(fname: str, override: Path | None = None) -> Path | None:
@@ -525,16 +520,21 @@ async def _find_asset(fname: str, override: Path | None = None) -> Path | None:
     Returns:
         Path to the asset file if found, None otherwise.
     """
-    for directory in _get_search_paths(override):
-        path = directory / fname
-        if await aiofiles.os.path.exists(path):
-            return path
-        # Check decompressed version (without .zst)
-        if fname.endswith(".zst"):
-            decompressed_path = directory / fname[:-4]
-            if await aiofiles.os.path.exists(decompressed_path):
-                return decompressed_path
-    return None
+    return await asyncio.to_thread(_first_existing, _asset_candidates(fname, override))
+
+
+def _asset_candidates(fname: str, override: Path | None) -> list[Path]:
+    """Where _find_asset looks, in order: the ready file (`.zst` removed) in each search folder."""
+    return [directory / fname.removesuffix(".zst") for directory in _get_search_paths(override)]
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    """The first of `paths` that exists. Blocking: the search folders include the
+    caller's (images_dir, EXEC_SANDBOX_IMAGES_DIR), which can be on a network disk,
+    so async callers run one lookup as one worker-thread job."""
+    # os.path.exists: a folder this process may not read counts as missing
+    # (Path.exists raises PermissionError before Python 3.14).
+    return next((path for path in paths if os.path.exists(path)), None)  # noqa: PTH110
 
 
 async def prefetch_all_assets(

@@ -431,11 +431,14 @@ class TestL2Cache:
         cache_key = "python-corrupt123"
         snapshot_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
         snapshot_path.write_bytes(b"not a valid qcow2 file")
+        sidecar = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2.sha256"
+        sidecar.write_text("stamp digest")
 
         result = await snapshot_manager._check_l2_cache(cache_key)
 
         assert result is None, "Should return None for corrupt qcow2"
         assert not snapshot_path.exists(), "Corrupt snapshot should be removed"
+        assert not sidecar.exists(), "Its digest sidecar goes with it"
 
     async def test_l2_cache_nonexistent_returns_none(self, make_snapshot_manager, tmp_path: Path) -> None:
         """L2 cache returns None for non-existent snapshot."""

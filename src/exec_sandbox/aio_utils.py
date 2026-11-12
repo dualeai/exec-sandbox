@@ -8,7 +8,7 @@ replace the hand-rolled copies of that loop.
 """
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 
 
 async def await_settled[T](task: asyncio.Task[T]) -> asyncio.CancelledError | None:
@@ -62,3 +62,11 @@ async def await_cancellation_safe[T](awaitable: Awaitable[T]) -> T:
             raise cancellation from error
         raise cancellation
     return task.result()
+
+
+async def run_to_end[T](call: Callable[[], T]) -> T:
+    """Run a blocking ``call`` in a worker thread to its end, even if the caller is
+    cancelled (await_cancellation_safe). An executor future, not a task: a loop
+    shutdown cancels every task, never this job, so the caller's cleanup runs after it.
+    """
+    return await await_cancellation_safe(asyncio.get_running_loop().run_in_executor(None, call))

@@ -16,13 +16,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Final, ParamSpec, TypeVar
 
-import aiofiles
-import aiofiles.os
-
 from exec_sandbox._logging import get_logger
 from exec_sandbox.cgroup import CGROUP_V2_BASE_PATH, is_cgroup_available, resolve_self_cgroup_v2
 from exec_sandbox.permission_utils import can_access
-from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
+from exec_sandbox.platform_utils import HostArch, HostOS, child_env, detect_host_arch, detect_host_os
+from exec_sandbox.settings import QemuBinaries
 from exec_sandbox.vm_types import AccelType
 
 P = ParamSpec("P")
@@ -931,13 +929,14 @@ async def _check_tsc_deadline_linux() -> bool:
 
     Note: Called from check_tsc_deadline() which handles caching and locking.
     """
-    cpuinfo_path = "/proc/cpuinfo"
-    if not await aiofiles.os.path.exists(cpuinfo_path):
+    cpuinfo_path = Path("/proc/cpuinfo")
+    if not cpuinfo_path.exists():
         return False
 
     try:
-        async with aiofiles.open(cpuinfo_path) as f:
-            cpuinfo = await f.read()
+        # In a worker thread: the kernel builds this file for every CPU (large on
+        # big hosts; some kernels sample each CPU's frequency while doing so)
+        cpuinfo = await asyncio.to_thread(cpuinfo_path.read_text)
         # Look for tsc_deadline_timer in the flags line
         # Format: "flags : fpu vme ... tsc_deadline_timer ..."
         for line in cpuinfo.split("\n"):
@@ -995,12 +994,10 @@ async def probe_io_uring_support() -> bool:
         return False
 
     # Check 1: Sysctl restrictions (kernel 5.12+)
-    sysctl_path = "/proc/sys/kernel/io_uring_disabled"
-    if await aiofiles.os.path.exists(sysctl_path):
+    sysctl_path = Path("/proc/sys/kernel/io_uring_disabled")
+    if sysctl_path.exists():
         try:
-            async with aiofiles.open(sysctl_path) as f:
-                content = await f.read()
-            disabled_value = int(content.strip())
+            disabled_value = int(sysctl_path.read_text().strip())  # a sysctl: answered at once
             # io_uring_disabled sysctl values: 0=enabled, 1=restricted, 2=disabled
             if disabled_value == 2:  # noqa: PLR2004
                 logger.info(

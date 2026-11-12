@@ -151,6 +151,7 @@ class DiskSnapshotManager(BaseCacheManager):
     """
 
     _cache_ext: ClassVar[str] = ".qcow2"
+    _sidecar_exts: ClassVar[tuple[str, ...]] = (".qcow2.sha256",)
 
     def __init__(self, settings: Settings, vm_manager: VmManager):
         """Initialize qcow2 snapshot manager.
@@ -192,7 +193,7 @@ class DiskSnapshotManager(BaseCacheManager):
         Returns:
             Path to cached qcow2 snapshot, or None if cache miss.
         """
-        cache_key = self._compute_cache_key(language, packages)
+        cache_key = await asyncio.to_thread(self._compute_cache_key, language, packages)
         return await self._check_l2_cache(cache_key)
 
     async def get_or_create_snapshot(
@@ -330,27 +331,31 @@ class DiskSnapshotManager(BaseCacheManager):
         """
         snapshot_path = self._cache_path(cache_key)
 
-        if not await aiofiles.os.path.exists(snapshot_path):
+        try:
+            stat = snapshot_path.stat()
+        except OSError:
             return None
 
         # Verify qcow2 format (standalone ext4 snapshot, no backing file expected)
-        try:
-            returncode, _, _ = await communicate_managed_process(
-                ["qemu-img", "check", str(snapshot_path)],
-                process_name="qemu-img-check",
-                context_id=cache_key,
-            )
+        stamp = file_stamp(stat)
+        if _L2_CHECK_PASSED.get(str(snapshot_path)) != stamp:
+            try:
+                returncode, _, _ = await _qemu_img(
+                    ["check", str(snapshot_path)], process_name="qemu-img-check", cache_key=cache_key
+                )
 
-            if returncode != 0:
-                logger.debug("Invalid qcow2 snapshot, removing", extra={"cache_key": cache_key})
-                await aiofiles.os.remove(snapshot_path)
+                if returncode != 0:
+                    logger.debug("Invalid qcow2 snapshot, removing", extra={"cache_key": cache_key})
+                    await asyncio.to_thread(self._remove_entry, snapshot_path)  # with its digest sidecar; up to GBs
+                    return None
+
+            except (OSError, TransientError):  # qemu-img could not start now (spawn_error): a miss, not kept
                 return None
+            _L2_CHECK_PASSED[str(snapshot_path)] = stamp
 
-        except (OSError, FileNotFoundError):
-            return None
-
-        # Update atime for LRU tracking
-        snapshot_path.touch(exist_ok=True)
+        # Update atime for LRU tracking. Keep mtime: image_hash and _L2_CHECK_PASSED key on it.
+        with contextlib.suppress(OSError):
+            os.utime(snapshot_path, ns=(time.time_ns(), snapshot_path.stat().st_mtime_ns))
 
         return snapshot_path
 

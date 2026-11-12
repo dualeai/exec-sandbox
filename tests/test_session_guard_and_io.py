@@ -2233,10 +2233,30 @@ class TestDualPortProbeSuccess:
 
     async def test_guest_ready_on_last_possible_attempt(self) -> None:
         """Guest responds on the very last retry — boundary case."""
-        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [PongMessage(version="1.0")])
         # Should succeed, not raise
         await channel._probe_guest_ready(caller_timeout=5.0)
+
+    async def test_lost_first_ping_costs_a_short_wait(self) -> None:
+        """QEMU accepted before the guest reopened its port: the first ping is lost.
+
+        The first attempt waits 50 ms, so the probe ends in ~0.1 s (with a 0.5 s
+        first wait it took 0.55 s)."""
+        answered: list[bool] = []
+
+        async def guest(*_args: object, **_kwargs: object) -> PongMessage:
+            if not answered:
+                answered.append(False)
+                await asyncio.Event().wait()  # the lost ping: no answer ever
+            return PongMessage(version="1.0")
+
+        channel = _make_probe_channel(guest)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await channel._probe_guest_ready(caller_timeout=5.0)
+
+        assert loop.time() - start < 0.3
 
 
 class TestDualPortProbeFailure:
@@ -2244,15 +2264,18 @@ class TestDualPortProbeFailure:
 
     async def test_all_attempts_timeout(self) -> None:
         """Guest never responds — TimeoutError with descriptive message."""
-        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         channel = _make_probe_channel([TimeoutError()] * max_retries)
 
         with pytest.raises(TimeoutError, match=f"after {max_retries} reconnection attempts"):
             await channel._probe_guest_ready(caller_timeout=5.0)
+        # One reconnect between attempts, none after the last: it would only delay the error.
+        assert channel._raw_connect.await_count == max_retries - 1
+        assert channel.close.await_count == max_retries - 1
 
     async def test_all_attempts_connection_error(self) -> None:
         """Guest socket broken every time — same TimeoutError."""
-        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         channel = _make_probe_channel([ConnectionError()] * max_retries)
 
         with pytest.raises(TimeoutError, match="reconnection attempts"):
@@ -2260,7 +2283,7 @@ class TestDualPortProbeFailure:
 
     async def test_guest_returns_wrong_message_type(self) -> None:
         """Guest returns StreamingErrorMessage instead of PongMessage — treated as failure."""
-        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         wrong_msg = StreamingErrorMessage(error_type="unknown", message="not a pong")
         channel = _make_probe_channel([wrong_msg] * max_retries)
 
@@ -2269,7 +2292,7 @@ class TestDualPortProbeFailure:
 
     async def test_one_more_failure_than_budget_still_raises(self) -> None:
         """MAX_RETRIES-1 failures + wrong message type = still raises."""
-        max_retries = constants.GUEST_RECONNECT_PROBE_MAX_RETRIES
+        max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         wrong_msg = StreamingErrorMessage(error_type="unknown", message="bad")
         channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [wrong_msg])
 

@@ -3,21 +3,24 @@
 Test categories:
 - Normal cases: Happy path with valid inputs
 - Edge cases: None, empty, boundary values
-- Error cases: OSError, PermissionError, VmError
+- Error cases: OSError, PermissionError, ConfigError
 - Weird cases: Special characters, path traversal, malformed data
 - Integration tests: Real cgroups on Linux (requires sudo)
 """
 
 import asyncio
+import errno
+import os
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from exec_sandbox.cgroup import (
     CGROUP_APP_NAMESPACE,
-    CGROUP_CPU_PERIOD_US,
     CGROUP_PIDS_LIMIT,
     CGROUP_V2_BASE_PATH,
     ERRNO_PERMISSION_DENIED,
@@ -496,113 +499,159 @@ print("SUCCESS")
 # =============================================================================
 
 
+@pytest.fixture
+def cgroup_root(tmp_path: Path) -> Iterator[Path]:
+    """A folder that stands in for /sys/fs/cgroup (cgroup v2 'mounted'): the functions
+    read and write real files in it."""
+    with (
+        patch("exec_sandbox.cgroup.CGROUP_V2_BASE_PATH", str(tmp_path)),
+        patch("exec_sandbox.cgroup._check_cgroup_v2_mounted", return_value=True),
+    ):
+        yield tmp_path
+
+
+def _record_writes(written: list[tuple[str, str]], *, fail_first: bool) -> Callable[[Path, str], int]:
+    """Path.write_text stand-in for cgroupfs control files, whose writes do not replace
+    each other: records (file name, value); with fail_first, the first write fails."""
+
+    def write_text(path: Path, data: str) -> int:
+        written.append((path.name, data))
+        if fail_first and len(written) == 1:
+            raise OSError(errno.ESRCH, "No such process")
+        return len(data)
+
+    return write_text
+
+
 class TestSetupCgroup:
     """Test cgroup setup function."""
 
     # --- Normal cases ---
-    async def test_setup_creates_cgroup_hierarchy(self):
+    async def test_setup_creates_cgroup_hierarchy(self, cgroup_root: Path):
         """Normal setup creates tenant and VM cgroups."""
         from exec_sandbox.cgroup import setup_cgroup
 
-        with patch("aiofiles.os.makedirs", new_callable=AsyncMock) as mock_makedirs:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.write = AsyncMock()
+        result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
-            with patch("aiofiles.open", return_value=mock_file):
-                result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
+        tenant = cgroup_root / CGROUP_APP_NAMESPACE / "tenant1"
+        assert result == tenant / "vm123"
+        assert result.is_dir()  # tenant + vm directories
+        assert (tenant / "cgroup.subtree_control").read_text() == "+memory +cpu +pids"
+        assert (result / "pids.max").read_text() == str(CGROUP_PIDS_LIMIT)
 
-                assert result == Path(f"{CGROUP_V2_BASE_PATH}/{CGROUP_APP_NAMESPACE}/tenant1/vm123")
-                assert mock_makedirs.call_count == 2  # tenant + vm directories
+    async def test_setup_runs_in_one_worker_thread(self, cgroup_root: Path):
+        """The cgroup files are made off the event loop thread (mkdir and cgroup.subtree_control
+        can wait for the kernel's cgroup locks)."""
+        from exec_sandbox.cgroup import setup_cgroup
 
-    async def test_setup_applies_precomputed_memory_limit(self):
+        loop_thread = threading.get_ident()
+        threads: set[int] = set()
+        real_mkdir = Path.mkdir
+
+        def mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            threads.add(threading.get_ident())
+            real_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", autospec=True, side_effect=mkdir):
+            await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
+
+        assert threads
+        assert loop_thread not in threads
+
+    async def test_setup_cancel_waits_for_the_job(self, cgroup_root: Path):
+        """A cancel during setup returns only once the job has ended: the owner's cleanup
+        never removes the folder while the job still makes it."""
+        from exec_sandbox.cgroup import setup_cgroup
+
+        started, release = threading.Event(), threading.Event()
+        real_mkdir = Path.mkdir
+
+        def slow_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            started.set()
+            release.wait(timeout=10)
+            real_mkdir(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", autospec=True, side_effect=slow_mkdir):
+            task = asyncio.create_task(setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0))
+            try:
+                await asyncio.to_thread(started.wait, 10)
+                task.cancel()
+                await asyncio.sleep(0.05)
+                assert not task.done(), "the cancel did not wait for the setup job"
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert (cgroup_root / CGROUP_APP_NAMESPACE / "tenant1" / "vm123" / "pids.max").exists()
+
+    async def test_setup_applies_precomputed_memory_limit(self, cgroup_root: Path):
         """setup_cgroup applies pre-computed memory limit (no internal overhead calc)."""
         from exec_sandbox.cgroup import setup_cgroup
 
-        written_values: list[str] = []
+        # Pass effective memory (admission already added overhead + TCG)
+        effective_memory = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
+        result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=effective_memory, cgroup_cpu_cores=1.0)
 
-        async def capture_write(value: str) -> None:
-            written_values.append(value)
-
-        with patch("aiofiles.os.makedirs", new_callable=AsyncMock):
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.write = AsyncMock(side_effect=capture_write)
-
-            with patch("aiofiles.open", return_value=mock_file):
-                # Pass effective memory (admission already added overhead + TCG)
-                effective_memory = 256 + DEFAULT_VM_MEMORY_OVERHEAD_MB + DEFAULT_TCG_TB_CACHE_SIZE_MB
-                await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=effective_memory, cgroup_cpu_cores=1.0)
-
-                # cgroup should apply exactly what was passed (in bytes)
-                expected_memory_bytes = effective_memory * 1024 * 1024
-                assert str(expected_memory_bytes) in written_values
+        # cgroup should apply exactly what was passed (in bytes)
+        expected_memory_bytes = effective_memory * 1024 * 1024
+        assert (result / "memory.max").read_text() == str(expected_memory_bytes)
 
     @pytest.mark.parametrize(
         ("cgroup_cpu_cores", "expected_cpu_max"),
         [
-            (1.0, f"{int(CGROUP_CPU_PERIOD_US * 1.0)} {CGROUP_CPU_PERIOD_US}"),
-            (1.25, f"{int(CGROUP_CPU_PERIOD_US * 1.25)} {CGROUP_CPU_PERIOD_US}"),
-            (2.0, f"{int(CGROUP_CPU_PERIOD_US * 2.0)} {CGROUP_CPU_PERIOD_US}"),
-            (4.0, f"{int(CGROUP_CPU_PERIOD_US * 4.0)} {CGROUP_CPU_PERIOD_US}"),
+            (1.0, "100000 100000"),
+            (1.25, "125000 100000"),
+            (2.0, "200000 100000"),
+            (4.0, "400000 100000"),
         ],
     )
-    async def test_setup_cpu_max_scales_with_cores(self, cgroup_cpu_cores: float, expected_cpu_max: str):
+    async def test_setup_cpu_max_scales_with_cores(
+        self, cgroup_root: Path, cgroup_cpu_cores: float, expected_cpu_max: str
+    ):
         """cpu.max quota scales proportionally with cgroup_cpu_cores (effective, including overhead)."""
         from exec_sandbox.cgroup import setup_cgroup
 
-        written_values: list[str] = []
-
-        async def capture_write(value: str) -> None:
-            written_values.append(value)
-
-        with patch("aiofiles.os.makedirs", new_callable=AsyncMock):
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.write = AsyncMock(side_effect=capture_write)
-
-            with patch("aiofiles.open", return_value=mock_file):
-                await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=cgroup_cpu_cores)
-                assert expected_cpu_max in written_values
+        result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=cgroup_cpu_cores)
+        assert (result / "cpu.max").read_text() == expected_cpu_max
 
     # --- Error cases ---
-    async def test_setup_read_only_filesystem_returns_fallback(self):
+    async def test_setup_read_only_filesystem_returns_fallback(self, cgroup_root: Path):
         """Read-only filesystem gracefully degrades to fallback path."""
         from exec_sandbox.cgroup import setup_cgroup
 
         error = OSError("Read-only filesystem")
         error.errno = ERRNO_READ_ONLY_FILESYSTEM
 
-        with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
+        with patch.object(Path, "mkdir", side_effect=error):
             result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
             assert result == Path("/tmp/cgroup-vm123")
 
-    async def test_setup_permission_denied_returns_fallback(self):
+    async def test_setup_permission_denied_returns_fallback(self, cgroup_root: Path):
         """Permission denied gracefully degrades to fallback path."""
         from exec_sandbox.cgroup import setup_cgroup
 
         error = OSError("Permission denied")
         error.errno = ERRNO_PERMISSION_DENIED
 
-        with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
+        with patch.object(Path, "mkdir", side_effect=error):
             result = await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
             assert result == Path("/tmp/cgroup-vm123")
 
-    async def test_setup_other_oserror_raises_vmerror(self):
-        """Other OSError raises VmError."""
+    async def test_setup_other_oserror_raises_config_error(self, cgroup_root: Path):
+        """Other OSError raises ConfigError HOST_DEPENDENCY."""
         from exec_sandbox.cgroup import setup_cgroup
-        from exec_sandbox.exceptions import VmError
+        from exec_sandbox.exceptions import ConfigError, ErrorCode
 
         error = OSError("Disk full")
         error.errno = 28  # ENOSPC
 
-        with patch("aiofiles.os.makedirs", new_callable=AsyncMock, side_effect=error):
-            with pytest.raises(VmError, match="Failed to setup cgroup"):
+        with patch.object(Path, "mkdir", side_effect=error):
+            with pytest.raises(
+                ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="Failed to setup cgroup"
+            ):
                 await setup_cgroup("vm123", "tenant1", cgroup_memory_mb=256, cgroup_cpu_cores=1.0)
 
 
@@ -615,46 +664,45 @@ class TestAttachToCgroup:
     """Test cgroup process attachment."""
 
     # --- Normal cases ---
-    async def test_attach_writes_pid_to_cgroup_procs(self):
-        """Normal attach writes PID to cgroup.procs."""
+    async def test_attach_writes_pid_to_cgroup_procs(self, tmp_path: Path):
+        """Normal attach writes PID to cgroup.procs, off the event loop thread."""
         from exec_sandbox.cgroup import attach_to_cgroup
 
-        mock_file = MagicMock()
-        mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-        mock_file.__aexit__ = AsyncMock(return_value=None)
-        mock_file.write = AsyncMock()
+        loop_thread = threading.get_ident()
+        writes: list[tuple[str, str, int]] = []
 
-        with patch("aiofiles.open", return_value=mock_file):
-            await attach_to_cgroup(Path("/sys/fs/cgroup/test"), 12345)
+        def write_text(path: Path, data: str) -> int:
+            writes.append((path.name, data, threading.get_ident()))
+            return len(data)
 
-            mock_file.write.assert_called_once_with("12345")
+        with patch.object(Path, "write_text", autospec=True, side_effect=write_text):
+            await attach_to_cgroup(tmp_path, 12345)
+
+        assert [(name, data) for name, data, _ in writes] == [("cgroup.procs", "12345")]
+        assert writes[0][2] != loop_thread
 
     # --- Error cases ---
-    async def test_attach_oserror_raises_vmerror(self):
-        """OSError during attach raises VmError."""
+    async def test_attach_oserror_raises_config_error(self, tmp_path: Path):
+        """OSError during attach raises ConfigError HOST_DEPENDENCY."""
         from exec_sandbox.cgroup import attach_to_cgroup
-        from exec_sandbox.exceptions import VmError
+        from exec_sandbox.exceptions import ConfigError, ErrorCode
 
-        mock_file = MagicMock()
-        mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-        mock_file.__aexit__ = AsyncMock(return_value=None)
-        mock_file.write = AsyncMock(side_effect=OSError("No such process"))
+        with patch.object(Path, "write_text", side_effect=OSError(errno.ESRCH, "No such process")):
+            with pytest.raises(
+                ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="Failed to attach PID"
+            ):
+                await attach_to_cgroup(tmp_path, 12345)
 
-        with patch("aiofiles.open", return_value=mock_file):
-            with pytest.raises(VmError, match="Failed to attach PID"):
-                await attach_to_cgroup(Path("/sys/fs/cgroup/test"), 12345)
-
-    async def test_attach_permission_error_raises_vmerror(self):
-        """PermissionError during attach raises VmError."""
+    async def test_attach_permission_error_raises_config_error(self, tmp_path: Path):
+        """PermissionError during attach raises ConfigError HOST_DEPENDENCY."""
         from exec_sandbox.cgroup import attach_to_cgroup
-        from exec_sandbox.exceptions import VmError
+        from exec_sandbox.exceptions import ConfigError, ErrorCode
 
-        mock_file = MagicMock()
-        mock_file.__aenter__ = AsyncMock(side_effect=PermissionError("Access denied"))
-
-        with patch("aiofiles.open", return_value=mock_file):
-            with pytest.raises(VmError, match="Failed to attach PID"):
-                await attach_to_cgroup(Path("/sys/fs/cgroup/test"), 12345)
+        with patch.object(Path, "write_text", side_effect=PermissionError("Access denied")):
+            with pytest.raises(
+                ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY, match="Failed to attach PID"
+            ):
+                await attach_to_cgroup(tmp_path, 12345)
 
 
 # =============================================================================
@@ -724,100 +772,64 @@ class TestReadCgroupStats:
     """Test cgroup stats reading."""
 
     # --- Edge cases (None/missing) ---
-    async def test_returns_none_for_none_path(self):
+    def test_returns_none_for_none_path(self):
         """Returns (None, None, None) for None path."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(None)
+        cpu_ms, mem_mb, nr_throttled = read_cgroup_stats(None)
         assert cpu_ms is None
         assert mem_mb is None
         assert nr_throttled is None
 
-    async def test_returns_none_for_nonexistent_path(self):
+    def test_returns_none_for_nonexistent_path(self):
         """Returns (None, None, None) for non-existent path."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        result = await read_cgroup_stats(Path("/nonexistent/cgroup"))
+        result = read_cgroup_stats(Path("/nonexistent/cgroup"))
         assert result == (None, None, None)
 
     # --- Normal cases ---
-    async def test_reads_cpu_and_memory_stats(self):
+    def test_reads_cpu_and_memory_stats(self, tmp_path: Path):
         """Reads and parses cpu.stat and memory.peak correctly."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        cpu_stat_content = "usage_usec 5000000\nuser_usec 3000000\nsystem_usec 2000000\nnr_throttled 42"
-        memory_peak_content = "104857600"  # 100MB in bytes
+        (tmp_path / "cpu.stat").write_text(
+            "usage_usec 5000000\nuser_usec 3000000\nsystem_usec 2000000\nnr_throttled 42"
+        )
+        (tmp_path / "memory.peak").write_text("104857600")  # 100MB in bytes
 
-        async def mock_exists(path: Any) -> bool:
-            return True
+        cpu_ms, mem_mb, nr_throttled = read_cgroup_stats(tmp_path)
 
-        def mock_open_file(path: Any, *args: Any, **kwargs: Any) -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-
-            if "cpu.stat" in str(path):
-                mock_file.read = AsyncMock(return_value=cpu_stat_content)
-            elif "memory.peak" in str(path):
-                mock_file.read = AsyncMock(return_value=memory_peak_content)
-
-            return mock_file
-
-        with (
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_open_file),
-        ):
-            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
-
-            assert cpu_ms == 5000  # 5000000 usec = 5000 ms
-            assert mem_mb == 100  # 104857600 bytes = 100 MB
-            assert nr_throttled == 42
+        assert cpu_ms == 5000  # 5000000 usec = 5000 ms
+        assert mem_mb == 100  # 104857600 bytes = 100 MB
+        assert nr_throttled == 42
 
     # --- Error cases ---
-    async def test_handles_malformed_cpu_stat(self):
+    def test_handles_malformed_cpu_stat(self, tmp_path: Path):
         """Handles malformed cpu.stat gracefully."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        async def mock_exists(path: Any) -> bool:
-            return True
+        (tmp_path / "cpu.stat").write_text("garbage data not_a_number")
+        (tmp_path / "memory.peak").write_text("garbage data not_a_number")
 
-        def mock_open_file(path: Any, *args: Any, **kwargs: Any) -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.read = AsyncMock(return_value="garbage data not_a_number")
-            return mock_file
+        cpu_ms, mem_mb, nr_throttled = read_cgroup_stats(tmp_path)
 
-        with (
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_open_file),
-        ):
-            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
+        # Should return None on parse error, not crash
+        assert cpu_ms is None
+        assert mem_mb is None
+        assert nr_throttled is None
 
-            # Should return None on parse error, not crash
-            assert cpu_ms is None
-            assert mem_mb is None
-            assert nr_throttled is None
-
-    async def test_handles_oserror_during_read(self):
+    def test_handles_oserror_during_read(self, tmp_path: Path):
         """Handles OSError during file read gracefully."""
         from exec_sandbox.cgroup import read_cgroup_stats
 
-        async def mock_exists(path: Any) -> bool:
-            return True
+        (tmp_path / "cpu.stat").mkdir()  # exists, but reading it raises IsADirectoryError
 
-        def mock_open_file(path: Any, *args: Any, **kwargs: Any) -> MagicMock:
-            raise OSError("Device not configured")
+        cpu_ms, mem_mb, nr_throttled = read_cgroup_stats(tmp_path)
 
-        with (
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_open_file),
-        ):
-            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(Path("/sys/fs/cgroup/test"))
-
-            assert cpu_ms is None
-            assert mem_mb is None
-            assert nr_throttled is None
+        assert cpu_ms is None
+        assert mem_mb is None
+        assert nr_throttled is None
 
 
 # =============================================================================
@@ -845,158 +857,90 @@ class TestCleanupCgroup:
         assert result is True
 
     # --- Normal cases ---
-    async def test_removes_empty_cgroup(self):
-        """Removes empty cgroup directory."""
+    async def test_removes_empty_cgroup(self, cgroup_root: Path):
+        """Removes empty cgroup directory, off the event loop thread."""
         from exec_sandbox.cgroup import cleanup_cgroup
 
-        async def mock_exists(path: Any) -> bool:
-            return True
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+        real_rmdir = Path.rmdir
 
-        def mock_read_file(path: Any, *args: Any, **kwargs: Any) -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.read = AsyncMock(return_value="")  # No PIDs
-            return mock_file
+        def rmdir(path: Path) -> None:
+            threads.append(threading.get_ident())
+            real_rmdir(path)
 
-        with (
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_read_file),
-            patch("aiofiles.os.rmdir", new_callable=AsyncMock) as mock_rmdir,
-        ):
-            cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
+        with patch.object(Path, "rmdir", autospec=True, side_effect=rmdir):
             result = await cleanup_cgroup(cgroup_path, "test-ctx")
 
-            assert result is True
-            mock_rmdir.assert_called_once_with(cgroup_path)
+        assert result is True
+        assert not cgroup_path.exists()
+        assert threads
+        assert loop_thread not in threads
 
-    async def test_migrates_pids_before_removal(self):
+    async def test_migrates_pids_before_removal(self, cgroup_root: Path):
         """Moves PIDs to parent cgroup before removing."""
         from exec_sandbox.cgroup import cleanup_cgroup
 
-        written_pids: list[str] = []
-
-        async def mock_exists(path: Any) -> bool:
-            return True
-
-        def mock_open_file(path: Any, mode: str = "r") -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-
-            if mode == "r" or mode not in ("w", "a"):
-                # Reading cgroup.procs
-                mock_file.read = AsyncMock(return_value="123\n456\n789")
-            else:
-                # Writing to parent cgroup.procs
-                async def capture_write(pid: str) -> None:
-                    written_pids.append(pid)
-
-                mock_file.write = AsyncMock(side_effect=capture_write)
-
-            return mock_file
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
+        (cgroup_path.parent / "cgroup.procs").write_text("")
+        (cgroup_path / "cgroup.procs").write_text("123\n456\n789")
+        written: list[tuple[str, str]] = []
 
         with (
-            patch("exec_sandbox.cgroup._check_cgroup_v2_mounted", return_value=True),
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_open_file),
-            patch("aiofiles.os.rmdir", new_callable=AsyncMock),
+            patch.object(Path, "write_text", autospec=True, side_effect=_record_writes(written, fail_first=False)),
+            patch.object(Path, "rmdir") as mock_rmdir,
         ):
-            cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
             result = await cleanup_cgroup(cgroup_path, "test-ctx")
 
-            assert result is True
-            assert "123" in written_pids
-            assert "456" in written_pids
-            assert "789" in written_pids
+        assert result is True
+        assert written == [("cgroup.procs", "123"), ("cgroup.procs", "456"), ("cgroup.procs", "789")]
+        mock_rmdir.assert_called_once_with()
 
     # --- Error cases ---
-    async def test_handles_already_deleted_cgroup(self):
+    async def test_handles_already_deleted_cgroup(self, cgroup_root: Path):
         """FileNotFoundError during rmdir returns True (already deleted)."""
         from exec_sandbox.cgroup import cleanup_cgroup
 
-        async def mock_exists(path: Any) -> bool:
-            return True
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"  # never made
+        result = await cleanup_cgroup(cgroup_path, "test-ctx")
 
-        def mock_read_file(path: Any, *args: Any, **kwargs: Any) -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.read = AsyncMock(return_value="")
-            return mock_file
+        assert result is True  # Race condition - already deleted
 
-        with (
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_read_file),
-            patch("aiofiles.os.rmdir", new_callable=AsyncMock, side_effect=FileNotFoundError),
-        ):
-            cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
-            result = await cleanup_cgroup(cgroup_path, "test-ctx")
-
-            assert result is True  # Race condition - already deleted
-
-    async def test_handles_rmdir_oserror(self):
+    async def test_handles_rmdir_oserror(self, cgroup_root: Path):
         """OSError during rmdir returns False."""
         from exec_sandbox.cgroup import cleanup_cgroup
 
-        async def mock_exists(path: Any) -> bool:
-            return True
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
+        (cgroup_path / "leftover").write_text("")  # rmdir: Directory not empty
 
-        def mock_read_file(path: Any, *args: Any, **kwargs: Any) -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-            mock_file.read = AsyncMock(return_value="")
-            return mock_file
+        result = await cleanup_cgroup(cgroup_path, "test-ctx")
 
-        with (
-            patch("exec_sandbox.cgroup._check_cgroup_v2_mounted", return_value=True),
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_read_file),
-            patch("aiofiles.os.rmdir", new_callable=AsyncMock, side_effect=OSError("Directory not empty")),
-        ):
-            cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
-            result = await cleanup_cgroup(cgroup_path, "test-ctx")
+        assert result is False
 
-            assert result is False
-
-    async def test_handles_pid_migration_error_gracefully(self):
+    async def test_handles_pid_migration_error_gracefully(self, cgroup_root: Path):
         """Continues cleanup even if PID migration fails (process already exited)."""
         from exec_sandbox.cgroup import cleanup_cgroup
 
-        call_count = {"read": 0, "write": 0}
-
-        async def mock_exists(path: Any) -> bool:
-            return True
-
-        def mock_open_file(path: Any, mode: str = "r") -> MagicMock:
-            mock_file = MagicMock()
-            mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-            mock_file.__aexit__ = AsyncMock(return_value=None)
-
-            if mode == "r" or mode not in ("w", "a"):
-                call_count["read"] += 1
-                mock_file.read = AsyncMock(return_value="123\n456")
-            else:
-                call_count["write"] += 1
-                # First PID fails, second succeeds
-                if call_count["write"] == 1:
-                    mock_file.write = AsyncMock(side_effect=OSError("No such process"))
-                else:
-                    mock_file.write = AsyncMock()
-
-            return mock_file
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
+        (cgroup_path.parent / "cgroup.procs").write_text("")
+        (cgroup_path / "cgroup.procs").write_text("123\n456")
+        written: list[tuple[str, str]] = []
 
         with (
-            patch("aiofiles.os.path.exists", side_effect=mock_exists),
-            patch("aiofiles.open", side_effect=mock_open_file),
-            patch("aiofiles.os.rmdir", new_callable=AsyncMock),
+            patch.object(Path, "write_text", autospec=True, side_effect=_record_writes(written, fail_first=True)),
+            patch.object(Path, "rmdir") as mock_rmdir,
         ):
-            cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
             result = await cleanup_cgroup(cgroup_path, "test-ctx")
 
-            # Should succeed even though one PID migration failed
-            assert result is True
+        # Should succeed even though one PID migration failed
+        assert result is True
+        assert written == [("cgroup.procs", "123"), ("cgroup.procs", "456")]
+        mock_rmdir.assert_called_once_with()
 
 
 # =============================================================================
@@ -1262,7 +1206,7 @@ class TestCgroupIntegration:
             await proc.wait()
 
             # Read stats
-            cpu_ms, mem_mb, nr_throttled = await read_cgroup_stats(cgroup_path)
+            cpu_ms, mem_mb, nr_throttled = read_cgroup_stats(cgroup_path)
 
             # Stats should have values (process did work)
             assert cpu_ms is not None, "CPU stats not available"

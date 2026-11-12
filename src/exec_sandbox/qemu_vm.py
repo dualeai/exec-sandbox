@@ -658,7 +658,7 @@ class QemuVM:
             )
 
             # Measure external resources from host (cgroup v2)
-            external_cpu_ms, external_mem_mb, external_nr_throttled = await self._read_cgroup_stats()
+            external_cpu_ms, external_mem_mb, external_nr_throttled = cgroup.read_cgroup_stats(self.cgroup_path)
 
             if external_nr_throttled is not None and external_nr_throttled > self._prev_nr_throttled:
                 new_throttles = external_nr_throttled - self._prev_nr_throttled

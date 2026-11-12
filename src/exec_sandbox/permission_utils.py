@@ -499,8 +499,10 @@ async def chmod_executable(path: Path) -> None:
     await asyncio.to_thread(path.chmod, 0o755)
 
 
-async def get_mode(path: Path) -> int | None:
+def get_mode(path: Path) -> int | None:
     """Get file mode bits.
+
+    One metadata call: direct, a worker thread costs 30 times more.
 
     Args:
         path: File or directory path
@@ -509,9 +511,8 @@ async def get_mode(path: Path) -> int | None:
         Mode bits as integer, or None if file doesn't exist
     """
     try:
-        stat_result = await aiofiles.os.stat(path)
-        return stat_result.st_mode
-    except (OSError, FileNotFoundError):
+        return path.stat().st_mode
+    except OSError:
         return None
 
 
@@ -656,10 +657,10 @@ async def sudo_rm(path: Path) -> bool:
 # =============================================================================
 
 
-async def can_access(path: Path | str, mode: int = os.R_OK | os.W_OK) -> bool:
+def can_access(path: Path | str, mode: int) -> bool:
     """Check if current user can access path with specified mode.
 
-    Async wrapper around os.access() using aiofiles.
+    One metadata call (callers check device and library paths).
 
     Args:
         path: File or directory path

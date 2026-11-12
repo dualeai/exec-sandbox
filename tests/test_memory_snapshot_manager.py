@@ -15,9 +15,12 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
-import hashlib
 import json
+import logging
 import os
+import shutil
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -226,6 +229,91 @@ class TestComputeCacheKey:
         """None QEMU version should produce stable key with 'unknown'."""
         key = await self._compute_key(manager, qemu_version=None)
         assert key.startswith("l1-python-v")
+
+
+class TestVmstateDigest:
+    """The L1 integrity digest: every non-zero byte, its offset and the size count; holes are not read."""
+
+    _SIZE = 1024 * 1024 * 1024  # APFS reports the holes of a large sparse file only
+    _LAYOUT_SIZE = 64 * 1024 * 1024  # APFS reports its holes; cheap to read whole
+
+    @staticmethod
+    def _sparse(path: Path, writes: dict[int, bytes], *, size: int) -> Path:
+        with path.open("wb") as f:
+            f.truncate(size)
+            for offset, data in writes.items():
+                f.seek(offset)
+                f.write(data)
+        return path
+
+    @staticmethod
+    def _data_ranges(path: Path) -> list[tuple[int, int]]:
+        """The (start, end) data ranges the filesystem reports (SEEK_DATA / SEEK_HOLE)."""
+        ranges: list[tuple[int, int]] = []
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            size, pos = os.fstat(fd).st_size, 0
+            while pos < size:
+                try:
+                    start = os.lseek(fd, pos, os.SEEK_DATA)
+                except OSError:  # ENXIO: no data after pos
+                    break
+                pos = os.lseek(fd, start, os.SEEK_HOLE)
+                ranges.append((start, pos))
+        finally:
+            os.close(fd)
+        return ranges
+
+    def test_hole_layout_does_not_change_it(self, tmp_path: Path) -> None:
+        """The same bytes in two hole layouts (zeros written into a hole of one): same digest."""
+        sparse = self._sparse(tmp_path / "sparse", {70_000: b"data"}, size=self._LAYOUT_SIZE)
+        zeros_written = self._sparse(
+            tmp_path / "zeros_written", {70_000: b"data", 32 * 1024 * 1024: bytes(64 * 1024)}, size=self._LAYOUT_SIZE
+        )
+        # Precondition: without holes both files have one layout and the test proves nothing
+        assert self._data_ranges(sparse) != self._data_ranges(zeros_written)
+        assert _vmstate_digest(sparse) == _vmstate_digest(zeros_written)
+
+    def test_each_change_changes_it(self, tmp_path: Path) -> None:
+        base = {70_000: b"data", 500_000_000: b"tail"}
+        digest = _vmstate_digest(self._sparse(tmp_path / "base", base, size=self._SIZE))
+        changed = {
+            "data byte": ({70_000: b"dAta", 500_000_000: b"tail"}, self._SIZE),
+            "byte in a hole": ({**base, 900_000_000: b"x"}, self._SIZE),
+            "block moved": ({70_000 + 64 * 1024: b"data", 500_000_000: b"tail"}, self._SIZE),
+            "zeros appended": (base, self._SIZE + 1),
+        }
+        for name, (writes, size) in changed.items():
+            assert _vmstate_digest(self._sparse(tmp_path / name, writes, size=size)) != digest, name
+
+    def test_without_seek_data_every_block_is_read_and_the_digest_is_the_same(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A filesystem without SEEK_DATA: the whole file is read, and holes still hash as zero blocks."""
+        path = self._sparse(tmp_path / "vmstate", {70_000: b"data"}, size=self._LAYOUT_SIZE)
+        # Precondition: the file has holes, so the two paths read different blocks
+        assert self._data_ranges(path) != [(0, self._LAYOUT_SIZE)]
+        with_ranges = _vmstate_digest(path)
+
+        def no_seek_data(*_args: object, **_kwargs: object) -> list[tuple[int, int]]:
+            raise OSError(errno.EINVAL, "SEEK_DATA not supported")
+
+        monkeypatch.setattr("exec_sandbox.memory_snapshot_manager.data_ranges", no_seek_data)
+        assert _vmstate_digest(path) == with_ranges
+
+    def test_holes_are_not_read(self, tmp_path: Path) -> None:
+        path = self._sparse(tmp_path / "vmstate", {0: b"a", 600_000_000: b"b"}, size=self._SIZE)
+        real_pread = os.pread
+        read: list[int] = []
+
+        def counting_pread(fd: int, n: int, offset: int) -> bytes:
+            data = real_pread(fd, n, offset)
+            read.append(len(data))
+            return data
+
+        with patch.object(os, "pread", counting_pread):
+            _vmstate_digest(path)
+        assert sum(read) <= 64 * 64 * 1024  # 2 data blocks, plus what the filesystem rounds into data
 
 
 class TestCheckCache:
@@ -1000,11 +1088,129 @@ class TestSaveSnapshotEdgeCases:
         # Eviction should have removed old entry
         assert not old_vmstate.exists()
 
+    async def test_ram_and_home_flushed_before_the_entry_is_published(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """The digest covers the vmstate only: the RAM template and the home disk go
+        through to the disk before the metadata and the rename publish the entry."""
+        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
+        key = await manager.compute_cache_key(spec, l2_path=None)
+        vmstate_path, meta_path = manager._cache_paths(key)
+        ram_path = manager.ram_path_from_vmstate(vmstate_path)
+        ram_path.write_bytes(b"ram template")  # the template save maps it before QEMU starts
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        vm = MagicMock()
+        vm.qmp_socket = Path("/tmp/fake.sock")
+        vm.use_qemu_vm_user = False
+        vm.workdir.home_disk = home_disk
+
+        async def write_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"vmstate")
+
+        flushed: list[tuple[Path, bool]] = []
+
+        def recording_flush(fd: int) -> None:
+            flushed.append((_fd_path(fd), meta_path.exists()))
+
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
+            patch("exec_sandbox.memory_snapshot_manager.flush_to_disk", recording_flush),
+        ):
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            await manager._do_save(vm, key, vmstate_path, meta_path, spec)
+
+        assert vmstate_path.exists()
+        home_path = manager.home_path_from_vmstate(vmstate_path)
+        assert sorted(flushed) == sorted([(ram_path.resolve(), False), (home_path.resolve(), False)])
+
+    async def test_saved_entry_is_a_hit(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """An entry _do_save publishes passes check_cache: the save writes the digest the
+        check computes. (The other tests build their entries with _vmstate_digest, so
+        they cannot see a save that writes another digest.)"""
+        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
+        key = await manager.compute_cache_key(spec, l2_path=None)
+        vmstate_path, meta_path = manager._cache_paths(key)
+        manager.ram_path_from_vmstate(vmstate_path).write_bytes(b"ram template")  # a template entry
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        vm = MagicMock()
+        vm.qmp_socket = Path("/tmp/fake.sock")
+        vm.use_qemu_vm_user = False
+        vm.workdir.home_disk = home_disk
+
+        async def write_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"vmstate")
+
+        with patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client:
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            assert await manager._do_save(vm, key, vmstate_path, meta_path, spec) == vmstate_path
+
+        assert await manager.check_cache(key) == vmstate_path
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root opens a file of mode 0")
+    async def test_entry_file_this_process_cannot_open_is_published_unflushed(
+        self,
+        manager: MemorySnapshotManager,
+        mock_system_probes: dict[str, Any],
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A RAM template QEMU made as another user (qemu-vm) that this process may not open:
+        the save still publishes the entry; that file is logged and not flushed."""
+        spec = VmSpec(language=Language.PYTHON, packages=(), memory_mb=512, cpu_cores=1)
+        key = await manager.compute_cache_key(spec, l2_path=None)
+        vmstate_path, meta_path = manager._cache_paths(key)
+        ram_path = manager.ram_path_from_vmstate(vmstate_path)
+        ram_path.write_bytes(b"ram template")
+        ram_path.chmod(0)
+        home_disk = tmp_path / "home.img"
+        home_disk.write_bytes(b"home")
+        vm = MagicMock()
+        vm.qmp_socket = Path("/tmp/fake.sock")
+        vm.use_qemu_vm_user = False
+        vm.workdir.home_disk = home_disk
+
+        async def write_vmstate(path: Path, **_kwargs: object) -> None:
+            path.write_bytes(b"vmstate")
+
+        flushed: list[Path] = []
+        with (
+            patch("exec_sandbox.memory_snapshot_manager.MigrationClient") as mock_client,
+            patch("exec_sandbox.memory_snapshot_manager.flush_to_disk", lambda fd: flushed.append(_fd_path(fd))),
+            caplog.at_level(logging.WARNING, logger="exec_sandbox.memory_snapshot_manager"),
+        ):
+            client = AsyncMock()
+            client.save_snapshot.side_effect = write_vmstate
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = client
+            result = await manager._do_save(vm, key, vmstate_path, meta_path, spec)
+
+        assert result == vmstate_path
+        assert meta_path.exists()
+        assert flushed == [manager.home_path_from_vmstate(vmstate_path).resolve()]
+        assert [r.path for r in caplog.records if r.getMessage() == "L1 entry file not flushed (no access)"] == [  # type: ignore[attr-defined]
+            str(ram_path)
+        ]
+
     async def test_do_save_cancelled_error_cleanup(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """_do_save: CancelledError during migration → clean up partial files, re-raise."""
-        key = await manager.compute_cache_key(Language.PYTHON, [], 512)
+        key = await manager.compute_cache_key(
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
+        )
         vmstate_path, meta_path = manager._cache_paths(key)
         tmp_path = vmstate_path.parent / f"{vmstate_path.name}.tmp"
 

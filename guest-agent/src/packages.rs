@@ -149,6 +149,9 @@ pub(crate) async fn install_packages(
             c.arg("pip")
                 .arg("install")
                 .arg("--no-build")
+                // The package layer is read-only at run time: compile now, or every
+                // import recompiles in memory.
+                .arg("--compile-bytecode")
                 .arg("--python")
                 .arg(format!("{PYTHON_HOME}/bin/python3"))
                 .arg("--target")

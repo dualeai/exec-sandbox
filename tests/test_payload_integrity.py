@@ -219,7 +219,7 @@ class TestPythonStreamingIntegrity:
         """Verify streaming receives uncorrupted data."""
         size_name, size_bytes = medium_payload_size
 
-        expected_hash = bytes_hash(generate_ascii_pattern(size_bytes))
+        expected_hash = hashlib.sha256(generate_ascii_pattern(size_bytes)).hexdigest()
         code = python_code_for_ascii_pattern(size_bytes)
 
         streamed_chunks: list[str] = []
@@ -244,7 +244,7 @@ class TestPythonStreamingIntegrity:
         )
 
         # Verify final result matches streamed
-        final_hash = bytes_hash(result.stdout.rstrip("\n").encode("utf-8"))
+        final_hash = hashlib.sha256(result.stdout.rstrip("\n").encode("utf-8")).hexdigest()
         assert final_hash == streamed_hash, f"[{size_name}] Final vs streamed mismatch!"
 
 
@@ -289,7 +289,7 @@ class TestBinaryPayloadIntegrity:
         size_name, size_bytes = small_payload_size
 
         expected_binary = generate_sequential_bytes(size_bytes)
-        expected_hash = bytes_hash(expected_binary)
+        expected_hash = hashlib.sha256(expected_binary).hexdigest()
 
         code = f"""
 import base64
@@ -329,7 +329,7 @@ class TestVMHashVerification:
         size_name, size_bytes = small_payload_size
 
         expected_data = generate_ascii_pattern(size_bytes)
-        expected_hash = bytes_hash(expected_data)
+        expected_hash = hashlib.sha256(expected_data).hexdigest()
 
         code = f"""
 import hashlib
@@ -363,7 +363,7 @@ sys.stdout.flush()
         )
 
         # Data we received matches?
-        host_hash = bytes_hash(received_data.encode("utf-8"))
+        host_hash = hashlib.sha256(received_data.encode("utf-8")).hexdigest()
         assert host_hash == expected_hash, f"[{size_name}] Received data corrupted in transit!"
 
 
@@ -517,7 +517,7 @@ class TestStreamingStress:
         num_iterations = 20
         payload_size = 100_000  # 100KB each
 
-        expected_hash = bytes_hash(generate_ascii_pattern(payload_size))
+        expected_hash = hashlib.sha256(generate_ascii_pattern(payload_size)).hexdigest()
         code = python_code_for_ascii_pattern(payload_size)
 
         for i in range(num_iterations):

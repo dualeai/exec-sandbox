@@ -269,7 +269,7 @@ class OverlayPool:
 
         # Create pool directory (graceful degradation on permission errors)
         try:
-            await aiofiles.os.makedirs(self._pool_dir, exist_ok=True)
+            self._pool_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             logger.warning(
                 "Failed to create overlay pool directory, pool disabled",
@@ -329,7 +329,7 @@ class OverlayPool:
             self._daemon = None
 
         # Clean up pool directory
-        if await aiofiles.os.path.exists(self._pool_dir):
+        if self._pool_dir.exists():
             try:
                 await asyncio.to_thread(shutil.rmtree, self._pool_dir)
             except OSError as e:
@@ -359,10 +359,10 @@ class OverlayPool:
         Raises:
             FileExistsError: target_path already exists
             RuntimeError: Daemon not started (call start() first)
-            QemuStorageDaemonError: Failed to create overlay via daemon
+            TransientError: OVERLAY_FAILED if the daemon failed to create the overlay
         """
         # Prevent silent overwrite of existing files
-        if await aiofiles.os.path.exists(target_path):
+        if target_path.exists():
             raise FileExistsError(f"Target overlay already exists: {target_path}")
 
         key = str(base_image.resolve())
@@ -397,14 +397,12 @@ class OverlayPool:
                     e,
                     extra={"source": str(overlay_path), "target": str(target_path)},
                 )
-                # Clean up the orphaned overlay file
+                # Clean up the orphaned overlay file (a new overlay: metadata only, small)
                 with contextlib.suppress(OSError):
-                    if await aiofiles.os.path.exists(overlay_path):
-                        await aiofiles.os.remove(overlay_path)
+                    overlay_path.unlink(missing_ok=True)
                 # Clean up partial target that cross-FS copy may have created
                 with contextlib.suppress(OSError):
-                    if await aiofiles.os.path.exists(target_path):
-                        await aiofiles.os.remove(target_path)
+                    target_path.unlink(missing_ok=True)
                 # Fall through to slow path
         except asyncio.QueueEmpty:
             logger.debug(
@@ -439,7 +437,7 @@ class OverlayPool:
                 await self._daemon.create_overlay(base_image, overlay_path)
 
                 # Defense-in-depth: verify file was actually created
-                if not await aiofiles.os.path.exists(overlay_path):
+                if not overlay_path.exists():
                     logger.warning(
                         "Daemon returned success but overlay file missing",
                         extra={"overlay_path": str(overlay_path), "base_image": str(base_image)},

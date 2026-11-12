@@ -116,44 +116,12 @@ async def file_hash(path: Path, algorithm: str = "sha256") -> str:
     Returns:
         Hex digest string
     """
-    hasher = IncrementalHasher(algorithm)
-    async with aiofiles.open(path, "rb") as f:
-        while chunk := await f.read(FILE_HASH_CHUNK_SIZE):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+    return await asyncio.to_thread(_file_digest, path, algorithm)
 
 
-def file_hash_iter(chunks: Iterator[bytes], algorithm: str = "sha256") -> str:
-    """Compute cryptographic hash from an iterator of chunks.
-
-    Use for streaming hash computation during downloads.
-
-    Args:
-        chunks: Iterator yielding bytes chunks
-        algorithm: Hash algorithm (default: sha256)
-
-    Returns:
-        Hex digest string
-    """
-    hasher = IncrementalHasher(algorithm)
-    for chunk in chunks:
-        hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def bytes_hash(data: bytes, algorithm: str = "sha256") -> str:
-    """Compute cryptographic hash of bytes.
-
-    Args:
-        data: Bytes to hash
-        algorithm: Hash algorithm (default: sha256)
-
-    Returns:
-        Hex digest string
-    """
-    hasher = IncrementalHasher(algorithm)
-    hasher.update(data)
-    return hasher.hexdigest()
+def _file_digest(path: Path, algorithm: str) -> str:
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, algorithm).hexdigest()
 
 
 def parse_hash_spec(hash_spec: str) -> tuple[str, str]:

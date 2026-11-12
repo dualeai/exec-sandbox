@@ -8,37 +8,35 @@ Provides zero-memory-copy streaming for large files.
 from __future__ import annotations
 
 import asyncio
+import functools
 import http
 import os
-import tarfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-import aiofiles
-import aiohttp
+from typing import TYPE_CHECKING, BinaryIO
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import AssetChecksumError, AssetDownloadError, AssetNotFoundError
+from exec_sandbox.aio_utils import run_to_end
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.hash_utils import IncrementalHasher, file_hash, parse_hash_spec
 from exec_sandbox.lock_utils import file_lock
-from exec_sandbox.platform_utils import get_arch_name, get_cache_dir, get_os_name
+from exec_sandbox.platform_utils import UserDir, get_arch_name, get_os_name, get_user_dir
 
 logger = get_logger(__name__)
 
-# Chunk size for streaming downloads and decompression (64KB)
+# Chunk size for streaming decompression (64KB)
 CHUNK_SIZE = 64 * 1024
 
-# Default retry settings
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_RETRY_DELAY = 1.0  # seconds
+# Download chunk: one worker-thread job (hash + write) each. A job hop costs 70 us on
+# an idle host, 700 us on a loaded one: with 64 KiB chunks the hops cap a download at
+# 600 MB/s (idle) to 80 MB/s (loaded); with 1 MiB chunks, 2100 MB/s (idle).
+_WRITE_CHUNK = 1024 * 1024
 
-
-def os_cache(app_name: str) -> Path:
-    """Alias for get_cache_dir (pooch compatibility)."""
-    return get_cache_dir(app_name)
+# Retry settings
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # seconds, doubled at each attempt
 
 
 async def retrieve(
@@ -181,28 +179,38 @@ async def _download_file(url: str, dest: Path, expected_hash: str, progressbar: 
             total_size = resp.content_length
             downloaded = 0
 
-            async with aiofiles.open(temp_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                    hasher.update(chunk)  # Hash as we go
-                    await f.write(chunk)  # Write as we go
+            f = temp_path.open("wb")
+            try:
+                async for chunk in resp.content.iter_chunked(_WRITE_CHUNK):
+                    # Hash and write as we go, in one worker-thread job per chunk: a write
+                    # into the page cache can wait for writeback. A cancel waits for the
+                    # job, so the file never closes under a write.
+                    await run_to_end(functools.partial(_hash_and_write, chunk, hasher=hasher, sink=f))
                     downloaded += len(chunk)
 
                     if progressbar and total_size:
                         pct = (downloaded / total_size) * 100
-                        if downloaded == total_size or downloaded % (CHUNK_SIZE * 16) == 0:
+                        if downloaded == total_size or downloaded % _WRITE_CHUNK == 0:
                             logger.debug(
                                 "Download progress",
                                 extra={"percent": f"{pct:.1f}%", "downloaded": downloaded, "total": total_size},
                             )
+            finally:
+                # In a worker thread: the cache folder can be on NFS, where close writes
+                # back every dirty page of the image. A cancel waits for the close.
+                await run_to_end(f.close)
 
         # Verify hash
         if expected_digest:
             actual_digest = hasher.hexdigest()
             if actual_digest != expected_digest:
                 temp_path.unlink(missing_ok=True)
-                raise AssetChecksumError(
+                raise TransientError(
                     f"Hash mismatch for {url}",
+                    code=ErrorCode.ASSET_DOWNLOAD,
                     context={"expected": expected_hash, "actual": f"{algorithm}:{actual_digest}"},
+                    hint=None,
+                    instance_id=None,
                 )
 
         # Atomic rename
@@ -216,13 +224,18 @@ async def _download_file(url: str, dest: Path, expected_hash: str, progressbar: 
         raise
 
 
+def _hash_and_write(chunk: bytes, *, hasher: IncrementalHasher, sink: BinaryIO) -> None:
+    hasher.update(chunk)
+    sink.write(chunk)
+
+
 class AsyncPooch:
     """
     Async file registry manager (like pooch.Pooch but async).
 
     Example:
         ASSETS = AsyncPooch(
-            path=get_cache_dir(),
+            path=get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox"),
             base_url="https://github.com/dualeai/exec-sandbox/releases/download/{version}",
             version=__version__,
             env="EXEC_SANDBOX_CACHE_DIR",
