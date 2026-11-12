@@ -13,19 +13,22 @@ from typing import TYPE_CHECKING
 import pytest
 
 from exec_sandbox import Scheduler, SchedulerConfig
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.warm_vm_pool import Language
 
 if TYPE_CHECKING:
     from exec_sandbox.models import ExecutionResult
     from exec_sandbox.vm_manager import VmManager
 
-from .conftest import skip_unless_fast_balloon, skip_unless_hwaccel, skip_unless_macos_arm64
+from tests.conftest import run_once, run_timed
+
+from .conftest import skip_unless_fast_virt, skip_unless_hwaccel, skip_unless_macos_arm64
 
 # Memory-intensive tests that push VMs to near-maximum utilization (250MB in 256MB VM)
-# require fast balloon/memory operations. On x64 CI runners with nested virtualization
+# require fast memory operations. On x64 CI runners with nested virtualization
 # (GitHub Actions on Azure), these operations are 50-100x slower due to missing
 # TSC_DEADLINE timer support, causing timeouts and VM crashes. These tests are skipped
-# on degraded environments via skip_unless_fast_balloon and run on:
+# on degraded environments via skip_unless_fast_virt and run on:
 # - ARM64 Linux (native KVM, no nested virt penalty)
 # - macOS (HVF, no nested virt)
 # - Local development with native KVM/HVF
@@ -343,93 +346,23 @@ class TestZramMemLimit:
             # restores from L1 (no reach into private snapshot-manager state).
             restored = None
             for _ in range(10):
-                result = await asyncio.wait_for(
-                    scheduler.run(
-                        code=_INCOMPRESSIBLE_PRESSURE,
-                        language=Language.PYTHON,
-                        memory_mb=192,
+                result, startup, _ = await asyncio.wait_for(
+                    run_timed(
+                        scheduler,
+                        VmSpec(language=Language.PYTHON, memory_mb=192),
+                        _INCOMPRESSIBLE_PRESSURE,
                         timeout_seconds=60,
                     ),
                     timeout=30,
                 )
                 assert result.exit_code == 137, result.stderr
                 assert "WORKLOAD_STARTED" in result.stdout
-                assert result.warm_pool_hit is False
-                if result.l1_cache_hit:
+                assert startup.warm_pool_hit is False
+                if startup.l1_cache_hit:
                     restored = result
                     break
                 await asyncio.sleep(1)
             assert restored is not None, "no run restored from L1 within retry budget"
-
-
-# ============================================================================
-# Balloon Tests
-# ============================================================================
-
-
-class TestBalloonDevice:
-    """Tests for virtio-balloon device in guest.
-
-    Balloon is only present on cold-boot VMs (anonymous memory).  Template-restored
-    VMs (L1 cache hit) use file-backed COW memory which is incompatible with balloon.
-    """
-
-    async def test_balloon_device_and_driver(self, scheduler: Scheduler) -> None:
-        """Balloon device should be visible with correct type (5), bound to a driver, and expose features.
-
-        On L1-restored VMs (template COW), balloon is absent by design — verify
-        that instead.
-        """
-        result = await scheduler.run(
-            code="""
-import os
-
-virtio_path = '/sys/bus/virtio/devices'
-assert os.path.exists(virtio_path), f'{virtio_path} not found'
-
-found_balloon = False
-for dev in os.listdir(virtio_path):
-    modalias_path = os.path.join(virtio_path, dev, 'modalias')
-    if os.path.exists(modalias_path):
-        with open(modalias_path) as f:
-            modalias = f.read().strip()
-            if 'd00000005' not in modalias:
-                continue
-
-        found_balloon = True
-        print(f'Found balloon device: {dev}')
-        print(f'  modalias: {modalias}')
-
-        # Driver must be bound (proves driver is working)
-        driver_path = os.path.join(virtio_path, dev, 'driver')
-        assert os.path.islink(driver_path), f'Balloon device {dev} not bound to driver'
-        driver = os.path.basename(os.readlink(driver_path))
-        print(f'  driver: {driver}')
-
-        # Check features sysfs attribute
-        features_path = os.path.join(virtio_path, dev, 'features')
-        if os.path.exists(features_path):
-            with open(features_path) as f:
-                features = f.read().strip()
-                print(f'  features: {features}')
-
-        break
-
-if found_balloon:
-    print('PASS: Balloon device visible and driver functional')
-else:
-    print('NO_BALLOON: Balloon device absent (expected for template COW VMs)')
-""",
-            language=Language.PYTHON,
-        )
-        assert result.exit_code == 0, f"Failed: {result.stderr}"
-        if result.l1_cache_hit:
-            # Template-restored VM: balloon absent by design (COW file-backed memory)
-            assert "NO_BALLOON" in result.stdout
-        else:
-            # Cold-boot VM: balloon must be present
-            assert "PASS" in result.stdout
-            assert "d00000005" in result.stdout
 
 
 # ============================================================================
@@ -441,7 +374,7 @@ class TestConcurrentVMs:
     """Tests for multiple VMs running concurrently with memory features."""
 
     @pytest.mark.slow
-    @skip_unless_fast_balloon
+    @skip_unless_fast_virt
     async def test_concurrent_vms_with_heavy_memory_pressure(self, images_dir: Path) -> None:
         """Concurrent VMs should each handle 180MB allocation.
 

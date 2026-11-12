@@ -54,12 +54,11 @@ from tenacity import (
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled, settle_and_report
-from exec_sandbox.balloon_client import BalloonClient, BalloonError
-from exec_sandbox.exceptions import SocketAuthError, VmTransientError
+from exec_sandbox.exceptions import SocketAuthError
 from exec_sandbox.guest_agent_protocol import PingRequest, PongMessage, WarmReplAckMessage, WarmReplRequest
 from exec_sandbox.models import Language
-from exec_sandbox.permission_utils import get_expected_socket_uid
 from exec_sandbox.platform_utils import advise_willneed
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 
 if TYPE_CHECKING:
@@ -765,75 +764,18 @@ class WarmVMPool:
         if not vm.l1_restored and not repl_is_ready:
             await self._warm_repl(vm, language)
 
-        # L1 uses file-backed MAP_PRIVATE memory and has no balloon device.
-        if not vm.l1_restored:
-            await self._inflate_balloon(vm)
-            await cgroup.reclaim_memory(vm.cgroup_path)
+        # Every idle VM: with init_on_free its free pages are zero, so reclaiming up
+        # to the whole guest RAM moves them to zswap at almost no cost.
+        await cgroup.reclaim_memory(vm.cgroup_path, amount_mb=constants.DEFAULT_MEMORY_MB)
 
         if self._shutdown_event.is_set():
             raise asyncio.CancelledError
         await self.pools[language].put(vm)
 
-    async def _inflate_balloon(self, vm: QemuVM) -> None:
-        """Inflate balloon to reduce guest memory for idle pool VM.
-
-        Inflating the balloon takes memory FROM the guest, reducing idle footprint.
-        Graceful degradation: logs warning and continues if balloon fails.
-
-        Args:
-            vm: QemuVM to inflate balloon for
-        """
-        try:
-            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
-            async with BalloonClient(vm.qmp_socket, expected_uid) as client:
-                await client.inflate(target_mb=constants.BALLOON_INFLATE_TARGET_MB)
-                logger.debug(
-                    "Balloon inflated for warm pool VM",
-                    extra={"vm_id": vm.vm_id, "target_mb": constants.BALLOON_INFLATE_TARGET_MB},
-                )
-        except (BalloonError, OSError, TimeoutError) as e:
-            # Graceful degradation: log and continue
-            logger.warning(
-                "Balloon inflation failed (VM will use full memory)",
-                extra={"vm_id": vm.vm_id, "error": str(e)},
-            )
-
-    async def _deflate_balloon(self, vm: QemuVM) -> None:
-        """Deflate balloon to restore guest memory before code execution.
-
-        Deflating the balloon returns memory TO the guest. Uses fire-and-forget
-        mode (wait_for_target=False) to avoid blocking - the balloon command is
-        sent immediately and memory is restored progressively while code runs.
-
-        This eliminates up to 5s of polling overhead on slow systems (nested
-        virtualization) where balloon operations are degraded. Most code doesn't
-        need the full 192MB immediately - the idle memory (BALLOON_INFLATE_TARGET_MB)
-        is sufficient for runtime startup, and full memory becomes available within ~1s.
-
-        Graceful degradation: logs warning and continues if balloon fails.
-
-        Args:
-            vm: QemuVM to deflate balloon for
-        """
-        try:
-            expected_uid = get_expected_socket_uid(vm.use_qemu_vm_user)
-            async with BalloonClient(vm.qmp_socket, expected_uid) as client:
-                await client.deflate(target_mb=constants.DEFAULT_MEMORY_MB, wait_for_target=False)
-                logger.debug(
-                    "Balloon deflated for warm pool VM",
-                    extra={"vm_id": vm.vm_id, "target_mb": constants.DEFAULT_MEMORY_MB},
-                )
-        except (BalloonError, OSError, TimeoutError) as e:
-            # Graceful degradation: log and continue (VM may be memory-constrained)
-            logger.warning(
-                "Balloon deflation failed (VM may be memory-constrained)",
-                extra={"vm_id": vm.vm_id, "error": str(e)},
-            )
-
     async def _warm_repl(self, vm: QemuVM, language: Language) -> None:
         """Pre-warm REPL in guest VM for faster first execution.
 
-        A failed warm-up makes this VM ineligible for pooling or L1 capture.
+        A failed warm-up makes this VM ineligible for pooling (and index 0 then schedules no L1 save).
         The caller destroys it through the normal _boot_and_add_vm error path.
         """
         response = await vm.channel.send_request(

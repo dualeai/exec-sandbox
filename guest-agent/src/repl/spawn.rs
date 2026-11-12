@@ -118,7 +118,8 @@ pub(crate) async fn spawn_repl(
             c.env("BUN_JSC_useConcurrentJIT", "false"); // No background JIT compilation
             // Reduce idle RSS. Tighter growth factor limits heap expansion;
             // earlier critical threshold triggers GC sooner; mimalloc purge
-            // returns freed pages to the OS immediately (important for balloon).
+            // returns freed pages to the OS immediately (zeroed by init_on_free, so
+            // host reclaim stores them at no cost).
             c.env("BUN_JSC_miniVMHeapGrowthFactor", "1.05"); // 5% growth (default 1.20)
             c.env("BUN_JSC_criticalGCMemoryThreshold", "0.50"); // Aggressive GC at 50% of RAM
             c.env("MIMALLOC_PURGE_DELAY", "0"); // Immediate page release to OS

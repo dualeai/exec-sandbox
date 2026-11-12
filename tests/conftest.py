@@ -163,17 +163,26 @@ skip_unless_hwaccel = pytest.mark.skipif(
     reason="Requires hardware acceleration (KVM/HVF) - TCG too slow for timing-sensitive tests",
 )
 
-# Skip marker for tests with tight timing assertions that include balloon overhead.
-# Even with KVM available, nested virtualization (GitHub Actions runners on Azure)
-# causes balloon operations to be 50-100x slower than bare-metal. This marker
-# requires both hwaccel AND TSC_DEADLINE (x86_64) to ensure fast balloon ops.
-# See check_fast_balloon_available() docstring for full rationale and references.
-skip_unless_fast_balloon = pytest.mark.skipif(
-    not asyncio.run(check_fast_balloon_available()),
-    reason=(
-        "Requires fast balloon operations - nested virtualization (CI runners) causes "
-        "balloon timeouts. TSC_DEADLINE CPU feature missing indicates degraded nested virt."
-    ),
+
+async def _fast_virt_available() -> bool:
+    """Hardware acceleration that is not degraded nested virtualization.
+
+    Nested KVM (GitHub Actions x86 runners on Azure) lacks TSC_DEADLINE and runs
+    memory-heavy work 50-100x slower than bare metal. macOS has no nested virt;
+    arm64 Linux KVM (GIC timer) is not affected.
+    """
+    if not await check_hwaccel_available():
+        return False
+    host_os, host_arch = detect_host_os(), detect_host_arch()
+    if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
+        return await check_tsc_deadline()
+    return host_os == HostOS.MACOS or (host_os == HostOS.LINUX and host_arch == HostArch.AARCH64)
+
+
+# Skip marker for tests with tight timing or heavy memory pressure.
+skip_unless_fast_virt = pytest.mark.skipif(
+    not asyncio.run(_fast_virt_available()),
+    reason="Requires fast virtualization - nested virtualization (CI runners, no TSC_DEADLINE) is too slow",
 )
 
 # Skip marker for Linux-only tests (cgroups, virtual memory ulimit, etc.)

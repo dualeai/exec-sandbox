@@ -680,29 +680,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         ]
     )
 
-    # virtio-balloon for host memory efficiency (deflate/inflate for warm pool).
-    #
-    # NOTE (non-adoption): virtio-mem is deliberately not used in place of the
-    # balloon. It targets long-lived, resizable VMs; unplug is guest-cooperative,
-    # slow, and can partially fail, and its block size must be a power-of-two
-    # >= 2 MiB — coarse for our small -m VMs. It has no HVF support and yields no
-    # net RSS win over free-page-reporting + template-COW page sharing.
-    #
-    # Disabled for ALL template VMs (save AND restore):
-    #   1. Device topology must match between save and restore — QEMU migration
-    #      fails with "Unknown section" if one side has balloon and the other doesn't.
-    #   2. VM Templating docs state: "virtio-balloon inflation and free page reporting
-    #      cannot discard VM RAM and will repeatedly report errors [...] free page
-    #      reporting should be disabled and the balloon should not be inflated."
-    #      Ref: https://www.qemu.org/docs/master/system/vm-templating.html
-    # Template VMs rely on COW page sharing instead of ballooning.
-    if mem_path is None:
-        qemu_args.extend(
-            [
-                "-device",
-                f"virtio-balloon-{virtio_suffix},deflate-on-oom=on,free-page-reporting=on",
-            ]
-        )
+    # No virtio-balloon: every VM has the same device set, so every VM can
+    # be saved and loaded. Idle guest memory returns to the host through
+    # memory.reclaim + zswap; init_on_free zeroes freed guest pages.
 
     # virtio-rng: continuous host→guest entropy via /dev/urandom backend.
     # Feeds the kernel input pool so RNDRESEEDCRNG ioctl (guest-agent) has fresh

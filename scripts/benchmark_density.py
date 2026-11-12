@@ -20,8 +20,6 @@ Methodology:
 
 Runs multiple "scenarios" to compare density techniques:
   - Baseline (current config)
-  - With free page reporting (if supported)
-  - With balloon inflated (idle VMs)
 
 Supports both macOS (vm_stat) and Linux (/proc/meminfo, KSM, PSI).
 

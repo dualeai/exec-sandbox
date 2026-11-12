@@ -610,7 +610,7 @@ async def read_cgroup_stats(cgroup_path: Path | None) -> tuple[int | None, int |
 # =============================================================================
 
 
-async def reclaim_memory(cgroup_path: Path | None, amount_mb: int = 32) -> bool:
+async def reclaim_memory(cgroup_path: Path | None, *, amount_mb: int) -> bool:
     """Proactively reclaim memory from a VM's cgroup via memory.reclaim.
 
     Triggers the kernel to compress anonymous pages into zswap/zram, reducing
@@ -623,31 +623,42 @@ async def reclaim_memory(cgroup_path: Path | None, amount_mb: int = 32) -> bool:
 
     Args:
         cgroup_path: VM cgroup directory
-        amount_mb: Amount of memory to reclaim (default 32 MB)
+        amount_mb: Amount of memory to reclaim
 
     Returns:
         True if reclaim was issued, False if unavailable or failed
+
+    One worker-thread job: the kernel reclaims inside the write (10 to 500 ms).
     """
     if not is_cgroup_available(cgroup_path) or cgroup_path is None:
         return False
+    return await asyncio.to_thread(_reclaim, cgroup_path, amount_bytes=amount_mb * 1024 * 1024)
 
+
+def _reclaim(cgroup_path: Path, *, amount_bytes: int) -> bool:
+    """reclaim_memory's writes (blocking)."""
     reclaim_file = cgroup_path / "memory.reclaim"
-    amount_bytes = amount_mb * 1024 * 1024
 
+    # EAGAIN = the kernel reclaimed less than asked: normal for a request sized to
+    # the whole guest. Only EINVAL (no swappiness support, kernel < 6.9) falls back.
     try:
         # Try with swappiness=200 first (kernel 6.9+, aggressively compress anon pages)
-        async with aiofiles.open(reclaim_file, "w") as f:
-            await f.write(f"{amount_bytes} swappiness=200")
+        reclaim_file.write_text(f"{amount_bytes} swappiness=200")
         return True
-    except OSError:
-        pass
+    except OSError as e:
+        if e.errno == errno.EAGAIN:
+            return True
+        if e.errno != errno.EINVAL:
+            logger.debug("memory.reclaim failed", extra={"cgroup_path": str(cgroup_path), "error": str(e)})
+            return False
 
     try:
         # Fall back to plain reclaim (kernel 6.1+)
-        async with aiofiles.open(reclaim_file, "w") as f:
-            await f.write(str(amount_bytes))
+        reclaim_file.write_text(str(amount_bytes))
         return True
     except OSError as e:
+        if e.errno == errno.EAGAIN:
+            return True
         logger.debug(
             "memory.reclaim unavailable",
             extra={"cgroup_path": str(cgroup_path), "error": str(e)},

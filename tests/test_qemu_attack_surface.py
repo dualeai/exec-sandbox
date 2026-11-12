@@ -33,14 +33,16 @@ Test categories:
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
 # Normal: Only essential virtio devices present
 # =============================================================================
 class TestMinimalDeviceSet:
-    """Guest should expose only virtio-blk, virtio-net, virtio-serial, and
-    optionally virtio-balloon. No legacy emulated hardware."""
+    """Guest should expose only virtio-blk, virtio-net, virtio-serial and
+    virtio-rng (no balloon). No legacy emulated hardware."""
 
     async def test_only_virtio_devices(self, scheduler: Scheduler) -> None:
         """PCI/MMIO devices should be exclusively virtio."""

@@ -33,7 +33,6 @@ logger = get_logger(__name__)
 __all__ = [
     "NOT_CACHED",
     "ProbeCache",
-    "check_fast_balloon_available",
     "check_hvf_available",
     "check_hwaccel_available",
     "check_kvm_available",
@@ -889,79 +888,6 @@ async def check_hwaccel_available() -> bool:
     if host_os == HostOS.MACOS:
         return await check_hvf_available()
     return False
-
-
-async def check_fast_balloon_available() -> bool:
-    """Check if fast balloon operations are expected (not degraded nested virtualization).
-
-    Used for timing-sensitive tests that include balloon inflate/deflate overhead.
-
-    Background
-    ==========
-    Balloon operations (memory reclaim via virtio-balloon) have vastly different
-    performance characteristics depending on the virtualization environment:
-
-    - Bare-metal KVM: Balloon operations complete in <100ms
-    - Nested KVM (CI runners): Balloon operations can take 5+ seconds due to
-      hypervisor overhead, often timing out after retry limits
-
-    The Problem
-    ===========
-    GitHub Actions runners are VMs on Azure, creating nested virtualization when
-    running QEMU. Even when /dev/kvm exists and KVM "works", balloon operations
-    are significantly degraded:
-
-    1. KVM availability is inconsistent on GitHub Actions - "/dev/kvm sometimes
-       exists (and works!), and sometimes it doesn't" (GitHub community #8305)
-
-    2. pytest-xdist workers perform independent test collection, so flaky KVM
-       detection can cause tests to run on workers where KVM isn't actually fast
-
-    3. TSC_DEADLINE timer (required for efficient APIC timer virtualization) is
-       often not exposed to nested VMs, causing timer fallback to slower modes
-
-    Solution
-    ========
-    Use TSC_DEADLINE availability as a proxy for "fast virtualization":
-
-    - TSC_DEADLINE is a CPU feature, not a kernel module state - deterministic
-    - When missing, QEMU enables legacy PIT/PIC timers (slower, more overhead)
-    - Reliably identifies degraded nested virt vs bare-metal/L1 KVM
-
-    References
-    ==========
-    - Linux kernel timekeeping: https://docs.kernel.org/virt/kvm/x86/timekeeping.html
-    - QEMU Hyper-V enlightenments: https://www.qemu.org/docs/master/system/i386/hyperv.html
-    - GitHub Actions KVM issues: https://github.com/actions/runner-images/issues/8542
-    - pytest-xdist collection: https://pytest-xdist.readthedocs.io/en/stable/how-it-works.html
-
-    Returns:
-        True if balloon operations are expected to be fast:
-          - Linux x86_64: KVM available AND TSC_DEADLINE available
-          - Linux ARM64: KVM available (ARM uses different timer, less affected)
-          - macOS: HVF available (nested virt not possible on macOS)
-        False otherwise (balloon operations may be slow, skip timing tests)
-    """
-    if not await check_hwaccel_available():
-        return False
-
-    host_os = detect_host_os()
-    host_arch = detect_host_arch()
-
-    # On Linux x86_64, TSC_DEADLINE absence indicates degraded nested virt
-    # See: https://www.qemu.org/docs/master/system/i386/microvm.html
-    if host_os == HostOS.LINUX and host_arch == HostArch.X86_64:
-        return await check_tsc_deadline()
-
-    # On macOS, HVF availability implies not nested (macOS doesn't support nested virt)
-    # If we got here, HVF is available, so balloon should be fast
-    if host_os == HostOS.MACOS:
-        return True
-
-    # On ARM64 Linux, KVM availability is sufficient
-    # ARM uses GIC timer (not TSC/APIC), less affected by nested virt overhead
-    # Unknown platform: conservative assumption (return False)
-    return host_os == HostOS.LINUX and host_arch == HostArch.AARCH64
 
 
 @_async_cached_probe("tsc_deadline")

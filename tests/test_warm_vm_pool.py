@@ -122,40 +122,67 @@ class TestWarmVMPoolConfig:
         assert set(pool.pools.keys()) == set(Language)
 
 
-class TestWarmVMPoolOwnership:
-    """Warm VM handoffs never leave a live VM outside pool and caller ownership."""
+class TestWarmVMPoolSpec:
+    """The pool holds one VM shape per language and serves only that spec."""
 
-    async def test_cancelled_checkout_destroys_removed_vm_and_replenishes(self, unit_test_vm_manager) -> None:
+    @pytest.mark.parametrize(
+        "spec_change",
+        [
+            pytest.param({"memory_mb": 1024}, id="memory"),
+            pytest.param({"disk_mb": 256}, id="disk"),
+            pytest.param({"packages": ("six==1.17.0",)}, id="packages"),
+            pytest.param({"allow_network": True}, id="network"),
+        ],
+    )
+    async def test_other_spec_gets_no_pool_vm(self, unit_test_vm_manager, spec_change: dict[str, object]) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
         vm = MagicMock()
-        vm.vm_id = "checkout-cancelled"
+        await pool.pools[Language.PYTHON].put(vm)
+        request = pool.spec_for(Language.PYTHON).model_copy(update=spec_change)
+
+        assert await pool.get_vm(request) is None
+        assert pool.pools[Language.PYTHON].qsize() == 1  # the pool VM was not taken
+
+
+class TestWarmVMPoolOwnership:
+    """Warm VM handoffs never leave a live VM outside pool and caller ownership."""
+
+    async def test_interrupted_checkout_destroys_removed_vm_and_replenishes(self, unit_test_vm_manager) -> None:
+        """A failure after the VM left the queue destroys it (no live VM without an owner)."""
+        from exec_sandbox.warm_vm_pool import WarmVMPool
+
+        pool = WarmVMPool(unit_test_vm_manager, SchedulerConfig(warm_pool_size=1))
+        vm = MagicMock()
+        vm.vm_id = "checkout-interrupted"
         vm.l1_restored = False
-        # Must pass the checkout liveness gate to reach the deflate step.
         vm.state = VmState.READY
         vm.process.returncode = None
         await pool.pools[Language.PYTHON].put(vm)
-        deflate_entered = asyncio.Event()
 
-        async def blocked_deflate(_vm) -> None:  # type: ignore[no-untyped-def]
-            deflate_entered.set()
-            await asyncio.Event().wait()
+        real_create_task = asyncio.create_task
+        scheduled: list[str] = []
+
+        def create_task_fails_once(coro: Any, **kwargs: Any) -> asyncio.Task[Any]:
+            if not scheduled:
+                scheduled.append("failed")
+                coro.close()
+                raise RuntimeError("boom")  # e.g. the loop refuses new tasks
+            scheduled.append(coro.__qualname__)
+            coro.close()  # the replenishment itself is not under test
+            return real_create_task(asyncio.sleep(0), **kwargs)
 
         with (
-            patch.object(pool, "_deflate_balloon", side_effect=blocked_deflate),
-            patch.object(pool, "_schedule_replenishment") as replenish,
+            patch("exec_sandbox.warm_vm_pool.asyncio.create_task", side_effect=create_task_fails_once),
             patch.object(unit_test_vm_manager, "destroy_vm", new_callable=AsyncMock, return_value=True) as destroy,
+            pytest.raises(RuntimeError, match="boom"),
         ):
-            checkout = asyncio.create_task(pool.get_vm(Language.PYTHON, []))
-            await deflate_entered.wait()
-            checkout.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await checkout
+            await pool.get_vm(pool.spec_for(Language.PYTHON))
 
-        assert pool.pools[Language.PYTHON].empty()
-        destroy.assert_awaited_once_with(vm)
-        replenish.assert_called_once_with(Language.PYTHON)
+        assert pool.pools[Language.PYTHON].empty()  # not handed out, not queued...
+        destroy.assert_awaited_once_with(vm)  # ...so destroyed: no live VM without an owner
+        assert scheduled == ["failed", "WarmVMPool._replenish_pool"]  # and the pool refills
 
     async def test_cancelled_stop_waiter_cannot_abandon_queued_vm(self, unit_test_vm_manager) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -494,18 +521,16 @@ class TestWarmReplUnit:
 
         with (
             patch.object(pool, "_warm_repl", new_callable=AsyncMock) as warm,
-            patch.object(pool, "_inflate_balloon", new_callable=AsyncMock) as inflate,
             patch("exec_sandbox.warm_vm_pool.cgroup.reclaim_memory", new_callable=AsyncMock) as reclaim,
         ):
             await pool._prepare_and_enqueue_vm(vm, Language.PYTHON)
 
         warm.assert_awaited_once_with(vm, Language.PYTHON)
-        inflate.assert_awaited_once_with(vm)
-        reclaim.assert_awaited_once_with(None)
+        reclaim.assert_awaited_once_with(None, amount_mb=VmSpec(language=Language.PYTHON).memory_mb)  # guest RAM
         assert pool.pools[Language.PYTHON].get_nowait() is vm
 
     async def test_prepare_and_enqueue_skips_duplicate_l1_preparation(self, unit_test_vm_manager) -> None:
-        """L1-restored VMs are already warm and have no balloon device."""
+        """L1-restored VMs are already warm, and are reclaimed like every pool VM (D17)."""
         from unittest.mock import patch
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -514,17 +539,16 @@ class TestWarmReplUnit:
         vm = AsyncMock()
         vm.vm_id = "l1-vm"
         vm.l1_restored = True
+        vm.cgroup_path = None
 
         with (
             patch.object(pool, "_warm_repl", new_callable=AsyncMock) as warm,
-            patch.object(pool, "_inflate_balloon", new_callable=AsyncMock) as inflate,
             patch("exec_sandbox.warm_vm_pool.cgroup.reclaim_memory", new_callable=AsyncMock) as reclaim,
         ):
             await pool._prepare_and_enqueue_vm(vm, Language.PYTHON)
 
         warm.assert_not_awaited()
-        inflate.assert_not_awaited()
-        reclaim.assert_not_awaited()
+        reclaim.assert_awaited_once_with(None, amount_mb=VmSpec(language=Language.PYTHON).memory_mb)  # guest RAM
         assert pool.pools[Language.PYTHON].get_nowait() is vm
 
 
@@ -1130,15 +1154,15 @@ class TestHealthcheckIntegration:
 
         try:
             # Get a VM from pool
-            vm = await pool.get_vm(Language.PYTHON, packages=[])
+            vm = await pool.get_vm(pool.spec_for(Language.PYTHON))
             assert vm is not None
 
-            # Wait for VM to stabilize after balloon deflation
+            # Wait for VM to stabilize after checkout
             # On slow CI, the guest needs time to reclaim memory after deflate
             await asyncio.sleep(0.5)
 
-            # Verify healthy first (with retries for slow CI where balloon
-            # operations may leave the guest temporarily slow)
+            # Verify healthy first (with retries for slow CI where the guest
+            # may be temporarily slow after checkout)
             is_healthy = False
             for _ in range(3):
                 is_healthy = await pool._check_vm_health(vm)
@@ -1438,8 +1462,8 @@ class TestWarmPoolIdleCpu:
         finally:
             await pool.stop()
 
-    async def test_balloon_inflation_cpu_is_transient(self, vm_manager) -> None:
-        """Balloon inflation CPU spike settles within bounded time."""
+    async def test_pool_start_cpu_is_transient(self, vm_manager) -> None:
+        """The CPU spike of pool start (REPL warm-up, reclaim) settles within bounded time."""
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         config = SchedulerConfig(warm_pool_size=1)
@@ -1450,9 +1474,9 @@ class TestWarmPoolIdleCpu:
             # Do NOT wait — start measuring immediately after start()
             vm = pool.pools[Language.PYTHON].get_nowait()
 
-            # Balloon inflation happened during start(); p95 absorbs initial spike
+            # Warm-up happened during start(); p95 absorbs initial spike
             samples = await collect_cpu_samples(vm.process)
-            assert_cpu_idle(samples, label="post-balloon")
+            assert_cpu_idle(samples, label="post-start")
 
             pool.pools[Language.PYTHON].put_nowait(vm)
         finally:

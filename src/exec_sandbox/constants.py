@@ -349,45 +349,14 @@ WARM_POOL_HEALTH_CHECK_RETRY_MAX_SECONDS: Final[float] = 2.0
 """Maximum backoff between health check retries."""
 
 # ============================================================================
-# Balloon Memory Management (for warm pool memory efficiency)
-# ============================================================================
-
-BALLOON_INFLATE_TARGET_MB: Final[int] = 140
-"""Target guest memory in MB when inflating balloon for idle warm pool VMs.
-Inflating the balloon reduces guest memory, allowing host to reclaim.
-
-History: 64MB caused unresponsive guests (only ~14MB headroom). 96MB still
-caused freezes on kernel 6.18 where ~38MB overhead + guest-agent + Python
-leaves <20MB free under pressure. 128MB caused ~20% QEMU vCPU overhead on
-Bun VMs (42MB RSS) because the balloon driver couldn't reach target and kept
-retrying page reclaim. 140MB provides ~50MB headroom after Bun overhead
-(zram swap provides additional buffer) while achieving 27% memory reduction
-vs 192MB."""
-
-BALLOON_TOLERANCE_MB: Final[int] = 20
-"""Tolerance in MB for balloon target polling. Allows early exit when balloon is
-'close enough' to target, accounting for kernel overhead and slow CI runners.
-
-Reduced from 40 to 20: at tolerance=40 with target=140, balloon accepted guest
-memory at 180MB (only 12MB reclaimed from 192MB). At tolerance=20, balloon pushes
-to 160MB, reclaiming ~32MB vs ~12MB — 2.7x more memory freed per idle VM.
-Safe because the balloon falls back after 10 retries if target is unreachable."""
-
-BALLOON_INFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
-"""Timeout for balloon inflate operation (reducing guest memory for idle pool)."""
-
-BALLOON_DEFLATE_TIMEOUT_SECONDS: Final[float] = 5.0
-"""Timeout for balloon deflate operation (restoring guest memory before execution)."""
-
-# ============================================================================
 # Memory Snapshot (L1 Cache)
 # ============================================================================
 
-MEMORY_SNAPSHOT_SAVE_TIMEOUT_SECONDS: Final[float] = 30.0
-"""Timeout for saving VM state to file (migrate command + poll)."""
+MIGRATION_TIMEOUT_BASE_SECONDS: Final[float] = 30.0
+"""Fixed part of the save/restore timeout (migrate or migrate-incoming + poll)."""
 
-MEMORY_SNAPSHOT_RESTORE_TIMEOUT_SECONDS: Final[float] = 30.0
-"""Timeout for restoring VM state from file (migrate-incoming + poll)."""
+MIGRATION_MIN_THROUGHPUT_MB_PER_SECOND: Final[float] = 100.0
+"""Slowest disk rate the save/restore timeout allows for the whole guest RAM."""
 
 MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS: Final[float] = 10.0
 """Timeout for individual QMP commands during migration."""

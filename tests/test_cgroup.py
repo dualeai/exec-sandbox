@@ -28,6 +28,7 @@ from exec_sandbox.cgroup import (
     detect_cgroup_memory_limit_mb,
     is_cgroup_available,
     read_container_available_memory_mb,
+    reclaim_memory,
     wrap_with_ulimit,
 )
 from exec_sandbox.constants import (
@@ -1376,3 +1377,45 @@ finally:
                 proc.terminate()
                 await proc.wait()
             await cleanup_cgroup(cgroup_path, "test-cleanup")
+
+
+class TestReclaimMemory:
+    """memory.reclaim: EAGAIN means "reclaimed less than asked", not "unsupported"."""
+
+    @staticmethod
+    def _writer(errors: list[int | None]) -> tuple[Callable[[Path, str], int], list[tuple[str, int]]]:
+        """Path.write_text stand-in: records (value, thread) and fails with errors[n] on write n."""
+        writes: list[tuple[str, int]] = []
+
+        def write_text(_path: Path, data: str) -> int:
+            writes.append((data, threading.get_ident()))
+            err = errors[len(writes) - 1]
+            if err is not None:
+                raise OSError(err, os.strerror(err))
+            return len(data)
+
+        return write_text, writes
+
+    @pytest.mark.parametrize(
+        ("errors", "expected", "attempts"),
+        [
+            pytest.param([None], True, 1, id="full"),
+            pytest.param([errno.EAGAIN], True, 1, id="partial-is-success"),
+            pytest.param([errno.EINVAL, None], True, 2, id="no-swappiness-falls-back"),
+            pytest.param([errno.EINVAL, errno.EAGAIN], True, 2, id="fallback-partial"),
+            pytest.param([errno.EACCES], False, 1, id="denied"),
+        ],
+    )
+    async def test_reclaim_errors(
+        self, tmp_path: Path, errors: list[int | None], expected: bool, attempts: int
+    ) -> None:
+        write_text, writes = self._writer(errors)
+        with (
+            patch("exec_sandbox.cgroup.is_cgroup_available", return_value=True),
+            patch.object(Path, "write_text", autospec=True, side_effect=write_text),
+        ):
+            assert await reclaim_memory(tmp_path, amount_mb=192) is expected
+        assert len(writes) == attempts
+        assert writes[0][0] == f"{192 * 1024 * 1024} swappiness=200"
+        # The kernel reclaims inside the write (10 to 500 ms): never on the event loop thread
+        assert threading.get_ident() not in {thread for _, thread in writes}
