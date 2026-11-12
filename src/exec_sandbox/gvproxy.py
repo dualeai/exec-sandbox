@@ -184,16 +184,14 @@ async def start_gvproxy(  # noqa: PLR0915
             pass_fds=(socket_fd,),
             on_process_started=publish_process,
         )
-    except (OSError, FileNotFoundError) as e:
+    except OSError as e:
         parent_sock.close()
-        raise VmGvproxyError(
-            f"Failed to start gvproxy-wrapper: {e}",
-            context={
-                "vm_id": vm_id,
-                "language": language,
-                "allowed_domains": allowed_domains,
-                "binary_path": str(gvproxy_binary),
-            },
+        raise spawn_error(
+            e,
+            binary=str(gvproxy_binary),
+            code=ErrorCode.GVPROXY_FAILED,
+            context={"vm_id": vm_id, "language": language, "allowed_domains": allowed_domains},
+            hint=None,
         ) from e
     except BaseException:
         parent_sock.close()
@@ -224,16 +222,9 @@ async def start_gvproxy(  # noqa: PLR0915
         logger.error(f"[gvproxy-wrapper error] {line}", extra={"vm_id": vm_id, "output": line})
 
     # Background task to drain gvproxy output (prevent pipe deadlock)
-    gvproxy_log_task = asyncio.create_task(
-        drain_subprocess_output(
-            proc,
-            process_name="gvproxy-wrapper",
-            context_id=vm_id,
-            stdout_handler=check_ready,
-            stderr_handler=check_error,
-        )
+    gvproxy_log_task = start_drain(
+        proc, process_name="gvproxy-wrapper", context_id=vm_id, stdout_handler=check_ready, stderr_handler=check_error
     )
-    gvproxy_log_task.add_done_callback(log_task_exception)
     if on_process_started is not None:
         on_process_started(proc, gvproxy_log_task)
 

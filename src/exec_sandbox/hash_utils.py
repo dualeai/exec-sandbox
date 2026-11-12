@@ -1,64 +1,45 @@
 """Hash utilities for fingerprinting and file integrity.
 
 Two categories:
-- CRC32/64: Fast non-cryptographic fingerprints for cache keys
+- fingerprint(): SHA-256 cache keys with a canonical, separator-free encoding
 - SHA256: Cryptographic hashes for file integrity verification
 """
 
 from __future__ import annotations
 
-import binascii
+import asyncio
 import hashlib
 from typing import TYPE_CHECKING
 
-import aiofiles
-
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
 
-# Default chunk size for file hashing (64KB)
-FILE_HASH_CHUNK_SIZE = 64 * 1024
-
 
 # =============================================================================
-# Non-cryptographic fingerprints (fast, for cache keys)
+# Cache-key fingerprints (SHA-256, canonical encoding)
 # =============================================================================
 
 
-def crc32(data: str) -> str:
-    """Compute CRC32 hash as 8-character hex string (32 bits).
+def fingerprint(*parts: str) -> str:
+    """Compute a SHA-256 fingerprint of an ordered list of strings.
 
-    Use for: file fingerprints, cache keys where 32 bits is sufficient.
-
-    Args:
-        data: String to hash
-
-    Returns:
-        8-character lowercase hex string
-    """
-    crc = binascii.crc32(data.encode()) & 0xFFFFFFFF
-    return f"{crc:08x}"
-
-
-def crc64(data: str) -> str:
-    """Compute 64-bit hash as 16-character hex string using chained CRC32.
-
-    Uses two CRC32 passes: first on the data, second seeded with the first result.
-    This provides 64 bits of output for better collision resistance.
-
-    Use for: package lists, cache keys where more uniqueness is needed.
+    Each part is prefixed with its byte length, so two different lists never
+    encode to the same bytes, whatever the parts contain. Inputs may be
+    tenant-chosen (package specs) and cache entries can be shared across
+    tenants, so the hash must resist chosen inputs: SHA-256, never CRC.
 
     Args:
-        data: String to hash
+        *parts: Ordered strings to fingerprint
 
     Returns:
-        16-character lowercase hex string
+        Full SHA-256 hex digest
     """
-    data_bytes = data.encode()
-    crc1 = binascii.crc32(data_bytes) & 0xFFFFFFFF
-    crc2 = binascii.crc32(data_bytes, crc1) & 0xFFFFFFFF
-    return f"{crc1:08x}{crc2:08x}"
+    hasher = hashlib.sha256()
+    for part in parts:
+        data = part.encode()
+        hasher.update(f"{len(data)}:".encode())
+        hasher.update(data)
+    return hasher.hexdigest()
 
 
 # =============================================================================

@@ -18,13 +18,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import hashlib
+import json
+import os
 import sys
+import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final, cast
 
-import aiofiles
-import aiofiles.os
+import psutil
 
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
@@ -74,6 +78,91 @@ if TYPE_CHECKING:
     from exec_sandbox.vm_manager import VmManager
 
 logger = get_logger(__name__)
+
+_L2_VIRTUAL_SIZE_MB: Final = 512
+"""Virtual size of an L2 snapshot image (qemu-img create)."""
+
+_L2_MAX_FILE_BYTES: Final = (_L2_VIRTUAL_SIZE_MB + 64) * 1024 * 1024
+"""Largest L2 qcow2 file: full virtual size plus qcow2 metadata headroom."""
+
+_DECOMPRESS_STEP_BYTES: Final = 4 * 1024 * 1024
+"""Max output of one zstd decompress step (bounds memory per step)."""
+
+_SETUP_ERRNOS: Final = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+"""File errors of a build that the same call gets again: no access, a read-only disk."""
+
+# In-process memo of passed `qemu-img check` runs: path -> file_stamp of the L2 file
+# when it passed. One entry per path, like the image_hash digest cache. A rebuilt or
+# replaced file gets a new stamp and is checked again.
+_L2_CHECK_PASSED: dict[str, str] = {}
+
+
+def _file_error(e: OSError, *, cache_key: str, language: Language, packages: list[str]) -> SandboxError:
+    """Error of a build's file step. No access or a read-only disk: ConfigError SETTING_INVALID
+    (a retry fails the same way: fix the folder). Any other file error: TransientError LOCAL_DISK."""
+    reason = e.strerror or type(e).__name__
+    if e.errno in _SETUP_ERRNOS:
+        return ConfigError(
+            f"Snapshot build {cache_key} cannot write its files: {reason}",
+            code=ErrorCode.SETTING_INVALID,
+            context={"cache_key": cache_key, "errno": e.errno},
+            hint="Give this user write access to disk_snapshot_cache_dir, on a writable disk.",
+            instance_id=None,
+        )
+    return TransientError(
+        f"Local disk error for snapshot {cache_key}: {reason}",
+        code=ErrorCode.LOCAL_DISK,
+        context={"cache_key": cache_key, "language": language, "packages": packages},
+        hint=None,
+        instance_id=None,
+    )
+
+
+def _part_path(path: Path) -> Path:
+    """Private temp name next to *path*; the pid lets _remove_stale_parts find orphans."""
+    return path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.part")
+
+
+def _remove_parts(*parts: Path) -> None:
+    """Blocking: async callers use asyncio.to_thread."""
+    for part in parts:
+        part.unlink(missing_ok=True)
+
+
+async def _qemu_img(args: list[str], *, process_name: str, cache_key: str) -> tuple[int | None, bytes, bytes]:
+    """Run qemu-img with `args`. A missing binary, or one this user may not run, is
+    ConfigError HOST_DEPENDENCY: a setup error that no retry fixes, never a local disk error;
+    a fork that hits a process, memory or file-handle limit is TransientError OVERLAY_FAILED."""
+    try:
+        return await communicate_managed_process(["qemu-img", *args], process_name=process_name, context_id=cache_key)
+    except OSError as e:
+        raise spawn_error(
+            e,
+            binary="qemu-img",
+            code=ErrorCode.OVERLAY_FAILED,
+            context={"cache_key": cache_key},
+            hint="Install QEMU (on Debian and Ubuntu, the qemu-utils package).",
+        ) from e
+
+
+async def _standalone_qcow2_problem(path: Path, cache_key: str) -> str | None:
+    """Why a downloaded image is not a standalone qcow2, or None when it is.
+
+    L2 images are standalone. A downloaded image that names a backing file or an
+    external data file would make QEMU serve that host file to the guest.
+    """
+    returncode, stdout, stderr = await _qemu_img(
+        ["info", "--output=json", "-U", str(path)], process_name="qemu-img-info", cache_key=cache_key
+    )
+    if returncode != 0:
+        return f"qemu-img info failed: {stderr.decode().strip()}"
+    info = json.loads(stdout)
+    if info.get("format") != "qcow2":
+        return f"S3 snapshot is not qcow2 (format={info.get('format')})"
+    if "backing-filename" in info or "data-file" in info.get("format-specific", {}).get("data", {}):
+        return "S3 snapshot names a backing or data file; L2 images are standalone"
+    return None
+
 
 _PERMANENT_PACKAGE_PATTERNS: Final[tuple[str, ...]] = (
     "no matching distribution",
@@ -160,7 +249,7 @@ class DiskSnapshotManager(BaseCacheManager):
             settings: Application settings with cache configuration
             vm_manager: VmManager for VM operations
         """
-        super().__init__(settings.disk_snapshot_cache_dir)
+        super().__init__(settings.disk_snapshot_cache_dir, setting="disk_snapshot_cache_dir")
         self.settings = settings
         self.vm_manager = vm_manager
 
@@ -174,6 +263,21 @@ class DiskSnapshotManager(BaseCacheManager):
         # Limit concurrent S3 uploads to prevent network saturation and memory exhaustion
         # S3 PutObject is atomic - aborted uploads leave no partial blobs
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_s3_uploads)
+
+    async def start(self) -> None:
+        """Delete .part files left by a killed process. One worker-thread job: the
+        listing has no size limit and each part can be GBs."""
+        await asyncio.to_thread(self._remove_stale_parts)
+
+    def _remove_stale_parts(self) -> None:
+        """Delete .part files left by a killed process (name holds the writer's pid)."""
+        for part in self.cache_dir.glob("*.part"):
+            try:
+                pid = int(part.name.split(".")[-3])
+            except (IndexError, ValueError):
+                continue
+            if not psutil.pid_exists(pid):
+                part.unlink(missing_ok=True)
 
     async def check_cache(
         self,
@@ -243,24 +347,27 @@ class DiskSnapshotManager(BaseCacheManager):
         # File lock serializes across coroutines and processes; yields False if
         # the target .qcow2 was created by another caller while we waited.
         target_path = self._cache_path(cache_key)
-        async with file_lock(target_path) as should_create:
+        async with contextlib.AsyncExitStack() as stack:
+            self._make_cache_dir()
+            try:  # the lock file is the first file of a build in the cache folder
+                should_create = await stack.enter_async_context(file_lock(target_path))
+            except OSError as e:
+                raise _file_error(e, cache_key=cache_key, language=language, packages=packages) from e
             if not should_create:
                 logger.debug("L2 cache hit (after lock)", extra={"cache_key": cache_key})
                 return target_path
 
             # L3 cache check (S3) - only for images with packages
             # Base images are already distributed via asset downloads, no need for S3
-            if packages:
-                try:
-                    snapshot_path = await self._download_from_s3(cache_key)
-                    logger.debug("L3 cache hit", extra={"cache_key": cache_key})
-                    return snapshot_path
-                except SnapshotError:
-                    pass  # Cache miss, create new
+            if packages and (snapshot_path := await self._download_from_s3(cache_key)) is not None:
+                logger.debug("L3 cache hit", extra={"cache_key": cache_key})
+                return snapshot_path
 
             # Cache miss: Create new snapshot
             logger.debug("Cache miss, creating snapshot", extra={"cache_key": cache_key})
-            snapshot_path = await self._create_snapshot(language, packages, cache_key, tenant_id, task_id, memory_mb)
+            snapshot_path = await self._create_snapshot(
+                language, packages, cache_key=cache_key, tenant_id=tenant_id, task_id=task_id, memory_mb=memory_mb
+            )
 
             # Upload to S3 (async, fire-and-forget) - only for images with packages
             # Base images don't need S3 - they're already globally distributed
@@ -312,16 +419,15 @@ class DiskSnapshotManager(BaseCacheManager):
 
         if not packages:
             return f"{base}-base"
-        packages_str = "".join(sorted(packages))
-        packages_hash = crc64(packages_str)
-        return f"{base}-{packages_hash}"
+        return f"{base}-{fingerprint(*sorted(packages))}"
 
     async def _check_l2_cache(self, cache_key: str) -> Path | None:
         """Check L2 local cache for qcow2 snapshot.
 
         Validates:
         1. Snapshot file exists
-        2. Valid qcow2 format (via qemu-img check)
+        2. Valid qcow2 format (via qemu-img check), once per process for each
+           version of the file (_L2_CHECK_PASSED); a failed check is not kept
 
         Args:
             cache_key: Snapshot cache key.
@@ -434,7 +540,7 @@ class DiskSnapshotManager(BaseCacheManager):
         async with self._creation_semaphore:
             try:
                 # Step 1: Create standalone ext4 qcow2 for overlay (vdb)
-                await self._create_snapshot_image(snapshot_path, cache_key, language, packages, tenant_id)
+                await self._create_snapshot_image(build_path, cache_key, language, packages, tenant_id)
 
                 # Step 2: Determine network configuration for snapshot creation
                 # ALWAYS enable network during snapshot creation (pip/npm needs it)
@@ -738,89 +844,133 @@ class DiskSnapshotManager(BaseCacheManager):
 
                         if result.exit_code != 0:
                             error_output = result.stderr or "Unknown error"
-                            error_class = _classify_install_error(error_output)
-                            if error_class is PackageInstallPermanentError:
-                                raise PackageInstallPermanentError(
-                                    f"Package installation failed permanently (exit code {result.exit_code}): {error_output[:500]}",
-                                    context={"exit_code": result.exit_code, "stderr": error_output[:500]},
-                                )
-                            if error_class is PackageInstallTransientError:
-                                raise PackageInstallTransientError(
+                            code = _classify_install_error(error_output)
+                            context = {"exit_code": result.exit_code, "stderr": error_output[:500]}
+                            if code is ErrorCode.PACKAGE_DOWNLOAD:
+                                raise TransientError(
                                     f"Package installation failed with transient network error (exit code {result.exit_code}): {error_output[:500]}",
-                                    context={"exit_code": result.exit_code, "stderr": error_output[:500]},
+                                    code=ErrorCode.PACKAGE_DOWNLOAD,
+                                    context=context,
+                                    hint=None,
+                                    instance_id=None,
                                 )
-                            raise GuestAgentError(
-                                f"Package installation failed with exit code {result.exit_code}: {error_output[:500]}",
-                                response={"exit_code": result.exit_code, "stderr": error_output[:500]},
+                            raise InvalidInputError(
+                                f"Package installation failed permanently (exit code {result.exit_code}): {error_output[:500]}"
+                                if code is ErrorCode.PACKAGE_INSTALL_FAILED
+                                else f"Package installation failed with exit code {result.exit_code}: {error_output[:500]}",
+                                code=ErrorCode.PACKAGE_INSTALL_FAILED,
+                                context=context,
+                                hint=None,
+                                instance_id=None,
                             )
 
         except TimeoutError as e:
-            raise SnapshotError(
+            raise TransientError(
                 f"Package installation timeout after {total_timeout}s",
+                code=ErrorCode.PACKAGE_DOWNLOAD,
                 context={"vm_id": vm.vm_id, "language": language, "packages": packages},
+                hint=None,
+                instance_id=None,
             ) from e
 
-        except (GuestAgentError, PackageInstallTransientError, PackageInstallPermanentError, PackageNotAllowedError):
+        # An explicit list, not SandboxError: GUEST_OUTCOME_UNKNOWN (VERIFY) must not
+        # escape Scheduler.new for an install that ran no user code.
+        except (InvalidInputError, TransientError, InternalError):
             raise
 
         except Exception as e:
-            raise SnapshotError(
+            raise TransientError(
                 f"Package installation failed (communication error): {e}",
+                code=ErrorCode.GUEST_UNAVAILABLE,
                 context={"vm_id": vm.vm_id, "language": language, "packages": packages},
+                hint=None,
+                instance_id=None,
             ) from e
 
-    async def _download_from_s3(self, cache_key: str) -> Path:
-        """Download and decompress snapshot from S3 to L2 cache.
+    def _s3_key(self, name: str) -> str:
+        """Object key for an L3 entry, under the configured prefix."""
+        return f"{self.settings.s3_snapshot_prefix}{name}"
+
+    async def _download_from_s3(self, cache_key: str) -> Path | None:
+        """Download, decompress and verify a snapshot from S3 into the L2 cache.
+
+        The object's ``sha256`` metadata (written at upload) must match the
+        decompressed bytes; a truncated zstd stream, a missing digest or a
+        mismatch is a cache miss. The final file appears atomically (rename),
+        so a concurrent reader never sees a partial snapshot.
 
         Args:
             cache_key: Snapshot cache key
 
         Returns:
-            Path to downloaded qcow2 snapshot
-
-        Raises:
-            SnapshotError: Download failed
+            Path to downloaded qcow2 snapshot, or None on a miss (no bucket, no
+            object, a missing digest, a mismatch, a truncated or oversized stream,
+            an image that is not a standalone qcow2, any failure): it is logged.
         """
+        if not self.settings.s3_bucket:
+            return None
         snapshot_path = self._cache_path(cache_key)
-        compressed_path = snapshot_path.with_suffix(".qcow2.zst")
+        compressed_name = snapshot_path.with_suffix(".qcow2.zst").name
+        compressed_path = _part_path(snapshot_path.with_name(compressed_name))
+        partial_path = _part_path(snapshot_path)
 
         try:
+            s3_key = self._s3_key(compressed_name)
             async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
-                # Download compressed qcow2
-                s3_key = f"snapshots/{compressed_path.name}"
+                head = cast(
+                    "dict[str, Any]",
+                    await s3.head_object(Bucket=self.settings.s3_bucket, Key=s3_key),  # type: ignore[union-attr]
+                )
+                metadata = cast("dict[str, str]", head.get("Metadata", {}))
+                expected_sha256 = metadata.get("sha256", "")
+                if not expected_sha256:
+                    raise ValueError(f"S3 object {s3_key} has no sha256 metadata")
                 await s3.download_file(  # type: ignore[union-attr]
                     self.settings.s3_bucket,
                     s3_key,
                     str(compressed_path),
                 )
 
-            # Decompress with zstd (run in thread pool to avoid blocking)
             chunk_size = 64 * 1024  # 64KB chunks for streaming
 
-            def _decompress() -> None:
+            def _decompress_and_hash() -> str:
+                # Bounded: max_length caps each output step, and the total stops
+                # at the largest qcow2 an L2 build can produce (zstd bomb guard).
                 decompressor = zstd.ZstdDecompressor()
-                with Path(compressed_path).open("rb") as src, Path(snapshot_path).open("wb") as dst:
-                    while True:
-                        chunk = src.read(chunk_size)
-                        if not chunk:
-                            break
-                        decompressed = decompressor.decompress(chunk)
-                        if decompressed:
-                            dst.write(decompressed)
+                hasher = hashlib.sha256()
+                written = 0
+                with compressed_path.open("rb") as src, partial_path.open("wb") as dst:
+                    while chunk := src.read(chunk_size):
+                        while True:
+                            out = decompressor.decompress(chunk, max_length=_DECOMPRESS_STEP_BYTES)
+                            chunk = b""
+                            written += len(out)
+                            if written > _L2_MAX_FILE_BYTES:
+                                raise ValueError("S3 snapshot is larger than any L2 image")
+                            hasher.update(out)
+                            dst.write(out)
+                            if decompressor.needs_input or decompressor.eof:
+                                break
+                if not decompressor.eof:
+                    raise ValueError("S3 snapshot stream is truncated")
+                compressed_path.unlink()  # read whole: removed here, in this worker thread (up to GBs)
+                return hasher.hexdigest()
 
-            await asyncio.to_thread(_decompress)
+            actual_sha256 = await asyncio.to_thread(_decompress_and_hash)
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    f"S3 snapshot digest mismatch for {s3_key}: expected {expected_sha256}, got {actual_sha256}"
+                )
+            if problem := await _standalone_qcow2_problem(partial_path, cache_key):
+                raise ValueError(problem)
+            partial_path.replace(snapshot_path)
 
-            # Cleanup compressed file
-            await aiofiles.os.remove(compressed_path)
-
-        except Exception as e:
-            # Cleanup on failure
-            if compressed_path.exists():
-                await aiofiles.os.remove(compressed_path)
-            if snapshot_path.exists():
-                await aiofiles.os.remove(snapshot_path)
-
-            raise SnapshotError(f"S3 download failed: {e}") from e
+        except Exception as e:  # noqa: BLE001 - every failure (S3, a check above) is a miss
+            logger.warning("L3 cache miss", extra={"cache_key": cache_key, "reason": str(e)})
+            return None
+        finally:
+            # After a failure each can be GBs (after a success both are gone): one worker-thread job
+            await asyncio.to_thread(_remove_parts, compressed_path, partial_path)
 
         return snapshot_path
 
@@ -836,7 +986,9 @@ class DiskSnapshotManager(BaseCacheManager):
             cache_key: Snapshot cache key
             snapshot_path: Local qcow2 snapshot path
         """
-        compressed_path = snapshot_path.with_suffix(".qcow2.zst")
+        if not self.settings.s3_bucket:
+            return  # S3 backup disabled
+        compressed_path = _part_path(snapshot_path.with_suffix(".qcow2.zst"))
 
         # Acquire semaphore to limit concurrent uploads
         async with self._upload_semaphore:
@@ -844,13 +996,17 @@ class DiskSnapshotManager(BaseCacheManager):
                 # Compress with zstd (level 3 for speed, run in thread pool to avoid blocking)
                 chunk_size = 64 * 1024  # 64KB chunks for streaming
 
-                def _compress() -> None:
+                def _compress() -> str:
+                    # Digest from the same read as the compressed bytes, so the
+                    # metadata always matches the object even if L2 is evicted.
                     compressor = zstd.ZstdCompressor(level=3)
+                    hasher = hashlib.sha256()
                     with Path(snapshot_path).open("rb") as src, Path(compressed_path).open("wb") as dst:
                         while True:
                             chunk = src.read(chunk_size)
                             if not chunk:
                                 break
+                            hasher.update(chunk)
                             compressed = compressor.compress(chunk)
                             if compressed:
                                 dst.write(compressed)
@@ -858,43 +1014,42 @@ class DiskSnapshotManager(BaseCacheManager):
                         final = compressor.flush()
                         if final:
                             dst.write(final)
+                    return hasher.hexdigest()
 
-                await asyncio.to_thread(_compress)
+                snapshot_sha256 = await asyncio.to_thread(_compress)
 
                 async with await self._get_s3_client() as s3:  # type: ignore[union-attr]
-                    # Upload compressed qcow2
-                    s3_key = f"snapshots/{compressed_path.name}"
+                    # Upload compressed qcow2; the digest of the uncompressed
+                    # bytes lets downloads verify the content end to end.
+                    s3_key = self._s3_key(snapshot_path.with_suffix(".qcow2.zst").name)
                     await s3.upload_file(  # type: ignore[union-attr]
                         str(compressed_path),
                         self.settings.s3_bucket,
                         s3_key,
                         ExtraArgs={
                             "Tagging": f"ttl_days={self.settings.snapshot_cache_ttl_days}",
+                            "Metadata": {"sha256": snapshot_sha256},
                         },
                     )
 
-                # Cleanup compressed file
-                await aiofiles.os.remove(compressed_path)
+                # Cleanup compressed file (up to GBs)
+                await asyncio.to_thread(compressed_path.unlink)
 
             except (OSError, RuntimeError, ConnectionError, Exception) as e:  # noqa: BLE001 - Fire-and-forget S3 upload
                 # Silent failure (L2 cache still works)
                 # Catch all exceptions including botocore.exceptions.ClientError
                 logger.warning("S3 upload failed silently", extra={"cache_key": cache_key, "error": str(e)})
-                if compressed_path.exists():
-                    await aiofiles.os.remove(compressed_path)
+                await asyncio.to_thread(compressed_path.unlink, missing_ok=True)
 
     async def _get_s3_client(self):  # type: ignore[no-untyped-def]
-        """Get S3 client (lazy init).
+        """Get S3 client (lazy init). The callers check that s3_bucket is set.
 
         Raises:
-            SnapshotError: If S3 backup not configured
+            ConfigError: EXTRA_MISSING if aioboto3 is not installed
 
         Returns:
             S3 client context manager from aioboto3 (untyped library)
         """
-        if not self.settings.s3_bucket:
-            raise SnapshotError("S3 backup disabled (s3_bucket not configured)")
-
         if self._s3_session is None:
             aioboto3 = require_aioboto3()
             self._s3_session = aioboto3.Session()

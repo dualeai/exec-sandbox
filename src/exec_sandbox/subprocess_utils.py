@@ -151,13 +151,41 @@ async def communicate_managed_process(
         raise
 
 
-async def drain_subprocess_output(
+def start_drain(
     process: ProcessWrapper,
     *,
     process_name: str,
     context_id: str,
-    stdout_handler: Callable[[str], None] | None = None,
-    stderr_handler: Callable[[str], None] | None = None,
+    stdout_handler: Callable[[str], None],
+    stderr_handler: Callable[[str], None],
+) -> asyncio.Task[None]:
+    """Start the background task that drains the process's stdout and stderr to EOF.
+
+    The task becomes the process's drain_task: while it runs, cleanup
+    (ProcessWrapper.wait_with_timeout) waits for the exit without reading the pipes.
+    Its error is logged (log_task_exception). The caller owns the task.
+
+    Args:
+        process: ProcessWrapper instance with stdout/stderr pipes
+        process_name: Process identifier for the task name (e.g., "QEMU", "gvproxy")
+        context_id: Context identifier (e.g., vm_id) for the task name
+        stdout_handler: Callback for each stdout line
+        stderr_handler: Callback for each stderr line
+    """
+    task = asyncio.create_task(
+        drain_subprocess_output(process, stdout_handler=stdout_handler, stderr_handler=stderr_handler),
+        name=f"{process_name}-drain-{context_id}",
+    )
+    task.add_done_callback(log_task_exception)
+    process.drain_task = task
+    return task
+
+
+async def drain_subprocess_output(
+    process: ProcessWrapper,
+    *,
+    stdout_handler: Callable[[str], None],
+    stderr_handler: Callable[[str], None],
 ) -> None:
     """Drain subprocess stdout/stderr concurrently to prevent 64KB pipe deadlock.
 

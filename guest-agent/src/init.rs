@@ -6,12 +6,17 @@ use std::time::Duration;
 
 use crate::constants::{
     NETWORK_FAILED, NETWORK_NOTIFY, NETWORK_PENDING, NETWORK_READY, NETWORK_SETUP_TIMEOUT_SECONDS,
-    NETWORK_STATE, SANDBOX_GID, SANDBOX_UID, ZRAM_FAILED, ZRAM_READY, ZRAM_STATE,
+    NETWORK_STATE, ZRAM_FAILED, ZRAM_READY, ZRAM_STATE,
 };
 
 // ============================================================================
 // Zombie reaping
 // ============================================================================
+
+/// Held while init waits for its own `ip` children. waitpid(-1) in the reaper
+/// would otherwise collect them first, and `status()` fails with ECHILD.
+/// A tokio mutex: the reaper awaits it instead of blocking the only runtime thread.
+static OWNED_CHILD_WAIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Reap zombie processes when running as PID 1.
 pub(crate) async fn reap_zombies() {
@@ -27,6 +32,7 @@ pub(crate) async fn reap_zombies() {
 
     loop {
         sigchld.recv().await;
+        let _owned = OWNED_CHILD_WAIT.lock().await;
         loop {
             let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
             match pid {
@@ -323,6 +329,8 @@ fn setup_network() -> Result<(), String> {
 fn run_ip(stage: &str, args: &[&str]) -> Result<(), String> {
     let started = crate::monotonic_ms();
     log_info!("[network] stage={stage} action=start at={started}ms");
+    // run_ip runs on spawn_blocking, so a blocking lock is allowed here.
+    let _owned = OWNED_CHILD_WAIT.blocking_lock();
     match StdCommand::new("ip").args(args).status() {
         Ok(status) if status.success() => {
             log_info!(

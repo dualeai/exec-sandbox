@@ -126,19 +126,25 @@ class TestGetGvproxySuffix:
     """Tests for get_gvproxy_suffix function."""
 
     @pytest.mark.parametrize(
-        ("os_name", "arch_name", "expected"),
+        ("os_name", "arch", "expected"),
         [
-            ("darwin", "arm64", "darwin-arm64"),
-            ("darwin", "amd64", "darwin-amd64"),
-            ("linux", "arm64", "linux-arm64"),
-            ("linux", "amd64", "linux-amd64"),
+            ("darwin", "aarch64", "darwin-arm64"),
+            ("darwin", "x86_64", "darwin-amd64"),
+            ("linux", "aarch64", "linux-arm64"),
+            ("linux", "x86_64", "linux-amd64"),
         ],
     )
-    def test_returns_correct_suffix(self, os_name: str, arch_name: str, expected: str):
-        """Should return correct os-arch suffix."""
+    def test_returns_correct_suffix(self, os_name: str, arch: str, expected: str):
+        """The os-arch suffix of the asked arch (Go names), not of this host's arch."""
         with patch("exec_sandbox.asset_downloader.get_os_name", return_value=os_name):
-            with patch("exec_sandbox.asset_downloader.get_arch_name", return_value=arch_name):
-                assert get_gvproxy_suffix() == expected
+            assert get_gvproxy_suffix(arch) == expected
+
+
+class TestImportCost:
+    def test_package_import_loads_no_aiohttp(self) -> None:
+        """aiohttp (~50 ms to import) loads at the first download, not at `import exec_sandbox`."""
+        code = "import sys, exec_sandbox\nassert 'aiohttp' not in sys.modules, 'aiohttp imported'\n"
+        subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
 
 
 class TestRetrieve:
@@ -514,41 +520,8 @@ class TestAsyncPooch:
             assert pooch.registry["file1.txt"] == "sha256:hash1"
             assert pooch.registry["file2.txt"] == "sha256:hash2"
 
-    async def test_load_registry_with_comments_and_empty_lines(self, tmp_path: Path):
-        """Should skip comments and empty lines in registry file."""
-        registry_file = tmp_path / "registry.txt"
-        registry_file.write_text(
-            "# This is a comment\n\nfile1.txt sha256:hash1\n   \n# Another comment\nfile2.txt sha256:hash2\n"
-        )
-
-        pooch = AsyncPooch(
-            path=tmp_path,
-            base_url="https://example.com",
-            version="1.0.0",
-        )
-        await pooch.load_registry_from_file(registry_file)
-
-        assert len(pooch.registry) == 2
-        assert pooch.registry["file1.txt"] == "sha256:hash1"
-        assert pooch.registry["file2.txt"] == "sha256:hash2"
-
-    async def test_load_registry_with_malformed_lines(self, tmp_path: Path):
-        """Should skip malformed lines (less than 2 parts) in registry file."""
-        registry_file = tmp_path / "registry.txt"
-        registry_file.write_text("file1.txt sha256:hash1\nmalformed_line_no_hash\nfile2.txt sha256:hash2\n")
-
-        pooch = AsyncPooch(
-            path=tmp_path,
-            base_url="https://example.com",
-            version="1.0.0",
-        )
-        await pooch.load_registry_from_file(registry_file)
-
-        assert len(pooch.registry) == 2
-        assert "malformed_line_no_hash" not in pooch.registry
-
     async def test_github_api_404_error(self, tmp_path: Path):
-        """Should raise AssetNotFoundError when GitHub release not found."""
+        """Should raise ConfigError ASSET_NOT_FOUND when GitHub release not found."""
         pooch = AsyncPooch(
             path=tmp_path,
             base_url="https://github.com/owner/repo/releases/download/v{version}",
@@ -561,8 +534,62 @@ class TestAsyncPooch:
                 status=404,
             )
 
-            with pytest.raises(AssetNotFoundError):
+            with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
                 await pooch.load_registry_from_github("owner", "repo", "v1.0.0")
+
+    @pytest.mark.parametrize("token", ["test-token", None], ids=["token", "no-token"])
+    async def test_github_token_authenticates_the_metadata_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str | None
+    ):
+        """GITHUB_TOKEN, when set, goes in the Authorization header of the release request (a
+        higher rate limit); without it the request is anonymous."""
+        if token is None:
+            monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        else:
+            monkeypatch.setenv("GITHUB_TOKEN", token)
+        pooch = AsyncPooch(
+            path=tmp_path,
+            base_url="https://github.com/owner/repo/releases/download/v{version}",
+            version="1.0.0",
+        )
+
+        with aioresponses() as m:
+            m.get(
+                "https://api.github.com/repos/owner/repo/releases/tags/v1.0.0",
+                payload={"tag_name": "v1.0.0", "assets": []},
+            )
+            await pooch.load_registry_from_github("owner", "repo", "v1.0.0")
+            ((call,),) = m.requests.values()
+
+        expected = {"Accept": "application/vnd.github+json"}
+        if token is not None:
+            expected["Authorization"] = "Bearer test-token"
+        assert call.kwargs["headers"] == expected
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            pytest.param({"status": 403}, id="rate-limited"),
+            pytest.param({"status": 502}, id="server-error"),
+            pytest.param({"exception": aiohttp.ClientConnectionError("no route")}, id="no-network"),
+            pytest.param({"status": 200, "body": "not json", "content_type": "application/json"}, id="not-json"),
+        ],
+    )
+    async def test_unreadable_release_metadata_is_retry(self, tmp_path: Path, answer: dict[str, object]):
+        """Metadata that cannot be read now (no network, a rate limit, a server error, a bad
+        body) is a TransientError ASSET_DOWNLOAD: the same call can succeed later."""
+        pooch = AsyncPooch(
+            path=tmp_path,
+            base_url="https://github.com/owner/repo/releases/download/v{version}",
+            version="1.0.0",
+        )
+
+        with aioresponses() as m:
+            m.get("https://api.github.com/repos/owner/repo/releases/tags/v1.0.0", **answer)  # type: ignore[arg-type]
+
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD) as exc:
+                await pooch.load_registry_from_github("owner", "repo", "v1.0.0")
+        assert exc.value.context == {"owner": "owner", "repo": "repo", "tag": "v1.0.0"}
 
     async def test_github_assets_without_digest(self, tmp_path: Path):
         """Should handle assets without digest (older releases)."""

@@ -156,14 +156,12 @@ def _kernel_candidates(arch: str) -> list[str]:
     Kernel filenames in preference order for the given architecture.
 
     For x86_64: vmlinux (PVH direct boot, ~50ms faster) is preferred over vmlinuz.
-    For aarch64: only vmlinuz is used.
-    Within each type, .zst (compressed) is preferred over decompressed.
+    For aarch64: only vmlinuz is used. These are the unpacked names; the release
+    serves each as `<name>.zst`.
     """
     candidates: list[str] = []
     if arch == "x86_64":
-        candidates.append(f"vmlinux-{arch}.zst")
         candidates.append(f"vmlinux-{arch}")
-    candidates.append(f"vmlinuz-{arch}.zst")
     candidates.append(f"vmlinuz-{arch}")
     return candidates
 
@@ -255,11 +253,12 @@ async def fetch_base_image(language: str, arch: str | None = None, override: Pat
     """
     arch = arch or get_current_arch()
 
-    # Map language to image filename
+    # Map language to image filename: the names scripts/build-qcow2.sh gives (python-<Python
+    # minor>, node-<Bun minor>); tests/test_assets.py checks them against its default versions.
     if language == "python":
         fname = f"python-3.14-base-{arch}.qcow2.zst"
     elif language == "javascript":
-        fname = f"node-1.3-base-{arch}.qcow2.zst"
+        fname = f"node-1.4-base-{arch}.qcow2.zst"
     else:
         fname = f"raw-base-{arch}.qcow2.zst"
 
@@ -333,8 +332,7 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
     await ensure_registry_loaded()
     assets = get_assets()
 
-    suffix = get_gvproxy_suffix()
-    fname = f"gvproxy-wrapper-{suffix}"
+    fname = f"gvproxy-wrapper-{get_gvproxy_suffix(arch)}"
 
     logger.debug("Fetching gvproxy-wrapper", extra={"file": fname})
     path = await assets.fetch(fname)
@@ -571,7 +569,7 @@ async def prefetch_all_assets(
     asset_tasks: list[tuple[str, asyncio.Task[Path]]] = [
         ("kernel", asyncio.create_task(fetch_kernel(arch=arch))),
         ("initramfs", asyncio.create_task(fetch_initramfs(arch=arch))),
-        ("gvproxy", asyncio.create_task(fetch_gvproxy())),
+        ("gvproxy", asyncio.create_task(fetch_gvproxy(override=None, arch=arch))),
     ]
     # Add base images for all supported languages
     asset_tasks.extend(

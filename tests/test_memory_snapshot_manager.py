@@ -31,8 +31,17 @@ if TYPE_CHECKING:
 
 import pytest
 
-from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
+from exec_sandbox.exceptions import (
+    ConfigError,
+    ErrorCode,
+    InternalError,
+    RouteError,
+    SandboxError,
+    TransientError,
+)
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, _vmstate_digest
 from exec_sandbox.models import Language
+from exec_sandbox.vm_spec import VmSpec
 
 
 @pytest.fixture
@@ -214,10 +223,10 @@ class TestComputeCacheKey:
         """Key format: l1-{language}-v{major.minor}-{hash}."""
         key = await self._compute_key(manager, language=Language.PYTHON)
         assert key.startswith("l1-python-v")
-        # Hash part should be 16 chars
+        # Hash part is a fixed-length SHA-256 fingerprint
         parts = key.split("-", 3)
         assert len(parts) == 4  # l1, python, v0.0, hash
-        assert len(parts[3]) == 16  # crc64 hex hash
+        assert len(parts[3]) == 64  # full SHA-256 hex digest
 
     async def test_package_order_insensitive(self, manager: MemorySnapshotManager) -> None:
         """Package order should not affect cache key (sorted internally)."""
@@ -408,15 +417,242 @@ class TestCheckCache:
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """Legacy metadata without SHA-256 still returns hit (graceful upgrade)."""
-        key = await manager.compute_cache_key(Language.PYTHON, [], 512)
+        key = await manager.compute_cache_key(
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
+        )
         vmstate = manager.cache_dir / f"{key}.vmstate"
         meta = manager.cache_dir / f"{key}.vmstate.meta"
         vmstate.write_bytes(b"fake vmstate data")
+        vmstate.with_suffix(".home").write_bytes(b"home disk")
         meta.write_text(json.dumps({"test": True}))  # No vmstate_sha256 field
 
-        result = await manager.check_cache(Language.PYTHON, [], 512)
+        result = await _check_spec(manager, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is not None
         assert result == vmstate
+
+
+class TestHomeDiskEntry:
+    """An L1 entry is vmstate + metadata + RAM template + home disk: all or nothing."""
+
+    async def test_missing_home_disk_is_a_miss_and_entry_removed(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
+    ) -> None:
+        spec = VmSpec(language=Language.PYTHON, memory_mb=512)
+        key = await manager.compute_cache_key(spec, l2_path=None)
+        vmstate = manager.cache_dir / f"{key}.vmstate"
+        meta = manager.cache_dir / f"{key}.vmstate.meta"
+        vmstate.write_bytes(b"vmstate")
+        meta.write_text(json.dumps({"vmstate_sha256": _vmstate_digest(vmstate)}))
+
+        assert await manager.check_cache(key) is None
+        assert not vmstate.exists()
+        assert not meta.exists()
+
+    async def test_failed_check_removes_every_file_off_the_loop_and_the_vmstate_last(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
+    ) -> None:
+        """An entry that fails its integrity check takes its large sidecars with it (eviction
+        lists only *.vmstate), in a worker thread (the .ram file is the RAM size); the miss
+        returns once they are gone. No save of a key starts while its vmstate exists
+        (_save_lock): the vmstate goes last, so a removal never deletes the sidecars of a
+        new save of that key."""
+        key = await manager.compute_cache_key(VmSpec(language=Language.PYTHON, memory_mb=512), l2_path=None)
+        files = [manager.cache_dir / f"{key}{ext}" for ext in (".vmstate", ".vmstate.meta", ".ram", ".home")]
+        for path in files:
+            path.write_bytes(b"x")
+        files[1].write_text(json.dumps({"vmstate_sha256": "0" * 64}))  # fails the check: removed
+        unlinked: list[tuple[str, int]] = []
+        real_unlink = Path.unlink
+
+        def spied_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+            if self in files:
+                unlinked.append((self.name, threading.get_ident()))
+            real_unlink(self, *args, **kwargs)
+
+        with patch.object(Path, "unlink", spied_unlink):
+            assert await manager.check_cache(key) is None
+
+        assert not any(path.exists() for path in files)
+        assert sorted(name for name, _ in unlinked) == sorted(path.name for path in files)
+        assert threading.get_ident() not in {thread for _, thread in unlinked}
+        assert unlinked[-1][0] == files[0].name
+
+    async def test_template_entry_without_its_ram_file_is_a_miss_and_entry_removed(
+        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
+    ) -> None:
+        """A template entry's vmstate holds no RAM: without its .ram file it cannot restore."""
+        spec = VmSpec(language=Language.PYTHON, memory_mb=512)
+        key = await manager.compute_cache_key(spec, l2_path=None)
+        vmstate = manager.cache_dir / f"{key}.vmstate"
+        vmstate.write_bytes(b"device state")
+        vmstate.with_suffix(".home").write_bytes(b"home disk")
+        (manager.cache_dir / f"{key}.vmstate.meta").write_text(
+            json.dumps({"vmstate_sha256": _vmstate_digest(vmstate), "use_template": True})
+        )
+
+        assert await manager.check_cache(key) is None
+        assert sorted(p.name for p in manager.cache_dir.iterdir() if p.name.startswith(key)) == []
+
+    async def test_disk_size_in_key(self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]) -> None:
+        """A template formats its home disk: another disk size is another template."""
+        small = await manager.compute_cache_key(VmSpec(language=Language.PYTHON, disk_mb=256), l2_path=None)
+        large = await manager.compute_cache_key(VmSpec(language=Language.PYTHON, disk_mb=1024), l2_path=None)
+        assert small != large
+
+
+@pytest.mark.usefixtures("mock_system_probes")
+class TestRestore:
+    """restore(): an L1 hit becomes a VM; a miss or a TransientError gives None (the caller cold boots)."""
+
+    _SPEC = VmSpec(language=Language.PYTHON, memory_mb=512)
+
+    @staticmethod
+    async def _entry(manager: MemorySnapshotManager) -> tuple[str, list[Path]]:
+        """A valid L1 entry of _SPEC (no L2 layer): its key and every file of it."""
+        key = await manager.compute_cache_key(TestRestore._SPEC, l2_path=None)
+        files = [manager.cache_dir / f"{key}{ext}" for ext in (".vmstate", ".vmstate.meta", ".ram", ".home")]
+        files[0].write_bytes(b"vmstate")
+        files[1].write_text(json.dumps({"vmstate_sha256": _vmstate_digest(files[0])}))
+        files[2].write_bytes(b"ram")
+        files[3].write_bytes(b"home")
+        return key, files
+
+    @staticmethod
+    async def _restore(manager: MemorySnapshotManager, key: str, reservation: object) -> object:
+        return await manager.restore(
+            TestRestore._SPEC,
+            key=key,
+            tenant_id="tenant",
+            task_id="task",
+            snapshot_drive=Path("/l2.qcow2"),
+            expose_ports=None,
+            reservation=reservation,  # type: ignore[arg-type]
+        )
+
+    async def test_hit_restores_the_entry(self, manager: MemorySnapshotManager) -> None:
+        key, files = await self._entry(manager)
+        vm, reservation = MagicMock(), MagicMock()
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(return_value=vm)) as restore_vm:
+            assert await self._restore(manager, key, reservation) is vm
+        restore_vm.assert_awaited_once_with(
+            self._SPEC,
+            tenant_id="tenant",
+            task_id="task",
+            vmstate_path=files[0],
+            base_image=manager.vm_manager.get_base_image("python"),
+            snapshot_drive=Path("/l2.qcow2"),
+            expose_ports=None,
+            reservation=reservation,
+        )
+
+    async def test_miss_starts_nothing(self, manager: MemorySnapshotManager) -> None:
+        key = await manager.compute_cache_key(self._SPEC, l2_path=None)
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock()) as restore_vm:
+            assert await self._restore(manager, key, MagicMock()) is None
+        restore_vm.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("cause", "evicted"),
+        [
+            pytest.param(
+                RouteError(
+                    "QEMU refused",
+                    code=ErrorCode.MIGRATION_REJECTED,
+                    required={},
+                    found={},
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                True,
+                id="rejected",
+            ),
+            pytest.param(
+                ConfigError(
+                    "QEMU cannot load", code=ErrorCode.MIGRATION_UNSUPPORTED, context=None, hint=None, instance_id=None
+                ),
+                True,
+                id="unsupported",
+            ),
+            pytest.param(
+                ConfigError(
+                    "qemu-vm user missing", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
+                ),
+                False,
+                id="setup",
+            ),
+            pytest.param(TimeoutError(), False, id="timeout"),
+        ],
+    )
+    async def test_transient_failure_removes_only_what_qemu_refused(
+        self, manager: MemorySnapshotManager, cause: BaseException, evicted: bool
+    ) -> None:
+        """A restore QEMU refused (MIGRATION_REJECTED or MIGRATION_UNSUPPORTED in the cause
+        chain) removes the entry; a setup failure or a timeout keeps it (a good entry)."""
+        key, files = await self._entry(manager)
+        error = TransientError(
+            "restore failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
+        )
+        error.__cause__ = cause
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)):
+            assert await self._restore(manager, key, MagicMock()) is None
+        assert all(not f.exists() for f in files) if evicted else all(f.exists() for f in files)
+
+    async def test_silent_guest_removes_the_entry(self, manager: MemorySnapshotManager) -> None:
+        """A guest that never answers after its state loaded: the request cold boots and
+        the entry goes (else every later hit waits for the same silence)."""
+        key, files = await self._entry(manager)
+        error = TransientError(
+            "guest did not answer", code=ErrorCode.GUEST_SILENT_AFTER_RESTORE, context=None, hint=None, instance_id=None
+        )
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)):
+            assert await self._restore(manager, key, MagicMock()) is None
+        assert not any(f.exists() for f in files)
+
+    async def test_rejection_found_through_context_chain(self, manager: MemorySnapshotManager) -> None:
+        """QEMU died while refusing the stream: the error is raised without `from`."""
+        key, files = await self._entry(manager)
+        try:
+            try:
+                raise RouteError(
+                    "QEMU refused",
+                    code=ErrorCode.MIGRATION_REJECTED,
+                    required={},
+                    found={},
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                )
+            except RouteError:
+                raise TransientError(  # noqa: B904 - as the code under test: no `from`
+                    "QEMU process died", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None
+                )
+        except SandboxError as caught:
+            error = caught
+        with patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)):
+            assert await self._restore(manager, key, MagicMock()) is None
+        assert not any(f.exists() for f in files)
+
+    async def test_unconfirmed_cleanup_raises_cleanup_unconfirmed_and_keeps_the_entry(
+        self, manager: MemorySnapshotManager
+    ) -> None:
+        """Cleanup of the failed restore not confirmed: no cold boot may reuse the reservation."""
+        key, files = await self._entry(manager)
+        error = InternalError(
+            "Restore failure cleanup was not confirmed",
+            code=ErrorCode.CLEANUP_UNCONFIRMED,
+            context=None,
+            hint=None,
+            instance_id=None,
+        )
+        with (
+            patch.object(manager.vm_manager, "restore_vm", new=AsyncMock(side_effect=error)),
+            pytest.raises(
+                InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED, match="not confirmed"
+            ),
+        ):
+            await self._restore(manager, key, MagicMock())
+        assert all(f.exists() for f in files)
 
 
 class TestSaveLock:
@@ -447,6 +683,14 @@ class TestSaveLock:
             with pytest.raises(BlockingIOError):
                 async with manager._save_lock("test-key"):
                     pass  # Should not reach here
+
+    async def test_lock_makes_a_removed_cache_folder_again(self, manager: MemorySnapshotManager) -> None:
+        """A cache folder removed while the worker runs (a tmp cleaner) is made again: the
+        save goes on, instead of a FileNotFoundError on every save until a restart."""
+        shutil.rmtree(manager.cache_dir)
+        async with manager._save_lock("test-key") as should_save:
+            assert should_save is True
+        assert manager.cache_dir.is_dir()
 
     async def test_lock_released_after_context(self, manager: MemorySnapshotManager) -> None:
         """Lock is released when context manager exits — re-acquire succeeds."""
@@ -739,20 +983,15 @@ class TestComputeCacheKeyEdgeCases:
         assert key_dup == key_nodup
 
     async def test_huge_package_list(self, manager: MemorySnapshotManager) -> None:
-        """Large package list (1000 packages) still produces a valid 16-char hash."""
+        """Large package list (1000 packages) still produces a fixed-length fingerprint."""
         packages = [f"pkg-{i}" for i in range(1000)]
         key = await self._compute_key(manager, packages=packages)
         parts = key.split("-", 3)
-        assert len(parts[3]) == 16
+        assert len(parts[3]) == 64  # full SHA-256 hex digest
 
     async def test_special_chars_in_packages(self, manager: MemorySnapshotManager) -> None:
         """Special characters in package names (pipes, commas, newlines)."""
         key = await self._compute_key(manager, packages=["pkg|bar", "pkg,baz", "pkg\nnl"])
-        assert key.startswith("l1-python-v")
-
-    async def test_memory_zero(self, manager: MemorySnapshotManager) -> None:
-        """Zero memory_mb produces valid key (validation is elsewhere)."""
-        key = await self._compute_key(manager, memory_mb=0)
         assert key.startswith("l1-python-v")
 
     async def test_memory_very_large(self, manager: MemorySnapshotManager) -> None:
@@ -1639,7 +1878,7 @@ class TestImageHashEdgeCases:
         f.write_bytes(b"")
         result = BaseCacheManager.image_hash(f)
         assert result != "missing0"
-        assert len(result) == 8  # crc32 = 8 hex chars
+        assert len(result) == 64  # full SHA-256 hex digest
 
     def test_same_file_same_hash(self, tmp_path: Path) -> None:
         """Same file produces same hash across calls."""
@@ -1651,8 +1890,29 @@ class TestImageHashEdgeCases:
         h2 = BaseCacheManager.image_hash(f)
         assert h1 == h2
 
-    def test_different_content_same_stat_same_hash(self, tmp_path: Path) -> None:
-        """Files with same mtime+size but different content → same hash (by design)."""
+    def test_hash_is_content_digest(self, tmp_path: Path) -> None:
+        """The digest is the SHA-256 of the bytes, identical on every host."""
+        import hashlib
+
+        from exec_sandbox.base_cache_manager import BaseCacheManager
+
+        f = tmp_path / "test"
+        f.write_bytes(b"data")
+        assert BaseCacheManager.image_hash(f) == hashlib.sha256(b"data").hexdigest()
+
+    def test_same_content_different_mtime_same_hash(self, tmp_path: Path) -> None:
+        """A rewrite with identical bytes keeps the identity (mtime is not identity)."""
+        from exec_sandbox.base_cache_manager import BaseCacheManager
+
+        f = tmp_path / "test"
+        f.write_bytes(b"data")
+        h1 = BaseCacheManager.image_hash(f)
+        time.sleep(0.01)
+        f.write_bytes(b"data")
+        assert BaseCacheManager.image_hash(f) == h1
+
+    def test_different_content_same_stat_different_hash(self, tmp_path: Path) -> None:
+        """New bytes with the old mtime and size are re-hashed (stamp includes inode)."""
         from exec_sandbox.base_cache_manager import BaseCacheManager
 
         f = tmp_path / "test"
@@ -1660,26 +1920,24 @@ class TestImageHashEdgeCases:
         stat1 = f.stat()
         h1 = BaseCacheManager.image_hash(f)
 
-        # Overwrite with different content but preserve mtime
-        f.write_bytes(b"bbbb")
-        os.utime(f, ns=(stat1.st_atime_ns, stat1.st_mtime_ns))
-        h2 = BaseCacheManager.image_hash(f)
+        # Replace the file (new inode) with different bytes but the same mtime and size
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"bbbb")
+        os.utime(replacement, ns=(stat1.st_atime_ns, stat1.st_mtime_ns))
+        replacement.replace(f)
+        assert BaseCacheManager.image_hash(f) != h1
 
-        assert h1 == h2  # Same mtime+size → same hash (by design: O(1) fingerprint)
+    def test_sidecar_written_and_reused(self, tmp_path: Path) -> None:
+        """The digest is cached in a <file>.sha256 sidecar keyed by inode, mtime and size."""
+        import hashlib
 
-    def test_modified_file_different_hash(self, tmp_path: Path) -> None:
-        """File with updated mtime (rebuild) produces different hash."""
         from exec_sandbox.base_cache_manager import BaseCacheManager
 
-        f = tmp_path / "test"
-        f.write_bytes(b"data")
-        h1 = BaseCacheManager.image_hash(f)
-
-        time.sleep(0.01)  # Ensure mtime changes
-        f.write_bytes(b"data")  # Same content, different mtime
-        h2 = BaseCacheManager.image_hash(f)
-
-        assert h1 != h2
+        f = tmp_path / "image.qcow2"
+        f.write_bytes(b"image-bytes")
+        digest = BaseCacheManager.image_hash(f)
+        sidecar = tmp_path / "image.qcow2.sha256"
+        assert sidecar.read_text().split()[1] == digest == hashlib.sha256(b"image-bytes").hexdigest()
 
 
 # ============================================================================

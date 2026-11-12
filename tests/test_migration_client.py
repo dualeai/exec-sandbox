@@ -270,20 +270,33 @@ class TestMigrationClientExecuteEdgeCases:
     """Edge cases for _execute (malformed JSON, event floods, etc.)."""
 
     async def test_malformed_json_response_raises(self) -> None:
-        """Malformed JSON from QEMU should raise."""
+        """Malformed JSON from QEMU raises TransientError MIGRATION_FAILED (no bare JSONDecodeError)."""
         client, reader, _writer = _make_connected()
         reader.feed_data(b"not valid json\n")
 
-        with pytest.raises(json.JSONDecodeError):
-            await client._execute("test-command")
+        with pytest.raises(
+            TransientError, match="QMP test-command failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+        ):
+            await client._execute("test-command", arguments=None, timeout=_QMP_TIMEOUT)
+
+    async def test_command_timeout_is_transient(self) -> None:
+        """A QMP command without an answer raises TransientError MIGRATION_FAILED, not a bare TimeoutError."""
+        client, _reader, _writer = _make_connected()
+
+        with pytest.raises(
+            TransientError, match="QMP stop failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+        ):
+            await client._execute("stop", timeout=0.05, arguments=None)
 
     async def test_event_flood_hits_safety_cap(self) -> None:
         """More skipped messages than the safety cap should raise."""
         events = [{"event": f"EVENT_{i}", "data": {}} for i in range(_MAX_SKIPPED_MESSAGES + 1)]
         client, _reader, _writer = _make_connected(events)
 
-        with pytest.raises(MigrationTransientError, match="Too many QMP messages"):
-            await client._execute("query-migrate")
+        with pytest.raises(
+            TransientError, match="Too many QMP messages", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+        ):
+            await client._execute("query-migrate", arguments=None, timeout=_QMP_TIMEOUT)
 
     async def test_events_just_under_cap_then_response(self) -> None:
         """cap-1 events + 1 response (within the cap) should succeed."""

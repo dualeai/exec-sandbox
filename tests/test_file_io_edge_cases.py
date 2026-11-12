@@ -7,18 +7,22 @@ Requires VM (integration tests).
 
 import asyncio
 import base64
+import errno
+import io
 import json
+import os
 import sys
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from exec_sandbox.constants import MAX_FILE_SIZE_BYTES
-from exec_sandbox.exceptions import SessionClosedError, VmPermanentError
+from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_SIZE_BYTES
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError, SessionClosedError, TransientError
 from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
 
 # Use native zstd module (Python 3.14+) or backports.zstd
 if sys.version_info >= (3, 14):
@@ -683,3 +687,31 @@ class TestWriteAbortRecovery:
             result = await session.exec("import os; print(os.path.exists('/home/user/will_abort.bin'))")
             assert result.exit_code == 0
             assert "False" in result.stdout
+
+    async def test_source_read_failure_writes_nothing_and_keeps_the_session(self, scheduler: Scheduler) -> None:
+        """The local source fails after the header and a chunk: write_file closes the channel
+        (no file_end), so the guest drops the write. RETRY (LOCAL_DISK) holds: no file at the
+        target, the session stays open, and the same call with a working source succeeds."""
+
+        class FailingSource(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:  # fails once the first chunk is read
+                if self.tell() >= FILE_TRANSFER_CHUNK_SIZE:
+                    raise OSError(errno.EIO, os.strerror(errno.EIO))
+                return super().read(size)
+
+        content = os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE)
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            source = FailingSource(content)
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+                await session.write_file("partial.bin", source)
+            assert not session.closed
+            assert source.tell() == 0  # set back: the same call can run again
+
+            result = await session.exec("import os; print(os.path.exists('/home/user/partial.bin'))")
+            assert result.exit_code == 0
+            assert "False" in result.stdout, "the guest committed a write that never got file_end"
+
+            await session.write_file("partial.bin", io.BytesIO(content))
+            read_back = io.BytesIO()
+            await session.read_file("partial.bin", destination=read_back)
+            assert read_back.getvalue() == content

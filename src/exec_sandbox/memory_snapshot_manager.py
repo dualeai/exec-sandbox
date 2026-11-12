@@ -270,8 +270,7 @@ class MemorySnapshotManager(BaseCacheManager):
             stat = vmstate_path.stat()
             if stat.st_size == 0:
                 logger.warning("L1 cache entry has zero size, removing", extra={"key": key})
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
+                await asyncio.to_thread(self._remove_entry, vmstate_path)  # all sidecars, or .ram/.home leak
                 return None
         except OSError:
             return None
@@ -283,23 +282,20 @@ class MemorySnapshotManager(BaseCacheManager):
             meta = None
         if meta is None:
             logger.warning("L1 cache metadata invalid, removing", extra={"key": key})
-            vmstate_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
+            await asyncio.to_thread(self._remove_entry, vmstate_path)
             return None
 
         # Verify vmstate SHA-256 integrity
         if meta.vmstate_sha256:
             try:
-                actual_sha256 = await asyncio.to_thread(_sha256_file, vmstate_path)
+                actual_sha256 = await asyncio.to_thread(_vmstate_digest, vmstate_path)
                 if actual_sha256 != meta.vmstate_sha256:
                     logger.warning("L1 cache vmstate integrity check failed, removing", extra={"key": key})
-                    vmstate_path.unlink(missing_ok=True)
-                    meta_path.unlink(missing_ok=True)
+                    await asyncio.to_thread(self._remove_entry, vmstate_path)
                     return None
             except OSError:
                 logger.warning("L1 cache vmstate unreadable during integrity check, removing", extra={"key": key})
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
+                await asyncio.to_thread(self._remove_entry, vmstate_path)  # all sidecars, or .ram/.home leak
                 return None
 
         # Validate RAM template file exists (for v3+ template format)
@@ -420,18 +416,14 @@ class MemorySnapshotManager(BaseCacheManager):
             size_mb = vmstate_path.stat().st_size / (1024 * 1024)
             logger.info(
                 "L1 snapshot saved",
-                extra={"key": key, "size_mb": f"{size_mb:.1f}", "language": language.value},
+                extra={"key": key, "size_mb": f"{size_mb:.1f}", "language": spec.language.value},
             )
             return vmstate_path
 
         except OSError as e:
-            ram_path = self.ram_path_from_vmstate(vmstate_path)
+            await run_to_end(discard)
             if e.errno == errno.ENOSPC:
-                # Disk full — evict oldest and retry once
-                tmp_path.unlink(missing_ok=True)
-                vmstate_path.unlink(missing_ok=True)
-                meta_path.unlink(missing_ok=True)
-                ram_path.unlink(missing_ok=True)
+                # Disk full — evict oldest; the next request saves again
                 await self._evict_oldest_snapshot()
                 logger.info("L1 evicted oldest on ENOSPC, will retry on next request", extra={"key": key})
                 return None
@@ -440,15 +432,11 @@ class MemorySnapshotManager(BaseCacheManager):
                 extra={"key": key, "error": str(e)},
                 exc_info=True,
             )
-            tmp_path.unlink(missing_ok=True)
-            vmstate_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
             return None
 
         except BaseException as e:
             # Catch BaseException (not just Exception) to handle CancelledError too.
             # Prevents orphaned partial files on SIGTERM / task cancellation.
-            ram_path_cleanup = self.ram_path_from_vmstate(vmstate_path)
             if not isinstance(e, Exception):
                 logger.info("L1 snapshot save cancelled, cleaning up", extra={"key": key})
             else:

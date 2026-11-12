@@ -342,6 +342,37 @@ class TestGuardNormal:
         await session.read_file("test.txt", destination=dest)
         mock_vm.read_file.assert_awaited_once_with("test.txt", destination=dest)
 
+    @pytest.mark.parametrize(
+        ("make_destination", "match"),
+        [
+            pytest.param(_closed_buffer, "^read_file destination stream is closed$", id="closed"),
+            pytest.param(
+                lambda: io.BufferedReader(io.BytesIO(b"")),
+                "^read_file destination stream is not writable$",
+                id="read-only",
+            ),
+            pytest.param(
+                io.StringIO,
+                "^read_file destination stream is a text stream: open it in binary mode$",
+                id="text",
+            ),
+            pytest.param(  # not an io.TextIOBase: only its write() refuses bytes
+                lambda: tempfile.SpooledTemporaryFile(mode="w+"),
+                "^read_file destination stream is a text stream: open it in binary mode$",
+                id="wrapped-text",
+            ),
+        ],
+    )
+    async def test_read_file_refuses_an_unusable_destination(self, make_destination: Any, match: str) -> None:
+        """A closed, read-only or text destination stream is the caller's error (FIX_INPUT),
+        found before the call takes the session: the guest is not asked, the session stays
+        open. A text stream would get bytes after dispatch: a builtin TypeError."""
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=match):
+            await session.read_file("out.bin", destination=make_destination())
+        mock_vm.read_file.assert_not_awaited()
+        assert not session.closed
+
     async def test_list_files_calls_vm(self) -> None:
         """list_files() delegates to VM under _guard."""
         session, mock_vm, _ = _make_session()
@@ -391,6 +422,46 @@ class TestGuardClosedFastPath:
         await session.close()
         with pytest.raises(SessionClosedError, match="Session is closed"):
             await session.list_files()
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda s, _p: s.exec("x = 1", timeout_seconds=0), id="exec-timeout"),
+            pytest.param(lambda s, _p: s.exec("x" * (MAX_CODE_SIZE + 1)), id="exec-code-size"),
+            pytest.param(lambda s, p: s.write_file("f.txt", p / "missing.bin"), id="write-missing-source"),
+            pytest.param(lambda s, _p: s.write_file("f.txt", _closed_buffer()), id="write-closed-stream"),
+            pytest.param(
+                lambda s, _p: s.read_file("f.txt", destination=_closed_buffer()), id="read-closed-destination"
+            ),
+        ],
+    )
+    async def test_closed_session_comes_before_argument_errors(self, call: Any, tmp_path: Path) -> None:
+        """On a closed session the caller must open a new session whatever the arguments:
+        RESTART is checked before FIX_INPUT."""
+        session, _, _ = _make_session()
+        await session.close()
+        with pytest.raises(SessionClosedError, match=r"^Session is closed$"):
+            await call(session, tmp_path)
+
+    async def test_write_file_on_closed_session_opens_no_local_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"data")
+        session, _, _ = _make_session()
+        await session.close()
+        opened: list[Any] = []
+        open_ = os.open
+
+        def spied_open(path: Any, *args: Any, **kwargs: Any) -> int:
+            if Path(path) == source:
+                opened.append(path)
+            return open_(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spied_open)
+        with pytest.raises(SessionClosedError, match=r"^Session is closed$"):
+            await session.write_file("f.txt", source)
+        assert opened == []
 
 
 # ============================================================================
@@ -653,6 +724,79 @@ class TestResolveContentNormal:
 
         await session.close()
 
+    async def test_path_checked_and_opened_off_the_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A Path source is opened and checked (type, size: fstat) in a worker thread: the
+        caller's path can be on a network disk, where each call waits for the disk."""
+        f = tmp_path / "src.bin"
+        f.write_bytes(b"data")
+        callers: list[int] = []
+        stat, open_ = Path.stat, os.open
+
+        def spied_stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+            if self == f:
+                callers.append(threading.get_ident())
+            return stat(self, *args, **kwargs)
+
+        def spied_open(path: Any, *args: Any, **kwargs: Any) -> int:
+            if Path(path) == f:
+                callers.append(threading.get_ident())
+            return open_(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", spied_stat)
+        monkeypatch.setattr(os, "open", spied_open)
+        session, _, _ = _make_session()
+        stream, owned = await session._resolve_content(f)
+        with stream:
+            assert owned is True
+            assert stream.read() == b"data"
+        assert callers  # the open
+        assert threading.get_ident() not in callers
+
+    async def test_cancel_while_opening_closes_the_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A caller cancelled while its Path source is being opened: the cancel waits for the
+        open, closes the file it opened (no file object without an owner), then propagates."""
+        f = tmp_path / "src.bin"
+        f.write_bytes(b"data")
+        loop_thread = threading.get_ident()
+        reached, released = threading.Event(), threading.Event()
+        opened: list[IO[Any]] = []
+        fdopen = os.fdopen
+
+        def held(fd: int, *args: Any, **kwargs: Any) -> IO[Any]:
+            stream = fdopen(fd, *args, **kwargs)
+            opened.append(stream)
+            reached.set()
+            if threading.get_ident() != loop_thread:  # an open on the loop must not block the test
+                released.wait(10)
+            return stream
+
+        monkeypatch.setattr(os, "fdopen", held)
+        session, _, _ = _make_session()
+        resolving = asyncio.create_task(session._resolve_content(f))
+        try:
+            assert await asyncio.to_thread(reached.wait, 10)
+            resolving.cancel()
+            await asyncio.sleep(0.05)
+            assert not resolving.done(), "the cancel did not wait for the open"
+        finally:
+            released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await resolving
+        (stream,) = opened
+        assert stream.closed
+
+    @pytest.mark.timeout(30)
+    async def test_fifo_source_is_refused_at_once(self, tmp_path: Path) -> None:
+        """A FIFO has no size to check, and its open or read can block forever (no writer):
+        refused as not a regular file, without waiting for a writer."""
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        session, _, _ = _make_session()
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="not a regular file"
+        ):
+            await asyncio.wait_for(session._resolve_content(fifo), timeout=5)
+
 
 # ============================================================================
 # _resolve_content() — Edge cases (boundaries)
@@ -661,6 +805,43 @@ class TestResolveContentNormal:
 
 class TestResolveContentEdgeCases:
     """Boundary value tests for _resolve_content()."""
+
+    async def test_closed_stream_is_refused(self) -> None:
+        """A closed IO source: refused before the write starts (a read would raise a builtin ValueError)."""
+        session, _, _ = _make_session()
+        stream = io.BytesIO(b"data")
+        stream.close()
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
+            await session._resolve_content(stream)
+
+    @pytest.mark.parametrize(
+        ("make_source", "match"),
+        [
+            pytest.param(lambda: tempfile.TemporaryFile("wb"), "^Stream content is not readable$", id="write-only"),
+            pytest.param(
+                lambda: io.StringIO("text"), "^Stream content is a text stream: open it in binary mode$", id="text"
+            ),
+            pytest.param(  # not an io.TextIOBase: only its read() gives str
+                lambda: tempfile.SpooledTemporaryFile(mode="w+"),
+                "^Stream content is a text stream: open it in binary mode$",
+                id="wrapped-text",
+            ),
+            pytest.param(
+                _SizeIgnoringReader, "^Stream content returned bytes for a zero-byte read$", id="ignores-size"
+            ),
+        ],
+    )
+    async def test_stream_that_cannot_be_read_as_bytes_is_refused(self, make_source: Any, match: str) -> None:
+        """A source stream not open for reading, a text stream, or one that ignores the read
+        size: the caller's error (FIX_INPUT), found before the call takes the session. The
+        guest gets no header (a failed read after it would close the session as VERIFY)."""
+        session, mock_vm, _ = _make_session()
+        with make_source() as source:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=match):
+                await session.write_file("out.bin", source)
+            assert not source.closed  # the caller's stream stays open
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     async def test_bytes_exactly_at_max_size_accepted(self) -> None:
         """Bytes of exactly MAX_FILE_SIZE_BYTES are accepted."""
@@ -757,19 +938,102 @@ class TestResolveContentEdgeCases:
 class TestResolveContentOutOfBounds:
     """Error handling in _resolve_content()."""
 
-    async def test_nonexistent_path_raises_file_not_found(self, tmp_path: Path) -> None:
-        """Path to non-existent file raises FileNotFoundError."""
+    async def test_nonexistent_path_raises_argument_invalid(self, tmp_path: Path) -> None:
+        """Path to non-existent file raises InvalidInputError ARGUMENT_INVALID."""
         session, _, _ = _make_session()
-        with pytest.raises(FileNotFoundError, match="Source file not found"):
-            await session._resolve_content(tmp_path / "ghost.txt")
+        ghost = tmp_path / "ghost.txt"
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=rf"^Source file cannot be opened \(No such file or directory\): {re.escape(str(ghost))}$",
+        ):
+            await session._resolve_content(ghost)
+
+    @pytest.mark.parametrize("case", ["no-read-access", "symlink-loop", "file-in-path"])
+    async def test_unopenable_source_raises_argument_invalid(self, tmp_path: Path, case: str) -> None:
+        """A source the caller cannot open is the caller's error (FIX_INPUT), not a builtin."""
+        source = tmp_path / "source.bin"
+        if case == "no-read-access":
+            if os.geteuid() == 0:
+                pytest.skip("root reads a file without read permission")
+            source.write_bytes(b"data")
+            source.chmod(0)
+        elif case == "symlink-loop":
+            source.symlink_to(tmp_path / "loop")
+            (tmp_path / "loop").symlink_to(source)
+        else:  # ENOTDIR
+            (tmp_path / "a-file").write_bytes(b"")
+            source = tmp_path / "a-file" / "source.bin"
+        session, _, _ = _make_session()
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=rf"^Source file cannot be opened \(.+\): {re.escape(str(source))}$",
+        ) as exc_info:
+            await session._resolve_content(source)
+        assert isinstance(exc_info.value.__cause__, OSError)
+
+    @pytest.mark.parametrize(
+        ("step", "code"),
+        [pytest.param("open", errno.EMFILE, id="open-EMFILE"), pytest.param("fstat", errno.EIO, id="fstat-EIO")],
+    )
+    async def test_source_host_error_is_local_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, code: int
+    ) -> None:
+        """This host cannot open the source now (out of file handles, an I/O error): the call
+        is right and can pass later (RETRY: LOCAL_DISK), not the caller's error."""
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"data")
+        inode = source.stat().st_ino
+        open_, fstat = os.open, os.fstat
+
+        def failing_open(path: Any, *args: Any, **kwargs: Any) -> int:
+            if step == "open" and Path(path) == source:
+                raise OSError(code, os.strerror(code), str(path))
+            return open_(path, *args, **kwargs)
+
+        def failing_fstat(fd: int) -> os.stat_result:
+            st = fstat(fd)
+            if step == "fstat" and st.st_ino == inode:
+                raise OSError(code, os.strerror(code))
+            return st
+
+        monkeypatch.setattr(os, "open", failing_open)
+        monkeypatch.setattr(os, "fstat", failing_fstat)
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.LOCAL_DISK and e.context["errno"] == code,
+            match=rf"^Source file cannot be opened \({re.escape(os.strerror(code))}\): {re.escape(str(source))}$",
+        ):
+            await session.write_file("out.bin", source)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
+
+    async def test_nul_byte_in_source_path_is_argument_invalid(self) -> None:
+        """A NUL byte in the source path (an agent can build one from model output): the
+        caller's error, not a builtin ValueError; the path is not printed."""
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^Source file cannot be opened \(.*null.*\)$",
+        ) as exc_info:
+            await session.write_file("out.bin", Path("a\x00b"))
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     async def test_path_is_directory_raises(self, tmp_path: Path) -> None:
-        """Path pointing to a directory raises (open fails)."""
+        """Path pointing to a directory: not a regular file."""
         d = tmp_path / "subdir"
         d.mkdir()
         session, _, _ = _make_session()
-        # A directory exists but open("rb") will fail
-        with pytest.raises(IsADirectoryError):
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match="Source subdir is not a regular file",
+        ):
             await session._resolve_content(d)
 
 
@@ -930,25 +1194,43 @@ class TestWriteFileCommitProtocol:
         vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
         return vm, inbox
 
-    async def test_source_failure_after_prefix_never_sends_file_end(self) -> None:
+    @pytest.mark.parametrize("seekable", [False, True], ids=["non-seekable", "seekable"])
+    async def test_source_failure_after_header_aborts_as_local_disk(self, seekable: bool) -> None:
+        """The local source fails after the header and a chunk, before file_end. The guest
+        commits a write only on the file_end of its op_id and drops it when the channel
+        closes: the host closes the channel and reports nothing written (RETRY: LOCAL_DISK),
+        not an unknown outcome (VERIFY, which closes the session). A seekable source goes
+        back to where the call found it, so the same call can run again."""
         from exec_sandbox.qemu_vm import QemuVM
 
-        class FailingReader:
+        class FailingSource(io.BytesIO):
             reads = 0
 
-            def read(self, _size: int) -> bytes:
+            def read(self, size: int | None = -1) -> bytes:
                 self.reads += 1
                 if self.reads == 1:
-                    return b"prefix"
-                raise OSError("injected source failure")
+                    return super().read(size)
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
 
+            def seekable(self) -> bool:
+                return seekable
+
+        source = FailingSource(b"head" + os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE))
+        source.seek(4)
         vm, _inbox = self._make_vm()
-        with pytest.raises(CommunicationOutcomeUnknownError, match="after dispatch"):
-            await QemuVM._write_file_protocol(vm, "target.bin", FailingReader())  # type: ignore[arg-type]
-
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.LOCAL_DISK and e.context["errno"] == errno.EIO,
+            match=rf"^VM write-commit-vm write_file could not read the local source \({os.strerror(errno.EIO)}\)$",
+        ) as exc_info:
+            await QemuVM._write_file_protocol(vm, "target.bin", source, make_executable=False)
+        assert isinstance(exc_info.value.__cause__, OSError)
+        vm.channel.enqueue_registered.assert_awaited_once()  # the header was sent
         actions = [json.loads(call.args[0])["action"] for call in vm.channel.enqueue_raw.await_args_list]
-        assert "file_end" not in actions
+        assert actions == ["file_chunk"]  # a chunk went out, never a file_end
+        vm.channel.close.assert_awaited_once()  # the guest drops the partial write
         vm.channel.unregister_op.assert_awaited_once()
+        assert source.tell() == (4 if seekable else 4 + FILE_TRANSFER_CHUNK_SIZE)
 
     async def test_failed_chunk_enqueue_never_starts_the_next_source_read(self) -> None:
         """A failed enqueue cannot return while look-ahead still owns the stream."""
@@ -1057,6 +1339,157 @@ class TestReadFileTerminalIntegrity:
         vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
         return vm
 
+    @staticmethod
+    def _bound(vm: MagicMock) -> MagicMock:
+        """read_file with its real helpers (a spec mock stubs them)."""
+        from functools import partial
+
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm._read_file_to_path = partial(QemuVM._read_file_to_path, vm)
+        vm._recv_file_chunks = partial(QemuVM._recv_file_chunks, vm)
+        return vm
+
+    async def test_path_destination_is_written_whole(self, tmp_path: Path) -> None:
+        from exec_sandbox.qemu_vm import QemuVM
+
+        payload = b"payload of the guest file"
+        destination = tmp_path / "out" / "file.bin"
+        vm = self._bound(self._file_read_vm(payload))
+        await QemuVM.read_file(vm, "file.bin", destination=destination)
+        assert destination.read_bytes() == payload
+        assert sorted(p.name for p in destination.parent.iterdir()) == ["file.bin"]  # no temp file left
+        vm.channel.unregister_op.assert_awaited_once()
+
+    @pytest.mark.parametrize("case", ["file-in-path", "no-write-access", "folder-at-destination"])
+    async def test_destination_the_caller_can_fix_is_argument_invalid(self, tmp_path: Path, case: str) -> None:
+        """A destination path the caller can fix (a file in its path: mkdir ENOTDIR; a folder
+        with no write access: EACCES; a folder where the file goes: rename EISDIR) fails the
+        same way on every retry: FIX_INPUT (ARGUMENT_INVALID), not RETRY."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        if case == "file-in-path":
+            (tmp_path / "a-file").write_bytes(b"")
+            destination, expected = tmp_path / "a-file" / "sub" / "file.bin", errno.ENOTDIR
+        elif case == "no-write-access":
+            if os.geteuid() == 0:
+                pytest.skip("root writes in a folder without write permission")
+            (tmp_path / "locked").mkdir()
+            (tmp_path / "locked").chmod(0o500)
+            destination, expected = tmp_path / "locked" / "file.bin", errno.EACCES
+        else:
+            destination, expected = tmp_path / "folder", errno.EISDIR
+            destination.mkdir()
+        vm = self._bound(self._file_read_vm(b"payload"))
+        reason = re.escape(os.strerror(expected))
+        try:
+            with pytest.raises(
+                InvalidInputError,
+                check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID and e.context["errno"] == expected,
+                match=rf"^VM test-vm read_file could not write the local destination \({reason}\)$",
+            ) as exc_info:
+                await QemuVM.read_file(vm, "file.bin", destination=destination)
+        finally:
+            if case == "no-write-access":
+                (tmp_path / "locked").chmod(0o700)
+        assert isinstance(exc_info.value.__cause__, OSError)
+        assert exc_info.value.context["path"] == "file.bin"
+        vm.channel.unregister_op.assert_awaited_once()
+        assert list(tmp_path.rglob("*.tmp")) == []  # no temp file left
+
+    @pytest.mark.parametrize(
+        "make_destination",
+        [
+            pytest.param(lambda p: p / "d\x00ir" / "file.bin", id="nul-byte"),
+            pytest.param(lambda _p: Path("/"), id="no-file-name"),
+        ],
+    )
+    async def test_destination_path_value_error_is_argument_invalid(
+        self, tmp_path: Path, make_destination: Any
+    ) -> None:
+        """A NUL byte in the destination path or a destination with no file name raises
+        ValueError in Path/os calls: the caller's error, and the cleanup's own ValueError
+        (unlink of the temp path) does not hide it. The guest is not asked."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm = self._bound(self._file_read_vm(b"payload"))
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^VM test-vm read_file could not write the local destination \(.+\)$",
+        ) as exc_info:
+            await QemuVM.read_file(vm, "file.bin", destination=make_destination(tmp_path))
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        vm.channel.register_op.assert_not_awaited()
+        vm.channel.unregister_op.assert_awaited_once()
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_host_disk_error_is_local_disk(self) -> None:
+        """A full disk can pass later: RETRY (LOCAL_DISK), named by its reason."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        class FullDisk:
+            def write(self, _data: bytes) -> int:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+        vm = self._file_read_vm(b"payload")
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.LOCAL_DISK and e.context["errno"] == errno.ENOSPC,
+            match=rf"^VM test-vm read_file could not write the local destination \({os.strerror(errno.ENOSPC)}\)$",
+        ):
+            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", FullDisk())  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("make_error", "match"),
+        [
+            pytest.param(TimeoutError, r"^VM test-vm read_file timed out for 'file\.bin'$", id="timeout"),
+            pytest.param(
+                lambda: ConnectionResetError(errno.ECONNRESET, "Connection reset by peer"),
+                r"^VM test-vm read_file communication failed: .*Connection reset by peer$",
+                id="oserror",
+            ),
+            pytest.param(
+                lambda: CommunicationError("channel closed", context=None),
+                r"^VM test-vm read_file communication failed: channel closed$",
+                id="communication",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("kind", ["path", "stream"])
+    async def test_transport_failure_is_guest_unavailable(
+        self, tmp_path: Path, make_error: Any, match: str, kind: str
+    ) -> None:
+        """One transport mapping for both destination kinds (OB5): a timeout, a socket error
+        or a channel error is the guest's (GUEST_UNAVAILABLE, RETRY), never LOCAL_DISK or a
+        builtin. The temp file goes; the op is unregistered once."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        error = make_error()
+        vm = self._bound(self._file_read_vm(b"payload"))
+        vm.channel.connect = AsyncMock(side_effect=error)
+        destination: Path | IO[bytes] = tmp_path / "file.bin" if kind == "path" else io.BytesIO()
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match=match
+        ) as exc_info:
+            await QemuVM.read_file(vm, "file.bin", destination=destination)
+        assert exc_info.value.__cause__ is error
+        vm.channel.unregister_op.assert_awaited_once()
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_failed_stream_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        """The guest stream fails after the temp file opened: the temp file goes, the
+        destination is not created, and the error stays the guest's."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm = self._bound(self._file_read_vm(b"payload"))
+        inbox = OperationInbox()
+        inbox._queue.put_nowait(StreamingErrorMessage(op_id="read-op", error_type="io_error", message="gone"))
+        vm.channel.register_op = AsyncMock(return_value=inbox)
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
+            await QemuVM.read_file(vm, "file.bin", destination=tmp_path / "file.bin")
+        assert list(tmp_path.iterdir()) == []
+
     async def test_short_destination_writes_are_completed(self) -> None:
         from exec_sandbox.qemu_vm import QemuVM
 
@@ -1083,7 +1516,7 @@ class TestReadFileTerminalIntegrity:
                 return 0
 
         vm = self._file_read_vm(b"payload")
-        with pytest.raises(OSError, match="no write progress"):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
             await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", ZeroWriter())  # type: ignore[arg-type]
 
     async def test_none_returning_destination_write_is_rejected(self) -> None:
@@ -1095,7 +1528,7 @@ class TestReadFileTerminalIntegrity:
                 return None
 
         vm = self._file_read_vm(b"payload")
-        with pytest.raises(OSError, match="no write progress"):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
             await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", NoneWriter())  # type: ignore[arg-type]
 
     async def test_over_reporting_destination_write_is_rejected(self) -> None:
@@ -1107,8 +1540,76 @@ class TestReadFileTerminalIntegrity:
                 return len(data) + 1
 
         vm = self._file_read_vm(b"payload")
-        with pytest.raises(OSError, match="no write progress"):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
             await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", OverWriter())  # type: ignore[arg-type]
+
+
+class TestLocalPathError:
+    """One errno split for a local path the caller gave (write_file's source, read_file's
+    destination): an error the caller can fix is FIX_INPUT (the same call fails again); any
+    other is this host's and can pass later (RETRY)."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            errno.ENOENT,
+            errno.EACCES,
+            errno.EPERM,
+            errno.EROFS,
+            errno.ENOTDIR,
+            errno.EISDIR,
+            errno.ELOOP,
+            errno.ENAMETOOLONG,
+            errno.EEXIST,
+        ],
+        ids=errno.errorcode.get,
+    )
+    def test_error_the_caller_can_fix_is_argument_invalid(self, code: int) -> None:
+        error = local_path_error(
+            OSError(code, os.strerror(code), "/x/y"),
+            failure="Source file cannot be opened",
+            path=Path("/x/y"),
+            context={"k": 1},
+        )
+        assert isinstance(error, InvalidInputError)
+        assert error.code is ErrorCode.ARGUMENT_INVALID
+        assert error.message == f"Source file cannot be opened ({os.strerror(code)}): /x/y"
+        assert error.context == {"k": 1, "errno": code}
+
+    @pytest.mark.parametrize(
+        "code",
+        [errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EMFILE, errno.ENFILE, errno.ENOMEM],
+        ids=errno.errorcode.get,
+    )
+    def test_host_error_is_local_disk(self, code: int) -> None:
+        error = local_path_error(
+            OSError(code, os.strerror(code)), failure="Destination cannot be written", path=None, context={}
+        )
+        assert isinstance(error, TransientError)
+        assert error.code is ErrorCode.LOCAL_DISK
+        assert error.message == f"Destination cannot be written ({os.strerror(code)})"
+        assert error.context == {"errno": code}
+
+    def test_error_without_errno_is_local_disk_named_by_its_text(self) -> None:
+        """A destination that made no write progress (no errno): this host's, its text kept."""
+        error = local_path_error(
+            OSError("made no write progress"), failure="Destination cannot be written", path=None, context={}
+        )
+        assert isinstance(error, TransientError)
+        assert error.code is ErrorCode.LOCAL_DISK
+        assert error.message == "Destination cannot be written (made no write progress)"
+
+    def test_value_error_is_argument_invalid_without_the_path(self) -> None:
+        """ValueError (a NUL byte, no file name): the caller's error; the path is not printed."""
+        error = local_path_error(
+            ValueError("embedded null character in path"),
+            failure="Source file cannot be opened",
+            path=Path("a\x00b"),
+            context={},
+        )
+        assert isinstance(error, InvalidInputError)
+        assert error.code is ErrorCode.ARGUMENT_INVALID
+        assert error.message == "Source file cannot be opened (embedded null character in path)"
 
 
 # ============================================================================

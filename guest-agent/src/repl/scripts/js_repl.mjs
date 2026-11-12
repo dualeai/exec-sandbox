@@ -109,6 +109,24 @@ const ctx = createContext({
     exports: {},
     __filename: '<exec>', __dirname: '/tmp',
 });
+// Math.random: JSC keeps its state in the process, so an L1 template (or a saved
+// instance loaded twice) would replay one stream in every VM. Feed it from
+// crypto.getRandomValues instead (kernel CRNG, reseeded before every command),
+// in both realms: user code reaches the outer one through require'd modules.
+// The pool is dropped before each exec, so no buffered value survives a save.
+const randomPool = new Uint32Array(1024);
+let randomNext = randomPool.length;
+const secureRandom = function random() {
+    if (randomNext === randomPool.length) {
+        crypto.getRandomValues(randomPool);
+        randomNext = 0;
+    }
+    const hi = randomPool[randomNext++] >>> 5;
+    const lo = randomPool[randomNext++] >>> 6;
+    return (hi * 67108864 + lo) / 9007199254740992; // 53-bit double in [0, 1)
+};
+Math.random = secureRandom;
+runInContext('Math', ctx).random = secureRandom;
 // Catch unhandled rejections from fire-and-forget promises (e.g. on non-last lines).
 // Sets exitCode so the sentinel reports failure.
 let unhandledRejection = null;
@@ -180,6 +198,7 @@ while (true) {
         // \b prevents false positives on identifiers like "reimport(".
         const patched = transformed.replace(/\bimport\s*\(/g, '__import(');
         if (patched.length > 0) {
+            randomNext = randomPool.length;
             let val = runInContext(patched, ctx, { filename: '<exec>' });
             // replMode wraps in async IIFE only when code has top-level await;
             // otherwise runInContext returns { value: expr } directly.

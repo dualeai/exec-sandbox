@@ -1051,20 +1051,38 @@ class TestCliExitCodePassthrough:
             stderr="error",
             exit_code=42,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.return_value = result_with_error
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            _vm(mock_scheduler).exec.return_value = result_with_error
 
             result = runner.invoke(run_command, ["exit(42)"])
 
             assert result.exit_code == 42
+
+    @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+    def test_code_timeout_exits_124(self, runner: CliRunner, json_output: bool) -> None:
+        """A code timeout (result exit code -1) exits 124, like the timeout command (not 255);
+        the JSON keeps the result's own -1."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _vm(_mock_scheduler(scheduler_cls)).exec.return_value = _result(-1)
+
+            result = runner.invoke(run_command, [*(["--json"] if json_output else []), "while True: pass"])
+
+        assert result.exit_code == EXIT_TIMEOUT
+        if json_output:
+            assert json.loads(result.stdout)["result"]["exit_code"] == -1
+
+    def test_code_exit_255_is_not_a_timeout(self, runner: CliRunner) -> None:
+        """Code that exits 255 (sys.exit(-1) in the guest) exits 255, not 124."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _vm(_mock_scheduler(scheduler_cls)).exec.return_value = _result(255)
+
+            result = runner.invoke(run_command, ["import sys; sys.exit(-1)"])
+
+        assert result.exit_code == 255
 
 
 class TestCliJsonOutputEdgeCases:
@@ -1624,10 +1642,39 @@ class TestCliFileIoIntegration:
                 mock_session.read_file.assert_called_once_with("out.csv", destination=Path("result.csv"))
                 assert Path("result.csv").read_bytes() == b"downloaded"
 
+    def test_download_to_a_path_under_a_file_exits_2(
+        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path
+    ) -> None:
+        """A --download destination the caller cannot write (a regular file in its path: ENOTDIR)
+        is the caller's to fix: ARGUMENT_INVALID (FIX_INPUT), exit 2, never 125 (RETRY). The real
+        destination step of read_file runs: it fails before any guest call."""
+        from types import SimpleNamespace
+
+        from exec_sandbox.qemu_vm import QemuVM
+
+        (tmp_path / "file").write_bytes(b"")
+        destination = tmp_path / "file" / "sub" / "out.csv"  # mkdir of "sub" under a file: ENOTDIR
+
+        async def read_file(path: str, *, destination: Path) -> None:
+            await QemuVM._read_file_to_path(cast("QemuVM", SimpleNamespace(vm_id="vm-1")), path, destination, "op")
+
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            vm = _vm(_mock_scheduler(scheduler_cls))
+            vm.exec.return_value = mock_result
+            vm.read_file.side_effect = read_file
+
+            result = runner.invoke(run_command, ["--download", f"out.csv:{destination}", "-c", "print(1)"])
+
+        assert result.exit_code == EXIT_CLI_ERROR
+        assert "Error: ARGUMENT_INVALID (FIX_INPUT)" in result.stderr
+        assert list((tmp_path).iterdir()) == [tmp_path / "file"]
+
     def test_download_shorthand_writes_to_basename(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
         """Download GUEST shorthand writes to ./basename in cwd."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
             mock_session = AsyncMock()
+            mock_session.startup_timing = _STARTUP
+            mock_session.exposed_ports = []
             mock_session.exec.return_value = mock_result
 
             async def _fake_read(path: str, *, destination: Path) -> None:
@@ -1920,6 +1967,58 @@ class TestCliMultiInput:
             assert all("index" in item for item in parsed)
             assert all("source" in item for item in parsed)
 
+    def test_output_without_a_final_new_line_gets_one(self, runner: CliRunner) -> None:
+        """Each source's block: a new line, its header, its stdout; its stderr on stderr. Output
+        that does not end with a new line gets one, so the next block starts on its own line.
+        Blocks come in the order the sources end (here, either order)."""
+        results = {
+            "x = 1": ExecutionResult(
+                stdout="1", stderr="w1", exit_code=0, timing=TimingBreakdown(execute_ms=5, connect_ms=None)
+            ),
+            "y = 2": ExecutionResult(
+                stdout="2\n", stderr="w2\n", exit_code=0, timing=TimingBreakdown(execute_ms=5, connect_ms=None)
+            ),
+        }
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = lambda code, **_: results[code]
+
+            result = runner.invoke(run_command, ["-q", "x = 1", "y = 2"])
+
+        assert result.exit_code == 0
+        first = f"\n━━━ [1/2] x = 1 {'━' * 45}\n1\n"
+        second = f"\n━━━ [2/2] y = 2 {'━' * 45}\n2\n"
+        assert (result.stdout, result.stderr) in {(first + second, "w1\nw2\n"), (second + first, "w2\nw1\n")}
+
+    @pytest.mark.parametrize(
+        ("exit_codes", "quiet", "summary"),
+        [
+            pytest.param((0, 0), False, r"✓ 2/2 passed \(\d+ms total\)", id="passed"),
+            pytest.param((0, 3), False, r"⚠ 1/2 passed, 1 failed \(\d+ms total\)", id="failed"),
+            pytest.param((0, 3), True, None, id="quiet"),
+        ],
+    )
+    def test_tty_summary(
+        self, runner: CliRunner, exit_codes: tuple[int, int], quiet: bool, summary: str | None
+    ) -> None:
+        """On a terminal, a run of several sources ends with a rule and the count of sources
+        that passed and failed (exit code 0 or not) on stdout; -q hides it."""
+        results = {
+            f"{name} = {code}": ExecutionResult(
+                stdout="", stderr="", exit_code=code, timing=TimingBreakdown(execute_ms=5, connect_ms=None)
+            )
+            for name, code in zip("ab", exit_codes, strict=True)
+        }
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls, patch("exec_sandbox.cli.is_tty", return_value=True):
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = lambda code, **_: results[code]
+
+            result = runner.invoke(run_command, [*(["-q"] if quiet else []), *results])
+
+        assert result.exit_code == max(exit_codes)
+        if summary is None:
+            assert "─" not in result.stdout
+        else:
+            assert re.search(rf"\n\n{'─' * 60}\n{summary}\n\Z", result.stdout), result.stdout
+
     def test_stdin_only_once(self, runner: CliRunner) -> None:
         """Stdin marker can only be used once."""
         result = runner.invoke(run_command, ["-", "-"], input="print(1)")
@@ -2008,36 +2107,84 @@ class TestComputeMultiExitCode:
             stderr="",
             exit_code=0,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
         result5 = ExecutionResult(
             stdout="",
             stderr="",
             exit_code=5,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
         results = [
-            MultiSourceResult(index=0, source="a", result=result0, error=None),
-            MultiSourceResult(index=1, source="b", result=result5, error=None),
+            MultiSourceResult(index=0, source="a", run=_one_shot(result0), error=None, code=None, action=None),
+            MultiSourceResult(index=1, source="b", run=_one_shot(result5), error=None, code=None, action=None),
         ]
         assert _compute_multi_exit_code(results) == 5
 
-    def test_timeout_takes_precedence(self, mock_result: ExecutionResult) -> None:
-        """Returns EXIT_TIMEOUT if any source timed out."""
-        results = [
-            MultiSourceResult(index=0, source="a", result=mock_result, error=None),
-            MultiSourceResult(index=1, source="b", result=None, error="Execution timed out"),
-        ]
+    @staticmethod
+    def _failed(code: ErrorCode, action: ErrorAction) -> MultiSourceResult:
+        return MultiSourceResult(index=1, source="b", run=None, error="It failed.", code=code, action=action)
+
+    @staticmethod
+    def _ran(exit_code: int) -> MultiSourceResult:
+        result = ExecutionResult(
+            stdout="",
+            stderr="",
+            exit_code=exit_code,
+            execution_time_ms=1,
+            timing=TimingBreakdown(execute_ms=1, connect_ms=None),
+        )
+        return MultiSourceResult(index=0, source="a", run=_one_shot(result), error=None, code=None, action=None)
+
+    def test_timeout_takes_precedence(self) -> None:
+        """EXIT_TIMEOUT if a source did not boot in time, over higher exit codes."""
+        results = [self._ran(130), self._failed(ErrorCode.VM_BOOT_TIMEOUT, ErrorAction.RETRY)]
         assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
 
     def test_sandbox_error_returns_125(self) -> None:
-        """Returns EXIT_SANDBOX_ERROR for non-timeout errors."""
+        """Returns EXIT_SANDBOX_ERROR for other errors."""
+        results = [self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY)]
+        assert _compute_multi_exit_code(results) == EXIT_SANDBOX_ERROR
+
+    @pytest.mark.parametrize(
+        ("code", "action"),
+        [(ErrorCode.OUTPUT_LIMIT, ErrorAction.FIX_INPUT), (ErrorCode.HOST_DEPENDENCY, ErrorAction.FIX_CONFIG)],
+        ids=["fix-input", "fix-config"],
+    )
+    def test_fix_error_takes_precedence(self, code: ErrorCode, action: ErrorAction) -> None:
+        """EXIT_CLI_ERROR when a source failed with a FIX_INPUT or FIX_CONFIG error, over a
+        boot timeout, another sandbox error and a higher exit code of the code."""
         results = [
-            MultiSourceResult(index=0, source="a", result=None, error="VM boot failed"),
+            self._ran(130),
+            self._failed(ErrorCode.VM_BOOT_TIMEOUT, ErrorAction.RETRY),
+            self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY),
+            self._failed(code, action),
         ]
+        assert _compute_multi_exit_code(results) == EXIT_CLI_ERROR
+
+    def test_code_timeout_counts_as_a_timeout(self) -> None:
+        """A source whose code timed out (-1): EXIT_TIMEOUT over a higher exit code and another
+        sandbox error, never the highest code (0 would hide it)."""
+        results = [self._ran(0), self._ran(-1)]
+        assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
+        results = [self._ran(130), self._ran(-1), self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY)]
+        assert _compute_multi_exit_code(results) == EXIT_TIMEOUT
+
+    def test_fix_error_wins_over_a_code_timeout(self) -> None:
+        results = [self._ran(-1), self._failed(ErrorCode.OUTPUT_LIMIT, ErrorAction.FIX_INPUT)]
+        assert _compute_multi_exit_code(results) == EXIT_CLI_ERROR
+
+    def test_only_minus_one_is_a_code_timeout(self) -> None:
+        """-1 is the guest's timeout code only: the code's own exit codes are 0-255 (sys.exit(-1)
+        is 255), and any other exit code counts as an exit code, not as a timeout."""
+        assert _compute_multi_exit_code([self._ran(255), self._ran(0)]) == 255
+        assert _compute_multi_exit_code([self._ran(-2), self._ran(0)]) == 0
+
+    @pytest.mark.parametrize("exit_code", [EXIT_CLI_ERROR, EXIT_TIMEOUT])
+    def test_code_exit_code_is_not_an_error(self, exit_code: int) -> None:
+        """Code that exits 2 or 124 is not a sandbox error: the highest exit code wins."""
+        results = [self._ran(exit_code), self._failed(ErrorCode.QEMU_CRASHED, ErrorAction.RETRY)]
         assert _compute_multi_exit_code(results) == EXIT_SANDBOX_ERROR
 
     def test_empty_results(self) -> None:

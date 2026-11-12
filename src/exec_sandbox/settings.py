@@ -1,16 +1,31 @@
 """Runtime configuration from environment variables."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from exec_sandbox import constants
-from exec_sandbox.platform_utils import get_cache_dir
+from exec_sandbox.platform_utils import UserDir, get_user_dir
+
+InstanceStoreKind = Literal["s3", "local"]
+"""Store of saved instances: an S3-API bucket, or a folder on this host."""
 
 
-class Settings(BaseSettings):
+class QemuBinaries(BaseSettings):
+    """The qemu-system files to run (EXEC_SANDBOX_QEMU_BIN_X86, EXEC_SANDBOX_QEMU_BIN_ARM):
+    used when the file exists, else the name on PATH (system_probes.qemu_system_binary).
+    Its own settings class: the probes read these two variables alone, so another invalid
+    variable never fails a probe."""
+
+    model_config = SettingsConfigDict(env_prefix="EXEC_SANDBOX_", extra="ignore")
+
+    qemu_bin_x86: Path = Path("/usr/bin/qemu-system-x86_64")
+    qemu_bin_arm: Path = Path("/usr/bin/qemu-system-aarch64")
+
+
+class Settings(QemuBinaries):
     """Runtime configuration from environment variables.
 
     All settings can be overridden via environment variables with EXEC_SANDBOX_ prefix.

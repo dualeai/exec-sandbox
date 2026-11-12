@@ -7,15 +7,16 @@ code execution, state management, and resource cleanup.
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import signal
 import sys
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, Any, Self, cast
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -112,56 +113,121 @@ def _write_all_bytes(sink: IO[bytes], data: bytes) -> None:
         offset += written
 
 
+def _stream_position(stream: IO[bytes]) -> int | None:
+    """Where a seekable stream stands, or None: not seekable, or no position (a duck-typed reader)."""
+    try:
+        return stream.tell() if stream.seekable() else None
+    except (AttributeError, OSError):
+        return None
+
+
+_CALLER_PATH_ERRNOS = frozenset(
+    {
+        errno.ENOENT,
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOTDIR,
+        errno.EISDIR,
+        errno.ELOOP,
+        errno.ENAMETOOLONG,
+        errno.EEXIST,
+    }
+)
+"""Errors of a local path the caller gave that the same call gets again: missing, no access, a
+read-only disk, a file in the path, a folder at it, a symlink loop, too long, taken."""
+
+
+def local_path_error(
+    error: OSError | ValueError, *, failure: str, path: Path | None, context: dict[str, Any]
+) -> InvalidInputError | TransientError:
+    """The error of a local path the caller gave (write_file's source, read_file's destination).
+    One the caller can fix (_CALLER_PATH_ERRNOS; ValueError: a NUL byte or no file name) is
+    InvalidInputError ARGUMENT_INVALID. Any other is this host's and can pass later (disk full,
+    quota, I/O error, out of file handles or memory): TransientError LOCAL_DISK."""
+    if isinstance(error, ValueError):  # its text names the fault; the path is not printed (a NUL byte)
+        return InvalidInputError(
+            f"{failure} ({error})", code=ErrorCode.ARGUMENT_INVALID, context=context, hint=None, instance_id=None
+        )
+    reason = error.strerror or str(error)
+    message = f"{failure} ({reason})" if path is None else f"{failure} ({reason}): {path}"
+    context = {**context, "errno": error.errno}
+    if error.errno in _CALLER_PATH_ERRNOS:
+        return InvalidInputError(message, code=ErrorCode.ARGUMENT_INVALID, context=context, hint=None, instance_id=None)
+    return TransientError(message, code=ErrorCode.LOCAL_DISK, context=context, hint=None, instance_id=None)
+
+
+def _destination_error(error: OSError | ValueError, *, vm_id: str, path: str) -> InvalidInputError | TransientError:
+    """local_path_error of read_file's local destination (*path* is the guest file)."""
+    return local_path_error(
+        error,
+        failure=f"VM {vm_id} read_file could not write the local destination",
+        path=None,
+        context={"vm_id": vm_id, "path": path},
+    )
+
+
+async def _destination_job[T](call: Callable[[], T], *, vm_id: str, path: str) -> T:
+    """Run one job on read_file's local destination to its end (a worker thread). Its
+    OSError or ValueError is this host's or the caller's (local_path_error), never the
+    guest's (GUEST_UNAVAILABLE)."""
+    try:
+        return await run_to_end(call)
+    except (OSError, ValueError) as e:
+        raise _destination_error(e, vm_id=vm_id, path=path) from e
+
+
 def guest_error_to_exception(
     msg: StreamingErrorMessage,
     vm_id: str,
     *,
-    operation: str = "",
+    operation: str | None,
 ) -> SandboxError:
-    """Map a guest StreamingErrorMessage to the appropriate SandboxError subclass.
+    """Map a guest StreamingErrorMessage to the matching SandboxError.
 
     Args:
         msg: The error message from the guest agent.
         vm_id: VM identifier for context.
-        operation: Optional operation name (e.g., "write_file", "read_file").
+        operation: Operation name for the message prefix and context (e.g., "write_file
+            '/a'"), or None for neither.
 
     Returns:
-        A SandboxError subclass instance (not raised, caller raises).
+        The error (not raised, caller raises): TransientError GUEST_UNAVAILABLE
+        when the code never ran, InvalidInputError for bad input, a path or a
+        guest I/O failure, InternalError GUEST_PROTOCOL for request, protocol
+        and unknown errors.
     """
     context: dict[str, object] = {
         "vm_id": vm_id,
         "error_type": msg.error_type,
         "guest_message": msg.message,
     }
-    if operation:
+    if operation is not None:
         context["operation"] = operation
 
-    prefix = f"{operation}: " if operation else ""
+    prefix = "" if operation is None else f"{operation}: "
 
     formatted = f"{prefix}[{msg.error_type}] {msg.message}"
 
+    cls: type[SandboxError]
     match msg.error_type:
-        case constants.GuestErrorType.TIMEOUT:
-            return VmTransientError(formatted, context=context)
+        case constants.GuestErrorType.TIMEOUT | constants.GuestErrorType.EXECUTION:
+            cls, code = TransientError, ErrorCode.GUEST_UNAVAILABLE  # code never ran
         case constants.GuestErrorType.ENV_VAR:
-            return EnvVarValidationError(formatted, context=context)
+            cls, code = InvalidInputError, ErrorCode.ENV_VAR_INVALID
         case constants.GuestErrorType.CODE:
-            return CodeValidationError(formatted, context=context)
-        case constants.GuestErrorType.PACKAGE:
-            return PackageNotAllowedError(formatted, context=context)
+            cls, code = InvalidInputError, ErrorCode.CODE_INVALID
+        case constants.GuestErrorType.PACKAGE:  # format, not allow-list: the guest has no allow-list
+            cls, code = InvalidInputError, ErrorCode.ARGUMENT_INVALID
         case constants.GuestErrorType.OUTPUT_LIMIT:
-            return OutputLimitError(formatted, context=context)
-        case constants.GuestErrorType.EXECUTION:
-            return VmTransientError(formatted, context=context)  # code never ran, transient
-        case (
-            constants.GuestErrorType.PATH
-            | constants.GuestErrorType.IO
-            | constants.GuestErrorType.REQUEST
-            | constants.GuestErrorType.PROTOCOL
-        ):
-            return VmPermanentError(formatted, context=context)
-        case _:
-            return VmPermanentError(formatted, context=context)
+            cls, code = InvalidInputError, ErrorCode.OUTPUT_LIMIT
+        case constants.GuestErrorType.PATH:
+            cls, code = InvalidInputError, ErrorCode.PATH_INVALID
+        case constants.GuestErrorType.IO:
+            cls, code = InvalidInputError, ErrorCode.GUEST_IO
+        case _:  # REQUEST, PROTOCOL, unknown
+            cls, code = InternalError, ErrorCode.GUEST_PROTOCOL
+    return cls(formatted, code=code, context=context, hint=None, instance_id=None)
 
 
 # Use native zstd module (Python 3.14+) or backports.zstd
@@ -175,15 +241,14 @@ else:
 class QemuDiagnostics:
     """Crash diagnostics snapshot from a QEMU VM process.
 
-    Captures console ring buffer, process stdout/stderr, signal info,
-    and host environment for structured logging and error context.
+    Captures the console ring buffer (QEMU stdout and stderr lines, from the
+    drain task), signal info, and host environment for structured logging and
+    error context.
     """
 
     vm_id: str
     exit_code: int | None
     signal_name: str  # "" if not signal-killed
-    stdout: str  # truncated to QEMU_OUTPUT_MAX_BYTES
-    stderr: str  # truncated to QEMU_OUTPUT_MAX_BYTES
     console_log: str  # full ring buffer join (already bounded by CONSOLE_RING_LINES)
     accel_type: str  # "hvf" | "tcg" | "kvm"
     host_os: str  # "macos" | "linux" | "unknown"
@@ -583,13 +648,19 @@ class QemuVM:
                 error_type = constants.GuestErrorType.CODE
             else:
                 error_type = constants.GuestErrorType.REQUEST
-            msg = StreamingErrorMessage(message=str(e), error_type=error_type.value)
-            exc = guest_error_to_exception(msg, self.vm_id)
-            if isinstance(exc, InputValidationError):
+            # Field and reason only, never the values: str(e) holds every env var value
+            # (credentials), and the CLI prints the message. No cause, for the same reason.
+            reasons = "; ".join(
+                f"{'.'.join(map(str, err['loc']))}: {err['msg']}"
+                for err in e.errors(include_url=False, include_input=False, include_context=False)
+            )
+            msg = StreamingErrorMessage(message=f"Invalid request: {reasons}", error_type=error_type.value)
+            exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
+            if isinstance(exc, InvalidInputError):
                 # Input was invalid but VM is fine — restore READY for session reuse
-                with contextlib.suppress(VmPermanentError):
+                with contextlib.suppress(InternalError):
                     await self.transition_state(VmState.READY)
-            raise exc from e
+            raise exc from None
 
         try:
             # Re-check state before expensive I/O operations
@@ -957,12 +1028,13 @@ class QemuVM:
             await self._write_file_protocol(path, content, make_executable=make_executable)
 
     async def _write_file_protocol(  # noqa: PLR0912, PLR0915
-        self, path: str, content: IO[bytes], *, make_executable: bool = False
+        self, path: str, content: IO[bytes], *, make_executable: bool
     ) -> None:
         """Execute the write_file streaming protocol (single attempt)."""
 
         op_id = uuid4().hex
         op_queue: OperationInbox | None = None
+        start = _stream_position(content)  # a failed source read sets the stream back here
 
         try:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
@@ -998,7 +1070,24 @@ class QemuVM:
                 return _encode_frame(compressed), len(raw)
 
             while True:
-                result = await _run_blocking_owned(lambda: _read_and_compress(content))
+                try:
+                    result = await run_to_end(lambda: _read_and_compress(content))
+                except OSError as e:
+                    # The local source failed after the header, before file_end. The guest
+                    # commits a write only on the file_end of its op_id, which this one never
+                    # gets, and drops the partial file when the channel closes: nothing was
+                    # written (RETRY), not an unknown outcome. A seekable source goes back to
+                    # where the call found it, so the same call can run again.
+                    with contextlib.suppress(OSError, RuntimeError):
+                        await self.channel.close()
+                    if start is not None:
+                        content.seek(start)
+                    raise local_path_error(
+                        e,
+                        failure=f"VM {self.vm_id} write_file could not read the local source",
+                        path=None,
+                        context={"vm_id": self.vm_id, "path": path},
+                    ) from e
                 if result is None:
                     break  # Proven source EOF.
                 frame, raw_size = result
@@ -1011,7 +1100,7 @@ class QemuVM:
                 remaining = compressor.flush()
                 return _encode_frame(remaining) if remaining else None
 
-            flush_frame = await _run_blocking_owned(_flush_and_encode)
+            flush_frame = await run_to_end(_flush_and_encode)
             if flush_frame:
                 await self.channel.enqueue_raw(flush_frame)
 
@@ -1100,22 +1189,40 @@ class QemuVM:
             destination: Local file path or IO[bytes] buffer to stream into
 
         Raises:
-            VmPermanentError: On not-found or validation failure
-            VmTransientError: On timeout or communication failure (reads are
-                idempotent, so post-dispatch timeouts stay retryable)
-            CommunicationOutcomeUnknownError: Event transport lost after
-                dispatch (propagated from the inbox)
+            InvalidInputError: PATH_INVALID or GUEST_IO on validation failure or
+                a file that is not found; ARGUMENT_INVALID when the caller can fix
+                the local destination (local_path_error: no access, a read-only
+                disk, a file in its path, a folder at it, a NUL byte, no file name)
+            InternalError: GUEST_PROTOCOL on a protocol error or a wrong answer
+            TransientError: GUEST_UNAVAILABLE on timeout or communication
+                failure (reads are idempotent, so post-dispatch timeouts stay
+                retryable); LOCAL_DISK when this host could not write the local
+                destination (disk full, quota, I/O error, out of file handles)
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the event transport
+                is lost after dispatch (propagated from the inbox)
         """
-        if isinstance(destination, Path):
-            await self._read_file_to_path(path, destination)
-        else:
-            await self._read_file_to_buffer(path, destination)
+        op_id = uuid4().hex
+        try:
+            if isinstance(destination, Path):
+                await self._read_file_to_path(path, destination, op_id)
+            else:
+                await self._recv_file_chunks(path, op_id, destination)
+        except TimeoutError as e:
+            raise _unavailable(
+                f"VM {self.vm_id} read_file timed out for '{path}'", context={"vm_id": self.vm_id, "path": path}
+            ) from e
+        except (OSError, json.JSONDecodeError, CommunicationError) as e:
+            raise _unavailable(
+                f"VM {self.vm_id} read_file communication failed: {e}", context={"vm_id": self.vm_id, "path": path}
+            ) from e
+        finally:
+            await self.channel.unregister_op(op_id)
 
     async def _recv_file_chunks(self, path: str, op_id: str, sink: IO[bytes]) -> None:
         """Connect, send ReadFileRequest, and stream decompressed chunks into *sink*.
 
         Shared protocol implementation for both Path and IO[bytes] destinations.
-        The caller is responsible for op registration/unregistration and sink lifecycle.
+        The caller is responsible for op unregistration and sink lifecycle.
         """
         await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
         op_queue = await self.channel.register_op(op_id)
@@ -1134,80 +1241,59 @@ class QemuVM:
                 compressed_chunk = base64.b64decode(msg.data)
                 decompressed = decompressor.decompress(compressed_chunk)
 
-                await _run_blocking_owned(partial(_write_all_bytes, sink, decompressed))
+                await _destination_job(partial(_write_all_bytes, sink, decompressed), vm_id=self.vm_id, path=path)
                 received_size += len(decompressed)
             elif isinstance(msg, FileReadCompleteMessage):
                 if msg.path != path or msg.size != received_size:
                     raise CommunicationError(
                         f"read_file terminal metadata mismatch for '{path}': "
-                        f"path={msg.path!r}, declared_size={msg.size}, received_size={received_size}"
+                        f"path={msg.path!r}, declared_size={msg.size}, received_size={received_size}",
+                        context=None,
                     )
                 break
             elif isinstance(msg, StreamingErrorMessage):
                 raise guest_error_to_exception(msg, self.vm_id, operation=f"read_file '{path}'")
             else:
-                raise VmPermanentError(
+                raise InternalError(
                     f"read_file unexpected message type: {type(msg).__name__}",
+                    code=ErrorCode.GUEST_PROTOCOL,
                     context={"vm_id": self.vm_id, "path": path},
+                    hint=None,
+                    instance_id=None,
                 )
 
-    async def _read_file_to_path(self, path: str, destination: Path) -> None:
-        """Stream sandbox file to a local Path with atomic rename."""
+    async def _read_file_to_path(self, path: str, destination: Path, op_id: str) -> None:
+        """Stream into a temp sibling, then rename it over *destination*: readers never see a
+        partial file. Temp path scoped by op_id (foo.bin -> foo.bin.<op_id>.tmp): concurrent
+        reads of the same destination do not collide."""
+        try:
+            tmp_dest = destination.with_suffix(f"{destination.suffix}.{op_id}.tmp")
+        except ValueError as e:  # no file name: "", ".", "/"
+            raise _destination_error(e, vm_id=self.vm_id, path=path) from e
+        opened: list[IO[bytes]] = []  # the worker job publishes the file: a cancel still closes it
 
-        op_id = uuid4().hex
-        # Temp path scoped by op_id: foo.bin -> foo.bin.<op_id>.tmp
-        # Prevents collisions when concurrent reads target the same destination.
-        tmp_dest = destination.with_suffix(f"{destination.suffix}.{op_id}.tmp")
+        def open_tmp() -> None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            opened.append(tmp_dest.open("wb"))
+
+        def close_and_rename() -> None:
+            opened[0].close()
+            tmp_dest.rename(destination)
+
+        def discard() -> None:  # its own error must not hide the failure it cleans up after
+            with contextlib.suppress(OSError):
+                for sink in opened:
+                    sink.close()
+            with contextlib.suppress(OSError, ValueError):  # ValueError: a NUL byte in the path
+                tmp_dest.unlink(missing_ok=True)
 
         try:
-            # Stream decompressed chunks to .tmp file.
-            # All disk I/O is offloaded to the thread pool to avoid blocking
-            # the event loop (decompressed chunks can be large).
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: destination.parent.mkdir(parents=True, exist_ok=True))
-            sink = await loop.run_in_executor(None, tmp_dest.open, "wb")
-            try:
-                await self._recv_file_chunks(path, op_id, sink)
-            finally:
-                await loop.run_in_executor(None, sink.close)
-
-            # Atomic rename — readers never see a partial file.
-            await loop.run_in_executor(None, tmp_dest.rename, destination)
-
-        except TimeoutError as e:
-            raise VmTransientError(
-                f"VM {self.vm_id} read_file timed out for '{path}'",
-                context={"vm_id": self.vm_id, "path": path},
-            ) from e
-        except (OSError, json.JSONDecodeError, CommunicationError) as e:
-            raise VmTransientError(
-                f"VM {self.vm_id} read_file communication failed: {e}",
-                context={"vm_id": self.vm_id, "path": path},
-            ) from e
-        finally:
-            # Clean up partial .tmp on any failure (no-op after successful rename)
-            tmp_dest.unlink(missing_ok=True)
-            await self.channel.unregister_op(op_id)
-
-    async def _read_file_to_buffer(self, path: str, sink: IO[bytes]) -> None:
-        """Stream sandbox file directly into an IO[bytes] buffer."""
-
-        op_id = uuid4().hex
-
-        try:
-            await self._recv_file_chunks(path, op_id, sink)
-        except TimeoutError as e:
-            raise VmTransientError(
-                f"VM {self.vm_id} read_file timed out for '{path}'",
-                context={"vm_id": self.vm_id, "path": path},
-            ) from e
-        except (OSError, json.JSONDecodeError, CommunicationError) as e:
-            raise VmTransientError(
-                f"VM {self.vm_id} read_file communication failed: {e}",
-                context={"vm_id": self.vm_id, "path": path},
-            ) from e
-        finally:
-            await self.channel.unregister_op(op_id)
+            await _destination_job(open_tmp, vm_id=self.vm_id, path=path)
+            await self._recv_file_chunks(path, op_id, opened[0])
+            await _destination_job(close_and_rename, vm_id=self.vm_id, path=path)
+        except BaseException:
+            await run_to_end(discard)
+            raise
 
     async def list_files(self, path: str = "") -> list[FileInfo]:
         """List files in a sandbox directory via guest agent.
@@ -1365,30 +1451,10 @@ class QemuVM:
     # Diagnostics
     # -------------------------------------------------------------------------
 
-    async def capture_process_output(self) -> tuple[str, str]:
-        """Capture stdout/stderr from QEMU process.
-
-        Returns (stdout, stderr) as strings, empty if process still running.
-        Must be called BEFORE destroy() — pipes are gone after cleanup.
-        """
-        if self.process.returncode is not None:
-            try:
-                stdout, stderr = await asyncio.wait_for(self.process.communicate(), timeout=1.0)
-                return (stdout.decode() if stdout else "", stderr.decode() if stderr else "")
-            except TimeoutError:
-                pass
-        return "", ""
-
     async def collect_diagnostics(self) -> QemuDiagnostics:
-        """Collect crash diagnostics from this VM.
-
-        Captures console ring buffer, process stdout/stderr, signal info,
-        and host environment. Safe to call whether process is alive or dead:
-        - Dead process: captures stdout/stderr via communicate(1s timeout)
-        - Alive process: stdout/stderr will be empty (drain task owns the pipes)
-        """
-        stdout_text, stderr_text = await self.capture_process_output()
-
+        """Collect crash diagnostics from this VM: console ring buffer, signal info, and host
+        environment. Safe whether the process is alive or dead. Never reads the QEMU pipes:
+        the drain task is their only reader (its lines are in the console ring buffer)."""
         console_log = "\n".join(self.console_lines) if self.console_lines else "(empty)"
 
         signal_name = ""
@@ -1406,8 +1472,6 @@ class QemuVM:
             vm_id=self.vm_id,
             exit_code=rc,
             signal_name=signal_name,
-            stdout=stdout_text[: constants.QEMU_OUTPUT_MAX_BYTES],
-            stderr=stderr_text[: constants.QEMU_OUTPUT_MAX_BYTES],
             console_log=console_log,
             accel_type=accel_type.value,
             host_os=host_os.name.lower(),

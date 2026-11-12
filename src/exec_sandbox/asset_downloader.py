@@ -353,7 +353,14 @@ class AsyncPooch:
             owner: GitHub repository owner
             repo: GitHub repository name
             tag: Release tag (e.g., "v0.1.0" or "latest")
+
+        Raises:
+            ConfigError: ASSET_NOT_FOUND: no such release.
+            TransientError: ASSET_DOWNLOAD: the metadata could not be read (no network,
+                a rate limit, a server error, a body that is not JSON).
         """
+        import aiohttp  # noqa: PLC0415 - only a download needs it (~50 ms at `import exec_sandbox`)
+
         # Use "latest" endpoint for latest release
         if tag == "latest":
             api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
@@ -362,24 +369,32 @@ class AsyncPooch:
 
         logger.debug("Fetching release metadata from GitHub", extra={"url": api_url})
 
-        async with aiohttp.ClientSession() as session:
-            headers = {"Accept": "application/vnd.github+json"}
-
-            # Add auth token if available (increases rate limit)
-            if token := os.environ.get("GITHUB_TOKEN"):
-                headers["Authorization"] = f"Bearer {token}"
-
-            async with session.get(api_url, headers=headers) as resp:
+        headers = {"Accept": "application/vnd.github+json"}
+        # Add auth token if available (increases rate limit)
+        if token := os.environ.get("GITHUB_TOKEN"):
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            async with aiohttp.ClientSession() as session, session.get(api_url, headers=headers) as resp:
                 if resp.status == http.HTTPStatus.NOT_FOUND:
-                    raise AssetNotFoundError(
+                    raise ConfigError(
                         f"Release not found: {tag}",
+                        code=ErrorCode.ASSET_NOT_FOUND,
                         context={"owner": owner, "repo": repo, "tag": tag},
+                        hint=None,
+                        instance_id=None,
                     )
                 resp.raise_for_status()
                 release_data = await resp.json()
-
-        # Cache release data for URL lookups
-        self._github_release_cache = {asset["name"]: asset for asset in release_data.get("assets", [])}
+        except (aiohttp.ClientError, TimeoutError, ValueError) as e:
+            # No network, a rate limit (403), a server error or a body that is not JSON:
+            # the same call can succeed later.
+            raise TransientError(
+                f"Could not read the release metadata of {owner}/{repo} {tag}: {e}",
+                code=ErrorCode.ASSET_DOWNLOAD,
+                context={"owner": owner, "repo": repo, "tag": tag},
+                hint=None,
+                instance_id=None,
+            ) from e
 
         # Store actual tag name for URL construction (e.g., "v0.2.1" from /releases/latest)
         self._resolved_version = release_data.get("tag_name")
@@ -497,14 +512,21 @@ def get_current_arch() -> str:
     Returns:
         Architecture string: "x86_64" or "aarch64"
     """
-    return get_arch_name("kernel")
+    return get_arch_name()
 
 
-def get_gvproxy_suffix() -> str:
+_GO_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
+"""get_current_arch's names to the Go names of the gvproxy-wrapper binaries."""
+
+
+def get_gvproxy_suffix(arch: str) -> str:
     """
-    Get gvproxy binary suffix for current platform.
+    Get gvproxy binary suffix of this OS for an architecture.
+
+    Args:
+        arch: "x86_64" or "aarch64" (get_current_arch's names).
 
     Returns:
         Suffix like "darwin-arm64", "darwin-amd64", "linux-arm64", "linux-amd64"
     """
-    return f"{get_os_name()}-{get_arch_name('go')}"
+    return f"{get_os_name()}-{_GO_ARCH[arch]}"

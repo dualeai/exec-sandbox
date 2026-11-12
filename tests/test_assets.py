@@ -8,6 +8,8 @@ Note: _find_asset and _find_images_dir are private but tested for correctness.
 from __future__ import annotations
 
 import os
+import re
+import threading
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
@@ -83,14 +85,15 @@ class TestFindAsset:
             result = await _find_asset("vmlinuz-x86_64.zst")
             assert result == tmp_path / "vmlinuz-x86_64"
 
-    async def test_compressed_preferred_over_decompressed(self, tmp_path: Path) -> None:
-        """When both .zst and decompressed exist, .zst is returned."""
-        (tmp_path / "vmlinuz-x86_64.zst").touch()
-        (tmp_path / "vmlinuz-x86_64").touch()
+    async def test_leftover_zst_is_never_returned(self, tmp_path: Path) -> None:
+        """A .zst that stays is an unpack that did not end: never a ready asset. With the
+        unpacked file next to it, that file; alone, nothing (the caller unpacks again)."""
+        (tmp_path / "leftover-asset.zst").touch()  # a name no other search folder holds
 
         with patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}):
-            result = await _find_asset("vmlinuz-x86_64.zst")
-            assert result == tmp_path / "vmlinuz-x86_64.zst"
+            assert await _find_asset("leftover-asset.zst") is None
+            (tmp_path / "leftover-asset").touch()
+            assert await _find_asset("leftover-asset.zst") == tmp_path / "leftover-asset"
 
     # =========================================================================
     # Priority / Order Cases
@@ -485,8 +488,8 @@ class TestFetchKernel:
             result = await fetch_kernel(arch="x86_64")
             assert result == env_dir / "vmlinux-x86_64"
 
-    async def test_x86_64_prefers_zst_over_decompressed_vmlinux(self, tmp_path: Path) -> None:
-        """On x86_64, vmlinux .zst is preferred over decompressed vmlinux."""
+    async def test_x86_64_ignores_leftover_zst_vmlinux(self, tmp_path: Path) -> None:
+        """On x86_64, a leftover vmlinux .zst never wins over the unpacked vmlinux."""
         from exec_sandbox.assets import fetch_kernel
 
         env_dir = tmp_path / "env"
@@ -500,10 +503,10 @@ class TestFetchKernel:
             patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
         ):
             result = await fetch_kernel(arch="x86_64")
-            assert result == env_dir / "vmlinux-x86_64.zst"
+            assert result == env_dir / "vmlinux-x86_64"
 
-    async def test_x86_64_prefers_zst_over_decompressed_vmlinuz(self, tmp_path: Path) -> None:
-        """On x86_64 with no vmlinux, vmlinuz .zst is preferred over decompressed."""
+    async def test_x86_64_ignores_leftover_zst_vmlinuz(self, tmp_path: Path) -> None:
+        """On x86_64 with no vmlinux, a leftover vmlinuz .zst never wins over the unpacked file."""
         from exec_sandbox.assets import fetch_kernel
 
         env_dir = tmp_path / "env"
@@ -517,7 +520,7 @@ class TestFetchKernel:
             patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
         ):
             result = await fetch_kernel(arch="x86_64")
-            assert result == env_dir / "vmlinuz-x86_64.zst"
+            assert result == env_dir / "vmlinuz-x86_64"
 
     # =========================================================================
     # Category 2: Directory priority beats kernel type (the bug regression)
@@ -626,8 +629,8 @@ class TestFetchKernel:
             result = await fetch_kernel(arch="aarch64")
             assert result == cache_dir / "vmlinuz-aarch64"
 
-    async def test_aarch64_prefers_zst_over_decompressed(self, tmp_path: Path) -> None:
-        """On aarch64, vmlinuz .zst is preferred over decompressed vmlinuz."""
+    async def test_aarch64_ignores_leftover_zst(self, tmp_path: Path) -> None:
+        """On aarch64, a leftover vmlinuz .zst never wins over the unpacked vmlinuz."""
         from exec_sandbox.assets import fetch_kernel
 
         env_dir = tmp_path / "env"
@@ -641,7 +644,7 @@ class TestFetchKernel:
             patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "empty_cache"),
         ):
             result = await fetch_kernel(arch="aarch64")
-            assert result == env_dir / "vmlinuz-aarch64.zst"
+            assert result == env_dir / "vmlinuz-aarch64"
 
     # =========================================================================
     # Category 4: Edge cases
@@ -879,12 +882,12 @@ class TestFetchBaseImage:
             assert result == image
 
     async def test_javascript_language_mapping(self, tmp_path: Path) -> None:
-        """JavaScript language maps to node-1.3-base image."""
+        """JavaScript language maps to node-1.4-base image."""
         from exec_sandbox.asset_downloader import get_current_arch
         from exec_sandbox.assets import fetch_base_image
 
         arch = get_current_arch()
-        image = tmp_path / f"node-1.3-base-{arch}.qcow2"
+        image = tmp_path / f"node-1.4-base-{arch}.qcow2"
         image.touch()
 
         with patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}):
@@ -917,16 +920,54 @@ class TestFetchBaseImage:
         result = await fetch_base_image("python", override=override_dir)
         assert result == override_dir / f"python-3.14-base-{arch}.qcow2"
 
+    @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+    async def test_download_names_match_the_build_script(self, arch: str) -> None:
+        """The release names its images as scripts/build-qcow2.sh does: python-<Python minor> and
+        node-<Bun minor> of the script's default versions. A version bump there without the same
+        change here would make the download ask for a file the release does not have."""
+        from pathlib import Path
+
+        from exec_sandbox.assets import fetch_base_image
+
+        script = (Path(__file__).parent.parent / "scripts" / "build-qcow2.sh").read_text()
+
+        def default_minor(name: str) -> str:
+            (version,) = re.findall(rf'^{name}="\$\{{{name}:-([0-9.]+)\}}"$', script, flags=re.MULTILINE)
+            return version.rsplit(".", 1)[0]  # the script's ${VERSION%.*}
+
+        # The naming rule these expectations follow, as the script writes it
+        assert 'local python_minor="${PYTHON_VERSION%.*}"' in script
+        assert 'local bun_minor="${BUN_VERSION%.*}"' in script
+        assert 'python) output_name="python-${python_minor}-base-$target_arch"' in script
+        assert 'node)   output_name="node-${bun_minor}-base-$target_arch"' in script
+        assert 'raw)    output_name="raw-base-$target_arch"' in script
+        expected = {
+            "python": f"python-{default_minor('PYTHON_VERSION')}-base-{arch}.qcow2.zst",
+            "javascript": f"node-{default_minor('BUN_VERSION')}-base-{arch}.qcow2.zst",
+            "raw": f"raw-base-{arch}.qcow2.zst",
+        }
+
+        registry = AsyncMock()
+        with (
+            patch("exec_sandbox.assets._find_asset", AsyncMock(return_value=None)),
+            patch("exec_sandbox.assets.ensure_registry_loaded", AsyncMock()),
+            patch("exec_sandbox.assets.get_assets", return_value=registry),
+        ):
+            for language in expected:
+                await fetch_base_image(language, arch=arch)
+
+        assert [call.args[0] for call in registry.fetch.call_args_list] == list(expected.values())
+
 
 class TestFetchGvproxy:
     """Tests for fetch_gvproxy() and get_gvproxy_path() functions."""
 
     async def test_get_gvproxy_path_from_env(self, tmp_path: Path) -> None:
         """get_gvproxy_path finds binary in env var path."""
-        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
         from exec_sandbox.assets import get_gvproxy_path
 
-        suffix = get_gvproxy_suffix()
+        suffix = get_gvproxy_suffix(get_current_arch())
         binary = tmp_path / f"gvproxy-wrapper-{suffix}"
         binary.touch()
 
@@ -940,10 +981,10 @@ class TestFetchGvproxy:
 
     async def test_get_gvproxy_path_override_priority(self, tmp_path: Path) -> None:
         """Override path takes priority for gvproxy."""
-        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
         from exec_sandbox.assets import get_gvproxy_path
 
-        suffix = get_gvproxy_suffix()
+        suffix = get_gvproxy_suffix(get_current_arch())
         override_dir = tmp_path / "override"
         env_dir = tmp_path / "env"
         override_dir.mkdir()
@@ -972,10 +1013,10 @@ class TestFetchGvproxy:
         """fetch_gvproxy returns cached binary and actually makes it executable."""
         import stat
 
-        from exec_sandbox.asset_downloader import get_gvproxy_suffix
+        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
         from exec_sandbox.assets import fetch_gvproxy
 
-        suffix = get_gvproxy_suffix()
+        suffix = get_gvproxy_suffix(get_current_arch())
         binary = tmp_path / f"gvproxy-wrapper-{suffix}"
         binary.touch()
 
@@ -988,12 +1029,35 @@ class TestFetchGvproxy:
             patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": str(tmp_path)}),
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
         ):
-            result = await fetch_gvproxy()
+            result = await fetch_gvproxy(override=None, arch=get_current_arch())
             assert result == binary
 
             # Verify file IS executable after fetch_gvproxy
             final_mode = binary.stat().st_mode
             assert final_mode & stat.S_IXUSR, "File should be executable after fetch_gvproxy"
+
+    @pytest.mark.parametrize(("arch", "go_arch"), [("x86_64", "amd64"), ("aarch64", "arm64")])
+    async def test_fetch_gvproxy_downloads_the_binary_of_the_asked_arch(
+        self, tmp_path: Path, arch: str, go_arch: str
+    ) -> None:
+        """The gvproxy-wrapper of the asked arch (and this OS), whatever arch this host has:
+        `sbx prefetch --arch` fills the cache of another arch."""
+        from exec_sandbox.assets import fetch_gvproxy
+        from exec_sandbox.platform_utils import get_os_name
+
+        downloaded = tmp_path / "downloaded"
+        downloaded.touch()
+        registry = AsyncMock()
+        registry.fetch.return_value = downloaded
+        with (
+            patch.dict(os.environ, {"EXEC_SANDBOX_IMAGES_DIR": ""}),
+            patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
+            patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path),
+            patch("exec_sandbox.assets.ensure_registry_loaded", AsyncMock()),
+            patch("exec_sandbox.assets.get_assets", return_value=registry),
+        ):
+            assert await fetch_gvproxy(override=None, arch=arch) == downloaded
+        registry.fetch.assert_awaited_once_with(f"gvproxy-wrapper-{get_os_name()}-{go_arch}")
 
 
 # =============================================================================
@@ -1254,8 +1318,10 @@ class TestPrefetchAllAssets:
             # Base images for all supported languages
             assert mock_base.call_count == len(Language)
 
-    async def test_prefetch_with_arch(self, tmp_path: Path) -> None:
-        """prefetch_all_assets respects arch parameter."""
+    @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+    async def test_prefetch_with_arch(self, tmp_path: Path, arch: str) -> None:
+        """prefetch_all_assets passes its arch to every fetch, gvproxy-wrapper included
+        (one of the two is never this host's arch)."""
         from exec_sandbox.assets import prefetch_all_assets
 
         with (
@@ -1272,15 +1338,15 @@ class TestPrefetchAllAssets:
             mock_gvproxy.return_value = tmp_path / "gvproxy"
             mock_base.return_value = tmp_path / "base.qcow2"
 
-            result = await prefetch_all_assets(arch="aarch64")
+            result = await prefetch_all_assets(arch=arch)
 
             assert result.success is True
-            assert result.arch == "aarch64"
-            # Verify arch was passed to kernel and initramfs
+            assert result.arch == arch
             mock_kernel.assert_called_once()
-            assert mock_kernel.call_args.kwargs.get("arch") == "aarch64"
+            assert mock_kernel.call_args.kwargs.get("arch") == arch
             mock_initramfs.assert_called_once()
-            assert mock_initramfs.call_args.kwargs.get("arch") == "aarch64"
+            assert mock_initramfs.call_args.kwargs.get("arch") == arch
+            mock_gvproxy.assert_called_once_with(override=None, arch=arch)
 
     async def test_prefetch_returns_error_on_registry_failure(self) -> None:
         """prefetch_all_assets returns failure result if registry load fails."""

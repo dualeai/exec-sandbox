@@ -484,6 +484,43 @@ print('another stdout')
         assert "stderr message" in captured_stderr
 
 
+class TestStartDrain:
+    """start_drain: its task is the process's drain_task (cleanup then never reads the
+    pipes), it reads both pipes, and a failure of the task is logged."""
+
+    async def test_task_is_the_drain_task_and_reads_both_pipes(self) -> None:
+        lines: list[str] = []
+        proc = await create_process(["bash", "-c", "echo out; echo err >&2"])
+
+        task = start_drain(
+            proc, process_name="bash", context_id="drain-1", stdout_handler=lines.append, stderr_handler=lines.append
+        )
+
+        assert proc.drain_task is task
+        await task
+        await proc.wait()
+        assert sorted(lines) == ["err", "out"]
+
+    async def test_failed_task_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        proc = await create_process(["echo", "line"])
+
+        def fail(_line: str) -> None:
+            raise RuntimeError("handler failed")
+
+        with caplog.at_level(logging.ERROR, logger="exec_sandbox.subprocess_utils"):
+            task = start_drain(
+                proc, process_name="echo", context_id="drain-2", stdout_handler=fail, stderr_handler=[].append
+            )
+            with pytest.raises(ExceptionGroup):
+                await task
+            await asyncio.sleep(0)  # the done callback runs in the next loop pass
+        await proc.wait()
+
+        assert [(r.getMessage(), getattr(r, "task_name", None)) for r in caplog.records] == [
+            ("Background task failed", "echo-drain-drain-2")
+        ]
+
+
 class TestWaitForSocket:
     """Tests for wait_for_socket function.
 

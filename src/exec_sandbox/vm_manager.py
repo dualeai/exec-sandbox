@@ -919,10 +919,13 @@ class VmManager:
                 pass_fds=pass_fds,
                 on_process_started=lambda proc: setattr(pending, "qemu_proc", proc),
             )
-        except (OSError, FileNotFoundError) as e:
-            raise VmDependencyError(
-                f"Failed to launch QEMU: {e}",
-                context={"vm_id": infra.vm_id, "language": language},
+        except OSError as e:
+            raise spawn_error(
+                e,
+                binary=qemu_cmd[0],
+                code=ErrorCode.QEMU_CRASHED,
+                context={"vm_id": infra.vm_id, "language": spec.language},
+                hint=None,
             ) from e
 
         console_lines: deque[str] = deque(maxlen=constants.CONSOLE_RING_LINES)
@@ -1527,16 +1530,38 @@ class VmManager:
                     "L1 restore failed",
                     extra={**asdict(diag), "vmstate_path": str(vmstate_path)},
                 )
-                raise VmTransientError(
+                raise TransientError(
                     f"L1 restore failed for {infra.vm_id}: {e}",
+                    code=ErrorCode.MIGRATION_FAILED,
                     context={**asdict(diag), "vmstate_path": str(vmstate_path)},
+                    hint=None,
+                    instance_id=None,
                 ) from e
 
             # Connect guest channel with reconnection probe.
             # L1 restore needs probing because the virtio-serial chardev was connected
             # at save time — the restored VM needs the host to re-sync the connection.
             infra.channel._has_been_connected = True  # type: ignore[attr-defined]  # noqa: SLF001
-            await infra.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            try:
+                await infra.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
+            except (TimeoutError, OSError) as e:  # no answer, or QEMU closed its port (it stopped)
+                # The saved state does not run (a torn RAM template, for example): the L1
+                # layer cold boots and removes the entry, as for a stream QEMU refuses.
+                raise TransientError(
+                    f"L1 restore of {infra.vm_id}: the guest did not answer after its state loaded",
+                    code=ErrorCode.GUEST_SILENT_AFTER_RESTORE,
+                    context={"vm_id": infra.vm_id, "vmstate_path": str(vmstate_path)},
+                    hint=None,
+                    instance_id=None,
+                ) from e
+            except CommunicationError as e:  # socket peer check failed (internal class): nothing ran
+                raise TransientError(
+                    f"L1 restore of {infra.vm_id}: the guest channel failed: {e}",
+                    code=ErrorCode.GUEST_UNAVAILABLE,
+                    context={"vm_id": infra.vm_id, "error_type": type(e).__name__},
+                    hint=None,
+                    instance_id=None,
+                ) from e
 
             # VM is now running with REPL already warm.
             # Admission ownership was already claimed inside _launch_qemu_vm.

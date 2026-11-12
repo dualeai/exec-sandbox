@@ -1363,6 +1363,10 @@ def run_command(
     if not all_sources:
         raise click.UsageError("No code provided. Provide SOURCES argument or use -c flag.")
 
+    # Without network access, the domain list has nothing to allow
+    if allowed_domains and not network:
+        raise click.UsageError("--allow-domain requires --network.")
+
     # Parse environment variables
     try:
         parsed_env_vars = parse_env_vars(env_vars)

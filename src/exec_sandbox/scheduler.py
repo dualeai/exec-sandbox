@@ -213,15 +213,6 @@ class Scheduler:
         warn_zswap()
         warn_damon()
 
-        logger.info(
-            "Starting scheduler",
-            extra={
-                "warm_pool_size": self.config.warm_pool_size,
-                "s3_enabled": self.config.s3_bucket is not None,
-                "auto_download_assets": self.config.auto_download_assets,
-            },
-        )
-
         # Resolve images directory (downloads if needed and allowed)
         self._images_dir = await ensure_assets(
             override=self.config.images_dir,
@@ -230,6 +221,15 @@ class Scheduler:
 
         # Create Settings from SchedulerConfig
         self._settings = self._create_settings()
+
+        logger.info(
+            "Starting scheduler",
+            extra={
+                "warm_pool_size": self.config.warm_pool_size,
+                "s3_enabled": self._settings.s3_bucket is not None,
+                "auto_download_assets": self.config.auto_download_assets,
+            },
+        )
 
         # Initialize VmManager (handles backpressure internally via admission controller).
         # From this publication onward, every startup failure rolls the whole

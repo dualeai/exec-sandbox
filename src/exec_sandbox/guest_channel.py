@@ -801,13 +801,15 @@ class DualPortChannel:
 
         After close()+connect(), QEMU's chardev socket accepts before the guest
         agent has reopened its virtio-serial port fds.  This probe retries until
-        the guest actually responds or the retry budget is exhausted.
+        the guest actually responds or the retry budget is exhausted; each
+        attempt waits longer (GUEST_RECONNECT_PROBE_TIMEOUTS).
         """
-        for attempt in range(constants.GUEST_RECONNECT_PROBE_MAX_RETRIES):
+        attempts = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
+        for attempt, probe_timeout in enumerate(constants.GUEST_RECONNECT_PROBE_TIMEOUTS):
             try:
                 response = await asyncio.wait_for(
-                    self.send_request(PingRequest(), timeout=int(constants.GUEST_RECONNECT_PROBE_TIMEOUT + 1)),
-                    timeout=constants.GUEST_RECONNECT_PROBE_TIMEOUT,
+                    self.send_request(PingRequest(), timeout=int(probe_timeout + 1)),
+                    timeout=probe_timeout,
                 )
                 if isinstance(response, PongMessage):
                     logger.debug(

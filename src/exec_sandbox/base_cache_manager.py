@@ -59,22 +59,29 @@ class BaseCacheManager:
     eviction also removes 'key.vmstate.meta'.
     """
 
-    def __init__(self, cache_dir: Path) -> None:
+    def __init__(self, cache_dir: Path, *, setting: str) -> None:
+        """Make the cache folder (_make_cache_dir); *setting* names its config field."""
         self.cache_dir = cache_dir
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._setting = setting
+        self._make_cache_dir()
         self._background_tasks: dict[asyncio.Task[None], str] = {}
 
-    @property
-    def background_task_count(self) -> int:
-        """Number of in-flight background tasks."""
-        return len(self._background_tasks)
+    def _make_cache_dir(self) -> None:
+        """Make the cache folder if it is not there: at start, then before each build or save
+        lock, so a folder removed at run time (a tmp cleaner) is made again. Raises ConfigError
+        SETTING_INVALID when it cannot be made (no access, a read-only disk, a file in its place)."""
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise ConfigError(
+                f"Cache folder {self.cache_dir} cannot be made: {e.strerror or type(e).__name__}",
+                code=ErrorCode.SETTING_INVALID,
+                context={"cache_dir": str(self.cache_dir), "errno": e.errno},
+                hint=f"Set {self._setting} to a folder this user can write, on a writable disk.",
+                instance_id=None,
+            ) from e
 
-    @property
-    def background_task_names(self) -> list[str]:
-        """Names of in-flight background tasks (for monitoring)."""
-        return list(self._background_tasks.values())
-
-    def _track_task(self, task: asyncio.Task[None], *, name: str = "unnamed") -> None:
+    def _track_task(self, task: asyncio.Task[None], *, name: str) -> None:
         """Register a background task with lifecycle logging.
 
         Tasks are tracked to prevent GC and awaited on stop().
@@ -111,17 +118,37 @@ class BaseCacheManager:
 
         Yields True if caller should proceed with save (lock acquired, file absent).
         Yields False if another process completed the save first.
-        Raises BlockingIOError if lock is held by another process/task.
+        Raises BlockingIOError if lock is held by another process/task, ConfigError
+        SETTING_INVALID if the cache folder cannot be made again.
         """
-        async with file_lock(self._cache_path(key), blocking=False) as should_proceed:
+        self._make_cache_dir()
+        with try_file_lock(self._cache_path(key)) as should_proceed:
             yield should_proceed
+
+    def _remove_entry(self, path: Path) -> None:
+        """Delete every file of one cache entry: its sidecars, then the primary file `path`.
+        Last, because no save of the key starts while the primary file exists (_save_lock):
+        a removal in a worker thread never deletes the files of a new save of the same key.
+
+        Blocking (an L1 .ram file is the RAM size, an L2 image up to GBs): async callers
+        use asyncio.to_thread.
+        """
+        stem = path.name[: -len(self._cache_ext)]
+        for ext in self._sidecar_exts:
+            (path.parent / f"{stem}{ext}").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
 
     async def _evict_oldest_snapshot(self) -> None:
         """Evict oldest cache entry by atime (lazy, on ENOSPC).
 
         Removes the primary file and any sidecar files defined by _sidecar_exts.
         Skips entries with an active save lock to avoid deleting in-progress saves.
+        One worker-thread job: the listing has no size limit and an entry can be GBs.
         """
+        await asyncio.to_thread(self._evict_oldest_entry)
+
+    def _evict_oldest_entry(self) -> None:
+        """_evict_oldest_snapshot itself (blocking)."""
         cache_files = sorted(
             self.cache_dir.glob(f"*{self._cache_ext}"),
             key=lambda p: p.stat().st_atime,
@@ -129,19 +156,15 @@ class BaseCacheManager:
 
         for candidate in cache_files:
             # Skip entries with an active save lock (flock held by another process).
-            # Try non-blocking flock: if it succeeds, no save is in progress.
-            stem = candidate.name[: -len(self._cache_ext)]
+            # Try non-blocking flock: if it succeeds, no save is in progress. The
+            # files go under the lock: no task starts a save of the entry meanwhile.
             try:
-                async with file_lock(candidate, blocking=False):
-                    pass  # Lock acquired and released — no save in progress
+                with try_file_lock(candidate):
+                    logger.info("Evicting oldest snapshot", extra={"path": str(candidate)})
+                    self._remove_entry(candidate)
             except BlockingIOError:
                 logger.debug("Skipping locked cache entry for eviction", extra={"path": str(candidate)})
                 continue
-
-            logger.info("Evicting oldest snapshot", extra={"path": str(candidate)})
-            candidate.unlink(missing_ok=True)
-            for ext in self._sidecar_exts:
-                (candidate.parent / f"{stem}{ext}").unlink(missing_ok=True)
             return
 
     async def stop(self) -> None:

@@ -253,23 +253,39 @@ class Session:
             ``owned=True`` means we created the stream (bytes→BytesIO, Path→file);
             ``owned=False`` means the caller passed an IO[bytes] they own.
 
-        TOCTOU note: for Path, we stat() before open(). The file could grow
-        between stat() and actual reads. The guest agent also enforces the
-        max file size, providing defense in depth.
+        TOCTOU note: for Path, the type and size checks run on the open file
+        (fstat), but the file can still grow during the reads. The guest agent
+        also enforces the max file size, providing defense in depth.
         """
         if isinstance(content, Path):
-            if not content.exists():
-                raise FileNotFoundError(f"Source file not found: {content}")
-            file_size = content.stat().st_size
-            if file_size > MAX_FILE_SIZE_BYTES:
-                raise ValueError(f"File {content.name} is {file_size} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
-            # Return open file handle — streams from disk, never loads full content.
-            return content.open("rb"), True
+            # One worker-thread job: the caller's path can be on a network disk. A
+            # cancel waits for the job, then closes the file it opened.
+            opened: list[IO[bytes]] = []
+            try:
+                await run_to_end(lambda: opened.append(_open_source(content)))
+            except asyncio.CancelledError:
+                for stream in opened:
+                    stream.close()
+                raise
+            return opened[0], True
         if isinstance(content, bytes):
             if len(content) > MAX_FILE_SIZE_BYTES:
-                raise ValueError(f"Content is {len(content)} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+                raise _bad_argument(f"Content is {len(content)} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
             return io.BytesIO(content), True
         # IO[bytes] — caller owns the stream, we do NOT close it.
+        if content.closed:  # every read would raise a builtin ValueError mid-write
+            raise _bad_argument("Stream content is closed")
+        # A zero-byte read moves nothing: it raises on a stream not open for reading and gives
+        # str from a text stream (also a wrapped one, as NamedTemporaryFile("w+")). Both are
+        # refused here: a read that fails after the header is sent closes the session.
+        try:
+            probe = cast("bytes | str", content.read(0))  # IO[bytes] types read() as -> bytes
+        except OSError as e:  # io.UnsupportedOperation
+            raise _bad_argument("Stream content is not readable") from e
+        if isinstance(probe, str):
+            raise _bad_argument("Stream content is a text stream: open it in binary mode")
+        if probe:  # a stream that ignores the read size: these bytes are already lost
+            raise _bad_argument("Stream content returned bytes for a zero-byte read")
         # Validate size only if the stream is seekable.
         if content.seekable():
             pos = content.tell()
@@ -634,11 +650,18 @@ class Session:
     async def __aexit__(
         self,
         _exc_type: type[BaseException] | None,
-        _exc_val: BaseException | None,
+        exc_val: BaseException | None,
         _exc_tb: object,
     ) -> None:
-        """Exit async context manager - ensure cleanup."""
-        await self.close()
+        """Exit async context manager - ensure cleanup.
+
+        After a failure in the block, a close error is logged, not raised: it
+        must not replace the error the caller is handling.
+        """
+        if exc_val is not None:
+            await self._close_for_failure()
+        else:
+            await self.close()
 
     # -------------------------------------------------------------------------
     # Idle Timeout
@@ -678,3 +701,31 @@ class Session:
             },
         )
         self._idle_close_task = asyncio.create_task(self._close_for_failure())
+
+
+def _open_source(path: Path) -> IO[bytes]:
+    """write_file's source file, open for streaming (never loaded whole), after the
+    type and size checks. Only a regular file: a FIFO or a device has no size to
+    check and can block a read forever. O_NONBLOCK: the open of a FIFO with no
+    writer returns at once (then the type check refuses it). Blocking:
+    Session._resolve_content runs it in a worker thread. Its OSError or ValueError (a NUL
+    byte): local_path_error."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise _bad_argument(f"Source {path.name} is not a regular file")
+            if st.st_size > MAX_FILE_SIZE_BYTES:
+                raise _bad_argument(f"File {path.name} is {st.st_size} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+            os.set_blocking(fd, True)
+            return os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+    except (OSError, ValueError) as e:
+        raise local_path_error(e, failure="Source file cannot be opened", path=path, context={}) from e
+
+
+def _ref(state: InstanceState | None) -> InstanceRef | None:
+    return None if state is None else InstanceRef(instance_id=state.instance_id, generation=state.header.generation)

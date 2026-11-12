@@ -745,22 +745,39 @@ class TestAttachIfAvailable:
         assert result is False
 
     # --- Normal cases ---
-    async def test_returns_true_on_successful_attach(self):
+    async def test_returns_true_on_successful_attach(self, cgroup_root: Path):
         """Returns True when attachment succeeds."""
         from exec_sandbox.cgroup import attach_if_available
 
-        mock_file = MagicMock()
-        mock_file.__aenter__ = AsyncMock(return_value=mock_file)
-        mock_file.__aexit__ = AsyncMock(return_value=None)
-        mock_file.write = AsyncMock()
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
+        result = await attach_if_available(cgroup_path, 12345)
+        assert result is True
+        assert (cgroup_path / "cgroup.procs").read_text() == "12345"
 
+    # --- Error cases ---
+    @pytest.mark.parametrize("err", [errno.EACCES, errno.EPERM], ids=["eacces", "eperm"])
+    async def test_denied_attach_degrades_to_false(self, cgroup_root: Path, err: int):
+        """The orchestrator is outside the delegated subtree: no limits for this VM, the VM still runs."""
+        from exec_sandbox.cgroup import attach_if_available
+
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
+        with patch.object(Path, "write_text", side_effect=OSError(err, os.strerror(err))):
+            assert await attach_if_available(cgroup_path, 12345) is False
+
+    async def test_other_attach_error_propagates(self, cgroup_root: Path):
+        """Any other errno is a real fault: the ConfigError HOST_DEPENDENCY of attach_to_cgroup."""
+        from exec_sandbox.cgroup import attach_if_available
+        from exec_sandbox.exceptions import ConfigError, ErrorCode
+
+        cgroup_path = cgroup_root / "code-exec" / "tenant" / "vm123"
+        cgroup_path.mkdir(parents=True)
         with (
-            patch("exec_sandbox.cgroup._check_cgroup_v2_mounted", return_value=True),
-            patch("aiofiles.open", return_value=mock_file),
+            patch.object(Path, "write_text", side_effect=OSError(errno.ESRCH, os.strerror(errno.ESRCH))),
+            pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY),
         ):
-            cgroup_path = Path("/sys/fs/cgroup/code-exec/tenant/vm123")
-            result = await attach_if_available(cgroup_path, 12345)
-            assert result is True
+            await attach_if_available(cgroup_path, 12345)
 
 
 # =============================================================================

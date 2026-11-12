@@ -1110,7 +1110,7 @@ class TestBaseImageFetchBeforeL1Restore:
     # Base image filename per language (mirrors assets.fetch_base_image mapping).
     _BASE_FILENAME: ClassVar[dict[Language, str]] = {
         Language.PYTHON: "python-3.14-base-{arch}.qcow2",
-        Language.JAVASCRIPT: "node-1.3-base-{arch}.qcow2",
+        Language.JAVASCRIPT: "node-1.4-base-{arch}.qcow2",
         Language.RAW: "raw-base-{arch}.qcow2",
     }
 
@@ -1947,26 +1947,34 @@ time.sleep(30)
             "init" in line.lower() or "timing" in line.lower() or "info" in line.lower() for line in boot_lines
         ), f"Expected boot markers in output, got: {boot_lines[:5]}"
 
+    @skip_unless_hwaccel
+    async def test_on_boot_log_that_raises_is_dropped_and_boot_goes_on(self, scheduler: Scheduler) -> None:
+        """A callback that raises gets no more lines; the VM boots and runs code."""
+        lines: list[str] = []
+
+        def broken(line: str) -> None:
+            lines.append(line)
+            raise RuntimeError("callback bug")
+
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello')", on_boot_log=broken)
+
+        assert (result.exit_code, result.stdout.strip()) == (0, "hello")
+        assert len(lines) == 1
+
 
 class TestSchedulerJavaScript:
     """JavaScript execution tests."""
 
     async def test_run_simple_javascript(self, scheduler: Scheduler) -> None:
         """Run simple JavaScript code."""
-        result = await scheduler.run(
-            code="console.log('hello from javascript')",
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log('hello from javascript')")
 
         assert result.exit_code == 0
         assert "hello from javascript" in result.stdout
 
     async def test_run_javascript_calculation(self, scheduler: Scheduler) -> None:
         """Run JavaScript with calculation."""
-        result = await scheduler.run(
-            code="console.log(2 + 2)",
-            language=Language.JAVASCRIPT,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log(2 + 2)")
 
         assert result.exit_code == 0
         assert "4" in result.stdout

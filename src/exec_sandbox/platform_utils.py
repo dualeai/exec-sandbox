@@ -346,6 +346,9 @@ class ProcessWrapper:
         """
         self.async_proc = async_proc
         self.psutil_proc: psutil.Process | None = None
+        # The background task that reads stdout/stderr, set by subprocess_utils.start_drain:
+        # while it runs, wait_with_timeout never reads the pipes.
+        self.drain_task: asyncio.Task[None] | None = None
 
         # Wrap with psutil for PID-reuse safe monitoring
         # Use exponential backoff to handle race conditions where the process
@@ -541,7 +544,8 @@ class ProcessWrapper:
         """
         has_pipes = self.stdout is not None or self.stderr is not None
 
-        if has_pipes:
+        drained = self.drain_task is not None and not self.drain_task.done()
+        if has_pipes and not drained:
             try:
                 # Drain stdout/stderr pipes to prevent deadlock
                 await asyncio.wait_for(self.async_proc.communicate(), timeout=timeout)

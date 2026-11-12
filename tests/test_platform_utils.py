@@ -603,6 +603,48 @@ class TestProcessWrapperWaitWithTimeout:
         code = await proc.wait_with_timeout(5.0)
         assert code == 0
 
+    async def test_pipes_read_by_drain_task_exit_without_stall(self, tmp_path: Path) -> None:
+        """A process whose pipes a drain task reads is waited without reading them.
+
+        The two yields below order the loop so that communicate() starts its
+        readers after the output reached the streams and before the woken drain
+        readers run: these then drop the wakeup of communicate(), which never
+        ends (the close() stall of 5 s on ~3% of VMs). wait() returns at exit.
+
+        Flag files set up the race without timing: the child writes only once the
+        drain readers wait ("go"), and the loop stays blocked until both lines are in
+        the pipes ("written").
+        """
+        go, written = tmp_path / "go", tmp_path / "written"
+        script = 'while [ ! -e "$1" ]; do sleep 0.01; done; echo out; echo err >&2; : > "$2"; sleep 0.8'
+        proc = await create_wrapped_process(["sh", "-c", script, "sh", str(go), str(written)])
+        lines: list[str] = []
+        drain = start_drain(
+            proc, process_name="test", context_id="test", stdout_handler=lines.append, stderr_handler=lines.append
+        )
+        await asyncio.sleep(0.05)  # both drain readers wait for data
+        go.touch()
+        deadline = time.monotonic() + 5.0
+        while not written.exists():  # blocks the loop: the child writes both lines, nothing reads them yet
+            assert time.monotonic() < deadline, "the child did not write"
+            time.sleep(0.005)
+        await asyncio.sleep(0)  # pass 1: this task, then the pipe reads (their data reaches the streams in pass 2)
+        await asyncio.sleep(0)  # pass 2: this task, then the data: the drain readers are woken, run in pass 3
+
+        assert await proc.wait_with_timeout(2.0) == 0
+        await drain
+        assert sorted(lines) == ["err", "out"]  # the drain task got every line
+
+    async def test_ended_drain_task_leaves_the_pipes_to_communicate(self) -> None:
+        """A drain task that ended (a line over the stream limit ends it) reads nothing more:
+        wait() alone would time out on a child blocked on its full stdout pipe."""
+        proc = await create_wrapped_process(["sh", "-c", "head -c 1000000 /dev/zero"])
+        ended = asyncio.create_task(asyncio.sleep(0))
+        await ended
+        proc.drain_task = ended
+
+        assert await proc.wait_with_timeout(5.0) == 0
+
 
 # ============================================================================
 # Platform-Specific Tests Using Skip Markers
@@ -615,13 +657,13 @@ class TestPlatformArchCombinations:
     @skip_unless_macos_x86_64
     def test_darwin_amd64_naming_combination(self) -> None:
         """Verify darwin-amd64 naming for Intel Mac."""
-        assert get_os_name() == "darwin"
-        assert get_arch_name("go") == "amd64"
-        # Combined suffix: darwin-amd64
+        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
+
+        assert get_gvproxy_suffix(get_current_arch()) == "darwin-amd64"
 
     @skip_unless_macos_arm64
     def test_darwin_arm64_naming_combination(self) -> None:
         """Verify darwin-arm64 naming for Apple Silicon."""
-        assert get_os_name() == "darwin"
-        assert get_arch_name("go") == "arm64"
-        # Combined suffix: darwin-arm64
+        from exec_sandbox.asset_downloader import get_current_arch, get_gvproxy_suffix
+
+        assert get_gvproxy_suffix(get_current_arch()) == "darwin-arm64"

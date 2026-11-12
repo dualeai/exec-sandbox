@@ -211,7 +211,6 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         )
     else:
         arch_suffix = "x86_64"
-        qemu_bin = "qemu-system-x86_64"
         # Machine type: microvm for all acceleration modes (KVM, HVF, TCG).
         # microvm provides direct kernel boot via qboot (acpi=off), skipping
         # SeaBIOS/iPXE. Under TCG this means ~2s boot vs 30+s with pc (i440FX).
@@ -606,7 +605,10 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Snapshot overlay drive — ext4 layer for overlayfs merge with EROFS base.
     # Presented as a second virtio-blk device; tiny-init detects it by serial=snap
     # and sets up overlayfs automatically (rw for snapshot creation, ro for usage).
+    # Outside snapshot creation the shared L2 file is opened read-only, so a guest
+    # can never write to a cache entry that other VMs use at the same time.
     if snapshot_drive:
+        snapshot_ro = "" if direct_write else "read-only=on,"
         qemu_args.extend(
             [
                 "-drive",
@@ -614,6 +616,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
                 f"format=qcow2,"
                 f"if=none,"
                 f"id=hd1,"
+                f"{snapshot_ro}"
                 f"cache=unsafe,"
                 f"aio={aio_mode},"
                 f"discard=unmap,"

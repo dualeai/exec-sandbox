@@ -42,6 +42,7 @@ __all__ = [
     "probe_qemu_sandbox_support",
     "probe_qemu_version",
     "probe_unshare_support",
+    "qemu_system_binary",
     "raise_fd_limit",
     "raise_nproc_limit",
     "warn_cgroup_pids_limit",
@@ -520,10 +521,20 @@ def _async_cached_probe(
     return decorator
 
 
-def _qemu_system_binary() -> str:
-    """Return the QEMU system emulator binary name for the host architecture."""
-    arch = detect_host_arch()
+def qemu_system_binary(binaries: QemuBinaries, *, arch: HostArch) -> str:
+    """The qemu-system binary for `arch`: the configured file (EXEC_SANDBOX_QEMU_BIN_X86 /
+    _ARM, /usr/bin by default) when it exists, else the bare name, found on PATH by exec.
+    The one resolver: VMs (qemu_cmd) and the QEMU probes run the binary it gives."""
+    configured = binaries.qemu_bin_arm if arch == HostArch.AARCH64 else binaries.qemu_bin_x86
+    if configured.is_file():
+        return str(configured)
     return "qemu-system-aarch64" if arch == HostArch.AARCH64 else "qemu-system-x86_64"
+
+
+def _probed_qemu_binary() -> str:
+    """The binary the QEMU probes run: VMs read the same two variables (Settings is a
+    QemuBinaries; SchedulerConfig does not set them)."""
+    return qemu_system_binary(QemuBinaries(), arch=detect_host_arch())
 
 
 @_async_cached_probe("qemu_accels")
@@ -545,7 +556,7 @@ async def probe_qemu_accelerators() -> set[str]:
     Returns:
         Set of available accelerator names (e.g., {"tcg", "kvm"} or {"tcg", "hvf"})
     """
-    qemu_bin = _qemu_system_binary()
+    qemu_bin = _probed_qemu_binary()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -605,7 +616,7 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
 
     Tuples compare naturally as semver: (9, 2, 0) >= (9, 2, 0) works correctly.
     """
-    qemu_bin = _qemu_system_binary()
+    qemu_bin = _probed_qemu_binary()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -663,7 +674,7 @@ async def probe_qemu_sandbox_support() -> bool:
     if detect_host_os() != HostOS.LINUX:
         return False
 
-    qemu_bin = _qemu_system_binary()
+    qemu_bin = _probed_qemu_binary()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -763,15 +774,21 @@ async def check_kvm_available() -> bool:
         False otherwise (falls back to TCG software emulation)
     """
     kvm_path = "/dev/kvm"
-    if not await aiofiles.os.path.exists(kvm_path):
+    if not Path(kvm_path).exists():
         logger.debug("KVM not available: /dev/kvm does not exist")
         return False
 
     # Check if we can actually access /dev/kvm (not just that it exists)
     # This catches permission issues that would cause QEMU to fail or hang
     # See: https://github.com/actions/runner-images/issues/8542
-    if not await can_access(kvm_path, os.R_OK | os.W_OK):
-        logger.debug("KVM not available: permission denied on /dev/kvm")
+    # A WARNING, once per process (this probe is cached): else VMs silently run under TCG.
+    if not can_access(kvm_path, os.R_OK | os.W_OK):
+        logger.warning(
+            "KVM not available: this user cannot read and write /dev/kvm, so VMs use software emulation "
+            "(TCG, about 5-8 times slower). Add the user to the kvm group (sudo usermod -aG kvm $USER), "
+            "then log in again.",
+            extra={"path": kvm_path},
+        )
         return False
 
     # Actually try to open /dev/kvm and check API version via subprocess

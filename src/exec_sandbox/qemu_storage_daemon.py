@@ -172,11 +172,13 @@ class QemuStorageDaemon:
             "chardev=qmp0",
         ]
 
+        spawned = False
         try:
             self._process = await start_managed_process(
                 cmd,
                 on_process_started=lambda proc: setattr(self, "_process", proc),
             )
+            spawned = True
 
             # Wait for socket and connect (single step to avoid TOCTOU)
             await self._wait_and_connect_qmp()
@@ -199,7 +201,15 @@ class QemuStorageDaemon:
                 raise
             if isinstance(e, asyncio.CancelledError):
                 raise
-            raise QemuStorageDaemonError(f"Failed to start daemon: {e}") from e
+            if isinstance(e, OSError) and not spawned:
+                raise spawn_error(
+                    e,
+                    binary=cmd[0],
+                    code=ErrorCode.OVERLAY_FAILED,
+                    context={},
+                    hint="Install QEMU (it ships qemu-storage-daemon).",
+                ) from e
+            raise _overlay_failed(f"Failed to start daemon: {e}", context=None) from e
 
     async def stop(self) -> None:
         """Stop daemon gracefully.
