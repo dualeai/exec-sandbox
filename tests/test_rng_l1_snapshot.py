@@ -11,6 +11,7 @@ works correctly.
 """
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -122,3 +123,33 @@ class TestL1SnapshotRNG:
             f"  Hashes: {hashes}\n"
             f"Kernel CRNG state was replayed from snapshot."
         )
+
+
+# Math.random lives in the JS runtime, not the kernel: the guest CRNG reseed does
+# not cover it. The REPL feeds it from crypto.getRandomValues in both realms (the
+# exec context and the outer realm that require'd modules and
+# process.constructor.constructor reach).
+JS_RANDOM = """\
+const words = new Uint32Array(4);
+crypto.getRandomValues(words);
+const outer = process.constructor.constructor('return [Math.random(), Math.random()]')();
+console.log(JSON.stringify({ math: [Math.random(), Math.random()], outer, crypto: Array.from(words) }));
+"""
+
+
+@skip_unless_hwaccel
+class TestL1SnapshotJsRNG:
+    async def test_l1_restored_js_vms_different_random(self, l1_scheduler: Scheduler) -> None:
+        prime = await run_once(l1_scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log('prime')")
+        assert prime.exit_code == 0, prime.stderr
+        await wait_l1_saves(l1_scheduler)
+
+        runs = [await run_timed(l1_scheduler, VmSpec(language=Language.JAVASCRIPT), JS_RANDOM) for _ in range(2)]
+
+        for i, run in enumerate(runs):
+            assert run.result.exit_code == 0, f"VM {i} failed: {run.result.stderr}"
+            assert run.startup.l1_cache_hit, f"VM {i} did NOT come from L1 restore"
+        first, second = (json.loads(run.result.stdout.strip()) for run in runs)
+        assert first["math"] != second["math"], "Math.random state cloned from the L1 template"
+        assert first["outer"] != second["outer"], "outer-realm Math.random state cloned from the L1 template"
+        assert first["crypto"] != second["crypto"], "crypto.getRandomValues state cloned from the L1 template"

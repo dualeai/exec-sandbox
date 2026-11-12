@@ -4,6 +4,9 @@ Tests Pydantic serialization, validation, and discriminated unions.
 No mocks - pure model testing.
 """
 
+import json
+import time
+
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis.strategies import characters, integers, sampled_from, text
@@ -50,14 +53,21 @@ class TestPingRequest:
     def test_serialize_to_dict(self) -> None:
         """PingRequest serializes correctly."""
         req = PingRequest()
-        data = req.model_dump()
+        data = req.model_dump(exclude={"host_time_ns"})
         assert data == {"action": "ping", "op_id": None}
 
     def test_serialize_to_json(self) -> None:
         """PingRequest serializes to JSON (exclude_none matches wire format)."""
         req = PingRequest()
-        json_str = req.model_dump_json(exclude_none=True)
+        json_str = req.model_dump_json(exclude_none=True, exclude={"host_time_ns"})
         assert json_str == '{"action":"ping"}'
+
+    def test_host_time_stamped_at_serialization(self) -> None:
+        """Every request carries the host wall clock taken when it is serialized (sent)."""
+        req = PingRequest()
+        before = time.time_ns()
+        wire = json.loads(req.model_dump_json(exclude_none=True))
+        assert before <= wire["host_time_ns"] <= time.time_ns()
 
 
 class TestWarmReplRequest:
@@ -69,7 +79,7 @@ class TestWarmReplRequest:
 
     def test_serialize_python(self) -> None:
         req = WarmReplRequest(language=Language.PYTHON)
-        data = req.model_dump()
+        data = req.model_dump(exclude={"host_time_ns"})
         assert data == {"action": "warm_repl", "language": "python", "op_id": None}
 
     def test_serialize_javascript(self) -> None:
@@ -844,7 +854,7 @@ class TestWriteFileRequest:
             path="data/output.csv",
             make_executable=False,
         )
-        data = req.model_dump()
+        data = req.model_dump(exclude={"host_time_ns"})
         assert data == {
             "action": "write_file",
             "op_id": "abc123",
@@ -943,7 +953,7 @@ class TestReadFileRequest:
     def test_serialize_to_dict(self) -> None:
         """ReadFileRequest serializes correctly."""
         req = ReadFileRequest(op_id="abc", path="results/data.json")
-        data = req.model_dump()
+        data = req.model_dump(exclude={"host_time_ns"})
         assert data == {"action": "read_file", "op_id": "abc", "path": "results/data.json"}
 
     def test_serialize_to_json(self) -> None:
@@ -989,13 +999,13 @@ class TestListFilesRequest:
     def test_serialize_to_dict(self) -> None:
         """ListFilesRequest serializes correctly."""
         req = ListFilesRequest(path="data")
-        data = req.model_dump()
+        data = req.model_dump(exclude={"host_time_ns"})
         assert data == {"action": "list_files", "path": "data", "op_id": None}
 
     def test_serialize_default_path(self) -> None:
         """ListFilesRequest serializes default empty path."""
         req = ListFilesRequest()
-        data = req.model_dump()
+        data = req.model_dump(exclude={"host_time_ns"})
         assert data == {"action": "list_files", "path": "", "op_id": None}
 
 

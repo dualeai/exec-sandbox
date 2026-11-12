@@ -27,6 +27,13 @@ fn extract_op_id(value: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// Host wall clock at send time (top-level, like op_id: not part of GuestCommand).
+fn extract_host_time_ns(value: &serde_json::Value) -> Option<u64> {
+    value
+        .get("host_time_ns")
+        .and_then(serde_json::Value::as_u64)
+}
+
 // ============================================================================
 // NonBlockingFile
 // ============================================================================
@@ -45,7 +52,8 @@ impl NonBlockingFile {
         use std::fs::OpenOptions;
         let file = OpenOptions::new().read(true).open(path)?;
         Self::set_nonblocking(file.as_raw_fd())?;
-        let async_fd = AsyncFd::new(file)?;
+        // SAFETY: AsyncFd owns `file`, so the fd stays open and unchanged for its lifetime.
+        let async_fd = unsafe { AsyncFd::register(file) }?;
         Ok(Self {
             async_fd,
             leftover: Vec::new(),
@@ -260,6 +268,7 @@ pub(crate) async fn handle_connection(
             }
         };
         let op_id = extract_op_id(&value);
+        let host_time_ns = extract_host_time_ns(&value);
         let cmd: GuestCommand = match serde_json::from_value(value) {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -274,6 +283,9 @@ pub(crate) async fn handle_connection(
                 continue;
             }
         };
+
+        // Step the wall clock forward to the host's before any user code reads it.
+        crate::clock::sync(host_time_ns);
 
         // Reseed kernel CRNG before every command dispatch (~11μs).
         // After L1 snapshot restore the VM resumes mid-loop with cloned CRNG;

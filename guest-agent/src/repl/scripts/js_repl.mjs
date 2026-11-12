@@ -217,5 +217,8 @@ while (true) {
     if (_stdoutBackPressure) {
         await new Promise(resolve => setTimeout(resolve, 50));
     }
+    // End of this exec's stdout: the agent stops reading stdout here, without
+    // waiting for the pipe to go idle.
+    _origStdoutWrite.call(process.stdout, `__STDOUT_END_${sentinelId}__\n`);
     process.stderr.write(`__SENTINEL_${sentinelId}_${exitCode}__\n`);
 }

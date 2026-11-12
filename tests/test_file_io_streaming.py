@@ -72,17 +72,16 @@ class TestStreamingLargeFiles:
         )
 
     async def test_write_read_file_larger_than_vm_memory(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write a 150 MB file — larger than what fits in default tmpfs.
+        """Write a 150 MB file — larger than the guest's free RAM at 192 MB.
 
-        /home/user tmpfs is 50% of RAM. Uses 512 MB VM (256 MB tmpfs) so the
-        150 MB file fits. Streaming only needs ~64 KB decompression buffer.
+        The home disk holds it; streaming only needs ~64 KB decompression buffer.
         """
         size = 150 * 1024 * 1024
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_150mb.bin"
 
-        async with await scheduler.session(language=Language.PYTHON, memory_mb=512) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
             await session.write_file("large_150mb.bin", content)
             await session.read_file("large_150mb.bin", destination=dest)
 

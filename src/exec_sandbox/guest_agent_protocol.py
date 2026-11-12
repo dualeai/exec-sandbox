@@ -8,9 +8,10 @@ Security: All fields validated by guest agent (see guest-agent/src/main.rs).
 
 from __future__ import annotations
 
+import time
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from exec_sandbox.constants import (
     ENV_VAR_FORBIDDEN_CONTROL_CHARS,
@@ -32,6 +33,13 @@ class GuestAgentRequest(BaseModel):
 
     action: str = Field(description="Action to perform")
     op_id: str | None = Field(default=None, description="Operation ID for request-response correlation")
+
+    @computed_field
+    @property
+    def host_time_ns(self) -> int:
+        """Host wall clock when the request is serialized (sent); the guest steps its clock
+        forward to it when it lags by more than 100 ms (never back)."""
+        return time.time_ns()
 
 
 class PingRequest(GuestAgentRequest):

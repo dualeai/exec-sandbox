@@ -1557,12 +1557,19 @@ for i in range(3):
 
     async def test_run_python_exit_code(self, scheduler: Scheduler) -> None:
         """Python code with non-zero exit."""
-        result = await scheduler.run(
-            code="import sys; sys.exit(42)",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import sys; sys.exit(42)")
 
         assert result.exit_code == 42
+
+    @pytest.mark.parametrize(("code", "exit_code"), [("-1", 255), ("256", 0), ("10**10 + 7", 7)])
+    async def test_run_python_exit_code_is_a_process_status(
+        self, scheduler: Scheduler, code: str, exit_code: int
+    ) -> None:
+        """A sys.exit() code outside 0-255 is kept like a process exit status (sys.exit(-1) is 255):
+        -1 stays the code timeout only."""
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), f"import sys; sys.exit({code})")
+
+        assert result.exit_code == exit_code
 
     async def test_run_python_stderr(self, scheduler: Scheduler) -> None:
         """Python code that writes to stderr."""
@@ -1637,31 +1644,13 @@ time.sleep(30)
 """
 
         async with Scheduler(config) as scheduler:
-            try:
-                result = await scheduler.run(
-                    code=code,
-                    language=Language.PYTHON,
-                    timeout_seconds=1,
-                )
-                # If we get here, guest-agent handled timeout
-                # Process should have been killed (exit code != 0)
-                assert result.exit_code != 0, (
-                    f"Expected non-zero exit code for timed-out execution, got {result.exit_code}"
-                )
-            except VmTimeoutError:
-                # Host timeout kicked in - also valid
-                pass
+            result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=1)
+        assert result.exit_code == -1
 
     async def test_run_multiple_sequential(self, scheduler: Scheduler) -> None:
         """Multiple sequential runs work (VMs not reused)."""
-        result1 = await scheduler.run(
-            code="print('first')",
-            language=Language.PYTHON,
-        )
-        result2 = await scheduler.run(
-            code="print('second')",
-            language=Language.PYTHON,
-        )
+        result1 = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('first')")
+        result2 = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('second')")
 
         assert result1.exit_code == 0
         assert "first" in result1.stdout

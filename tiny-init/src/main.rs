@@ -1,7 +1,9 @@
 //! Minimal init for QEMU microVMs
 //!
 //! Custom kernel (CONFIG_MODULES=n): all drivers are built-in.
-//! Handles devtmpfs, read-only rootfs mount, and switch_root.
+//! Handles devtmpfs, the read-only rootfs mount, the move into the new root
+//! (busybox switch_root steps), the home disk on /home/user, and the exec of
+//! the guest agent.
 
 #[macro_use]
 mod sys;
@@ -37,7 +39,7 @@ fn mount_virtual_filesystems() {
     // querying user. Prevents UID 1000 from reading /proc/1/maps (memory layout
     // leak). /proc/self is always exempted by the kernel. System-wide files
     // (/proc/meminfo, /proc/cpuinfo, /proc/net/*) are unaffected.
-    // MS_MOVE in switch_root() preserves this option (superblock not modified).
+    // MS_MOVE in enter_rootfs() preserves this option (superblock not modified).
     // Available since Linux 3.3; see proc(5).
     sys::mount("proc", "/proc", "proc", 0, "hidepid=2");
     sys::mount("sysfs", "/sys", "sysfs", 0, "");
@@ -109,30 +111,64 @@ fn find_block_device_by_serial(target_serial: &str) -> Option<String> {
     None
 }
 
+/// Find a drive the host attached, retrying briefly (enumeration race on a
+/// loaded host): 6 checks, 10 ms apart. Built-in virtio-blk drivers probe
+/// before init, so a miss here is rare; a drive that stays missing is fatal
+/// (fail closed).
+fn require_block_device_by_serial(serial: &str) -> String {
+    let mut dev = None;
+    device::poll_backoff(&[10_000; 5], || {
+        dev = find_block_device_by_serial(serial);
+        dev.is_some()
+    });
+    let Some(dev) = dev else {
+        log_error!("drive serial={} not found", serial);
+        sys::fallback_shell();
+    };
+    dev
+}
+
+/// Format the blank snapshot drive `dev` as ext4 (no journal, no reserved
+/// blocks) with mkfs.ext4 from the EROFS rootfs mounted at /lower.
+///
+/// The tool's ELF interpreter resolves against the initramfs root (where /lib
+/// is empty), so bind-mount /dev into the rootfs and chroot into it first.
+fn mkfs_in_lower(dev: &str) -> bool {
+    let root_dev = "/lower/dev";
+    if sys::mount("/dev", root_dev, "", sys::MS_BIND, "") != 0 {
+        log_error!(
+            "bind mount /dev -> {} failed: errno={}",
+            root_dev,
+            sys::last_errno()
+        );
+        return false;
+    }
+    let root_c = CString::new("/lower").unwrap();
+    let status = unsafe {
+        std::process::Command::new("/sbin/mkfs.ext4")
+            .args(["-q", "-O", "^has_journal", "-m", "0", dev])
+            .pre_exec(move || {
+                let slash = CString::new("/").unwrap();
+                if libc::chroot(root_c.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chdir(slash.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .status()
+    };
+    sys::umount(root_dev);
+    matches!(status, Ok(s) if s.success())
+}
+
 fn mount_rootfs() {
     // Discover drives by serial number (set in QEMU -device virtio-blk serial=).
     // "base" = EROFS rootfs, "snap" = ext4 snapshot overlay.
     // Cannot rely on /dev/vda ordering: ARM MMIO enumerates in reverse.
     let base_dev = find_block_device_by_serial("base").unwrap_or_else(|| "/dev/vda".to_string());
-    let mut snap_dev = find_block_device_by_serial("snap");
-
-    // Defense against device enumeration race: if host indicated a snap drive
-    // should exist (init.snap=1 on cmdline) but we didn't find it, retry a few
-    // times. Built-in virtio-blk drivers probe before init, so this is rarely
-    // needed, but provides a safety net for loaded hosts.
-    if snap_dev.is_none() && sys::cmdline_has("init.snap=1") {
-        for _ in 0..5 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            snap_dev = find_block_device_by_serial("snap");
-            if snap_dev.is_some() {
-                break;
-            }
-        }
-        if snap_dev.is_none() {
-            log_error!("init.snap=1 set but snap drive not found");
-            sys::fallback_shell();
-        }
-    }
+    let snap_dev = sys::cmdline_has("init.snap=1").then(|| require_block_device_by_serial("snap"));
 
     let erofs_flags = sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV;
     let need_rw = sys::cmdline_has("init.rw=1");
@@ -143,10 +179,10 @@ fn mount_rootfs() {
         //   - Snapshot creation (init.rw=1): ext4 writable upper
         //   - Snapshot usage: ext4 read-only, overlayfs provides merged view
         //
-        // Mount hierarchy (on initramfs, before switch_root):
+        // Mount hierarchy (on initramfs, before enter_rootfs):
         //   /lower      ← EROFS base (always ro)
         //   /upper_dev  ← ext4 snapshot (rw or ro)
-        //   /mnt        ← overlayfs merge (switch_root target)
+        //   /mnt        ← overlayfs merge (enter_rootfs target)
 
         let _ = fs::create_dir("/lower");
         let _ = fs::create_dir("/upper_dev");
@@ -159,45 +195,10 @@ fn mount_rootfs() {
 
         // Mount ext4 overlay layer (rw for snapshot creation, ro for snapshot usage)
         if need_rw {
-            // Snapshot creation: format blank drive as ext4.
-            // Host creates a blank qcow2; we format here using mkfs.ext4 from
-            // the EROFS rootfs (already mounted at /lower).
-            //
-            // mkfs.ext4 is dynamically linked (Alpine musl). It can't execute
-            // directly from initramfs because the ELF interpreter resolves
-            // against the initramfs root (where /lib is empty). We bind-mount
-            // /dev into the EROFS rootfs and chroot so the linker resolves.
-            if sys::mount("/dev", "/lower/dev", "", sys::MS_BIND, "") != 0 {
-                log_error!(
-                    "bind mount /dev -> /lower/dev failed: errno={}",
-                    sys::last_errno()
-                );
+            // Snapshot creation: format the blank drive (EROFS rootfs already at /lower).
+            if !mkfs_in_lower(snap) {
+                log_error!("mkfs.ext4 {} failed", snap);
                 sys::fallback_shell();
-            }
-            let snap_for_chroot = snap.clone();
-            let mkfs_status = unsafe {
-                std::process::Command::new("/sbin/mkfs.ext4")
-                    .args(["-q", "-O", "^has_journal", "-m", "0", &snap_for_chroot])
-                    .pre_exec(|| {
-                        let lower = CString::new("/lower").unwrap();
-                        let root = CString::new("/").unwrap();
-                        if libc::chroot(lower.as_ptr()) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        if libc::chdir(root.as_ptr()) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    })
-                    .status()
-            };
-            sys::umount("/lower/dev");
-            match mkfs_status {
-                Ok(s) if s.success() => {}
-                _ => {
-                    log_error!("mkfs.ext4 {} failed", snap);
-                    sys::fallback_shell();
-                }
             }
         }
         let snap_flags = if need_rw {
@@ -256,7 +257,67 @@ fn mount_rootfs() {
     let _ = fs::remove_dir_all("/dev/block");
 }
 
-fn switch_root() -> ! {
+/// Format the VM's home disk (serial=home) and mount it on /home/user.
+///
+/// Every VM has one: a raw sparse file the host attaches. tiny-init runs only
+/// at a cold boot (restores and loads resume RAM), so the disk is always blank
+/// here. Runs inside the new root (after enter_rootfs): mkfs runs from the
+/// rootfs directly, with no /dev bind mount, whose umount would wait a full RCU
+/// grace period (~12 ms at HZ=100 with rcu_normal_after_boot).
+///
+/// mkfs.ext4 options:
+/// - assume_storage_prezeroed: the sparse file reads as zeros, so mke2fs skips
+///   zeroing and ext4lazyinit never runs (~60 ms at any size).
+/// - root_owner: /home/user belongs to the sandbox user.
+/// - nodiscard: a blank disk has nothing to discard.
+/// - ^orphan_file: the mount reads 5 blocks, not 69 (the classic orphan list is
+///   journaled too; it only scales worse for many CPUs).
+/// - ^resize_inode: nothing grows a home filesystem online.
+/// - stdin and stdout on /dev/null: mke2fs probes for an old filesystem (libblkid)
+///   only on a tty. stderr stays on the console for errors.
+fn mount_home() {
+    let home = require_block_device_by_serial("home");
+    let status = std::process::Command::new("/sbin/mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-b",
+            "4096",
+            "-m",
+            "0",
+            "-O",
+            "^orphan_file,^resize_inode",
+            "-E",
+            "assume_storage_prezeroed=1,root_owner=1000:1000,nodiscard",
+            &home,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        log_error!("mkfs.ext4 {} failed", home);
+        sys::fallback_shell();
+    }
+    let flags = sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV;
+    if sys::mount(&home, "/home/user", "ext4", flags, "discard") != 0 {
+        log_error!(
+            "mount {} on /home/user failed: errno={}",
+            home,
+            sys::last_errno()
+        );
+        sys::fallback_shell();
+    }
+    // mke2fs makes lost+found as root 0700: uid 1000 could not read it, so
+    // tar, du or rm over /home/user would fail. Nothing runs fsck on this disk.
+    if let Err(e) = std::fs::remove_dir("/home/user/lost+found") {
+        log_warn!("remove /home/user/lost+found failed: {}", e);
+    }
+    // Same rule as the root drives: no raw device node after mount.
+    device::remove_device_node(&home);
+}
+
+/// Make the merged rootfs at /mnt the root: /dev, /proc, /sys and /tmp move into it.
+fn enter_rootfs() {
     // cd /mnt
     if std::env::set_current_dir("/mnt").is_err() {
         log_error!("chdir /mnt failed");
@@ -274,7 +335,7 @@ fn switch_root() -> ! {
     // 1. mount --move . / (overmount rootfs with new root)
     // 2. chroot .
     // 3. chdir /
-    // 4. exec new init
+    // 4. exec new init (exec_agent, after mount_home)
     // See: https://docs.kernel.org/filesystems/ramfs-rootfs-initramfs.html
 
     let dot = CString::new(".").unwrap();
@@ -302,7 +363,10 @@ fn switch_root() -> ! {
     unsafe {
         libc::chdir(root.as_ptr());
     }
+}
 
+/// Set up the environment and stdio, then exec the guest agent.
+fn exec_agent() -> ! {
     // Set minimal environment for guest-agent
     // SAFETY: called at startup before any threads are spawned
     unsafe {

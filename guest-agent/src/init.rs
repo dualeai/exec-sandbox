@@ -65,7 +65,7 @@ pub(crate) fn setup_phase2_core() {
     );
     chmod_paths(0o640, &["/etc/shadow"]);
 
-    mount_home_tmpfs();
+    // /home/user: ext4 home disk, mounted by tiny-init before the agent starts.
     // ALL /proc/sys writes MUST happen before mount_readonly_paths() which
     // makes /proc/sys read-only. This includes sysctl hardening AND zram
     // VM tuning (swappiness, page-cluster, etc.).
@@ -245,43 +245,6 @@ pub(crate) async fn wait_for_untrusted_readiness() -> Result<(), &'static str> {
     wait_for_network().await
 }
 
-/// Mount tmpfs on /home/user — writable scratch space on read-only rootfs.
-///
-/// Sized to 40% of RAM with per-UID quota enforcement (`usrquota` +
-/// `usrquota_block_hardlimit`) to prevent sparse file inflation attacks.
-/// Quota must be set at initial mount time — cannot be added via remount.
-///
-/// 40% (vs 50% prior): most sandbox code uses <30MB; 40% of 192MB = 77MB
-/// which provides ample headroom while reducing tmpfs metadata overhead.
-fn mount_home_tmpfs() {
-    // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
-    let page_mask = !(page_size() - 1);
-    // 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5
-    let tmpfs_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
-    let ret = unsafe {
-        let source = std::ffi::CString::new("tmpfs").unwrap();
-        let target = std::ffi::CString::new("/home/user").unwrap();
-        let fstype = std::ffi::CString::new("tmpfs").unwrap();
-        let data = std::ffi::CString::new(format!(
-            "mode=0755,uid={SANDBOX_UID},gid={SANDBOX_GID},size={tmpfs_bytes},usrquota,usrquota_block_hardlimit={tmpfs_bytes},noswap"
-        ))
-        .unwrap();
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            data.as_ptr() as *const libc::c_void,
-        )
-    };
-    if ret != 0 {
-        log_warn!(
-            "tmpfs mount on /home/user failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
 /// Read-only bind remounts for CIS hardening.
 fn mount_readonly_paths() {
     let rw_mode = std::fs::read_to_string("/proc/cmdline")
@@ -402,7 +365,7 @@ fn setup_dev_symlinks() {
 fn setup_dev_shm() {
     // Page-align (round down) so the mount size is an exact multiple of PAGE_SIZE.
     let page_mask = !(page_size() - 1);
-    // 40% of RAM (matching /home/user sizing)
+    // 40% of RAM
     let shm_bytes = (read_mem_total_kb() * 2048 / 5) & page_mask;
     let opts = format!("size={shm_bytes},usrquota,usrquota_block_hardlimit={shm_bytes},noswap");
 

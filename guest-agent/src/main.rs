@@ -41,6 +41,7 @@ macro_rules! log_info {
     };
 }
 
+mod clock;
 mod connection;
 mod error;
 mod file_io;

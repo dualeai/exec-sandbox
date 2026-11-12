@@ -157,7 +157,8 @@ multiprocessing.Pool = _lazy_mp_pool  # type: ignore[attr-defined]
 
 # PID guard: forked children inherit the REPL wrapper. Record parent PID so
 # children that escape user code (via sys.exit(), exception, or fall-through)
-# flush their output and terminate without writing a premature sentinel.
+# flush their output and terminate without writing a premature stdout end
+# marker or sentinel.
 _repl_pid = _repl_os.getpid()
 
 # Redirect sys.stdin to /dev/null so user code that reads stdin (input(),
@@ -178,12 +179,14 @@ while True:
         compiled = compile(code, "<exec>", "exec")
         exec(compiled, ns)  # noqa: S102
     except SystemExit as e:
-        exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        # Like a process exit status: sys.exit(-1) is 255, never the host's timeout code (-1).
+        exit_code = e.code & 0xFF if isinstance(e.code, int) else (0 if e.code is None else 1)
     except BaseException:  # noqa: BLE001
         traceback.print_exc()
         exit_code = 1
     # PID guard: if we're a forked child, flush output and terminate immediately
-    # without writing a sentinel. Only the original REPL parent writes sentinels.
+    # without writing the stdout end marker or the sentinel. Only the original
+    # REPL parent writes them.
     if _repl_os.getpid() != _repl_pid:
         try:
             sys.stdout.flush()
@@ -193,5 +196,13 @@ while True:
         _repl_os._exit(exit_code)
     sys.stdout.flush()
     sys.stderr.flush()
+    # End of this exec's stdout, through the original stream (user code may
+    # replace sys.stdout): the agent stops reading stdout here, without waiting
+    # for the pipe to go idle. If it cannot be written, the agent's idle wait covers it.
+    try:
+        sys.__stdout__.write(f"__STDOUT_END_{sentinel_id}__\n")  # type: ignore[union-attr]
+        sys.__stdout__.flush()  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001, S110
+        pass
     sys.stderr.write(f"__SENTINEL_{sentinel_id}_{exit_code}__\n")
     sys.stderr.flush()

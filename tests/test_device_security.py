@@ -1902,21 +1902,21 @@ with open(path) as f:
 os.unlink(path)
 print(f'OK:{data}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "OK:writable" in result.stdout
 
 
 # =============================================================================
-# /home/user tmpfs mount hardening
+# /home/user disk mount hardening
 # =============================================================================
-class TestHomeUserTmpfs:
-    """/home/user is mounted as tmpfs with nosuid, nodev, and usrquota flags.
+class TestHomeUserDisk:
+    """/home/user is the VM's own ext4 home disk (serial=home), mounted by
+    tiny-init with nosuid, nodev, noatime and discard.
 
-    Zero-copy scratch space: /home/user on rootfs is empty (cloudpickle
-    installed to /usr/lib/python3/site-packages), so the tmpfs mount
-    overlays an empty directory. This provides writable user space without
-    compromising the read-only rootfs.
+    The disk size caps what user code can write there (no guest RAM is used,
+    unlike the former tmpfs). /home/user on rootfs is empty (cloudpickle is in
+    /usr/lib/python3/site-packages), so the mount overlays an empty directory.
     """
 
     HOME_MOUNT_LINE = """\
@@ -1927,8 +1927,8 @@ with open('/proc/mounts') as f:
             break
 """
 
-    async def test_is_tmpfs(self, dual_scheduler: Scheduler) -> None:
-        """/home/user filesystem type is tmpfs."""
+    async def test_is_ext4(self, dual_scheduler: Scheduler) -> None:
+        """/home/user filesystem type is ext4 (the home disk)."""
         code = """\
 with open('/proc/mounts') as f:
     for line in f:
@@ -1939,9 +1939,17 @@ with open('/proc/mounts') as f:
     else:
         print('MOUNT_NOT_FOUND')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "FSTYPE:tmpfs" in result.stdout, f"Expected /home/user to be tmpfs.\nstdout: {result.stdout}"
+        assert "FSTYPE:ext4" in result.stdout, f"Expected /home/user to be ext4.\nstdout: {result.stdout}"
+
+    async def test_no_lost_and_found(self, dual_scheduler: Scheduler) -> None:
+        """mke2fs's root-only lost+found is removed: user tools see only user files (as on tmpfs)."""
+        code = "ls -A /home/user; tar -C /home/user -cf /tmp/home.tar . && echo TAR_OK"
+        result = await run_once(dual_scheduler, VmSpec(language=Language.RAW), code)
+        assert result.exit_code == 0, result.stderr
+        assert "lost+found" not in result.stdout
+        assert "TAR_OK" in result.stdout
 
     async def test_nosuid_flag(self, dual_scheduler: Scheduler) -> None:
         """/home/user has nosuid mount flag."""
@@ -1984,37 +1992,29 @@ with open('/proc/mounts') as f:
             print(f'NOEXEC_PRESENT:{"noexec" in opts}')
             break
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "NOEXEC_PRESENT:False" in result.stdout
 
-    async def test_usrquota_flag(self, dual_scheduler: Scheduler) -> None:
-        """/home/user has usrquota mount option for per-UID quota enforcement."""
-        result = await dual_scheduler.run(code=self.HOME_MOUNT_LINE, language=Language.PYTHON)
+    async def test_noatime_and_discard(self, dual_scheduler: Scheduler) -> None:
+        """noatime: reads write nothing; discard: deleted files free host disk blocks."""
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), self.HOME_MOUNT_LINE)
         assert result.exit_code == 0
-        assert "usrquota" in result.stdout
+        opts = result.stdout.split()[3].split(",")
+        assert "noatime" in opts
+        assert "discard" in opts
 
-    async def test_size_is_forty_pct_memtotal(self, dual_scheduler: Scheduler) -> None:
-        """Verify /home/user size is ~40% of MemTotal (memory-proportional)."""
+    async def test_size_matches_disk(self, dual_scheduler: Scheduler) -> None:
+        """Usable space is the default home disk minus ext4 metadata (~95%)."""
         code = """\
 import os
-with open('/proc/meminfo') as f:
-    for line in f:
-        if line.startswith('MemTotal:'):
-            mem_total_kb = int(line.split()[1])
-            break
-page_size = os.sysconf('SC_PAGESIZE')
-# 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5, page-aligned
-expected_bytes = (mem_total_kb * 2048 // 5) // page_size * page_size
 s = os.statvfs('/home/user')
-home_bytes = s.f_blocks * s.f_frsize
-print(f'EXPECTED_BYTES:{expected_bytes}')
-print(f'HOME_BYTES:{home_bytes}')
-print(f'MATCH:{home_bytes == expected_bytes}')
+print(f'MB:{s.f_blocks * s.f_frsize // (1 << 20)}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "MATCH:True" in result.stdout
+        size_mb = int(result.stdout.split("MB:")[1].split()[0])
+        assert DEFAULT_DISK_MB * 0.9 <= size_mb <= DEFAULT_DISK_MB
 
     async def test_cloudpickle_importable(self, dual_scheduler: Scheduler) -> None:
         """cloudpickle is importable (loaded from /usr/lib/python3/site-packages)."""
@@ -2034,19 +2034,21 @@ s = os.stat('/home/user')
 print(f'UID:{s.st_uid}')
 print(f'GID:{s.st_gid}')
 """
-        result = await dual_scheduler.run(code=code, language=Language.PYTHON)
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "UID:1000" in result.stdout
         assert "GID:1000" in result.stdout
 
 
 # =============================================================================
-# Per-UID tmpfs quota enforcement
+# Per-UID tmpfs quota enforcement (/dev/shm: RAM-backed)
 # =============================================================================
 class TestTmpfsQuotaEnforcement:
     """Per-UID quota (usrquota_block_hardlimit) prevents a single user from
-    consuming all tmpfs space. Sparse file inflation via ftruncate() is allowed
-    (metadata-only, no real pages consumed) but real writes are bounded.
+    consuming all tmpfs space (guest RAM). Sparse file inflation via ftruncate()
+    is allowed (metadata-only, no real pages consumed) but real writes are bounded.
+    /home/user is a disk now (its size is the cap); /dev/shm is the RAM-backed
+    tmpfs these limits protect.
 
     Three-layer defense:
     - size= caps total tmpfs memory usage (all UIDs combined)
@@ -2102,18 +2104,18 @@ print(f'BLOCKS:{os.stat("/dev/shm/sparse").st_blocks}')
     # --- Edge: real writes hit quota/size limit ---
 
     async def test_real_write_exceeding_limit_fails(self, dual_scheduler: Scheduler) -> None:
-        """Writing real data beyond tmpfs size limit produces ENOSPC or EDQUOT.
+        """Writing real data beyond the /dev/shm size limit produces ENOSPC or EDQUOT.
 
-        With default 256MB VM, MemTotal ~236MB, half ~118MB. Writing 200MB
+        /dev/shm is 40% of MemTotal (~77MB at the default 192MB). Writing 300MB
         of real data should fail. We don't check the exact error code because
         it could be ENOSPC (size= limit) or EDQUOT (quota limit).
         """
         code = """\
 import os, errno
-# Write in 10MB chunks to /home/user until failure
+# Write in 10MB chunks to /dev/shm until failure
 written = 0
 try:
-    with open('/home/user/bigfile', 'wb') as f:
+    with open('/dev/shm/bigfile', 'wb') as f:
         for _ in range(30):  # 300MB attempted
             f.write(b'A' * (10 * 1024 * 1024))
             f.flush()
@@ -2143,14 +2145,14 @@ except OSError as e:
 import os
 # Create 10 sparse files with 10GB apparent each (100GB total apparent)
 for i in range(10):
-    path = f'/home/user/sparse_{i}'
+    path = f'/dev/shm/sparse_{i}'
     open(path, 'w').close()
     os.truncate(path, 10 * 1024**3)
 
 # Now try to write real data — should still hit limit
 written = 0
 try:
-    with open('/home/user/realdata', 'wb') as f:
+    with open('/dev/shm/realdata', 'wb') as f:
         for _ in range(30):
             f.write(b'B' * (10 * 1024 * 1024))
             f.flush()
@@ -2168,12 +2170,12 @@ except OSError:
 
     async def test_quota_exhaustion_doesnt_crash_vm(self, dual_scheduler: Scheduler) -> None:
         """Exhausting tmpfs quota doesn't crash the VM — exec still works after."""
-        async with await dual_scheduler.session(language=Language.PYTHON) as session:
-            # Step 1: Fill /home/user until failure
+        async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            # Step 1: Fill /dev/shm until failure
             exhaust = """\
 written = 0
 try:
-    with open('/home/user/fill', 'wb') as f:
+    with open('/dev/shm/fill', 'wb') as f:
         for _ in range(50):
             f.write(b'X' * (10 * 1024 * 1024))
             f.flush()
@@ -2195,10 +2197,10 @@ print(f'FILLED:{written}MB')
             r3 = await session.exec(
                 """\
 import os
-os.unlink('/home/user/fill')
-with open('/home/user/recovered.txt', 'w') as f:
+os.unlink('/dev/shm/fill')
+with open('/dev/shm/recovered.txt', 'w') as f:
     f.write('back to normal')
-with open('/home/user/recovered.txt') as f:
+with open('/dev/shm/recovered.txt') as f:
     print(f'RECOVERED:{f.read()}')
 """,
             )

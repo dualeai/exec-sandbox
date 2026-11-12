@@ -80,6 +80,8 @@ async fn flush_output_buffer(
 }
 
 /// Parse a single stderr line for a sentinel marker, returning the exit code if found.
+/// The code is kept like a process exit status (0-255, 255 if it is not a number):
+/// the host reads -1 as a timeout only.
 /// Appends any pre-sentinel text to `stderr_buffer`, and non-sentinel lines as-is.
 fn parse_stderr_line_for_sentinel(
     line: &str,
@@ -93,7 +95,7 @@ fn parse_stderr_line_for_sentinel(
                 stderr_buffer.push_str(&line[..sentinel_pos]);
             }
             let code_str = &sentinel_part[sentinel_prefix.len()..sentinel_part.len() - 2];
-            return Some(code_str.parse::<i32>().unwrap_or(-1));
+            return Some(code_str.parse::<i32>().map_or(255, |code| code & 0xFF));
         }
     }
     stderr_buffer.push_str(line);
@@ -149,8 +151,60 @@ fn process_stderr_chunk(
     sentinel_exit_code
 }
 
-/// Drain stdout until a continuous idle window (no data for DRAIN_IDLE_MS) or
-/// the cumulative `deadline_ms` elapses, whichever comes first.
+/// The end of one exec's stdout. Each REPL writes `__STDOUT_END_<id>__\n` to
+/// stdout after flushing it and before the stderr sentinel, so the agent stops
+/// reading stdout at the marker instead of waiting for the pipe to go idle.
+/// The marker is removed from the output. A tail that may be the start of a
+/// marker split across reads is held back until the next chunk shows it is not.
+struct StdoutEnd {
+    marker: Vec<u8>,
+    pending: Vec<u8>,
+    seen: bool,
+}
+
+impl StdoutEnd {
+    fn new(sentinel_id: &str) -> Self {
+        Self {
+            marker: format!("__STDOUT_END_{sentinel_id}__\n").into_bytes(),
+            pending: Vec::new(),
+            seen: false,
+        }
+    }
+
+    /// The output bytes of `chunk` that are known not to be part of the marker.
+    /// Bytes after the marker (a background child of the exec) stay output.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.seen {
+            return chunk.to_vec();
+        }
+        self.pending.extend_from_slice(chunk);
+        if let Some(pos) = self
+            .pending
+            .windows(self.marker.len())
+            .position(|window| window == self.marker.as_slice())
+        {
+            self.seen = true;
+            let mut output = std::mem::take(&mut self.pending);
+            output.drain(pos..pos + self.marker.len());
+            return output;
+        }
+        // Longest tail of `pending` that starts the marker: wait for more bytes.
+        let held = (1..self.marker.len())
+            .rev()
+            .find(|&k| self.pending.ends_with(&self.marker[..k]))
+            .unwrap_or(0);
+        let rest = self.pending.split_off(self.pending.len() - held);
+        std::mem::replace(&mut self.pending, rest)
+    }
+
+    /// The held-back tail when no marker came (user code closed or redirected fd 1).
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// Fallback after the sentinel when the stdout marker has not come: stop once
+/// stdout is idle for this long (user code that closed or redirected fd 1).
 ///
 /// A single continuous idle window (rather than N discrete short windows)
 /// tolerates event-loop overhead under QEMU TCG (~8× slower than KVM/HVF),
@@ -158,21 +212,27 @@ fn process_stderr_chunk(
 /// timeout boundary while data is still in the pipe buffer.
 const DRAIN_IDLE_MS: u64 = 40;
 
+/// Read stdout until its end marker (`end`), an idle window of DRAIN_IDLE_MS,
+/// or the cumulative `deadline_ms`, whichever comes first. The held-back tail
+/// stays in `end`: the caller adds it (`end.finish()`) when it keeps the output.
 async fn drain_stdout(
     stdout: &mut tokio::process::ChildStdout,
+    end: &mut StdoutEnd,
     stdout_buffer: &mut String,
     deadline_ms: u64,
 ) {
     let total_deadline = Instant::now() + Duration::from_millis(deadline_ms);
     let mut buf = [0u8; 8192];
-    loop {
+    while !end.seen {
         let total_remaining = total_deadline.saturating_duration_since(Instant::now());
         if total_remaining.is_zero() {
             break;
         }
         let window = total_remaining.min(Duration::from_millis(DRAIN_IDLE_MS));
         match tokio::time::timeout(window, stdout.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => stdout_buffer.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Ok(Ok(n)) if n > 0 => {
+                stdout_buffer.push_str(&String::from_utf8_lossy(&end.feed(&buf[..n])));
+            }
             // EOF, read error, idle window elapsed, or total deadline hit.
             _ => break,
         }
@@ -187,6 +247,7 @@ async fn drain_stdout(
 async fn drain_after_sigterm(
     stdout: &mut tokio::process::ChildStdout,
     stderr: &mut tokio::process::ChildStderr,
+    stdout_end: &mut StdoutEnd,
     stdout_buffer: &mut String,
     stderr_buffer: &mut String,
     stderr_line_buf: &mut String,
@@ -207,7 +268,13 @@ async fn drain_after_sigterm(
 
         // Sentinel found — switch to stdout-only drain (stderr no longer needed)
         if sentinel_exit_code.is_some() {
-            drain_stdout(stdout, stdout_buffer, remaining.as_millis() as u64).await;
+            drain_stdout(
+                stdout,
+                stdout_end,
+                stdout_buffer,
+                remaining.as_millis() as u64,
+            )
+            .await;
             break;
         }
 
@@ -222,7 +289,7 @@ async fn drain_after_sigterm(
             r = tokio::time::timeout(per_read, stdout.read(&mut stdout_buf)), if !stdout_done => {
                 match r {
                     Ok(Ok(n)) if n > 0 => {
-                        stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_buf[..n]));
+                        stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.feed(&stdout_buf[..n])));
                     }
                     Err(_) if !stderr_done => {} // both active: timeout retries
                     _ => stdout_done = true,      // EOF/error always; timeout in single-stream mode
@@ -247,6 +314,7 @@ async fn drain_after_sigterm(
         }
     }
 
+    stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.finish()));
     sentinel_exit_code
 }
 
@@ -344,10 +412,10 @@ pub(crate) async fn warm_exercise_repl(
 
     match result {
         Ok(Ok(())) => {
-            // Drain any stdout the no-op may have produced.
-            // 250 ms: warm-up is trivial so output here is not user-visible,
-            // but TCG needs slack beyond the idle-tolerance window (40 ms).
-            drain_stdout(&mut repl.stdout, &mut String::new(), 250).await;
+            // Read the no-op's stdout up to its end marker, so no byte of it
+            // reaches the next exec. 250 ms: TCG slack for the fallback.
+            let mut end = StdoutEnd::new(&sentinel_id);
+            drain_stdout(&mut repl.stdout, &mut end, &mut String::new(), 250).await;
             log_info!(
                 "[repl-readiness] phase={PHASE} language={} action=ready",
                 language.as_str()
@@ -464,11 +532,13 @@ pub(crate) async fn execute_code_streaming(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut sentinel_exit_code: Option<i32> = None;
+    let mut stdout_end = StdoutEnd::new(&sentinel_id);
 
     // Output size cap counters (guest-enforced limits).
-    // These count raw pipe bytes, not UTF-8 decoded string length.
+    // These count bytes, not UTF-8 decoded string length: stdout counts the
+    // output left after the end marker is removed, stderr the raw pipe bytes.
     // When a read crosses the limit boundary, the entire chunk is discarded
-    // (up to 8192 bytes fewer than the limit may be delivered to the host).
+    // (the host may get up to about 8 KiB less than the limit).
     let mut stdout_total: usize = 0;
     let mut stderr_total: usize = 0;
     let mut stdout_capped = false;
@@ -506,7 +576,9 @@ pub(crate) async fn execute_code_streaming(
                                     n
                                 );
                             }
-                            stdout_total += n;
+                            // The marker is found before the cap: a capped exec still ends at it.
+                            let output = stdout_end.feed(&stdout_bytes[..n]);
+                            stdout_total += output.len();
                             if stdout_total > MAX_STDOUT_BYTES {
                                 if !stdout_capped {
                                     let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
@@ -514,7 +586,7 @@ pub(crate) async fn execute_code_streaming(
                                 }
                                 // Keep reading pipe (prevent child blocking) but discard
                             } else {
-                                stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_bytes[..n]));
+                                stdout_buffer.push_str(&String::from_utf8_lossy(&output));
                                 if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
                                     let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
                                 }
@@ -578,13 +650,16 @@ pub(crate) async fn execute_code_streaming(
         && sentinel_exit_code.is_some()
         && !crate::oom_guard::retirement_required()
     {
-        // 500 ms: post-sentinel stdout flush. The JS REPL yields 50 ms for
-        // back-pressure before the sentinel, but under TCG (~8× slower) data
-        // may still be in the kernel pipe buffer.
-        drain_stdout(&mut repl.stdout, &mut stdout_buffer, 500).await;
+        // Most execs read the stdout marker before the sentinel: no wait.
+        // Else read up to it; 500 ms: under TCG (~8× slower) or after a JS
+        // back-pressure yield, stdout can trail the sentinel.
+        drain_stdout(&mut repl.stdout, &mut stdout_end, &mut stdout_buffer, 500).await;
     }
 
     // Flush residual buffers (skip capped streams)
+    if !stdout_capped {
+        stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.finish()));
+    }
     if !stderr_line_buf.is_empty() && !stderr_capped {
         stderr_buffer.push_str(&stderr_line_buf);
     }
@@ -647,7 +722,7 @@ pub(crate) async fn execute_code_streaming(
         }
         Ok(()) => {
             let status = repl.child.wait().await;
-            let observed_exit_code = status.map(exit_code_from_status).unwrap_or(-1);
+            let observed_exit_code = status.map_or(255, exit_code_from_status);
             let exit_code = crate::oom_guard::reconcile_retirement_exit(observed_exit_code);
             log_warn!(
                 "REPL for {} died with exit_code={}",
@@ -679,6 +754,7 @@ pub(crate) async fn execute_code_streaming(
             let sigterm_exit_code = drain_after_sigterm(
                 &mut repl.stdout,
                 &mut repl.stderr,
+                &mut stdout_end,
                 &mut stdout_buffer,
                 &mut stderr_buffer,
                 &mut stderr_line_buf,
@@ -761,12 +837,20 @@ mod tests {
         assert_eq!(result, Some(42));
     }
 
-    #[test]
-    fn sentinel_negative_exit_code() {
+    #[rstest]
+    #[case("-1", 255)]
+    #[case("256", 0)]
+    #[case("-256", 0)]
+    #[case("2147483647", 255)]
+    fn sentinel_out_of_range_exit_code_is_a_process_status(
+        #[case] code: &str,
+        #[case] expected: i32,
+    ) {
+        // Like a process exit status: -1 stays the host's timeout code only.
         let mut buf = String::new();
-        let result =
-            parse_stderr_line_for_sentinel("__SENTINEL_1_0_-1__", "__SENTINEL_1_0_", &mut buf);
-        assert_eq!(result, Some(-1));
+        let line = format!("__SENTINEL_1_0_{code}__");
+        let result = parse_stderr_line_for_sentinel(&line, "__SENTINEL_1_0_", &mut buf);
+        assert_eq!(result, Some(expected));
     }
 
     #[test]
@@ -831,8 +915,8 @@ mod tests {
             "__SENTINEL_1_0_",
             &mut buf,
         );
-        // "42_extra" is not a valid i32, falls back to -1
-        assert_eq!(result, Some(-1));
+        // "42_extra" is not a valid i32, falls back to 255 (unknown error)
+        assert_eq!(result, Some(255));
     }
 
     #[test]
@@ -840,7 +924,7 @@ mod tests {
         let mut buf = String::new();
         let result =
             parse_stderr_line_for_sentinel("__SENTINEL_1_0_abc__", "__SENTINEL_1_0_", &mut buf);
-        assert_eq!(result, Some(-1));
+        assert_eq!(result, Some(255));
     }
 
     #[test]
@@ -858,8 +942,8 @@ mod tests {
         let mut buf = String::new();
         let result =
             parse_stderr_line_for_sentinel("__SENTINEL_1_0___", "__SENTINEL_1_0_", &mut buf);
-        // Empty string between prefix and __ → parse fails → -1
-        assert_eq!(result, Some(-1));
+        // Empty string between prefix and __ → parse fails → 255
+        assert_eq!(result, Some(255));
     }
 
     #[rstest]
@@ -1122,7 +1206,8 @@ mod tests {
         let prefix = "__SENTINEL_1_0_";
         let line = format!("{prefix}{code}__\n");
         let result = process_stderr_chunk(line.as_bytes(), &mut line_buf, prefix, &mut stderr_buf);
-        assert_eq!(result, Some(code));
+        // Kept like a process exit status: i32::MAX is 255, i32::MIN is 0.
+        assert_eq!(result, Some(code & 0xFF));
     }
 
     #[test]
@@ -1156,5 +1241,59 @@ mod tests {
             &mut stderr_buf,
         );
         assert_eq!(result, Some(5));
+    }
+
+    // -------------------------------------------------------------------------
+    // StdoutEnd — the per-exec stdout end marker
+    // -------------------------------------------------------------------------
+
+    const MARKER: &[u8] = b"__STDOUT_END_7_1__\n";
+
+    fn fed(chunks: &[&[u8]]) -> (Vec<u8>, bool, Vec<u8>) {
+        let mut end = StdoutEnd::new("7_1");
+        let mut output = Vec::new();
+        for chunk in chunks {
+            output.extend(end.feed(chunk));
+        }
+        let seen = end.seen;
+        (output, seen, end.finish())
+    }
+
+    #[test]
+    fn marker_in_one_chunk_is_removed() {
+        let chunk = [b"hello\n".as_slice(), MARKER].concat();
+        assert_eq!(fed(&[&chunk]), (b"hello\n".to_vec(), true, Vec::new()));
+    }
+
+    #[test]
+    fn marker_split_byte_by_byte_is_found() {
+        let stream = [b"no newline".as_slice(), MARKER].concat();
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(fed(&bytes), (b"no newline".to_vec(), true, Vec::new()));
+    }
+
+    #[test]
+    fn output_after_the_marker_stays() {
+        let chunk = [b"a".as_slice(), MARKER, b"child\n"].concat();
+        assert_eq!(
+            fed(&[&chunk, b"more"]),
+            (b"achild\nmore".to_vec(), true, Vec::new())
+        );
+    }
+
+    #[test]
+    fn another_exec_marker_is_output() {
+        let (output, seen, _) = fed(&[b"__STDOUT_END_8_1__\n"]);
+        assert_eq!((output, seen), (b"__STDOUT_END_8_1__\n".to_vec(), false));
+    }
+
+    #[test]
+    fn only_a_marker_prefix_is_held_back() {
+        let mut end = StdoutEnd::new("7_1");
+        assert_eq!(end.feed(b"line\n__STDOUT_E"), b"line\n".to_vec());
+        assert_eq!(end.feed(b"xtra"), b"__STDOUT_Extra".to_vec());
+        assert_eq!(end.feed(b"__STD"), Vec::<u8>::new());
+        // No marker came (fd 1 closed by user code): the tail is still output.
+        assert_eq!(end.finish(), b"__STD".to_vec());
     }
 }
