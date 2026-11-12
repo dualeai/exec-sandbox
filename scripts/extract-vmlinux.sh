@@ -9,6 +9,9 @@
 # Usage: ./scripts/extract-vmlinux.sh <bzImage> > vmlinux
 
 set -euo pipefail
+# Byte-oriented tr/grep: under a UTF-8 locale, BSD tr (macOS) rejects binary
+# input with "Illegal byte sequence".
+export LC_ALL=C
 
 if [ $# -lt 1 ] || [ ! -f "$1" ]; then
     echo "Usage: $0 <bzImage>" >&2
