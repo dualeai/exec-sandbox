@@ -22,9 +22,10 @@ from pathlib import Path
 
 import pytest
 
-from exec_sandbox.exceptions import VmPermanentError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import skip_unless_hwaccel
 
 # --- Guest memory threshold (percentage of MemTotal that must remain free) ---
@@ -481,13 +482,13 @@ class TestInterleavedSuccessFailure:
         """Gather 3 valid writes + 2 invalid writes (path traversal).
 
         Valid writes must succeed with correct data. Invalid writes must raise
-        VmPermanentError. No cross-contamination between ops.
+        InvalidInputError PATH_INVALID. No cross-contamination between ops.
         """
         size = 1 * 1024 * 1024  # 1 MB each
         valid_files = {f"valid_{i}.bin": os.urandom(size) for i in range(3)}
         valid_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in valid_files.items()}
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Fire all 5 concurrently: 3 valid + 2 invalid
             results = await asyncio.gather(
                 *(session.write_file(name, data) for name, data in valid_files.items()),
@@ -500,11 +501,13 @@ class TestInterleavedSuccessFailure:
             for i, name in enumerate(valid_files):
                 assert results[i] is None, f"[{name}] Expected success, got {results[i]}"
 
-            # Last 2 should be VmPermanentError
+            # Last 2 should be InvalidInputError PATH_INVALID
             for i in range(3, 5):
-                assert isinstance(results[i], VmPermanentError), (
-                    f"Expected VmPermanentError for invalid path, got {type(results[i])}"
+                error = results[i]
+                assert isinstance(error, InvalidInputError), (
+                    f"Expected InvalidInputError for invalid path, got {error!r}"
                 )
+                assert error.code is ErrorCode.PATH_INVALID
 
             # Verify valid files are intact (read back + SHA256)
             for name, expected_hash in valid_hashes.items():
@@ -516,13 +519,13 @@ class TestInterleavedSuccessFailure:
     async def test_concurrent_reads_existent_and_nonexistent(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Gather 2 valid reads + 2 reads of nonexistent files.
 
-        Valid reads return correct data. Nonexistent reads raise VmPermanentError.
+        Valid reads return correct data. Nonexistent reads raise InvalidInputError GUEST_IO.
         """
         size = 1 * 1024 * 1024
         files = {f"exists_{i}.bin": os.urandom(size) for i in range(2)}
         expected_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Pre-write the valid files
             for name, data in files.items():
                 await session.write_file(name, data)
@@ -540,11 +543,13 @@ class TestInterleavedSuccessFailure:
             for i, name in enumerate(files):
                 assert results[i] is None, f"[{name}] Expected success, got {results[i]}"
 
-            # Last 2 should be VmPermanentError
+            # Last 2 should be InvalidInputError GUEST_IO
             for i in range(2, 4):
-                assert isinstance(results[i], VmPermanentError), (
-                    f"Expected VmPermanentError for nonexistent file, got {type(results[i])}"
+                error = results[i]
+                assert isinstance(error, InvalidInputError), (
+                    f"Expected InvalidInputError for nonexistent file, got {error!r}"
                 )
+                assert error.code is ErrorCode.GUEST_IO
 
             # Verify valid files are intact
             for name, expected_hash in expected_hashes.items():
@@ -576,9 +581,11 @@ class TestInterleavedSuccessFailure:
             )
 
             assert results[0] is None, f"Valid write failed: {results[0]}"
-            assert isinstance(results[1], VmPermanentError), f"Invalid write should fail: {type(results[1])}"
+            assert isinstance(results[1], InvalidInputError), f"Invalid write should fail: {results[1]!r}"
+            assert results[1].code is ErrorCode.PATH_INVALID
             assert results[2] is None, f"Valid read failed: {results[2]}"
-            assert isinstance(results[3], VmPermanentError), f"Invalid read should fail: {type(results[3])}"
+            assert isinstance(results[3], InvalidInputError), f"Invalid read should fail: {results[3]!r}"
+            assert results[3].code is ErrorCode.GUEST_IO
 
             # Verify successful write is intact
             verify_dest = tmp_path / "good_write.bin"
@@ -597,13 +604,13 @@ class TestInterleavedSuccessFailure:
         content = os.urandom(size)
         expected_hash = hashlib.sha256(content).hexdigest()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Fail: read nonexistent file
-            with pytest.raises(VmPermanentError):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
                 await session.read_file("ghost.bin", destination=tmp_path / "ghost.bin")
 
             # Fail: write to traversal path
-            with pytest.raises(VmPermanentError):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file("../escape.bin", b"x")
 
             # Success: write + read should still work

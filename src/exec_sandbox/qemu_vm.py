@@ -27,20 +27,16 @@ from tenacity import (
 
 from exec_sandbox import cgroup, constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.aio_utils import await_cancellation_safe, await_settled
+from exec_sandbox.aio_utils import await_settled, run_to_end
 from exec_sandbox.exceptions import (
-    CodeValidationError,
     CommunicationError,
-    CommunicationOutcomeUnknownError,
-    EnvVarValidationError,
-    InputValidationError,
-    OutputLimitError,
-    PackageNotAllowedError,
+    ErrorCode,
+    InternalError,
+    InvalidInputError,
+    OutcomeUnknownError,
     SandboxError,
-    VmBootTimeoutError,
-    VmPermanentError,
-    VmQemuCrashError,
-    VmTransientError,
+    SessionClosedError,
+    TransientError,
 )
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
@@ -77,9 +73,21 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-async def _run_blocking_owned[T](call: Callable[[], T]) -> T:
-    """Finish one owned thread operation before propagating cancellation."""
-    return await await_cancellation_safe(asyncio.to_thread(call))
+def _unavailable(message: str, *, context: dict[str, Any]) -> TransientError:
+    """The TransientError (GUEST_UNAVAILABLE) of a call the guest could not take: nothing was dispatched."""
+    return TransientError(message, code=ErrorCode.GUEST_UNAVAILABLE, context=context, hint=None, instance_id=None)
+
+
+def _outcome_unknown(message: str, *, context: dict[str, Any]) -> OutcomeUnknownError:
+    """The OutcomeUnknownError (GUEST_OUTCOME_UNKNOWN) of a call dispatched, then lost."""
+    return OutcomeUnknownError(
+        message, code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context=context, hint=None, instance_id=None
+    )
+
+
+def _crashed(message: str, *, context: dict[str, Any]) -> TransientError:
+    """The TransientError (QEMU_CRASHED) of a QEMU that exited during boot."""
+    return TransientError(message, code=ErrorCode.QEMU_CRASHED, context=context, hint=None, instance_id=None)
 
 
 def _write_all_bytes(sink: IO[bytes], data: bytes) -> None:
@@ -388,9 +396,12 @@ class QemuVM:
         # Cleanup VM when exiting context (always runs destroy)
         # destroy() is idempotent and state-safe, will skip if already destroying/destroyed
         if not await self.destroy():
-            raise VmPermanentError(
+            raise InternalError(
                 f"VM resource cleanup was not confirmed for {self.vm_id}",
+                code=ErrorCode.CLEANUP_UNCONFIRMED,
                 context={"vm_id": self.vm_id, "operation": "vm_context_exit"},
+                hint=None,
+                instance_id=None,
             )
         return False  # Don't suppress exceptions
 
@@ -409,20 +420,23 @@ class QemuVM:
             new_state: Target state to transition to
 
         Raises:
-            VmPermanentError: If transition is invalid for current state
+            InternalError: INTERNAL if the transition is invalid for the current state
         """
         async with self._state_lock:
             # Validate transition is allowed from current state
             allowed_transitions = VALID_STATE_TRANSITIONS.get(self._state, set())
             if new_state not in allowed_transitions:
-                raise VmPermanentError(
+                raise InternalError(
                     f"Invalid state transition: {self._state.value} -> {new_state.value}",
+                    code=ErrorCode.INTERNAL,
                     context={
                         "vm_id": self.vm_id,
                         "current_state": self._state.value,
                         "target_state": new_state.value,
                         "allowed_transitions": [s.value for s in allowed_transitions],
                     },
+                    hint=None,
+                    instance_id=None,
                 )
 
             old_state = self._state
@@ -577,12 +591,15 @@ class QemuVM:
             # which would transition state to DESTROYING or DESTROYED
             # Note: pyright doesn't understand async race conditions, so we suppress the warning
             if self._state in (VmState.DESTROYING, VmState.DESTROYED):  # type: ignore[comparison-overlap]
-                raise VmPermanentError(
+                raise SessionClosedError(
                     "VM destroyed during execution start",
+                    code=ErrorCode.SESSION_CLOSED,
                     context={
                         "vm_id": self.vm_id,
                         "current_state": self._state.value,
                     },
+                    hint=None,
+                    instance_id=None,
                 )
 
             # Connect to guest agent with timing
@@ -599,8 +616,8 @@ class QemuVM:
             async def _handle_exec_error(msg: StreamingErrorMessage) -> None:
                 exc = guest_error_to_exception(msg, self.vm_id, operation="execute")
                 # Recoverable input errors: VM is fine, restore READY for session reuse
-                if isinstance(exc, (InputValidationError, OutputLimitError, PackageNotAllowedError)):
-                    with contextlib.suppress(VmPermanentError):
+                if isinstance(exc, InvalidInputError):
+                    with contextlib.suppress(InternalError):
                         await self.transition_state(VmState.READY)
                     raise exc
                 # Timeout: code ran too long — this is a user code result, not infrastructure.
@@ -682,7 +699,7 @@ class QemuVM:
             # Success - transition back to READY for reuse (if not destroyed)
             try:
                 await self.transition_state(VmState.READY)
-            except VmPermanentError as e:
+            except InternalError as e:
                 # VM destroyed while executing, skip transition
                 logger.debug(
                     "VM destroyed during execution, skipping READY transition",
@@ -707,14 +724,14 @@ class QemuVM:
                 "timeout_phase": timeout_phase,
                 "timeout_source": "total_stream_deadline",
                 "command_dispatched": e.command_dispatched,
-                "language": self.language,
+                "language": self.spec.language,
             }
             if not e.command_dispatched:
-                raise VmBootTimeoutError(
+                raise _unavailable(
                     f"VM {self.vm_id} execution exceeded {hard_timeout}s host deadline before command dispatch",
                     context=context,
                 ) from e
-            raise CommunicationOutcomeUnknownError(
+            raise _outcome_unknown(
                 f"VM {self.vm_id} execution exceeded {hard_timeout}s host deadline "
                 f"({timeout_seconds}s guest timeout + "
                 f"{constants.EXECUTION_TIMEOUT_MARGIN_SECONDS}s infrastructure margin) "
@@ -723,21 +740,21 @@ class QemuVM:
             ) from e
         except TimeoutError as e:
             if timeout_phase == "connect":
-                raise VmBootTimeoutError(
+                raise _unavailable(
                     f"VM {self.vm_id} guest connection timed out before execution dispatch",
                     context={
                         "vm_id": self.vm_id,
                         "timeout_seconds": timeout_seconds,
                         "connect_attempt_timeout_seconds": constants.GUEST_CONNECT_TIMEOUT_SECONDS,
                         "timeout_phase": timeout_phase,
-                        "language": self.language,
+                        "language": self.spec.language,
                     },
                 ) from e
-            raise CommunicationOutcomeUnknownError(
+            raise _outcome_unknown(
                 f"VM {self.vm_id} execution transport timed out before a terminal event",
                 context={
                     "vm_id": self.vm_id,
-                    "language": self.language,
+                    "language": self.spec.language,
                     "soft_timeout_seconds": timeout_seconds,
                     "hard_timeout_seconds": hard_timeout,
                     "timeout_phase": timeout_phase,
@@ -753,11 +770,11 @@ class QemuVM:
             RuntimeError,
             CommunicationError,
         ) as e:
-            raise VmTransientError(
+            raise _unavailable(
                 f"VM {self.vm_id} communication failed: {e}",
                 context={
                     "vm_id": self.vm_id,
-                    "language": self.language,
+                    "language": self.spec.language,
                     "error_type": type(e).__name__,
                 },
             ) from e
@@ -796,29 +813,31 @@ class QemuVM:
             await self.channel.fail_pending_operations(f"QEMU exited during execution with code {exit_code}")
             try:
                 result = await stream_task
-            except CommunicationOutcomeUnknownError as error:
-                raise CommunicationOutcomeUnknownError(
+            except OutcomeUnknownError as error:
+                raise _outcome_unknown(
                     f"QEMU exited during execution before a terminal guest event: {error}",
                     context={
                         "vm_id": self.vm_id,
-                        "language": self.language,
+                        "language": self.spec.language,
                         "exit_code": exit_code,
                         "soft_timeout_seconds": soft_timeout_seconds,
                         "hard_timeout_seconds": hard_timeout_seconds,
                     },
                 ) from error
-            except SandboxError:
-                # A parsed terminal guest error is a known operation outcome,
-                # but the VM that reported it has exited and is not reusable.
+            except (SandboxError, CommunicationError):
+                # A parsed terminal guest error, or a transport failure before
+                # dispatch (CommunicationError, internal: execute() turns it into
+                # GUEST_UNAVAILABLE), is a known operation outcome, but the VM
+                # that reported it has exited and is not reusable.
                 await self.begin_destroy()
                 raise
             except Exception as error:
-                raise CommunicationOutcomeUnknownError(
+                raise _outcome_unknown(
                     f"QEMU exited during execution before a trustworthy terminal guest event: "
                     f"{type(error).__name__}: {error}",
                     context={
                         "vm_id": self.vm_id,
-                        "language": self.language,
+                        "language": self.spec.language,
                         "exit_code": exit_code,
                         "soft_timeout_seconds": soft_timeout_seconds,
                         "hard_timeout_seconds": hard_timeout_seconds,
@@ -881,36 +900,44 @@ class QemuVM:
             make_executable: Set executable permission (0o755 vs 0o644)
 
         Raises:
-            VmPermanentError: On validation or write failure
-            VmTransientError: On pre-dispatch timeout or communication failure
-            CommunicationOutcomeUnknownError: Transport lost after the header
-                was dispatched — the write may have landed
+            InvalidInputError: PATH_INVALID or GUEST_IO on validation or write failure
+            InternalError: GUEST_PROTOCOL on a protocol error or a wrong answer
+            TransientError: GUEST_UNAVAILABLE on pre-dispatch timeout or communication failure;
+                LOCAL_DISK when the source cannot be read after the header was sent: the
+                channel closes, so the guest drops the write (it commits only on file_end);
+                nothing was written and a seekable source is back at its start position
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost
+                after the header was dispatched — the write may have landed
         """
 
         # Validate path (once, before any retry)
         if not path:
-            raise VmPermanentError(
+            raise InvalidInputError(
                 "write_file path must not be empty",
+                code=ErrorCode.PATH_INVALID,
                 context={"vm_id": self.vm_id, "path": path},
+                hint=None,
+                instance_id=None,
             )
         if len(path) > constants.MAX_FILE_PATH_LENGTH:
-            raise VmPermanentError(
+            raise InvalidInputError(
                 f"write_file path is {len(path)} chars, exceeds {constants.MAX_FILE_PATH_LENGTH}",
+                code=ErrorCode.PATH_INVALID,
                 context={"vm_id": self.vm_id, "path_length": len(path)},
+                hint=None,
+                instance_id=None,
             )
 
-        try:
-            retry_position = content.tell() if content.seekable() else None
-        except (AttributeError, OSError):
-            retry_position = None
+        retry_position = _stream_position(content)
 
         # Retry once for "No active write" — a transient protocol error caused
         # by QEMU dropping the WriteFile header when the guest virtio-serial
         # port is closed during the guest agent's 18s idle-timeout reconnect.
         try:
             await self._write_file_protocol(path, content, make_executable=make_executable)
-        except VmPermanentError as exc:
-            if "No active write" not in str(exc):
+        except InternalError as exc:
+            # The guest sends it as a protocol error (GUEST_PROTOCOL).
+            if exc.code is not ErrorCode.GUEST_PROTOCOL or "No active write" not in exc.message:
                 raise
             logger.warning(
                 "write_file header dropped (stale connection), forcing reconnect and retrying",
@@ -995,13 +1022,16 @@ class QemuVM:
                 raise guest_error_to_exception(response, self.vm_id, operation=f"write_file '{path}'")
 
             if not isinstance(response, FileWriteAckMessage):
-                raise VmPermanentError(
+                raise InternalError(
                     f"write_file unexpected response type: {type(response).__name__}",
+                    code=ErrorCode.GUEST_PROTOCOL,
                     context={"vm_id": self.vm_id, "path": path},
+                    hint=None,
+                    instance_id=None,
                 )
 
             if response.path != path or response.bytes_written != source_size:
-                raise CommunicationOutcomeUnknownError(
+                raise _outcome_unknown(
                     f"VM {self.vm_id} write_file acknowledgement did not bind the requested content for '{path}'",
                     context={
                         "vm_id": self.vm_id,
@@ -1012,16 +1042,16 @@ class QemuVM:
                     },
                 )
 
-        except CommunicationOutcomeUnknownError:
-            raise
-        except (VmPermanentError, VmTransientError, InputValidationError, OutputLimitError, PackageNotAllowedError):
-            # These are parsed terminal guest responses, so their operation
-            # outcome is known even though the response is an error.
+        except SandboxError:
+            # Parsed terminal guest responses (their operation outcome is known
+            # even though the response is an error) and unknown outcomes after
+            # dispatch. CommunicationError is not a SandboxError: a transport
+            # failure reaches the dispatch check below.
             raise
         except Exception as error:
             dispatched = op_queue is not None and op_queue.command_may_have_been_sent
             if dispatched:
-                raise CommunicationOutcomeUnknownError(
+                raise _outcome_unknown(
                     f"VM {self.vm_id} write_file failed after dispatch for '{path}': {type(error).__name__}: {error}",
                     context={
                         "vm_id": self.vm_id,
@@ -1030,12 +1060,12 @@ class QemuVM:
                     },
                 ) from error
             if isinstance(error, TimeoutError):
-                raise VmTransientError(
+                raise _unavailable(
                     f"VM {self.vm_id} write_file timed out before dispatch for '{path}'",
                     context={"vm_id": self.vm_id, "path": path},
                 ) from error
             if isinstance(error, (OSError, json.JSONDecodeError, CommunicationError)):
-                raise VmTransientError(
+                raise _unavailable(
                     f"VM {self.vm_id} write_file communication failed before dispatch: {error}",
                     context={"vm_id": self.vm_id, "path": path},
                 ) from error
@@ -1405,37 +1435,30 @@ class QemuVM:
                     "QEMU exited with code 0 during boot on macOS (will retry)\n  vm_id=%s",
                     diag.vm_id,
                 )
-                raise VmQemuCrashError("QEMU process exited during boot (macOS clean exit)", diagnostics=diag)
+                raise _crashed("QEMU process exited during boot (macOS clean exit)", context=asdict(diag))
 
             # TCG: exit code 0 during boot = guest reboot/panic
             if diag.accel_type == "tcg" and diag.exit_code == 0:
                 logger.warning(
-                    "QEMU TCG exited with code 0 during boot (will retry)\n"
-                    "  vm_id=%s host_os=%s\n  stderr: %s\n  console:\n%s",
+                    "QEMU TCG exited with code 0 during boot (will retry)\n  vm_id=%s host_os=%s\n  console:\n%s",
                     diag.vm_id,
                     diag.host_os,
-                    diag.stderr[:500] if diag.stderr else "(empty)",
                     diag.console_log[-2000:],
                 )
-                raise VmQemuCrashError("QEMU TCG exited with code 0 during boot (guest reboot/panic)", diagnostics=diag)
+                raise _crashed("QEMU TCG exited with code 0 during boot (guest reboot/panic)", context=asdict(diag))
 
-            # General crash
+            # General crash. The console (QEMU stderr, kernel, init) goes in the context,
+            # never the message: str(error) is one line.
             logger.error(
-                "QEMU process exited unexpectedly\n"
-                "  vm_id=%s exit_code=%s signal=%s\n"
-                "  stderr: %s\n  stdout: %s\n  console:\n%s",
+                "QEMU process exited unexpectedly\n  vm_id=%s exit_code=%s signal=%s\n  console:\n%s",
                 diag.vm_id,
                 diag.exit_code,
                 diag.signal_name,
-                diag.stderr if diag.stderr else "(empty)",
-                diag.stdout if diag.stdout else "(empty)",
                 diag.console_log,
             )
-            raise VmQemuCrashError(
-                f"QEMU process died (exit code {diag.exit_code}, {diag.signal_name}). "
-                f"stderr: {diag.stderr[:200] if diag.stderr else '(empty)'}, "
-                f"console: {diag.console_log[-4000:]}",
-                diagnostics=diag,
+            signal_part = f", {diag.signal_name}" if diag.signal_name else ""
+            raise _crashed(
+                f"QEMU process died during boot (exit code {diag.exit_code}{signal_part})", context=asdict(diag)
             )
 
         async def check_guest_ready() -> None:
@@ -1471,7 +1494,7 @@ class QemuVM:
                 try:
                     await self.channel.connect(timeout_seconds=0.005)
                     logger.debug("Pre-connected to guest channel sockets", extra={"vm_id": self.vm_id})
-                except (TimeoutError, OSError, CommunicationError, CommunicationOutcomeUnknownError) as e:
+                except (TimeoutError, OSError, CommunicationError, OutcomeUnknownError) as e:
                     # Expected - sockets may not be ready yet, retry loop will handle
                     logger.debug("Pre-connect to sockets deferred", extra={"vm_id": self.vm_id, "reason": str(e)})
 
@@ -1485,7 +1508,7 @@ class QemuVM:
                             RuntimeError,
                             asyncio.IncompleteReadError,
                             CommunicationError,
-                            CommunicationOutcomeUnknownError,
+                            OutcomeUnknownError,
                         )
                     ),
                     # E1: Tighter retry backoff for faster guest detection
@@ -1506,17 +1529,14 @@ class QemuVM:
                         if death_task in done:
                             # QEMU died - cancel guest and retrieve exception
                             guest_task.cancel()
-                            # Suppress ALL exceptions - we're about to re-raise VmError from death_task.
+                            # Suppress ALL exceptions - we're about to re-raise QEMU_CRASHED from death_task.
                             with contextlib.suppress(BaseException):
                                 await guest_task
-                            await death_task  # Re-raise VmError
+                            await death_task  # Re-raise QEMU_CRASHED
                             # Safety net: monitor_process_death should always raise,
                             # but guard against future code paths that return normally.
                             diag = await self.collect_diagnostics()
-                            raise VmQemuCrashError(
-                                "QEMU process exited during boot (clean exit)",
-                                diagnostics=diag,
-                            )
+                            raise _crashed("QEMU process exited during boot (clean exit)", context=asdict(diag))
 
                         # Guest task completed - check result (raises if failed, triggering retry)
                         # Wrap CancelledError from guest_task: the child task can be

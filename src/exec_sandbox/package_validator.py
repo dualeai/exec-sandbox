@@ -96,12 +96,17 @@ class PackageValidator:
             language: Programming language to validate for
 
         Raises:
-            PackageNotAllowedError: If package not in allow-list or language has no allow-list
+            InvalidInputError: PACKAGE_NOT_ALLOWED if a package is not in the allow-list;
+                ARGUMENT_INVALID if a spec has no version or the language has no packages
         """
         if language.value not in self._allow_lists:
-            raise PackageNotAllowedError(
+            raise InvalidInputError(
                 f"Package validation not supported for '{language.value}' language. "
-                f"Supported: {', '.join(sorted(self._allow_lists))}."
+                f"Supported: {', '.join(sorted(self._allow_lists))}.",
+                code=ErrorCode.ARGUMENT_INVALID,
+                context=None,
+                hint=None,
+                instance_id=None,
             )
 
         allow_list = self._allow_lists[language.value]
@@ -110,29 +115,24 @@ class PackageValidator:
             match = _PACKAGE_NAME_PATTERN.match(package_spec)
             if not match:
                 # Should never happen due to schema validation, but defensive
-                raise PackageNotAllowedError(
+                raise InvalidInputError(
                     f"Invalid package spec: '{package_spec}'. "
-                    f"Must include version specifier (e.g., pandas==2.0.0 or lodash@4.17.21)."
+                    f"Must include version specifier (e.g., pandas==2.0.0 or lodash@4.17.21).",
+                    code=ErrorCode.ARGUMENT_INVALID,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
                 )
 
             base_name = match.group(1).strip().lower()
 
             # Check if package is in allow-list
             if base_name not in allow_list:
-                raise PackageNotAllowedError(
+                raise InvalidInputError(
                     f"Package '{base_name}' not in {language.value} allow-list. "
-                    f"Only pre-approved packages from the catalog are permitted."
+                    f"Only pre-approved packages from the catalog are permitted.",
+                    code=ErrorCode.PACKAGE_NOT_ALLOWED,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
                 )
-
-    def is_allowed(self, package_name: str, language: str) -> bool:
-        """Check if a package name is in the allow-list.
-
-        Args:
-            package_name: Package name (without version specifier)
-            language: Programming language ("python" or "javascript")
-
-        Returns:
-            True if package is in allow-list, False otherwise
-        """
-        allow_list = self._allow_lists.get(language, set())
-        return package_name.lower() in allow_list

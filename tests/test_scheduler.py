@@ -5,38 +5,47 @@ Integration tests: Test real VM execution (requires QEMU + images).
 """
 
 import asyncio
+import contextlib
 import json
 import platform
 import shutil
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
+from exec_sandbox import package_validator
 from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB, MAX_CODE_SIZE
+from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB
 from exec_sandbox.exceptions import (
-    AssetDownloadError,
-    SandboxError,
-    SnapshotError,
-    VmConfigError,
-    VmDependencyError,
-    VmPermanentError,
-    VmTimeoutError,
-    VmTransientError,
+    ConfigError,
+    ErrorAction,
+    ErrorCode,
+    InternalError,
+    InvalidInputError,
+    RouteError,
+    TransientError,
 )
-from exec_sandbox.models import ExecutionResult, Language, TimingBreakdown
+from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
+from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, StartupTiming, TimingBreakdown
 from exec_sandbox.qemu_vm import QemuVM
-from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.scheduler import Scheduler, settings_from_config
+from exec_sandbox.settings import Settings
+from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.vm_types import VmState
 from tests.conftest import (
     create_test_qcow2,
+    l1_hit,
     make_destroy_mock,
     random_test_id,
-    skip_unless_fast_balloon,
+    run_once,
+    run_timed,
+    skip_unless_fast_virt,
     skip_unless_hwaccel,
 )
 
@@ -90,17 +99,17 @@ class TestSchedulerContextManager:
         # Manually set _started to simulate already started
         scheduler._started = True
 
-        with pytest.raises(SandboxError) as exc_info:
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE) as exc_info:
             await scheduler.__aenter__()
 
         assert "already started" in str(exc_info.value)
 
     async def test_run_without_start_raises(self) -> None:
-        """Calling run() without starting raises SandboxError."""
+        """Calling run() without starting raises InvalidInputError SCHEDULER_STATE."""
         scheduler = Scheduler()
 
-        with pytest.raises(SandboxError) as exc_info:
-            await scheduler.run(code="print(1)", language=Language.PYTHON)
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE) as exc_info:
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(1)")
 
         assert "not started" in str(exc_info.value)
 
@@ -302,8 +311,12 @@ class TestRunTeardownConfirmation:
             new_callable=AsyncMock,
             return_value=prepared,
         ):
-            with pytest.raises(VmPermanentError, match="process cleanup was not confirmed"):
-                await scheduler.run(code="print('ok')", language=Language.PYTHON)
+            with pytest.raises(
+                InternalError,
+                check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED,
+                match="process cleanup was not confirmed",
+            ):
+                await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('ok')")
 
         scheduler._vm_manager.destroy_vm.assert_awaited_once_with(vm)
 
@@ -706,16 +719,20 @@ class TestBaseImageFetchBeforeSnapshot:
             assert call_count == 2, "fetch_base_image should be called each time (it's idempotent internally)"
 
     async def test_fetch_failure_propagates(self, images_dir: Path, tmp_path: Path) -> None:
-        """fetch_base_image raising AssetDownloadError propagates to caller."""
+        """fetch_base_image raising TransientError ASSET_DOWNLOAD propagates to caller."""
 
         config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
         async with Scheduler(config) as scheduler:
 
             async def mock_fetch_fail(language, **kwargs):  # type: ignore[no-untyped-def]
-                raise AssetDownloadError("Network unreachable")
+                raise TransientError(
+                    "Network unreachable", code=ErrorCode.ASSET_DOWNLOAD, context=None, hint=None, instance_id=None
+                )
 
             with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch_fail):
-                with pytest.raises(AssetDownloadError, match="Network unreachable"):
+                with pytest.raises(
+                    TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD, match="Network unreachable"
+                ):
                     await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
 
     async def test_concurrent_fetch_same_language(self, images_dir: Path, tmp_path: Path) -> None:
@@ -833,14 +850,18 @@ class TestBaseImageFetchBeforeSnapshot:
                     scheduler._snapshot_manager,
                     "_create_snapshot",
                     new_callable=AsyncMock,
-                    side_effect=SnapshotError("VM boot failed"),
+                    side_effect=TransientError(
+                        "VM boot failed", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None
+                    ),
                 ),
             ):
-                with pytest.raises(SnapshotError, match="VM boot failed"):
+                with pytest.raises(
+                    TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED, match="VM boot failed"
+                ):
                     await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
 
             # Base image should still exist (not cleaned up on downstream failure)
-            assert base_image_path.exists(), "Base image must survive downstream SnapshotError"
+            assert base_image_path.exists(), "Base image must survive a downstream build failure"
 
 
 class TestBaseImageFetchBeforeL1Restore:
@@ -1220,8 +1241,8 @@ class TestSchedulerShutdownOrdering:
         await pool_stop_entered.wait()
 
         assert scheduler._started is False
-        with pytest.raises(SandboxError, match="not started"):
-            await scheduler.run(code="print(1)", language=Language.PYTHON)
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE, match="not started"):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(1)")
 
         release_pool_stop.set()
         await asyncio.wait_for(shutdown, timeout=1)
@@ -1272,7 +1293,9 @@ class TestSchedulerShutdownOrdering:
         shutdown = asyncio.create_task(scheduler.__aexit__(None, None, None))
         await pool_stop_entered.wait()
 
-        with pytest.raises(SandboxError, match="still shutting down"):
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE, match="still shutting down"
+        ):
             await scheduler.__aenter__()
 
         release_pool_stop.set()
@@ -1280,9 +1303,13 @@ class TestSchedulerShutdownOrdering:
 
     async def test_shutdown_failure_leaves_scheduler_closed(self) -> None:
         scheduler = self._make_scheduler()
-        scheduler._vm_manager.stop.side_effect = VmPermanentError("cleanup failed")  # type: ignore[union-attr]
+        scheduler._vm_manager.stop.side_effect = InternalError(
+            "cleanup failed", code=ErrorCode.CLEANUP_UNCONFIRMED, context=None, hint=None, instance_id=None
+        )  # type: ignore[union-attr]
 
-        with pytest.raises(VmPermanentError, match="cleanup failed"):
+        with pytest.raises(
+            InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED, match="cleanup failed"
+        ):
             await scheduler.__aexit__(None, None, None)
 
         assert scheduler._started is False
@@ -1365,11 +1392,15 @@ class TestSchedulerShutdownOrdering:
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
 
-    async def test_shutdown_warm_pool_permanent_error_continues_then_propagates(self) -> None:
+    async def test_shutdown_warm_pool_internal_error_continues_then_propagates(self) -> None:
         scheduler = self._make_scheduler()
-        scheduler._warm_pool.stop.side_effect = VmPermanentError("pool cleanup unconfirmed")  # type: ignore[union-attr]
+        scheduler._warm_pool.stop.side_effect = InternalError(
+            "pool cleanup unconfirmed", code=ErrorCode.CLEANUP_UNCONFIRMED, context=None, hint=None, instance_id=None
+        )  # type: ignore[union-attr]
 
-        with pytest.raises(VmPermanentError, match="pool cleanup unconfirmed"):
+        with pytest.raises(
+            InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED, match="pool cleanup unconfirmed"
+        ):
             await scheduler.__aexit__(None, None, None)
 
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]

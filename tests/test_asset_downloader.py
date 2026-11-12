@@ -178,13 +178,15 @@ class TestRetrieve:
             m.assert_called_once()
 
     async def test_checksum_verification_fails(self, tmp_path: Path):
-        """Should raise AssetDownloadError (wrapping AssetChecksumError) on hash mismatch after retries."""
+        """Should raise TransientError ASSET_DOWNLOAD on hash mismatch after retries."""
         with aioresponses() as m:
             # Mock all retry attempts with wrong content
             for _ in range(3):
                 m.get("https://example.com/bad.txt", body=b"actual content")
 
-            with pytest.raises(AssetDownloadError):  # Wraps AssetChecksumError after retries
+            with pytest.raises(
+                TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD
+            ):  # the hash mismatch, after the retries
                 await retrieve(
                     url="https://example.com/bad.txt",
                     known_hash="sha256:wronghash",
@@ -200,13 +202,13 @@ class TestRetrieve:
 
     @pytest.mark.parametrize("status_code", [404, 500])
     async def test_http_error(self, tmp_path: Path, status_code: int):
-        """Should raise AssetDownloadError on HTTP error status."""
+        """Should raise TransientError ASSET_DOWNLOAD on HTTP error status."""
         with aioresponses() as m:
             url = f"https://example.com/error-{status_code}.txt"
             for _ in range(3):  # All retry attempts return error
                 m.get(url, status=status_code)
 
-            with pytest.raises(AssetDownloadError):
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD):
                 await retrieve(
                     url=url,
                     known_hash="sha256:abc123",
@@ -214,7 +216,7 @@ class TestRetrieve:
                 )
 
     async def test_connection_error(self, tmp_path: Path):
-        """Should raise AssetDownloadError on connection failure."""
+        """Should raise TransientError ASSET_DOWNLOAD on connection failure."""
         with aioresponses() as m:
             for _ in range(3):  # All retry attempts fail
                 m.get(
@@ -222,7 +224,7 @@ class TestRetrieve:
                     exception=aiohttp.ClientConnectionError("Connection refused"),
                 )
 
-            with pytest.raises(AssetDownloadError):
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD):
                 await retrieve(
                     url="https://example.com/timeout.txt",
                     known_hash="sha256:abc123",
@@ -400,7 +402,7 @@ class TestAsyncPooch:
             assert path.read_bytes() == content
 
     async def test_fetch_not_in_registry(self, tmp_path: Path):
-        """Should raise AssetNotFoundError for unknown file."""
+        """Should raise ConfigError ASSET_NOT_FOUND for unknown file."""
         pooch = AsyncPooch(
             path=tmp_path,
             base_url="https://example.com",
@@ -891,8 +893,9 @@ class TestConcurrentRetrieve:
                 return_exceptions=True,
             )
 
-            # First should fail with AssetDownloadError
-            assert isinstance(results[0], AssetDownloadError)
+            # First should fail with TransientError ASSET_DOWNLOAD
+            assert isinstance(results[0], TransientError)
+            assert results[0].code is ErrorCode.ASSET_DOWNLOAD
             # Rest should succeed
             for r in results[1:]:
                 assert isinstance(r, Path)

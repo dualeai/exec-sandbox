@@ -11,14 +11,14 @@ import contextlib
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Never, Protocol, runtime_checkable
+from typing import Never, Protocol, Self, runtime_checkable
 from uuid import uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
-from exec_sandbox.exceptions import CommunicationError, CommunicationOutcomeUnknownError
+from exec_sandbox.exceptions import CommunicationError, ErrorCode, OutcomeUnknownError
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
     GuestAgentRequest,
@@ -94,7 +94,7 @@ class OperationInbox:
     def ensure_open(self) -> None:
         """Fail before dispatch when registration raced a dead generation."""
         if self._failed.done():
-            raise CommunicationError(self._failed.result())
+            raise CommunicationError(self._failed.result(), context=None)
 
     async def route(self, message: StreamingMessage) -> bool:
         """Route with bounded, cancellation-safe backpressure.
@@ -141,8 +141,10 @@ class OperationInbox:
     def _raise_failure(self) -> Never:
         reason = self._failed.result()
         if self._outcome_unknown:
-            raise CommunicationOutcomeUnknownError(reason)
-        raise CommunicationError(reason)
+            raise OutcomeUnknownError(
+                reason, code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context=None, hint=None, instance_id=None
+            )
+        raise CommunicationError(reason, context=None)
 
     async def get(self) -> StreamingMessage:
         """Receive ordered data, then raise any out-of-band transport failure."""

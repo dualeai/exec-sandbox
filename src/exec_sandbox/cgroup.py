@@ -500,14 +500,21 @@ async def attach_to_cgroup(cgroup_path: Path, pid: int) -> None:
         pid: Process ID to attach
 
     Raises:
-        VmDependencyError: Failed to attach process (e.g. EACCES when
+        ConfigError: HOST_DEPENDENCY: failed to attach process (e.g. EACCES when
             the orchestrator is outside the delegated subtree)
     """
     try:
-        async with aiofiles.open(cgroup_path / "cgroup.procs", "w") as f:
-            await f.write(str(pid))
+        # In a worker thread: the kernel's write to cgroup.procs can wait for an
+        # RCU grace period (cgroup_threadgroup_rwsem), often several ms
+        await asyncio.to_thread((cgroup_path / "cgroup.procs").write_text, str(pid))
     except OSError as e:  # includes PermissionError (EACCES)
-        raise VmDependencyError(f"Failed to attach PID {pid} to cgroup: {e}") from e
+        raise ConfigError(
+            f"Failed to attach PID {pid} to cgroup: {e}",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context=None,
+            hint=None,
+            instance_id=None,
+        ) from e
 
 
 async def attach_if_available(cgroup_path: Path | None, pid: int | None) -> bool:
@@ -533,7 +540,7 @@ async def attach_if_available(cgroup_path: Path | None, pid: int | None) -> bool
     try:
         await attach_to_cgroup(cgroup_path, pid)  # type: ignore[arg-type]
         return True
-    except VmDependencyError as e:
+    except ConfigError as e:
         # Only degrade gracefully for permission errors (delegation not
         # possible).  Other errors (ENOENT, EINVAL) indicate a real fault
         # and should propagate.

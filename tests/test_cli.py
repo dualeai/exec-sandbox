@@ -464,52 +464,151 @@ class TestCliErrorHandling:
     """Tests for CLI error handling."""
 
     def test_package_not_allowed_error(self, runner: CliRunner) -> None:
-        """Handles PackageNotAllowedError."""
-        from exec_sandbox import PackageNotAllowedError
-
+        """PACKAGE_NOT_ALLOWED (FIX_INPUT): exit 2 with the allow-list advice."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.side_effect = PackageNotAllowedError("fake-package")
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            mock_scheduler.new.side_effect = InvalidInputError(
+                "Package 'fake-package' not in python allow-list.",
+                code=ErrorCode.PACKAGE_NOT_ALLOWED,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
 
             result = runner.invoke(run_command, ["import fake"])
 
             assert result.exit_code == EXIT_CLI_ERROR
-            assert "not allowed" in result.output.lower()
+            assert "Error: PACKAGE_NOT_ALLOWED (FIX_INPUT)" in result.stderr
+            assert "Use --no-validation to bypass (not recommended)" in result.stderr
 
     def test_timeout_error(self, runner: CliRunner) -> None:
-        """Handles VmTimeoutError."""
-        from exec_sandbox import VmTimeoutError
-
+        """VM_BOOT_TIMEOUT (RETRY): exit 124, like the timeout command."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.side_effect = VmTimeoutError("Execution timed out")
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            mock_scheduler.new.side_effect = TransientError(
+                "Guest agent not ready after 30s",
+                code=ErrorCode.VM_BOOT_TIMEOUT,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
 
             result = runner.invoke(run_command, ["import time; time.sleep(100)"])
 
             assert result.exit_code == EXIT_TIMEOUT
-            assert "timed out" in result.output.lower()
+            assert "Error: VM_BOOT_TIMEOUT (RETRY)" in result.stderr
+            assert "The VM failed to start before code could run" in result.stderr
 
-    def test_sandbox_error(self, runner: CliRunner) -> None:
-        """Handles SandboxError."""
-        from exec_sandbox import SandboxError
-
+    @pytest.mark.parametrize(
+        ("error", "exit_code", "advice"),
+        [
+            (
+                ConfigError(
+                    "Failed to start qemu-img: [Errno 2] No such file or directory",
+                    code=ErrorCode.HOST_DEPENDENCY,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                2,
+                ["Install or fix the host dependency the message names", "Correct the settings, then run again."],
+            ),
+            (
+                TransientError(
+                    "No space left on device", code=ErrorCode.LOCAL_DISK, context=None, hint=None, instance_id=None
+                ),
+                125,
+                ["Run the same command again later."],
+            ),
+            (
+                ConfigError(
+                    "Install with: pip install 'exec-sandbox[s3]'",
+                    code=ErrorCode.EXTRA_MISSING,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                2,
+                ["Correct the settings, then run again."],
+            ),
+            (
+                ConfigError(
+                    "Release not found: v0.0.0",
+                    code=ErrorCode.ASSET_NOT_FOUND,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                2,
+                ["download the VM images with 'sbx prefetch'", "Correct the settings, then run again."],
+            ),
+            (
+                TransientError(
+                    "Failed to download https://example.invalid/vmlinuz after 3 attempts",
+                    code=ErrorCode.ASSET_DOWNLOAD,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                125,
+                ["download the VM images with 'sbx prefetch'", "Run the same command again later."],
+            ),
+            (
+                InvalidInputError(
+                    "pip install failed: no matching distribution",
+                    code=ErrorCode.PACKAGE_INSTALL_FAILED,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+                2,
+                ["Correct the command, then run again."],
+            ),
+            (
+                InternalError(
+                    "Unexpected state transition", code=ErrorCode.INTERNAL, context=None, hint=None, instance_id=None
+                ),
+                125,
+                ["report it with the output of a run with EXEC_SANDBOX_LOG_LEVEL=DEBUG"],
+            ),
+            (
+                SessionClosedError(
+                    "Session is closed", code=ErrorCode.SESSION_CLOSED, context=None, hint=None, instance_id=None
+                ),
+                125,
+                ["Run the command again."],
+            ),
+        ],
+        ids=[
+            "missing-qemu-or-image",
+            "transient",
+            "missing-extra",
+            "asset-not-found",
+            "asset-download",
+            "package-install-failed",
+            "internal",
+            "restart",
+        ],
+    )
+    def test_sandbox_error(self, runner: CliRunner, error: SandboxError, exit_code: int, advice: list[str]) -> None:
+        """Header CODE (ACTION) and the message; exit 2 for FIX_INPUT and FIX_CONFIG, else 125;
+        install advice only for a missing QEMU, kernel or image, prefetch advice for images
+        that could not be found or fetched, then the advice of the action; no advice that
+        does not apply."""
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.side_effect = SandboxError("VM boot failed")
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            mock_scheduler.new.side_effect = error
 
             result = runner.invoke(run_command, ["print(1)"])
 
-            assert result.exit_code == EXIT_SANDBOX_ERROR
-            assert "sandbox error" in result.output.lower()
+        assert result.exit_code == exit_code
+        assert f"Error: {error.code} ({error.action})" in result.stderr
+        assert error.message in result.stderr
+        for line in advice:
+            assert line in result.stderr
+        assert result.stderr.count("•") == len(advice)  # one bullet per advice line: nothing else
+        if error.code is not ErrorCode.HOST_DEPENDENCY:
+            assert "QEMU" not in result.stderr
 
 
 class TestCliNoValidation:
@@ -1597,28 +1696,34 @@ class TestMultiSourceResult:
     def test_create_success_result(self, mock_result: ExecutionResult) -> None:
         """Creates successful MultiSourceResult."""
         result = MultiSourceResult(
-            index=0,
-            source="test.py",
-            result=mock_result,
-            error=None,
+            index=0, source="test.py", run=_one_shot(mock_result), error=None, code=None, action=None
         )
         assert result.index == 0
         assert result.source == "test.py"
-        assert result.result is not None
+        assert result.run is not None
+        assert result.exit_code == 0
         assert result.error is None
 
-    def test_create_error_result(self) -> None:
-        """Creates error MultiSourceResult."""
-        result = MultiSourceResult(
-            index=1,
-            source="bad.py",
-            result=None,
-            error="Execution timed out",
-        )
+    @pytest.mark.parametrize(
+        ("code", "action", "exit_code"),
+        [
+            (ErrorCode.CODE_INVALID, ErrorAction.FIX_INPUT, EXIT_CLI_ERROR),
+            (ErrorCode.HOST_DEPENDENCY, ErrorAction.FIX_CONFIG, EXIT_CLI_ERROR),
+            (ErrorCode.VM_BOOT_TIMEOUT, ErrorAction.RETRY, EXIT_TIMEOUT),
+            (ErrorCode.QEMU_CRASHED, ErrorAction.RETRY, EXIT_SANDBOX_ERROR),
+            (ErrorCode.GUEST_OUTCOME_UNKNOWN, ErrorAction.VERIFY, EXIT_SANDBOX_ERROR),
+        ],
+        ids=["fix-input", "fix-config", "boot-timeout", "retry", "verify"],
+    )
+    def test_create_error_result(self, code: ErrorCode, action: ErrorAction, exit_code: int) -> None:
+        """A source with no run keeps its error's message, code and action; its exit code is
+        the one a single source gets for that error."""
+        result = MultiSourceResult(index=1, source="bad.py", run=None, error="It failed.", code=code, action=action)
         assert result.index == 1
         assert result.source == "bad.py"
-        assert result.result is None
-        assert result.error == "Execution timed out"
+        assert result.run is None
+        assert result.exit_code == exit_code
+        assert (result.error, result.code, result.action) == ("It failed.", code, action)
 
 
 class TestFormatMultiResultJson:
@@ -1647,15 +1752,24 @@ class TestFormatMultiResultJson:
         import json
 
         results = [
-            MultiSourceResult(index=0, source="good.py", result=mock_result, error=None),
-            MultiSourceResult(index=1, source="bad.py", result=None, error="Timed out"),
+            MultiSourceResult(
+                index=0, source="good.py", run=_one_shot(mock_result), error=None, code=None, action=None
+            ),
+            MultiSourceResult(
+                index=1,
+                source="bad.py",
+                run=None,
+                error="QEMU died.",
+                code=ErrorCode.QEMU_CRASHED,
+                action=ErrorAction.RETRY,
+            ),
         ]
         output = format_multi_result_json(results)
         parsed = json.loads(output)
 
         assert len(parsed) == 2
-        assert parsed[0]["exit_code"] == 0
-        assert parsed[1]["error"] == "Timed out"
+        assert (parsed[0]["exit_code"], parsed[0]["code"], parsed[0]["action"]) == (0, None, None)
+        assert (parsed[1]["error"], parsed[1]["code"], parsed[1]["action"]) == ("QEMU died.", "QEMU_CRASHED", "RETRY")
         assert parsed[1]["exit_code"] == EXIT_SANDBOX_ERROR
 
 
@@ -1895,54 +2009,202 @@ class TestCliMultiInputExitCodes:
             stderr="",
             exit_code=0,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
         result1 = ExecutionResult(
             stdout="",
             stderr="",
             exit_code=5,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
-            mock_scheduler.run.side_effect = [result0, result1]
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            _vm(mock_scheduler).exec.side_effect = [result0, result1]
 
             result = runner.invoke(run_command, ["print(1)", "exit(5)"])
 
             # Should return max(0, 5) = 5
             assert result.exit_code == 5
 
-    def test_timeout_returns_124(self, runner: CliRunner) -> None:
-        """Returns EXIT_TIMEOUT (124) if any source times out."""
-        from exec_sandbox import VmTimeoutError
+    def test_package_not_allowed_exits_2_like_one_source(self, runner: CliRunner) -> None:
+        """Every source has the same packages: each source shows the single-source error
+        (header and advice), and the run exits 2."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            mock_scheduler = _mock_scheduler(scheduler_cls)
+            mock_scheduler.new.side_effect = InvalidInputError(
+                "Package 'nope' not in python allow-list.",
+                code=ErrorCode.PACKAGE_NOT_ALLOWED,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
 
+            result = runner.invoke(run_command, ["-p", "nope==1.0", "print(1)", "print(2)"])
+
+        assert result.exit_code == EXIT_CLI_ERROR
+        assert result.stderr.count("Error: PACKAGE_NOT_ALLOWED (FIX_INPUT)") == 2
+        assert result.stderr.count("Use --no-validation to bypass (not recommended)") == 2
+
+    def test_timeout_returns_124(self, runner: CliRunner) -> None:
+        """Returns EXIT_TIMEOUT (124) if any source times out (VM_BOOT_TIMEOUT)."""
         result0 = ExecutionResult(
             stdout="",
             stderr="",
             exit_code=0,
             execution_time_ms=10,
-            timing=TimingBreakdown(setup_ms=1, boot_ms=10, execute_ms=5, total_ms=16),
-            warm_pool_hit=False,
+            timing=TimingBreakdown(execute_ms=5, connect_ms=None),
         )
 
         with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
-            mock_scheduler = AsyncMock()
+            mock_scheduler = _mock_scheduler(scheduler_cls)
             # First succeeds, second times out
-            mock_scheduler.run.side_effect = [result0, VmTimeoutError("timeout")]
-            mock_scheduler.__aenter__.return_value = mock_scheduler
-            mock_scheduler.__aexit__.return_value = None
-            scheduler_cls.return_value = mock_scheduler
+            _vm(mock_scheduler).exec.side_effect = [
+                result0,
+                TransientError(
+                    "Guest agent not ready", code=ErrorCode.VM_BOOT_TIMEOUT, context=None, hint=None, instance_id=None
+                ),
+            ]
 
             result = runner.invoke(run_command, ["print(1)", "import time; time.sleep(100)"])
 
             assert result.exit_code == EXIT_TIMEOUT
+
+    def test_code_timeout_of_one_source_exits_124(self, runner: CliRunner) -> None:
+        """One source's code times out (-1), the other exits 0: 124, not 0; its JSON entry
+        has exit_code 124."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = [_result(0), _result(-1)]
+
+            result = runner.invoke(run_command, ["--json", "pass", "while True: pass"])
+
+        assert result.exit_code == EXIT_TIMEOUT
+        assert sorted(entry["exit_code"] for entry in json.loads(result.stdout)) == [0, EXIT_TIMEOUT]
+
+    def test_failed_source_keeps_the_other_results(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """A SandboxError of one source becomes its result's error, code and action (exit 125 for
+        VERIFY), printed after the JSON with its advice; the other source's run stays."""
+
+        def exec_(code: str, **_: Any) -> ExecutionResult:
+            if code == "boom()":
+                raise OutcomeUnknownError(
+                    "guest agent gone", code=ErrorCode.GUEST_OUTCOME_UNKNOWN, context=None, hint=None, instance_id=None
+                )
+            return mock_result
+
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = exec_
+
+            result = runner.invoke(run_command, ["--json", "print(1)", "boom()"])
+
+        assert result.exit_code == EXIT_SANDBOX_ERROR
+        ok, failed = json.loads(result.stdout)
+        assert (ok["index"], ok["run"]["result"]["stdout"], ok["error"], ok["exit_code"]) == (0, "hello\n", None, 0)
+        assert failed == {
+            "index": 1,
+            "source": "boom()",
+            "run": None,
+            "error": "guest agent gone",
+            "code": "GUEST_OUTCOME_UNKNOWN",
+            "action": "VERIFY",
+            "exit_code": 125,
+        }
+        assert result.stderr.startswith("Error: GUEST_OUTCOME_UNKNOWN (VERIFY)\n\n  guest agent gone\n")
+        assert "Check before you run again" in result.stderr
+
+    def test_fix_config_of_one_source_exits_2_with_its_advice(
+        self, runner: CliRunner, mock_result: ExecutionResult, tmp_path: Path
+    ) -> None:
+        """A FIX_CONFIG error of one source: under that source, the header, the message and the
+        advice of a single source; exit 2, also when the other source's code exits higher."""
+        py_file = tmp_path / "ok.py"
+        py_file.write_text("raise SystemExit(5)")
+        js_file = tmp_path / "broken.js"
+        js_file.write_text("console.log(1)")
+        exit_5 = mock_result.model_copy(update={"exit_code": 5})
+
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            scheduler = _mock_scheduler(scheduler_cls)
+            vm = _vm(scheduler)
+            vm.exec.return_value = exit_5
+
+            async def new(spec: VmSpec, **_: Any) -> Session:
+                if spec.language is Language.JAVASCRIPT:
+                    raise ConfigError(
+                        "node binary not found",
+                        code=ErrorCode.HOST_DEPENDENCY,
+                        context=None,
+                        hint=None,
+                        instance_id=None,
+                    )
+                return vm
+
+            scheduler.new.side_effect = new
+
+            result = runner.invoke(run_command, [str(py_file), str(js_file)])
+
+        assert result.exit_code == EXIT_CLI_ERROR
+        assert "Error: HOST_DEPENDENCY (FIX_CONFIG)\n\n  node binary not found\n" in result.stderr
+        assert "Correct the settings, then run again." in result.stderr
+        assert "✗ node binary not found" not in result.stderr
+
+    def test_fix_input_wins_over_a_boot_timeout_in_json(self, runner: CliRunner, mock_result: ExecutionResult) -> None:
+        """--json: each failed source has its code, action and exit code in the JSON, then its
+        error on stderr; a FIX_INPUT error (2) wins over a boot timeout (124)."""
+
+        def exec_(code: str, **_: Any) -> ExecutionResult:
+            if code == "big()":
+                raise InvalidInputError(
+                    "Output limit exceeded", code=ErrorCode.OUTPUT_LIMIT, context=None, hint=None, instance_id=None
+                )
+            if code == "slow()":
+                raise TransientError(
+                    "Guest agent not ready", code=ErrorCode.VM_BOOT_TIMEOUT, context=None, hint=None, instance_id=None
+                )
+            return mock_result
+
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            _vm(_mock_scheduler(scheduler_cls)).exec.side_effect = exec_
+
+            result = runner.invoke(run_command, ["--json", "print(1)", "big()", "slow()"])
+
+        assert result.exit_code == EXIT_CLI_ERROR
+        rows = [(r["code"], r["action"], r["exit_code"]) for r in json.loads(result.stdout)]
+        assert rows == [(None, None, 0), ("OUTPUT_LIMIT", "FIX_INPUT", 2), ("VM_BOOT_TIMEOUT", "RETRY", 124)]
+        assert result.stderr.index("Error: OUTPUT_LIMIT (FIX_INPUT)") < result.stderr.index(
+            "Error: VM_BOOT_TIMEOUT (RETRY)"
+        )
+        assert "Correct the command, then run again." in result.stderr
+
+    def test_scheduler_start_failure_prints_one_error(self, runner: CliRunner) -> None:
+        """A failure before any source runs: one error with its advice, no result; a setup
+        error (FIX_CONFIG) exits 2."""
+        with patch("exec_sandbox.cli.Scheduler") as scheduler_cls:
+            scheduler = _mock_scheduler(scheduler_cls)
+            scheduler.__aenter__.side_effect = ConfigError(
+                "Failed to start qemu-img: [Errno 2] No such file or directory",
+                code=ErrorCode.HOST_DEPENDENCY,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+
+            result = runner.invoke(run_command, ["print(1)", "print(2)"])
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert result.stderr == (
+            "Error: HOST_DEPENDENCY (FIX_CONFIG)\n"
+            "\n"
+            "  Failed to start qemu-img: [Errno 2] No such file or directory\n"
+            "\n"
+            "  Suggestions:\n"
+            "    • Install or fix the host dependency the message names "
+            "(QEMU: brew install qemu on macOS, the distribution's qemu packages on Linux).\n"
+            "    • Correct the settings, then run again.\n"
+        )
+        scheduler.new.assert_not_called()
 
 
 # ============================================================================

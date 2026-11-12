@@ -186,8 +186,8 @@ class TestClassifyInstallError:
         ],
     )
     def test_transient_patterns(self, error_output: str) -> None:
-        """Known transient network patterns classify as PackageInstallTransientError."""
-        assert _classify_install_error(error_output) is PackageInstallTransientError
+        """Known transient network patterns classify as PACKAGE_DOWNLOAD."""
+        assert _classify_install_error(error_output) is ErrorCode.PACKAGE_DOWNLOAD
 
     @pytest.mark.parametrize(
         "error_output",
@@ -205,14 +205,14 @@ class TestClassifyInstallError:
         ],
     )
     def test_permanent_patterns(self, error_output: str) -> None:
-        """Known permanent patterns classify as PackageInstallPermanentError."""
-        assert _classify_install_error(error_output) is PackageInstallPermanentError
+        """Known permanent patterns classify as PACKAGE_INSTALL_FAILED."""
+        assert _classify_install_error(error_output) is ErrorCode.PACKAGE_INSTALL_FAILED
 
     def test_permanent_takes_priority_over_transient(self) -> None:
         """When both permanent and transient patterns match, permanent wins."""
         # "404 client error" contains both "404 client error" (permanent) and "client error" (transient)
         result = _classify_install_error("HTTP 404 Client Error for url: https://pypi.org/simple/foo/")
-        assert result is PackageInstallPermanentError
+        assert result is ErrorCode.PACKAGE_INSTALL_FAILED
 
     @pytest.mark.parametrize(
         "error_output",
@@ -229,11 +229,11 @@ class TestClassifyInstallError:
 
     def test_case_insensitive(self) -> None:
         """Pattern matching is case-insensitive."""
-        assert _classify_install_error("CONNECTION REFUSED") is PackageInstallTransientError
-        assert _classify_install_error("Client Error (Connect)") is PackageInstallTransientError
-        assert _classify_install_error("NETWORK UNREACHABLE") is PackageInstallTransientError
-        assert _classify_install_error("NO MATCHING DISTRIBUTION found") is PackageInstallPermanentError
-        assert _classify_install_error("ERESOLVE could not resolve") is PackageInstallPermanentError
+        assert _classify_install_error("CONNECTION REFUSED") is ErrorCode.PACKAGE_DOWNLOAD
+        assert _classify_install_error("Client Error (Connect)") is ErrorCode.PACKAGE_DOWNLOAD
+        assert _classify_install_error("NETWORK UNREACHABLE") is ErrorCode.PACKAGE_DOWNLOAD
+        assert _classify_install_error("NO MATCHING DISTRIBUTION found") is ErrorCode.PACKAGE_INSTALL_FAILED
+        assert _classify_install_error("ERESOLVE could not resolve") is ErrorCode.PACKAGE_INSTALL_FAILED
 
 
 # ============================================================================
@@ -400,13 +400,13 @@ class TestDiskSnapshotManagerIntegration:
         # sorted() puts 3.13 before 3.14 lexicographically
         assert result == path_313, f"Expected {path_313}, got {result}"
 
-    def test_unknown_language_raises_vm_config_error(self, unit_test_vm_manager) -> None:
-        """get_base_image raises VmConfigError (not KeyError) for unknown languages.
+    def test_unknown_language_raises_internal_error(self, unit_test_vm_manager) -> None:
+        """get_base_image raises InternalError INTERNAL (not KeyError) for unknown languages.
 
         The patterns dict uses .get() with an explicit check, so an unknown language
-        must raise VmConfigError with 'Unknown language', not a raw KeyError.
+        must raise InternalError with 'Unknown language', not a raw KeyError.
         """
-        with pytest.raises(VmConfigError, match="Unknown language"):
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.INTERNAL, match="Unknown language"):
             unit_test_vm_manager.get_base_image("ruby")
 
 
@@ -1118,9 +1118,11 @@ class TestCacheHierarchy:
             snapshot_manager,
             "_create_snapshot",
             new_callable=AsyncMock,
-            side_effect=SnapshotError("VM boot failed"),
+            side_effect=TransientError(
+                "VM boot failed", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None
+            ),
         ):
-            with pytest.raises(SnapshotError) as exc_info:
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED) as exc_info:
                 await snapshot_manager.get_or_create_snapshot(
                     language=Language.PYTHON,
                     packages=["broken-pkg==1.0.0"],

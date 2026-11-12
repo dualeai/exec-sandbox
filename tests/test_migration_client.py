@@ -9,17 +9,23 @@ readline → event skipping → JSON parse).  Only connect/close remain mocked
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from exec_sandbox import constants
-from exec_sandbox.exceptions import MigrationTransientError
-from exec_sandbox.migration_client import MigrationClient
+from exec_sandbox.exceptions import ConfigError, ErrorCode, RouteError, SandboxError, TransientError
+from exec_sandbox.migration_client import MigrationClient, migration_timeout, rejected_by_qemu
 from exec_sandbox.qmp_exchange import _MAX_SKIPPED_MESSAGES
+from tests.instance_support import FakeQmp
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 # ============================================================================
 # Test Helpers
@@ -80,6 +86,14 @@ def _make_connected(
     return client, reader, writer
 
 
+_QEMU = (11, 2, 0)
+_QMP_TIMEOUT = constants.MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS
+
+
+def _fast_poll():
+    return patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001)
+
+
 # ============================================================================
 # Init
 # ============================================================================
@@ -128,8 +142,10 @@ class TestMigrationClientConnectOwnership:
             new_callable=AsyncMock,
             return_value=(reader, writer),
         ):
-            with pytest.raises(MigrationTransientError, match="QMP capabilities failed"):
-                await client.connect()
+            with pytest.raises(
+                TransientError, match="QMP capabilities failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ):
+                await client.connect(timeout=5.0)
 
         writer.close.assert_called_once()
         writer.wait_closed.assert_awaited_once()
@@ -188,8 +204,8 @@ class TestMigrationClientExecute:
     async def test_not_connected_raises(self) -> None:
         """Should raise when not connected."""
         client = MigrationClient(Path("/tmp/fake.sock"), 501)
-        with pytest.raises(MigrationTransientError, match="Not connected"):
-            await client._execute("test-command")
+        with pytest.raises(TransientError, match="Not connected", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED):
+            await client._execute("test-command", arguments=None, timeout=_QMP_TIMEOUT)
 
     async def test_skips_events_to_find_response(self) -> None:
         """Should skip QMP event messages and return the command response."""
@@ -201,21 +217,23 @@ class TestMigrationClientExecute:
             ]
         )
 
-        result = await client._execute("query-migrate")
+        result = await client._execute("query-migrate", arguments=None, timeout=_QMP_TIMEOUT)
         assert result["return"] == {"status": "completed"}
 
     async def test_connection_closed_raises(self) -> None:
         """Should raise when connection is closed (empty readline)."""
         client, _reader, _writer = _make_connected(feed_eof=True)
 
-        with pytest.raises(MigrationTransientError, match="closed unexpectedly"):
-            await client._execute("test-command")
+        with pytest.raises(
+            TransientError, match="closed unexpectedly", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+        ):
+            await client._execute("test-command", arguments=None, timeout=_QMP_TIMEOUT)
 
     async def test_execute_with_arguments(self) -> None:
         """Execute sends arguments in the JSON command."""
         client, _reader, writer = _make_connected([{"return": {}}])
 
-        await client._execute("migrate", arguments={"uri": "file:/tmp/test.vmstate"})
+        await client._execute("migrate", arguments={"uri": "file:/tmp/test.vmstate"}, timeout=_QMP_TIMEOUT)
 
         cmds = writer.commands
         assert len(cmds) == 1
@@ -275,235 +293,296 @@ class TestMigrationClientExecuteEdgeCases:
         responses.append({"return": {"status": "ok"}})
         client, _reader, _writer = _make_connected(responses)
 
-        result = await client._execute("query-migrate")
+        result = await client._execute("query-migrate", arguments=None, timeout=_QMP_TIMEOUT)
         assert result["return"] == {"status": "ok"}
 
 
 # ============================================================================
-# _set_capabilities — real _execute with pre-loaded responses
+# Capabilities and progress, through save_snapshot and restore_snapshot
 # ============================================================================
 
+_OK: dict[str, Any] = {"return": {}}
+_FAILED_QUERY: dict[str, Any] = {"error": {"class": "GenericError", "desc": "query failed"}}
 
-class TestMigrationClientSetCapabilities:
-    """Tests for _set_capabilities (mapped-ram + multifd on QEMU >= 9.0)."""
 
-    async def test_enables_mapped_ram_for_qemu_11(self) -> None:
-        """QEMU >= 11.0 should enable mapped-ram + multifd."""
-        client, _reader, writer = _make_connected([{"return": {}}])
+def _query(status: str | None) -> dict[str, Any]:
+    """A query-migrate answer (None: an answer without a status)."""
+    return {"return": {"status": status}} if status is not None else {"return": {}}
 
-        await client._set_capabilities((11, 2, 0))
 
-        cmds = writer.commands
-        assert len(cmds) == 1
-        assert cmds[0]["execute"] == "migrate-set-capabilities"
-        cap_names = {c["capability"] for c in cmds[0]["arguments"]["capabilities"]}
-        assert "multifd" in cap_names
-        assert "mapped-ram" in cap_names
-        # Non-template save: no x-ignore-shared (full RAM captured).
-        assert "x-ignore-shared" not in cap_names
+async def _run(
+    client: MigrationClient,
+    operation: str,
+    *,
+    qemu_version: tuple[int, int, int] | None,
+    use_template: bool,
+    timeout: float,
+) -> None:
+    """A save (QEMU quits after it) or a restore of /tmp/t.vmstate."""
+    if operation == "save":
+        await client.save_snapshot(
+            Path("/tmp/t.vmstate"),
+            qemu_version=qemu_version,
+            timeout=timeout,
+            use_template=use_template,
+            keep_running=False,
+            while_paused=None,
+        )
+    else:
+        await client.restore_snapshot(
+            Path("/tmp/t.vmstate"), qemu_version=qemu_version, timeout=timeout, use_template=use_template
+        )
 
-    async def test_template_adds_x_ignore_shared(self) -> None:
-        """Template mode appends x-ignore-shared to the unified mapped-ram list."""
-        client, _reader, writer = _make_connected([{"return": {}}])
 
-        await client._set_capabilities((11, 2, 0), use_template=True)
+def _replies(operation: str, *, queries: list[dict[str, Any]], after_failure: bool) -> list[dict[str, Any]]:
+    """What QEMU answers: capabilities, the start of the migration, the query-migrate answers,
+    then a save's quit or a restore's cont, or (`after_failure`) a save's migrate_cancel and cont."""
+    start = [_OK, _OK, _OK] if operation == "save" else [_OK, _OK]  # save: stop, migrate
+    if after_failure:
+        return [*start, *queries, *([_OK, _OK] if operation == "save" else [])]
+    return [*start, *queries, _OK]
 
-        cmds = writer.commands
-        assert len(cmds) == 1
-        cap_names = {c["capability"] for c in cmds[0]["arguments"]["capabilities"]}
-        assert cap_names == {"multifd", "mapped-ram", "x-ignore-shared"}
 
-    async def test_no_capabilities_for_old_qemu(self) -> None:
-        """QEMU < 11.0 should not set capabilities (falls back to plain streaming)."""
+class TestMigrationCapabilities:
+    """Both directions set the same explicit capabilities first; no legacy fallback."""
+
+    @pytest.mark.parametrize("operation", ["save", "restore"])
+    @pytest.mark.parametrize("use_template", [False, True])
+    @pytest.mark.parametrize("version", [(11, 0, 0), (20, 0, 0)], ids=["floor", "newer"])
+    async def test_explicit_capability_list(
+        self, operation: str, use_template: bool, version: tuple[int, int, int]
+    ) -> None:
+        """mapped-ram + multifd on, x-ignore-shared always sent with an explicit state."""
+        client, _reader, writer = _make_connected(
+            _replies(operation, queries=[_query("completed")], after_failure=False)
+        )
+
+        with _fast_poll():
+            await _run(client, operation, qemu_version=version, use_template=use_template, timeout=5.0)
+
+        first = writer.commands[0]
+        assert first["execute"] == "migrate-set-capabilities"
+        states = {c["capability"]: c["state"] for c in first["arguments"]["capabilities"]}
+        assert states == {"multifd": True, "mapped-ram": True, "x-ignore-shared": use_template}
+
+    @pytest.mark.parametrize("operation", ["save", "restore"])
+    @pytest.mark.parametrize("version", [None, (10, 99, 99), (8, 2, 0)], ids=["unknown", "just-below", "old"])
+    async def test_below_floor_sends_nothing(self, operation: str, version: tuple[int, int, int] | None) -> None:
         client, _reader, writer = _make_connected()
 
-        await client._set_capabilities((10, 2, 0))
+        with pytest.raises(
+            ConfigError, match="below the migration floor", check=lambda e: e.code is ErrorCode.MIGRATION_UNSUPPORTED
+        ) as exc:
+            await _run(client, operation, qemu_version=version, use_template=False, timeout=5.0)
 
-        assert len(writer.commands) == 0
+        assert writer.commands == []
+        assert rejected_by_qemu(exc.value)  # an L1 entry this QEMU cannot load is evicted
 
-    async def test_no_capabilities_for_none_version(self) -> None:
-        """None version should not set capabilities."""
-        client, _reader, writer = _make_connected()
-
-        await client._set_capabilities(None)
-
-        assert len(writer.commands) == 0
-
-    async def test_capability_error_is_non_fatal(self) -> None:
-        """Capability setting failure should not raise (falls back to streaming)."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"error": {"class": "GenericError", "desc": "mapped-ram not supported"}},
-            ]
+    @pytest.mark.parametrize("operation", ["save", "restore"])
+    async def test_refused_capability_is_rejected(self, operation: str) -> None:
+        """A refused capability fails the operation (no silent legacy stream); a save had not
+        stopped the VM yet, so it runs on."""
+        client, _reader, writer = _make_connected(
+            [{"error": {"class": "GenericError", "desc": "mapped-ram not supported"}}]
         )
 
-        # Should not raise
-        await client._set_capabilities((11, 2, 0))
+        with pytest.raises(
+            ConfigError, match="mapped-ram not supported", check=lambda e: e.code is ErrorCode.MIGRATION_UNSUPPORTED
+        ) as exc:
+            await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
+
+        assert [c["execute"] for c in writer.commands] == ["migrate-set-capabilities"]
+        if operation == "save":
+            assert exc.value.context["vm_resumed"] is True
 
 
-class TestMigrationClientSetCapabilitiesEdgeCases:
-    """Edge cases for capability negotiation."""
+class TestMigrationProgress:
+    """query-migrate polling, seen through save_snapshot and restore_snapshot."""
 
-    async def test_boundary_qemu_version_11_0_0(self) -> None:
-        """Exactly QEMU 11.0.0 should enable capabilities (>= check)."""
-        client, _reader, writer = _make_connected([{"return": {}}])
-
-        await client._set_capabilities((11, 0, 0))
-
-        assert any(c["execute"] == "migrate-set-capabilities" for c in writer.commands)
-
-    async def test_boundary_qemu_version_10_99_99(self) -> None:
-        """QEMU 10.99.99 should NOT enable capabilities (< 11.0.0)."""
-        client, _reader, writer = _make_connected()
-
-        await client._set_capabilities((10, 99, 99))
-
-        assert len(writer.commands) == 0
-
-    async def test_very_high_qemu_version(self) -> None:
-        """Future QEMU version (20.0.0) should enable capabilities."""
-        client, _reader, writer = _make_connected([{"return": {}}])
-
-        await client._set_capabilities((20, 0, 0))
-
-        assert any(c["execute"] == "migrate-set-capabilities" for c in writer.commands)
-
-
-# ============================================================================
-# _poll_migration — real _execute with pre-loaded responses
-# ============================================================================
-
-
-class TestMigrationClientPollMigration:
-    """Tests for _poll_migration (query-migrate polling loop)."""
-
-    async def test_poll_until_completed(self) -> None:
-        """Poll should return when status is 'completed'."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {"status": "active"}},
-                {"return": {"status": "active"}},
-                {"return": {"status": "completed"}},
-            ]
+    @pytest.mark.parametrize(
+        "statuses",
+        [
+            pytest.param(["active", "active", "completed"], id="after-active"),
+            pytest.param(["completed"], id="immediate"),
+            pytest.param(["setup", "postcopy-active", "completed"], id="unknown-status"),
+            pytest.param([None, "completed"], id="missing-status"),
+        ],
+    )
+    async def test_polls_until_completed(self, statuses: list[str | None]) -> None:
+        client, _reader, writer = _make_connected(
+            _replies("restore", queries=[_query(st) for st in statuses], after_failure=False)
         )
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client._poll_migration(timeout=5.0)
+        with _fast_poll():
+            await _run(client, "restore", qemu_version=_QEMU, use_template=False, timeout=5.0)
 
-    async def test_poll_raises_on_failure(self) -> None:
-        """Poll should raise MigrationTransientError on 'failed' status."""
+        assert [c["execute"] for c in writer.commands] == [
+            "migrate-set-capabilities",
+            "migrate-incoming",
+            *["query-migrate"] * len(statuses),  # polled until "completed", no further
+            "cont",
+        ]
+
+    @pytest.mark.parametrize("status", ["failed", "cancelled", "failing"])
+    @pytest.mark.parametrize(
+        ("operation", "error"),
+        [
+            ("save", (TransientError, ErrorCode.MIGRATION_FAILED)),
+            ("restore", (RouteError, ErrorCode.MIGRATION_REJECTED)),
+        ],
+    )
+    async def test_ended_migration(
+        self, status: str, operation: str, error: tuple[type[SandboxError], ErrorCode]
+    ) -> None:
+        """QEMU ends a save: transient, the VM resumes and can be kept. QEMU ends a restore: it
+        refused the saved state (ROUTE), and the VM is never resumed. QEMU's reason stays."""
+        queries = [_query("active"), {"return": {"status": status, "error-desc": "disk full"}}]
+        client, _reader, writer = _make_connected(_replies(operation, queries=queries, after_failure=True))
+
+        with (
+            _fast_poll(),
+            pytest.raises(error[0], match=f"{status}: disk full", check=lambda e: e.code is error[1]) as exc,
+        ):
+            await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
+
+        sent = [c["execute"] for c in writer.commands]
+        if operation == "save":
+            assert sent[-2:] == ["migrate_cancel", "cont"]
+            assert exc.value.context["vm_resumed"] is True
+            assert not rejected_by_qemu(exc.value)
+        else:
+            assert sent[-1] == "query-migrate"
+            assert isinstance(exc.value, RouteError)
+            assert exc.value.required == {"qemu_version": "a QEMU that accepts this saved state"}
+            assert exc.value.found == {"qemu_version": "11.2.0"}
+            assert rejected_by_qemu(exc.value)
+
+    @pytest.mark.parametrize("operation", ["save", "restore"])
+    async def test_failed_query_is_transient(self, operation: str) -> None:
+        """query-migrate itself failing says nothing about the saved state: transient, also for a restore."""
+        client, _reader, _writer = _make_connected(_replies(operation, queries=[_FAILED_QUERY], after_failure=True))
+
+        with (
+            _fast_poll(),
+            pytest.raises(
+                TransientError, match="query-migrate failed", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ) as exc,
+        ):
+            await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=5.0)
+        assert not rejected_by_qemu(exc.value)  # a good L1 entry is kept
+
+    @pytest.mark.parametrize("operation", ["save", "restore"])
+    async def test_hung_migration_is_transient(self, operation: str) -> None:
+        """A migration that never ends becomes TransientError MIGRATION_FAILED, not a bare TimeoutError."""
         client, _reader, _writer = _make_connected(
-            [
-                {"return": {"status": "active"}},
-                {"return": {"status": "failed", "error-desc": "disk full"}},
-            ]
+            _replies(operation, queries=[_query("active")] * 500, after_failure=True)
         )
 
         with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="disk full"),
+            _fast_poll(),
+            pytest.raises(
+                TransientError, match="did not complete", check=lambda e: e.code is ErrorCode.MIGRATION_FAILED
+            ),
         ):
-            await client._poll_migration(timeout=5.0)
+            await _run(client, operation, qemu_version=_QEMU, use_template=False, timeout=0.05)
 
-    async def test_poll_raises_on_cancelled(self) -> None:
-        """Poll should raise MigrationTransientError on 'cancelled' status."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {"status": "cancelled"}},
-            ]
+
+class TestRejectedByQemu:
+    """rejected_by_qemu decides the L1 eviction and the reuse() ROUTE rule. It matches by code
+    (MIGRATION_REJECTED, MIGRATION_UNSUPPORTED), never by class, anywhere in the cause or
+    context chain: a restore whose setup fails (HOST_DEPENDENCY, also a ConfigError) or whose
+    QEMU fails otherwise must not evict a good entry."""
+
+    @staticmethod
+    def _rejected() -> SandboxError:
+        return RouteError(
+            "migrate-incoming command failed",
+            code=ErrorCode.MIGRATION_REJECTED,
+            required={"qemu_version": "a QEMU that accepts this saved state"},
+            found={"qemu_version": "11.2.0"},
+            context=None,
+            hint=None,
+            instance_id=None,
         )
 
-        with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="cancelled"),
-        ):
-            await client._poll_migration(timeout=5.0)
-
-    async def test_poll_raises_on_failing(self) -> None:
-        """Poll should raise on 'failing' status (QEMU 11.0+ error-cleanup state).
-
-        'failing' means an error occurred and cleanup is underway (it transitions
-        to 'failed' shortly). We treat it as terminal so the failure surfaces one
-        poll interval sooner instead of waiting for the 'failed' transition.
-        """
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {"status": "active"}},
-                {"return": {"status": "failing", "error-desc": "write error"}},
-            ]
+    @staticmethod
+    def _unsupported() -> SandboxError:
+        return ConfigError(
+            "QEMU 10.2.0 is below the migration floor 11.0.0",
+            code=ErrorCode.MIGRATION_UNSUPPORTED,
+            context=None,
+            hint=None,
+            instance_id=None,
         )
 
-        with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="failing"),
-        ):
-            await client._poll_migration(timeout=5.0)
-
-    async def test_poll_raises_on_query_error(self) -> None:
-        """Poll should raise MigrationTransientError on query-migrate error response."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"error": {"class": "GenericError", "desc": "query failed"}},
-            ]
+    @staticmethod
+    def _host_dependency() -> SandboxError:
+        return ConfigError(
+            "qemu-vm user not found", code=ErrorCode.HOST_DEPENDENCY, context=None, hint=None, instance_id=None
         )
 
-        with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(MigrationTransientError, match="query-migrate failed"),
-        ):
-            await client._poll_migration(timeout=5.0)
-
-    async def test_poll_timeout(self) -> None:
-        """Poll should raise TimeoutError when migration hangs."""
-        # Feed many "active" responses so the poll loop doesn't exhaust them
-        active_responses = [{"return": {"status": "active"}} for _ in range(500)]
-        client, _reader, _writer = _make_connected(active_responses)
-
-        with (
-            patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001),
-            pytest.raises(TimeoutError),
-        ):
-            await client._poll_migration(timeout=0.05)
-
-
-class TestMigrationClientPollEdgeCases:
-    """Edge cases for _poll_migration."""
-
-    async def test_immediate_completion(self) -> None:
-        """First poll returns completed → immediate return."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {"status": "completed"}},
-            ]
+    @staticmethod
+    def _failed() -> SandboxError:
+        return TransientError(
+            "query-migrate failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
         )
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client._poll_migration(timeout=5.0)
+    @staticmethod
+    def _crashed() -> SandboxError:
+        return TransientError("QEMU exited", code=ErrorCode.QEMU_CRASHED, context=None, hint=None, instance_id=None)
 
-    async def test_unknown_status_keeps_polling(self) -> None:
-        """Unknown migration status keeps polling (until completed/failed/timeout)."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {"status": "setup"}},
-                {"return": {"status": "postcopy-active"}},
-                {"return": {"status": "completed"}},
-            ]
+    @staticmethod
+    def _chained(inner: BaseException, *, link: str) -> BaseException:
+        """`inner` as raised, or under the restore's TransientError wrap: `raise ... from` (cause)
+        or a raise inside the handler without `from` (context only, as _check_qemu_alive does)."""
+        if link == "self":
+            return inner
+        outer = TransientError(
+            "L1 restore failed", code=ErrorCode.MIGRATION_FAILED, context=None, hint=None, instance_id=None
         )
+        try:
+            try:
+                raise inner
+            except BaseException as e:
+                if link == "cause":
+                    raise outer from e
+                raise outer  # noqa: B904 - the context-only link is the case under test
+        except TransientError as raised:
+            return raised
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client._poll_migration(timeout=5.0)
+    @pytest.mark.parametrize("link", ["self", "cause", "context"])
+    @pytest.mark.parametrize(
+        ("make", "refused"),
+        [
+            ("_rejected", True),
+            ("_unsupported", True),
+            ("_host_dependency", False),
+            ("_failed", False),
+            ("_crashed", False),
+        ],
+    )
+    def test_matches_only_refusal_codes(self, make: str, refused: bool, link: str) -> None:
+        error = self._chained(getattr(self, make)(), link=link)
+        assert rejected_by_qemu(error) is refused
 
-    async def test_missing_status_field_keeps_polling(self) -> None:
-        """Response missing 'status' field → empty string → keeps polling."""
-        client, _reader, _writer = _make_connected(
-            [
-                {"return": {}},  # No status field
-                {"return": {"status": "completed"}},
-            ]
-        )
+    def test_refusal_below_a_plain_error_is_found(self) -> None:
+        """The restore wrap, then an OSError (context), then QEMU's refusal (its cause)."""
+        os_error = OSError("QMP socket closed")
+        assert rejected_by_qemu(self._chained(os_error, link="context")) is False
+        os_error.__cause__ = self._rejected()
+        assert rejected_by_qemu(self._chained(os_error, link="context")) is True
 
-        with patch.object(constants, "MEMORY_SNAPSHOT_POLL_INTERVAL_SECONDS", 0.001):
-            await client._poll_migration(timeout=5.0)
+    def test_cycle_in_the_chain_ends(self) -> None:
+        a, b = self._failed(), self._crashed()
+        a.__context__, b.__context__ = b, a
+        assert rejected_by_qemu(a) is False
+
+
+class TestMigrationTimeout:
+    def test_scales_with_ram(self) -> None:
+        base = constants.MIGRATION_TIMEOUT_BASE_SECONDS
+        assert migration_timeout(0) == base
+        assert migration_timeout(4096) > migration_timeout(256) > base
 
 
 # ============================================================================

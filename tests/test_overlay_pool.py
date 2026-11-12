@@ -510,16 +510,18 @@ class TestOverlayPoolErrorHandling:
         await mp.pool.stop()
 
     async def test_daemon_also_fails_after_move(self, mock_pool: types.SimpleNamespace, tmp_path: Path) -> None:
-        """Move + daemon both fail -> QemuStorageDaemonError propagates."""
-        from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
+        """Move + daemon both fail -> the daemon's TransientError OVERLAY_FAILED propagates."""
+        from exec_sandbox.exceptions import ErrorCode, TransientError
 
         mp = mock_pool
         await mp.pool._pools[str(mp.base_image.resolve())].put(mp.overlay)
-        mp.mock_daemon.create_overlay.side_effect = QemuStorageDaemonError("daemon down")
+        mp.mock_daemon.create_overlay.side_effect = TransientError(
+            "daemon down", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None
+        )
 
         with (
             patch("shutil.move", side_effect=OSError("move failed")),
-            pytest.raises(QemuStorageDaemonError, match="daemon down"),
+            pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="daemon down"),
         ):
             await mp.pool.acquire(mp.base_image, tmp_path / "target.qcow2")
 
@@ -623,12 +625,14 @@ class TestOverlayPoolErrorHandling:
     # --- E: _create_and_enqueue edge cases ---
 
     async def test_create_enqueue_daemon_error_not_queued(self, mock_pool: types.SimpleNamespace) -> None:
-        """Daemon raises QemuStorageDaemonError -> queue stays empty."""
-        from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
+        """Daemon raises TransientError OVERLAY_FAILED -> queue stays empty."""
+        from exec_sandbox.exceptions import ErrorCode, TransientError
 
         mp = mock_pool
         key = str(mp.base_image.resolve())
-        mp.mock_daemon.create_overlay.side_effect = QemuStorageDaemonError("daemon error")
+        mp.mock_daemon.create_overlay.side_effect = TransientError(
+            "daemon error", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None
+        )
 
         await mp.pool._create_and_enqueue(mp.base_image, key)
 

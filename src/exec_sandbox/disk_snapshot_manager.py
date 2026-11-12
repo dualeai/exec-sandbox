@@ -37,7 +37,7 @@ import logging
 from tenacity import (
     AsyncRetrying,
     before_sleep_log,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
@@ -45,29 +45,29 @@ from tenacity import (
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_aioboto3
 from exec_sandbox._logging import get_logger
-from exec_sandbox.base_cache_manager import BaseCacheManager
+from exec_sandbox.base_cache_manager import BaseCacheManager, file_stamp
 from exec_sandbox.exceptions import (
-    GuestAgentError,
-    PackageInstallPermanentError,
-    PackageInstallTransientError,
-    PackageNotAllowedError,
-    SnapshotError,
-    VmQemuCrashError,
-    VmTransientError,
+    ConfigError,
+    ErrorCode,
+    InternalError,
+    InvalidInputError,
+    SandboxError,
+    TransientError,
+    spawn_error,
 )
 from exec_sandbox.guest_agent_protocol import (
     InstallPackagesRequest,
     StreamingErrorMessage,
 )
 from exec_sandbox.guest_channel import consume_stream
-from exec_sandbox.hash_utils import crc64
+from exec_sandbox.hash_utils import fingerprint
 from exec_sandbox.lock_utils import file_lock
 from exec_sandbox.models import Language
-from exec_sandbox.overlay_pool import QemuImgError
 from exec_sandbox.qemu_vm import guest_error_to_exception
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings  # noqa: TC001 - Used at runtime
 from exec_sandbox.subprocess_utils import communicate_managed_process
+from exec_sandbox.vm_spec import VmSpec
 
 if TYPE_CHECKING:
     from exec_sandbox.qemu_vm import QemuVM
@@ -108,23 +108,27 @@ _TRANSIENT_NETWORK_PATTERNS: Final[tuple[str, ...]] = (
 """Patterns that indicate a transient network error (may succeed on retry)."""
 
 
-def _classify_install_error(
-    error_output: str,
-) -> type[PackageInstallPermanentError | PackageInstallTransientError] | None:
+def _classify_install_error(error_output: str) -> ErrorCode | None:
     """Two-phase error classification for package install failures.
 
-    Phase 1: Check permanent patterns first (no matching distribution, 404).
-    Phase 2: Check transient patterns (connection reset, timed out).
-    Returns None if neither matches (falls through to generic GuestAgentError).
+    Phase 1: Check permanent patterns first (no matching distribution, 404):
+    PACKAGE_INSTALL_FAILED.
+    Phase 2: Check transient patterns (connection reset, timed out): PACKAGE_DOWNLOAD.
+    Returns None if neither matches (the caller raises PACKAGE_INSTALL_FAILED).
     """
     lower = error_output.lower()
     # Phase 1: Permanent errors take priority — stop retrying immediately
     if any(pattern in lower for pattern in _PERMANENT_PACKAGE_PATTERNS):
-        return PackageInstallPermanentError
+        return ErrorCode.PACKAGE_INSTALL_FAILED
     # Phase 2: Transient errors — retry with backoff
     if any(pattern in lower for pattern in _TRANSIENT_NETWORK_PATTERNS):
-        return PackageInstallTransientError
+        return ErrorCode.PACKAGE_DOWNLOAD
     return None
+
+
+def _is_package_download(error: BaseException) -> bool:
+    """The install retry predicate: a network failure of the package manager."""
+    return isinstance(error, SandboxError) and error.code is ErrorCode.PACKAGE_DOWNLOAD
 
 
 class DiskSnapshotManager(BaseCacheManager):
@@ -217,9 +221,16 @@ class DiskSnapshotManager(BaseCacheManager):
             Path to snapshot qcow2 file.
 
         Raises:
-            SnapshotError: Snapshot creation failed
+            TransientError: QEMU_CRASHED, LOCAL_DISK, OVERLAY_FAILED, PACKAGE_DOWNLOAD,
+                GUEST_UNAVAILABLE: snapshot creation failed, can succeed later
+            InvalidInputError: ARGUMENT_INVALID (the guest refused the package list),
+                PACKAGE_INSTALL_FAILED
+            ConfigError: HOST_DEPENDENCY (qemu-img missing or not executable),
+                SETTING_INVALID (no write access to the build files, a read-only disk, a cache
+                folder that cannot be made again)
+            InternalError: INTERNAL: unclassified creation failure
         """
-        cache_key = self._compute_cache_key(language, packages)
+        cache_key = await asyncio.to_thread(self._compute_cache_key, language, packages)
 
         # Fast path: Check L2 cache without lock (read-only, safe for concurrent access)
         snapshot_path = await self._check_l2_cache(cache_key)
@@ -377,12 +388,32 @@ class DiskSnapshotManager(BaseCacheManager):
             Path to created qcow2 snapshot
 
         Raises:
-            SnapshotError: Creation failed
-            VmQemuCrashError: VM crashed during snapshot creation
+            TransientError: QEMU_CRASHED (VM crashed during snapshot creation),
+                LOCAL_DISK (disk full after eviction retry, other local disk error),
+                OVERLAY_FAILED, PACKAGE_DOWNLOAD, GUEST_UNAVAILABLE
+            InvalidInputError: ARGUMENT_INVALID (the guest refused the package list),
+                PACKAGE_INSTALL_FAILED
+            ConfigError: HOST_DEPENDENCY (qemu-img missing or not executable),
+                SETTING_INVALID (no write access to the build files, a read-only disk)
+            InternalError: INTERNAL: any other failure
         """
         start_time = asyncio.get_running_loop().time()
         snapshot_path = self._cache_path(cache_key)
+        # Build under a private name: lock-free readers (_check_l2_cache) never see
+        # a half-built image, and the final name appears only after a clean exit.
+        build_path = _part_path(snapshot_path)
         success = False
+        retry = False
+
+        def build_failed(error: BaseException) -> InternalError:
+            """A build failure this code does not expect (a bug, not the guest or the disk)."""
+            return InternalError(
+                f"Failed to create snapshot: {error}",
+                code=ErrorCode.INTERNAL,
+                context={"cache_key": cache_key, "language": language, "packages": packages, "tenant_id": tenant_id},
+                hint=None,
+                instance_id=None,
+            )
 
         # Ensure snapshot VMs have enough memory for package managers (uv/bun).
         # Under TCG, uv cold-start JIT + TLS crypto pushes RSS above 192MB,
@@ -460,24 +491,30 @@ class DiskSnapshotManager(BaseCacheManager):
                     # Verify QEMU exited cleanly
                     if we_initiated_shutdown:
                         if vm.process.returncode not in {0, -9, -15}:
-                            raise VmQemuCrashError(
+                            raise TransientError(
                                 f"QEMU exited unexpectedly after terminate (exit code {vm.process.returncode})",
+                                code=ErrorCode.QEMU_CRASHED,
                                 context={
                                     "cache_key": cache_key,
                                     "exit_code": vm.process.returncode,
                                     "language": language,
                                     "packages": packages,
                                 },
+                                hint=None,
+                                instance_id=None,
                             )
                     elif vm.process.returncode != 0:
-                        raise VmQemuCrashError(
+                        raise TransientError(
                             f"QEMU died unexpectedly during snapshot creation (exit code {vm.process.returncode})",
+                            code=ErrorCode.QEMU_CRASHED,
                             context={
                                 "cache_key": cache_key,
                                 "exit_code": vm.process.returncode,
                                 "language": language,
                                 "packages": packages,
                             },
+                            hint=None,
+                            instance_id=None,
                         )
                     else:
                         logger.info(
@@ -485,59 +522,48 @@ class DiskSnapshotManager(BaseCacheManager):
                             extra={"cache_key": cache_key, "language": language},
                         )
 
-                    success = True
                 # ephemeral_vm's finally calls destroy_vm (idempotent)
+                build_path.replace(snapshot_path)
+                success = True
 
             # Handle disk full (lazy eviction)
             except OSError as e:
-                if e.errno == errno.ENOSPC:
-                    if _enospc_retried:
-                        raise SnapshotError(
-                            f"Disk full after eviction retry for snapshot {cache_key}",
-                            context={"cache_key": cache_key, "language": language, "packages": packages},
-                        ) from e
+                if isinstance(e, TimeoutError):  # an OSError in Python, not a disk error: unexpected here
+                    raise build_failed(e) from e
+                if e.errno == errno.ENOSPC and not _enospc_retried:
                     await self._evict_oldest_snapshot()
-                    return await self._create_snapshot(
-                        language, packages, cache_key, tenant_id, task_id, memory_mb, _enospc_retried=True
-                    )
-                raise
+                    retry = True  # after the semaphore is released: the retry takes it again
+                else:
+                    raise _file_error(e, cache_key=cache_key, language=language, packages=packages) from e
 
-            except (SnapshotError, PackageNotAllowedError, PackageInstallPermanentError, asyncio.CancelledError):
+            except (asyncio.CancelledError, SandboxError):
                 raise
-
-            except VmTransientError as e:
-                raise SnapshotError(
-                    f"VM crashed during snapshot creation: {e}",
-                    context={
-                        "cache_key": cache_key,
-                        "language": language,
-                        "packages": packages,
-                        "tenant_id": tenant_id,
-                    },
-                ) from e
 
             except Exception as e:
-                raise SnapshotError(
-                    f"Failed to create snapshot: {e}",
-                    context={
-                        "cache_key": cache_key,
-                        "language": language,
-                        "packages": packages,
-                        "tenant_id": tenant_id,
-                    },
-                ) from e
+                raise build_failed(e) from e
 
             finally:
-                # Cleanup snapshot file on failure
-                if not success and snapshot_path.exists():
+                # Cleanup the private build file on failure
+                if not success and build_path.exists():
                     try:
-                        snapshot_path.unlink()
-                        logger.debug("Snapshot file cleaned up on failure", extra={"cache_key": cache_key})
+                        await asyncio.to_thread(build_path.unlink)  # up to GBs
+                        logger.debug("Snapshot build file cleaned up on failure", extra={"cache_key": cache_key})
                     except OSError as e:
                         logger.warning(
-                            "Failed to cleanup snapshot file",
+                            "Failed to cleanup snapshot build file",
                             extra={"cache_key": cache_key, "error": str(e)},
                         )
+
+        if retry:
+            return await self._create_snapshot(
+                language,
+                packages,
+                cache_key=cache_key,
+                tenant_id=tenant_id,
+                task_id=task_id,
+                memory_mb=memory_mb,
+                _enospc_retried=True,
+            )
 
         # Record snapshot creation duration
         duration_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
@@ -575,35 +601,36 @@ class DiskSnapshotManager(BaseCacheManager):
             tenant_id: Tenant identifier
 
         Raises:
-            SnapshotError: qemu-img command failed
+            TransientError: OVERLAY_FAILED: qemu-img command failed
         """
-        try:
-            returncode, _, stderr = await communicate_managed_process(
-                [
-                    "qemu-img",
-                    "create",
-                    "-f",
-                    "qcow2",
-                    "-o",
-                    "cluster_size=128k,lazy_refcounts=on,extended_l2=on",
-                    str(snapshot_path),
-                    "512M",
-                ],
-                process_name="qemu-img-create-snapshot",
-                context_id=cache_key,
-            )
-            if returncode != 0:
-                raise QemuImgError(f"qemu-img create failed: {stderr.decode().strip()}")
-        except QemuImgError as e:
-            raise SnapshotError(
-                str(e),
+        returncode, _, stderr = await _qemu_img(
+            [
+                "create",
+                "-f",
+                "qcow2",
+                "-o",
+                "cluster_size=128k,lazy_refcounts=on,extended_l2=on",
+                str(snapshot_path),
+                f"{_L2_VIRTUAL_SIZE_MB}M",
+            ],
+            process_name="qemu-img-create-snapshot",
+            cache_key=cache_key,
+        )
+        if returncode != 0:
+            stderr_text = stderr.decode().strip()
+            raise TransientError(
+                f"qemu-img create failed: {stderr_text}",
+                code=ErrorCode.OVERLAY_FAILED,
                 context={
                     "cache_key": cache_key,
                     "language": language,
                     "packages": packages,
                     "tenant_id": tenant_id,
+                    "stderr": stderr_text,
                 },
-            ) from e
+                hint=None,
+                instance_id=None,
+            )
 
     async def _monitor_vm_death(self, vm: QemuVM, cache_key: str) -> None:
         """Monitor VM process for unexpected death during snapshot creation."""
@@ -613,9 +640,12 @@ class DiskSnapshotManager(BaseCacheManager):
             "VM died during snapshot creation",
             extra={**asdict(diag), "cache_key": cache_key},
         )
-        raise VmQemuCrashError(
+        raise TransientError(
             f"VM process died during snapshot creation (exit code {returncode})",
-            diagnostics=diag,
+            code=ErrorCode.QEMU_CRASHED,
+            context=asdict(diag),
+            hint=None,
+            instance_id=None,
         )
 
     async def _install_packages(
@@ -666,8 +696,10 @@ class DiskSnapshotManager(BaseCacheManager):
             )
             exc = guest_error_to_exception(msg, vm.vm_id, operation="install_packages")
             # Guest timeouts during install are transient — wrap so tenacity retries
-            if isinstance(exc, VmTransientError):
-                raise PackageInstallTransientError(str(exc), context={"vm_id": vm.vm_id}) from exc
+            if isinstance(exc, TransientError):
+                raise TransientError(
+                    str(exc), code=ErrorCode.PACKAGE_DOWNLOAD, context={"vm_id": vm.vm_id}, hint=None, instance_id=None
+                ) from exc
             raise exc
 
         try:
@@ -678,7 +710,7 @@ class DiskSnapshotManager(BaseCacheManager):
                         min=constants.PACKAGE_INSTALL_RETRY_MIN_SECONDS,
                         max=constants.PACKAGE_INSTALL_RETRY_MAX_SECONDS,
                     ),
-                    retry=retry_if_exception_type(PackageInstallTransientError),
+                    retry=retry_if_exception(_is_package_download),
                     before_sleep=before_sleep_log(logger, logging.WARNING),
                     reraise=True,
                 ):

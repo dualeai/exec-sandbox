@@ -11,9 +11,11 @@ References:
 
 import pytest
 
-from exec_sandbox.exceptions import OutputLimitError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 
 # =============================================================================
@@ -243,18 +245,16 @@ print(len(s))
         code = """
 print("9" * 2_000_000)
 """
-        with pytest.raises(OutputLimitError):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-            )
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
     async def test_user_env_var_cannot_override_limit(self, scheduler: Scheduler) -> None:
         """User env_vars are injected as Python code (os.environ), too late to affect
         PYTHONINTMAXSTRDIGITS which is read at interpreter startup."""
-        result = await scheduler.run(
-            code="import sys; print(sys.get_int_max_str_digits())",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler,
+            VmSpec(language=Language.PYTHON),
+            "import sys; print(sys.get_int_max_str_digits())",
             env_vars={"PYTHONINTMAXSTRDIGITS": "1000"},
         )
 

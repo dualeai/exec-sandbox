@@ -6,18 +6,18 @@ the gvproxy-wrapper process that provides network connectivity with outbound fil
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.assets import get_gvproxy_path
 from exec_sandbox.dns_filter import generate_outbound_allow_json
-from exec_sandbox.exceptions import VmDependencyError, VmGvproxyError
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError, spawn_error
 from exec_sandbox.models import ExposedPort
 from exec_sandbox.permission_utils import grant_qemu_vm_access
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.socket_auth import create_unix_socket
-from exec_sandbox.subprocess_utils import drain_subprocess_output, log_task_exception, start_managed_process
+from exec_sandbox.subprocess_utils import start_drain, start_managed_process
 from exec_sandbox.vm_working_directory import VmWorkingDirectory
 
 logger = get_logger(__name__)
@@ -106,23 +106,30 @@ async def start_gvproxy(  # noqa: PLR0915
         parent_sock = create_unix_socket(str(socket_path))
         socket_fd = parent_sock.fileno()
     except OSError as e:
-        raise VmGvproxyError(
+        raise TransientError(
             f"Failed to create gvproxy socket: {e}",
+            code=ErrorCode.GVPROXY_FAILED,
             context={
                 "vm_id": vm_id,
                 "language": language,
                 "socket_path": str(socket_path),
             },
+            hint=None,
+            instance_id=None,
         ) from e
 
     # Start gvproxy-wrapper with pre-bound FD
     gvproxy_binary = await get_gvproxy_path()
     if gvproxy_binary is None:
         parent_sock.close()
-        raise VmDependencyError(
+        raise ConfigError(
             "gvproxy-wrapper binary not found. "
             "Either enable auto_download_assets=True in SchedulerConfig, "
-            "or run 'make build' to build it locally."
+            "or run 'make build' to build it locally.",
+            code=ErrorCode.HOST_DEPENDENCY,
+            context=None,
+            hint=None,
+            instance_id=None,
         )
 
     # Build gvproxy-wrapper command arguments
@@ -240,13 +247,16 @@ async def start_gvproxy(  # noqa: PLR0915
     except TimeoutError:
         parent_sock.close()
         await cleanup_process(proc, "gvproxy", vm_id)
-        raise VmGvproxyError(
+        raise TransientError(
             "gvproxy-wrapper did not become ready in time",
+            code=ErrorCode.GVPROXY_FAILED,
             context={
                 "vm_id": vm_id,
                 "language": language,
                 "socket_path": str(socket_path),
             },
+            hint=None,
+            instance_id=None,
         ) from None
     except BaseException:
         # CancelledError or other unexpected exception — clean up socket and process

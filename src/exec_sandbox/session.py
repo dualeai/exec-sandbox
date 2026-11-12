@@ -139,14 +139,13 @@ class Session:
 
         On the way out it also owns VM retirement for cancellation and
         unknown-outcome failures: any dispatched guest operation may still be
-        running after CancelledError or CommunicationOutcomeUnknownError, so
-        the session is closed before either propagates.
+        running after CancelledError or OutcomeUnknownError, so the session
+        is closed before either propagates.
         """
-        if self._closed:
-            raise SessionClosedError("Session is closed")
+        self._check_open()
         async with self._exec_lock:
             if self._closed:
-                raise SessionClosedError("Session closed while waiting for lock")
+                raise _session_closed("Session closed while waiting for lock")
             if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED) or self._vm.process.returncode is not None:
                 # QEMU died while the session was idle: the process-exit
                 # watcher (armed lazily on first execute) publishes DESTROYING;
@@ -154,7 +153,7 @@ class Session:
                 # returncode. Fail fast instead of letting every operation
                 # time out one transient error at a time.
                 await self._close_for_failure()
-                raise SessionClosedError("Session VM was retired")
+                raise _session_closed("Session VM was retired")
             self._cancel_idle_timer()
             try:
                 yield
@@ -164,7 +163,7 @@ class Session:
                 # file/list operations as well as code execution.
                 await self._close_for_failure()
                 raise
-            except CommunicationOutcomeUnknownError:
+            except OutcomeUnknownError:
                 # Dispatch may have reached the guest. Retire before exposing
                 # the reconciliation-required error so no API can reuse a VM
                 # whose command outcome is unknown.
@@ -174,11 +173,18 @@ class Session:
                 if not self._closed:
                     self._reset_idle_timer()
 
+    def _check_open(self) -> None:
+        """Raise SessionClosedError on a closed session. Every call checks it first, before
+        its arguments and before any local file: on a closed session, whatever the
+        arguments, the caller must open a new session (RESTART)."""
+        if self._closed:
+            raise _session_closed("Session is closed")
+
     async def _close_for_failure(self) -> None:
         """Close the session without letting a close-time error mask the
         primary failure (or swallow the CancelledError) being propagated."""
         try:
-            await self.close()
+            await self._close()
         except Exception:
             logger.exception(
                 "Session close failed while handling a prior failure",
@@ -219,7 +225,7 @@ class Session:
             size = content.tell()
             content.seek(pos)
             if size - pos > MAX_FILE_SIZE_BYTES:
-                raise ValueError(f"Stream content is {size - pos} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
+                raise _bad_argument(f"Stream content is {size - pos} bytes, exceeds {MAX_FILE_SIZE_BYTES}")
         return content, False
 
     # -------------------------------------------------------------------------
@@ -254,29 +260,30 @@ class Session:
             ExecutionResult with stdout, stderr, exit_code, timing info.
 
         Raises:
-            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
-            EnvVarValidationError: Invalid env var names/values (control chars, size limits).
-            OutputLimitError: stdout/stderr exceeded guest-enforced limits (session stays alive).
-            SessionClosedError: Session has been closed.
-            VmPermanentError: VM communication failed (session auto-closed).
-            VmTransientError: VM communication failed (session auto-closed).
-            VmBootTimeoutError: Host deadline hit before command dispatch or
-                guest connection timed out (session auto-closed) — not a
-                user-code timeout; those return exit_code=-1.
-            CommunicationOutcomeUnknownError: Transport failed after dispatch;
-                the session is closed and callers must reconcile before retrying.
-
-        Note:
-            Execution timeouts (guest agent level) return a result with
-            exit_code=-1 and timeout message in stderr — they do NOT raise.
-            Only VM-level failures (communication errors) raise exceptions.
+            TransientError: GUEST_UNAVAILABLE: the VM communication failed or timed out
+                before the code was sent (the session closes). A timeout of your code
+                does not raise: it returns exit_code -1 with the reason in stderr.
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN: the transport failed after the
+                code was sent; the session is closed. Check the side effects of the
+                code before you retry.
+            SessionClosedError: The session is closed (checked first, whatever the arguments).
+            InvalidInputError: The session stays open. ARGUMENT_INVALID (timeout
+                out of range), CODE_INVALID (code empty, only spaces, too large, or
+                with null bytes), ENV_VAR_INVALID (control characters, size
+                limits), OUTPUT_LIMIT (stdout or stderr went above the guest
+                limit).
+            InternalError: Protocol failure (the session closes).
         """
+        self._check_open()
         if timeout_seconds is not None and (timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS):
-            raise ValueError(f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}")
+            raise _bad_argument(f"timeout_seconds must be between 1 and {MAX_TIMEOUT_SECONDS}, got {timeout_seconds}")
         if len(code) > MAX_CODE_SIZE:
-            raise VmConfigError(
+            raise InvalidInputError(
                 f"Code too large: {len(code)} bytes exceeds {MAX_CODE_SIZE} byte limit",
+                code=ErrorCode.CODE_INVALID,
                 context={"code_size": len(code), "max_code_size": MAX_CODE_SIZE},
+                hint=None,
+                instance_id=None,
             )
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
 
@@ -290,13 +297,9 @@ class Session:
                     on_stdout=on_stdout,
                     on_stderr=on_stderr,
                 )
-            except InputValidationError:
-                # Input validation errors are caller bugs, not VM failures.
-                # Session stays alive — caller can retry with valid input.
-                raise
-            except OutputLimitError:
-                # Output limit exceeded — guest-enforced, REPL preserved.
-                # Session stays alive — caller can retry with less output.
+            except InvalidInputError:
+                # Caller bugs (bad input, output above the guest limit), not VM
+                # failures: the REPL is preserved and the session stays alive.
                 raise
             except Exception:
                 # VM failure — auto-close session. CancelledError is handled by

@@ -30,14 +30,72 @@ from typing import TYPE_CHECKING, Any, Self
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_cancellation_safe
-from exec_sandbox.exceptions import MigrationTransientError
+from exec_sandbox.exceptions import (
+    CommunicationError,
+    ConfigError,
+    ErrorCode,
+    RouteError,
+    SandboxError,
+    TransientError,
+)
 from exec_sandbox.qmp_exchange import qmp_id_exchange
 from exec_sandbox.socket_auth import connect_and_verify
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
 logger = get_logger(__name__)
+
+_CONNECT_TIMEOUT_SECONDS = 5.0
+_QMP_TIMEOUT = constants.MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS
+
+
+def rejected_by_qemu(error: BaseException) -> bool:
+    """A MIGRATION_REJECTED or MIGRATION_UNSUPPORTED error anywhere in the cause/context
+    chain (a QEMU that died while refusing the stream is reported by an error raised
+    without `from`). By code: a setup failure of the restore (HOST_DEPENDENCY, for
+    example) must not count as a refusal of the saved state."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, SandboxError) and current.code in _REFUSED:
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+_REFUSED = frozenset({ErrorCode.MIGRATION_REJECTED, ErrorCode.MIGRATION_UNSUPPORTED})
+
+
+def _failed(message: str, *, context: dict[str, Any] | None) -> TransientError:
+    """The TransientError (MIGRATION_FAILED) of a save or load that QEMU did not finish."""
+    return TransientError(message, code=ErrorCode.MIGRATION_FAILED, context=context, hint=None, instance_id=None)
+
+
+def _unsupported(message: str) -> ConfigError:
+    """The ConfigError (MIGRATION_UNSUPPORTED) of a QEMU that cannot save or load VM state."""
+    return ConfigError(message, code=ErrorCode.MIGRATION_UNSUPPORTED, context=None, hint=None, instance_id=None)
+
+
+def _rejected(message: str, *, qemu_version: tuple[int, int, int] | None) -> RouteError:
+    """The RouteError (MIGRATION_REJECTED) of a saved state this QEMU refuses."""
+    found = ".".join(map(str, qemu_version)) if qemu_version else "unknown"
+    return RouteError(
+        message,
+        code=ErrorCode.MIGRATION_REJECTED,
+        required={"qemu_version": "a QEMU that accepts this saved state"},
+        found={"qemu_version": found},
+        context=None,
+        hint=None,
+        instance_id=None,
+    )
+
+
+def migration_timeout(memory_mb: float) -> float:
+    """Save/restore timeout: a fixed base plus the time to move the whole guest RAM at a slow disk rate."""
+    return constants.MIGRATION_TIMEOUT_BASE_SECONDS + memory_mb / constants.MIGRATION_MIN_THROUGHPUT_MB_PER_SECOND
 
 
 class MigrationClient:
@@ -110,17 +168,18 @@ class MigrationClient:
                 )
                 resp_data = json.loads(response)
                 if "error" in resp_data:
-                    raise MigrationTransientError(f"QMP capabilities failed: {resp_data['error']}")
+                    raise _failed(f"QMP capabilities failed: {resp_data['error']}", context=None)
 
                 self._connected = True
                 logger.debug("QMP connection established (migration)")
 
             except BaseException as error:  # Every failed handshake owns socket cleanup.
                 await self._cleanup_after_connect_failure()
-                if isinstance(error, asyncio.CancelledError | MigrationTransientError):
+                if isinstance(error, asyncio.CancelledError | SandboxError):
                     raise
-                if isinstance(error, OSError | TimeoutError | json.JSONDecodeError):
-                    raise MigrationTransientError(f"QMP connection failed: {error}") from error
+                # CommunicationError: SocketAuthError, internal; the guest channel wraps it the same way.
+                if isinstance(error, OSError | TimeoutError | json.JSONDecodeError | CommunicationError):
+                    raise _failed(f"QMP connection failed: {error}", context=None) from error
                 raise
 
     async def close(self) -> None:

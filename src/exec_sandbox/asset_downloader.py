@@ -283,14 +283,16 @@ class AsyncPooch:
             Path to the local file
 
         Raises:
-            AssetNotFoundError: File not in registry
-            AssetDownloadError: Download failed
-            AssetChecksumError: Hash verification failed
+            ConfigError: ASSET_NOT_FOUND: file not in registry
+            TransientError: ASSET_DOWNLOAD: download or hash verification failed
         """
         if fname not in self.registry:
-            raise AssetNotFoundError(
+            raise ConfigError(
                 f"File '{fname}' not in registry",
+                code=ErrorCode.ASSET_NOT_FOUND,
                 context={"available": list(self.registry.keys())},
+                hint=None,
+                instance_id=None,
             )
 
         known_hash = self.registry[fname]

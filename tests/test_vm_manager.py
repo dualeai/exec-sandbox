@@ -19,26 +19,20 @@ from pydantic import ValidationError
 from exec_sandbox import constants
 from exec_sandbox.constants import GuestErrorType
 from exec_sandbox.exceptions import (
-    CodeValidationError,
     CommunicationError,
-    CommunicationOutcomeUnknownError,
-    EnvVarValidationError,
-    InputValidationError,
-    OutputLimitError,
-    PackageNotAllowedError,
+    ConfigError,
+    ErrorCode,
+    InternalError,
+    InvalidInputError,
+    OutcomeUnknownError,
     SandboxError,
+    SessionClosedError,
     SocketAuthError,
-    VmBootTimeoutError,
-    VmDependencyError,
-    VmError,
-    VmOverlayError,
-    VmPermanentError,
-    VmQemuCrashError,
-    VmTransientError,
+    TransientError,
 )
 from exec_sandbox.models import ExposedPort, Language
-from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
-from exec_sandbox.qemu_vm import QemuVM
+from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os, detect_host_x86_vendor
+from exec_sandbox.qemu_vm import QemuDiagnostics, QemuVM
 from exec_sandbox.system_probes import (
     NOT_CACHED,
     _check_tsc_deadline_linux,  # pyright: ignore[reportPrivateUsage]
@@ -1820,20 +1814,18 @@ class TestArm64TcgVersionGuard(_QemuCmdTestBase):
         qemu_version: tuple[int, int, int] | None,
         should_raise: bool,
     ) -> None:
-        """ARM64 TCG raises VmDependencyError for QEMU < 9.0.4."""
+        """ARM64 TCG raises ConfigError HOST_DEPENDENCY for QEMU < 9.0.4."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks(qemu_version=qemu_version, accel_type=AccelType.TCG):
             if should_raise:
-                with pytest.raises(VmDependencyError):
+                with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY):
                     await build_qemu_cmd(
                         settings=vm_settings,
                         arch=HostArch.AARCH64,
                         vm_id="test-vm-arm64-tcg",
                         workdir=workdir,
-                        memory_mb=256,
-                        cpu_cores=1,
-                        allow_network=False,
+                        spec=VmSpec(language=Language.PYTHON, memory_mb=256, cpu_cores=1, allow_network=False),
                     )
             else:
                 cmd = await build_qemu_cmd(
@@ -3046,7 +3038,9 @@ class TestDestroyVmStatus:
             stop_task = asyncio.create_task(unit_test_vm_manager.stop())
             await admission_stopped.wait()
 
-            with pytest.raises(VmPermanentError, match="stopping"):
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE, match="stopping"
+            ):
                 async with unit_test_vm_manager._launch_operation():
                     pytest.fail("launch entered after STOPPING")
             assert not stop_task.done()
@@ -3180,11 +3174,42 @@ class TestPendingLaunchOwnership:
             ),
             patch.object(unit_test_vm_manager._admission, "release", new_callable=AsyncMock) as release,
         ):
-            assert await unit_test_vm_manager._cleanup_failed_owner(pending.vm_id) is True
+            await unit_test_vm_manager._cleanup_failed_owner(
+                pending.vm_id, operation="boot_failure_cleanup", error=RuntimeError("boot failed")
+            )
 
         assert pending.vm_id not in unit_test_vm_manager._pending_launches
         assert pending.reservation is reservation
         release.assert_not_awaited()
+
+    async def test_unconfirmed_attempt_cleanup_raises_cleanup_unconfirmed(self, unit_test_vm_manager) -> None:
+        """A failed attempt whose cleanup is not confirmed: InternalError CLEANUP_UNCONFIRMED,
+        caused by the attempt's failure; the owner stays published for the reaper."""
+        _infra, _reservation, pending = self._pending(unit_test_vm_manager)
+        cleanup = {"qemu": False, "gvproxy": True, "workdir": False, "cgroup": False}
+        failure = RuntimeError("boot failed")
+
+        with (
+            patch.object(
+                unit_test_vm_manager,
+                "_force_cleanup_all_resources",
+                new_callable=AsyncMock,
+                return_value=cleanup,
+            ),
+            patch.object(unit_test_vm_manager, "_schedule_failed_pending_cleanup_retry"),
+        ):
+            with pytest.raises(
+                InternalError,
+                check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED,
+                match=r"^VM resource cleanup was not confirmed for pending-launch-vm \(boot_failure_cleanup\)$",
+            ) as exc_info:
+                await unit_test_vm_manager._cleanup_failed_owner(
+                    pending.vm_id, operation="boot_failure_cleanup", error=failure
+                )
+
+        assert exc_info.value.__cause__ is failure
+        assert exc_info.value.context == {"vm_id": "pending-launch-vm", "operation": "boot_failure_cleanup"}
+        assert unit_test_vm_manager._pending_launches[pending.vm_id] is pending
 
     async def test_ancillary_cleanup_failure_retains_retry_owner(self, unit_test_vm_manager) -> None:
         """A removed process is not enough to forget leaked workdir/cgroup state."""
@@ -3257,12 +3282,11 @@ class TestPendingLaunchOwnership:
             assert len(unit_test_vm_manager._pending_launches) == 1
             return True
 
-        async def cleanup_owner(vm_id: str) -> bool:
+        async def cleanup_owner(vm_id: str, **_kwargs: object) -> None:
             nonlocal observed_path
             pending = unit_test_vm_manager._pending_launches[vm_id]
             observed_path = pending.cgroup_path
             unit_test_vm_manager._pending_launches.pop(vm_id)
-            return True
 
         with (
             patch("exec_sandbox.vm_manager.validate_kernel_initramfs", new_callable=AsyncMock),
@@ -3295,12 +3319,11 @@ class TestPendingLaunchOwnership:
         actual_cgroup = Path("/tmp/actual-cgroup")
         observed_path: Path | None = None
 
-        async def cleanup_owner(vm_id: str) -> bool:
+        async def cleanup_owner(vm_id: str, **_kwargs: object) -> None:
             nonlocal observed_path
             pending = unit_test_vm_manager._pending_launches[vm_id]
             observed_path = pending.cgroup_path
             unit_test_vm_manager._pending_launches.pop(vm_id)
-            return True
 
         with (
             patch("exec_sandbox.vm_manager.validate_kernel_initramfs", new_callable=AsyncMock),
@@ -3313,17 +3336,21 @@ class TestPendingLaunchOwnership:
                 unit_test_vm_manager._overlay_pool,
                 "acquire",
                 new_callable=AsyncMock,
-                side_effect=VmOverlayError("overlay"),
+                side_effect=TransientError(
+                    "overlay", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None
+                ),
             ),
             patch("exec_sandbox.vm_manager.cgroup.setup_cgroup", new_callable=AsyncMock, return_value=actual_cgroup),
             patch.object(unit_test_vm_manager, "_cleanup_failed_owner", side_effect=cleanup_owner),
         ):
-            with pytest.raises(VmOverlayError, match="overlay"):
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="overlay"):
                 await unit_test_vm_manager._setup_vm_infra(
-                    Language.PYTHON,
+                    VmSpec(language=Language.PYTHON),
                     "tenant",
                     "task",
                     reservation,
+                    base_image=Path("/fake/base.qcow2"),
+                    home_template=None,
                 )
 
         assert observed_path == actual_cgroup
@@ -3435,11 +3462,11 @@ class TestKernelInitramfsValidation:
         await validate_kernel_initramfs(vm_settings.kernel_path, arch)
 
     async def test_validation_fails_with_fake_path(self) -> None:
-        """Validation raises VmError when kernel doesn't exist."""
+        """Validation raises ConfigError ASSET_NOT_FOUND when kernel doesn't exist."""
         arch = detect_host_arch()
         fake_path = Path("/nonexistent/kernels")
 
-        with pytest.raises(VmError, match="Kernel not found"):
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND, match="Kernel not found"):
             await validate_kernel_initramfs(fake_path, arch)
 
     async def test_cache_prevents_repeated_io(self, vm_settings) -> None:
@@ -3463,7 +3490,7 @@ class TestKernelInitramfsValidation:
 
         # Different path still gets validated (and fails)
         fake_path = Path("/nonexistent/kernels")
-        with pytest.raises(VmError, match="Kernel not found"):
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND, match="Kernel not found"):
             await validate_kernel_initramfs(fake_path, arch)
 
     async def test_validation_accepts_vmlinux_only(self, tmp_path: Path) -> None:
@@ -3509,7 +3536,7 @@ class TestKernelInitramfsValidation:
         # Only initramfs, no kernel
         (tmp_path / f"initramfs-{arch_suffix}").write_text("fake-cpio")
 
-        with pytest.raises(VmDependencyError, match="Kernel not found"):
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND, match="Kernel not found"):
             await validate_kernel_initramfs(tmp_path, arch)
 
 
@@ -4371,29 +4398,29 @@ class TestExecuteStateRace:
     """
 
     async def test_execute_rejects_destroying_state(self) -> None:
-        """execute() raises VmError if state is DESTROYING (caught by initial check)."""
+        """execute() raises InternalError INTERNAL if state is DESTROYING (caught by initial check)."""
         # Create a minimal mock VM
         vm = object.__new__(QemuVM)
         vm._state = VmState.DESTROYING
         vm._state_lock = asyncio.Lock()
         vm.vm_id = "test-vm-123"
-        vm.language = "python"
+        vm.spec = VmSpec(language=Language.PYTHON)
 
-        with pytest.raises(VmError) as exc_info:
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.INTERNAL) as exc_info:
             await vm.execute(code="print('hello')", timeout_seconds=5)
 
         # Initial check catches non-READY state
         assert "Cannot execute in state destroying" in str(exc_info.value)
 
     async def test_execute_rejects_destroyed_state(self) -> None:
-        """execute() raises VmError if state is DESTROYED (caught by initial check)."""
+        """execute() raises InternalError INTERNAL if state is DESTROYED (caught by initial check)."""
         vm = object.__new__(QemuVM)
         vm._state = VmState.DESTROYED
         vm._state_lock = asyncio.Lock()
         vm.vm_id = "test-vm-123"
-        vm.language = "python"
+        vm.spec = VmSpec(language=Language.PYTHON)
 
-        with pytest.raises(VmError) as exc_info:
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.INTERNAL) as exc_info:
             await vm.execute(code="print('hello')", timeout_seconds=5)
 
         # Initial check catches non-READY state
@@ -4427,7 +4454,7 @@ class TestExecuteStateRace:
         with patch("exec_sandbox.qemu_vm.ExecuteCodeRequest") as mock_request:
             mock_request.side_effect = lambda **kwargs: (change_state_to_destroying(), None)[1] or AsyncMock()
 
-            with pytest.raises(VmError) as exc_info:
+            with pytest.raises(SessionClosedError, check=lambda e: e.code is ErrorCode.SESSION_CLOSED) as exc_info:
                 await vm.execute(code="print('hello')", timeout_seconds=5)
 
             assert race_triggered, "Race condition was not triggered"
@@ -4450,7 +4477,7 @@ class TestExecuteStateRace:
         with patch("exec_sandbox.qemu_vm.ExecuteCodeRequest") as mock_request:
             mock_request.side_effect = lambda **kwargs: (change_state_to_destroyed(), None)[1] or AsyncMock()
 
-            with pytest.raises(VmError) as exc_info:
+            with pytest.raises(SessionClosedError, check=lambda e: e.code is ErrorCode.SESSION_CLOSED) as exc_info:
                 await vm.execute(code="print('hello')", timeout_seconds=5)
 
             assert "VM destroyed during execution start" in str(exc_info.value)
@@ -4495,10 +4522,12 @@ class TestExecuteEnvVarValidation:
         ],
     )
     async def test_control_chars_raise_env_var_validation_error(self, vm, env_vars: dict[str, str], match: str) -> None:
-        with pytest.raises(EnvVarValidationError, match=match) as exc_info:
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ENV_VAR_INVALID, match=match
+        ) as exc_info:
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
         assert isinstance(exc_info.value, SandboxError)
-        assert exc_info.value.__cause__ is not None
+        assert exc_info.value.__cause__ is None  # the ValidationError holds every env var value
         assert exc_info.value.context["vm_id"] == "test-vm-envvar"
 
     # -- Size / count limits -----------------------------------------------
@@ -4561,7 +4590,7 @@ class TestExecuteEnvVarValidation:
         ],
     )
     async def test_adversarial_values_raise_env_var_validation_error(self, vm, env_vars: dict[str, str]) -> None:
-        with pytest.raises(EnvVarValidationError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ENV_VAR_INVALID):
             await vm.execute(code="x", timeout_seconds=5, env_vars=env_vars)
 
 
@@ -4696,7 +4725,13 @@ class _BlockingExecutionChannel:
     ) -> AsyncGenerator:
         try:
             await self.failed.wait()
-            raise CommunicationOutcomeUnknownError("event transport closed")
+            raise OutcomeUnknownError(
+                "event transport closed",
+                code=ErrorCode.GUEST_OUTCOME_UNKNOWN,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
             yield  # type: ignore[unreachable]
         finally:
             self.cancelled.set()
@@ -4777,54 +4812,56 @@ class TestExecuteExceptionWrapping:
         vm = QemuVM(
             vm_id="test-exec-wrap",
             process=mock_process,
-            cgroup_path=None,  # disables _read_cgroup_stats I/O
+            cgroup_path=None,  # disables read_cgroup_stats I/O
             workdir=mock_workdir,
             channel=channel,  # type: ignore[arg-type]
-            language=Language.PYTHON,
+            spec=VmSpec(language=Language.PYTHON),
             console_lines=deque(maxlen=100),
+            base_image=Path("/test/base.qcow2"),
+            packages_image=None,
         )
         vm._state = state  # pyright: ignore[reportPrivateUsage]
         return vm
 
-    # -- Group A: Transport errors → VmTransientError --------------------------
+    # -- Group A: Transport errors → TransientError GUEST_UNAVAILABLE ----------
 
     async def test_oserror_from_connect(self) -> None:
-        """OSError from connect() wrapped as VmTransientError."""
+        """OSError from connect() wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectRaisesChannel(OSError("connection refused")))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, OSError)
 
     async def test_oserror_from_stream(self) -> None:
-        """OSError from stream_messages() wrapped as VmTransientError."""
+        """OSError from stream_messages() wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(OSError("broken pipe")))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, OSError)
 
     async def test_incomplete_read_error(self) -> None:
-        """IncompleteReadError (EOF) wrapped as VmTransientError."""
+        """IncompleteReadError (EOF) wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(asyncio.IncompleteReadError(b"", 100)))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, asyncio.IncompleteReadError)
 
     async def test_limit_overrun_error(self) -> None:
-        """LimitOverrunError (oversized message) wrapped as VmTransientError."""
+        """LimitOverrunError (oversized message) wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(asyncio.LimitOverrunError("limit", 512)))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, asyncio.LimitOverrunError)
 
     async def test_json_decode_error(self) -> None:
-        """JSONDecodeError wrapped as VmTransientError."""
+        """JSONDecodeError wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(json.JSONDecodeError("bad", "", 0)))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
 
     async def test_validation_error(self) -> None:
-        """pydantic.ValidationError wrapped as VmTransientError."""
+        """pydantic.ValidationError wrapped as TransientError GUEST_UNAVAILABLE."""
         try:
             from exec_sandbox.guest_agent_protocol import ExecutionCompleteMessage
 
@@ -4834,44 +4871,46 @@ class TestExecuteExceptionWrapping:
             pydantic_err = e
 
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(pydantic_err))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, ValidationError)
 
     async def test_runtime_error(self) -> None:
-        """RuntimeError (channel not connected) wrapped as VmTransientError."""
+        """RuntimeError (channel not connected) wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(RuntimeError("Channel not connected")))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, RuntimeError)
 
     async def test_communication_error(self) -> None:
-        """CommunicationError wrapped as VmTransientError."""
-        vm = self._make_vm(_ConnectRaisesChannel(CommunicationError("agent failed")))
-        with pytest.raises(VmTransientError) as exc_info:
+        """CommunicationError wrapped as TransientError GUEST_UNAVAILABLE."""
+        vm = self._make_vm(_ConnectRaisesChannel(CommunicationError("agent failed", context=None)))
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, CommunicationError)
 
     async def test_socket_auth_error(self) -> None:
-        """SocketAuthError (CommunicationError subclass) wrapped as VmTransientError."""
-        vm = self._make_vm(_ConnectRaisesChannel(SocketAuthError("auth failed", expected_uid=1000, actual_uid=0)))
-        with pytest.raises(VmTransientError) as exc_info:
+        """SocketAuthError (CommunicationError subclass) wrapped as TransientError GUEST_UNAVAILABLE."""
+        vm = self._make_vm(
+            _ConnectRaisesChannel(SocketAuthError("auth failed", expected_uid=1000, actual_uid=0, context=None))
+        )
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, SocketAuthError)
 
-    # -- Group B: TimeoutError → VmBootTimeoutError ----------------------------
+    # -- Group B: TimeoutError before dispatch → TransientError GUEST_UNAVAILABLE --
 
     async def test_timeout_from_connect(self) -> None:
-        """TimeoutError from connect() wrapped as VmBootTimeoutError."""
+        """TimeoutError from connect() of a booted VM: GUEST_UNAVAILABLE, not the boot's VM_BOOT_TIMEOUT."""
         vm = self._make_vm(_ConnectRaisesChannel(TimeoutError("connect timed out")))
-        with pytest.raises(VmBootTimeoutError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, TimeoutError)
 
     async def test_timeout_from_stream(self) -> None:
         """A nested transport timeout is not mislabeled as the 15s host deadline."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(TimeoutError("hard timeout")))
-        with pytest.raises(CommunicationOutcomeUnknownError) as exc_info:
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, TimeoutError)
         assert "transport timed out" in str(exc_info.value)
@@ -4883,7 +4922,7 @@ class TestExecuteExceptionWrapping:
     async def test_true_stream_deadline_is_outcome_unknown_after_dispatch(self) -> None:
         """The 15s total deadline cannot imply that dispatched code did not run."""
         vm = self._make_vm(_HardDeadlineChannel())
-        with pytest.raises(CommunicationOutcomeUnknownError) as exc_info:
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert "15s host deadline" in str(exc_info.value)
         assert exc_info.value.context["soft_timeout_seconds"] == 5
@@ -4895,15 +4934,17 @@ class TestExecuteExceptionWrapping:
     async def test_stream_deadline_before_dispatch_remains_retryable(self) -> None:
         """Registration timeout cannot be mislabeled as an unknown execution."""
         vm = self._make_vm(_HardDeadlineChannel(command_dispatched=False))
-        with pytest.raises(VmBootTimeoutError, match="before command dispatch") as exc_info:
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="before command dispatch"
+        ) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert exc_info.value.context["command_dispatched"] is False
         assert exc_info.value.context["timeout_source"] == "total_stream_deadline"
 
     async def test_timeout_context_has_seconds(self) -> None:
-        """VmBootTimeoutError context includes timeout_seconds from caller."""
+        """TransientError GUEST_UNAVAILABLE context includes timeout_seconds from caller."""
         vm = self._make_vm(_ConnectRaisesChannel(TimeoutError()))
-        with pytest.raises(VmBootTimeoutError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=17)
         assert exc_info.value.context["timeout_seconds"] == 17
         assert exc_info.value.context["timeout_phase"] == "connect"
@@ -4918,7 +4959,11 @@ class TestExecuteExceptionWrapping:
         vm.process.wait = AsyncMock(return_value=17)
 
         async with asyncio.timeout(1):
-            with pytest.raises(CommunicationOutcomeUnknownError, match="QEMU exited during execution") as exc_info:
+            with pytest.raises(
+                OutcomeUnknownError,
+                check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN,
+                match="QEMU exited during execution",
+            ) as exc_info:
                 await vm.execute(code="x", timeout_seconds=5)
 
         assert exc_info.value.context["exit_code"] == 17
@@ -5020,45 +5065,45 @@ class TestExecuteExceptionWrapping:
     # -- Group C: Must NOT be wrapped — propagate bare -------------------------
 
     async def test_cancelled_error_propagates(self) -> None:
-        """CancelledError propagates bare, not wrapped as VmTransientError."""
+        """CancelledError propagates bare, not wrapped as TransientError."""
         vm = self._make_vm(_ConnectRaisesChannel(asyncio.CancelledError()))
         with pytest.raises(asyncio.CancelledError):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_code_validation_error_propagates(self) -> None:
-        """CodeValidationError from guest error propagates bare."""
+        """InvalidInputError CODE_INVALID from guest error propagates bare."""
         vm = self._make_vm(_GuestErrorChannel("code_error", "syntax error"))
-        with pytest.raises(CodeValidationError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_output_limit_error_propagates(self) -> None:
-        """OutputLimitError from guest error propagates bare."""
+        """InvalidInputError OUTPUT_LIMIT from guest error propagates bare."""
         vm = self._make_vm(_GuestErrorChannel("output_limit_error", "output too large"))
-        with pytest.raises(OutputLimitError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
             await vm.execute(code="x", timeout_seconds=5)
 
     # -- Group D: OSError subclasses -------------------------------------------
 
     async def test_connection_reset_wrapped(self) -> None:
-        """ConnectionResetError (OSError subclass) wrapped as VmTransientError."""
+        """ConnectionResetError (OSError subclass) wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(ConnectionResetError("peer reset")))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, ConnectionResetError)
 
     async def test_broken_pipe_wrapped(self) -> None:
-        """BrokenPipeError (OSError subclass) wrapped as VmTransientError."""
+        """BrokenPipeError (OSError subclass) wrapped as TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_ConnectOKStreamRaisesChannel(BrokenPipeError()))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert isinstance(exc_info.value.__cause__, BrokenPipeError)
 
     # -- Group E: Context and cause verification -------------------------------
 
     async def test_context_has_vm_id_language_error_type(self) -> None:
-        """VmTransientError context includes vm_id, language, and error_type."""
+        """TransientError GUEST_UNAVAILABLE context includes vm_id, language, and error_type."""
         vm = self._make_vm(_ConnectRaisesChannel(OSError("refused")))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         ctx = exc_info.value.context
         assert ctx["vm_id"] == "test-exec-wrap"
@@ -5069,16 +5114,16 @@ class TestExecuteExceptionWrapping:
         """__cause__ is the original exception (identity, not copy)."""
         original = OSError("the original error")
         vm = self._make_vm(_ConnectRaisesChannel(original))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert exc_info.value.__cause__ is original
 
     # -- Group F: Guest error classification in _handle_exec_error -------------
 
     async def test_execution_error_raises_transient(self) -> None:
-        """execution_error (REPL spawn failed) raises VmTransientError."""
+        """execution_error (REPL spawn failed) raises TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_GuestErrorChannel("execution_error", "spawn failed"))
-        with pytest.raises(VmTransientError) as exc_info:
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
             await vm.execute(code="x", timeout_seconds=5)
         assert "spawn failed" in str(exc_info.value)
         assert exc_info.value.__cause__ is None
@@ -5090,18 +5135,18 @@ class TestExecuteExceptionWrapping:
         assert result.exit_code == -1
         assert "[timeout_error]" in result.stderr
 
-    async def test_request_error_raises_permanent(self) -> None:
-        """request_error raises VmPermanentError."""
+    async def test_request_error_raises_internal(self) -> None:
+        """request_error raises InternalError GUEST_PROTOCOL."""
         vm = self._make_vm(_GuestErrorChannel("request_error", "invalid JSON"))
-        with pytest.raises(VmPermanentError):
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
             await vm.execute(code="x", timeout_seconds=5)
 
     # -- Group G: Partial output before errors ---------------------------------
 
     async def test_execution_error_after_partial_stdout(self) -> None:
-        """execution_error after partial stdout raises VmTransientError (output lost)."""
+        """execution_error after partial stdout raises TransientError GUEST_UNAVAILABLE (output lost)."""
         vm = self._make_vm(_GuestErrorAfterOutputChannel(["partial"], "execution_error", "OOM"))
-        with pytest.raises(VmTransientError):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_timeout_after_partial_stdout(self) -> None:
@@ -5115,35 +5160,49 @@ class TestExecuteExceptionWrapping:
     # -- Group H: Errors unlikely during execute() but must be handled ---------
 
     async def test_protocol_error_during_execute_raises(self) -> None:
-        """protocol_error raises VmPermanentError."""
+        """protocol_error raises InternalError GUEST_PROTOCOL."""
         vm = self._make_vm(_GuestErrorChannel("protocol_error", "frame corruption"))
-        with pytest.raises(VmPermanentError):
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_io_error_during_execute_raises(self) -> None:
-        """io_error raises VmPermanentError."""
+        """io_error raises InvalidInputError GUEST_IO."""
         vm = self._make_vm(_GuestErrorChannel("io_error", "disk full"))
-        with pytest.raises(VmPermanentError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_path_error_during_execute_raises(self) -> None:
-        """path_error raises VmPermanentError."""
+        """path_error raises InvalidInputError PATH_INVALID."""
         vm = self._make_vm(_GuestErrorChannel("path_error", "no such file"))
-        with pytest.raises(VmPermanentError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
             await vm.execute(code="x", timeout_seconds=5)
 
     # -- Group I: Out-of-bounds / adversarial ----------------------------------
 
-    async def test_unknown_error_type_raises_permanent(self) -> None:
-        """Unknown error type from newer guest raises VmPermanentError."""
+    async def test_request_outside_its_limits_is_guest_protocol(self) -> None:
+        """A request the host itself builds wrong (timeout above the guest's 300 s: Session
+        checks the range first) is a protocol error, never the caller's ARGUMENT_INVALID;
+        nothing is sent."""
+        channel = _RecordingCompletionChannel()
+        vm = self._make_vm(channel)
+        with pytest.raises(
+            InternalError,
+            check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL,
+            match=r"^execute: \[request_error\] Invalid request: timeout: ",
+        ):
+            await vm.execute(code="x", timeout_seconds=301)
+        assert channel.requests == []
+
+    async def test_unknown_error_type_raises_internal(self) -> None:
+        """Unknown error type from newer guest raises InternalError GUEST_PROTOCOL."""
         vm = self._make_vm(_GuestErrorChannel("future_new_error", "from newer guest"))
-        with pytest.raises(VmPermanentError):
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_execution_error_empty_message(self) -> None:
-        """execution_error with empty message still raises VmTransientError."""
+        """execution_error with empty message still raises TransientError GUEST_UNAVAILABLE."""
         vm = self._make_vm(_GuestErrorChannel("execution_error", ""))
-        with pytest.raises(VmTransientError):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE):
             await vm.execute(code="x", timeout_seconds=5)
 
     async def test_timeout_error_long_message(self) -> None:
@@ -5159,7 +5218,7 @@ class TestExecuteExceptionWrapping:
     async def test_execution_error_does_not_restore_ready(self) -> None:
         """execution_error does NOT restore READY (only input validation errors do)."""
         vm = self._make_vm(_GuestErrorChannel("execution_error", "spawn failed"))
-        with pytest.raises(VmTransientError):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE):
             await vm.execute(code="x", timeout_seconds=5)
         assert vm._state != VmState.READY  # pyright: ignore[reportPrivateUsage]
 
@@ -5181,29 +5240,31 @@ class TestGuestErrorToException:
     """Unit tests for guest_error_to_exception() centralized error mapping."""
 
     @pytest.mark.parametrize(
-        "error_type, expected_cls",
+        "error_type, expected_cls, expected_code",
         [
-            pytest.param("env_var_error", EnvVarValidationError, id="env_var"),
-            pytest.param("code_error", CodeValidationError, id="code"),
-            pytest.param("path_error", VmPermanentError, id="path"),
-            pytest.param("package_error", PackageNotAllowedError, id="package"),
-            pytest.param("io_error", VmPermanentError, id="io"),
-            pytest.param("execution_error", VmTransientError, id="execution"),
-            pytest.param("timeout_error", VmTransientError, id="timeout"),
-            pytest.param("request_error", VmPermanentError, id="request"),
-            pytest.param("protocol_error", VmPermanentError, id="protocol"),
-            pytest.param("unknown_future_type", VmPermanentError, id="unknown"),
+            pytest.param("env_var_error", InvalidInputError, ErrorCode.ENV_VAR_INVALID, id="env_var"),
+            pytest.param("code_error", InvalidInputError, ErrorCode.CODE_INVALID, id="code"),
+            pytest.param("path_error", InvalidInputError, ErrorCode.PATH_INVALID, id="path"),
+            pytest.param("package_error", InvalidInputError, ErrorCode.ARGUMENT_INVALID, id="package"),
+            pytest.param("io_error", InvalidInputError, ErrorCode.GUEST_IO, id="io"),
+            pytest.param("output_limit_error", InvalidInputError, ErrorCode.OUTPUT_LIMIT, id="output_limit"),
+            pytest.param("execution_error", TransientError, ErrorCode.GUEST_UNAVAILABLE, id="execution"),
+            pytest.param("timeout_error", TransientError, ErrorCode.GUEST_UNAVAILABLE, id="timeout"),
+            pytest.param("request_error", InternalError, ErrorCode.GUEST_PROTOCOL, id="request"),
+            pytest.param("protocol_error", InternalError, ErrorCode.GUEST_PROTOCOL, id="protocol"),
+            pytest.param("unknown_future_type", InternalError, ErrorCode.GUEST_PROTOCOL, id="unknown"),
         ],
     )
-    def test_error_type_mapping(self, error_type: str, expected_cls: type) -> None:
-        """Each error_type maps to the correct exception class."""
+    def test_error_type_mapping(self, error_type: str, expected_cls: type, expected_code: ErrorCode) -> None:
+        """Each error_type maps to the correct exception class and code."""
         from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="test error", error_type=error_type)
         exc = guest_error_to_exception(msg, "vm-123", operation="read_file '/foo'")
 
-        assert isinstance(exc, expected_cls)
+        assert type(exc) is expected_cls
+        assert exc.code is expected_code
         assert error_type in str(exc)
         assert "test error" in str(exc)
 
@@ -5236,31 +5297,32 @@ class TestGuestErrorToException:
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="oops", error_type="io_error")
-        exc = guest_error_to_exception(msg, "vm-000")
+        exc = guest_error_to_exception(msg, "vm-000", operation=None)
 
         assert "operation" not in exc.context
         assert str(exc).startswith("[io_error]")
 
-    def test_env_var_error_maps_to_env_var_validation_error(self) -> None:
-        """env_var_error maps to EnvVarValidationError (defense-in-depth)."""
+    def test_env_var_error_maps_to_env_var_invalid(self) -> None:
+        """env_var_error maps to InvalidInputError ENV_VAR_INVALID (defense-in-depth)."""
         from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="blocked env var", error_type="env_var_error")
         exc = guest_error_to_exception(msg, "vm-exec", operation="execute")
 
-        assert isinstance(exc, EnvVarValidationError)
+        assert isinstance(exc, InvalidInputError)
+        assert exc.code is ErrorCode.ENV_VAR_INVALID
         assert "env_var_error" in str(exc)
 
     @pytest.mark.parametrize(
-        "error_type_enum, expected_cls",
+        "error_type_enum, expected_code",
         [
-            pytest.param(GuestErrorType.ENV_VAR, EnvVarValidationError, id="env_var"),
-            pytest.param(GuestErrorType.CODE, CodeValidationError, id="code"),
-            pytest.param(GuestErrorType.REQUEST, VmPermanentError, id="request"),
+            pytest.param(GuestErrorType.ENV_VAR, ErrorCode.ENV_VAR_INVALID, id="env_var"),
+            pytest.param(GuestErrorType.CODE, ErrorCode.CODE_INVALID, id="code"),
+            pytest.param(GuestErrorType.REQUEST, ErrorCode.GUEST_PROTOCOL, id="request"),
         ],
     )
-    def test_enum_value_round_trip(self, error_type_enum: GuestErrorType, expected_cls: type) -> None:
+    def test_enum_value_round_trip(self, error_type_enum: GuestErrorType, expected_code: ErrorCode) -> None:
         """GuestErrorType enum .value round-trips through StreamingErrorMessage.
 
         Regression: str(GuestErrorType.ENV_VAR) produces 'GuestErrorType.ENV_VAR'
@@ -5270,8 +5332,8 @@ class TestGuestErrorToException:
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="test", error_type=error_type_enum.value)
-        exc = guest_error_to_exception(msg, "vm-roundtrip")
-        assert isinstance(exc, expected_cls)
+        exc = guest_error_to_exception(msg, "vm-roundtrip", operation=None)
+        assert exc.code is expected_code
 
     @pytest.mark.parametrize(
         "error_type",
@@ -5281,24 +5343,24 @@ class TestGuestErrorToException:
         ],
     )
     def test_input_validation_errors_are_input_validation(self, error_type: str) -> None:
-        """env_var_error and code_error both produce InputValidationError subclasses."""
+        """env_var_error and code_error both produce InvalidInputError (FIX_INPUT)."""
         from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="test", error_type=error_type)
-        exc = guest_error_to_exception(msg, "vm-test")
-        assert isinstance(exc, InputValidationError)
+        exc = guest_error_to_exception(msg, "vm-test", operation=None)
+        assert isinstance(exc, InvalidInputError)
 
-    def test_path_error_maps_to_permanent_error(self) -> None:
-        """path_error maps to VmPermanentError (bad path)."""
+    def test_path_error_maps_to_path_invalid(self) -> None:
+        """path_error maps to InvalidInputError PATH_INVALID (bad path), not ENV_VAR_INVALID."""
         from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
         from exec_sandbox.qemu_vm import guest_error_to_exception
 
         msg = StreamingErrorMessage(type="error", message="path traversal", error_type="path_error")
         exc = guest_error_to_exception(msg, "vm-file", operation="write_file '/../../etc/passwd'")
 
-        assert isinstance(exc, VmPermanentError)
-        assert not isinstance(exc, EnvVarValidationError)
+        assert isinstance(exc, InvalidInputError)
+        assert exc.code is ErrorCode.PATH_INVALID
 
 
 # ============================================================================
@@ -5405,46 +5467,59 @@ class TestWaitForGuest:
     # QEMU crashes — process exits before guest is ready
     # ------------------------------------------------------------------
 
-    async def test_qemu_crash_raises_vm_error(self) -> None:
-        """QEMU dies with non-zero exit code during boot."""
+    @patch("exec_sandbox.qemu_vm.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.KVM)
+    @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
+    async def test_qemu_crash_raises_qemu_crashed(self, _mock_os, _mock_accel) -> None:
+        """QEMU dies with non-zero exit code during boot: one line names the exit code; the
+        console (QEMU stderr lines, kernel) is in context only."""
         # Guest must not respond instantly, otherwise it wins the race
         vm = self._make_vm(returncode=1, connect_side_effect=OSError("connection refused"))
+        vm.console_lines.extend(["qemu-system: cannot allocate memory", "[    0.1] kernel line"])
 
-        with pytest.raises(VmQemuCrashError):
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.QEMU_CRASHED,
+            match=r"^QEMU process died during boot \(exit code 1\)$",
+        ) as exc_info:
             await vm.wait_for_guest(timeout=5)
+        assert exc_info.value.context["console_log"] == "qemu-system: cannot allocate memory\n[    0.1] kernel line"
 
-    async def test_qemu_crash_signal_raises_vm_error(self) -> None:
+    async def test_qemu_crash_signal_raises_qemu_crashed(self) -> None:
         """QEMU killed by signal (negative return code)."""
         vm = self._make_vm(returncode=-9, connect_side_effect=OSError("connection refused"))
 
-        with pytest.raises(VmQemuCrashError):
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED, match=r"\(exit code -9, SIGKILL\)$"
+        ):
             await vm.wait_for_guest(timeout=5)
 
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.MACOS)
-    async def test_macos_clean_exit_during_boot_raises_vm_error(self, _mock_os) -> None:
+    async def test_macos_clean_exit_during_boot_raises_qemu_crashed(self, _mock_os) -> None:
         """macOS QEMU exits cleanly (code 0) during boot → must raise, not CancelledError.
 
         Regression test: monitor_process_death() returned normally on macOS
         with exit code 0, causing fall-through to await a cancelled guest_task.
         Verifies:
-        - VmQemuCrashError is raised (not CancelledError)
+        - TransientError QEMU_CRASHED is raised (not CancelledError)
         - Error message contains "clean exit"
         - Error context includes host_os for diagnostics
         """
         vm = self._make_vm(returncode=0, connect_side_effect=OSError("connection refused"))
 
-        with pytest.raises(VmQemuCrashError, match="clean exit") as exc_info:
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED, match="clean exit"
+        ) as exc_info:
             await vm.wait_for_guest(timeout=5)
 
         assert exc_info.value.context.get("host_os") == "macos"
 
     @patch("exec_sandbox.qemu_vm.detect_accel_type", new_callable=AsyncMock, return_value=AccelType.TCG)
     @patch("exec_sandbox.qemu_vm.detect_host_os", return_value=HostOS.LINUX)
-    async def test_tcg_clean_exit_during_boot_raises_vm_error(self, _mock_os, _mock_accel) -> None:
+    async def test_tcg_clean_exit_during_boot_raises_qemu_crashed(self, _mock_os, _mock_accel) -> None:
         """TCG exits with code 0 during boot (ARM64 timing race)."""
         vm = self._make_vm(returncode=0, connect_side_effect=OSError("connection refused"))
 
-        with pytest.raises(VmQemuCrashError):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED):
             await vm.wait_for_guest(timeout=5)
 
     # ------------------------------------------------------------------

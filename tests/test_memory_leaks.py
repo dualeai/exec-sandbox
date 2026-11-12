@@ -905,14 +905,14 @@ sys.stdout.flush()
 """
 
     async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Warm-up: populates Pydantic caches, channel state, etc.
             await session.exec('print("warmup")')
 
             gc.collect()
             tracemalloc.start()
             try:
-                with pytest.raises(OutputLimitError):
+                with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
                     await session.exec(code, timeout_seconds=300)
                 _, peak_bytes = tracemalloc.get_traced_memory()
             finally:

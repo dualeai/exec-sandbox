@@ -293,15 +293,14 @@ class TestWarmVMPoolOwnership:
         assert destroy.await_count == len(Language)
         assert {call.args[0] for call in destroy.await_args_list} == set(vms)
 
-    async def test_permanent_l1_restore_failure_does_not_cold_boot(self, unit_test_vm_manager) -> None:
+    async def test_internal_l1_restore_failure_does_not_cold_boot(self, unit_test_vm_manager, tmp_path: Path) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         reservation = MagicMock()
         reservation_context = MagicMock()
         reservation_context.__aenter__ = AsyncMock(return_value=reservation)
         reservation_context.__aexit__ = AsyncMock(return_value=False)
-        memory = MagicMock()
-        memory.check_cache = AsyncMock(return_value=Path("/tmp/cached.vmstate"))
+        memory = l1_hit(unit_test_vm_manager, tmp_path)
         pool = WarmVMPool(
             unit_test_vm_manager,
             SchedulerConfig(warm_pool_size=1),
@@ -310,28 +309,38 @@ class TestWarmVMPoolOwnership:
 
         with (
             patch.object(unit_test_vm_manager, "reservation_context", return_value=reservation_context),
+            patch.object(unit_test_vm_manager, "get_base_image", return_value=Path("/tmp/base.qcow2")),
             patch.object(
                 unit_test_vm_manager,
                 "restore_vm",
                 new_callable=AsyncMock,
-                side_effect=VmPermanentError("cleanup unconfirmed"),
+                side_effect=InternalError(
+                    "cleanup unconfirmed",
+                    code=ErrorCode.CLEANUP_UNCONFIRMED,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
             ),
             patch.object(unit_test_vm_manager, "create_vm", new_callable=AsyncMock) as create,
         ):
-            with pytest.raises(VmPermanentError, match="cleanup unconfirmed"):
+            with pytest.raises(
+                InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED, match="cleanup unconfirmed"
+            ):
                 await pool._boot_warm_vm(Language.PYTHON, 0)
 
         create.assert_not_awaited()
 
-    async def test_transient_l1_restore_failure_reuses_reservation_for_cold_boot(self, unit_test_vm_manager) -> None:
+    async def test_transient_l1_restore_failure_reuses_reservation_for_cold_boot(
+        self, unit_test_vm_manager, tmp_path: Path
+    ) -> None:
         from exec_sandbox.warm_vm_pool import WarmVMPool
 
         reservation = MagicMock()
         reservation_context = MagicMock()
         reservation_context.__aenter__ = AsyncMock(return_value=reservation)
         reservation_context.__aexit__ = AsyncMock(return_value=False)
-        memory = MagicMock()
-        memory.check_cache = AsyncMock(return_value=Path("/tmp/cached.vmstate"))
+        memory = l1_hit(unit_test_vm_manager, tmp_path)
         pool = WarmVMPool(
             unit_test_vm_manager,
             SchedulerConfig(warm_pool_size=1),
@@ -341,12 +350,19 @@ class TestWarmVMPoolOwnership:
 
         with (
             patch.object(unit_test_vm_manager, "reservation_context", return_value=reservation_context),
+            patch.object(unit_test_vm_manager, "get_base_image", return_value=Path("/tmp/base.qcow2")),
             patch.object(
                 unit_test_vm_manager,
                 "restore_vm",
                 new_callable=AsyncMock,
-                side_effect=VmTransientError("migration failed"),
-            ),
+                side_effect=TransientError(
+                    "migration failed",
+                    code=ErrorCode.MIGRATION_FAILED,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
+                ),
+            ) as restore,
             patch.object(
                 unit_test_vm_manager,
                 "create_vm",

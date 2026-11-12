@@ -366,81 +366,75 @@ def format_error(title: str, message: str, suggestions: list[str] | None = None)
     return "\n".join(lines)
 
 
-def format_result_json(result: ExecutionResult) -> str:
-    """Format execution result as JSON.
+class OneShotRun(BaseModel):
+    """One VM, one execution: what `--json` prints for a source."""
 
-    Args:
-        result: Execution result from scheduler
+    model_config = ConfigDict(frozen=True)
 
-    Returns:
-        JSON string
-    """
-    return json.dumps(_result_to_dict(result), indent=2)
-
-
-def _result_to_dict(result: ExecutionResult) -> dict[str, Any]:
-    """Convert ExecutionResult to dictionary for JSON serialization."""
-    output: dict[str, Any] = {
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "exit_code": result.exit_code,
-        "execution_time_ms": result.execution_time_ms,
-        "timing": {
-            "total_ms": result.timing.total_ms,
-            "boot_ms": result.timing.boot_ms,
-            "execute_ms": result.timing.execute_ms,
-            "setup_ms": result.timing.setup_ms,
-        },
-        "warm_pool_hit": result.warm_pool_hit,
-    }
-
-    if result.external_memory_peak_mb is not None:
-        output["memory_peak_mb"] = result.external_memory_peak_mb
-
-    if result.exposed_ports:
-        output["exposed_ports"] = [
-            {"internal": p.internal, "external": p.external, "host": p.host, "url": p.url} for p in result.exposed_ports
-        ]
-
-    return output
+    result: ExecutionResult
+    startup: StartupTiming
+    exposed_ports: list[ExposedPort]
+    instance: InstanceRef | None = Field(
+        description="With --instance: the generation this run saved. None when the run saved nothing"
+    )
+    total_ms: int = Field(
+        description="From the start of the session (with --instance: describe, then new() or reuse()) "
+        "to its close: uploads, exec, downloads and save included, measured by the CLI"
+    )
 
 
-@dataclass
-class MultiSourceResult:
+def _error_exit_code(*, action: ErrorAction | None, code: ErrorCode | None) -> int:
+    """The exit code of an error: EXIT_CLI_ERROR (2) for FIX_INPUT and FIX_CONFIG,
+    EXIT_TIMEOUT (124) for VM_BOOT_TIMEOUT, else EXIT_SANDBOX_ERROR (125)."""
+    if action in (ErrorAction.FIX_INPUT, ErrorAction.FIX_CONFIG):
+        return EXIT_CLI_ERROR
+    if code is ErrorCode.VM_BOOT_TIMEOUT:
+        return EXIT_TIMEOUT
+    return EXIT_SANDBOX_ERROR
+
+
+def _timed_out(result: ExecutionResult) -> bool:
+    """The code ran past its timeout: the guest stopped it, and the result's exit code is -1.
+    The guest keeps the code's own exit code in 0-255, like a process (sys.exit(-1) is 255)."""
+    return result.exit_code == -1
+
+
+def _run_exit_code(result: ExecutionResult) -> int:
+    """The exit code of a run: the code's own, or EXIT_TIMEOUT (124) when the code timed out."""
+    return EXIT_TIMEOUT if _timed_out(result) else result.exit_code
+
+
+class MultiSourceResult(BaseModel):
     """Result from a single source in multi-input execution."""
 
+    model_config = ConfigDict(frozen=True)
+
     index: int
-    source: str  # Label for display
-    result: ExecutionResult | None
-    error: str | None  # Error message if execution failed
+    source: str = Field(description="Label for display")
+    run: OneShotRun | None
+    error: str | None = Field(description="Why the source has no run: the message of its error")
+    code: ErrorCode | None = Field(description="The code of that error; None when the source ran")
+    action: ErrorAction | None = Field(description="The action of that error; None when the source ran")
+
+    @computed_field
+    @property
+    def exit_code(self) -> int:
+        """The run's exit code (see _run_exit_code: 124 for a code timeout); for a source with
+        no run, its error's (see _error_exit_code)."""
+        return _run_exit_code(self.run.result) if self.run else _error_exit_code(action=self.action, code=self.code)
+
+
+def format_result_json(run: OneShotRun) -> str:
+    """Format a one-shot run as JSON."""
+    return run.model_dump_json(indent=2)
 
 
 def format_multi_result_json(results: list[MultiSourceResult]) -> str:
-    """Format multiple execution results as JSON array.
+    """Format multiple execution results as a JSON array."""
+    return _MULTI_RESULTS.dump_json(results, indent=2).decode()
 
-    Args:
-        results: List of multi-source results
 
-    Returns:
-        JSON string with array of results
-    """
-    output: list[dict[str, Any]] = []
-    for r in results:
-        if r.result:
-            item: dict[str, Any] = {
-                "index": r.index,
-                "source": r.source,
-                **_result_to_dict(r.result),
-            }
-        else:
-            item = {
-                "index": r.index,
-                "source": r.source,
-                "error": r.error,
-                "exit_code": EXIT_SANDBOX_ERROR,
-            }
-        output.append(item)
-    return json.dumps(output, indent=2)
+_MULTI_RESULTS = TypeAdapter(list[MultiSourceResult])
 
 
 def truncate_source(source: str, max_len: int = 40) -> str:
@@ -512,17 +506,16 @@ def _display_multi_summary(total_passed: int, total_failed: int, total_sources: 
 
 
 def _compute_multi_exit_code(results: list[MultiSourceResult]) -> int:
-    """Compute the exit code for multi-source execution.
-
-    Returns max exit code, or EXIT_TIMEOUT if any source timed out.
-    """
-    # Check for timeouts first
-    if any(r.error == "Execution timed out" for r in results):
-        return EXIT_TIMEOUT
-
-    # Return max exit code from all results
-    exit_codes = [r.result.exit_code if r.result else EXIT_SANDBOX_ERROR for r in results]
-    return max(exit_codes) if exit_codes else EXIT_SUCCESS
+    """Exit code of a multi-source run, from the error of each source with no run (see
+    _error_exit_code) and the code timeouts: EXIT_CLI_ERROR when an error is FIX_INPUT or
+    FIX_CONFIG (the command or the setup needs a change), else EXIT_TIMEOUT when an error is
+    VM_BOOT_TIMEOUT or the code of a source timed out, else the highest exit code of the
+    sources. Code that exits 2 or 124 itself does not count here."""
+    flagged = {r.exit_code for r in results if r.run is None or _timed_out(r.run.result)}
+    for exit_code in (EXIT_CLI_ERROR, EXIT_TIMEOUT):
+        if exit_code in flagged:
+            return exit_code
+    return max((r.exit_code for r in results), default=EXIT_SUCCESS)
 
 
 def is_tty() -> bool:
@@ -637,88 +630,40 @@ async def run_code(
                         on_stderr=on_stderr,
                     )
 
-                    # Download files (stream directly to disk — zero memory overhead)
-                    for guest_path, local_path in download_files:
-                        local = Path(local_path)
-                        await session.read_file(guest_path, destination=local)
-                        if not quiet:
-                            file_size = local.stat().st_size
-                            click.echo(
-                                click.style(
-                                    f"  Downloaded: {guest_path} -> {local_path} ({file_size} bytes)", dim=True
-                                ),
-                                err=True,
-                            )
-            else:
-                # Direct path: scheduler.run() for full timing breakdown
-                result = await scheduler.run(
-                    code=code,
-                    language=language,
-                    packages=list(packages) if packages else None,
-                    timeout_seconds=timeout,
-                    memory_mb=memory,
-                    allow_network=network,
-                    allowed_domains=list(allowed_domains) if allowed_domains else None,
-                    expose_ports=expose_ports,  # type: ignore[arg-type]  # list invariance
-                    env_vars=env_vars if env_vars else None,
-                    on_stdout=on_stdout,
-                    on_stderr=on_stderr,
-                    on_boot_log=on_boot_log,
-                )
+                    saved, failures = await _download_and_save(
+                        vm, download_files=download_files, instance_id=instance_id, result=result, quiet=quiet
+                    )
+                    startup, exposed_ports = vm.startup_timing, vm.exposed_ports
+            run = OneShotRun(
+                result=result,
+                startup=startup,
+                exposed_ports=exposed_ports,
+                instance=saved,
+                total_ms=round((time.perf_counter() - start) * 1000),
+            )
 
         # JSON output mode
         if json_output:
-            click.echo(format_result_json(result))
-            return result.exit_code
+            click.echo(format_result_json(run))
+        codes = [_report_error(e, saved=saved) for e in failures]
+        if codes:
+            return codes[0]
+        if json_output:
+            return _run_exit_code(result)
 
         # TTY mode: show timing footer
         if is_tty() and not quiet:
             click.echo()  # Ensure newline after output
-            click.echo(
-                click.style(f"✓ Done in {result.timing.total_ms}ms", fg="green", dim=True),
-                err=True,
-            )
+            click.echo(click.style(f"✓ Done in {run.total_ms}ms", fg="green", dim=True), err=True)
 
-        return result.exit_code
-
-    except PackageNotAllowedError as e:
-        error_msg = format_error(
-            f"Package not allowed: {e.message}",
-            "Only packages from the top 10,000 PyPI/npm packages are allowed for security reasons.",
-            [
-                "Check spelling of package name",
-                "Use --no-validation to bypass (not recommended)",
-            ],
-        )
-        click.echo(error_msg, err=True)
-        return EXIT_CLI_ERROR
-
-    except VmTimeoutError:
-        error_msg = format_error(
-            "VM boot timed out",
-            "The VM failed to start before code could run.",
-            [
-                "Retry — boot timeouts are often transient (CPU contention)",
-                "Check system load and available resources",
-            ],
-        )
-        click.echo(error_msg, err=True)
-        return EXIT_TIMEOUT
+        return _run_exit_code(result)
 
     except SandboxError as e:
-        error_msg = format_error(
-            "Sandbox error",
-            str(e.message),
-            [
-                "Check that QEMU is installed: brew install qemu",
-                "Ensure VM images are available",
-            ],
-        )
-        click.echo(error_msg, err=True)
-        return EXIT_SANDBOX_ERROR
+        return _report_error(e, saved=None)
 
 
 async def run_multiple(
+    *,
     sources: list[SourceInput],
     packages: list[str],
     timeout: int,
@@ -730,9 +675,12 @@ async def run_multiple(
     json_output: bool,
     quiet: bool,
     no_validation: bool,
-    debug: bool = False,
+    debug: bool,
 ) -> int:
-    """Execute multiple sources concurrently and return max exit code.
+    """Execute multiple sources concurrently; return the exit code of _compute_multi_exit_code.
+
+    The error of a source with no run is printed like the error of a single source
+    (_report_error): under its source, or after the JSON with --json.
 
     Args:
         sources: List of SourceInput objects to execute
@@ -809,14 +757,14 @@ async def run_multiple(
                 results.append(result)
 
                 # Update counters
-                if result.result and result.result.exit_code == 0:
+                if result.run and result.run.result.exit_code == 0:
                     total_passed += 1
                 else:
                     total_failed += 1
 
                 # Display result if not JSON mode
                 if not json_output:
-                    _display_multi_result(result, len(sources), quiet)
+                    _display_multi_result(result, len(sources), quiet, error=errors.get(result.index))
 
         total_time_ms = int((time.perf_counter() - start_time) * 1000)
 
@@ -826,74 +774,56 @@ async def run_multiple(
         # Final output
         if json_output:
             click.echo(format_multi_result_json(results))
+            for result in results:
+                if result.index in errors:
+                    _report_error(errors[result.index], saved=None)
         elif is_tty() and not quiet:
             _display_multi_summary(total_passed, total_failed, len(sources), total_time_ms)
 
         return _compute_multi_exit_code(results)
 
-    except PackageNotAllowedError as e:
-        error_msg = format_error(
-            f"Package not allowed: {e.message}",
-            "Only packages from the top 10,000 PyPI/npm packages are allowed for security reasons.",
-            [
-                "Check spelling of package name",
-                "Use --no-validation to bypass (not recommended)",
-            ],
-        )
-        click.echo(error_msg, err=True)
-        return EXIT_CLI_ERROR
-
     except SandboxError as e:
-        error_msg = format_error(
-            "Sandbox error",
-            str(e.message),
-            [
-                "Check that QEMU is installed: brew install qemu",
-                "Ensure VM images are available",
-            ],
-        )
-        click.echo(error_msg, err=True)
-        return EXIT_SANDBOX_ERROR
+        return _report_error(e, saved=None)
 
 
-def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool) -> None:
-    """Display a single result from multi-source execution."""
+def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool, *, error: SandboxError | None) -> None:
+    """Display a single result from multi-source execution; `error`: why it has no run."""
     label = truncate_source(result.source)
 
     # Header
     click.echo()
     click.echo(click.style(f"━━━ [{result.index + 1}/{total}] {label} ", bold=True) + "━" * max(0, 50 - len(label)))
 
-    if result.result:
+    if result.run:
+        run = result.run
         # Show stdout/stderr
-        if result.result.stdout:
-            click.echo(result.result.stdout, nl=False)
-            if not result.result.stdout.endswith("\n"):
+        if run.result.stdout:
+            click.echo(run.result.stdout, nl=False)
+            if not run.result.stdout.endswith("\n"):
                 click.echo()
-        if result.result.stderr:
-            click.echo(result.result.stderr, nl=False, err=True)
-            if not result.result.stderr.endswith("\n"):
+        if run.result.stderr:
+            click.echo(run.result.stderr, nl=False, err=True)
+            if not run.result.stderr.endswith("\n"):
                 click.echo(err=True)
 
         # Show status
         if not quiet:
-            if result.result.exit_code == 0:
+            if run.result.exit_code == 0:
                 click.echo(
-                    click.style(f"✓ {result.result.timing.total_ms}ms", fg="green", dim=True),
+                    click.style(f"✓ {run.total_ms}ms", fg="green", dim=True),
                     err=True,
                 )
             else:
                 click.echo(
                     click.style(
-                        f"✗ {result.result.timing.total_ms}ms (exit {result.result.exit_code})",
+                        f"✗ {run.total_ms}ms (exit {run.result.exit_code})",
                         fg="red",
                         dim=True,
                     ),
                     err=True,
                 )
-    else:
-        # Show error
-        click.echo(click.style(f"✗ {result.error}", fg="red"), err=True)
+    elif error is not None:
+        _report_error(error, saved=None)  # its exit code is result.exit_code
 
 
 # ============================================================================

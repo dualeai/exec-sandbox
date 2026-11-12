@@ -9,10 +9,11 @@ Tests that the execution system handles unusual inputs gracefully:
 
 import pytest
 
-from exec_sandbox.exceptions import CodeValidationError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_hwaccel
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, skip_unless_hwaccel
 
 
 # =============================================================================
@@ -22,26 +23,23 @@ class TestEdgeCases:
     """Edge cases that should work but might break naive implementations."""
 
     async def test_empty_code(self, scheduler: Scheduler) -> None:
-        """Empty code string raises CodeValidationError."""
-        with pytest.raises(CodeValidationError, match="Code cannot be empty"):
-            await scheduler.run(
-                code="",
-                language=Language.PYTHON,
-            )
+        """Empty code string raises InvalidInputError CODE_INVALID."""
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="Code cannot be empty"
+        ):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), "")
 
     async def test_whitespace_only_code(self, scheduler: Scheduler) -> None:
-        """Whitespace-only code raises CodeValidationError."""
-        with pytest.raises(CodeValidationError, match="Code cannot be empty"):
-            await scheduler.run(
-                code="   \n\n\t\t\n   ",
-                language=Language.PYTHON,
-            )
+        """Whitespace-only code raises InvalidInputError CODE_INVALID."""
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="Code cannot be empty"
+        ):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), "   \n\n\t\t\n   ")
 
     async def test_comment_only_code(self, scheduler: Scheduler) -> None:
         """Comment-only code executes without error."""
-        result = await scheduler.run(
-            code="# This is just a comment\n# Another comment",
-            language=Language.PYTHON,
+        result = await run_once(
+            scheduler, VmSpec(language=Language.PYTHON), "# This is just a comment\n# Another comment"
         )
 
         assert result.exit_code == 0
@@ -197,35 +195,26 @@ sys.stdout.buffer.write(b"before\\x00after\\n")
 sys.stdout.buffer.flush()
 """
 
-        result = await scheduler.run(
-            code=code,
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         # Should handle null bytes without crashing
         assert result.exit_code == 0
         assert "before" in result.stdout or "after" in result.stdout
 
     async def test_null_bytes_in_code_rejected(self, scheduler: Scheduler) -> None:
-        """Code containing null bytes raises CodeValidationError."""
-        with pytest.raises(CodeValidationError, match="null bytes"):
-            await scheduler.run(
-                code="print('hello')\x00print('world')",
-                language=Language.PYTHON,
-            )
+        """Code containing null bytes raises InvalidInputError CODE_INVALID."""
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="null bytes"):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello')\x00print('world')")
 
     @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
     async def test_null_bytes_rejected_all_languages(self, scheduler: Scheduler, language: Language) -> None:
         """Null bytes rejected regardless of language."""
-        with pytest.raises(CodeValidationError, match="null bytes"):
-            await scheduler.run(code="echo hi\x00", language=language)
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="null bytes"):
+            await run_once(scheduler, VmSpec(language=language), "echo hi\x00")
 
     async def test_escaped_null_repr_accepted(self, scheduler: Scheduler) -> None:
         r"""Literal '\\x00' string (no actual null byte) executes fine."""
-        result = await scheduler.run(
-            code="print(repr('hello\\x00world'))",
-            language=Language.PYTHON,
-        )
+        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(repr('hello\\x00world'))")
         assert result.exit_code == 0
         assert "hello\\x00world" in result.stdout
 

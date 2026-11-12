@@ -454,8 +454,8 @@ class OverlayPool:
                     except asyncio.QueueFull:
                         # Pool is full, clean up extra overlay
                         with contextlib.suppress(OSError):
-                            await aiofiles.os.remove(overlay_path)
-            except (OSError, QemuStorageDaemonError) as e:
+                            overlay_path.unlink()
+            except (OSError, TransientError) as e:
                 logger.warning(
                     "Failed to create pooled overlay",
                     extra={"base_image": str(base_image), "error": str(e)},

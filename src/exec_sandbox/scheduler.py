@@ -70,13 +70,31 @@ from exec_sandbox.system_probes import (
     warn_zswap,
 )
 from exec_sandbox.vm_manager import VmManager
-from exec_sandbox.vm_types import VmState
 from exec_sandbox.warm_vm_pool import WarmVMPool
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from exec_sandbox.instance.manager import InstanceManager
+    from exec_sandbox.instance.models import InstanceInfo
     from exec_sandbox.qemu_vm import QemuVM
+    from exec_sandbox.vm_spec import VmSpec
 
 logger = get_logger(__name__)
+
+
+def _scheduler_state(message: str) -> InvalidInputError:
+    """The InvalidInputError (SCHEDULER_STATE) of a call the scheduler cannot take now."""
+    return InvalidInputError(message, code=ErrorCode.SCHEDULER_STATE, context=None, hint=None, instance_id=None)
+
+
+def _internal(message: str) -> InternalError:
+    """The InternalError (INTERNAL) of a scheduler invariant that does not hold."""
+    return InternalError(message, code=ErrorCode.INTERNAL, context=None, hint=None, instance_id=None)
+
+
+_NOT_STARTED = "Scheduler not started. Use: async with Scheduler() as scheduler:"
+_NOT_INITIALIZED = "Scheduler resources not initialized"
 
 
 async def _wait_for_owned_task(task: asyncio.Task[None]) -> BaseException | None:
@@ -844,16 +862,18 @@ class Scheduler:
         Args:
             language: Programming language
             packages: List of packages to install
-            memory_mb: VM memory in MB (included in cache key)
+            memory_mb: VM memory in MB of the VM that builds the snapshot (not in the cache key)
 
         Returns:
             Path to snapshot qcow2.
 
         Raises:
-            SandboxError: Snapshot manager not configured or snapshot creation failed.
+            InternalError: INTERNAL: snapshot manager not configured.
+            SandboxError: Snapshot creation failed (see
+                DiskSnapshotManager.get_or_create_snapshot).
         """
         if not self._snapshot_manager:
-            raise SandboxError("Packages requested but snapshot manager is not configured")
+            raise _internal("Packages requested but snapshot manager is not configured")
 
         # Ensure base image is on disk before computing snapshot cache key
         # (_compute_cache_key hashes the base image file via get_base_image() glob)

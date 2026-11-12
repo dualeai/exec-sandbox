@@ -36,14 +36,14 @@ class TestPathEdgeCases:
 
     async def test_dotdot_path_rejected(self, scheduler: Scheduler) -> None:
         """Pure '..' path is rejected (traversal)."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(VmPermanentError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file("..", b"data")
 
     async def test_spaces_in_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Spaces in filename work."""
         dest = tmp_path / "my_file.txt"
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("my file.txt", b"hello")
             await session.read_file("my file.txt", destination=dest)
             assert dest.read_bytes() == b"hello"
@@ -92,8 +92,8 @@ class TestPathEdgeCases:
     async def test_256_char_filename_rejected(self, scheduler: Scheduler) -> None:
         """256-char filename is rejected."""
         name = "a" * 256
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises((VmPermanentError, ValueError)):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file(name, b"too long")
 
 
@@ -132,13 +132,13 @@ class TestContentEdgeCases:
 
     async def test_read_nonexistent_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Reading nonexistent file raises error."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(VmPermanentError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
                 await session.read_file("does_not_exist.txt", destination=tmp_path / "out.bin")
 
     async def test_make_executable(self, scheduler: Scheduler) -> None:
         """make_executable=True allows execution of the file."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             script = b"#!/bin/sh\necho 'script ran'"
             await session.write_file("run.sh", script, make_executable=True)
             result = await session.exec(
@@ -148,10 +148,12 @@ class TestContentEdgeCases:
             assert "script ran" in result.stdout
 
     async def test_oversized_content_rejected(self, scheduler: Scheduler) -> None:
-        """Content exceeding MAX_FILE_SIZE_BYTES is rejected at the Session level."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        """Content exceeding MAX_FILE_SIZE_BYTES is rejected at the Session level (ARGUMENT_INVALID)."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             oversized = b"x" * (MAX_FILE_SIZE_BYTES + 1)
-            with pytest.raises(ValueError, match="exceeds"):
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"
+            ):
                 await session.write_file("big.bin", oversized)
 
 
@@ -177,26 +179,32 @@ class TestWriteFileInputTypes:
         local_file.write_bytes(b"local content")
         dest = tmp_path / "from_path.txt"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("from_path.txt", local_file)
             await session.read_file("from_path.txt", destination=dest)
             assert dest.read_bytes() == b"local content"
 
     async def test_write_from_nonexistent_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """write_file raises FileNotFoundError for nonexistent Path."""
+        """write_file raises InvalidInputError ARGUMENT_INVALID for nonexistent Path."""
         missing = tmp_path / "does_not_exist.txt"
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(FileNotFoundError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(
+                InvalidInputError,
+                check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+                match=r"^Source file cannot be opened \(No such file or directory\): ",
+            ):
                 await session.write_file("target.txt", missing)
 
     async def test_write_from_oversized_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """write_file raises ValueError for oversized Path."""
+        """write_file raises InvalidInputError ARGUMENT_INVALID for oversized Path."""
         big_file = tmp_path / "big.bin"
         big_file.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(ValueError, match="exceeds"):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(
+                InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"
+            ):
                 await session.write_file("target.bin", big_file)
 
 
@@ -285,13 +293,13 @@ class TestListFiles:
 
     async def test_list_nonexistent_directory(self, scheduler: Scheduler) -> None:
         """list_files on nonexistent directory raises error."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(VmPermanentError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
                 await session.list_files("does_not_exist")
 
     async def test_file_info_fields(self, scheduler: Scheduler) -> None:
         """FileInfo has correct name, is_dir, and size fields."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("info_test.txt", b"hello")
             await session.exec("import os; os.makedirs('/home/user/info_dir', exist_ok=True)")
             files = await session.list_files()

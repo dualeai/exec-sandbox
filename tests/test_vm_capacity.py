@@ -17,11 +17,13 @@ from unittest.mock import patch
 import pytest
 
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.exceptions import VmCapacityError, VmOverlayError
+from exec_sandbox.exceptions import ErrorCode, SandboxError, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_manager import VmManager
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

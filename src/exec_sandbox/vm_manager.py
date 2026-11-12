@@ -43,39 +43,37 @@ from exec_sandbox._logging import get_logger
 from exec_sandbox.admission import ResourceAdmissionController, ResourceReservation
 from exec_sandbox.aio_utils import await_cancellation_safe as _await_cancellation_safe
 from exec_sandbox.exceptions import (
-    VmBootTimeoutError,
-    VmConfigError,
-    VmDependencyError,
-    VmOverlayError,
-    VmPermanentError,
-    VmTransientError,
+    CommunicationError,
+    ConfigError,
+    ErrorCode,
+    InternalError,
+    InvalidInputError,
+    TransientError,
+    spawn_error,
 )
 from exec_sandbox.guest_channel import DualPortChannel, GuestChannel
 from exec_sandbox.gvproxy import start_gvproxy
+from exec_sandbox.home_disk_dir import HomeDiskDir, remove_dead_folders
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager, SnapshotMetadata
-from exec_sandbox.migration_client import MigrationClient
-from exec_sandbox.models import ExposedPort, Language
-from exec_sandbox.overlay_pool import OverlayPool, QemuImgError
+from exec_sandbox.migration_client import MigrationClient, migration_timeout
+from exec_sandbox.models import ExposedPort
+from exec_sandbox.overlay_pool import OverlayPool
 from exec_sandbox.permission_utils import (
     chmod_async,
     get_qemu_vm_uid,
     grant_qemu_vm_file_access,
+    grant_qemu_vm_private_file_access,
     probe_sudo_as_qemu_vm,
 )
 from exec_sandbox.platform_utils import HostArch, ProcessWrapper, detect_host_arch
 from exec_sandbox.process_registry import unregister_process
 from exec_sandbox.qemu_cmd import build_qemu_cmd
-from exec_sandbox.qemu_storage_daemon import QemuStorageDaemonError
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.settings import Settings
 from exec_sandbox.socket_auth import create_unix_socket
-from exec_sandbox.subprocess_utils import (
-    drain_subprocess_output,
-    log_task_exception,
-    start_managed_process,
-    wait_for_socket,
-)
+from exec_sandbox.sparse_file import clone_sparse, create_sparse
+from exec_sandbox.subprocess_utils import start_drain, start_managed_process, wait_for_socket
 from exec_sandbox.system_probes import (
     check_tsc_deadline,
     detect_accel_type,
@@ -175,6 +173,15 @@ class _PendingLaunch:
     qemu_log_task: asyncio.Task[None] | None = None
     gvproxy_log_task: asyncio.Task[None] | None = None
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _allocated_bytes(path: Path) -> int:
+    return path.stat().st_blocks * 512
+
+
+def _host_dependency(message: str, *, context: dict[str, Any] | None) -> ConfigError:
+    """The ConfigError (HOST_DEPENDENCY) of a user or ACL support this host lacks."""
+    return ConfigError(message, code=ErrorCode.HOST_DEPENDENCY, context=context, hint=None, instance_id=None)
 
 
 class VmManager:
@@ -371,7 +378,13 @@ class VmManager:
         attributes suffice, no lock.
         """
         if self._stopping:
-            raise VmPermanentError("VmManager is stopping and cannot launch new VMs")
+            raise InvalidInputError(
+                "VmManager is stopping and cannot launch new VMs",
+                code=ErrorCode.SCHEDULER_STATE,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
         if self._active_launches == 0:
             self._launches_drained.clear()
         self._active_launches += 1
@@ -592,27 +605,25 @@ class VmManager:
                 EROFS base + ext4 snapshot via overlayfs.
             reservation: Pre-acquired admission reservation from reservation_context().
                 When provided, skips admission acquire (caller owns the reservation).
-                When None, self-acquires as usual (backward compatible).
+                When None, acquires its own reservation.
             retry_profile: Retry parameters for boot (default: RETRY_USER_FACING).
 
         Returns:
             QemuVM handle for code execution
 
         Raises:
-            VmTransientError: VM creation failed (retried, then re-raised)
-            VmPermanentError: VM creation failed (not retryable)
-            asyncio.TimeoutError: VM boot timeout after all retries
+            TransientError: VM creation failed (retried, then re-raised; VM_BOOT_TIMEOUT
+                when the guest never became ready)
+            SandboxError: VM creation failed (not retryable)
         """
         async with self._launch_operation():
             if reservation is not None:
                 try:
                     return await self._create_vm_with_reservation(
                         reservation,
-                        language=language,
+                        spec,
                         tenant_id=tenant_id,
                         task_id=task_id,
-                        allow_network=allow_network,
-                        allowed_domains=allowed_domains,
                         direct_write_target=direct_write_target,
                         expose_ports=expose_ports,
                         on_boot_log=on_boot_log,
@@ -671,19 +682,17 @@ class VmManager:
                 min=retry_profile.retry_min_seconds,
                 max=retry_profile.retry_max_seconds,
             ),
-            # Only retry transient errors - permanent errors (config, capacity, dependency) should fail immediately
-            retry=retry_if_exception_type((VmTransientError, TimeoutError)),
+            # Only retry transient errors - other errors (config, internal) should fail immediately
+            retry=retry_if_exception_type((TransientError, TimeoutError)),
             before_sleep=before_sleep_log(logger, logging.WARNING),
             reraise=True,
         ):
             with attempt:
                 vm = await self._create_vm_impl(
-                    language=language,
+                    spec,
                     tenant_id=tenant_id,
                     task_id=task_id,
                     reservation=reservation,
-                    allow_network=allow_network,
-                    allowed_domains=allowed_domains,
                     direct_write_target=direct_write_target,
                     expose_ports=expose_ports,
                     on_boot_log=on_boot_log,
@@ -763,9 +772,7 @@ class VmManager:
             if not isinstance(cgroup_result, BaseException):
                 pending.cgroup_path = cgroup_result
             if isinstance(overlay_result, BaseException):
-                if isinstance(overlay_result, (QemuImgError, QemuStorageDaemonError)):
-                    raise VmOverlayError(str(overlay_result)) from overlay_result
-                raise overlay_result
+                raise overlay_result  # qemu-img or the daemon: already TransientError OVERLAY_FAILED
             if isinstance(cgroup_result, BaseException):
                 raise cgroup_result
             cgroup_path: Path | None = cgroup_result
@@ -773,17 +780,19 @@ class VmManager:
             # Permissions need the overlay file to exist (changes ownership/mode)
             workdir.use_qemu_vm_user = await self._apply_overlay_permissions(base_image, workdir.overlay_image)
 
+            await self._prepare_home_disk(workdir, spec, home_template)
+
             # Socket cleanup + channel
-            for socket_path in [workdir.cmd_socket, workdir.event_socket, str(workdir.qmp_socket)]:
+            for socket_path in [workdir.cmd_socket, workdir.event_socket, workdir.qmp_socket]:
                 with suppress(OSError):
-                    await aiofiles.os.remove(socket_path)
+                    Path(socket_path).unlink()
 
             if workdir.use_qemu_vm_user:
                 expected_uid = get_qemu_vm_uid()
                 if expected_uid is None:
-                    raise VmDependencyError(
+                    raise _host_dependency(
                         "qemu-vm user required for socket authentication but not found",
-                        {"use_qemu_vm_user": True},
+                        context={"use_qemu_vm_user": True},
                     )
             else:
                 expected_uid = os.getuid()
@@ -805,20 +814,14 @@ class VmManager:
                 pending=pending,
             )
         except BaseException as error:
-            if not await self._cleanup_failed_owner(vm_id):
-                raise VmPermanentError(
-                    f"VM infrastructure cleanup was not confirmed for {vm_id}",
-                    context={"vm_id": vm_id, "operation": "infrastructure_cleanup"},
-                ) from error
+            await self._cleanup_failed_owner(vm_id, operation="infrastructure_cleanup", error=error)
             raise
 
     async def _start_gvproxy_for_vm(
         self,
         infra: _VmInfra,
         pending: _PendingLaunch,
-        language: Language,
-        allow_network: bool,
-        allowed_domains: list[str] | None,
+        spec: VmSpec,
         expose_ports: list[ExposedPort] | None,
     ) -> tuple[ProcessWrapper | None, asyncio.Task[None] | None, int]:
         """Start gvproxy-wrapper for a VM (shared by create and restore paths).
@@ -989,16 +992,29 @@ class VmManager:
         self._pending_launches[vm_id] = pending
         return pending
 
-    async def _cleanup_failed_owner(self, vm_id: str) -> bool:
-        """Clean a failed attempt without consuming its caller-owned reservation."""
+    async def _cleanup_failed_owner(self, vm_id: str, *, operation: str, error: BaseException) -> None:
+        """Clean a failed attempt without consuming its caller-owned reservation.
+
+        Raises:
+            InternalError: CLEANUP_UNCONFIRMED (from `error`, the failure of the attempt)
+                when the cleanup is not confirmed; the registry keeps the owner for retry.
+        """
         async with self._vms_lock:
             vm = self._vms.get(vm_id)
         if vm is not None:
-            return await self.destroy_vm(vm, _release_admission=False)
-        pending = self._pending_launches.get(vm_id)
-        if pending is None:
-            return True
-        return await self._cleanup_pending_launch(pending, _release_admission=False)
+            confirmed = await self.destroy_vm(vm, _release_admission=False)
+        elif (pending := self._pending_launches.get(vm_id)) is not None:
+            confirmed = await self._cleanup_pending_launch(pending, _release_admission=False)
+        else:
+            confirmed = True
+        if not confirmed:
+            raise InternalError(
+                f"VM resource cleanup was not confirmed for {vm_id} ({operation})",
+                code=ErrorCode.CLEANUP_UNCONFIRMED,
+                context={"vm_id": vm_id, "operation": operation},
+                hint=None,
+                instance_id=None,
+            ) from error
 
     async def _cleanup_pending_launch(
         self,
@@ -1114,22 +1130,29 @@ class VmManager:
             QemuVM handle for code execution
 
         Raises:
-            VmConfigError: Invalid configuration (mutually exclusive args)
-            VmDependencyError: Missing kernel, image, or qemu-vm user
-            VmOverlayError: Overlay creation failed
-            VmQemuCrashError: QEMU crashed during startup
-            VmBootTimeoutError: Guest agent not ready in time
-            VmGvproxyError: gvproxy startup failed
-            asyncio.TimeoutError: VM boot timeout (>5s)
+            InternalError: INTERNAL: invalid configuration (mutually exclusive args)
+            ConfigError: ASSET_NOT_FOUND: missing kernel, initramfs or base image;
+                HOST_DEPENDENCY: missing QEMU, gvproxy-wrapper or qemu-vm user
+            TransientError: OVERLAY_FAILED (overlay creation failed), QEMU_CRASHED
+                (QEMU crashed during startup), VM_BOOT_TIMEOUT (guest agent not ready
+                in time), GVPROXY_FAILED (gvproxy startup failed)
         """
         start_time = asyncio.get_running_loop().time()
 
         # Validate mutual exclusivity (create-specific)
         if snapshot_drive and direct_write_target:
-            raise VmConfigError("snapshot_drive and direct_write_target are mutually exclusive")
+            raise InternalError(
+                "snapshot_drive and direct_write_target are mutually exclusive",
+                code=ErrorCode.INTERNAL,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
 
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
-        infra = await self._setup_vm_infra(language, tenant_id, task_id, reservation)
+        infra = await self._setup_vm_infra(
+            spec, tenant_id, task_id, reservation, base_image=self.get_base_image(spec.language), home_template=None
+        )
         setup_complete_time = asyncio.get_running_loop().time()
         pending = infra.pending
 
@@ -1161,11 +1184,7 @@ class VmManager:
                 mem_path_share=mem_path_share,
             )
         except BaseException as error:
-            if not await self._cleanup_failed_owner(infra.vm_id):
-                raise VmPermanentError(
-                    f"Pre-boot resource cleanup was not confirmed for {infra.vm_id}",
-                    context={"vm_id": infra.vm_id, "operation": "pre_boot_resource_cleanup"},
-                ) from error
+            await self._cleanup_failed_owner(infra.vm_id, operation="pre_boot_resource_cleanup", error=error)
             raise
 
         # Phase 3: Start gvproxy BEFORE QEMU
@@ -1173,17 +1192,11 @@ class VmManager:
             gvproxy_proc, gvproxy_log_task, gvproxy_start_ms = await self._start_gvproxy_for_vm(
                 infra,
                 pending,
-                language,
-                allow_network,
-                allowed_domains,
+                spec,
                 expose_ports,
             )
         except BaseException as error:
-            if not await self._cleanup_failed_owner(infra.vm_id):
-                raise VmPermanentError(
-                    f"Pre-boot process cleanup was not confirmed for {infra.vm_id}",
-                    context={"vm_id": infra.vm_id, "operation": "pre_boot_cleanup"},
-                ) from error
+            await self._cleanup_failed_owner(infra.vm_id, operation="pre_boot_cleanup", error=error)
             raise
 
         # Phase 4: Launch QEMU (shared helper)
@@ -1222,38 +1235,25 @@ class VmManager:
                 await vm.transition_state(VmState.READY)
             except TimeoutError as e:
                 diag = await vm.collect_diagnostics()
-                qemu_cmd_str = " ".join(shlex.quote(arg) for arg in qemu_cmd)
                 arch_suffix = "aarch64" if self.arch == HostArch.AARCH64 else "x86_64"
-                kernel_path = self.settings.kernel_path / f"vmlinuz-{arch_suffix}"
-                initramfs_path = self.settings.kernel_path / f"initramfs-{arch_suffix}"
-
-                logger.error(
-                    "Guest agent boot timeout",
-                    extra={
-                        **asdict(diag),
-                        "language": language,
-                        "timeout_seconds": boot_timeout_seconds,
-                        "qemu_cmd": qemu_cmd_str[:1000],
-                        "kernel_path": str(kernel_path),
-                        "initramfs_path": str(initramfs_path),
-                        "overlay_image": str(infra.workdir.overlay_image),
-                    },
-                )
-
-                raise VmBootTimeoutError(
-                    f"Guest agent not ready after {boot_timeout_seconds}s: {e}. "
-                    f"qemu_running={diag.exit_code is None}, "
-                    f"stderr: {diag.stderr[:200] if diag.stderr else '(empty)'}, "
-                    f"console: {diag.console_log[-4000:]}",
-                    context={
-                        "vm_id": infra.vm_id,
-                        "language": language,
-                        "timeout_seconds": boot_timeout_seconds,
-                        "qemu_cmd": qemu_cmd_str[:1000],
-                        "kernel_path": str(kernel_path),
-                        "initramfs_path": str(initramfs_path),
-                        "overlay_image": str(infra.workdir.overlay_image),
-                    },
+                # The console (QEMU output, kernel, init) goes in the context, never the
+                # message: str(error) is one line.
+                context = {
+                    **asdict(diag),
+                    "language": spec.language,
+                    "timeout_seconds": boot_timeout_seconds,
+                    "qemu_cmd": " ".join(shlex.quote(arg) for arg in qemu_cmd)[:1000],
+                    "kernel_path": str(self.settings.kernel_path / f"vmlinuz-{arch_suffix}"),
+                    "initramfs_path": str(self.settings.kernel_path / f"initramfs-{arch_suffix}"),
+                    "overlay_image": str(infra.workdir.overlay_image),
+                }
+                logger.error("Guest agent boot timeout", extra=context)
+                raise TransientError(
+                    f"Guest agent not ready after {boot_timeout_seconds}s (qemu_running={diag.exit_code is None})",
+                    code=ErrorCode.VM_BOOT_TIMEOUT,
+                    context=context,
+                    hint=None,
+                    instance_id=None,
                 ) from e
 
             total_boot_ms = round((asyncio.get_running_loop().time() - start_time) * 1000)
@@ -1397,11 +1397,7 @@ class VmManager:
             if infra.workdir.use_qemu_vm_user and snapshot_drive:
                 await grant_qemu_vm_file_access(snapshot_drive, writable=False)
         except BaseException as error:
-            if not await self._cleanup_failed_owner(infra.vm_id):
-                raise VmPermanentError(
-                    f"Pre-restore resource cleanup was not confirmed for {infra.vm_id}",
-                    context={"vm_id": infra.vm_id, "operation": "pre_restore_file_access_cleanup"},
-                ) from error
+            await self._cleanup_failed_owner(infra.vm_id, operation="pre_restore_file_access_cleanup", error=error)
             raise
 
         # Phase 2: Socket activation for QMP (eliminates TOCTOU race)
@@ -1419,11 +1415,7 @@ class VmManager:
                 qmp_parent_sock = create_unix_socket(str(infra.workdir.qmp_socket))
                 qmp_fd = qmp_parent_sock.fileno()
         except BaseException as error:
-            if not await self._cleanup_failed_owner(infra.vm_id):
-                raise VmPermanentError(
-                    f"Pre-restore resource cleanup was not confirmed for {infra.vm_id}",
-                    context={"vm_id": infra.vm_id, "operation": "pre_restore_qmp_socket_cleanup"},
-                ) from error
+            await self._cleanup_failed_owner(infra.vm_id, operation="pre_restore_qmp_socket_cleanup", error=error)
             raise
 
         # Phase 3-5 wrapped in try so qmp_parent_sock is always cleaned up
@@ -1491,9 +1483,12 @@ class VmManager:
             # Reuses QSD pattern (qemu_storage_daemon.py:313-315)
             def _check_qemu_alive() -> None:
                 if vm.process.returncode is not None:
-                    raise VmTransientError(
+                    raise TransientError(
                         f"QEMU died during L1 restore for {infra.vm_id} (rc={vm.process.returncode})",
+                        code=ErrorCode.QEMU_CRASHED,
                         context={"vm_id": infra.vm_id, "returncode": vm.process.returncode},
+                        hint=None,
+                        instance_id=None,
                     )
 
             _check_qemu_alive()
@@ -1509,16 +1504,24 @@ class VmManager:
                         abort_check=_check_qemu_alive,
                     )
                 except TimeoutError as e:
-                    raise VmTransientError(
+                    raise TransientError(
                         f"QMP socket never appeared for {infra.vm_id}",
+                        code=ErrorCode.QEMU_CRASHED,
                         context={"vm_id": infra.vm_id, "qmp_socket": str(vm.qmp_socket)},
+                        hint=None,
+                        instance_id=None,
                     ) from e
             # else: socket activation — socket is pre-created, no wait needed
 
             # Restore VM state via QMP migration (load vmstate → resume vCPU)
             try:
                 async with MigrationClient(vm.qmp_socket, infra.expected_uid) as client:
-                    await client.restore_snapshot(vmstate_path, qemu_version=qemu_version, use_template=use_template)
+                    await client.restore_snapshot(
+                        vmstate_path,
+                        qemu_version=qemu_version,
+                        timeout=migration_timeout(spec.memory_mb),
+                        use_template=use_template,
+                    )
             except Exception as e:
                 # Check if QEMU died — provides a more informative error
                 _check_qemu_alive()
@@ -1569,11 +1572,7 @@ class VmManager:
             if qmp_parent_sock is not None:
                 with suppress(OSError):
                     qmp_parent_sock.close()
-            if not await self._cleanup_failed_owner(infra.vm_id):
-                raise VmPermanentError(
-                    f"Restore failure cleanup was not confirmed for {infra.vm_id}",
-                    context={"vm_id": infra.vm_id, "operation": "restore_failure_cleanup"},
-                ) from error
+            await self._cleanup_failed_owner(infra.vm_id, operation="restore_failure_cleanup", error=error)
             raise
 
     async def _force_cleanup_all_resources(
@@ -1783,8 +1782,7 @@ class VmManager:
             async with vm.cleanup_lock:
                 # Make direct VM APIs non-reusable before touching processes. Unlike
                 # the old destroy path, this does not claim DESTROYED yet.
-                with suppress(VmPermanentError):
-                    await vm.begin_destroy()
+                await vm.begin_destroy()
                 with suppress(OSError, RuntimeError):
                     await vm.channel.close()
 
@@ -1896,14 +1894,20 @@ class VmManager:
 
         pattern = patterns.get(language)
         if not pattern:
-            raise VmConfigError(f"Unknown language: {language}")
+            raise InternalError(
+                f"Unknown language: {language}", code=ErrorCode.INTERNAL, context=None, hint=None, instance_id=None
+            )
 
         # Find matching images
         matches = list(self.settings.base_images_dir.glob(pattern))
         if not matches:
-            raise VmDependencyError(
+            raise ConfigError(
                 f"Base image not found for language: {language}. "
-                f"Pattern: {pattern}, dir: {self.settings.base_images_dir}"
+                f"Pattern: {pattern}, dir: {self.settings.base_images_dir}",
+                code=ErrorCode.ASSET_NOT_FOUND,
+                context=None,
+                hint=None,
+                instance_id=None,
             )
 
         # Return first match (sorted for determinism)

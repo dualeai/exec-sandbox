@@ -141,17 +141,21 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             qemu_version_check = await probe_qemu_version()
             if qemu_version_check is not None and qemu_version_check < (9, 0, 4):
                 version_str = ".".join(str(v) for v in qemu_version_check)
-                raise VmDependencyError(
+                raise ConfigError(
                     f"QEMU {version_str} has a deterministic ARM64 TCG crash in "
                     f"regime_is_user() (target/arm/internals.h). Every kernel↔userspace "
                     f"transition triggers g_assert_not_reached(). "
                     f"Upgrade to QEMU >= 9.0.4 to fix this. "
-                    f"See: https://gitlab.com/qemu-project/qemu/-/commit/1505b651fdbd"
+                    f"See: https://gitlab.com/qemu-project/qemu/-/commit/1505b651fdbd",
+                    code=ErrorCode.HOST_DEPENDENCY,
+                    context=None,
+                    hint=None,
+                    instance_id=None,
                 )
 
+    tsc_available = False  # x86 only: set below from the TSC_DEADLINE probe
     if arch == HostArch.AARCH64:
         arch_suffix = "aarch64"
-        qemu_bin = "qemu-system-aarch64"
         # highmem=off: Keep all RAM below 4GB for simpler memory mapping (faster boot)
         # gic-version=3: Explicit GIC version for TCG (ITS not modeled in TCG)
         # virtualization=off: Disable nested virt emulation (not needed, faster TCG)

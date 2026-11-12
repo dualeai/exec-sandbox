@@ -427,6 +427,7 @@ class TestSecurityEdgeCases:
             message="Test",
             expected_uid=1000,
             actual_uid=2000,
+            context=None,
         )
 
         assert isinstance(exc, CommunicationError)
@@ -470,11 +471,12 @@ class TestSocketAuthError:
         assert str(exc) == "Test error"
 
     def test_exception_without_context(self) -> None:
-        """SocketAuthError works without context."""
+        """SocketAuthError works with no context (None)."""
         exc = SocketAuthError(
             message="Test error",
             expected_uid=1000,
             actual_uid=2000,
+            context=None,
         )
         assert exc.expected_uid == 1000
         assert exc.actual_uid == 2000
@@ -596,6 +598,7 @@ class TestEdgeCases:
             message=f"UID mismatch: expected {fake_uid}",
             expected_uid=fake_uid,
             actual_uid=os.getuid(),
+            context=None,
         )
         assert exc.expected_uid == fake_uid
 

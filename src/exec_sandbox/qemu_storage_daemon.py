@@ -37,14 +37,14 @@ import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Final, Self, cast
 
 import psutil
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
-from exec_sandbox.exceptions import VmOverlayError as QemuStorageDaemonError
+from exec_sandbox.exceptions import ErrorCode, TransientError, spawn_error
 from exec_sandbox.process_registry import unregister_process
 from exec_sandbox.resource_cleanup import cleanup_process
 from exec_sandbox.subprocess_utils import communicate_managed_process, start_managed_process, wait_for_socket
@@ -56,6 +56,17 @@ logger = get_logger(__name__)
 
 # Cleanup must outlive a caller that abandons a partially-started daemon.
 _cleanup_tasks: set[asyncio.Task[None]] = set()
+
+# qcow2 options of every overlay (qemu-img create -o lazy_refcounts=on,extended_l2=on,cluster_size=128k):
+# lazy refcounts for faster writes (metadata stays crash-consistent through fsync), extended L2
+# entries for sub-cluster allocation of small writes, 128 KiB clusters to balance metadata size
+# and I/O.
+_OVERLAY_QCOW2_OPTIONS: Final[dict[str, Any]] = {"cluster-size": 131072, "lazy-refcounts": True, "extended-l2": True}
+
+
+def _overlay_failed(message: str, *, context: dict[str, Any] | None) -> TransientError:
+    """The TransientError (OVERLAY_FAILED) of a daemon, QMP, image-info or job failure."""
+    return TransientError(message, code=ErrorCode.OVERLAY_FAILED, context=context, hint=None, instance_id=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,15 +253,12 @@ class QemuStorageDaemon:
         Args:
             base_image: Base qcow2 image (backing file, read-only)
             overlay_path: Path for new overlay file (will be created)
-            cluster_size: qcow2 cluster size in bytes (default: 128k)
-            lazy_refcounts: Enable lazy refcounts for faster writes
-            extended_l2: Enable extended L2 entries for sub-cluster allocation
 
         Raises:
-            QemuStorageDaemonError: If daemon not started or creation fails
+            TransientError: OVERLAY_FAILED if daemon not started or creation fails
         """
         if not self._started:
-            raise QemuStorageDaemonError("Daemon not started")
+            raise _overlay_failed("Daemon not started", context=None)
 
         uid = secrets.token_hex(8)
         file_job_id = f"file-{uid}"
@@ -306,7 +314,7 @@ class QemuStorageDaemon:
 
         finally:
             # Always clean up blockdev node
-            with contextlib.suppress(QemuStorageDaemonError):
+            with contextlib.suppress(TransientError):
                 await self._execute("blockdev-del", {"node-name": node_name})
 
     async def _wait_and_connect_qmp(self) -> None:
@@ -318,14 +326,14 @@ class QemuStorageDaemon:
         under CI load.
 
         Raises:
-            QemuStorageDaemonError: If socket doesn't appear or handshake fails
+            TransientError: OVERLAY_FAILED if socket doesn't appear or handshake fails
         """
         if not self._socket_path:
-            raise QemuStorageDaemonError("No socket path configured")
+            raise _overlay_failed("No socket path configured", context=None)
 
         def _check_process_alive() -> None:
             if self._process and self._process.returncode is not None:
-                raise QemuStorageDaemonError(f"Daemon process exited with code {self._process.returncode}")
+                raise _overlay_failed(f"Daemon process exited with code {self._process.returncode}", context=None)
 
         startup_timeout = constants.QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS
         socket_timeout = constants.QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS
@@ -338,13 +346,13 @@ class QemuStorageDaemon:
                 keep_connection=True,
             )
         except TimeoutError as e:
-            raise QemuStorageDaemonError(f"Daemon socket not ready after {startup_timeout}s") from e
+            raise _overlay_failed(f"Daemon socket not ready after {startup_timeout}s", context=None) from e
 
         # Read greeting
         greeting = await asyncio.wait_for(self._reader.readline(), timeout=socket_timeout)
         greeting_data = json.loads(greeting)
         if "QMP" not in greeting_data:
-            raise QemuStorageDaemonError(f"Invalid QMP greeting: {greeting.decode()}")
+            raise _overlay_failed(f"Invalid QMP greeting: {greeting.decode()}", context=None)
 
         # Send capabilities
         await self._execute("qmp_capabilities")
@@ -369,10 +377,10 @@ class QemuStorageDaemon:
             QMP response dict (the 'return' field contents)
 
         Raises:
-            QemuStorageDaemonError: If command fails or not connected
+            TransientError: OVERLAY_FAILED if command fails or not connected
         """
         if self._writer is None or self._reader is None:
-            raise QemuStorageDaemonError("Not connected to QMP")
+            raise _overlay_failed("Not connected to QMP", context=None)
 
         self._request_seq += 1
         request_id = f"qsd-{self._request_seq}"
@@ -401,7 +409,7 @@ class QemuStorageDaemon:
     ) -> dict[str, Any]:
         """Write one identified QMP command and consume its matching response."""
         if self._writer is None or self._reader is None:
-            raise QemuStorageDaemonError("Not connected to QMP")
+            raise _overlay_failed("Not connected to QMP", context=None)
 
         msg: dict[str, Any] = {"execute": command, "id": request_id}
         if arguments:
@@ -431,15 +439,15 @@ class QemuStorageDaemon:
                 continue
 
             if "error" in result:
-                raise QemuStorageDaemonError(
+                raise _overlay_failed(
                     result["error"].get("desc", "Unknown QMP error"),
-                    result["error"].get("class"),
+                    context={"error_class": result["error"].get("class")},
                 )
 
             if "return" in result:
                 return result["return"]
 
-        raise QemuStorageDaemonError(f"Timeout waiting for response to {command}")
+        raise _overlay_failed(f"Timeout waiting for response to {command}", context=None)
 
     async def _get_image_virtual_size(self, image_path: Path) -> int:
         """Get image virtual size using qemu-img info (cached).
@@ -469,21 +477,21 @@ class QemuStorageDaemon:
 
         if returncode != 0:
             error_msg = stderr.decode().strip() if stderr else "Unknown error"
-            raise QemuStorageDaemonError(f"Failed to get image info for {image_path}: {error_msg}")
+            raise _overlay_failed(f"Failed to get image info for {image_path}: {error_msg}", context=None)
 
         try:
             info = json.loads(stdout)
         except json.JSONDecodeError as e:
-            raise QemuStorageDaemonError(f"Invalid JSON from qemu-img info for {image_path}: {e}") from e
+            raise _overlay_failed(f"Invalid JSON from qemu-img info for {image_path}: {e}", context=None) from e
 
         # Verify it's a qcow2 image (not raw or other format)
         fmt = info.get("format")
         if fmt != "qcow2":
-            raise QemuStorageDaemonError(f"Base image {image_path} is not qcow2 format (got: {fmt})")
+            raise _overlay_failed(f"Base image {image_path} is not qcow2 format (got: {fmt})", context=None)
 
         size = info.get("virtual-size")
         if size is None:
-            raise QemuStorageDaemonError(f"No virtual-size in qemu-img info for {image_path}")
+            raise _overlay_failed(f"No virtual-size in qemu-img info for {image_path}", context=None)
 
         self._virtual_size_cache[cache_key] = size
         return size
@@ -581,9 +589,9 @@ class QemuStorageDaemon:
                             job = self._parse_job(raw)
                             if job.status == "concluded":
                                 if job.error:
-                                    with contextlib.suppress(QemuStorageDaemonError):
+                                    with contextlib.suppress(TransientError):
                                         await self._execute("job-dismiss", {"id": job_id})
-                                    raise QemuStorageDaemonError(f"Job {job_id} failed: {job.error}")
+                                    raise _overlay_failed(f"Job {job_id} failed: {job.error}", context=None)
                                 # Dismiss completed job
                                 await self._execute("job-dismiss", {"id": job_id})
                                 return
@@ -609,16 +617,16 @@ class QemuStorageDaemon:
 
                 if job.status == "concluded":
                     if job.error:
-                        with contextlib.suppress(QemuStorageDaemonError):
+                        with contextlib.suppress(TransientError):
                             await self._execute("job-dismiss", {"id": job_id})
-                        raise QemuStorageDaemonError(f"Job {job_id} failed: {job.error}")
+                        raise _overlay_failed(f"Job {job_id} failed: {job.error}", context=None)
                     await self._execute("job-dismiss", {"id": job_id})
                     return
 
                 # Safety net: polling at 50ms (5x slower than before — events are primary)
                 await asyncio.sleep(0.05)
 
-            raise QemuStorageDaemonError(f"Job {job_id} timed out after {timeout}s")
+            raise _overlay_failed(f"Job {job_id} timed out after {timeout}s", context=None)
         finally:
             # Purge any stale events for this job (e.g. concluded events that
             # arrived after we already observed completion via query-jobs)

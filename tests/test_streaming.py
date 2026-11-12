@@ -12,10 +12,11 @@ import time
 import pytest
 
 from exec_sandbox.constants import DEFAULT_TIMEOUT_SECONDS
-from exec_sandbox.exceptions import OutputLimitError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_unless_hwaccel
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, skip_unless_hwaccel
 
 
 # =============================================================================
@@ -234,19 +235,17 @@ import sys
 sys.stdout.write("X" * {target_size})
 sys.stdout.flush()
 """
-        with pytest.raises(OutputLimitError, match="output_limit_error"):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                on_stdout=stdout_chunks.append,
-            )
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT, match="output_limit_error"
+        ):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
 
         # Callbacks received partial output up to the limit
         joined = "".join(stdout_chunks)
         assert len(joined) <= 1_000_000 + 8192  # limit + one read buffer margin
 
     async def test_stderr_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """120KB stderr raises OutputLimitError; partial output delivered via callbacks."""
+        """120KB stderr raises InvalidInputError OUTPUT_LIMIT; partial output delivered via callbacks."""
         stderr_chunks: list[str] = []
         target_size = 120_000  # 120KB — over 100KB limit
 
@@ -255,12 +254,10 @@ import sys
 sys.stderr.write("E" * {target_size})
 sys.stderr.flush()
 """
-        with pytest.raises(OutputLimitError, match="output_limit_error"):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                on_stderr=stderr_chunks.append,
-            )
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT, match="output_limit_error"
+        ):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stderr=stderr_chunks.append)
 
         # Callbacks received partial output up to the limit
         joined = "".join(stderr_chunks)
@@ -677,19 +674,22 @@ sys.stdout.flush()
 sys.stderr.write("E" * {stderr_size})
 sys.stderr.flush()
 """
-        with pytest.raises(OutputLimitError, match="output_limit_error"):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT, match="output_limit_error"
+        ):
+            await run_once(
+                scheduler,
+                VmSpec(language=Language.PYTHON),
+                code,
                 on_stdout=stdout_chunks.append,
                 on_stderr=stderr_chunks.append,
             )
 
     async def test_session_reuse_after_output_limit_error(self, scheduler: Scheduler) -> None:
-        """REPL session survives OutputLimitError — next exec works normally."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        """REPL session survives InvalidInputError OUTPUT_LIMIT — next exec works normally."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # First execution: exceed stdout limit
-            with pytest.raises(OutputLimitError):
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
                 await session.exec(
                     "import sys; sys.stdout.write('X' * 1_200_000); sys.stdout.flush()",
                 )

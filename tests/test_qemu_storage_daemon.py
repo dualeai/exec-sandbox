@@ -10,6 +10,7 @@ that creates qcow2 overlays — it does not boot VMs or use KVM/HVF.
 """
 
 import asyncio
+import errno
 import json
 import os
 import secrets
@@ -20,9 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from exec_sandbox.exceptions import ConfigError, ErrorCode, SandboxError, TransientError
 from exec_sandbox.overlay_pool import OverlayPool
 from exec_sandbox.process_registry import _process_groups
-from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError, QmpEvent
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QmpEvent
 from exec_sandbox.vm_manager import VmManager
 
 # ============================================================================
@@ -65,7 +67,7 @@ class TestQemuStorageDaemonUnit:
     async def test_create_overlay_when_not_started_raises_error(self) -> None:
         """create_overlay raises if daemon not started."""
         daemon = QemuStorageDaemon()
-        with pytest.raises(QemuStorageDaemonError, match="not started"):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="not started"):
             await daemon.create_overlay(Path("/fake/base.qcow2"), Path("/fake/out.qcow2"))
 
     async def test_cancelled_exchange_drains_identified_response_before_next_command(self) -> None:
@@ -137,11 +139,15 @@ class TestQemuStorageDaemonUnit:
                 QemuStorageDaemon,
                 "stop",
                 new_callable=AsyncMock,
-                side_effect=QemuStorageDaemonError("cleanup pending"),
+                side_effect=TransientError(
+                    "cleanup pending", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None
+                ),
             ) as stop,
             patch("exec_sandbox.qemu_storage_daemon.start_managed_process", new_callable=AsyncMock) as spawn,
         ):
-            with pytest.raises(QemuStorageDaemonError, match="cleanup pending"):
+            with pytest.raises(
+                TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="cleanup pending"
+            ):
                 await daemon.start()
 
         stop.assert_awaited_once_with()
@@ -159,16 +165,67 @@ class TestQemuStorageDaemonUnit:
         daemon = QemuStorageDaemon()
         assert daemon.started is False
 
-    async def test_error_class_preserved_in_exception(self) -> None:
-        """QemuStorageDaemonError preserves error_class attribute."""
-        error = QemuStorageDaemonError("Some error", error_class="GenericError")
-        assert error.error_class == "GenericError"
-        assert str(error) == "Some error"
+    async def test_qmp_error_keeps_its_class_and_description(self) -> None:
+        """A QMP error answer raises TransientError OVERLAY_FAILED: the message is the
+        QMP description, context["error_class"] the QMP error class."""
+        daemon = QemuStorageDaemon()
+        reader = MagicMock()
+        reader.readline = AsyncMock(
+            return_value=b'{"error":{"class":"GenericError","desc":"Some error"},"id":"qsd-1"}\n'
+        )
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        daemon._reader = reader
+        daemon._writer = writer
 
-    async def test_error_class_defaults_to_none(self) -> None:
-        """QemuStorageDaemonError error_class defaults to None."""
-        error = QemuStorageDaemonError("Some error")
-        assert error.error_class is None
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED) as exc_info:
+            await daemon._execute("blockdev-add")
+
+        assert str(exc_info.value) == "Some error"
+        assert exc_info.value.context["error_class"] == "GenericError"
+
+    async def test_missing_binary_is_a_config_error(self) -> None:
+        """A host without qemu-storage-daemon raises ConfigError HOST_DEPENDENCY (no
+        retry fixes it), not the transient OVERLAY_FAILED."""
+        daemon = QemuStorageDaemon()
+        with (
+            patch(
+                "exec_sandbox.qemu_storage_daemon.start_managed_process",
+                new_callable=AsyncMock,
+                side_effect=FileNotFoundError(2, "No such file or directory", "qemu-storage-daemon"),
+            ),
+            pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info,
+        ):
+            await daemon.start()
+
+        assert exc_info.value.context["binary"] == "qemu-storage-daemon"
+        assert not daemon.started
+
+    @pytest.mark.parametrize(
+        ("err", "cls", "code"),
+        [
+            (errno.EACCES, ConfigError, ErrorCode.HOST_DEPENDENCY),
+            (errno.ENOEXEC, ConfigError, ErrorCode.HOST_DEPENDENCY),
+            (errno.EAGAIN, TransientError, ErrorCode.OVERLAY_FAILED),
+        ],
+        ids=["no-exec-bit", "other-arch", "process-limit"],
+    )
+    async def test_spawn_error_by_errno(self, err: int, cls: type[SandboxError], code: ErrorCode) -> None:
+        """A binary this user cannot run fails on every retry (FIX_CONFIG); a fork that hits
+        a process limit can pass later (OVERLAY_FAILED, RETRY)."""
+        daemon = QemuStorageDaemon()
+        with (
+            patch(
+                "exec_sandbox.qemu_storage_daemon.start_managed_process",
+                new_callable=AsyncMock,
+                side_effect=OSError(err, os.strerror(err)),
+            ),
+            pytest.raises(cls, check=lambda e: e.code is code) as exc_info,
+        ):
+            await daemon.start()
+
+        assert exc_info.value.context["errno"] == err
+        assert not daemon.started
 
     # --- Event buffer logic ---
 
@@ -623,7 +680,7 @@ class TestQemuStorageDaemonIntegration:
     ) -> None:
         """Valid overlay creation succeeds after a failed attempt on same daemon."""
         # First: fail with nonexistent base
-        with pytest.raises(QemuStorageDaemonError):
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED):
             await started_daemon.create_overlay(tmp_path / "nonexistent.qcow2", tmp_path / "fail.qcow2")
 
         # Second: succeed with valid base
@@ -663,7 +720,9 @@ class TestQemuStorageDaemonIntegration:
 
         monkeypatch.setattr(QemuStorageDaemon, "_wait_and_connect_qmp", _bad_wait_and_connect_qmp)
 
-        with pytest.raises(QemuStorageDaemonError, match="Failed to start daemon"):
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to start daemon"
+        ):
             await daemon.start()
 
         # Process was cleaned up, should not be in registry
@@ -756,7 +815,9 @@ class TestQemuStorageDaemonErrors:
         nonexistent = tmp_path / "does-not-exist.qcow2"
         overlay = tmp_path / "overlay.qcow2"
 
-        with pytest.raises(QemuStorageDaemonError, match="Failed to get image info"):
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to get image info"
+        ):
             await started_daemon.create_overlay(nonexistent, overlay)
 
         # Overlay should not exist
@@ -772,7 +833,9 @@ class TestQemuStorageDaemonErrors:
 
         overlay = tmp_path / "overlay.qcow2"
 
-        with pytest.raises(QemuStorageDaemonError, match="not qcow2 format"):
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="not qcow2 format"
+        ):
             await started_daemon.create_overlay(fake_base, overlay)
 
     async def test_create_overlay_permission_denied(
@@ -787,7 +850,7 @@ class TestQemuStorageDaemonErrors:
         overlay = readonly_dir / "overlay.qcow2"
 
         try:
-            with pytest.raises(QemuStorageDaemonError):
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED):
                 await started_daemon.create_overlay(base_image, overlay)
         finally:
             readonly_dir.chmod(0o755)  # Restore for cleanup

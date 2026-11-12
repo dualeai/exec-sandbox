@@ -9,14 +9,16 @@ Strategy: Generate deterministic output in VM, compare hash with pre-computed ex
 Uses dynamic fixtures to test various payload sizes.
 """
 
+import hashlib
 from collections.abc import Callable
 
 import pytest
 
-from exec_sandbox.exceptions import OutputLimitError
-from exec_sandbox.hash_utils import bytes_hash
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once
 
 from .conftest import skip_unless_hwaccel
 
@@ -447,12 +449,8 @@ class TestLargePayloadStreaming:
         # Use longer timeout for extra large payloads (25MB+)
         timeout = EXTRA_LARGE_TIMEOUT_SECONDS if size_bytes >= 25_000_000 else TIMEOUT_SECONDS
 
-        with pytest.raises(OutputLimitError):
-            await scheduler.run(
-                code=code,
-                language=Language.PYTHON,
-                timeout_seconds=timeout,
-            )
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
+            await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=timeout)
 
 
 # =============================================================================

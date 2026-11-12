@@ -50,7 +50,7 @@ from exec_sandbox.constants import (
     DEFAULT_VM_MEMORY_OVERHEAD_MB,
     GATE3_SELF_WAKE_INTERVAL_SECONDS,
 )
-from exec_sandbox.exceptions import VmCapacityError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError, RouteError, TransientError
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 if TYPE_CHECKING:
@@ -503,9 +503,37 @@ class ResourceAdmissionController:
             vm_id=vm_id,
             memory_mb=total_memory_mb,
             cpu_cores=total_cpu,
-            guest_memory_mb=memory_mb,
-            guest_cpu_cores=cpu_cores,
+            disk_mb=disk_mb,
         )
+
+        # Budgets are static: a request above the whole budget can never be
+        # admitted, so fail now instead of after `timeout`.
+        if total_memory_mb > self._memory_budget_mb or total_cpu > self._cpu_budget:
+            required: dict[str, str] = {}
+            found: dict[str, str] = {}
+            if total_memory_mb > self._memory_budget_mb:
+                required["memory_mb"] = str(round(total_memory_mb))
+                found["memory_mb"] = str(round(self._memory_budget_mb))
+            if total_cpu > self._cpu_budget:
+                required["cpu"] = str(round(total_cpu, 2))
+                found["cpu"] = str(round(self._cpu_budget, 1))
+            raise RouteError(
+                f"VM {vm_id} can never fit: requested {round(total_memory_mb)}MB memory, "
+                f"{round(total_cpu, 2)} CPU; total budget {round(self._memory_budget_mb)}MB memory, "
+                f"{round(self._cpu_budget, 1)} CPU.",
+                code=ErrorCode.CAPACITY_NEVER_FITS,
+                required=required,
+                found=found,
+                context={
+                    "vm_id": vm_id,
+                    "requested_memory_mb": round(total_memory_mb),
+                    "requested_cpu": round(total_cpu, 2),
+                    "memory_budget_mb": round(self._memory_budget_mb),
+                    "cpu_budget": round(self._cpu_budget, 1),
+                },
+                hint="Run it on a worker whose budget holds it (see `required`), or ask for a smaller VM.",
+                instance_id=None,
+            )
 
         logger.debug(
             "Acquiring resources",
@@ -556,14 +584,16 @@ class ResourceAdmissionController:
             system_avail = self._probe_available_memory()
             if system_avail is not None:
                 floor_info = f" System available: {round(system_avail)}MB (floor: {self._available_memory_floor_mb}MB)."
-            raise VmCapacityError(
+            raise TransientError(
                 f"Resource admission timeout after {timeout}s for VM {vm_id}. "
                 f"Requested: {round(total_memory_mb)}MB memory, {round(total_cpu, 2)} CPU. "
                 f"Budget: {mem_budget_str}MB memory "
                 f"({round(self._allocated_memory_mb)}/{mem_budget_str} allocated), "
                 f"{cpu_budget_str} CPU "
                 f"({round(self._allocated_cpu, 1)}/{cpu_budget_str} allocated), "
-                f"{self._allocated_vm_slots} VM slots in use.{floor_info}",
+                f"{self._allocated_vm_slots} VM slots in use.{floor_info} "
+                f"Home disks: {disk_mb}MB requested, {round(self._allocated_disk_mb)}MB admitted.",
+                code=ErrorCode.CAPACITY,
                 context={
                     "vm_id": vm_id,
                     "requested_memory_mb": round(total_memory_mb),
@@ -576,6 +606,8 @@ class ResourceAdmissionController:
                     "available_memory_floor_mb": self._available_memory_floor_mb,
                     "system_available_memory_mb": (round(system_avail) if system_avail is not None else None),
                 },
+                hint=None,
+                instance_id=None,
             ) from None
 
     async def release(self, reservation: ResourceReservation) -> None:

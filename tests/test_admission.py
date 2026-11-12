@@ -28,7 +28,7 @@ from exec_sandbox.constants import (
     DEFAULT_VM_MEMORY_OVERHEAD_MB,
     RESOURCE_ADMISSION_TIMEOUT_SECONDS,
 )
-from exec_sandbox.exceptions import VmCapacityError
+from exec_sandbox.exceptions import ErrorAction, ErrorCode, InvalidInputError, RouteError, TransientError
 from tests.conftest import skip_unless_linux, skip_unless_macos
 
 # ============================================================================
@@ -287,14 +287,42 @@ async def test_overcommit_allows_more_cpu_than_physical() -> None:
 # ============================================================================
 
 
+@pytest.mark.parametrize(
+    ("memory_mb", "cpu_cores", "too_big"),
+    [pytest.param(1_000_000, _CPU, "memory_mb", id="memory"), pytest.param(256, 64.0, "cpu", id="cpu")],
+)
+async def test_acquire_never_fits_fails_at_once(memory_mb: float, cpu_cores: float, too_big: str) -> None:
+    """A request above the whole budget fails at once, without waiting for the timeout.
+
+    It is a RouteError (a worker with a larger budget can run it); `required` and
+    `found` list only the value that is too big.
+    """
+    ctrl = _make_controller()
+
+    async with asyncio.timeout(1.0):
+        with pytest.raises(
+            RouteError, check=lambda e: e.code is ErrorCode.CAPACITY_NEVER_FITS, match="can never fit"
+        ) as exc_info:
+            await ctrl.acquire("vm-huge", memory_mb=memory_mb, cpu_cores=cpu_cores, disk_mb=0, timeout=_TIMEOUT)
+
+    error = exc_info.value
+    assert error.action is ErrorAction.ROUTE
+    assert set(error.required) == set(error.found) == {too_big}
+    assert float(error.required[too_big]) > float(error.found[too_big])
+    async with asyncio.timeout(1.0):  # nothing was reserved: a request that fits is admitted at once
+        await ctrl.release(await ctrl.acquire("vm-ok", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT))
+
+
 async def test_acquire_timeout_raises_capacity_error() -> None:
-    """VmCapacityError raised when timeout expires waiting for resources."""
+    """TransientError CAPACITY raised when timeout expires waiting for resources."""
     # Tight CPU budget: only 1 VM fits (1.5 host CPUs, 0 reserve, each VM 1.25 effective)
     ctrl = _make_controller(host_cpu_count=1.5, cpu_overcommit=1.0, cpu_reserve_cores=0.0)
-    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+    r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
 
-    with pytest.raises(VmCapacityError, match="Resource admission timeout"):
-        await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+    with pytest.raises(
+        TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"
+    ):
+        await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
     await ctrl.release(r1)
 
@@ -566,8 +594,11 @@ async def test_floor_rejects_when_system_cannot_fit_requested() -> None:
     ctrl = _make_controller(available_memory_floor_mb=512)
 
     # System has 300MB available, request needs ~384MB + 512MB floor → reject
-    with _mock_system_memory(300.0), pytest.raises(VmCapacityError, match="Resource admission timeout"):
-        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+    with (
+        _mock_system_memory(300.0),
+        pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"),
+    ):
+        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
 
 async def test_floor_allows_when_sufficient_available() -> None:
@@ -586,8 +617,11 @@ async def test_floor_zero_rejects_when_literally_no_memory() -> None:
     ctrl = _make_controller(available_memory_floor_mb=0)
 
     # System has 100MB available, request needs ~384MB → 100 - 384 < 0 → reject
-    with _mock_system_memory(100.0), pytest.raises(VmCapacityError, match="Resource admission timeout"):
-        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+    with (
+        _mock_system_memory(100.0),
+        pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"),
+    ):
+        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
 
 async def test_floor_zero_allows_when_available_sufficient() -> None:
@@ -678,8 +712,11 @@ async def test_cross_process_backpressure_rejects_when_system_low() -> None:
 
     # System only has 200MB available (e.g. other xdist workers consumed memory)
     # Request needs ~384MB → 200 - 384 < 0 → reject
-    with _mock_system_memory(200.0), pytest.raises(VmCapacityError, match="Resource admission timeout"):
-        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+    with (
+        _mock_system_memory(200.0),
+        pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"),
+    ):
+        await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
 
 # ============================================================================
@@ -800,9 +837,11 @@ class TestMemoryPressureGate:
         with (
             _mock_system_memory(8192.0),
             patch.object(type(ctrl), "_probe_memory_pressure", return_value=True),
-            pytest.raises(VmCapacityError, match="Resource admission timeout"),
+            pytest.raises(
+                TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"
+            ),
         ):
-            await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+            await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
     async def test_allows_when_no_pressure(self) -> None:
         """Gate 3b allows when _probe_memory_pressure returns False."""
@@ -1121,12 +1160,13 @@ async def test_n_controllers_converge_to_system_limit() -> None:
                     f"vm-{i}",
                     memory_mb=256,
                     cpu_cores=_CPU,
+                    disk_mb=0,
                     timeout=0.2,
                 )
                 available_mb[0] -= 384.0
                 total_admitted += 1
                 reservations.append((ctrl, r))
-            except VmCapacityError:
+            except TransientError:
                 break  # System full
 
     # Per-controller budget allows 56 VMs each (224 total), but system only fits ~5
@@ -1152,12 +1192,14 @@ async def test_gate1_still_limits_single_controller() -> None:
     # Budget = 1000MB, per-VM = 384MB → max 2 VMs
 
     with _mock_system_memory(100_000.0):  # system has plenty
-        r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
-        r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, timeout=_TIMEOUT)
+        r1 = await ctrl.acquire("vm-1", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
+        r2 = await ctrl.acquire("vm-2", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=_TIMEOUT)
 
         # Third VM: Gate 3a passes (100GB available) but Gate 1 rejects (768/1000 + 384 > 1000)
-        with pytest.raises(VmCapacityError, match="Resource admission timeout"):
-            await ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.CAPACITY, match="Resource admission timeout"
+        ):
+            await ctrl.acquire("vm-3", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
 
     await ctrl.release(r1)
     await ctrl.release(r2)
@@ -1180,11 +1222,11 @@ async def test_floor_adds_headroom_in_multi_controller() -> None:
             ctrl = ctrl_a if i % 2 == 0 else ctrl_b
             _invalidate_probe_caches(ctrl_a, ctrl_b)
             try:
-                r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, timeout=0.2)
+                r = await ctrl.acquire(f"vm-{i}", memory_mb=256, cpu_cores=_CPU, disk_mb=0, timeout=0.2)
                 available_mb[0] -= 384.0
                 admitted += 1
                 reservations.append((ctrl, r))
-            except VmCapacityError:
+            except TransientError:
                 break
 
     # floor=512: reject when available - 384 < 512, i.e. available < 896
@@ -1243,7 +1285,7 @@ async def test_stop_unblocks_waiting_acquires() -> None:
     # stop() should immediately unblock the waiter
     await ctrl.stop()
 
-    with pytest.raises(VmCapacityError, match="stopped"):
+    with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE, match="stopped"):
         await asyncio.wait_for(acquire_task, timeout=2.0)
 
     await ctrl.release(r1)

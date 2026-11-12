@@ -58,34 +58,36 @@ For S3 snapshot caching:
 # HVF (macOS) acceleration.  None of these are available on Windows.
 #
 # We detect the platform via psutil (see platform_utils.detect_host_os) and
-# raise PermanentError — a SandboxError subclass — so that cross-platform
-# orchestrators can handle the rejection gracefully:
-#
-#     from exec_sandbox.exceptions import PermanentError
+# raise ConfigError (code PLATFORM_UNSUPPORTED), a SandboxError, so that
+# cross-platform orchestrators can handle the rejection gracefully. Python runs
+# this file before any exec_sandbox module, so no import of the error classes
+# can come before this check: catch Exception and test its code (ErrorCode is
+# a str enum).
 #
 #     try:
 #         from exec_sandbox import Scheduler
-#     except PermanentError:
-#         # Fall back to another execution backend
-#         pass
-#
-# The exceptions module is pure Python with no POSIX dependencies, so it
-# imports successfully on any platform.
+#     except Exception as e:
+#         if getattr(e, "code", None) != "PLATFORM_UNSUPPORTED":
+#             raise
+#         ...  # fall back to another execution backend
 # ---------------------------------------------------------------------------
 from exec_sandbox.platform_utils import HostOS, detect_host_os
 
 if detect_host_os() == HostOS.UNKNOWN:
     import platform
 
-    from exec_sandbox.exceptions import PermanentError
+    from exec_sandbox.exceptions import ConfigError, ErrorCode
 
-    raise PermanentError(
+    raise ConfigError(
         "exec-sandbox requires Linux or macOS. "
         f"Detected platform '{platform.system()}' is not supported because "
         "exec-sandbox relies on QEMU with KVM/HVF acceleration, Unix domain sockets, "
         "and POSIX process management (signals, cgroups, overlayfs). "
         "Consider running inside WSL2 on Windows.",
+        code=ErrorCode.PLATFORM_UNSUPPORTED,
         context={"platform": platform.system()},
+        hint=None,
+        instance_id=None,
     )
 
 from importlib.metadata import PackageNotFoundError, version
@@ -98,84 +100,61 @@ except PackageNotFoundError:
 from exec_sandbox._logging import configure_logging
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.exceptions import (
-    AssetChecksumError,
-    AssetDownloadError,
-    AssetError,
-    AssetNotFoundError,
-    BalloonTransientError,
-    CodeValidationError,
-    CommunicationError,
-    CommunicationOutcomeUnknownError,
-    EnvVarValidationError,
-    GuestAgentError,
-    InputValidationError,
-    OutputLimitError,
-    PackageNotAllowedError,
-    PermanentError,
-    SandboxDependencyError,
+    ConfigError,
+    ErrorAction,
+    ErrorCode,
+    InstanceGoneError,
+    InstanceNotSavedWarning,
+    InternalError,
+    InvalidInputError,
+    OutcomeUnknownError,
+    RouteError,
     SandboxError,
     SessionClosedError,
-    SnapshotError,
-    SocketAuthError,
     TransientError,
-    VmBootError,
-    VmBootTimeoutError,
-    VmCapacityError,
-    VmConfigError,
-    VmDependencyError,
-    VmError,
-    VmGvproxyError,
-    VmOverlayError,
-    VmPermanentError,
-    VmQemuCrashError,
-    VmTimeoutError,
-    VmTransientError,
 )
-from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, PortMapping, TimingBreakdown
+from exec_sandbox.instance.models import HostFacts, InstanceInfo, RecentCommit
+from exec_sandbox.models import (
+    ExecutionResult,
+    ExposedPort,
+    FileInfo,
+    InstanceRef,
+    Language,
+    PortMapping,
+    StartupTiming,
+    TimingBreakdown,
+)
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.session import Session
+from exec_sandbox.vm_spec import VmSpec
 
 __all__ = [
-    "AssetChecksumError",
-    "AssetDownloadError",
-    "AssetError",
-    "AssetNotFoundError",
-    "BalloonTransientError",
-    "CodeValidationError",
-    "CommunicationError",
-    "CommunicationOutcomeUnknownError",
-    "EnvVarValidationError",
+    "ConfigError",
+    "ErrorAction",
+    "ErrorCode",
     "ExecutionResult",
     "ExposedPort",
     "FileInfo",
-    "GuestAgentError",
-    "InputValidationError",
+    "HostFacts",
+    "InstanceGoneError",
+    "InstanceInfo",
+    "InstanceNotSavedWarning",
+    "InstanceRef",
+    "InternalError",
+    "InvalidInputError",
     "Language",
-    "OutputLimitError",
-    "PackageNotAllowedError",
-    "PermanentError",
+    "OutcomeUnknownError",
     "PortMapping",
-    "SandboxDependencyError",
+    "RecentCommit",
+    "RouteError",
     "SandboxError",
     "Scheduler",
     "SchedulerConfig",
     "Session",
     "SessionClosedError",
-    "SnapshotError",
-    "SocketAuthError",
+    "StartupTiming",
     "TimingBreakdown",
     "TransientError",
-    "VmBootError",
-    "VmBootTimeoutError",
-    "VmCapacityError",
-    "VmConfigError",
-    "VmDependencyError",
-    "VmError",
-    "VmGvproxyError",
-    "VmOverlayError",
-    "VmPermanentError",
-    "VmQemuCrashError",
-    "VmTimeoutError",
-    "VmTransientError",
+    "VmSpec",
     "configure_logging",
 ]

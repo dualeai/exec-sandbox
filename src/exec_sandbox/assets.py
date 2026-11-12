@@ -433,14 +433,18 @@ async def ensure_assets(
     # Not found - either download or error
     if not download:
         search_paths = _get_search_paths(override)
-        raise FileNotFoundError(
+        raise ConfigError(
             f"Assets not found and auto_download_assets=False. "
             f"Searched: {[str(p) for p in search_paths]}. "
-            f"Set EXEC_SANDBOX_IMAGES_DIR or enable auto_download_assets."
+            f"Set EXEC_SANDBOX_IMAGES_DIR or enable auto_download_assets.",
+            code=ErrorCode.ASSET_NOT_FOUND,
+            context=None,
+            hint=None,
+            instance_id=None,
         )
 
     # Download assets and return images directory
-    images_dir, _ = await ensure_assets_available(language, override)
+    images_dir, _ = await ensure_assets_available(override=override)
     return images_dir
 
 

@@ -254,20 +254,22 @@ class TestBufferErrors:
     """Error cases for IO[bytes] buffer support."""
 
     async def test_closed_bytesio_write(self, scheduler: Scheduler) -> None:
-        """Closed BytesIO write raises ValueError."""
+        """Closed BytesIO write raises InvalidInputError ARGUMENT_INVALID before any transfer."""
+        from exec_sandbox.exceptions import ErrorCode, InvalidInputError
+
         buf = io.BytesIO(b"data")
         buf.close()
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(ValueError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
                 await session.write_file("test.bin", buf)
 
     async def test_path_traversal_bytesio(self, scheduler: Scheduler) -> None:
-        """Path traversal with BytesIO content raises VmPermanentError."""
-        from exec_sandbox.exceptions import VmPermanentError
+        """Path traversal with BytesIO content raises InvalidInputError PATH_INVALID."""
+        from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 
-        async with await scheduler.session(language=Language.PYTHON) as session:
-            with pytest.raises(VmPermanentError):
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file("../escape.txt", io.BytesIO(b"x"))
 
 

@@ -14,12 +14,14 @@ import asyncio
 import pytest
 
 from exec_sandbox.exceptions import (
-    CodeValidationError,
+    ErrorCode,
+    InvalidInputError,
     SessionClosedError,
 )
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
-from tests.conftest import skip_on_python_312_subprocess_bug, skip_unless_hwaccel
+from exec_sandbox.vm_spec import VmSpec
+from tests.conftest import run_once, skip_on_python_312_subprocess_bug, skip_unless_hwaccel
 
 
 # =============================================================================
@@ -321,14 +323,14 @@ class TestSessionEdgeCases:
             assert "42" in result.stdout
 
     async def test_code_validation_error_preserves_session(self, scheduler: Scheduler) -> None:
-        """CodeValidationError doesn't close the session — caller can retry."""
-        async with await scheduler.session(language=Language.PYTHON) as session:
+        """InvalidInputError CODE_INVALID doesn't close the session — caller can retry."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             setup = await session.exec("x = 42")
             assert setup.exit_code == 0, (
                 f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
             )
-            with pytest.raises(CodeValidationError):
-                await session.exec("")  # empty code → CodeValidationError
+            with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID):
+                await session.exec("")  # empty code → CODE_INVALID
             # Session still alive and state preserved
             result = await session.exec("print(x)")
             assert result.exit_code == 0

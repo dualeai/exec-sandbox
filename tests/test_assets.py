@@ -20,6 +20,7 @@ from exec_sandbox.assets import (
     _versioned_cache_dir,  # pyright: ignore[reportPrivateUsage]
     ensure_assets,
 )
+from exec_sandbox.exceptions import ConfigError, ErrorCode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -258,11 +259,11 @@ class TestEnsureAssets:
         arch = get_current_arch()
         (tmp_path / f"vmlinuz-{arch}").touch()
 
-        result = await ensure_assets(override=tmp_path)
+        result = await ensure_assets(override=tmp_path, download=True)
         assert result == tmp_path
 
     async def test_raises_when_not_found_and_download_disabled(self, tmp_path: Path) -> None:
-        """Raises FileNotFoundError when assets not found and download=False."""
+        """Raises ConfigError ASSET_NOT_FOUND when assets not found and download=False."""
         nonexistent = tmp_path / "does_not_exist"
 
         with (
@@ -270,7 +271,7 @@ class TestEnsureAssets:
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
             patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "cache"),
         ):
-            with pytest.raises(FileNotFoundError) as exc_info:
+            with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND) as exc_info:
                 await ensure_assets(override=nonexistent, download=False)
 
             assert "auto_download_assets=False" in str(exc_info.value)
@@ -1174,7 +1175,7 @@ class TestErrorCases:
             patch("exec_sandbox.assets.__file__", "/nonexistent/assets.py"),
             patch("exec_sandbox.assets._versioned_cache_dir", return_value=tmp_path / "cache"),
         ):
-            with pytest.raises(FileNotFoundError) as exc_info:
+            with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND) as exc_info:
                 await ensure_assets(override=nonexistent, download=False)
 
             error_msg = str(exc_info.value)

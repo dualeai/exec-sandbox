@@ -17,22 +17,33 @@ are mocked. Covers:
 
 import asyncio
 import base64
+import errno
 import io
 import json
 import os
 import random
+import re
+import tempfile
+import threading
 from pathlib import Path
+from typing import IO, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from exec_sandbox import constants
-from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
+from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import (
     CommunicationError,
-    CommunicationOutcomeUnknownError,
+    ConfigError,
+    ErrorCode,
+    InternalError,
+    InvalidInputError,
+    OutcomeUnknownError,
+    RouteError,
+    SandboxError,
     SessionClosedError,
-    VmPermanentError,
+    TransientError,
 )
 from exec_sandbox.guest_agent_protocol import (
     ExecutionCompleteMessage,
@@ -126,21 +137,33 @@ class TestExecTimeoutValidation:
     """Tests for timeout_seconds validation in Session.exec()."""
 
     async def test_timeout_zero_rejected(self) -> None:
-        """timeout_seconds=0 raises ValueError."""
+        """timeout_seconds=0 raises InvalidInputError ARGUMENT_INVALID."""
         session, _, _ = _make_session()
-        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match="timeout_seconds must be between 1 and 300",
+        ):
             await session.exec("print(1)", timeout_seconds=0)
 
     async def test_timeout_negative_rejected(self) -> None:
-        """Negative timeout_seconds raises ValueError."""
+        """Negative timeout_seconds raises InvalidInputError ARGUMENT_INVALID."""
         session, _, _ = _make_session()
-        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match="timeout_seconds must be between 1 and 300",
+        ):
             await session.exec("print(1)", timeout_seconds=-1)
 
     async def test_timeout_exceeds_max_rejected(self) -> None:
-        """timeout_seconds > 300 raises ValueError."""
+        """timeout_seconds > 300 raises InvalidInputError ARGUMENT_INVALID."""
         session, _, _ = _make_session()
-        with pytest.raises(ValueError, match="timeout_seconds must be between 1 and 300"):
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match="timeout_seconds must be between 1 and 300",
+        ):
             await session.exec("print(1)", timeout_seconds=301)
 
     async def test_timeout_none_uses_default(self) -> None:
@@ -532,9 +555,9 @@ class TestResolveContentEdgeCases:
         stream.close()
 
     async def test_bytes_one_over_max_rejected(self) -> None:
-        """Bytes of MAX_FILE_SIZE_BYTES + 1 raise ValueError."""
+        """Bytes of MAX_FILE_SIZE_BYTES + 1 raise InvalidInputError ARGUMENT_INVALID."""
         session, _, _ = _make_session()
-        with pytest.raises(ValueError, match="exceeds"):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
             await session._resolve_content(b"x" * (MAX_FILE_SIZE_BYTES + 1))
 
     async def test_path_exactly_at_max_size_accepted(self, tmp_path: Path) -> None:
@@ -548,11 +571,11 @@ class TestResolveContentEdgeCases:
         stream.close()
 
     async def test_path_one_over_max_rejected(self, tmp_path: Path) -> None:
-        """Path to file of MAX_FILE_SIZE_BYTES + 1 raises ValueError."""
+        """Path to file of MAX_FILE_SIZE_BYTES + 1 raises InvalidInputError ARGUMENT_INVALID."""
         f = tmp_path / "over.bin"
         f.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
         session, _, _ = _make_session()
-        with pytest.raises(ValueError, match="exceeds"):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
             await session._resolve_content(f)
 
     async def test_empty_bytes_accepted(self) -> None:
@@ -582,10 +605,10 @@ class TestResolveContentEdgeCases:
         assert stream is buf
 
     async def test_seekable_io_bytes_over_max_rejected(self) -> None:
-        """Seekable IO[bytes] exceeding MAX_FILE_SIZE_BYTES raises ValueError."""
+        """Seekable IO[bytes] exceeding MAX_FILE_SIZE_BYTES raises InvalidInputError ARGUMENT_INVALID."""
         session, _, _ = _make_session()
         buf = io.BytesIO(b"x" * (MAX_FILE_SIZE_BYTES + 1))
-        with pytest.raises(ValueError, match="exceeds"):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
             await session._resolve_content(buf)
 
     async def test_non_seekable_io_bytes_skips_validation(self) -> None:
@@ -646,7 +669,7 @@ class TestResolveContentToctou:
         f = tmp_path / "big.bin"
         f.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
         session, _, _ = _make_session()
-        with pytest.raises(ValueError, match="exceeds"):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
             await session._resolve_content(f)
 
     async def test_file_stays_within_limit_accepted(self, tmp_path: Path) -> None:
@@ -670,10 +693,9 @@ class TestWriteFilePathValidation:
     """Path validation that mirrors WriteFileRequest Pydantic validators."""
 
     async def test_empty_path_rejected(self) -> None:
-        """Empty path raises VmPermanentError."""
+        """Empty path raises InvalidInputError PATH_INVALID."""
         import io
 
-        from exec_sandbox.exceptions import VmPermanentError
         from exec_sandbox.qemu_vm import QemuVM
 
         vm = MagicMock(spec=QemuVM)
@@ -681,7 +703,9 @@ class TestWriteFilePathValidation:
         vm.channel = AsyncMock()
 
         # Call the real write_file method
-        with pytest.raises(VmPermanentError, match="must not be empty"):
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID, match="must not be empty"
+        ):
             await QemuVM.write_file(vm, "", io.BytesIO(b"data"))
 
     async def test_path_at_max_length_accepted(self) -> None:
@@ -707,18 +731,41 @@ class TestWriteFilePathValidation:
         await QemuVM.write_file(vm, "x" * MAX_FILE_PATH_LENGTH, io.BytesIO(b"data"))
 
     async def test_path_over_max_length_rejected(self) -> None:
-        """Path exceeding MAX_FILE_PATH_LENGTH raises VmPermanentError."""
+        """Path exceeding MAX_FILE_PATH_LENGTH raises InvalidInputError PATH_INVALID."""
         import io
 
-        from exec_sandbox.exceptions import VmPermanentError
         from exec_sandbox.qemu_vm import QemuVM
 
         vm = MagicMock(spec=QemuVM)
         vm.vm_id = "test-vm"
         vm.channel = AsyncMock()
 
-        with pytest.raises(VmPermanentError, match="exceeds"):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID, match="exceeds"):
             await QemuVM.write_file(vm, "x" * (MAX_FILE_PATH_LENGTH + 1), io.BytesIO(b"data"))
+
+    async def test_other_protocol_error_is_not_retried(self) -> None:
+        """Only the dropped header ("No active write") is retried: another protocol error
+        propagates at once and keeps the connection."""
+        from exec_sandbox.qemu_vm import QemuVM
+
+        vm = MagicMock(spec=QemuVM)
+        vm.vm_id = "protocol-error-vm"
+        vm.channel = AsyncMock()
+        vm._write_file_protocol = AsyncMock(
+            side_effect=InternalError(
+                "write_file: [protocol_error] frame corruption",
+                code=ErrorCode.GUEST_PROTOCOL,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+        )
+
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL, match="frame corruption"):
+            await QemuVM.write_file(vm, "target.bin", io.BytesIO(b"data"))
+
+        vm._write_file_protocol.assert_awaited_once()
+        vm.channel.close.assert_not_awaited()
 
     async def test_retry_restores_the_callers_initial_stream_position(self) -> None:
         """A stale-header retry resends exactly the caller-selected suffix."""
@@ -732,7 +779,9 @@ class TestWriteFilePathValidation:
             positions.append(content.tell())
             content.read(1)
             if len(positions) == 1:
-                raise VmPermanentError("No active write")
+                raise InternalError(
+                    "No active write", code=ErrorCode.GUEST_PROTOCOL, context=None, hint=None, instance_id=None
+                )
 
         vm = MagicMock(spec=QemuVM)
         vm.vm_id = "retry-position-vm"
@@ -801,22 +850,25 @@ class TestWriteFileCommitProtocol:
         vm, _inbox = self._make_vm()
         vm.channel.enqueue_raw = AsyncMock(side_effect=OSError("injected enqueue failure"))
 
-        with pytest.raises(CommunicationOutcomeUnknownError, match="after dispatch"):
-            await QemuVM._write_file_protocol(vm, "target.bin", reader)  # type: ignore[arg-type]
+        with pytest.raises(
+            OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="after dispatch"
+        ):
+            await QemuVM._write_file_protocol(vm, "target.bin", reader, make_executable=False)  # type: ignore[arg-type]
 
         assert reader.reads == 1
 
     async def test_prefailed_registration_is_reported_before_dispatch(self) -> None:
         """A dead registered inbox proves that no header reached the write queue."""
-        from exec_sandbox.exceptions import VmTransientError
         from exec_sandbox.qemu_vm import QemuVM
 
         vm, inbox = self._make_vm()
         inbox.fail("event transport already closed")
         vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
 
-        with pytest.raises(VmTransientError, match="before dispatch"):
-            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"))
+        with pytest.raises(
+            TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="before dispatch"
+        ):
+            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"), make_executable=False)
 
         vm.channel.enqueue_raw.assert_not_awaited()
 
@@ -825,8 +877,10 @@ class TestWriteFileCommitProtocol:
 
         monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 0.01)
         vm, _inbox = self._make_vm()
-        with pytest.raises(CommunicationOutcomeUnknownError, match="after dispatch") as exc_info:
-            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"))
+        with pytest.raises(
+            OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="after dispatch"
+        ) as exc_info:
+            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"), make_executable=False)
 
         assert isinstance(exc_info.value.__cause__, TimeoutError)
         actions = [json.loads(call.args[0])["action"] for call in vm.channel.enqueue_raw.await_args_list]
@@ -841,12 +895,18 @@ class TestWriteFileCommitProtocol:
 
         ack = FileWriteAckMessage(op_id="write-op", path=ack_path, bytes_written=ack_size)
         vm, _inbox = self._make_vm(ack)
-        with pytest.raises(CommunicationOutcomeUnknownError, match="acknowledgement did not bind"):
-            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"))
+        with pytest.raises(
+            OutcomeUnknownError,
+            check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN,
+            match="acknowledgement did not bind",
+        ):
+            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"), make_executable=False)
 
 
 class TestReadFileTerminalIntegrity:
-    """File-read completion metadata must bind the bytes actually received."""
+    """File-read completion metadata must bind the bytes actually received. A local
+    destination that cannot take the bytes is the caller's error (ARGUMENT_INVALID) or this
+    host's (LOCAL_DISK), never the guest's (GUEST_UNAVAILABLE)."""
 
     async def test_declared_size_mismatch_is_communication_failure(self) -> None:
         from exec_sandbox.qemu_vm import QemuVM
@@ -1728,7 +1788,7 @@ class TestDispatchLoopConnectionReset:
         message = await asyncio.wait_for(inbox.get(), timeout=1.0)
         assert isinstance(message, ExecutionCompleteMessage)
         assert message.exit_code == 137
-        with pytest.raises(CommunicationOutcomeUnknownError, match="EOF"):
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"):
             await inbox.get()
         await dispatcher.stop()
 
@@ -1771,7 +1831,7 @@ class TestDispatchLoopConnectionReset:
         ]
         assert isinstance(messages[-1], ExecutionCompleteMessage)
         assert messages[-1].exit_code == 137
-        with pytest.raises(CommunicationOutcomeUnknownError, match="EOF"):
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"):
             await inbox.get()
         await dispatcher.stop()
 
@@ -1804,7 +1864,7 @@ class TestDispatchLoopConnectionReset:
 
         assert dispatcher._task is not None
         await asyncio.wait_for(dispatcher._task, timeout=1.0)
-        with pytest.raises(CommunicationOutcomeUnknownError, match="EOF"):
+        with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"):
             await op_queue.get()
         await dispatcher.stop()
 
@@ -2478,7 +2538,11 @@ class TestIdleTimerLifecycleStress:
         vm.state = VmState.DESTROYING
         manager.destroy_vm = AsyncMock(return_value=False)
 
-        with pytest.raises(VmPermanentError, match="process cleanup was not confirmed"):
+        with pytest.raises(
+            InternalError,
+            check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED,
+            match="process cleanup was not confirmed",
+        ):
             await session.close()
 
         assert session.closed
