@@ -57,7 +57,9 @@ EVENT_TRANSPORT_DRAIN_TIMEOUT_SECONDS = 1.0
 # Cached TypeAdapter for StreamingMessage discriminated union
 # Performance: Avoids rebuilding validators on every message (1000s of allocations per execution)
 # Pydantic TypeAdapter is expensive to construct - caching eliminates this overhead in hot paths
-_STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
+# pydantic >= 2.14 types TypeAdapter's argument as TypeForm[T]; pyright does not
+# yet infer TypeForm from an Annotated alias, so the declared type carries T.
+_STREAMING_MESSAGE_ADAPTER: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]
 
 
 class StreamDeadlineExceededError(TimeoutError):

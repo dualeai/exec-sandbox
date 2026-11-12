@@ -23,11 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="$REPO_ROOT/images/dist"
 
-PYTHON_VERSION="${PYTHON_VERSION:-3.14.2}"
-PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20251217}"  # From astral-sh/python-build-standalone
-UV_VERSION="${UV_VERSION:-0.9.24}"  # From astral-sh/uv
+PYTHON_VERSION="${PYTHON_VERSION:-3.14.10}"
+PYTHON_BUILD_DATE="${PYTHON_BUILD_DATE:-20261026}"  # From astral-sh/python-build-standalone
+UV_VERSION="${UV_VERSION:-0.13.7}"  # From astral-sh/uv
 CLOUDPICKLE_VERSION="${CLOUDPICKLE_VERSION:-3.1.2}"  # From https://github.com/cloudpipe/cloudpickle/releases
-BUN_VERSION="${BUN_VERSION:-1.3.10}"
+BUN_VERSION="${BUN_VERSION:-1.4.4}"
 # Alpine version + digest come from versions.lock only (mutable tags can be
 # re-pushed; the digest pins the exact manifest). Fail-closed: a missing lock
 # or missing keys abort the build — no unpinned fallback.
