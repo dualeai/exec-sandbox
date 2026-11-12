@@ -2047,7 +2047,7 @@ class TestTmpfsQuotaEnforcement:
     # --- Normal: sparse files don't consume quota ---
 
     async def test_sparse_truncate_succeeds(self, dual_scheduler: Scheduler) -> None:
-        """ftruncate() to huge apparent size succeeds (metadata-only, no quota hit)."""
+        """ftruncate() to huge apparent size succeeds on the home disk (metadata-only)."""
         code = """\
 import os
 open('/home/user/sparse', 'w').close()
@@ -2176,7 +2176,7 @@ print(f'FILLED:{written}MB')
             assert r1.exit_code == 0
             assert "FILLED:" in r1.stdout
 
-            # Step 2: Python execution still works (REPL doesn't need /home/user disk)
+            # Step 2: Python execution still works (REPL doesn't need /dev/shm)
             r2 = await session.exec("print(f'MATH:{6 * 7}')")
             assert r2.exit_code == 0
             assert "MATH:42" in r2.stdout

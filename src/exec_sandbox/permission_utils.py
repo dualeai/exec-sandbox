@@ -1,4 +1,6 @@
-"""Cross-platform permission utilities for qemu-vm user isolation.
+"""Cross-platform permission utilities for qemu-vm user isolation, and the
+private-folder checks of the local instance store (owner, mode, ACL entries,
+folders above it).
 
 Centralizes chmod, chown, setfacl, sudo operations with:
 - Platform guards (Linux vs macOS)

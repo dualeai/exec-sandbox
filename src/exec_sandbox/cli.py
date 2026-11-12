@@ -159,8 +159,6 @@ EXIT_CLI_ERROR = 2
 EXIT_TIMEOUT = 124  # Matches `timeout` command
 EXIT_SANDBOX_ERROR = 125
 
-# Concurrency limits
-
 # File extension to language mapping
 EXTENSION_MAP: dict[str, str] = {
     ".py": "python",
@@ -1554,22 +1552,15 @@ def instance_rm_command(*, instance_ids: tuple[str, ...]) -> NoReturn:
     "--arch",
     type=click.Choice(["x86_64", "aarch64"]),
     default=None,
-    help="Target architecture (default: current machine)",
+    help="Target architecture (default: this machine)",
 )
-@click.option("-q", "--quiet", is_flag=True, help="Suppress progress output")
+@click.option("-q", "--quiet", is_flag=True, help="Hide progress output")
 def prefetch_command(arch: str | None, quiet: bool) -> NoReturn:
-    """Pre-download VM assets for offline use.
+    """Download the VM assets before use, for offline hosts.
 
-    Downloads all required assets (kernel, initramfs, gvproxy, base images)
-    to the cache directory. Useful for container builds before running with
-    EXEC_SANDBOX_OFFLINE=1.
-
-    Examples:
-
-    \b
-      sbx prefetch                    # Download all assets for current arch
-      sbx prefetch --arch aarch64     # Cross-arch prefetch for multi-arch Docker
-      sbx prefetch -q                 # Quiet mode (CI/Docker)
+    Downloads all the assets of one architecture (kernel, initramfs,
+    gvproxy-wrapper for this OS, base images) to the cache folder. Exit code 1
+    when a download fails.
 
     Dockerfile example:
 

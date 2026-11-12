@@ -335,7 +335,7 @@ class TestCliHelp:
         """Shows help with --help flag."""
         result = runner.invoke(run_command, ["--help"])
         assert result.exit_code == 0
-        assert "Execute code in an isolated VM sandbox" in result.output
+        assert "Run code in an isolated VM." in result.output
         assert "--language" in result.output
         assert "--timeout" in result.output
 
@@ -343,7 +343,7 @@ class TestCliHelp:
         """Shows help with -h flag."""
         result = runner.invoke(run_command, ["-h"])
         assert result.exit_code == 0
-        assert "Execute code" in result.output
+        assert "Run code in an isolated VM." in result.output
 
 
 class TestCliVersion:
@@ -2393,7 +2393,7 @@ class TestCliPrefetch:
         """Shows help for prefetch command."""
         result = runner.invoke(prefetch_command, ["--help"])
         assert result.exit_code == 0
-        assert "Pre-download VM assets" in result.output
+        assert "Download the VM assets before use" in result.output
         assert "--arch" in result.output
         assert "--quiet" in result.output
 
@@ -2488,14 +2488,14 @@ class TestCliGroup:
         """Shows help for run subcommand."""
         result = runner.invoke(cli, ["run", "--help"])
         assert result.exit_code == 0
-        assert "Execute code" in result.output
+        assert "Run code in an isolated VM." in result.output
         assert "--language" in result.output
 
     def test_prefetch_subcommand_help(self, runner: CliRunner) -> None:
         """Shows help for prefetch subcommand."""
         result = runner.invoke(cli, ["prefetch", "--help"])
         assert result.exit_code == 0
-        assert "Pre-download VM assets" in result.output
+        assert "Download the VM assets before use" in result.output
 
 
 # ============================================================================

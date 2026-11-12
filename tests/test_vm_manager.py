@@ -1675,7 +1675,8 @@ class TestCpuModelSelection(_QemuCmdTestBase):
     """Verify -cpu flag matches arch/accel combinations.
 
     ARM64 HVF/KVM → host, ARM64 TCG → max,pauth-impdef=on,
-    x86 HVF/KVM → host,-svm,-vmx, x86 TCG → SapphireRapids-v2.
+    x86 (every accel) → the fixed AVX2-level model (D1); KVM adds PV flags,
+    hardware accel with TSC_DEADLINE adds +tsc-deadline.
     """
 
     @pytest.mark.parametrize(
@@ -2250,7 +2251,7 @@ class TestUnshareNamespaces(_QemuCmdTestBase):
         assert "qemu-system-x86_64" in cmd[separator_idx + 1]
 
     async def test_unshare_with_network(self, vm_settings, workdir) -> None:
-        """Linux + unshare + network → namespace isolation without --net."""
+        """Linux + unshare + network → QEMU still gets its own netns (C02; gvproxy is a Unix socket)."""
         from exec_sandbox.qemu_cmd import build_qemu_cmd
 
         with _qemu_cmd_mocks(host_os=HostOS.LINUX, unshare=True):
@@ -4708,7 +4709,7 @@ class TestExecuteStateRace:
 
 
 class TestExecuteEnvVarValidation:
-    """Verify execute() wraps ValidationError as EnvVarValidationError.
+    """Verify execute() wraps ValidationError as InvalidInputError ENV_VAR_INVALID.
 
     Users catching SandboxError must catch invalid env vars. Without the
     conversion, raw pydantic.ValidationError leaks through.
@@ -5040,10 +5041,10 @@ class TestExecuteExceptionWrapping:
     """Unit tests for execute()'s error handling.
 
     Covers:
-    - Transport errors (OSError, EOF, etc.) → VmTransientError
-    - TimeoutError → VmBootTimeoutError
+    - Transport errors (OSError, EOF, etc.) → TransientError GUEST_UNAVAILABLE
+    - TimeoutError before dispatch → TransientError GUEST_UNAVAILABLE (VM_BOOT_TIMEOUT is the boot's)
     - CancelledError propagates bare
-    - Guest error classification: execution_error → VmTransientError (raised),
+    - Guest error classification: execution_error → TransientError GUEST_UNAVAILABLE (raised),
       timeout_error → exit_code=-1 (returned), others → raised
     """
 

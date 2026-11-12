@@ -1,7 +1,7 @@
 """Subprocess lifecycle utilities.
 
 - start_managed_process: launch a subprocess with standard piping and process registration
-- drain_subprocess_output: concurrent stdout/stderr draining (prevents 64KB pipe deadlock)
+- start_drain: the background task that drains stdout/stderr (prevents 64KB pipe deadlock)
 - wait_for_socket: poll for a Unix socket created by a child process after fork+exec
 """
 
@@ -34,11 +34,11 @@ async def start_managed_process(
 
     Common boilerplate for all subprocesses (QEMU, gvproxy, QSD, qemu-img):
     - Wraps asyncio subprocess with ProcessWrapper for PID-reuse safety
-    - Pipes stdout/stderr (prevents 64 KiB deadlock when paired with drain_subprocess_output)
+    - Pipes stdout/stderr (prevents 64 KiB deadlock when paired with start_drain)
     - Registers in process_registry for emergency Ctrl+C kill (prevents orphans)
     - Creates new session (isolates signal delivery, enables killpg)
 
-    Callers handle their own error wrapping (VmDependencyError, VmGvproxyError, etc.)
+    Callers handle their own error wrapping (ConfigError HOST_DEPENDENCY, TransientError GVPROXY_FAILED, etc.)
     and domain-specific post-launch steps (cgroup attachment, socket wait, etc.).
 
     Args:

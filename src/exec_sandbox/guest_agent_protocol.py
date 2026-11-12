@@ -78,7 +78,7 @@ class ExecuteCodeRequest(GuestAgentRequest):
     code: str = Field(max_length=MAX_CODE_SIZE, description="Code to execute (max 1 MiB)")
 
     # Note: empty-code and null-byte checks live in guest-agent validation.rs.
-    # The host translates the guest's code_error response to CodeValidationError
+    # The host translates the guest's code_error response to InvalidInputError (CODE_INVALID)
     # via guest_error_to_exception. No Pydantic validator here.
 
     timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
@@ -155,9 +155,12 @@ class WriteFileRequest(GuestAgentRequest):
 
     Initiates a multi-message write sequence:
     1. Host sends WriteFileRequest (this header with op_id)
-    2. Host sends FileChunkRequest messages (zstd-compressed chunks)
-    3. Host sends FileEndRequest (signals end of stream)
+    2. Host sends file_chunk frames (op_id, data: base64 of zstd-compressed chunks)
+    3. Host sends a file_end frame (op_id; signals end of stream)
     4. Guest responds with FileWriteAckMessage
+
+    QemuVM writes the file_chunk and file_end frames itself (no model: one per
+    128 KB chunk); guest-agent/src/types.rs GuestCommand::FileChunk/FileEnd parse them.
 
     Guest agent enforces:
     - Path length: PATH_MAX 4096 bytes, NAME_MAX 255 bytes per component
@@ -165,7 +168,7 @@ class WriteFileRequest(GuestAgentRequest):
     - File size: max 500MB (streaming zstd, ~64KB peak memory)
     - Permissions: 0o644 default, 0o755 with make_executable=True
 
-    Response: FileWriteAckMessage (after FileEndRequest).
+    Response: FileWriteAckMessage (after file_end).
     """
 
     action: Literal["write_file"] = Field(default="write_file")  # type: ignore[assignment]

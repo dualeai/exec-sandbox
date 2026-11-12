@@ -33,13 +33,13 @@ class VmWorkingDirectory:
     under the 108-byte Unix domain socket limit.
 
     Usage as context manager (preferred for short-lived VMs):
-        async with await VmWorkingDirectory.create(vm_id) as workdir:
+        async with await VmWorkingDirectory.create(vm_id, home_dir=home_dir) as workdir:
             overlay = workdir.overlay_image
             # VM runs...
         # Directory automatically cleaned up
 
     Usage with manual lifecycle (for warm pool VMs):
-        workdir = await VmWorkingDirectory.create(vm_id)
+        workdir = await VmWorkingDirectory.create(vm_id, home_dir=home_dir)
         try:
             overlay = workdir.overlay_image
             # VM runs for extended period...
@@ -205,7 +205,7 @@ class VmWorkingDirectory:
 
         try:
             cleaned = cleanup_task.result()
-        except Exception as error:  # noqa: BLE001 - preserve a retry owner for every failure
+        except Exception as error:
             logger.error(
                 "VM working directory cleanup task failed",
                 extra={"vm_id": self.vm_id, "path": str(self._path)},

@@ -280,7 +280,7 @@ _F_RDADVISE = 44  # from darwin-xnu/bsd/sys/fcntl.h
 class _Radvisory(ctypes.Structure):
     """macOS struct radvisory { off_t ra_offset; int ra_count; }."""
 
-    _fields_ = [  # noqa: RUF012 - ctypes protocol requires mutable _fields_
+    _fields_ = [
         ("ra_offset", ctypes.c_int64),  # off_t
         ("ra_count", ctypes.c_int),  # int
     ]
@@ -526,9 +526,15 @@ class ProcessWrapper:
         """Wait for process with timeout, handling pipe draining automatically.
 
         Prevents pipe buffer deadlock by draining stdout/stderr if pipes exist.
-        Handles both scenarios:
+        Handles three cases:
+        - Pipes read by a running background task (drain_task): use wait() only.
+          communicate() would read the same streams; when the two readers
+          interleave, one loses its wakeup, and communicate() waits for the full
+          timeout although the process has exited. A drain task that ended (a
+          line over the stream limit ends it) reads nothing more: communicate()
+          drains then, or a child that still writes blocks on a full pipe.
         - Pipes exist with no background reader: use communicate() to drain
-        - Pipes exist with background reader: use wait() (pipes drained by reader)
+          (wait() if another coroutine already reads them: RuntimeError)
         - No pipes: use wait()
 
         Best practice pattern from Nov 2025 asyncio docs for subprocess cleanup.
@@ -554,7 +560,7 @@ class ProcessWrapper:
                 # Pipes being drained by other reader, so just wait for exit
                 await asyncio.wait_for(self.wait(), timeout=timeout)
         else:
-            # No pipes - just wait for process exit
+            # No pipes, or the drain task reads them - just wait for process exit
             await asyncio.wait_for(self.wait(), timeout=timeout)
 
         return self.returncode  # type: ignore[return-value]

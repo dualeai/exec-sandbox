@@ -1,7 +1,7 @@
 """Shared id-matched QMP request/response exchange.
 
 QMP echoes the request's ``id`` on every command response (per spec), and
-interleaves asynchronous events (BALLOON_CHANGE, MIGRATION_PASS, STOP, ...) on
+interleaves asynchronous events (MIGRATION_PASS, STOP, RESUME, ...) on
 the same stream at any time.  A positional "first non-event line wins" match
 desynchronizes the moment a command times out with its connection left open:
 the late reply of command N is then consumed as the reply to command N+1.

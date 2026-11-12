@@ -23,7 +23,7 @@ async def validate_kernel_initramfs(kernel_path: Path, arch: HostArch) -> None:
     """Pre-flight check: validate kernel and initramfs exist (cached, one-time per config).
 
     This is NOT a probe (optional feature) - it's a hard requirement.
-    Raises VmDependencyError if files are missing.
+    Raises ConfigError (ASSET_NOT_FOUND) if files are missing.
     """
     cache_key = (kernel_path, arch)
     if cache_key in _kernel_validated:

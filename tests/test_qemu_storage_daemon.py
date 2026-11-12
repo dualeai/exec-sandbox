@@ -576,7 +576,8 @@ class TestQemuStorageDaemonIntegration:
     async def test_overlay_has_qcow2_format(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
-        """Created overlay is valid qcow2 format."""
+        """Created overlay is valid qcow2 format, with the options of every overlay
+        (qemu-img create -o lazy_refcounts=on,extended_l2=on,cluster_size=128k)."""
         overlay = tmp_path / "format-test.qcow2"
         await started_daemon.create_overlay(base_image, overlay)
 

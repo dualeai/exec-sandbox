@@ -32,7 +32,8 @@ class PackageValidator:
 
     Catalogs are built at dev time and bundled in container (no runtime fetching).
 
-    Use the async factory method `create()` to instantiate.
+    Use the async factory method `create()` to instantiate. It parses about
+    400 KB of JSON: create one validator and reuse it.
     """
 
     def __init__(self, allow_lists: dict[str, set[str]]):

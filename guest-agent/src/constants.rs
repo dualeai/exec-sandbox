@@ -52,7 +52,8 @@ pub(crate) const DRAIN_TIMEOUT_MS: u64 = 5;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
 
 // Output size limits (guest-enforced). Exceeding either raises CmdError::output_limit
-// to the host (maps to OutputLimitError in Python). The REPL is preserved for session reuse.
+// to the host (InvalidInputError OUTPUT_LIMIT in Python). The REPL is preserved for
+// session reuse.
 pub(crate) const MAX_STDOUT_BYTES: usize = 1_000_000; // 1 MB
 pub(crate) const MAX_STDERR_BYTES: usize = 100_000; // 100 KB
 

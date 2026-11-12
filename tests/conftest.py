@@ -54,11 +54,11 @@ logger = logging.getLogger(__name__)
 #
 # Note: The previous "regime_is_user: code should not be reached" crash (QEMU
 # ARM64 TCG bug in versions < 9.0.4) is now caught early by a version check in
-# qemu_cmd.py, which raises VmDependencyError before QEMU is launched. That
+# qemu_cmd.py, which raises ConfigError HOST_DEPENDENCY before QEMU is launched. That
 # crash was deterministic (not transient) and exited with code 0, not SIGABRT.
 #
-# We detect exact error strings and retry with backoff plus heavy jitter to
-# desynchronize parallel workers on noisy CI hardware.
+# We detect the error codes below and the SIGABRT text, and retry with backoff
+# plus heavy jitter to desynchronize parallel workers on noisy CI hardware.
 #
 # Tuning rationale:
 #   - 5 retries (not 3): thread exhaustion can persist through multiple boot
@@ -116,7 +116,8 @@ def _is_retryable_qemu_crash(reports: list[pytest.TestReport]) -> bool:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
-    """Retry tests on QEMU SIGABRT / thread exhaustion (GitHub Actions CI only).
+    """Retry tests on QEMU SIGABRT / thread exhaustion and on VM boot timeouts and crashes
+    (_QEMU_RETRYABLE_CODES) (GitHub Actions CI only).
 
     Uses exponential backoff (2^n) with full jitter ([0, 10s)) between retries
     to desynchronize parallel workers and avoid thundering herd on noisy CI.
@@ -618,7 +619,7 @@ def _reset_probe_caches() -> Iterator[None]:
     populate ``probe_cache`` via the ``@_async_cached_probe`` decorator.
     Without a post-test reset, a subsequent test on the same pytest-xdist
     worker inherits the stale value — e.g. ``qemu_version=(8,2,0)`` from a
-    mock causes real integration tests to raise ``VmDependencyError``, or
+    mock causes real integration tests to raise ``ConfigError`` HOST_DEPENDENCY, or
     ``kvm=True`` from a mock causes ``-accel kvm`` on macOS (crash).
 
     Resetting *all* attributes (not just a subset) is intentional: it

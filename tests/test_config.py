@@ -105,7 +105,7 @@ class TestSchedulerConfigS3:
 
 
 class TestSchedulerConfigCacheDir:
-    """Tests for snapshot cache dir defaults using get_cache_dir()."""
+    """Tests for snapshot cache dir defaults using get_user_dir(kind=UserDir.CACHE)."""
 
     def test_env_override_affects_default(self) -> None:
         """EXEC_SANDBOX_CACHE_DIR env var changes both cache dir defaults."""

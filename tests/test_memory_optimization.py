@@ -1,6 +1,6 @@
-"""Integration tests for memory optimization features (balloon + zram).
+"""Integration tests for memory optimization features (zram).
 
-These tests verify that virtio-balloon and zram compression work correctly
+These tests verify that zram compression works correctly
 in real QEMU VMs.
 
 Run with: uv run pytest tests/test_memory_optimization.py -v

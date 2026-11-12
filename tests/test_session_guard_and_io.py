@@ -2167,7 +2167,7 @@ class TestDispatchLoopConnectionReset:
     """Tests that _dispatch_loop exits cleanly on OSError variants.
 
     The dispatch loop catches (IncompleteReadError, OSError) so that
-    connection resets — normal during peer disconnect or balloon stress —
+    connection resets — normal during peer disconnect or memory stress —
     are treated the same as EOF.
 
     IMPORTANT: after injecting the error, we await the task directly to

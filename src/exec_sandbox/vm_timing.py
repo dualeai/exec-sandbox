@@ -26,10 +26,6 @@ class VmTiming:
         gvproxy_start_ms: Time to start gvproxy (0 if network disabled)
         qemu_fork_ms: Time for QEMU process fork/exec
         guest_wait_ms: Time waiting for guest agent ready signal
-
-    Example usage:
-        timing = VmTiming(setup_ms=50, boot_ms=250, overlay_ms=10, ...)
-        print(timing.to_dict())  # Only includes non-None values
     """
 
     # High-level timing (aggregates)

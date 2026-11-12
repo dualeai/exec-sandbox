@@ -166,10 +166,10 @@ async def test_vm_holds_admission_flag_set_correctly(capacity_vm_manager: VmMana
 
 @pytest.mark.slow
 async def test_no_capacity_errors_under_load(images_dir: Path) -> None:
-    """Verify VmCapacityError no longer raised under concurrent load.
+    """Verify TransientError CAPACITY no longer raised under concurrent load.
 
     Regression test: previously the capacity check in _create_vm_impl could
-    race with the semaphore, causing VmCapacityError even with available slots.
+    race with the semaphore, causing a capacity error even with available slots.
     """
     config = SchedulerConfig(
         images_dir=images_dir,

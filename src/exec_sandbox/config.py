@@ -175,7 +175,7 @@ class SchedulerConfig(BaseModel):
         default=constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO,
         ge=0.01,
         le=0.5,
-        description="Fraction of host memory reserved for OS (e.g. 0.1 = 10%)",
+        description="Fraction of host memory reserved for the OS (for example 0.1 = 10%)",
     )
     host_cpu_reserve_cores: float = Field(
         default=constants.DEFAULT_HOST_CPU_RESERVE_CORES,

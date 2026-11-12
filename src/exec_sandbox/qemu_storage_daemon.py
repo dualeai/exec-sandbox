@@ -143,7 +143,8 @@ class QemuStorageDaemon:
         Idempotent: Does nothing if already started.
 
         Raises:
-            QemuStorageDaemonError: If daemon fails to start or connect
+            TransientError: OVERLAY_FAILED if daemon fails to start or connect
+            ConfigError: HOST_DEPENDENCY if the qemu-storage-daemon binary is missing or cannot run
         """
         if self._started:
             return
@@ -463,7 +464,7 @@ class QemuStorageDaemon:
             Virtual size in bytes
 
         Raises:
-            QemuStorageDaemonError: If image doesn't exist, is invalid, or query fails
+            TransientError: OVERLAY_FAILED if image doesn't exist, is invalid, or query fails
         """
         cache_key = str(image_path)
         if cache_key in self._virtual_size_cache:

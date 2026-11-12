@@ -41,7 +41,7 @@ PAYLOAD_SIZES = {
     "1mb": 1_000_000,  # 1 MB (exactly at guest-agent limit, not exceeding)
 }
 
-# Large sizes that exceed the guest-agent stdout limit (OutputLimitError expected)
+# Large sizes that exceed the guest-agent stdout limit (InvalidInputError OUTPUT_LIMIT expected)
 STREAMING_ONLY_SIZES = {
     "2mb": 2_000_000,  # 2 MB
     "5mb": 5_000_000,  # 5 MB
@@ -415,11 +415,11 @@ class TestLargePayloadStreaming:
     """Large payload streaming tests (1MB - 500MB).
 
     All sizes exceed the guest-agent's 1MB stdout limit (MAX_STDOUT_BYTES),
-    so these verify that OutputLimitError is raised correctly.
+    so these verify that InvalidInputError OUTPUT_LIMIT is raised correctly.
     """
 
     async def test_streaming_integrity(self, scheduler: Scheduler, streaming_payload_size: tuple[str, int]) -> None:
-        """Verify OutputLimitError is raised for payloads exceeding 1MB stdout limit."""
+        """Verify InvalidInputError OUTPUT_LIMIT is raised for payloads exceeding 1MB stdout limit."""
         _size_name, size_bytes = streaming_payload_size
 
         code = python_code_for_ascii_pattern(size_bytes)

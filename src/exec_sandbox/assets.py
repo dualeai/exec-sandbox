@@ -494,7 +494,10 @@ async def _find_asset(fname: str, override: Path | None = None) -> Path | None:
     3. Local build directory (./images/dist/ relative to package root)
     4. Download cache directory (~/.cache/exec-sandbox/v{version}/)
 
-    Also checks for decompressed versions (.zst removed).
+    A `.zst` name is looked up unpacked only: decompress_zstd removes the `.zst`
+    once it is unpacked, so one that stays is an unpack that did not end (the
+    process died). It is never a ready asset: the caller unpacks it again (retrieve
+    reuses it when its digest is right) or downloads it.
 
     Args:
         fname: Asset filename.
@@ -526,7 +529,7 @@ async def prefetch_all_assets(
     """
     Pre-download all VM assets for offline use.
 
-    Downloads kernel, initramfs, gvproxy, and all base images (from BASE_IMAGES)
+    Downloads kernel, initramfs, gvproxy-wrapper (of this OS), and all base images
     for the specified architecture. Useful for pre-populating cache in container
     builds before running with EXEC_SANDBOX_OFFLINE=1.
 

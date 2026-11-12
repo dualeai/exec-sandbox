@@ -1,21 +1,21 @@
-# Security Policy
+# Security policy
 
-## Reporting a Vulnerability
+## Supported versions
 
-Please report security vulnerabilities via [GitHub Security Advisories](https://github.com/dualeai/exec-sandbox/security/advisories/new).
+| Version | Supported          |
+| ------- | ------------------ |
+| 0.x     | :white_check_mark: |
 
-### Response Timeline
+## Report a vulnerability
+
+Report security vulnerabilities through [GitHub Security Advisories](https://github.com/dualeai/exec-sandbox/security/advisories/new).
+
+### Response times
 
 - **48 hours**: Initial acknowledgment
 - **7 days**: Assessment and action plan
 - **90 days**: Target for fix and disclosure
 
-### Third-Party Dependencies
+### Third-party dependencies
 
-For vulnerabilities in dependencies (e.g., `pydantic`), please report directly to those projects.
-
-## Supported Versions
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.x     | :white_check_mark: |
+Report a vulnerability in a dependency (for example `pydantic`) to that project.

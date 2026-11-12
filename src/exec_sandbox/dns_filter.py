@@ -32,11 +32,11 @@ def validate_domain(domain: str) -> None:
         ValueError: If domain format is invalid
 
     Examples:
-        >>> _validate_domain("pypi.org")  # Valid
-        >>> _validate_domain("files.pythonhosted.org")  # Valid
-        >>> _validate_domain("x" * 300)  # Raises ValueError (too long)
-        >>> _validate_domain("bad..domain")  # Raises ValueError (empty label)
-        >>> _validate_domain("-invalid.com")  # Raises ValueError (starts with hyphen)
+        >>> validate_domain("pypi.org")  # Valid
+        >>> validate_domain("files.pythonhosted.org")  # Valid
+        >>> validate_domain("x" * 300)  # Raises ValueError (too long)
+        >>> validate_domain("bad..domain")  # Raises ValueError (empty label)
+        >>> validate_domain("-invalid.com")  # Raises ValueError (starts with hyphen)
     """
     if not domain:
         raise ValueError("Domain cannot be empty")
@@ -75,7 +75,8 @@ def create_outbound_patterns(domains: Sequence[str]) -> list[str]:
         List of regex pattern strings for OutboundAllow
 
     Raises:
-        ValueError: If any domain has invalid format (see _validate_domain)
+        ValueError: If any domain has invalid format (see validate_domain; VmSpec
+            checks allowed_domains with it when the spec is built)
 
     Example:
         >>> patterns = create_outbound_patterns(["pypi.org", "example.com"])
@@ -97,14 +98,14 @@ def create_outbound_patterns(domains: Sequence[str]) -> list[str]:
 
 
 def generate_outbound_allow_json(
-    allowed_domains: list[str] | None,
+    allowed_domains: Sequence[str] | None,
     language: str,
 ) -> str:
     """Generate gvproxy OutboundAllow JSON.
 
     Args:
-        allowed_domains: Custom allowed domains, empty list to block ALL outbound,
-                        or None for language defaults
+        allowed_domains: Custom allowed domains; empty for no domain filter (all
+                        outbound allowed); None for the language's package registries
         language: Programming language (for default package registries)
 
     Returns:
@@ -114,7 +115,7 @@ def generate_outbound_allow_json(
         >>> json_str = generate_outbound_allow_json(None, "python")
         >>> "pypi" in json_str
         True
-        >>> json_str = generate_outbound_allow_json([], "python")  # Block all
+        >>> json_str = generate_outbound_allow_json([], "python")  # No filter: all allowed
         >>> json_str
         '[]'
     """
@@ -128,8 +129,9 @@ def generate_outbound_allow_json(
             # No language-specific defaults, no filtering
             return "[]"
 
-    # Empty list = block ALL outbound (handled by BlockAllOutbound flag,
-    # OutboundAllow stays empty so it doesn't interfere)
+    # Empty list = no domain filter: with allow_network, all outbound is allowed
+    # (by design). Blocking all outbound is the -block-outbound flag, set only
+    # when ports are exposed without allow_network.
     if len(allowed_domains) == 0:
         return "[]"
 

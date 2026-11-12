@@ -1066,7 +1066,7 @@ async def consume_stream(
                     if on_stdout is not None:
                         try:
                             on_stdout(msg.chunk)
-                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                        except Exception:
                             logger.warning(
                                 "on_stdout callback raised, disabling",
                                 extra={"vm_id": vm_id},
@@ -1078,7 +1078,7 @@ async def consume_stream(
                     if on_stderr is not None:
                         try:
                             on_stderr(msg.chunk)
-                        except Exception:  # noqa: BLE001 - user-provided callback, must not interrupt streaming
+                        except Exception:
                             logger.warning(
                                 "on_stderr callback raised, disabling",
                                 extra={"vm_id": vm_id},

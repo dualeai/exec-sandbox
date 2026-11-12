@@ -228,8 +228,8 @@ class DiskSnapshotManager(BaseCacheManager):
     - L3 cache: S3 with zstd compression (cross-host sharing)
 
     Cache key format:
-    - "{language}-v{major.minor}-base" for base images (no packages)
-    - "{language}-v{major.minor}-{16char_hash}" for packages
+    - "{language}-v{major.minor}-{img_sha256}-base" for base images (no packages)
+    - "{language}-v{major.minor}-{img_sha256}-{pkg_sha256}" for packages
 
     Simplifications:
     - ❌ No Redis (never implemented)
@@ -397,8 +397,8 @@ class DiskSnapshotManager(BaseCacheManager):
         - User's allow_network setting only controls gvproxy at execution time
 
         Format:
-        - "{language}-v{major.minor}-{img_hash}-base" for base (no packages)
-        - "{language}-v{major.minor}-{img_hash}-{16char_pkg_hash}" for packages
+        - "{language}-v{major.minor}-{img_sha256}-base" for base (no packages)
+        - "{language}-v{major.minor}-{img_sha256}-{pkg_sha256}" for packages
 
         Args:
             language: Programming language
@@ -411,7 +411,7 @@ class DiskSnapshotManager(BaseCacheManager):
         version_parts = __version__.split(".")
         version = f"{version_parts[0]}.{version_parts[1]}"
 
-        # Include base image hash (first 8 chars) to invalidate cache on image rebuild
+        # Base image content digest: a rebuilt image gets a new key
         base_image = self.vm_manager.get_base_image(language)
         img_hash = self.image_hash(base_image)
 
@@ -783,10 +783,12 @@ class DiskSnapshotManager(BaseCacheManager):
             packages: Package list with versions
 
         Raises:
-            SnapshotError: Package installation failed
-            GuestAgentError: Guest agent returned error (permanent)
-            PackageInstallTransientError: Transient network error (after all retries exhausted)
-            PackageInstallPermanentError: Permanent package error (no retry)
+            TransientError: PACKAGE_DOWNLOAD (network error after all retries, or
+                install timeout), GUEST_UNAVAILABLE (communication error)
+            InvalidInputError: PACKAGE_INSTALL_FAILED (permanent package error or
+                unclassified failure, no retry), ARGUMENT_INVALID (the guest refused
+                the package list: a language without packages, empty, too long, a bad name)
+            InternalError: GUEST_PROTOCOL
         """
         if not packages:
             return

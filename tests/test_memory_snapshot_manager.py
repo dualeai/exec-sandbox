@@ -1,8 +1,7 @@
 """Tests for MemorySnapshotManager (L1 memory snapshot cache).
 
 De-mocked: uses real Settings + real VmManager (not started) instead of
-MagicMock. Only DiskSnapshotManager (L2 boundary) and system probes
-(QEMU binary / CPU features) remain mocked.
+MagicMock. Only system probes (QEMU binary / CPU features) remain mocked.
 
 Includes:
 - Normal case tests for all public APIs
@@ -1825,7 +1824,7 @@ class TestBackgroundTaskLifecycle:
 
 
 class TestImageHashEdgeCases:
-    """Edge cases for stat-based image fingerprinting."""
+    """Edge cases for content-digest image identity."""
 
     def test_missing_file(self, tmp_path: Path) -> None:
         """Missing file returns 'missing0'."""

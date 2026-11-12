@@ -80,11 +80,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         settings: Service configuration (paths, limits, etc.)
         arch: Host CPU architecture
         vm_id: Unique VM identifier
-        workdir: VM working directory containing overlay and socket paths
-        memory_mb: Guest VM memory in MB
-        cpu_cores: Number of vCPUs for the guest (maps to -smp)
-        allow_network: Enable network access via gvproxy (outbound internet)
-        expose_ports: List of ports to expose from guest to host.
+        workdir: VM working directory: overlay, socket and home disk paths
+        spec: Creation settings (memory, vCPUs, network access, ...)
+        expose_ports: Ports to expose from guest to host, host ports resolved.
             When set without allow_network, uses gvproxy with
             BlockAllOutbound (Mode 1). When set with allow_network, port
             forwarding is handled by gvproxy API (Mode 2).
@@ -96,8 +94,9 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             When set, tiny-init discovers drives by serial number and mounts
             EROFS base + ext4 snapshot via overlayfs. For snapshot creation
             (direct_write=True), the ext4 drive is writable; for usage, read-only.
-        defer_incoming: Start QEMU with `-incoming defer` for L1 memory snapshot
-            restore. The VM starts paused, waiting for a migration stream via QMP.
+        defer_incoming: Start QEMU with `-incoming defer` for a restore (L1
+            template or saved instance). The VM starts paused, waiting for a
+            migration stream via QMP.
         qmp_fd: File descriptor of a pre-created listening socket for QMP
             (socket activation pattern). When set, uses ``-chardev socket,fd=N,...``
             + ``-mon chardev=qmp0,mode=control`` instead of ``-qmp`` shorthand
@@ -106,7 +105,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         mem_path: Path to file-backed RAM for VM Templating (COW sharing).
             Template save uses share=on (QEMU writes RAM to file).
             Template restore uses share=off (MAP_PRIVATE = COW from file).
-            None (default) uses anonymous memory (standard mode).
+            None (default) uses anonymous memory (memory-backend-ram).
         mem_path_share: When True, memory-backend-file uses share=on (template
             save). When False, uses share=off,readonly=on,rom=off (clone restore,
             MAP_PRIVATE COW). Only meaningful when mem_path is set.
@@ -197,7 +196,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
         mem_merge = "off" if is_macos else "on"
         # virtio-mmio-transports=8: cap the number of virtio-mmio transport slots
         #   (QEMU virt board default is 32). We instantiate at most 6 virtio-mmio
-        #   devices (blk-base + optional blk-snap + serial + balloon + rng +
+        #   devices (blk-base + optional blk-snap + blk-home + serial + rng +
         #   optional net); 8 leaves headroom. Fewer empty slots means the guest's
         #   virtio_mmio driver skips ~24 spurious MMIO magic/device-id probes at
         #   boot and the DTB is smaller. Keep >= the live device count or QEMU aborts.
@@ -319,11 +318,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
             "-accel",
             accel,
             "-cpu",
-            # For hardware accel use host CPU with nested virt flags masked;
-            # for TCG use optimized emulated CPUs.
-            # -svm,-vmx: Hide AMD SVM and Intel VMX flags from guest to prevent
-            # nested virtualization attacks (CVE-2024-50115 KVM nSVM nCR3 bug).
-            # These flags are x86-specific — ARM64 HVF uses plain "host".
+            # ARM64 hardware accel: "host".
             # ARM64 TCG: "max" exposes every feature the current QEMU TCG
             # version supports, adapting automatically — on QEMU 8.2 (Ubuntu
             # 24.04 CI) it enables fewer ARMv9 features than on 10.x, but only
@@ -586,7 +581,7 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
     # Block device — serial=base: stable identifier for tiny-init to find the EROFS
     # rootfs drive, regardless of /dev/vdX assignment. ARM virt (MMIO) enumerates
     # virtio devices in reverse declaration order, so /dev/vda != first -device on ARM.
-    # D2: event_idx=off reduces interrupt coalescing overhead during boot.
+    # event_idx=off reduces interrupt coalescing overhead during boot.
     #
     # NOTE (non-adoption): num-queues=1 is deliberate. virtio-blk multiqueue /
     # iothread-vq-mapping (QEMU 9.0) only pays off with many vCPUs and an
@@ -885,6 +880,21 @@ async def build_qemu_cmd(  # noqa: PLR0912, PLR0915
 
     # Run QEMU as unprivileged user if qemu-vm user is available (optional hardening)
     # Falls back to current user if qemu-vm doesn't exist - VM still provides isolation
+    #
+    # TODO (security; out of scope for now, by design): investigate and decide, with
+    # upstream sources. Every VM's QEMU runs as the same qemu-vm uid, so a guest that
+    # escapes into its QEMU can read and write every live VM's overlay and home disk
+    # (opened by path: chown / ACL u:qemu-vm), e.g. change another tenant's state just
+    # before that tenant saves its instance.
+    # - QEMU requires an unprivileged uid (done) and states that a guest must reach
+    #   only its own disk image; it leaves the mechanism to the management tool:
+    #   https://www.qemu.org/docs/master/system/security.html
+    # - libvirt keeps one per-host uid and keeps guests apart with per-VM labels (sVirt):
+    #   https://libvirt.org/drvqemu.html#selinux-svirt-confinement
+    #   https://libvirt.org/drvqemu.html#apparmor-svirt-confinement
+    # - Passing each disk as an fd (-add-fd) would remove the path access, but sudo
+    #   >= 1.9.14 closes inherited fds (below), so it needs another launcher.
+    # Options to evaluate: per-VM SELinux/AppArmor labels, a per-VM uid pool (jailer).
     if workdir.use_qemu_vm_user:
         # Skip sudo when already running as qemu-vm user. This enables fd
         # inheritance (socket activation) which sudo >= 1.9.14 blocks via its

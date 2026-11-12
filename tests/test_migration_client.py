@@ -604,10 +604,9 @@ class TestMigrationTimeout:
 
 
 class TestMigrationClientSaveSnapshot:
-    """Tests for save_snapshot (stop → migrate → poll → quit sequence)."""
+    """save_snapshot: set-capabilities → stop → migrate → poll → quit | cont."""
 
     async def test_save_command_sequence(self) -> None:
-        """Save should: set-capabilities → stop → migrate → poll → quit."""
         client, _reader, writer = _make_connected(
             [
                 {"return": {}},  # migrate-set-capabilities
@@ -846,10 +845,9 @@ class TestMigrationClientSaveSnapshot:
 
 
 class TestMigrationClientRestoreSnapshot:
-    """Tests for restore_snapshot (migrate-incoming → poll → cont sequence)."""
+    """restore_snapshot: set-capabilities → migrate-incoming → poll → cont."""
 
     async def test_restore_command_sequence(self) -> None:
-        """Restore should: set-capabilities → migrate-incoming → poll → cont."""
         client, _reader, writer = _make_connected(
             [
                 {"return": {}},  # migrate-set-capabilities

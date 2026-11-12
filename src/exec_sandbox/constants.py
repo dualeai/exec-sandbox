@@ -160,7 +160,7 @@ Zram readiness is terminal before the guest listener starts, so it can never
 delay a request. Network readiness gates only the first execution and usually
 resolves in well under a second; a pathologically slow (multi-second) setup on
 that first execution may trip this watchdog. The VM is then discarded and the
-caller sees CommunicationOutcomeUnknownError (after dispatch) or a boot
+caller sees OutcomeUnknownError (after dispatch) or a boot
 timeout (before dispatch) — never a wrong result. That rare case is accepted
 instead of delaying hung-guest detection by 8s on every execution. The
 package-install path, which is always a first op on a network VM, adds its
@@ -374,6 +374,11 @@ protocol to invalidate stale L1 cache entries. History:
   v4: unified capability list — template path now also enables mapped-ram +
       multifd alongside x-ignore-shared (QEMU >= 11.0 fixes the coexistence
       crash), removing the version-forked branch.
+  v5: L2 snapshot drive (hd1) opened read-only outside the L2 build — the
+      virtio-blk device now carries VIRTIO_BLK_F_RO, which v4 templates lack;
+      x-ignore-shared state always sent explicitly; no legacy streaming saves;
+      no virtio-balloon; home disk drive (hd2, serial=home) with a .home file
+      per entry.
 
 NOTE: the migration stream layout is QEMU-version- AND parameter-specific — a
 QEMU upgrade or a change to multifd-channels / direct-io (both baked into the
@@ -589,7 +594,7 @@ execution (not long-running compilation), so TB cache churn is low. Saves
 
 RESOURCE_ADMISSION_TIMEOUT_SECONDS: Final[float] = 120.0
 """Timeout for resource admission acquire (seconds). Blocks waiting for
-resources to become available, then raises VmCapacityError."""
+resources to become available, then raises TransientError (CAPACITY)."""
 
 GATE3_SELF_WAKE_INTERVAL_SECONDS: Final[float] = 10.0
 """Interval for Gate 3 self-wake timer (seconds). Periodically notifies

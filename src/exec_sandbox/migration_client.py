@@ -1,23 +1,27 @@
 """QMP client for QEMU migration (save/restore memory snapshots).
 
-Provides L1 memory snapshot operations via QEMU's migration subsystem.
+Provides memory snapshot save and restore, via QEMU's migration subsystem, for
+the L1 cache and for saved instances (Session.save, Scheduler.reuse).
 Save captures full VM state (CPU + RAM + device) to file; restore resumes
 from the exact instruction.
 
 Architecture:
 - Connects to QEMU's QMP (QEMU Monitor Protocol) Unix socket
-- Uses socket peer credential authentication (same as balloon_client)
+- Uses socket peer credential authentication (socket_auth.connect_and_verify)
 - Save: `stop` (pause vCPU, avoid HVF ARM64 ISV race) →
-        `migrate file:/path` → poll until completed → `quit`
-- Restore: QEMU started with `-incoming defer` → `migrate-incoming file:/path` → `cont`
+        `migrate file:/path` → poll until completed → `while_paused` hook (VM still
+        stopped) → `quit` (or `cont` to keep running)
+- Restore: QEMU started with `-incoming defer` →
+        `migrate-incoming file:/path` (exit-on-error=false) → poll → `cont`
+- Strict: success only on an observed "completed"; no legacy fallback.
 
 Usage:
     async with MigrationClient(qmp_socket_path, expected_uid) as client:
-        await client.save_snapshot(vmstate_path)  # VM is dead after this
+        await client.save_snapshot(vmstate_path, qemu_version=v, timeout=migration_timeout(mb), while_paused=None, use_template=False, keep_running=False)
 
     # For restore, connect to a QEMU started with -incoming defer:
     async with MigrationClient(qmp_socket_path, expected_uid) as client:
-        await client.restore_snapshot(vmstate_path)  # VM resumes
+        await client.restore_snapshot(vmstate_path, qemu_version=v, timeout=migration_timeout(mb), use_template=False)
 """
 
 from __future__ import annotations
@@ -104,7 +108,7 @@ class MigrationClient:
     Connection lifecycle is protected by an asyncio lock (connect/close).
     _execute() is NOT concurrency-safe: callers must not issue commands
     concurrently on the same client (the QMP protocol is sequential).
-    Follows balloon_client.py pattern: connect_and_verify(), QMP handshake,
+    Pattern: connect_and_verify(), QMP handshake,
     _execute() with event-skipping loop.
 
     Attributes:

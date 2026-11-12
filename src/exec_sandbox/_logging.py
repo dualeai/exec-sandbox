@@ -12,7 +12,7 @@ CLI output format (httpx convention):
 Non-blocking logging:
     Uses QueueHandler + QueueListener (stdlib) to decouple log emission
     from stderr I/O.  A bounded FIFO queue absorbs bursts; a daemon
-    thread drains records to click.echo(err=True).  When the queue is
+    thread drains records to stderr.  When the queue is
     full or stderr saturated, records are silently dropped instead of
     raising BlockingIOError on the caller's coroutine.
 
@@ -114,16 +114,17 @@ def configure_logging(
     level: int | str | None = None,
     quiet: bool = False,
 ) -> None:
-    """Configure library logging for CLI / application entry points.
+    """Add a stderr handler to the exec_sandbox logger, then set its level.
 
-    Adds a _NonBlockingHandler if none exists (idempotent), then sets the
-    log level.  Library consumers who configure their own handlers are
-    unaffected -- the guard ensures we never stack duplicate handlers.
+    Call it from a command line tool or an application entry point. A second
+    call adds no second handler. Without this call, the library adds no handler.
+    The handler never blocks: when its queue is full, it drops records.
 
     Args:
-        level: Log level (e.g. logging.DEBUG, "WARNING"). Overrides env var.
-        quiet: If True, set level to ERROR (suppress WARNING/INFO).
-               Takes precedence over level.
+        level: Log level (for example logging.DEBUG, "WARNING"). It wins over
+            EXEC_SANDBOX_LOG_LEVEL.
+        quiet: If True, set the level to ERROR (hide WARNING and INFO). It wins
+            over level.
     """
     lib_logger = logging.getLogger(LIBRARY_LOGGER_NAME)
 

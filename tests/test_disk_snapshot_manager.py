@@ -1881,7 +1881,7 @@ class TestCacheHierarchy:
             await proc.communicate()
             return expected_path
 
-        # Spy on _download_from_s3 to verify it raises (S3 disabled)
+        # S3 disabled: the L3 check is a miss and the build runs
         with patch.object(snapshot_manager, "_create_snapshot", side_effect=fake_create_snapshot):
             result_path = await snapshot_manager.get_or_create_snapshot(
                 language=Language.PYTHON,

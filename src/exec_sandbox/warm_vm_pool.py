@@ -10,25 +10,21 @@ Architecture:
 - Security: One-time use (no cross-tenant reuse)
 
 Performance:
-- Default image (packages=[]): 1-2ms allocation (vs 400ms cold boot)
-- Custom packages: Fallback to cold boot (no change)
-- Memory overhead: ~140MB idle (balloon inflated) / ~192MB active per VM
+- A spec equal to VmSpec(language=...) defaults: 1-2ms allocation (vs 400ms cold boot)
+- Any other spec: L1 restore or cold boot
+- Memory: memory.reclaim moves the pages of idle pool VMs to zswap (Linux); the
+  guest kernel zeroes freed pages (init_on_free), so they cost almost nothing there
 
 L2 Disk Snapshots:
 - Uses L2 cache (local qcow2) for faster warm pool boots
 - snapshot_manager: Optional for L2 cache (graceful degradation to cold boot if None)
-
-Memory Optimization (Balloon):
-- Idle pool VMs have balloon inflated (guest has BALLOON_INFLATE_TARGET_MB)
-- Before execution, balloon deflates (guest gets full memory back)
-- Reduces idle memory per VM (140MB idle vs 192MB active)
 
 Example:
     ```python
     # In Scheduler
     async with WarmVMPool(vm_manager, config, snapshot_manager) as warm_pool:
         # Per execution
-        vm = await warm_pool.get_vm("python", packages=[])
+        vm = await warm_pool.get_vm(VmSpec(language="python"))
         if vm:  # Warm hit (1-2ms)
             result = await vm.execute(...)
         else:  # Cold fallback (400ms)
@@ -196,11 +192,8 @@ class WarmVMPool:
     async def _start_impl(self) -> None:
         """Start the warm VM pool by pre-booting VMs (parallel).
 
-        Boots all VMs in parallel for faster startup.
-        Logs progress for operational visibility.
-
-        Raises:
-            VmTransientError: If critical number of VMs fail to boot
+        Boots all VMs in parallel for faster startup. A VM that fails to boot is
+        logged and left out (the pool runs with fewer VMs): a failed boot does not raise.
         """
         logger.info(
             "Starting warm VM pool",
@@ -540,8 +533,9 @@ class WarmVMPool:
     ) -> None:
         """Boot VM and add to pool (used for parallel startup).
 
-        For index=0: If L1 cache is empty, saves L1 from the first warmed VM
-        (sacrificial save — VM is killed, then replaced from L1 cache).
+        For index=0: If L1 cache is empty, schedules a background L1 save (a
+        template entry with a warm REPL, made by a sacrificial VM); this VM
+        stays in the pool.
 
         Args:
             language: Programming language enum

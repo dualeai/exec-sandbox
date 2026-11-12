@@ -196,7 +196,7 @@ class VmManager:
 
     Usage:
         async with VmManager(settings) as manager:
-            vm = await manager.create_vm(Language.PYTHON, "tenant-123", "task-456")
+            vm = await manager.create_vm(VmSpec(language="python"), tenant_id="tenant-123", task_id="task-456")
             result = await vm.execute("print('hello')", timeout_seconds=30)
             await manager.destroy_vm(vm)
     """
@@ -898,7 +898,8 @@ class VmManager:
         owner is published in _pending_launches or _vms.
 
         Raises:
-            VmDependencyError: QEMU binary not found
+            ConfigError: HOST_DEPENDENCY: the QEMU binary is missing or cannot run
+            TransientError: QEMU_CRASHED: the fork hit a process, memory or file-handle limit
         """
         if not cgroup.is_cgroup_available(infra.cgroup_path):
             qemu_cmd = cgroup.wrap_with_ulimit(qemu_cmd, int(reservation.memory_mb))
@@ -1896,8 +1897,8 @@ class VmManager:
             Path to base qcow2 image
 
         Raises:
-            VmConfigError: Unknown language
-            VmDependencyError: Base image not found
+            InternalError: INTERNAL: unknown language
+            ConfigError: ASSET_NOT_FOUND: base image not found
         """
         # Pattern prefixes for each language
         patterns = {

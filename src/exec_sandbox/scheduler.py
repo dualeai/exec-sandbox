@@ -288,7 +288,7 @@ class Scheduler:
     async def __aexit__(
         self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
     ) -> None:
-        """Close ingress and await one scheduler-owned shutdown operation."""
+        """Stop the Scheduler: wait for the saves in progress, destroy every VM, then close the instance store."""
         self._started = False
         if self._shutdown_task is None:
             self._shutdown_task = asyncio.create_task(self._shutdown())
@@ -300,8 +300,10 @@ class Scheduler:
         Shutdown sequence:
         1. Stop WarmVMPool (drains and destroys pre-booted VMs, frees resource slots)
         2. Stop MemorySnapshotManager (awaits in-flight background L1 saves)
-        3. Destroy any remaining active VMs
-        4. Stop VmManager (overlay pool cleanup)
+        3. Wait for instance saves in flight (InstanceManager.drain)
+        4. Destroy any remaining active VMs
+        5. Stop VmManager (overlay pool cleanup)
+        6. Close the instance store (after every VM that could save is gone)
 
         IMPORTANT: WarmVMPool must stop BEFORE MemorySnapshotManager. Background
         L1 save tasks (from schedule_background_save) create sacrificial VMs via

@@ -63,8 +63,7 @@ async def retrieve(
         Path to the downloaded (and optionally processed) file
 
     Raises:
-        AssetDownloadError: Download failed after retries
-        AssetChecksumError: Hash verification failed
+        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries
 
     Example:
         fname = await retrieve(

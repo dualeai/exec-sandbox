@@ -167,7 +167,7 @@ class Session:
 
     @property
     def exposed_ports(self) -> list[ExposedPort]:
-        """Resolved port mappings (internal→external) for this session's VM."""
+        """Port mappings (internal→external) of this session's VM, with their host ports."""
         return self._vm.exposed_ports
 
     # -------------------------------------------------------------------------
@@ -309,18 +309,17 @@ class Session:
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
     ) -> ExecutionResult:
-        """Execute code in the session VM.
+        """Run code in the session's VM.
 
-        State (variables, imports, functions) persists from previous exec() calls.
-        Non-zero exit codes do not normally close the session. Two cases are
-        terminal: exit 137 (reserved as a terminal result) and a VM whose QEMU
-        died while delivering the result — both return the result, then close
-        the session.
+        A non-zero exit code does not close the session, with two exceptions:
+        exit code 137, and a QEMU that stopped while it sent the result. In both
+        cases exec() returns the result, then closes the session.
 
         Args:
             code: Source code to execute.
             timeout_seconds: Execution timeout. Default: scheduler's default_timeout_seconds.
-            env_vars: Environment variables for this execution.
+            env_vars: Environment variables for this execution: at most 100; a name up to
+                256 bytes, a value up to 4096 bytes; no control characters except tab.
             on_stdout: Callback for stdout chunks (streaming).
             on_stderr: Callback for stderr chunks (streaming).
 

@@ -5,16 +5,19 @@ package import. On restore, the VM resumes at the exact instruction — ~100ms
 regardless of packages.
 
 Cache structure:
-    {cache_dir}/{key}.vmstate       # QEMU migration stream (sparse, ~50-140MB on disk)
+    {cache_dir}/{key}.vmstate       # QEMU migration stream (sparse: ~140MB apparent, ~3MB on disk)
     {cache_dir}/{key}.vmstate.meta  # JSON metadata sidecar
     {cache_dir}/{key}.vmstate.lock  # flock for cross-process deduplication
+    {cache_dir}/{key}.ram           # guest RAM of a template (memory-backend-file)
+    {cache_dir}/{key}.home          # home disk at the save point (cloned per restore)
 
 Cache key includes ALL parameters that affect VM state:
-    crc64(language, sorted_packages, exec_sandbox_version, img_hash,
-          qemu_version, arch, accel_type, memory_mb, cpu_cores,
-          allow_network, format_version, kernel_hash, initramfs_hash)
+    sha256 fingerprint(language, *sorted_packages, exec_sandbox_version, img_hash,
+          qemu_version, arch, accel_type, memory_mb, cpu_cores, disk_mb,
+          network_device, format_version, kernel_hash, initramfs_hash
+          [, l2_image_hash when there are packages])
 
-Format: 'l1-{language}-v{major.minor}-{16char_hash}'
+Format: 'l1-{language}-v{major.minor}-{sha256}'
 """
 
 from __future__ import annotations
@@ -114,7 +117,7 @@ class SnapshotMetadata:
     cpu_cores: int
     language: str
     packages: list[str]
-    allow_network: bool
+    allow_network: bool  # the VM has a network device (network access or exposed ports)
     exec_sandbox_version: str
     vmstate_sha256: str
     vmstate_size: int

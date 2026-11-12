@@ -10,7 +10,7 @@ Two-level locking prevents thread-pool starvation:
   2. flock() guards cross-process access — at most 1 thread per distinct path.
 Without level 1, N coroutines each submit blocking to_thread(flock) to the
 default executor; the winning coroutine then needs the same executor for file
-I/O (aiofiles), but every slot is occupied by flock waiters — deadlock.
+I/O (asyncio.to_thread), but every slot is occupied by flock waiters — deadlock.
 See CERT TPS01-J ("Do not execute interdependent tasks in a bounded thread
 pool") for the general class of bug.
 """

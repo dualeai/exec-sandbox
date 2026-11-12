@@ -1,52 +1,41 @@
-"""exec-sandbox: Secure code execution in microVMs.
+"""exec-sandbox: run untrusted code in QEMU microVMs, from Python or the sbx command line.
 
-A standalone Python library for executing untrusted code in isolated QEMU microVMs.
-
-Quick Start (single execution):
+Quick Start:
     ```python
-    from exec_sandbox import Scheduler
+    from exec_sandbox import Scheduler, VmSpec
 
     async with Scheduler() as scheduler:
-        result = await scheduler.run(
-            code="print('hello')",
-            language="python",
-        )
-        print(result.stdout)  # "hello\\n"
-    ```
-
-Session (stateful multi-step execution):
-    ```python
-    from exec_sandbox import Scheduler
-
-    async with Scheduler() as scheduler:
-        async with await scheduler.session(language="python") as session:
+        async with await scheduler.new(VmSpec(language="python")) as session:
             await session.exec("x = 42")
-            result = await session.exec("print(x)")
+            result = await session.exec("print(x)")  # state stays across exec() calls
             print(result.stdout)  # "42\\n"
     ```
 
-With Configuration:
+VmSpec says what a VM is made of (defaults included); keep a catalog of specs:
     ```python
-    from exec_sandbox import Scheduler, SchedulerConfig
+    from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 
-    config = SchedulerConfig(
-        s3_bucket="my-snapshots",  # Enable S3 cache
-    )
-    async with Scheduler(config) as scheduler:
-        result = await scheduler.run(
-            code="import pandas; print(pandas.__version__)",
-            language="python",
-            packages=["pandas==2.2.0"],
-        )
+    DATA = VmSpec(language="python", memory_mb=1024, packages=("pandas==3.0.1",))
+    async with Scheduler(SchedulerConfig(s3_bucket="my-snapshots")) as scheduler:
+        async with await scheduler.new(DATA) as session:
+            result = await session.exec("import pandas; print(pandas.__version__)")
     ```
 
-Requirements:
-    - QEMU 8.0+ with KVM (Linux) or HVF (macOS) acceleration
-    - VM images from GitHub Releases
-    - Python 3.12+
+Saved instances: Session.save(), Scheduler.reuse() (with SchedulerConfig.instance_store).
+Errors: exec_sandbox.exceptions (one error class per action).
 
-For S3 snapshot caching:
-    pip install exec-sandbox[s3]
+Requirements:
+    - QEMU 8.0 or later; QEMU 11.0 or later for L1 memory snapshots and saved
+      instances; QEMU 9.0.4 or later on ARM64 without KVM or HVF
+    - KVM (Linux) or HVF (macOS) recommended: without it, QEMU uses software
+      emulation (TCG), about 5-8x slower
+    - VM images from GitHub Releases
+    - Python 3.12 or later
+
+For the L3 snapshot cache (S3) and the "s3" instance store:
+    pip install 'exec-sandbox[s3]'
+For the "local" instance store (and the sbx command line):
+    pip install 'exec-sandbox[cli]'
 """
 
 # ---------------------------------------------------------------------------

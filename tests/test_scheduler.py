@@ -766,7 +766,7 @@ class TestBaseImageFetchBeforeSnapshot:
     ensure_assets() at startup only downloads kernel/initramfs/gvproxy (no
     language param). If packages are requested, _compute_cache_key() needs the
     base image on disk to hash it. Without the fetch_base_image() call in
-    _get_or_create_snapshot(), get_base_image() glob fails with VmDependencyError.
+    _get_or_create_snapshot(), get_base_image() glob fails with ConfigError ASSET_NOT_FOUND.
     """
 
     @staticmethod
@@ -804,11 +804,11 @@ class TestBaseImageFetchBeforeSnapshot:
         return mock_vm
 
     async def test_missing_base_image_fetched_before_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
-        """Regression: fresh cache dir without base image does not raise VmDependencyError.
+        """Regression: fresh cache dir without base image does not raise ConfigError ASSET_NOT_FOUND.
 
         Reproduces the original bug: _compute_cache_key() calls get_base_image()
         which globs for python-*-base-*.qcow2. Without the fetch_base_image()
-        call, the glob finds nothing and raises VmDependencyError.
+        call, the glob finds nothing and raises ConfigError ASSET_NOT_FOUND.
 
         This test uses a real DiskSnapshotManager (no mock on get_or_create_snapshot)
         so that _compute_cache_key → get_base_image → glob actually runs.
@@ -845,7 +845,7 @@ class TestBaseImageFetchBeforeSnapshot:
                 patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
                 patch.object(scheduler._snapshot_manager, "_create_snapshot", side_effect=mock_create_snapshot),
             ):
-                # This would raise VmDependencyError without the fix
+                # This would raise ConfigError ASSET_NOT_FOUND without the fix
                 result = await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
 
             assert result.exists()
@@ -1047,9 +1047,9 @@ class TestBaseImageFetchBeforeSnapshot:
             )
 
     async def test_fetch_ok_but_snapshot_creation_fails(self, images_dir: Path, tmp_path: Path) -> None:
-        """fetch_base_image succeeds but _create_snapshot raises SnapshotError.
+        """fetch_base_image succeeds but _create_snapshot raises TransientError QEMU_CRASHED.
 
-        Verifies that SnapshotError propagates to the caller and that the
+        Verifies that the error propagates to the caller and that the
         base image (written by fetch_base_image) is NOT cleaned up — only the
         snapshot file is cleaned up by _create_snapshot's own finally block.
         """
@@ -1097,11 +1097,11 @@ class TestBaseImageFetchBeforeL1Restore:
     Companion to TestBaseImageFetchBeforeSnapshot (which covers the packages /
     L2 disk-snapshot path). On a fresh cache, ensure_assets() at startup only
     downloads kernel/initramfs/gvproxy — no base images. With no packages, the
-    L1 memory-snapshot check_cache() (scheduler._prepare_vm) computes a cache
-    key that hashes the base image via get_base_image(). If the cold-boot
-    fetch_base_image() runs AFTER that (the original bug), get_base_image()
-    globs an empty dir and raises VmDependencyError. The fix hoists the fetch
-    ahead of check_cache in the cold path.
+    L1 memory-snapshot compute_cache_key() (scheduler._prepare_vm) hashes the
+    base image via get_base_image(). If the cold-boot fetch_base_image() runs
+    AFTER that (the original bug), get_base_image() globs an empty dir and
+    raises ConfigError ASSET_NOT_FOUND. The fix hoists the fetch ahead of the L1 key in
+    the cold path.
 
     NOTE: these tests keep a REAL MemorySnapshotManager (they do NOT use
     _setup_cold_boot_mocks, which nulls it and would hide the bug entirely).
@@ -1160,10 +1160,10 @@ class TestBaseImageFetchBeforeL1Restore:
     async def test_no_packages_fresh_cache_fetches_before_l1(
         self, images_dir: Path, tmp_path: Path, language: Language
     ) -> None:
-        """PRIMARY regression: no packages + fresh cache does NOT raise VmDependencyError.
+        """PRIMARY regression: no packages + fresh cache does NOT raise ConfigError ASSET_NOT_FOUND.
 
-        On the buggy (pre-fix) code this raises VmDependencyError from
-        check_cache -> compute_cache_key -> get_base_image. It is the whole
+        On the buggy (pre-fix) code this raises ConfigError ASSET_NOT_FOUND from
+        compute_cache_key -> get_base_image. It is the whole
         guard for this bug: confirm it FAILS before the _prepare_vm fix lands.
 
         Parametrized over PYTHON/JAVASCRIPT (RAW omitted; the fix is
@@ -1191,7 +1191,7 @@ class TestBaseImageFetchBeforeL1Restore:
             assert fetch_calls == [language], "fetch must run exactly once, before the L1 cache-key hash"
 
     async def test_auto_download_disabled_missing_base_raises(self, images_dir: Path, tmp_path: Path) -> None:
-        """auto_download_assets=False + no base -> VmDependencyError; fetch NOT called.
+        """auto_download_assets=False + no base -> ConfigError ASSET_NOT_FOUND; fetch NOT called.
 
         Offline/misconfigured users must still get a clear failure — the fix
         must not paper over genuinely missing images.
@@ -1283,8 +1283,8 @@ class TestWarmPoolStartupBaseFetch:
     """Regression tests: base images downloaded before warm-pool startup.
 
     WarmVMPool.start() pre-boots one VM per language and hashes each base image
-    (check_cache -> compute_cache_key -> get_base_image). On a fresh cache that
-    would raise VmDependencyError, since ensure_assets() fetched only the
+    (compute_cache_key -> get_base_image). On a fresh cache that
+    would raise ConfigError ASSET_NOT_FOUND, since ensure_assets() fetched only the
     kernel/initramfs. Scheduler.__aenter__ must fetch every pooled base image
     first (when auto_download_assets is enabled). Same user experience as the
     per-run fix in _prepare_vm.
@@ -1873,14 +1873,9 @@ print("out2")
         assert len(stdout_chunks) > 0 or "out1" in result.stdout
 
     async def test_run_timeout(self, scheduler_config: SchedulerConfig) -> None:
-        """Execution timeout works.
-
-        Timeout can be enforced at two levels:
-        1. Guest-agent soft timeout: Returns result with exit code (killed by signal)
-        2. Host hard timeout: Raises VmTimeoutError
-
-        The test accepts either behavior - both indicate the timeout worked.
-        """
+        """A code timeout is a result, never an error: the guest stops the code at the
+        timeout (exit_code -1). The host deadline comes 10 s later (EXECUTION_TIMEOUT_MARGIN_SECONDS),
+        and a boot failure (VM_BOOT_TIMEOUT) is not a timeout of the code: both fail this test."""
         config = SchedulerConfig(
             images_dir=scheduler_config.images_dir,
             default_timeout_seconds=2,
@@ -2244,8 +2239,8 @@ class TestSchedulerWarmPoolTiming:
     2. boot_ms=0 (boot happened at startup, not request time)
     3. execute_ms and total_ms reflect actual request time
 
-    Note: setup_ms is not asserted because it includes balloon deflation
-    which varies widely under TCG emulation with parallel test workers.
+    Note: setup_ms is not asserted because pool checkout time varies widely
+    under TCG emulation with parallel test workers.
     """
 
     @pytest.fixture

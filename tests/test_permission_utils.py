@@ -405,7 +405,7 @@ class TestAclOperations:
 class TestLinuxAclBinaries:
     """Tests for Linux ACL binary availability.
 
-    These tests verify that setfacl/getfacl are available on Linux.
+    These tests verify that setfacl is available on Linux.
     They ASSERT (not skip) to catch missing binaries in CI.
     """
 
@@ -610,8 +610,8 @@ class TestAclRealLinux:
 class TestGrantQemuVmFileAccess:
     """Tests for grant_qemu_vm_file_access function.
 
-    Note: grant_qemu_vm_file_access traverses parent dirs all the way to /,
-    which requires root to chmod system dirs. In unit tests, we mock
+    Note: grant_qemu_vm_file_access traverses parent dirs up to the filesystem
+    root, which requires root to chmod system dirs. In unit tests, we mock
     ensure_traversable to isolate the file operation logic. The traversal
     itself is tested separately in TestEnsureTraversable.
     """

@@ -46,7 +46,7 @@ class TestGetVmLiveness:
         vm = MagicMock(spec=QemuVM)
         vm.vm_id = f"pool-vm-{state.value}"
         vm.state = state
-        vm.l1_restored = True  # skip balloon deflate
+        vm.l1_restored = True
         vm.process = MagicMock()
         vm.process.returncode = returncode
         return vm
@@ -571,7 +571,7 @@ class TestWarmReplUnit:
         assert request.language == Language.JAVASCRIPT
 
     async def test_prepare_and_enqueue_warms_and_reclaims_non_l1_vm(self, unit_test_vm_manager) -> None:
-        """Every non-L1 insertion uses the warm, balloon, and reclaim contract."""
+        """Every non-L1 insertion uses the warm and reclaim contract."""
         from unittest.mock import patch
 
         from exec_sandbox.warm_vm_pool import WarmVMPool
@@ -919,7 +919,7 @@ class TestHealthcheckIntegration:
         await pool.start()
 
         try:
-            # Wait for VMs to stabilize after startup balloon inflation
+            # Wait for VMs to stabilize after startup (REPL warm-up, reclaim)
             # On slow CI, VMs may need time to adjust to reduced memory
             await asyncio.sleep(0.5)
 
@@ -1096,7 +1096,7 @@ class TestHealthcheckIntegration:
 
         Real-QEMU pin for the get_vm liveness gate: the process-exit watcher
         (or returncode) marks the death, checkout discards the VM and returns
-        None (cold-boot fallback) instead of raising VmPermanentError.
+        None (cold-boot fallback) instead of raising an InternalError.
         """
         import os
         import signal
@@ -1368,7 +1368,7 @@ class TestHealthcheckIntegration:
 # ============================================================================
 
 SETTLE_SLEEP_S: float = 3.0
-"""Post-start settling time (balloon inflate + REPL warmup)."""
+"""Post-start settling time (REPL warmup + reclaim)."""
 
 CONTEXT_SWITCHES_MAX_PER_SECOND: float = 50.0
 """Legacy QEMU-process context-switch regression target.
@@ -1418,7 +1418,7 @@ class TestWarmPoolIdleCpu:
         try:
             await asyncio.sleep(SETTLE_SLEEP_S)
 
-            # Get VM directly from internal queue (no balloon deflation, no replenishment)
+            # Get VM directly from internal queue (no replenishment)
             vm = pool.pools[lang].get_nowait()
 
             # Snapshot context switches before CPU sampling window

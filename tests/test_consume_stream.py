@@ -309,7 +309,7 @@ class TestConsumeStreamErrors:
 # Transport / protocol errors — must propagate (not be swallowed)
 #
 # These exceptions propagate through consume_stream() to execute(), which
-# wraps them as VmTransientError. The centralized retry logic then handles
+# wraps them as TransientError GUEST_UNAVAILABLE. The centralized retry logic then handles
 # retries. Swallowing them here would prevent retry and return a misleading
 # exit_code=-1 result for a dead VM.
 # ---------------------------------------------------------------------------
@@ -320,7 +320,7 @@ class TestConsumeStreamTransportErrors:
 
     When QEMU dies, the socket breaks, or the guest sends garbage,
     the exception must propagate through consume_stream() so execute()
-    can wrap it as VmTransientError and the retry infrastructure can act.
+    can wrap it as TransientError GUEST_UNAVAILABLE and the retry infrastructure can act.
     """
 
     # -- Socket / connection errors (readuntil raises) -----------------------
@@ -399,7 +399,7 @@ class TestConsumeStreamTransportErrors:
     # -- Boundary: errors that must NOT be caught ----------------------------
 
     async def test_timeout_error_propagates(self) -> None:
-        """TimeoutError propagates — execute() converts to VmBootTimeoutError."""
+        """TimeoutError propagates — execute() converts it to a TransientError or an OutcomeUnknownError."""
         with pytest.raises(TimeoutError):
             await _consume_error(TimeoutError("hard timeout"))
 

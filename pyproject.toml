@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "exec-sandbox"
 version = "0.0.0.dev0"
-description = "Secure code execution in microVMs with QEMU"
+description = "Run untrusted code in QEMU microVMs, from Python or the sbx command line"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"

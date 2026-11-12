@@ -7,12 +7,15 @@ Four admission gates (all must pass):
 3b. Memory pressure - reject when system is thrashing
     - Linux 4.20+: PSI full avg10 >= 10% from /proc/pressure/memory
     - macOS: kern.memorystatus_vm_pressure_level at CRITICAL
+4. Home disk space - free space of the home disk folder, minus the unwritten
+   part of admitted home disks, minus the request, stays >= disk_free_floor_mb
 
-Gates 1-2 are budget-based (stable). Gates 3a/3b are dynamic (inline probe,
-~3-5µs each, cached 100ms). A self-wake timer periodically notifies blocked
+Gates 1-2 are budget-based (stable). Gates 3a/3b and 4 are dynamic (inline
+probe, cached 100ms). A self-wake timer periodically notifies blocked
 waiters so Gate 3 re-probes even without local release() events.
-All gates block via asyncio.Condition with FIFO notify(1) wakeup (O(1) per
-release instead of O(N) thundering herd), timing out with VmCapacityError.
+Waiters block on an asyncio.Condition. A release wakes one waiter when all
+waiters ask for the same size, else all of them (mixed VmSpec sizes). A
+timeout raises TransientError (CAPACITY).
 
 Capacity detection priority chain:
   manual override > cgroup limit > psutil total
@@ -175,6 +178,10 @@ class ResourceAdmissionController:
     3a. Available-memory floor: system_available - requested >= floor
     3b. Memory pressure: reject when system is thrashing
         (Linux: PSI full avg10 >= 10% / macOS: sysctl level == CRITICAL)
+    4.  Home disk space: free space of disk_dir, minus the part of admitted
+        home disks not written yet, minus the request, stays >= the floor.
+        Home disks are sparse: each guest can still fill its own disk, so the
+        space it has not written yet is counted as taken.
 
     Gates 3a/3b probe system memory inline (~3-5µs each, cached 100ms).
     A self-wake timer periodically notifies blocked waiters so Gate 3
@@ -360,7 +367,7 @@ class ResourceAdmissionController:
         """Stop the admission controller and unblock all waiting acquire() callers.
 
         Sets a stopped flag and notifies all waiters so they raise
-        VmCapacityError immediately instead of blocking until timeout.
+        InvalidInputError (SCHEDULER_STATE) immediately instead of blocking until timeout.
         """
         self._stopped = True
 
@@ -500,12 +507,15 @@ class ResourceAdmissionController:
             cpu_cores: CPU cores to reserve
             timeout: Max seconds to wait for resources
             use_tcg: Whether TCG emulation is used (adds extra memory overhead)
+            disk_mb: Home disk size the guest can fill
 
         Returns:
             ResourceReservation tracking the allocated resources
 
         Raises:
-            VmCapacityError: Resources not available within timeout
+            TransientError: CAPACITY: resources not available within timeout
+            RouteError: CAPACITY_NEVER_FITS: a request larger than the whole budget
+            InvalidInputError: SCHEDULER_STATE: a stopped controller
         """
         # Calculate effective limits: guest + overhead (single source of truth)
         total_memory_mb = memory_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB

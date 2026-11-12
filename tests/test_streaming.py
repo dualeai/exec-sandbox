@@ -3,7 +3,7 @@
 Verifies the streaming contract:
 - Callbacks fire in real-time as chunks arrive from the guest agent
 - "".join(chunks) == result.stdout/stderr (within guest-enforced limits)
-- Output exceeding limits raises OutputLimitError (guest-enforced)
+- Output exceeding limits raises InvalidInputError OUTPUT_LIMIT (guest-enforced)
 - Buffer boundaries (64KB flush), timing (50ms flush interval), and edge cases
 """
 
@@ -199,7 +199,7 @@ sys.stdout.flush()
         assert len(stdout_chunks) >= 2
 
     async def test_stdout_exceeds_max_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """1.2MB stdout raises OutputLimitError; partial output delivered via callbacks."""
+        """1.2MB stdout raises InvalidInputError OUTPUT_LIMIT; partial output delivered via callbacks."""
         stdout_chunks: list[str] = []
         target_size = 1_200_000  # 1.2MB — over 1MB limit
 
@@ -590,7 +590,7 @@ sys.stdout.flush()
             assert "exec-one" not in joined_2
 
     async def test_mixed_stdout_over_stderr_under_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """stdout over limit raises OutputLimitError; stderr under limit is fine."""
+        """stdout over limit raises InvalidInputError OUTPUT_LIMIT; stderr under limit is fine."""
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 

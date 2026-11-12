@@ -88,7 +88,8 @@ class IncrementalHasher:
 async def file_hash(path: Path, algorithm: str = "sha256") -> str:
     """Compute cryptographic hash of a file asynchronously.
 
-    Reads file in chunks to minimize memory usage.
+    One worker-thread job (hashlib.file_digest): neither the reads nor the
+    hashing run on the event loop.
 
     Args:
         path: Path to file

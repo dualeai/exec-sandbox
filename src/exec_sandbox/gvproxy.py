@@ -83,8 +83,9 @@ async def start_gvproxy(  # noqa: PLR0915
         Tuple of (gvproxy_process, gvproxy_log_task)
 
     Raises:
-        VmGvproxyError: Failed to create socket or start gvproxy-wrapper
-        VmDependencyError: gvproxy-wrapper binary not found
+        TransientError: GVPROXY_FAILED: failed to create socket, or the fork of gvproxy-wrapper
+            hit a process, memory or file-handle limit
+        ConfigError: HOST_DEPENDENCY: gvproxy-wrapper binary not found or cannot run
     """
     socket_path = workdir.gvproxy_socket
 

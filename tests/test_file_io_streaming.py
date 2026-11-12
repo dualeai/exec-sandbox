@@ -7,8 +7,9 @@ Validates that the zstd-compressed chunked file transfer protocol:
 4. Handles interleaved success/failure correctly (dispatcher multiplexing)
 5. Measures upload/download throughput (write_file/read_file MiB/s)
 
-Note: /home/user is tmpfs (50% of guest RAM). Files written there consume guest
-RAM directly, so tests use 512 MB VMs for large files (tmpfs cap = 256 MB).
+Note: /home/user is the VM's home disk (ext4, ~973 MB usable by default), so large
+files consume host disk, not guest RAM. Some tests still use 512 MB VMs from the
+former tmpfs home; they stay valid.
 
 All tests require real VMs via the scheduler fixture.
 """
@@ -51,8 +52,6 @@ class TestStreamingLargeFiles:
     async def test_write_read_30mb_in_128mb_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write 30 MB and read it back with SHA256 verification.
 
-        /home/user is tmpfs (50% of RAM), so file writes consume guest RAM.
-        Uses 512 MB VM (256 MB tmpfs cap) to avoid ENOSPC.
         Streaming only needs ~128 KB decompression buffer in the guest.
         """
         size = 30 * 1024 * 1024

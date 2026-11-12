@@ -389,8 +389,8 @@ class TestRetrieve:
         expected_hash = hasher.hexdigest()
 
         # Warmup: absorb one-time allocations from tracemalloc internals,
-        # aiofiles thread-pool startup, and hashlib module init so they
-        # don't inflate the peak measurement.
+        # worker thread startup (asyncio.to_thread), and hashlib module init
+        # so they don't inflate the peak measurement.
         tracemalloc.start()
         await _verify_hash(large_file, f"sha256:{expected_hash}")
         tracemalloc.stop()
@@ -405,13 +405,9 @@ class TestRetrieve:
 
         # Broken streaming (entire file read at once): peak = file_size
         # (hashlib.update processes in-place, no copy).
-        # Working streaming on standard CPython: peak = chunk_size
-        # (refcounting frees each chunk immediately on walrus reassignment).
-        # Working streaming on free-threaded Python (3.14t): biased
-        # refcounting defers deallocation of bytes objects handed across
-        # threads (aiofiles worker -> event loop).  Observed ~4MB peak for
-        # a 4MB file (all 64 chunks alive).  A larger file gives more I/O
-        # scheduling points for deferred frees, keeping peak below file_size.
+        # Working streaming: peak = one read buffer (hashlib.file_digest
+        # reuses a 256 KiB buffer in its worker thread). Half the file size
+        # leaves room for deferred frees on free-threaded Python (3.14t).
         max_allowed = file_size // 2
         assert peak_memory < max_allowed, (
             f"Peak memory {peak_memory / 1024:.1f}KB exceeded {max_allowed / 1024:.1f}KB limit "

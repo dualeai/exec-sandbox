@@ -307,8 +307,10 @@ class QemuVM:
             cgroup_path: cgroup v2 path for cleanup
             workdir: Working directory containing overlay, sockets, and logs
             channel: Communication channel for guest agent
-            language: Programming language for this VM
+            spec: Creation settings of this VM (stored with a saved instance)
             console_lines: In-memory ring buffer of QEMU console output lines (for error diagnostics)
+            base_image: Base image the VM runs on (a saved instance records its digest)
+            packages_image: L2 packages image the VM runs on, None without packages
             gvproxy_proc: Optional gvproxy-wrapper process (ProcessWrapper)
             qemu_log_task: Background task draining QEMU stdout/stderr (prevents pipe deadlock)
             gvproxy_log_task: Background task draining gvproxy stdout/stderr (prevents pipe deadlock)
@@ -562,27 +564,29 @@ class QemuVM:
             ExecutionResult with stdout, stderr, exit code, and resource usage
 
         Raises:
-            CodeValidationError: Code is empty, whitespace-only, or contains null bytes.
-            EnvVarValidationError: Invalid env vars (control chars, size limits)
-            OutputLimitError: stdout or stderr exceeded guest-enforced size limits.
-            VmTransientError: Failure before dispatch (connect failure, guest
-                readiness gate, stdin write failure). Code never ran.
-            VmPermanentError: VM not in READY state, or protocol/request corruption.
-            VmBootTimeoutError: Host deadline hit before command dispatch, or
-                guest connection timed out.
-            CommunicationOutcomeUnknownError: Transport lost after dispatch
-                (socket EOF, QEMU crash, hard deadline) — the code may have
-                run; reconcile side effects before retrying.
+            InvalidInputError: CODE_INVALID (code empty, whitespace-only, or
+                with null bytes), ENV_VAR_INVALID (control chars, size limits),
+                OUTPUT_LIMIT (stdout or stderr exceeded guest-enforced size
+                limits).
+            TransientError: GUEST_UNAVAILABLE on a failure before dispatch
+                (connect failure or timeout, guest readiness gate, stdin write
+                failure, host deadline before command dispatch). Code never ran.
+            SessionClosedError: SESSION_CLOSED when the VM was destroyed during
+                execution start.
+            InternalError: INTERNAL (VM not in READY state), GUEST_PROTOCOL
+                (protocol/request corruption).
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is
+                lost after dispatch (socket EOF, QEMU crash, hard deadline):
+                the code may have run; reconcile side effects before retrying.
 
         Failure modes:
             System/infrastructure errors (raised as exceptions):
-                - VmTransientError: failure before dispatch — code never ran,
+                - TransientError: failure before dispatch — code never ran,
                   caller can retry
-                - CommunicationOutcomeUnknownError: transport lost after
-                  dispatch (socket EOF, QEMU crash, hard deadline) — reconcile
-                  before retrying; a died-mid-REPL-spawn guest surfaces here
-                - VmBootTimeoutError: execution exceeded host timeout
-                - VmPermanentError: protocol/request corruption
+                - OutcomeUnknownError: transport lost after dispatch (socket
+                  EOF, QEMU crash, hard deadline) — reconcile before retrying;
+                  a died-mid-REPL-spawn guest surfaces here
+                - InternalError: protocol/request corruption
             User code results (returned as ExecutionResult, not retryable):
                 - exit_code=0: success
                 - exit_code>0: code error
@@ -748,8 +752,8 @@ class QemuVM:
                 },
             )
 
-            # Parse result with both internal (guest) and external (host) measurements
-            # Note: timing is a placeholder here - scheduler will populate actual values
+            # Parse result with both internal (guest) and external (host) measurements.
+            # execute_ms is a placeholder: the session measures the whole call.
             exec_result = ExecutionResult(
                 stdout=result.stdout,
                 stderr=result.stderr,
@@ -1295,9 +1299,10 @@ class QemuVM:
             List of FileInfo entries
 
         Raises:
-            VmPermanentError: On validation failure
-            VmTransientError: On timeout or communication failure
-            CommunicationOutcomeUnknownError: Transport lost after dispatch
+            InvalidInputError: PATH_INVALID or GUEST_IO on validation failure
+            InternalError: GUEST_PROTOCOL on a protocol error or a wrong answer
+            TransientError: GUEST_UNAVAILABLE on timeout or communication failure
+            OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost after dispatch
         """
         request = ListFilesRequest(path=path)
 
@@ -1465,7 +1470,7 @@ class QemuVM:
             timeout: Maximum wait time in seconds
 
         Raises:
-            VmQemuCrashError: QEMU process died during boot
+            TransientError: QEMU_CRASHED when the QEMU process died during boot
             TimeoutError: Guest not ready within timeout
         """
 
