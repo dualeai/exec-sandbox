@@ -73,11 +73,11 @@ async def retrieve(
             processor=decompress_zstd,
         )
     """
-    cache_dir = path or get_cache_dir()
+    cache_dir = path or get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract filename from URL
-    fname = url.split("/")[-1]
+    fname = url.rsplit("/", maxsplit=1)[-1]
     dest = cache_dir / fname
 
     # Use a file lock to prevent concurrent download+decompress of the same asset
@@ -104,7 +104,7 @@ async def retrieve(
             if dest.exists():
                 logger.warning("Cache file hash mismatch, re-downloading", extra={"file": str(dest)})
                 dest.unlink()
-            await _download_with_retry(url, dest, known_hash, progressbar)
+            await _download_with_retry(url, dest, expected_hash=known_hash, progressbar=progressbar)
 
         # Apply processor if provided (e.g., decompress)
         if processor:
@@ -123,48 +123,48 @@ async def _verify_hash(path: Path, expected_hash: str) -> bool:
     return actual_digest == expected_digest
 
 
-async def _download_with_retry(
-    url: str,
-    dest: Path,
-    expected_hash: str,
-    progressbar: bool = True,
-    max_retries: int = DEFAULT_MAX_RETRIES,
-    retry_delay: float = DEFAULT_RETRY_DELAY,
-) -> None:
+async def _download_with_retry(url: str, dest: Path, *, expected_hash: str, progressbar: bool) -> None:
     """Download file with exponential backoff retry."""
+    import aiohttp  # noqa: PLC0415 - only a download needs it (~50 ms at `import exec_sandbox`)
+
     last_error: Exception | None = None
 
-    for attempt in range(max_retries):
+    for attempt in range(MAX_RETRIES):
         try:
-            await _download_file(url, dest, expected_hash, progressbar)
+            await _download_file(url, dest, expected_hash=expected_hash, progressbar=progressbar)
             return
-        except (aiohttp.ClientError, AssetChecksumError, OSError) as e:
+        except (aiohttp.ClientError, TransientError, OSError) as e:  # TransientError: hash mismatch
             last_error = e
             if dest.exists():
                 dest.unlink()
 
-            if attempt < max_retries - 1:
-                delay = retry_delay * (2**attempt)
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2**attempt)
                 logger.warning(
                     "Download failed, retrying",
                     extra={"url": url, "attempt": attempt + 1, "delay": delay, "error": str(e)},
                 )
                 await asyncio.sleep(delay)
 
-    raise AssetDownloadError(
-        f"Failed to download {url} after {max_retries} attempts",
+    raise TransientError(
+        f"Failed to download {url} after {MAX_RETRIES} attempts",
+        code=ErrorCode.ASSET_DOWNLOAD,
         context={"url": url, "last_error": str(last_error)},
+        hint=None,
+        instance_id=None,
     )
 
 
-async def _download_file(url: str, dest: Path, expected_hash: str, progressbar: bool = True) -> None:
+async def _download_file(url: str, dest: Path, *, expected_hash: str, progressbar: bool) -> None:
     """
     Stream download with incremental hash verification.
 
-    Uses chunked reads to minimize memory usage (~64KB per download).
+    Uses chunked reads to bound memory usage (1 MiB per download).
     Hash is computed incrementally during download (no second pass).
     Uses atomic write pattern (temp file -> rename).
     """
+    import aiohttp  # noqa: PLC0415 - only a download needs it (~50 ms at `import exec_sandbox`)
+
     algorithm, expected_digest = parse_hash_spec(expected_hash) if expected_hash else ("sha256", "")
     hasher = IncrementalHasher(algorithm)
     temp_path = dest.with_suffix(dest.suffix + ".tmp")
@@ -275,7 +275,6 @@ class AsyncPooch:
         self.base_url = base_url
         self.version = version
         self.registry: dict[str, str] = registry or {}
-        self._github_release_cache: dict[str, dict[str, Any]] | None = None
         self._resolved_version: str | None = None  # Actual tag from GitHub API
 
     async def fetch(
@@ -323,25 +322,6 @@ class AsyncPooch:
             progressbar=progressbar,
             processor=processor,
         )
-
-    async def load_registry_from_file(self, registry_file: Path) -> None:
-        """
-        Load registry from a file (filename hash per line).
-
-        File format:
-            vmlinuz-x86_64.zst sha256:abc123...
-            python-base.qcow2.zst sha256:def456...
-        """
-        min_parts = 2
-        async with aiofiles.open(registry_file) as f:
-            content = await f.read()
-        for raw_line in content.splitlines():
-            stripped_line = raw_line.strip()
-            if not stripped_line or stripped_line.startswith("#"):
-                continue
-            parts = stripped_line.split()
-            if len(parts) >= min_parts:
-                self.registry[parts[0]] = parts[1]
 
     async def load_registry_from_github(self, owner: str, repo: str, tag: str) -> None:
         """
@@ -482,27 +462,6 @@ async def decompress_zstd(fname: Path) -> Path:
 
     logger.debug("Decompression complete", extra={"file": str(dest)})
     return dest
-
-
-async def untar(fname: Path) -> Path:
-    """
-    Extract tar archive, return path to extracted directory.
-
-    Args:
-        fname: Path to tar archive
-
-    Returns:
-        Path to extracted directory
-    """
-    dest_dir = fname.parent / fname.stem.replace(".tar", "")
-
-    def _extract_sync() -> None:
-        with tarfile.open(fname) as tar:
-            tar.extractall(path=dest_dir, filter="data")  # Secure extraction filter
-        fname.unlink()
-
-    await asyncio.to_thread(_extract_sync)
-    return dest_dir
 
 
 def get_current_arch() -> str:

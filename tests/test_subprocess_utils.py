@@ -271,12 +271,7 @@ class TestDrainSubprocessOutput:
 
         proc = await create_process(["echo", "hello world"])
 
-        await drain_subprocess_output(
-            proc,
-            process_name="echo",
-            context_id="test-1",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         # Wait for process to finish
         await proc.wait()
@@ -290,12 +285,7 @@ class TestDrainSubprocessOutput:
         # bash -c to write to stderr
         proc = await create_process(["bash", "-c", "echo 'error message' >&2"])
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-2",
-            stderr_handler=captured_stderr.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=[].append, stderr_handler=captured_stderr.append)
 
         await proc.wait()
 
@@ -311,8 +301,6 @@ class TestDrainSubprocessOutput:
 
         await drain_subprocess_output(
             proc,
-            process_name="bash",
-            context_id="test-3",
             stdout_handler=captured_stdout.append,
             stderr_handler=captured_stderr.append,
         )
@@ -328,12 +316,7 @@ class TestDrainSubprocessOutput:
 
         proc = await create_process(["bash", "-c", "echo line1; echo line2; echo line3"])
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-4",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
@@ -363,8 +346,6 @@ class TestDrainSubprocessOutput:
 
         await drain_subprocess_output(
             proc,
-            process_name="bash",
-            context_id="test-5",
             stdout_handler=captured_stdout.append,
             stderr_handler=captured_stderr.append,
         )
@@ -384,12 +365,7 @@ class TestDrainSubprocessOutput:
             ["bash", "-c", 'for i in $(seq 1 1000); do echo "line $i with some padding text"; done']
         )
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-6",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
@@ -406,8 +382,6 @@ class TestDrainSubprocessOutput:
 
         await drain_subprocess_output(
             proc,
-            process_name="true",
-            context_id="test-7",
             stdout_handler=captured_stdout.append,
             stderr_handler=captured_stderr.append,
         )
@@ -417,22 +391,6 @@ class TestDrainSubprocessOutput:
         assert captured_stdout == []
         assert captured_stderr == []
 
-    async def test_drain_with_default_handlers(self) -> None:
-        """Drain with default handlers (logging, no capture)."""
-        proc = await create_process(["echo", "test"])
-
-        # No custom handlers - uses default logging
-        await drain_subprocess_output(
-            proc,
-            process_name="echo",
-            context_id="test-8",
-        )
-
-        await proc.wait()
-
-        # Just verify it completes without error
-        assert proc.returncode == 0
-
     async def test_drain_binary_safe(self) -> None:
         """Drain handles non-UTF8 gracefully (ignores decode errors)."""
         captured: list[str] = []
@@ -440,12 +398,7 @@ class TestDrainSubprocessOutput:
         # Output some bytes that might cause decode issues
         proc = await create_process(["bash", "-c", "echo 'normal text'"])
 
-        await drain_subprocess_output(
-            proc,
-            process_name="bash",
-            context_id="test-9",
-            stdout_handler=captured.append,
-        )
+        await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
@@ -471,8 +424,6 @@ print('another stdout')
 
         await drain_subprocess_output(
             proc,
-            process_name="python",
-            context_id="test-10",
             stdout_handler=captured_stdout.append,
             stderr_handler=captured_stderr.append,
         )

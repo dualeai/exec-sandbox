@@ -312,11 +312,6 @@ class VmManager:
             },
         )
 
-    @property
-    def admission(self) -> ResourceAdmissionController:
-        """Access the resource admission controller."""
-        return self._admission
-
     def get_active_vms(self) -> dict[str, QemuVM]:
         """Get snapshot of active VMs (for debugging/metrics).
 
@@ -411,7 +406,7 @@ class VmManager:
             if self._active_launches == 0:
                 self._launches_drained.set()
 
-    async def __aenter__(self) -> "VmManager":
+    async def __aenter__(self) -> Self:
         """Enter async context manager, starting the manager."""
         await self.start()
         return self
@@ -884,13 +879,15 @@ class VmManager:
         self,
         infra: _VmInfra,
         pending: _PendingLaunch,
+        *,
         qemu_cmd: list[str],
-        language: Language,
+        spec: VmSpec,
+        packages_image: Path | None,
         reservation: ResourceReservation,
-        on_boot_log: Callable[[str], None] | None = None,
-        gvproxy_proc: ProcessWrapper | None = None,
-        gvproxy_log_task: asyncio.Task[None] | None = None,
-        pass_fds: tuple[int, ...] = (),
+        on_boot_log: Callable[[str], None] | None,
+        gvproxy_proc: ProcessWrapper | None,
+        gvproxy_log_task: asyncio.Task[None] | None,
+        pass_fds: tuple[int, ...],
     ) -> QemuVM:
         """Launch QEMU subprocess, create VM object, register in tracking.
 
@@ -936,35 +933,34 @@ class VmManager:
             if on_boot_log is not None:
                 try:
                     on_boot_log(line)
-                except Exception:  # noqa: BLE001 - user-provided callback, must not kill drain task
+                except Exception:
                     logger.warning(
                         "on_boot_log callback raised, disabling", extra={"vm_id": infra.vm_id}, exc_info=True
                     )
                     on_boot_log = None
 
-        qemu_log_task = asyncio.create_task(
-            drain_subprocess_output(
-                qemu_proc,
-                process_name="QEMU",
-                context_id=infra.vm_id,
-                stdout_handler=write_to_console,
-                stderr_handler=write_to_console,
-            )
+        qemu_log_task = start_drain(
+            qemu_proc,
+            process_name="QEMU",
+            context_id=infra.vm_id,
+            stdout_handler=write_to_console,
+            stderr_handler=write_to_console,
         )
-        qemu_log_task.add_done_callback(log_task_exception)
         pending.qemu_log_task = qemu_log_task
 
         vm = QemuVM(
             infra.vm_id,
-            qemu_proc,
-            infra.cgroup_path,
-            infra.workdir,
-            infra.channel,
-            language,
-            console_lines,
-            gvproxy_proc,
-            qemu_log_task,
-            gvproxy_log_task,
+            process=qemu_proc,
+            cgroup_path=infra.cgroup_path,
+            workdir=infra.workdir,
+            channel=infra.channel,
+            spec=spec,
+            console_lines=console_lines,
+            base_image=infra.base_image,
+            packages_image=packages_image,
+            gvproxy_proc=gvproxy_proc,
+            qemu_log_task=qemu_log_task,
+            gvproxy_log_task=gvproxy_log_task,
             release_callback=self.destroy_vm,
         )
 
@@ -1214,12 +1210,14 @@ class VmManager:
             vm = await self._launch_qemu_vm(
                 infra,
                 pending,
-                qemu_cmd,
-                language,
-                reservation,
-                on_boot_log,
-                gvproxy_proc,
-                gvproxy_log_task,
+                qemu_cmd=qemu_cmd,
+                spec=spec,
+                packages_image=snapshot_drive,
+                reservation=reservation,
+                on_boot_log=on_boot_log,
+                gvproxy_proc=gvproxy_proc,
+                gvproxy_log_task=gvproxy_log_task,
+                pass_fds=(),
             )
             qemu_fork_ms = round((asyncio.get_running_loop().time() - qemu_start_time) * 1000)
 
@@ -1335,65 +1333,57 @@ class VmManager:
             # launch if the vmstate was evicted between check_cache() and this
             # call (TOCTOU).
             if not vmstate_path.exists():
-                raise VmTransientError(
+                raise TransientError(
                     f"vmstate file missing (evicted?): {vmstate_path}",
+                    code=ErrorCode.LOCAL_DISK,
                     context={"vmstate_path": str(vmstate_path)},
+                    hint=None,
+                    instance_id=None,
                 )
 
-            if reservation is not None:
-                try:
-                    return await self._restore_vm_with_reservation(
-                        reservation,
-                        language=language,
-                        tenant_id=tenant_id,
-                        task_id=task_id,
-                        vmstate_path=vmstate_path,
-                        snapshot_drive=snapshot_drive,
-                        allow_network=allow_network,
-                        allowed_domains=allowed_domains,
-                        expose_ports=expose_ports,
-                        start_time=start_time,
-                    )
-                except BaseException:
-                    await self._cleanup_reservation_owners(reservation, release_admission=False)
-                    raise
-
-            # reservation_context.__aexit__ owns owner cleanup and admission
-            # release on failure — no second sweep here.
-            async with self.reservation_context(
-                vm_id=f"{tenant_id}-{task_id}",
-                memory_mb=memory_mb,
-            ) as res:
+            try:
                 return await self._restore_vm_with_reservation(
-                    res,
-                    language=language,
+                    reservation,
+                    spec,
                     tenant_id=tenant_id,
                     task_id=task_id,
                     vmstate_path=vmstate_path,
+                    base_image=base_image,
                     snapshot_drive=snapshot_drive,
-                    allow_network=allow_network,
-                    allowed_domains=allowed_domains,
                     expose_ports=expose_ports,
                     start_time=start_time,
                 )
+            except BaseException:
+                await self._cleanup_reservation_owners(reservation, release_admission=False)
+                raise
 
     async def _restore_vm_with_reservation(  # noqa: PLR0912, PLR0915
         self,
         reservation: ResourceReservation,
+        spec: VmSpec,
         *,
-        language: Language,
         tenant_id: str,
         task_id: str,
         vmstate_path: Path,
+        base_image: Path,
         snapshot_drive: Path | None,
-        allow_network: bool,
-        allowed_domains: list[str] | None,
         expose_ports: list[ExposedPort] | None,
         start_time: float,
     ) -> QemuVM:
         """Restore VM with an already-acquired reservation. Ownership transfers to VM on success."""
         # Phase 1: Shared infrastructure (validation, workdir, overlay, cgroup, channel)
-        infra = await self._setup_vm_infra(language, tenant_id, task_id, reservation)
+        home_template = MemorySnapshotManager.home_path_from_vmstate(vmstate_path)
+        if not home_template.exists():
+            raise TransientError(
+                f"L1 home disk missing (evicted?): {home_template}",
+                code=ErrorCode.LOCAL_DISK,
+                context={"vmstate_path": str(vmstate_path)},
+                hint=None,
+                instance_id=None,
+            )
+        infra = await self._setup_vm_infra(
+            spec, tenant_id, task_id, reservation, base_image=base_image, home_template=home_template
+        )
         pending = infra.pending
 
         # Grant qemu-vm read access to snapshot drive if present
@@ -1466,9 +1456,11 @@ class VmManager:
             vm = await self._launch_qemu_vm(
                 infra,
                 pending,
-                qemu_cmd,
-                language,
-                reservation,
+                qemu_cmd=qemu_cmd,
+                spec=spec,
+                packages_image=snapshot_drive,
+                reservation=reservation,
+                on_boot_log=None,
                 gvproxy_proc=gvproxy_proc,
                 gvproxy_log_task=gvproxy_log_task,
                 pass_fds=(qmp_fd,) if qmp_fd is not None else (),

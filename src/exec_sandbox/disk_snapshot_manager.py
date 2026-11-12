@@ -469,11 +469,11 @@ class DiskSnapshotManager(BaseCacheManager):
         self,
         language: Language,
         packages: list[str],
+        *,
         cache_key: str,
         tenant_id: str,
         task_id: str,
         memory_mb: int,
-        *,
         _enospc_retried: bool = False,
     ) -> Path:
         """Create new qcow2 snapshot with packages installed.

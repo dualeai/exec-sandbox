@@ -175,7 +175,7 @@ class TestMigrationClientConnectOwnership:
             new_callable=AsyncMock,
             return_value=(reader, writer),
         ):
-            connect = asyncio.create_task(client.connect())
+            connect = asyncio.create_task(client.connect(timeout=5.0))
             await asyncio.wait_for(greeting_entered.wait(), timeout=1)
             connect.cancel()
             await asyncio.wait_for(close_entered.wait(), timeout=1)
@@ -244,7 +244,7 @@ class TestMigrationClientExecute:
         """Execute without arguments doesn't include 'arguments' key."""
         client, _reader, writer = _make_connected([{"return": {}}])
 
-        await client._execute("stop")
+        await client._execute("stop", arguments=None, timeout=_QMP_TIMEOUT)
 
         cmds = writer.commands
         assert cmds[0]["execute"] == "stop"
@@ -256,7 +256,7 @@ class TestMigrationClientExecute:
         error_resp = {"error": {"class": "GenericError", "desc": "device not found"}}
         client, _reader, _writer = _make_connected([error_resp])
 
-        result = await client._execute("invalid-command")
+        result = await client._execute("invalid-command", arguments=None, timeout=_QMP_TIMEOUT)
         assert "error" in result
         assert result["error"]["desc"] == "device not found"
 

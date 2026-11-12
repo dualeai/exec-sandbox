@@ -24,61 +24,13 @@ from pathlib import Path
 from typing import Self
 from uuid import uuid4
 
-import aiofiles.os
-
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import settle_and_report
-from exec_sandbox.exceptions import VmOverlayError as QemuImgError
-from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QemuStorageDaemonError
-from exec_sandbox.subprocess_utils import communicate_managed_process
+from exec_sandbox.exceptions import TransientError
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 
 logger = get_logger(__name__)
-
-
-async def create_qcow2_overlay(base_image: Path, overlay_path: Path) -> None:
-    """Create qcow2 overlay with copy-on-write backing file.
-
-    Subprocess-based overlay creation using qemu-img. Used by:
-    - DiskSnapshotManager (snapshot creation)
-
-    Note: OverlayPool uses QemuStorageDaemon for faster overlay creation.
-
-    Options rationale:
-    - lazy_refcounts=on: Faster writes, metadata crash-consistent via fsync
-    - extended_l2=on: Sub-cluster allocation (better for small writes)
-    - cluster_size=128k: Balance between metadata size and I/O efficiency
-
-    Args:
-        base_image: Base qcow2 image (backing file, read-only)
-        overlay_path: Path for new overlay file (will be created)
-
-    Raises:
-        QemuImgError: qemu-img command failed
-    """
-    cmd = [
-        "qemu-img",
-        "create",
-        "-f",
-        "qcow2",
-        "-F",
-        "qcow2",
-        "-b",
-        str(base_image),
-        "-o",
-        "lazy_refcounts=on,extended_l2=on,cluster_size=128k",
-        str(overlay_path),
-    ]
-
-    returncode, _, stderr = await communicate_managed_process(
-        cmd,
-        process_name="qemu-img-create-overlay",
-        context_id=str(overlay_path),
-    )
-
-    if returncode != 0:
-        stderr_text = stderr.decode()
-        raise QemuImgError(f"qemu-img create failed: {stderr_text}", stderr=stderr_text)
 
 
 class OverlayPool:
@@ -502,19 +454,11 @@ class OverlayPool:
 
             except asyncio.CancelledError:
                 break
-            except (OSError, QemuStorageDaemonError) as e:
+            except (OSError, TransientError) as e:
                 logger.warning(
                     "Replenishment error",
                     extra={"base_image": key, "error": str(e)},
                 )
-
-    def get_stats(self) -> dict[str, int]:
-        """Get pool sizes for monitoring.
-
-        Returns:
-            Dict mapping base image paths to current pool sizes
-        """
-        return {key: pool.qsize() for key, pool in self._pools.items()}
 
     async def __aenter__(self) -> Self:
         """Enter async context manager, starting the pool."""

@@ -701,34 +701,6 @@ class TestSaveLock:
             assert should_save is True
 
 
-class TestGetL2ForL1:
-    """Tests for get_l2_for_l1 (L2 snapshot path lookup)."""
-
-    async def test_no_packages_returns_none(self, manager: MemorySnapshotManager) -> None:
-        """No packages = no L2 snapshot needed."""
-        result = await manager.get_l2_for_l1(Language.PYTHON, [])
-        assert result is None
-
-    async def test_with_packages_delegates_to_snapshot_manager(self, manager: MemorySnapshotManager) -> None:
-        """With packages, delegates to snapshot_manager.check_cache."""
-        expected = Path("/tmp/l2.qcow2")
-        manager.snapshot_manager.check_cache = AsyncMock(return_value=expected)
-
-        result = await manager.get_l2_for_l1(Language.PYTHON, ["pandas"])
-        assert result == expected
-        manager.snapshot_manager.check_cache.assert_called_once_with(
-            language=Language.PYTHON,
-            packages=["pandas"],
-        )
-
-    async def test_with_packages_cache_miss(self, manager: MemorySnapshotManager) -> None:
-        """With packages but L2 miss, returns None."""
-        manager.snapshot_manager.check_cache = AsyncMock(return_value=None)
-
-        result = await manager.get_l2_for_l1(Language.PYTHON, ["pandas"])
-        assert result is None
-
-
 class TestEvictOldestSnapshot:
     """Tests for _evict_oldest_snapshot (LRU eviction)."""
 
@@ -1247,50 +1219,20 @@ class TestSaveLockEdgeCases:
 
 
 # ============================================================================
-# Torture Tests — save_snapshot Edge Cases
+# Torture Tests — _do_save Edge Cases
 # ============================================================================
 
 
-class TestSaveSnapshotEdgeCases:
-    """Edge cases for save_snapshot (ENOSPC, partial writes, errors)."""
-
-    async def test_save_returns_existing_on_race(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """If cache entry appears between compute_key and lock → returns existing path."""
-        key = await manager.compute_cache_key(Language.PYTHON, [], 512)
-        vmstate = manager.cache_dir / f"{key}.vmstate"
-        vmstate.write_bytes(b"already saved")
-
-        vm = MagicMock()
-        vm.qmp_socket = Path("/tmp/fake.sock")
-        vm.use_qemu_vm_user = False
-
-        result = await manager.save_snapshot(vm, Language.PYTHON, [], 512)
-        assert result == vmstate  # Returns existing, doesn't try to save
-
-    async def test_save_blocked_by_lock_returns_none(
-        self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
-    ) -> None:
-        """save_snapshot returns None when lock is held by another process."""
-        key = await manager.compute_cache_key(Language.PYTHON, [], 512)
-
-        # Hold flock to simulate another process saving
-        lock_path = manager.cache_dir / f"{key}.vmstate.lock"
-        fd = lock_path.open("w")
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            vm = MagicMock()
-            result = await manager.save_snapshot(vm, Language.PYTHON, [], 512)
-            assert result is None  # BlockingIOError caught → None
-        finally:
-            fd.close()
+class TestDoSaveEdgeCases:
+    """Edge cases for _do_save (ENOSPC, partial writes, errors)."""
 
     async def test_do_save_enospc_cleanup(
         self, manager: MemorySnapshotManager, mock_system_probes: dict[str, Any]
     ) -> None:
         """_do_save: ENOSPC during migration → evict, clean partial files, return None."""
-        key = await manager.compute_cache_key(Language.PYTHON, [], 512)
+        key = await manager.compute_cache_key(
+            VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None
+        )
         vmstate_path, meta_path = manager._cache_paths(key)
         tmp_path = vmstate_path.parent / f"{vmstate_path.name}.tmp"
 
@@ -1746,8 +1688,8 @@ class TestBackgroundTaskLifecycle:
     """Tests for _track_task and background task tracking."""
 
     async def test_task_count_tracks_in_flight(self, manager: MemorySnapshotManager) -> None:
-        """background_task_count reflects number of running tasks."""
-        assert manager.background_task_count == 0
+        """The tracked set holds the running tasks, and only them."""
+        assert len(manager._background_tasks) == 0
 
         gate = asyncio.Event()
 
@@ -1760,28 +1702,13 @@ class TestBackgroundTaskLifecycle:
             manager._track_task(task, name="test")
             tasks.append(task)
 
-        assert manager.background_task_count == 5
+        assert len(manager._background_tasks) == 5
 
         gate.set()
         await asyncio.gather(*tasks)
         await asyncio.sleep(0)  # Let done callbacks fire
 
-        assert manager.background_task_count == 0
-
-    async def test_task_names_reported(self, manager: MemorySnapshotManager) -> None:
-        """background_task_names returns descriptive names."""
-        gate = asyncio.Event()
-
-        async def wait_task() -> None:
-            await gate.wait()
-
-        task = asyncio.create_task(wait_task())
-        manager._track_task(task, name="l1-save-python-abc")
-
-        assert "l1-save-python-abc" in manager.background_task_names
-
-        gate.set()
-        await task
+        assert len(manager._background_tasks) == 0
 
     async def test_failed_task_removed_from_tracking(self, manager: MemorySnapshotManager) -> None:
         """Failed background tasks are removed from tracking dict."""
@@ -1795,7 +1722,7 @@ class TestBackgroundTaskLifecycle:
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0)
 
-        assert manager.background_task_count == 0
+        assert len(manager._background_tasks) == 0
 
     async def test_cancelled_task_removed_from_tracking(self, manager: MemorySnapshotManager) -> None:
         """Cancelled background tasks are removed from tracking dict."""
@@ -1811,7 +1738,7 @@ class TestBackgroundTaskLifecycle:
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0)
 
-        assert manager.background_task_count == 0
+        assert len(manager._background_tasks) == 0
 
     async def test_stop_waits_for_multiple_tasks(self, manager: MemorySnapshotManager) -> None:
         """stop() waits for all background tasks to complete."""
@@ -2071,54 +1998,26 @@ class TestIntegrationCycles:
             kernel_path=images_dir / "kernels",
         )
         vm_manager = VmManager(settings)
-        snapshot_manager = MagicMock()
 
         # Create entry with first manager
-        mgr1 = MemorySnapshotManager(settings, vm_manager, snapshot_manager)
-        key = await mgr1.compute_cache_key(Language.PYTHON, [], 512)
+        mgr1 = MemorySnapshotManager(settings, vm_manager)
+        key = await mgr1.compute_cache_key(VmSpec(language=Language.PYTHON, packages=(), memory_mb=512), l2_path=None)
         vmstate = mgr1.cache_dir / f"{key}.vmstate"
         meta = mgr1.cache_dir / f"{key}.vmstate.meta"
         data = b"persistent " * 100
         vmstate.write_bytes(data)
-        meta.write_text(json.dumps({"vmstate_sha256": hashlib.sha256(data).hexdigest()}))
+        vmstate.with_suffix(".home").write_bytes(b"home disk")  # an L1 entry carries its home disk
+        meta.write_text(json.dumps({"vmstate_sha256": _vmstate_digest(vmstate)}))
 
         # Check with second manager
-        mgr2 = MemorySnapshotManager(settings, vm_manager, snapshot_manager)
-        result = await mgr2.check_cache(Language.PYTHON, [], 512)
+        mgr2 = MemorySnapshotManager(settings, vm_manager)
+        result = await _check_spec(mgr2, VmSpec(language=Language.PYTHON, packages=(), memory_mb=512))
         assert result is not None
         assert result == vmstate
 
 
-# ============================================================================
-# Torture Tests — get_l2_for_l1 Edge Cases
-# ============================================================================
-
-
-class TestGetL2ForL1EdgeCases:
-    """Edge cases for L2 path lookup."""
-
-    async def test_multiple_packages_forwarded(self, manager: MemorySnapshotManager) -> None:
-        """Multiple packages are forwarded as-is to snapshot_manager."""
-        expected = Path("/tmp/l2.qcow2")
-        manager.snapshot_manager.check_cache = AsyncMock(return_value=expected)
-
-        result = await manager.get_l2_for_l1(Language.PYTHON, ["pandas", "numpy", "scipy"])
-        assert result == expected
-        manager.snapshot_manager.check_cache.assert_called_once_with(
-            language=Language.PYTHON,
-            packages=["pandas", "numpy", "scipy"],
-        )
-
-    async def test_empty_packages_list_returns_none(self, manager: MemorySnapshotManager) -> None:
-        """Empty list (not None) returns None."""
-        result = await manager.get_l2_for_l1(Language.PYTHON, [])
-        assert result is None
-        # snapshot_manager should NOT be called
-        manager.snapshot_manager.check_cache.assert_not_called()
-
-    async def test_snapshot_manager_raises(self, manager: MemorySnapshotManager) -> None:
-        """snapshot_manager.check_cache exception propagates."""
-        manager.snapshot_manager.check_cache = AsyncMock(side_effect=RuntimeError("L2 error"))
-
-        with pytest.raises(RuntimeError, match="L2 error"):
-            await manager.get_l2_for_l1(Language.PYTHON, ["pandas"])
+def _fd_path(fd: int) -> Path:
+    """The path of an open file (macOS F_GETPATH, Linux /proc)."""
+    if sys.platform == "darwin":
+        return Path(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0").decode()).resolve()
+    return Path(f"/proc/self/fd/{fd}").readlink().resolve()

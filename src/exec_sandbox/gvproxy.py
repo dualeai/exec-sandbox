@@ -25,7 +25,8 @@ logger = get_logger(__name__)
 
 async def start_gvproxy(  # noqa: PLR0915
     vm_id: str,
-    allowed_domains: list[str] | None,
+    *,
+    allowed_domains: Sequence[str] | None,
     language: str,
     workdir: VmWorkingDirectory,
     expose_ports: list[ExposedPort] | None = None,

@@ -242,7 +242,7 @@ class WarmVMPool:
             task.add_done_callback(self._initial_boot_tasks.discard)
 
         # Boot all VMs in parallel
-        results: list[None | BaseException] = await asyncio.gather(*boot_tasks, return_exceptions=True)
+        results: list[BaseException | None] = await asyncio.gather(*boot_tasks, return_exceptions=True)
 
         # Log failures (graceful degradation)
         for i, result in enumerate(results):

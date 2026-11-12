@@ -536,9 +536,11 @@ mod tests {
         serde_json::from_slice(json_bytes).unwrap()
     }
 
+    const PONG: GuestResponse = GuestResponse::Pong { version: "1.0" };
+
     #[tokio::test]
     async fn response_writer_inject_op_id_into_pong() {
-        let val = writer_send_json(Some("abc"), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some("abc"), &PONG).await;
         assert_eq!(val["op_id"], "abc");
         assert_eq!(val["type"], "pong");
     }
@@ -683,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_writer_no_op_id_writer_produces_no_op_id() {
-        let val = writer_send_json(None, &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(None, &PONG).await;
         assert!(val.get("op_id").is_none());
     }
 
@@ -702,26 +704,26 @@ mod tests {
 
     #[tokio::test]
     async fn response_writer_special_chars_in_op_id() {
-        let val = writer_send_json(Some("a\"b\\c"), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some("a\"b\\c"), &PONG).await;
         assert_eq!(val["op_id"], "a\"b\\c");
     }
 
     #[tokio::test]
     async fn response_writer_unicode_op_id() {
-        let val = writer_send_json(Some("日本語"), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some("日本語"), &PONG).await;
         assert_eq!(val["op_id"], "日本語");
     }
 
     #[tokio::test]
     async fn response_writer_long_op_id() {
         let long_id = "x".repeat(1000);
-        let val = writer_send_json(Some(&long_id), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some(&long_id), &PONG).await;
         assert_eq!(val["op_id"].as_str().unwrap().len(), 1000);
     }
 
     #[tokio::test]
     async fn response_writer_empty_op_id() {
-        let val = writer_send_json(Some(""), &GuestResponse::Pong { version: "1.0" }).await;
+        let val = writer_send_json(Some(""), &PONG).await;
         assert_eq!(val["op_id"], "");
     }
 }

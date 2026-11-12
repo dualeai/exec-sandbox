@@ -5,13 +5,14 @@ Sudo tests require elevated privileges and are marked with @pytest.mark.sudo.
 """
 
 import os
+import pwd
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from exec_sandbox.permission_utils import (
-    _probe_getfacl,
     _probe_setfacl,
     can_access,
     chmod_async,
@@ -224,46 +225,22 @@ class TestChmodExecutable:
 class TestGetMode:
     """Tests for get_mode function."""
 
-    async def test_returns_mode(self, tmp_path: Path) -> None:
+    def test_returns_mode(self, tmp_path: Path) -> None:
         """get_mode returns file mode."""
         test_file = tmp_path / "test.txt"
         test_file.write_text("content")
         test_file.chmod(0o640)
 
-        result = await get_mode(test_file)
+        result = get_mode(test_file)
 
         assert result is not None
         assert (result & 0o777) == 0o640
 
-    async def test_nonexistent_returns_none(self, tmp_path: Path) -> None:
+    def test_nonexistent_returns_none(self, tmp_path: Path) -> None:
         """get_mode returns None for nonexistent file."""
         nonexistent = tmp_path / "nonexistent.txt"
 
-        result = await get_mode(nonexistent)
-
-        assert result is None
-
-
-class TestGetOwner:
-    """Tests for get_owner function."""
-
-    async def test_returns_owner_tuple(self, tmp_path: Path) -> None:
-        """get_owner returns (user, group) tuple."""
-        test_file = tmp_path / "test.txt"
-        test_file.write_text("content")
-
-        result = await get_owner(test_file)
-
-        assert result is not None
-        user, group = result
-        assert isinstance(user, str)
-        assert isinstance(group, str)
-
-    async def test_nonexistent_returns_none(self, tmp_path: Path) -> None:
-        """get_owner returns None for nonexistent file."""
-        nonexistent = tmp_path / "nonexistent.txt"
-
-        result = await get_owner(nonexistent)
+        result = get_mode(nonexistent)
 
         assert result is None
 
@@ -397,16 +374,6 @@ class TestAclOperations:
 
         assert result is False
 
-    @skip_unless_macos
-    async def test_get_acl_macos_returns_none(self, tmp_path: Path) -> None:
-        """get_acl returns None on macOS."""
-        test_file = tmp_path / "test.txt"
-        test_file.write_text("content")
-
-        result = await get_acl(test_file)
-
-        assert result is None
-
     async def test_grant_qemu_vm_access_no_user(self, tmp_path: Path) -> None:
         """grant_qemu_vm_access returns False if qemu-vm user doesn't exist."""
         test_file = tmp_path / "test.sock"
@@ -436,11 +403,6 @@ class TestLinuxAclBinaries:
         result = await _probe_setfacl()
         assert result is True, "setfacl binary must be available on Linux"
 
-    async def test_getfacl_available(self) -> None:
-        """getfacl must be available on Linux."""
-        result = await _probe_getfacl()
-        assert result is True, "getfacl binary must be available on Linux"
-
     async def test_set_acl_works(self, tmp_path: Path) -> None:
         """set_acl_user actually sets ACL on Linux."""
         import pwd
@@ -452,16 +414,6 @@ class TestLinuxAclBinaries:
         result = await set_acl_user(test_file, current_user, "rw")
 
         assert result is True, "set_acl_user must succeed on Linux"
-
-    async def test_get_acl_works(self, tmp_path: Path) -> None:
-        """get_acl actually reads ACL on Linux."""
-        test_file = tmp_path / "acl_test.txt"
-        test_file.write_text("content")
-
-        result = await get_acl(test_file)
-
-        assert result is not None, "get_acl must return ACL dict on Linux"
-        assert "user::" in result, "get_acl must include owner entry"
 
 
 class TestSudoRm:
@@ -541,9 +493,8 @@ class TestSudoRmReal:
             pytest.skip("Cannot chown to root (sudo not available?)")
 
         # Verify ownership changed
-        owner = await get_owner(test_file)
-        assert owner is not None
-        assert owner[0] == "root", f"Expected owner 'root', got '{owner[0]}'"
+        owner = pwd.getpwuid(test_file.stat().st_uid).pw_name
+        assert owner == "root", f"Expected owner 'root', got '{owner}'"
 
         # Step 2: Verify normal user cannot remove
         try:
@@ -598,9 +549,7 @@ class TestSudoRmReal:
         result = await chown_to_qemu_vm(test_file)
 
         assert result is True
-        owner = await get_owner(test_file)
-        assert owner is not None
-        assert owner[0] == "qemu-vm"
+        assert pwd.getpwuid(test_file.stat().st_uid).pw_name == "qemu-vm"
 
         # Cleanup
         await sudo_rm(test_file)
@@ -611,8 +560,8 @@ class TestSudoRmReal:
 class TestAclRealLinux:
     """Real ACL tests on Linux - require setfacl."""
 
-    async def test_set_and_get_acl(self, tmp_path: Path) -> None:
-        """set_acl_user and get_acl work together."""
+    async def test_set_acl_user(self, tmp_path: Path) -> None:
+        """set_acl_user adds the user's entry."""
         test_file = tmp_path / "acl_test.txt"
         test_file.write_text("content")
 
@@ -625,54 +574,10 @@ class TestAclRealLinux:
         if not result:
             pytest.skip("setfacl not available")
 
-        # Get ACL and verify
-        acl = await get_acl(test_file)
+        acl = read_acl(test_file)
 
-        assert acl is not None
         assert f"user:{current_user}" in acl
         assert "rw" in acl[f"user:{current_user}"]
-
-    async def test_verify_user_access(self, tmp_path: Path) -> None:
-        """verify_user_access checks ACL permissions."""
-        test_file = tmp_path / "verify_test.txt"
-        test_file.write_text("content")
-
-        import pwd
-
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-
-        # Set ACL
-        result = await set_acl_user(test_file, current_user, "rw")
-        if not result:
-            pytest.skip("setfacl not available")
-
-        # Verify access
-        has_access = await verify_user_access(test_file, current_user, "rw")
-
-        assert has_access is True
-
-    async def test_remove_acl_user(self, tmp_path: Path) -> None:
-        """remove_acl_user removes user ACL entry."""
-        test_file = tmp_path / "remove_acl.txt"
-        test_file.write_text("content")
-
-        import pwd
-
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-
-        # Set then remove ACL
-        set_result = await set_acl_user(test_file, current_user, "rw")
-        if not set_result:
-            pytest.skip("setfacl not available")
-
-        remove_result = await remove_acl_user(test_file, current_user)
-
-        assert remove_result is True
-
-        # Verify removed
-        acl = await get_acl(test_file)
-        assert acl is not None
-        assert f"user:{current_user}" not in acl
 
     async def test_grant_qemu_vm_access_real(self, tmp_path: Path) -> None:
         """grant_qemu_vm_access sets ACL for qemu-vm user."""
@@ -683,10 +588,7 @@ class TestAclRealLinux:
 
         assert result is True
 
-        # Verify ACL
-        acl = await get_acl(test_file)
-        assert acl is not None
-        assert "user:qemu-vm" in acl
+        assert "user:qemu-vm" in read_acl(test_file)
 
 
 # =============================================================================
@@ -897,8 +799,6 @@ class TestGrantQemuVmFileAccessReal:
         result = await grant_qemu_vm_file_access(test_file, writable=True)
 
         assert result is True
-        owner = await get_owner(test_file)
-        assert owner is not None
-        assert owner[0] == "qemu-vm"
+        assert pwd.getpwuid(test_file.stat().st_uid).pw_name == "qemu-vm"
 
         await sudo_rm(test_file)

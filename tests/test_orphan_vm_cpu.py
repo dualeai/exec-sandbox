@@ -54,7 +54,7 @@ async def kill_vm_processes(vm: QemuVM) -> None:
     await cleanup_vm_processes(
         vm.process,
         vm.gvproxy_proc,
-        vm.vm_id,
+        vm_id=vm.vm_id,
         qemu_term_timeout=1.0,
         qemu_kill_timeout=1.0,
         gvproxy_term_timeout=1.0,

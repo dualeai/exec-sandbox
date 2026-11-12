@@ -475,23 +475,8 @@ class TestAsyncPooch:
             registry={},
         )
 
-        with pytest.raises(AssetNotFoundError):
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
             await pooch.fetch("unknown.txt")
-
-    async def test_load_registry_from_file(self, tmp_path: Path):
-        """Should load registry from file."""
-        registry_file = tmp_path / "registry.txt"
-        registry_file.write_text("file1.txt sha256:hash1\nfile2.txt sha256:hash2\n")
-
-        pooch = AsyncPooch(
-            path=tmp_path,
-            base_url="https://example.com",
-            version="1.0.0",
-        )
-        await pooch.load_registry_from_file(registry_file)
-
-        assert pooch.registry["file1.txt"] == "sha256:hash1"
-        assert pooch.registry["file2.txt"] == "sha256:hash2"
 
     async def test_load_registry_from_github(self, tmp_path: Path):
         """Should load registry from GitHub release API."""
@@ -746,55 +731,6 @@ class TestDecompressZstd:
         assert result_path.read_bytes() == b""
 
 
-class TestUntar:
-    """Tests for untar function."""
-
-    async def test_extracts_tar_archive(self, tmp_path: Path):
-        """Should extract tar archive and remove original."""
-        import tarfile
-
-        # Create a tar archive
-        archive_content_dir = tmp_path / "content"
-        archive_content_dir.mkdir()
-        (archive_content_dir / "file1.txt").write_text("content1")
-        (archive_content_dir / "file2.txt").write_text("content2")
-
-        tar_path = tmp_path / "archive.tar"
-        with tarfile.open(tar_path, "w") as tar:
-            tar.add(archive_content_dir / "file1.txt", arcname="file1.txt")
-            tar.add(archive_content_dir / "file2.txt", arcname="file2.txt")
-
-        # Extract
-        result_dir = await untar(tar_path)
-
-        # Verify
-        assert result_dir.exists()
-        assert (result_dir / "file1.txt").read_text() == "content1"
-        assert (result_dir / "file2.txt").read_text() == "content2"
-        assert not tar_path.exists()  # Original should be deleted
-
-    async def test_extracts_tar_gz_archive(self, tmp_path: Path):
-        """Should extract .tar.gz archive and remove original."""
-        import tarfile
-
-        # Create a tar.gz archive
-        archive_content_dir = tmp_path / "content"
-        archive_content_dir.mkdir()
-        (archive_content_dir / "file.txt").write_text("gzip content")
-
-        tar_path = tmp_path / "archive.tar.gz"
-        with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(archive_content_dir / "file.txt", arcname="file.txt")
-
-        # Extract
-        result_dir = await untar(tar_path)
-
-        # Verify
-        assert result_dir.exists()
-        assert (result_dir / "file.txt").read_text() == "gzip content"
-        assert not tar_path.exists()  # Original should be deleted
-
-
 # ============================================================================
 # file_lock unit tests
 # ============================================================================
@@ -816,13 +752,32 @@ class TestFileLock:
         async with file_lock(target) as should_proceed:
             assert should_proceed is False
 
-    async def test_nonblocking_raises_when_held(self, tmp_path: Path):
-        """Should raise BlockingIOError in non-blocking mode when lock is held."""
+    async def test_try_lock_raises_when_held(self, tmp_path: Path):
+        """try_file_lock raises BlockingIOError at once while file_lock holds the lock."""
         target = tmp_path / "locked.txt"
         async with file_lock(target):
-            with pytest.raises(BlockingIOError):
-                async with file_lock(target, blocking=False):
-                    pass  # Should not reach here
+            with pytest.raises(BlockingIOError), try_file_lock(target):
+                pass  # Should not reach here
+
+    @pytest.mark.parametrize("wait", [True, False], ids=["file_lock", "try_file_lock"])
+    async def test_lock_file_is_not_truncated(self, tmp_path: Path, wait: bool):
+        """Taking the lock opens the existing lock file without O_TRUNC (open("w") costs
+        about 0.4 ms on APFS): bytes already in it stay, the lock is the same."""
+        target = tmp_path / "kept.txt"
+        lock_file = tmp_path / "kept.txt.lock"
+        lock_file.write_bytes(b"kept")
+
+        async with contextlib.AsyncExitStack() as stack:
+            if wait:
+                should_proceed = await stack.enter_async_context(file_lock(target))
+            else:
+                should_proceed = stack.enter_context(try_file_lock(target))
+            assert should_proceed is True
+            assert lock_file.read_bytes() == b"kept"
+            with pytest.raises(BlockingIOError), try_file_lock(target):  # still an exclusive lock on the same file
+                pass
+
+        assert lock_file.read_bytes() == b"kept"
 
     @pytest.mark.parametrize("n_waiters", [1, 10, 100])
     async def test_blocking_waits_then_proceeds(self, tmp_path: Path, n_waiters: int):

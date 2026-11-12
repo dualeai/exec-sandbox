@@ -240,15 +240,7 @@ class QemuStorageDaemon:
 
         logger.info("QEMU storage daemon stopped")
 
-    async def create_overlay(
-        self,
-        base_image: Path,
-        overlay_path: Path,
-        *,
-        cluster_size: int = 131072,  # 128k
-        lazy_refcounts: bool = True,
-        extended_l2: bool = True,
-    ) -> None:
+    async def create_overlay(self, base_image: Path, overlay_path: Path) -> None:
         """Create qcow2 overlay with backing file via QMP.
 
         Uses 3-step approach required by qemu-storage-daemon:
@@ -314,9 +306,7 @@ class QemuStorageDaemon:
                         "size": virtual_size,
                         "backing-file": str(base_image),
                         "backing-fmt": "qcow2",
-                        "cluster-size": cluster_size,
-                        "lazy-refcounts": lazy_refcounts,
-                        "extended-l2": extended_l2,
+                        **_OVERLAY_QCOW2_OPTIONS,
                     },
                 },
             )
@@ -559,11 +549,7 @@ class QemuStorageDaemon:
         """
         self._event_buffer = [e for e in self._event_buffer if e.job_id != job_id]
 
-    async def _wait_for_job(
-        self,
-        job_id: str,
-        timeout: float = constants.QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS,
-    ) -> None:
+    async def _wait_for_job(self, job_id: str) -> None:
         """Wait for async job to complete using event-driven approach.
 
         Primary path: Checks _event_buffer for a JOB_STATUS_CHANGE(concluded)
@@ -576,12 +562,12 @@ class QemuStorageDaemon:
         this job_id from the buffer to prevent stale event accumulation.
 
         Args:
-            job_id: Job ID to wait for
-            timeout: Maximum time to wait
+            job_id: Job ID to wait for (at most QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS)
 
         Raises:
-            QemuStorageDaemonError: If job times out or fails
+            TransientError: OVERLAY_FAILED if job times out or fails
         """
+        timeout = constants.QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout

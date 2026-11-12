@@ -175,7 +175,7 @@ class Session:
     # -------------------------------------------------------------------------
 
     @asynccontextmanager
-    async def _guard(self) -> AsyncIterator[None]:
+    async def _guard(self) -> AsyncGenerator[None]:
         """Acquire exec lock with session lifecycle checks.
 
         Encapsulates the preamble shared by all public methods:

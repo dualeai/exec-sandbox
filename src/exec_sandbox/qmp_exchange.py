@@ -37,6 +37,7 @@ _MAX_SKIPPED_MESSAGES = 64
 async def qmp_id_exchange(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
+    *,
     request_id: str,
     command: str,
     arguments: dict[str, Any] | None,

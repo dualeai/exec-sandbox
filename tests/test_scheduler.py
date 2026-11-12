@@ -836,8 +836,8 @@ class TestBaseImageFetchBeforeSnapshot:
 
             # Mock _create_snapshot to avoid QEMU boot — write to the real
             # cache_key path so file_lock's "already exists" check stays correct.
-            async def mock_create_snapshot(language, packages, key, *args, **kwargs):  # type: ignore[no-untyped-def]
-                snap = cache_dir / f"{key}.qcow2"
+            async def mock_create_snapshot(language, packages, *, cache_key, **kwargs):  # type: ignore[no-untyped-def]
+                snap = cache_dir / f"{cache_key}.qcow2"
                 await create_test_qcow2(snap)
                 return snap
 
@@ -994,8 +994,8 @@ class TestBaseImageFetchBeforeSnapshot:
                 await asyncio.sleep(0.05)
                 # No-op: base image already exists (idempotent)
 
-            async def mock_create_snapshot(language, packages, key, *args, **kwargs):  # type: ignore[no-untyped-def]
-                snap = cache_dir / f"{key}.qcow2"
+            async def mock_create_snapshot(language, packages, *, cache_key, **kwargs):  # type: ignore[no-untyped-def]
+                snap = cache_dir / f"{cache_key}.qcow2"
                 if not snap.exists():
                     await create_test_qcow2(snap)
                 return snap

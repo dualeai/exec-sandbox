@@ -68,7 +68,7 @@ class PrefetchResult:
 
 def _versioned_cache_dir() -> Path:
     """Get version-specific cache directory for downloaded assets."""
-    base = get_cache_dir("exec-sandbox")
+    base = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
     # Don't add version suffix when user explicitly overrides cache dir
     if os.environ.get("EXEC_SANDBOX_CACHE_DIR"):
         return base
@@ -343,38 +343,31 @@ async def fetch_gvproxy(*, override: Path | None, arch: str) -> Path:
     return path
 
 
-async def ensure_assets_available(
-    language: str | None = None,
-    override: Path | None = None,
-) -> tuple[Path, Path]:
+async def ensure_assets_available(*, override: Path | None) -> tuple[Path, Path]:
     """
-    Ensure all required assets are available for the given language.
+    Ensure the kernel, initramfs and gvproxy are available (base images are fetched
+    per language, on first use: fetch_base_image).
 
     Downloads assets from GitHub Releases if not already cached.
-    In offline mode, raises FileNotFoundError if assets are missing.
+    In offline mode, missing assets raise ConfigError ASSET_NOT_FOUND (no download).
 
     Args:
-        language: Optional language to pre-fetch base image for.
-                  If None, only fetches kernel and gvproxy.
         override: Explicit path to search first (from SchedulerConfig.images_dir).
 
     Returns:
         Tuple of (images_dir, gvproxy_path)
 
     Raises:
-        AssetNotFoundError: Release not found on GitHub.
-        AssetDownloadError: Download failed after retries.
-        AssetChecksumError: Hash verification failed.
-        FileNotFoundError: Offline mode and assets missing.
+        ConfigError: ASSET_NOT_FOUND: release not found on GitHub, or offline mode
+            and assets missing.
+        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries.
     """
     # Fetch required assets in parallel
     fetch_tasks: list[asyncio.Task[Path]] = [
         asyncio.create_task(fetch_kernel(override=override)),
         asyncio.create_task(fetch_initramfs(override=override)),
-        asyncio.create_task(fetch_gvproxy(override=override)),
+        asyncio.create_task(fetch_gvproxy(override=override, arch=get_current_arch())),
     ]
-    if language:
-        fetch_tasks.append(asyncio.create_task(fetch_base_image(language, override=override)))
 
     results = await asyncio.gather(*fetch_tasks)
     kernel_path, _, gvproxy_path = results[0], results[1], results[2]
@@ -390,36 +383,28 @@ async def ensure_assets_available(
     return images_dir, gvproxy_path
 
 
-async def ensure_assets(
-    override: Path | None = None,
-    download: bool = True,
-    language: str | None = None,
-) -> Path:
+async def ensure_assets(*, override: Path | None, download: bool) -> Path:
     """
     Find or download assets. Single entry point for asset resolution.
 
     Args:
         override: Explicit path from SchedulerConfig.images_dir.
         download: If True, download missing assets. If False, raise on missing.
-        language: Optional language to pre-fetch base image for.
 
     Returns:
         Path to images directory.
 
     Raises:
-        FileNotFoundError: Assets not found and download=False.
-        AssetNotFoundError: Release not found on GitHub.
-        AssetDownloadError: Download failed after retries.
-        AssetChecksumError: Hash verification failed.
+        ConfigError: ASSET_NOT_FOUND: assets not found and download=False, or release not found on GitHub.
+        TransientError: ASSET_DOWNLOAD: download or hash verification failed after retries.
     """
     # Try to find existing assets first
     if images_dir := await _find_images_dir(override):
         # Validate that essential files exist (not just the directory)
         arch = get_current_arch()
-        for name in _kernel_candidates(arch):
-            if await aiofiles.os.path.exists(images_dir / name):
-                logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
-                return images_dir
+        if await asyncio.to_thread(_first_existing, [images_dir / name for name in _kernel_candidates(arch)]):
+            logger.debug("Found existing assets", extra={"images_dir": str(images_dir)})
+            return images_dir
         # Directory exists but kernel is missing - fall through to download
         logger.debug(
             "Directory exists but kernel missing",

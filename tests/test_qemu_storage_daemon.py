@@ -595,6 +595,9 @@ class TestQemuStorageDaemonIntegration:
         virtual_size = info.get("virtual-size")
         assert isinstance(virtual_size, int)
         assert virtual_size > 0
+        assert info["cluster-size"] == 128 * 1024
+        options = info["format-specific"]["data"]
+        assert (options["lazy-refcounts"], options["extended-l2"]) == (True, True)
 
     async def test_multiple_overlays_created_sequentially(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path

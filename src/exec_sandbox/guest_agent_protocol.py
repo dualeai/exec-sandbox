@@ -178,29 +178,6 @@ class WriteFileRequest(GuestAgentRequest):
     make_executable: bool = Field(default=False, description="Set executable permission (0o755 vs 0o644)")
 
 
-class FileChunkRequest(GuestAgentRequest):
-    """A chunk of zstd-compressed file data (host → guest).
-
-    Part of a streaming file write sequence. Each chunk contains
-    base64-encoded zstd-compressed data belonging to a single zstd frame.
-    """
-
-    action: Literal["file_chunk"] = Field(default="file_chunk")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID matching the initiating WriteFileRequest")  # type: ignore[assignment]
-    data: str = Field(max_length=200_000, description="Base64-encoded zstd-compressed chunk")
-
-
-class FileEndRequest(GuestAgentRequest):
-    """Signals end of a streaming file write (host → guest).
-
-    After receiving this, the guest finalizes the file (flush decompressor,
-    set permissions, atomic rename) and sends FileWriteAckMessage.
-    """
-
-    action: Literal["file_end"] = Field(default="file_end")  # type: ignore[assignment]
-    op_id: str = Field(description="Operation ID matching the initiating WriteFileRequest")  # type: ignore[assignment]
-
-
 class ReadFileRequest(GuestAgentRequest):
     """Read a file from the sandbox (streaming response).
 

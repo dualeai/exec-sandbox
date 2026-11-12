@@ -636,38 +636,8 @@ class TestLanguageTypeHandling:
 
     async def test_raw_language_single_package_raises(self, validator: PackageValidator) -> None:
         """Language.RAW with a single valid-format package should raise on missing allow-list."""
-        with pytest.raises(PackageNotAllowedError):
+        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
             validator.validate(["pkg==1.0"], language=Language.RAW)
-
-
-# =============================================================================
-# is_allowed() Method Tests
-# =============================================================================
-
-
-class TestIsAllowedMethod:
-    """Test the is_allowed() helper method."""
-
-    async def test_is_allowed_returns_true(self, validator: PackageValidator) -> None:
-        """Test is_allowed returns True for allowed packages."""
-        assert validator.is_allowed("pandas", "python") is True
-        assert validator.is_allowed("lodash", "javascript") is True
-
-    async def test_is_allowed_returns_false(self, validator: PackageValidator) -> None:
-        """Test is_allowed returns False for non-allowed packages."""
-        assert validator.is_allowed("malicious", "python") is False
-        assert validator.is_allowed("evil-pkg", "javascript") is False
-
-    async def test_is_allowed_case_insensitive(self, validator: PackageValidator) -> None:
-        """Test is_allowed is case-insensitive."""
-        assert validator.is_allowed("PANDAS", "python") is True
-        assert validator.is_allowed("PaNdAs", "python") is True
-        assert validator.is_allowed("LODASH", "javascript") is True
-
-    async def test_is_allowed_unknown_language(self, validator: PackageValidator) -> None:
-        """Test is_allowed with unknown language returns False."""
-        assert validator.is_allowed("pandas", "rust") is False
-        assert validator.is_allowed("pandas", "unknown") is False
 
 
 # =============================================================================
@@ -721,8 +691,8 @@ class TestPackageValidatorCreate:
         validator = await PackageValidator.create()
 
         # Should have loaded real packages from catalogs
-        assert validator.is_allowed("pandas", "python") is True
-        assert validator.is_allowed("lodash", "javascript") is True
+        validator.validate(["pandas==2.0.0"], language=Language.PYTHON)
+        validator.validate(["lodash@4.17.21"], language=Language.JAVASCRIPT)
 
     async def test_create_with_duplicate_packages_in_catalog(self, tmp_path: Path) -> None:
         """Test that duplicate packages in catalog are deduplicated."""

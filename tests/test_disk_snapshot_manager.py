@@ -1651,7 +1651,7 @@ class TestCacheHierarchy:
         expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
         # Mock _create_snapshot to simulate snapshot creation (avoids real QEMU)
-        async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
+        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
             # Simulate creating a qcow2 file
             proc = await asyncio.create_subprocess_exec(
                 "qemu-img",
@@ -1867,7 +1867,7 @@ class TestCacheHierarchy:
         expected_path = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
 
         # Mock creation
-        async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
+        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
             proc = await asyncio.create_subprocess_exec(
                 "qemu-img",
                 "create",
@@ -1944,7 +1944,7 @@ class TestCacheHierarchy:
 
         creation_count = 0
 
-        async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
+        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
             nonlocal creation_count
             creation_count += 1
             # Yield control so all 10 coroutines are queued on the asyncio.Lock
@@ -1990,8 +1990,8 @@ class TestCacheHierarchy:
         corrupt_path.write_bytes(b"\x00\xff\xde\xad" * 64)
 
         # Mock _create_snapshot to write valid qcow2
-        async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
-            expected = settings.disk_snapshot_cache_dir / f"{key}.qcow2"
+        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
+            expected = settings.disk_snapshot_cache_dir / f"{cache_key}.qcow2"
             await create_test_qcow2(expected)
             return expected
 
@@ -2031,7 +2031,7 @@ class TestCacheHierarchy:
         assert not expected_path.exists()
         assert lock_path.exists()
 
-        async def fake_create_snapshot(language, packages, key, tenant_id, task_id, memory_mb):
+        async def fake_create_snapshot(language, packages, *, cache_key, tenant_id, task_id, memory_mb):
             await create_test_qcow2(expected_path)
             return expected_path
 

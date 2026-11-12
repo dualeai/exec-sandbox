@@ -445,7 +445,7 @@ class QemuVM:
         """Serialize all direct and manager-owned cleanup attempts."""
         return self._cleanup_lock
 
-    async def __aenter__(self) -> "QemuVM":
+    async def __aenter__(self) -> Self:
         """Enter async context manager.
 
         Returns:
@@ -592,29 +592,19 @@ class QemuVM:
         # Validate VM is in READY state before execution (atomic check-and-set)
         async with self._state_lock:
             if self._state != VmState.READY:
-                raise VmPermanentError(
+                raise InternalError(
                     f"Cannot execute in state {self._state.value}, must be READY",
+                    code=ErrorCode.INTERNAL,
                     context={
                         "vm_id": self.vm_id,
                         "current_state": self._state.value,
-                        "language": self.language,
+                        "language": self.spec.language,
                     },
+                    hint=None,
+                    instance_id=None,
                 )
 
-            # Validate transition to EXECUTING (inline to avoid lock re-acquisition)
-            allowed_transitions = VALID_STATE_TRANSITIONS.get(self._state, set())
-            if VmState.EXECUTING not in allowed_transitions:
-                raise VmPermanentError(
-                    f"Invalid state transition: {self._state.value} -> {VmState.EXECUTING.value}",
-                    context={
-                        "vm_id": self.vm_id,
-                        "current_state": self._state.value,
-                        "target_state": VmState.EXECUTING.value,
-                        "allowed_transitions": [s.value for s in allowed_transitions],
-                    },
-                )
-
-            # Transition to EXECUTING inside same lock
+            # Transition to EXECUTING inside same lock (READY -> EXECUTING is in VALID_STATE_TRANSITIONS)
             old_state = self._state
             self._state = VmState.EXECUTING
             logger.debug(
@@ -1315,51 +1305,36 @@ class QemuVM:
             await self.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
             response = await self.channel.send_request(request, timeout=constants.FILE_IO_TIMEOUT_SECONDS)
         except TimeoutError as e:
-            raise VmTransientError(
-                f"VM {self.vm_id} list_files timed out for '{path}'",
-                context={"vm_id": self.vm_id, "path": path},
+            raise _unavailable(
+                f"VM {self.vm_id} list_files timed out for '{path}'", context={"vm_id": self.vm_id, "path": path}
             ) from e
         except (OSError, json.JSONDecodeError, CommunicationError) as e:
-            # CommunicationOutcomeUnknownError subclasses SandboxError, not
-            # CommunicationError, so post-dispatch unknown outcomes still
-            # propagate as themselves.
-            raise VmTransientError(
-                f"VM {self.vm_id} list_files communication failed: {e}",
-                context={"vm_id": self.vm_id, "path": path},
+            # OutcomeUnknownError is a SandboxError, not a CommunicationError,
+            # so post-dispatch unknown outcomes still propagate as themselves.
+            raise _unavailable(
+                f"VM {self.vm_id} list_files communication failed: {e}", context={"vm_id": self.vm_id, "path": path}
             ) from e
 
         if isinstance(response, StreamingErrorMessage):
             raise guest_error_to_exception(response, self.vm_id, operation=f"list_files '{path}'")
 
         if not isinstance(response, FileListMessage):
-            raise VmPermanentError(
+            raise InternalError(
                 f"list_files unexpected response type: {type(response).__name__}",
+                code=ErrorCode.GUEST_PROTOCOL,
                 context={"vm_id": self.vm_id, "path": path},
+                hint=None,
+                instance_id=None,
             )
 
         return [FileInfo(name=e.name, is_dir=e.is_dir, size=e.size) for e in response.entries]
 
-    async def _read_cgroup_stats(self) -> tuple[int | None, int | None, int | None]:
-        """Read external CPU time, peak memory, and CPU throttle count from cgroup v2.
-
-        Returns:
-            Tuple of (cpu_time_ms, peak_memory_mb, nr_throttled)
-            Returns (None, None, None) if cgroup not available or read fails
-        """
-        return await cgroup.read_cgroup_stats(self.cgroup_path)
-
     async def begin_destroy(self) -> None:
-        """Make the VM non-reusable while allowing cleanup retries."""
+        """Make the VM non-reusable while allowing cleanup retries (every state before
+        DESTROYING may go to it: VALID_STATE_TRANSITIONS)."""
         async with self._state_lock:
-            if self._state in (VmState.DESTROYING, VmState.DESTROYED):
-                return
-            allowed_transitions = VALID_STATE_TRANSITIONS.get(self._state, set())
-            if VmState.DESTROYING not in allowed_transitions:
-                raise VmPermanentError(
-                    f"Invalid state transition: {self._state.value} -> {VmState.DESTROYING.value}",
-                    context={"vm_id": self.vm_id, "current_state": self._state.value},
-                )
-            self._state = VmState.DESTROYING
+            if self._state not in (VmState.DESTROYING, VmState.DESTROYED):
+                self._state = VmState.DESTROYING
 
     async def confirm_destroyed(self) -> None:
         """Publish the terminal state only after process death is confirmed."""
@@ -1412,7 +1387,7 @@ class QemuVM:
             await self.channel.close()
 
         # Step 2: Terminate QEMU and gvproxy processes (SIGTERM -> SIGKILL)
-        processes_destroyed = await cleanup_vm_processes(self.process, self.gvproxy_proc, self.vm_id)
+        processes_destroyed = await cleanup_vm_processes(self.process, self.gvproxy_proc, vm_id=self.vm_id)
         if not processes_destroyed:
             logger.error(
                 "VM process cleanup is unconfirmed; retaining dependent resources",

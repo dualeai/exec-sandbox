@@ -969,25 +969,3 @@ class TestOverlayPoolIntegration:
 
             for vm in vms:
                 await vm_manager.destroy_vm(vm)
-
-    async def test_get_stats(self, vm_settings, tmp_path: Path) -> None:
-        """get_stats returns accurate pool sizes."""
-        from exec_sandbox.overlay_pool import OverlayPool
-        from exec_sandbox.vm_manager import VmManager
-
-        vm_manager = VmManager(vm_settings)
-        base_image = vm_manager.get_base_image("python")
-
-        pool = OverlayPool(pool_size=3, pool_dir=tmp_path / "pool")
-        await pool.start([base_image])
-
-        stats = pool.get_stats()
-        assert stats[str(base_image.resolve())] == 3
-
-        # Acquire one
-        await pool.acquire(base_image, tmp_path / "t.qcow2")
-
-        stats = pool.get_stats()
-        assert stats[str(base_image.resolve())] == 2
-
-        await pool.stop()

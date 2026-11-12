@@ -202,37 +202,9 @@ async def drain_subprocess_output(
 
     Args:
         process: ProcessWrapper instance with stdout/stderr pipes
-        process_name: Process identifier for logging (e.g., "QEMU", "gvproxy")
-        context_id: Context identifier (e.g., vm_id) for log correlation
-        stdout_handler: Optional callback for stdout lines (default: debug log)
-        stderr_handler: Optional callback for stderr lines (default: warning log)
-
-    Example:
-        >>> proc = await asyncio.create_subprocess_exec(
-        ...     "qemu-system-x86_64", ...,
-        ...     stdout=asyncio.subprocess.PIPE,
-        ...     stderr=asyncio.subprocess.PIPE,
-        ... )
-        >>> task = asyncio.create_task(drain_subprocess_output(
-        ...     proc, process_name="QEMU", context_id=vm_id
-        ... ))
-        >>> # Later: task.cancel() and await task during cleanup
+        stdout_handler: Callback for each stdout line
+        stderr_handler: Callback for each stderr line
     """
-
-    # Default handlers: structured logging
-    if stdout_handler is None:
-
-        def default_stdout_handler(line: str) -> None:
-            logger.debug(f"[{process_name} stdout] {line}", extra={"context_id": context_id, "output": line})
-
-        stdout_handler = default_stdout_handler
-
-    if stderr_handler is None:
-
-        def default_stderr_handler(line: str) -> None:
-            logger.warning(f"[{process_name} stderr] {line}", extra={"context_id": context_id, "output": line})
-
-        stderr_handler = default_stderr_handler
 
     # Concurrent reading with TaskGroup (Python 3.11+)
     async with asyncio.TaskGroup() as tg:

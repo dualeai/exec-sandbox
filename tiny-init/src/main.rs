@@ -425,6 +425,12 @@ fn exec_agent() -> ! {
     sys::fallback_shell();
 }
 
+/// Log the time of one init step, from `from_us` to `to_us` (monotonic, in µs).
+fn log_timing(name: &str, from_us: u64, to_us: u64) {
+    let us = to_us - from_us;
+    log_info!("[timing] {}: {}.{}ms", name, us / 1000, (us % 1000) / 100);
+}
+
 fn main() {
     let t0 = sys::monotonic_us();
     mount_virtual_filesystems();
@@ -433,11 +439,7 @@ fn main() {
     // B5: /dev symlinks deferred to guest-agent
 
     device::redirect_to_console();
-    log_info!(
-        "[timing] mount_vfs: {}.{}ms",
-        (t1 - t0) / 1000,
-        ((t1 - t0) % 1000) / 100
-    );
+    log_timing("mount_vfs", t0, t1);
 
     // B2: Wait for vda + virtio-ports in parallel (independent devices)
     // /dev/vda always exists (first virtio-blk enumerated by kernel), though its
@@ -453,24 +455,17 @@ fn main() {
         device::setup_virtio_ports();
     }
     let t2 = sys::monotonic_us();
-    log_info!(
-        "[timing] wait_devices: {}.{}ms",
-        (t2 - t1) / 1000,
-        ((t2 - t1) % 1000) / 100
-    );
+    log_timing("wait_devices", t1, t2);
 
     mount_rootfs();
     let t3 = sys::monotonic_us();
-    log_info!(
-        "[timing] mount_rootfs: {}.{}ms",
-        (t3 - t2) / 1000,
-        ((t3 - t2) % 1000) / 100
-    );
+    log_timing("mount_rootfs", t2, t3);
+    // The mount_home time also counts enter_rootfs (five mount moves and a chroot).
+    enter_rootfs();
+    mount_home();
+    let t4 = sys::monotonic_us();
+    log_timing("mount_home", t3, t4);
 
-    log_info!(
-        "[timing] init_total: {}.{}ms",
-        (t3 - t0) / 1000,
-        ((t3 - t0) % 1000) / 100
-    );
-    switch_root();
+    log_timing("init_total", t0, t4);
+    exec_agent();
 }

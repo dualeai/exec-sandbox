@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator, Generator
     from pathlib import Path
 
 # Per-path asyncio locks that prevent in-process coroutines from flooding the
@@ -33,21 +33,12 @@ _async_locks: dict[str, asyncio.Lock] = {}
 
 
 @asynccontextmanager
-async def file_lock(
-    target: Path,
-    *,
-    blocking: bool = True,
-) -> AsyncIterator[bool]:
-    """Acquire an exclusive flock for *target*, creating a sibling .lock file.
+async def file_lock(target: Path) -> AsyncGenerator[bool]:
+    """Acquire an exclusive flock for *target*, creating a sibling .lock file;
+    wait in a thread until the lock is available.
 
     The lock file is ``target.with_suffix(target.suffix + ".lock")``, e.g.
     ``foo.qcow2`` → ``foo.qcow2.lock``.
-
-    Args:
-        target: Path to the file being protected.
-        blocking: If True (default), wait in a thread until the lock is
-            available.  If False, raise ``BlockingIOError`` immediately when
-            the lock is held by another caller.
 
     Yields:
         True if *target* does not yet exist (or is empty) — caller should
@@ -56,28 +47,32 @@ async def file_lock(
 
     The lock is released when the context manager exits (fd close).
     """
-    lock_path = target.with_suffix(target.suffix + ".lock")
-
-    if blocking:
-        # Level 1: serialize in-process coroutines on an asyncio.Lock so only
-        # one coroutine per path ever blocks a thread-pool worker on flock().
-        key = str(lock_path)
-        alock = _async_locks.setdefault(key, asyncio.Lock())
-        await alock.acquire()
+    # Level 1: serialize in-process coroutines on an asyncio.Lock so only
+    # one coroutine per path ever blocks a thread-pool worker on flock().
+    lock_path = _lock_path(target)
+    alock = _async_locks.setdefault(str(lock_path), asyncio.Lock())
+    await alock.acquire()
+    try:
+        fd = lock_path.open("a")  # "a", not "w": no O_TRUNC (0.4 ms on APFS), the file stays empty
         try:
-            fd = lock_path.open("w")
-            try:
-                # Level 2: cross-process guard (at most 1 thread per path).
-                await asyncio.to_thread(fcntl.flock, fd.fileno(), fcntl.LOCK_EX)
-                yield not (target.exists() and target.stat().st_size > 0)
-            finally:
-                fd.close()  # Closing fd releases the flock
-        finally:
-            alock.release()
-    else:
-        fd = lock_path.open("w")
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Level 2: cross-process guard (at most 1 thread per path).
+            await asyncio.to_thread(fcntl.flock, fd.fileno(), fcntl.LOCK_EX)
             yield not (target.exists() and target.stat().st_size > 0)
         finally:
-            fd.close()
+            fd.close()  # Closing fd releases the flock
+    finally:
+        alock.release()
+
+
+@contextmanager
+def try_file_lock(target: Path) -> Generator[bool]:
+    """The same flock as ``file_lock``, without the wait: raises ``BlockingIOError``
+    at once when the lock is held, else yields the same flag. For sync code (a
+    worker thread) and for async code that skips a held lock (the L1 save)."""
+    with _lock_path(target).open("a") as fd:  # "a", not "w": no O_TRUNC
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield not (target.exists() and target.stat().st_size > 0)
+
+
+def _lock_path(target: Path) -> Path:
+    return target.with_suffix(target.suffix + ".lock")

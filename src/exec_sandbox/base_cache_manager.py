@@ -109,7 +109,7 @@ class BaseCacheManager:
         return self.cache_dir / f"{key}{self._cache_ext}"
 
     @contextlib.asynccontextmanager
-    async def _save_lock(self, key: str) -> AsyncIterator[bool]:
+    async def _save_lock(self, key: str) -> AsyncGenerator[bool]:
         """File-based exclusive lock for snapshot save. Cross-process safe.
 
         Acquires non-blocking flock on {key}{ext}.lock, then checks whether

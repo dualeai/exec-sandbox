@@ -4,7 +4,7 @@ Provides a structured way to track and report timing information for VM lifecycl
 Used for performance monitoring, debugging, and optimization.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 
 @dataclass
@@ -47,28 +47,3 @@ class VmTiming:
 
     # Retry tracking (for CPU contention resilience)
     boot_retries: int | None = None  # 0 = succeeded first try, 1+ = number of retries
-
-    def to_dict(self) -> dict[str, int]:
-        """Convert to dict with only non-None values.
-
-        Returns:
-            Dictionary mapping timing names to millisecond values,
-            excluding any timing that was not recorded (None).
-
-        Example:
-            >>> timing = VmTiming(setup_ms=50, boot_ms=None)
-            >>> timing.to_dict()
-            {'setup_ms': 50}
-        """
-        return {k: v for k, v in asdict(self).items() if v is not None}
-
-    @property
-    def total_ms(self) -> int | None:
-        """Total time (setup + boot) if both are available.
-
-        Returns:
-            Total milliseconds if both setup_ms and boot_ms are set, None otherwise.
-        """
-        if self.setup_ms is not None and self.boot_ms is not None:
-            return self.setup_ms + self.boot_ms
-        return None

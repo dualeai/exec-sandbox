@@ -1085,35 +1085,13 @@ class TestEnsureAssetsAvailable:
             mock_initramfs.return_value = initramfs
             mock_gvproxy.return_value = gvproxy
 
-            images_dir, gvproxy_path = await ensure_assets_available()
+            images_dir, gvproxy_path = await ensure_assets_available(override=None)
 
             mock_kernel.assert_called_once()
             mock_initramfs.assert_called_once()
             mock_gvproxy.assert_called_once()
             assert images_dir == tmp_path  # Parent of kernel
             assert gvproxy_path == gvproxy
-
-    async def test_fetches_base_image_when_language_specified(self, tmp_path: Path) -> None:
-        """Also fetches base image when language is provided."""
-        from exec_sandbox.assets import ensure_assets_available
-
-        with (
-            patch("exec_sandbox.assets.fetch_kernel") as mock_kernel,
-            patch("exec_sandbox.assets.fetch_initramfs") as mock_initramfs,
-            patch("exec_sandbox.assets.fetch_gvproxy") as mock_gvproxy,
-            patch("exec_sandbox.assets.fetch_base_image") as mock_base,
-        ):
-            mock_kernel.return_value = tmp_path / "vmlinuz"
-            mock_initramfs.return_value = tmp_path / "initramfs"
-            mock_gvproxy.return_value = tmp_path / "gvproxy"
-            mock_base.return_value = tmp_path / "base.qcow2"
-
-            await ensure_assets_available(language="python")
-
-            mock_base.assert_called_once()
-            # Verify language was passed
-            call_args = mock_base.call_args
-            assert call_args[0][0] == "python" or call_args.kwargs.get("language") == "python"
 
     async def test_passes_override_to_all_fetch_functions(self, tmp_path: Path) -> None:
         """Override parameter is passed to all fetch functions."""

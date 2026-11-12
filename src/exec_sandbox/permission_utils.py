@@ -306,40 +306,17 @@ async def _probe_setfacl() -> bool:
             "--version",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=child_env(),
         )
         await asyncio.wait_for(proc.wait(), timeout=5)
         _probe_cache.setfacl_available = proc.returncode == 0
-    except (OSError, FileNotFoundError, TimeoutError):
+    except (OSError, TimeoutError):
         _probe_cache.setfacl_available = False
 
     return _probe_cache.setfacl_available
 
 
-async def _probe_getfacl() -> bool:
-    """Check if getfacl is available (cached)."""
-    if _probe_cache.getfacl_available is not None:
-        return _probe_cache.getfacl_available
-
-    if detect_host_os() != HostOS.LINUX:
-        _probe_cache.getfacl_available = False
-        return False
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "getfacl",
-            "--version",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=5)
-        _probe_cache.getfacl_available = proc.returncode == 0
-    except (OSError, FileNotFoundError, TimeoutError):
-        _probe_cache.getfacl_available = False
-
-    return _probe_cache.getfacl_available
-
-
-async def set_acl_user(path: Path, user: str, perms: str = "rw") -> bool:
+async def set_acl_user(path: Path, user: str, perms: str) -> bool:
     """Set ACL for a specific user on a file.
 
     Equivalent to: setfacl -m u:{user}:{perms} {path}
@@ -371,88 +348,9 @@ async def set_acl_user(path: Path, user: str, perms: str = "rw") -> bool:
             return False
         logger.debug(f"Set ACL u:{user}:{perms} on {path}")
         return True
-    except (OSError, FileNotFoundError) as e:
+    except OSError as e:
         logger.debug(f"setfacl failed: {e}")
         return False
-
-
-async def remove_acl_user(path: Path, user: str) -> bool:
-    """Remove ACL entry for a specific user.
-
-    Equivalent to: setfacl -x u:{user} {path}
-
-    Args:
-        path: File or directory path
-        user: Username to remove from ACL
-
-    Returns:
-        True if successful, False otherwise (including on macOS)
-    """
-    if not await _probe_setfacl():
-        return False
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "setfacl",
-            "-x",
-            f"u:{user}",
-            str(path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        return proc.returncode == 0
-    except (OSError, FileNotFoundError):
-        return False
-
-
-async def get_acl(path: Path) -> dict[str, str] | None:
-    """Get ACL entries for a file.
-
-    Parses getfacl output into a dictionary.
-
-    Args:
-        path: File or directory path
-
-    Returns:
-        Dictionary mapping ACL entries to permissions, e.g.:
-        {'user::': 'rw-', 'user:qemu-vm': 'rw-', 'group::': 'r--', ...}
-        Returns None on error or macOS.
-    """
-    if not await _probe_getfacl():
-        return None
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "getfacl",
-            "-p",  # Don't strip leading directory
-            str(path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return None
-
-        # Parse getfacl output
-        acl: dict[str, str] = {}
-        for raw_line in stdout.decode().splitlines():
-            stripped = raw_line.strip()
-            # Skip comments and empty lines
-            if not stripped or stripped.startswith("#"):
-                continue
-            # Parse entries like "user:qemu-vm:rw-" or "user::rw-"
-            if ":" in stripped:
-                parts = stripped.split(":")
-                if len(parts) >= _ACL_ENTRY_MIN_PARTS:
-                    entry_type = parts[0]  # user, group, mask, other
-                    entry_name = parts[1]  # username/groupname or empty
-                    entry_perms = parts[2]  # rwx permissions
-                    key = f"{entry_type}:{entry_name}" if entry_name else f"{entry_type}::"
-                    acl[key] = entry_perms
-        return acl
-    except (OSError, FileNotFoundError):
-        return None
 
 
 # =============================================================================
@@ -477,13 +375,14 @@ async def chmod_async(path: Path, mode: str) -> bool:
             str(path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             logger.debug(f"chmod {mode} {path} failed: {stderr.decode().strip()}")
             return False
         return True
-    except (OSError, FileNotFoundError) as e:
+    except OSError as e:
         logger.debug(f"chmod failed: {e}")
         return False
 
@@ -542,13 +441,14 @@ async def chown_async(path: Path, user: str, group: str) -> bool:
             str(path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
             logger.debug(f"chown {user}:{group} {path} failed: {stderr.decode().strip()}")
             return False
         return True
-    except (OSError, FileNotFoundError) as e:
+    except OSError as e:
         logger.debug(f"chown failed: {e}")
         return False
 
@@ -565,36 +465,6 @@ async def chown_to_qemu_vm(path: Path) -> bool:
         True if successful, False otherwise
     """
     return await chown_async(path, "qemu-vm", "qemu-vm")
-
-
-async def get_owner(path: Path) -> tuple[str, str] | None:
-    """Get file owner (user, group).
-
-    Args:
-        path: File or directory path
-
-    Returns:
-        Tuple of (username, groupname), or None if file doesn't exist
-    """
-    try:
-        stat_result = await aiofiles.os.stat(path)
-        uid = stat_result.st_uid
-        gid = stat_result.st_gid
-
-        # Convert UID/GID to names
-        try:
-            username = pwd.getpwuid(uid).pw_name
-        except KeyError:
-            username = str(uid)
-
-        try:
-            groupname = grp.getgrgid(gid).gr_name
-        except KeyError:
-            groupname = str(gid)
-
-        return (username, groupname)
-    except (OSError, FileNotFoundError):
-        return None
 
 
 # =============================================================================
@@ -647,7 +517,7 @@ async def sudo_rm(path: Path) -> bool:
             logger.debug(f"sudo rm -rf {path} failed: {stderr.decode().strip()}")
             return False
         return True
-    except (OSError, FileNotFoundError) as e:
+    except OSError as e:
         logger.debug(f"sudo rm failed: {e}")
         return False
 
@@ -669,34 +539,7 @@ def can_access(path: Path | str, mode: int) -> bool:
     Returns:
         True if access is allowed, False otherwise
     """
-    return await aiofiles.os.access(path, mode)
-
-
-async def verify_user_access(path: Path, user: str, perms: str = "rw") -> bool:
-    """Verify that a user has specified permissions on a file.
-
-    Checks ACL entries to verify access.
-
-    Args:
-        path: File or directory path
-        user: Username to check
-        perms: Required permissions (e.g., "rw", "r", "rwx")
-
-    Returns:
-        True if user has at least the specified permissions, False otherwise
-    """
-    acl = await get_acl(path)
-    if acl is None:
-        return False
-
-    # Check user-specific ACL entry
-    user_key = f"user:{user}"
-    if user_key in acl:
-        user_perms = acl[user_key]
-        # Check each required permission
-        return all(p in user_perms for p in perms)
-
-    return False
+    return os.access(path, mode)
 
 
 # =============================================================================
@@ -725,7 +568,7 @@ async def grant_qemu_vm_access(path: Path) -> bool:
     return await set_acl_user(path, "qemu-vm", "rw")
 
 
-async def grant_qemu_vm_file_access(path: Path, *, writable: bool = False) -> bool:
+async def grant_qemu_vm_file_access(path: Path, *, writable: bool) -> bool:
     """Grant qemu-vm user access to a file, including parent directory traversal.
 
     Makes all parent directories traversable (a+x) up to filesystem root, then:

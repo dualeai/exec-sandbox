@@ -675,7 +675,7 @@ class UnixSocketChannel:
         """Get the stream reader (for direct access when needed)."""
         return self._reader
 
-    async def __aenter__(self) -> "UnixSocketChannel":
+    async def __aenter__(self) -> Self:
         """Enter async context manager, connecting to guest."""
         await self.connect(timeout_seconds=5)
         return self
@@ -824,45 +824,22 @@ class DualPortChannel:
                 ConnectionError,
                 RuntimeError,
                 CommunicationError,
-                CommunicationOutcomeUnknownError,
+                OutcomeUnknownError,
             ):
                 pass
+            if attempt == attempts - 1:
+                break  # no attempt left: no reconnect to pay for
 
             # Guest not ready yet — close, wait, reconnect
             logger.debug(
                 "Reconnection probe failed, retrying",
-                extra={"attempt": attempt + 1, "max": constants.GUEST_RECONNECT_PROBE_MAX_RETRIES},
+                extra={"attempt": attempt + 1, "max": attempts},
             )
             await self.close()
             await asyncio.sleep(constants.GUEST_RECONNECT_PROBE_DELAY)
             await self._raw_connect(caller_timeout)
 
-        raise TimeoutError(
-            f"Guest agent did not respond to ping after {constants.GUEST_RECONNECT_PROBE_MAX_RETRIES} "
-            f"reconnection attempts"
-        )
-
-    async def send_command(
-        self,
-        request: GuestAgentRequest,
-        timeout: int = 5,
-    ) -> None:
-        """Send command on command port (non-blocking).
-
-        Commands are serialized and queued on the command port's write worker.
-        Responses come via event port.
-
-        Args:
-            request: Pydantic request model (PingRequest, ExecuteCodeRequest, etc)
-            timeout: Write timeout in seconds (default: 5)
-
-        Raises:
-            RuntimeError: If channel not connected or write queue full
-        """
-        # Use UnixSocketChannel's queued write mechanism
-        # Serialize and enqueue the command
-        request_json = request.model_dump_json(by_alias=False, exclude_none=True) + "\n"
-        await self._cmd_channel.enqueue_write(request_json.encode(), timeout=float(timeout))
+        raise TimeoutError(f"Guest agent did not respond to ping after {attempts} reconnection attempts")
 
     async def enqueue_raw(self, data: bytes) -> None:
         """Send raw bytes on command port without waiting for response."""
@@ -1014,7 +991,7 @@ class DualPortChannel:
             self._event_channel.close(),
         )
 
-    async def __aenter__(self) -> "DualPortChannel":
+    async def __aenter__(self) -> Self:
         """Enter async context manager, connecting to guest."""
         await self.connect(timeout_seconds=5)
         return self
@@ -1138,65 +1115,3 @@ async def consume_stream(
         spawn_ms=spawn_ms,
         process_ms=process_ms,
     )
-
-
-@asynccontextmanager
-async def reconnecting_channel(
-    channel: GuestChannel,
-    connect_timeout: int = 5,
-) -> AsyncGenerator[GuestChannel]:
-    """Async context manager for QEMU GA standard reconnect pattern.
-
-    Pattern: close → connect → use → (auto-cleanup on exit)
-    - Ensures clean connection state (no stale data from previous sessions)
-    - Guest agent expects disconnect after each command
-    - Industry standard (libvirt, QEMU GA reference implementation)
-
-    Use for:
-    - Health checks (ping)
-    - One-off commands
-    - Any single request-response
-
-    Don't use for:
-    - Code execution (needs persistent connection for streaming)
-    - Package installation (needs persistent connection for streaming)
-
-    Usage:
-        # GOOD - one-off command
-        async with reconnecting_channel(vm.channel) as ch:
-            response = await ch.send_request(PingRequest())
-
-        # BAD - streaming operation
-        async with reconnecting_channel(vm.channel) as ch:
-            async for msg in ch.stream_messages(...):  # Will break!
-                pass
-
-        # GOOD - streaming operation
-        await vm.channel.connect()
-        async for msg in vm.channel.stream_messages(...):
-            yield msg
-        await vm.channel.close()
-
-    Args:
-        channel: Guest channel to manage
-        connect_timeout: Connection timeout in seconds (default: 5)
-
-    Yields:
-        Connected channel ready for use
-
-    Reference:
-        - QEMU GA docs: connect-send-disconnect per command
-        - libvirt: guest-sync before every command
-    """
-    # Close existing connection (if any)
-    await channel.close()
-
-    # Establish fresh connection
-    await channel.connect(timeout_seconds=connect_timeout)
-
-    try:
-        # Yield connected channel to caller
-        yield channel
-    finally:
-        # Not closing channel here — caller owns the lifecycle
-        pass

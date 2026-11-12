@@ -131,11 +131,11 @@ class MigrationClient:
         self._request_seq = 0
         self._lock = asyncio.Lock()
 
-    async def connect(self, timeout: float = 5.0) -> None:
+    async def connect(self, *, timeout: float) -> None:
         """Connect to QMP socket and complete handshake.
 
         Raises:
-            MigrationTransientError: Connection or handshake failed
+            TransientError: MIGRATION_FAILED: connection, peer authentication or handshake failed
         """
         async with self._lock:
             if self._connected:
@@ -211,16 +211,17 @@ class MigrationClient:
     async def _execute(
         self,
         command: str,
-        arguments: dict[str, Any] | None = None,
-        timeout: float = constants.MEMORY_SNAPSHOT_QMP_TIMEOUT_SECONDS,
+        *,
+        arguments: dict[str, Any] | None,
+        timeout: float,
     ) -> dict[str, Any]:
         """Execute QMP command, skipping async events.
 
         Raises:
-            MigrationTransientError: Command failed or not connected
+            TransientError: MIGRATION_FAILED: command failed or not connected
         """
         if not self._connected or self._writer is None or self._reader is None:
-            raise MigrationTransientError("Not connected to QMP")
+            raise _failed("Not connected to QMP", context=None)
 
         # Tag each command with a unique id and match it on the response. The
         # save path interleaves stop/migrate/query-migrate where a shifted

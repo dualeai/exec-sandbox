@@ -9,7 +9,7 @@ from typing import Final
 # ============================================================================
 
 
-class GuestErrorType(str, enum.Enum):
+class GuestErrorType(enum.StrEnum):
     """Domain-specific error types from the guest agent wire protocol.
 
     Maps 1:1 to Rust ErrorType enum in guest-agent/src/error.rs.
@@ -205,9 +205,6 @@ Longer than VM boot retry (2s) to allow transient DNS/routing issues to resolve.
 MAX_CODE_SIZE: Final[int] = 1024 * 1024  # 1 MiB
 """Maximum size in bytes for code input."""
 
-MAX_PACKAGES: Final[int] = 50
-"""Maximum number of packages allowed per execution."""
-
 MAX_ENV_VARS: Final[int] = 100
 """Maximum number of environment variables allowed."""
 
@@ -250,10 +247,6 @@ guest agent's validate_file_path(). This constant covers the full relative path.
 FILE_IO_TIMEOUT_SECONDS: Final[int] = 120
 """Timeout for file I/O operations in seconds."""
 
-
-GUEST_SANDBOX_DIR: Final[str] = "/home/user"
-"""Root directory for sandbox file operations in the guest VM."""
-
 # ============================================================================
 # Outbound Domain Filtering
 # ============================================================================
@@ -280,9 +273,6 @@ CONSOLE_RING_LINES: Final[int] = 500
 
 Kernel loglevel=7 can emit 300-600 lines before init starts.
 500 keeps the diagnostic tail intact for boot failure analysis."""
-
-QEMU_OUTPUT_MAX_BYTES: Final[int] = 2000
-"""Maximum bytes to capture from QEMU stdout/stderr."""
 
 # ============================================================================
 # Disk I/O Performance Limits
@@ -312,16 +302,6 @@ Reduced from 256 (default) for density: sandbox I/O is sequential and
 low-throughput, 64 entries is sufficient. No measurable wall-time difference
 observed in cold-start benchmarks (bottleneck is Mach kernel / KVM, not
 queue depth)."""
-
-# ============================================================================
-# Kernel Version Requirements
-# ============================================================================
-
-IO_URING_MIN_KERNEL_MAJOR: Final[int] = 5
-"""Minimum Linux kernel major version for io_uring support."""
-
-IO_URING_MIN_KERNEL_MINOR: Final[int] = 1
-"""Minimum Linux kernel minor version for io_uring support (5.1+)."""
 
 # ============================================================================
 # Warm VM Pool
@@ -455,14 +435,8 @@ QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS: Final[float] = 30.0
 MAX_EXPOSED_PORTS: Final[int] = 10
 """Maximum number of ports that can be exposed per VM."""
 
-PORT_FORWARD_MIN_HOST_PORT: Final[int] = 1024
-"""Minimum host port for port forwarding (unprivileged ports only)."""
-
 PORT_FORWARD_BIND_HOST: Final[str] = "127.0.0.1"
 """Host address to bind forwarded ports to (localhost only for security)."""
-
-GVPROXY_API_TIMEOUT_SECONDS: Final[float] = 5.0
-"""Timeout for gvproxy HTTP API requests (port forward expose/unexpose)."""
 
 # ============================================================================
 # File Transfer Streaming

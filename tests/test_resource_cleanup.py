@@ -11,8 +11,6 @@ from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import (
     _cleanup_zombie_task,
     _zombie_reap_tasks,
-    cleanup_file,
-    cleanup_overlay,
     cleanup_process,
 )
 
@@ -212,72 +210,7 @@ class TestResourceCleanupProcess:
 
 
 class TestResourceCleanupFilesystem:
-    """Test file/cgroup/overlay cleanup (async functions)."""
-
-    async def test_cleanup_file_missing(self, tmp_path: Path):
-        """Missing file cleanup succeeds (idempotent)."""
-        nonexistent = tmp_path / "does-not-exist.txt"
-
-        # REAL cleanup_file logic with real filesystem
-        result = await cleanup_file(nonexistent, "test-ctx")
-
-        assert result is True
-
-    async def test_cleanup_file_exists(self, tmp_path: Path):
-        """Existing file is deleted."""
-        test_file = tmp_path / "test.txt"
-        test_file.write_text("content")
-
-        # REAL cleanup_file logic with real filesystem
-        result = await cleanup_file(test_file, "test-ctx")
-
-        assert result is True
-        # Verify REAL deletion happened
-        assert not test_file.exists()
-
-    async def test_cleanup_file_none(self):
-        """None file path returns True (no-op)."""
-        result = await cleanup_file(None, "test-ctx")
-
-        assert result is True
-
-    async def test_cleanup_file_with_description(self, tmp_path: Path):
-        """Custom description used in logging."""
-        test_file = tmp_path / "socket.sock"
-        test_file.write_text("socket")
-
-        # REAL cleanup_file logic with real filesystem
-        result = await cleanup_file(test_file, "test-ctx", description="unix socket")
-
-        assert result is True
-        # Verify REAL deletion happened
-        assert not test_file.exists()
-
-    async def test_cleanup_file_permission_error(self, tmp_path: Path):
-        """Permission error returns False."""
-        test_file = tmp_path / "readonly.txt"
-        test_file.write_text("content")
-
-        # Mock aiofiles.os.remove to simulate permission error
-        with patch("aiofiles.os.remove", side_effect=PermissionError("Access denied")):
-            # REAL error handling logic runs
-            result = await cleanup_file(test_file, "test-ctx")
-
-            assert result is False
-        # Verify file still exists (cleanup failed)
-        assert test_file.exists()
-
-    async def test_cleanup_file_os_error(self, tmp_path: Path):
-        """OSError during deletion returns False."""
-        test_file = tmp_path / "locked.txt"
-        test_file.write_text("content")
-
-        # Mock aiofiles.os.remove to simulate OS error
-        with patch("aiofiles.os.remove", side_effect=OSError("File in use")):
-            # REAL error handling logic runs
-            result = await cleanup_file(test_file, "test-ctx")
-
-            assert result is False
+    """Test cgroup cleanup (async functions)."""
 
     async def test_cleanup_cgroup_missing(self, tmp_path: Path):
         """Missing cgroup cleanup succeeds (idempotent)."""
@@ -347,30 +280,12 @@ class TestResourceCleanupFilesystem:
         # Mock filesystem operations
         with (
             patch("exec_sandbox.cgroup._check_cgroup_v2_mounted", return_value=True),
-            patch("aiofiles.os.path.exists", return_value=False),
-            patch("aiofiles.os.rmdir", side_effect=OSError("Directory not empty")),
+            patch.object(Path, "exists", return_value=False),
+            patch.object(Path, "rmdir", side_effect=OSError("Directory not empty")),
         ):
             result = await cleanup_cgroup(fake_cgroup_path, "test-ctx")
 
             assert result is False
-
-    async def test_cleanup_overlay_delegates_to_cleanup_file(self, tmp_path: Path):
-        """cleanup_overlay uses cleanup_file internally."""
-        overlay = tmp_path / "overlay.qcow2"
-        overlay.write_bytes(b"fake qcow2")
-
-        # REAL cleanup_overlay logic with real filesystem
-        result = await cleanup_overlay(overlay, "test-ctx")
-
-        assert result is True
-        # Verify REAL deletion happened
-        assert not overlay.exists()
-
-    async def test_cleanup_overlay_none(self):
-        """None overlay path returns True (no-op)."""
-        result = await cleanup_overlay(None, "test-ctx")
-
-        assert result is True
 
 
 class TestZombieTaskTracking:
