@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 from contextlib import AsyncExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, NamedTuple, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -20,13 +21,25 @@ import pytest
 from _pytest.runner import runtestprotocol
 from moto.server import ThreadedMotoServer
 
+from exec_sandbox import subprocess_utils
 from exec_sandbox._logging import LIBRARY_LOGGER_NAME
 from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import ErrorCode, TransientError
+from exec_sandbox.files.disk import file_stamp, make_private_dir, memory_filesystem
+from exec_sandbox.images import kernel_dir_of
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, StartupTiming
-from exec_sandbox.platform_utils import HostArch, HostOS, detect_host_arch, detect_host_os
+from exec_sandbox.permission_utils import _probe_cache as permission_probe_cache  # pyright: ignore[reportPrivateUsage]
+from exec_sandbox.permission_utils import get_qemu_vm_uid
+from exec_sandbox.platform_utils import (
+    HostArch,
+    HostOS,
+    UserDir,
+    detect_host_arch,
+    detect_host_os,
+    get_user_dir,
+)
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.settings import Settings
 from exec_sandbox.system_probes import check_hwaccel_available, check_tsc_deadline, probe_cache
@@ -36,6 +49,38 @@ from exec_sandbox.vm_spec import VmSpec
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# Temp folder on disk (Linux hosts whose /tmp is tmpfs)
+# ============================================================================
+# VM tests put home disks and save files in tmp_path. On tmpfs (the default /tmp of
+# Ubuntu 25.10 and later) those pages are shared memory charged to the VM's memory
+# cgroup, so a save can be OOM-killed. Before pytest makes its temp folder, a tmpfs
+# temp folder is replaced by one on disk: tempfile.tempdir for this process, TMPDIR
+# for the xdist workers and every child (QEMU among them).
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    # TMPDIR moves even with --basetemp: fixtures and children (QEMU) make files through it
+    if memory_filesystem(Path(tempfile.gettempdir())) is None:
+        return
+    disk_tmp = get_user_dir(kind=UserDir.CACHE) / "tmp"
+    try:
+        make_private_dir(disk_tmp)
+    except OSError as e:
+        raise pytest.UsageError(
+            f"The temp folder {tempfile.gettempdir()} is in memory, and {disk_tmp} cannot be made instead "
+            f"({e.strerror or e}): set TMPDIR to a folder on disk"
+        ) from e
+    if (filesystem := memory_filesystem(disk_tmp)) is not None:
+        raise pytest.UsageError(
+            f"The temp folder {tempfile.gettempdir()} and {disk_tmp} are both in memory ({filesystem}): "
+            "set TMPDIR or EXEC_SANDBOX_CACHE_DIR to a folder on disk"
+        )
+    os.environ["TMPDIR"] = str(disk_tmp)
+    tempfile.tempdir = str(disk_tmp)
+
+
+# ============================================================================
 # QEMU Crash Retry (GitHub Actions CI only)
 # ============================================================================
 # GitHub Actions CI runners can trigger a transient QEMU crash:
@@ -43,19 +88,17 @@ logger = logging.getLogger(__name__)
 #      → Host runs out of threads under parallel test load (EAGAIN)
 #      → Causes SIGABRT (exit code -6). This is a host-side issue, not a test bug.
 #
-# Root cause: With TCG thread=single, each QEMU process uses ~5-8 threads at
-# steady state (main loop, vCPU, call_rcu, iothread, signal handler). However,
-# the I/O worker thread pool (QEMU util/thread-pool.c, aio=threads) can spike
-# to 64 threads *per AioContext* during heavy disk I/O. When many VMs boot
+# Root cause: With TCG, each QEMU process uses ~5-11 threads at
+# steady state (main loop, vCPU, call_rcu, iothread, signal handler), plus the
+# I/O worker threads (QEMU util/thread-pool.c, aio=threads; qemu_cmd caps the
+# pool at 8 per AioContext, QEMU's default is 64). When many VMs boot
 # simultaneously (pytest -n auto with 4 workers), these transient spikes can
-# exhaust OS thread limits. Measured locally: 5 threads (TCG minimal) to
-# 8 threads (HVF full config); QEMU maintainer docs confirm ~4-7 baseline
-# with unbounded I/O pool spikes.
+# exhaust OS thread limits.
 #
-# Note: The previous "regime_is_user: code should not be reached" crash (QEMU
-# ARM64 TCG bug in versions < 9.0.4) is now caught early by a version check in
-# qemu_cmd.py, which raises ConfigError HOST_DEPENDENCY before QEMU is launched. That
-# crash was deterministic (not transient) and exited with code 0, not SIGABRT.
+# Note: the "regime_is_user: code should not be reached" crash (QEMU ARM64 TCG bug
+# in versions < 9.0.4) is not retried: a version check in qemu_cmd.py raises
+# ConfigError HOST_DEPENDENCY before QEMU starts. That crash is deterministic (not
+# transient) and exits with code 0, not SIGABRT.
 #
 # We detect the error codes below and the SIGABRT text, and retry with backoff
 # plus heavy jitter to desynchronize parallel workers on noisy CI hardware.
@@ -76,7 +119,7 @@ _QEMU_CRASH_JITTER_MAX_S = 10.0  # uniform random jitter [0, 10s)
 # The one text signature: QEMU aborted (thread exhaustion ends in SIGABRT). Not the EAGAIN
 # text "Resource temporarily unavailable": any EAGAIN has it (the BlockingIOError of a held
 # file lock, for example), and a QEMU fork that hits EAGAIN is QEMU_CRASHED (by code).
-_QEMU_RETRYABLE_SIGNATURES = ("SIGABRT",)
+_QEMU_RETRYABLE_SIGNATURE = "SIGABRT"
 
 # VM timeouts and crashes under TCG contention or thread exhaustion: a TransientError
 # with one of these codes (boot timeout, QEMU exit, guest agent unresponsive). By code,
@@ -106,10 +149,7 @@ def _is_retryable_qemu_crash(reports: list[pytest.TestReport]) -> bool:
             continue
         if any(name == _QEMU_RETRYABLE_PROPERTY for name, _value in report.user_properties):
             return True
-        if not report.longrepr:
-            continue
-        text = str(report.longrepr)
-        if any(sig in text for sig in _QEMU_RETRYABLE_SIGNATURES):
+        if report.longrepr and _QEMU_RETRYABLE_SIGNATURE in str(report.longrepr):
             return True
     return False
 
@@ -362,12 +402,9 @@ async def dual_scheduler(
 
 
 @pytest.fixture
-def vm_settings(images_dir: Path):
+def vm_settings(make_vm_settings) -> Settings:
     """Settings for VM tests (auto-detects KVM/HVF, falls back to TCG)."""
-    return Settings(
-        base_images_dir=images_dir,
-        kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-    )
+    return make_vm_settings()
 
 
 @pytest.fixture
@@ -386,23 +423,13 @@ async def vm_manager(vm_settings) -> AsyncGenerator[VmManager, None]:
 
 
 @pytest.fixture
-def emulation_settings(images_dir: Path):
-    """Settings with forced software emulation (no KVM/HVF)."""
-    return Settings(
-        base_images_dir=images_dir,
-        kernel_path=images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-        force_emulation=True,
-    )
-
-
-@pytest.fixture
-async def emulation_vm_manager(emulation_settings) -> AsyncGenerator[VmManager, None]:
-    """VmManager configured for software emulation (started).
+async def emulation_vm_manager(make_vm_settings) -> AsyncGenerator[VmManager, None]:
+    """VmManager with forced software emulation (no KVM/HVF), started.
 
     Automatically calls start() to start the overlay pool daemon,
     and stop() for cleanup.
     """
-    async with VmManager(emulation_settings) as manager:  # type: ignore[arg-type]
+    async with VmManager(make_vm_settings(force_emulation=True)) as manager:
         yield manager
 
 
@@ -431,7 +458,8 @@ def unit_test_vm_manager(unit_test_settings):
 
 @pytest.fixture
 def make_vm_settings(images_dir: Path):
-    """Factory to create Settings with optional overrides.
+    """Factory to create Settings with optional overrides. The kernel folder is the one
+    Scheduler uses (kernel_dir_of): images_dir, or its kernels/ folder when that holds the files.
 
     Usage:
         def test_something(make_vm_settings, tmp_path):
@@ -439,12 +467,8 @@ def make_vm_settings(images_dir: Path):
     """
 
     def _make(**overrides: Any) -> Settings:
-        defaults: dict[str, Any] = {
-            "base_images_dir": images_dir,
-            "kernel_path": images_dir / "kernels" if (images_dir / "kernels").exists() else images_dir,
-        }
-        defaults.update(overrides)
-        return Settings(**defaults)
+        kernel_path = kernel_dir_of(images_dir, arch=detect_host_arch())
+        return Settings(**{"base_images_dir": images_dir, "kernel_path": kernel_path, **overrides})
 
     return _make
 
@@ -492,7 +516,7 @@ async def make_snapshot_manager(make_vm_manager):  # type: ignore[no-untyped-def
         vm_manager = await make_vm_manager(**overrides)
         settings = vm_manager.settings
         if settings.disk_snapshot_cache_dir:
-            settings.disk_snapshot_cache_dir.mkdir(parents=True, exist_ok=True)
+            settings.disk_snapshot_cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         return DiskSnapshotManager(settings, vm_manager), settings
 
     return _make
@@ -624,11 +648,21 @@ def _reset_probe_caches() -> Iterator[None]:
 
     Resetting *all* attributes (not just a subset) is intentional: it
     eliminates the need for per-class fixtures and prevents future probes
-    from being forgotten.
+    from being forgotten. The qemu-vm probes too: a test that mocks one would
+    else give every later VM of the worker another QEMU identity. And the exec lookup of
+    child_shell (exec_errno): a test makes its own binaries.
     """
-    probe_cache.reset()
+    resets = (
+        probe_cache.reset,
+        permission_probe_cache.reset,
+        get_qemu_vm_uid.cache_clear,
+        subprocess_utils._runnable.clear,
+    )  # pyright: ignore[reportPrivateUsage]
+    for reset in resets:
+        reset()
     yield
-    probe_cache.reset()
+    for reset in resets:
+        reset()
 
 
 @pytest.fixture(autouse=True)
@@ -680,37 +714,89 @@ class NonSeekableIO(io.RawIOBase):
 # Object store (moto server, S3 API) shared by the L3 cache and instance store tests
 @pytest.fixture
 def fake_aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set fake AWS credentials required by moto/boto3."""
+    """Fake AWS credentials for moto, and no SDK retries (AWS_MAX_ATTEMPTS=1) for the clients the
+    test makes. A request to the local moto fails only when the test makes it fail: a retry would
+    hide that, and wait for its backoff (seconds against an endpoint that does not answer)."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "1")
+
+
+class MotoWorker(NamedTuple):
+    """The moto of one xdist worker: its HTTP endpoint, a sync boto3 client on it, and its WSGI app."""
+
+    endpoint_url: str
+    s3: Any
+    app: Any
+    """moto's WSGI app: called in this process, it serves the same buckets as the server."""
+
+
+@pytest.fixture(scope="session")
+def worker_moto_server() -> Iterator[MotoWorker]:
+    """One moto S3 server for each xdist worker. Tests use `moto_s3_server` (or `s3_proxy`).
+
+    A server per test costs 0.5 s to stop (werkzeug polls its stop flag twice a second).
+    It listens on and is reached at 127.0.0.1, never 0.0.0.0: the HTTP server looks up the
+    name of its bind address (for 0.0.0.0, the host name: an mDNS query on macOS runners,
+    whose names end in .local), and macOS sends a connect to 0.0.0.0 to its first address,
+    which may not be loopback. No SDK retry.
+
+    moto finds the service of each request by listing its own package folder (about 180
+    stat calls, under its dispatch lock): here it lists the folder once.
+    """
+    from botocore.config import Config
+    from moto import backends
+    from moto.server import DomainDispatcherApplication, create_backend_app
+
+    modules = tuple(backends.list_of_moto_modules())
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(backends, "list_of_moto_modules", lambda: modules)
+        server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+        server.start()
+        try:
+            _, port = server.get_host_and_port()
+            endpoint_url = f"http://127.0.0.1:{port}"
+            s3_sync = boto3.client(
+                "s3",
+                region_name="us-east-1",
+                endpoint_url=endpoint_url,
+                aws_access_key_id="testing",
+                aws_secret_access_key="testing",  # noqa: S106 - moto takes any key
+                config=Config(retries={"total_max_attempts": 1}),
+            )
+            yield MotoWorker(endpoint_url=endpoint_url, s3=s3_sync, app=DomainDispatcherApplication(create_backend_app))
+        finally:
+            server.stop()
 
 
 @pytest.fixture
-def moto_s3_server(fake_aws_env):
-    """Start a moto S3 server, create the default bucket, and yield (endpoint_url, sync_client).
+def moto_s3_server(fake_aws_env, worker_moto_server: MotoWorker) -> tuple[str, Any]:
+    """The worker's moto S3 server, empty but for the default bucket: (endpoint_url, sync_client).
 
-    Server is stopped on teardown.
+    Each test starts on an empty moto (moto's reset API, then the bucket again; in process,
+    below 1 ms): no test sees what another test wrote.
     """
-    server = ThreadedMotoServer(port=0)
-    server.start()
-    host, port = server.get_host_and_port()
-    endpoint_url = f"http://{host}:{port}"
-    s3_sync = boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint_url)
-    s3_sync.create_bucket(Bucket="test-snapshots")
-    yield endpoint_url, s3_sync
-    server.stop()
+    from werkzeug.test import Client
+
+    moto = Client(worker_moto_server.app)
+    for method, path in (("POST", "/moto-api/reset"), ("PUT", "/test-snapshots")):
+        status = moto.open(path, method=method).status_code
+        assert status == 200, f"moto {method} {path}: HTTP {status}"
+    return worker_moto_server.endpoint_url, worker_moto_server.s3
 
 
 def l1_hit(vm_manager: Any, tmp_path: Path) -> MemorySnapshotManager:
-    """A real L1 manager (its restore() runs) whose lookup finds an entry in tmp_path."""
+    """A real L1 manager (its restore() runs) whose lookup, and the check restore() runs,
+    find an entry in tmp_path at its current version."""
     memory = MemorySnapshotManager(Settings(memory_snapshot_cache_dir=tmp_path), vm_manager)
     vmstate = tmp_path / "cached.vmstate"
     vmstate.write_bytes(b"vmstate")
     memory.compute_cache_key = AsyncMock(return_value="cached")  # type: ignore[method-assign]
     memory.check_cache = AsyncMock(return_value=vmstate)  # type: ignore[method-assign]
+    memory._check_entry = AsyncMock(return_value=(vmstate, file_stamp(vmstate.stat())))  # type: ignore[method-assign]
     return memory
 
 
@@ -722,31 +808,55 @@ async def wait_l1_saves(scheduler: Scheduler) -> None:
 
 
 @pytest.fixture
-async def s3_proxy(moto_s3_server, monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[Any]:
-    """Fault-injecting S3 proxy in front of moto, in the test's event loop (tests/s3_faults.py).
+async def s3_proxy(moto_s3_server, worker_moto_server: MotoWorker) -> AsyncGenerator[Any]:
+    """Fault-injecting S3 proxy in front of the worker's moto, in the test's event loop
+    (tests/s3_faults.py), started for each test.
 
     Yields an S3Proxy: point a store at `proxy.endpoint_url` and `proxy.prefix` (fresh per test);
     `proxy.bucket` reads and writes moto directly. SDK retries are off for clients made during the
-    test (AWS_MAX_ATTEMPTS=1; the store's head client has its own setting of 1): one store call is
+    test (fake_aws_env; the store's head client has its own setting of 1): one store call is
     one HTTP request, so a rule applies once per call and no test waits for SDK backoff.
     """
     from tests.s3_faults import Bucket, S3Proxy
 
-    endpoint_url, s3 = moto_s3_server
-    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "1")
-    async with S3Proxy.start(upstream=endpoint_url, bucket=Bucket(s3)) as proxy:
+    moto = worker_moto_server
+    async with S3Proxy.start(moto=moto.app, moto_url=moto.endpoint_url, bucket=Bucket(moto.s3)) as proxy:
         yield proxy
+
+
+@pytest.fixture(scope="session")
+def host_accelerator():
+    """This host's accelerator (AccelType), probed once for each xdist worker. The autouse
+    probe-cache reset would make every save and load of a test probe it again (two process spawns)."""
+    from exec_sandbox.system_probes import detect_accel_type
+
+    return asyncio.run(detect_accel_type())
 
 
 @pytest.fixture
 async def instance_env(
-    s3_proxy, short_tmp_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    s3_proxy, host_accelerator, short_tmp_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncGenerator[Any]:
     """Saved instances without QEMU (tests/instance_support.py): yields an InstanceEnv, the real
     InstanceManager on a store behind `s3_proxy`, fake VMs whose QMP sockets live under a short
-    path, and the bytes each commit saved. Only the QEMU version probe is replaced (no binary needed)."""
-    from tests.instance_support import InstanceEnv, qemu_floor
+    path, and the bytes each commit saved. The host probes of the manager are replaced: the QEMU
+    version (no binary needed) and the accelerator (probed once for the worker)."""
+    from tests.instance_support import InstanceEnv, accelerator_probe, qemu_floor
 
     monkeypatch.setattr("exec_sandbox.instance.manager.probe_qemu_version", qemu_floor)
+    monkeypatch.setattr("exec_sandbox.instance.manager.detect_accel_type", accelerator_probe(host_accelerator))
     async with InstanceEnv.open(proxy=s3_proxy, root=short_tmp_dir, tmp=tmp_path) as env:
         yield env
+
+
+def asyncio_with(**overrides: Any) -> SimpleNamespace:
+    """A module's own `asyncio` name with some functions replaced: patch
+    "exec_sandbox.<module>.asyncio" with it. Patching "exec_sandbox.<module>.asyncio.sleep"
+    replaces asyncio.sleep for the whole process (the event loop, pytest-asyncio)."""
+    return SimpleNamespace(**{**vars(asyncio), **overrides})
+
+
+def time_with(**overrides: Any) -> SimpleNamespace:
+    """A module's own `time` name with some functions replaced (as asyncio_with): patching
+    "exec_sandbox.<module>.time.monotonic" replaces the event loop's clock too."""
+    return SimpleNamespace(**{**vars(time), **overrides})

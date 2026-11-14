@@ -100,6 +100,9 @@ packages = ["src/exec_sandbox"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# Delete the tmp_path of each passed test at its end: per-test caches and disks
+# (L1 RAM files, L2 images) would otherwise fill the disk until the session ends
+tmp_path_retention_policy = "failed"
 addopts = [
     "-v",
     "--tb=short",
@@ -115,6 +118,8 @@ markers = [
 filterwarnings = [
     # Catch pending task warnings early - Python 3.14 has stricter detection
     "error:Task was destroyed but it is pending:RuntimeWarning",
+    # botocore signs every request with datetime.utcnow() (deprecated in 3.12): thousands per run
+    "ignore:datetime.datetime.utcnow\\(\\) is deprecated:DeprecationWarning:botocore\\.",
 ]
 
 [tool.pyright]
