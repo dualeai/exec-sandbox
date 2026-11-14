@@ -66,8 +66,11 @@ if not devices:
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # Should have virtio devices (blk, net, serial, rng)
-        assert "VIRTIO:" in result.stdout, f"Expected at least one virtio device. stdout: {result.stdout}"
+        device_ids = {line.rsplit(":", 1)[1] for line in result.stdout.splitlines() if line.startswith("VIRTIO:")}
+        assert device_ids, f"Expected at least one virtio device. stdout: {result.stdout}"
+        # virtio IDs: 0x0001 net, 0x0002 block, 0x0003 console (virtio-serial), 0x0004 entropy (rng).
+        # Any other is extra attack surface: balloon 0x0005, virtio-snd 0x0019 (CVE-2024-7730).
+        assert device_ids <= {"0x0001", "0x0002", "0x0003", "0x0004"}, f"stdout: {result.stdout}"
 
     async def test_no_pci_non_virtio_devices(self, scheduler: Scheduler) -> None:
         """No legacy PCI devices (IDE, AHCI, e1000, rtl8139, AC97, etc.).
@@ -277,36 +280,6 @@ else:
             if line.startswith("NET_DRIVER:"):
                 driver = line.split(":")[1]
                 assert "virtio" in driver, f"Legacy NIC driver found: {driver}. Only virtio-net should be used."
-
-
-# =============================================================================
-# Edge: No sound devices in QEMU (CVE-2024-7730)
-# =============================================================================
-class TestNoVirtioSndDevice:
-    """Virtio-snd device adds unnecessary attack surface.
-
-    CVE-2024-7730: Virtio-snd heap buffer overflow in hw/audio/virtio-snd.c.
-    Code execution sandboxes have no need for sound devices.
-    """
-
-    async def test_no_virtio_snd_device_id(self, scheduler: Scheduler) -> None:
-        """No virtio-snd device (device ID 0x0019) should be present."""
-        code = """\
-import os, glob
-for dev_path in sorted(glob.glob('/sys/bus/virtio/devices/*')):
-    try:
-        with open(os.path.join(dev_path, 'device')) as f:
-            device_id = f.read().strip()
-        # virtio-snd device ID is 0x0019
-        if device_id == '0x0019':
-            print(f"VIRTIO_SND_FOUND:{os.path.basename(dev_path)}")
-    except (OSError, PermissionError):
-        continue
-print("DONE")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "VIRTIO_SND_FOUND" not in result.stdout, f"Virtio-snd device should not exist. stdout: {result.stdout}"
 
 
 # =============================================================================
