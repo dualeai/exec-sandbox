@@ -62,24 +62,20 @@ class TestKernelEntropyHealth:
         assert (result.exit_code, result.stdout) == (0, "256\n"), result.stderr
 
     async def test_urandom_nonblocking(self, scheduler: Scheduler) -> None:
-        """getrandom() doesn't block - CRNG ready at boot."""
+        """getrandom() does not block: with GRND_NONBLOCK it fails with EAGAIN while the CRNG is not
+        ready, so a read that returns 256 bytes shows it never waits. No clock: 1 MiB took 108.8 ms
+        under TCG on a loaded runner, slow ChaCha20 output, not a block."""
+        # musl's getrandom(3) through ctypes: the guest Python has no os.getrandom
         code = """
-import os
-import time
-
-# Read 1MB - should be instant if CRNG initialized
-start = time.perf_counter()
-data = os.urandom(1024 * 1024)
-elapsed_ms = (time.perf_counter() - start) * 1000
-
-print(f"TIME_MS:{elapsed_ms:.2f}")
-# Should complete in <100ms, blocking would take seconds
-print("PASS" if elapsed_ms < 100 else "FAIL_BLOCKED")
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+buf = ctypes.create_string_buffer(256)
+n = libc.getrandom(buf, 256, 1)  # GRND_NONBLOCK
+print(n, ctypes.get_errno() if n < 0 else 0)
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        assert result.exit_code == 0
-        assert result.stdout.splitlines()[-1] == "PASS", f"getrandom() blocked - entropy starvation: {result.stdout}"
+        assert (result.exit_code, result.stdout) == (0, "256 0\n"), result.stderr  # not "-1 11" (EAGAIN)
 
 
 # =============================================================================
