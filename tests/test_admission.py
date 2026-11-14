@@ -42,6 +42,7 @@ from exec_sandbox.admission import (
     _Settle,  # pyright: ignore[reportPrivateUsage]
     _settle_removals,  # pyright: ignore[reportPrivateUsage]
     _zfs_loaded,  # pyright: ignore[reportPrivateUsage]
+    _zfs_settle,  # pyright: ignore[reportPrivateUsage]
 )
 from exec_sandbox.constants import (
     DEFAULT_CPU_OVERCOMMIT_RATIO,
@@ -1397,9 +1398,9 @@ class _Disk:
 class _Cache:
     """A cache whose entries, oldest first, give `gives_back` of their size back to `disk` when
     evicted, `after` seconds later (XFS frees removed files in the background); 0: nothing back
-    (their blocks still in use: a CoW clone, a reader without a lease). With `shown_after`, no
-    space shows before that many entries are evicted, then all of it, `after` seconds later
-    (a ZFS transaction sync): the passes that see nothing do not depend on the clock."""
+    (their blocks still in use: a CoW clone, a reader without a lease). With `holds`, the
+    space of each eviction shows only at show() (a ZFS transaction sync): the passes before
+    it see nothing, whatever the clock."""
 
     def __init__(
         self,
@@ -1409,15 +1410,15 @@ class _Cache:
         *,
         gives_back: float = 1.0,
         after: float = 0.0,
-        shown_after: int = 0,
+        holds: bool = False,
     ) -> None:
         cache_dir.mkdir(mode=0o700, exist_ok=True)
         self.cache_dir = cache_dir
         self._disk = disk
         self._gives_back = gives_back
         self._after = after
-        self._shown_after = shown_after
-        self._not_shown_mb = 0.0  # evicted, held until shown_after entries are evicted
+        self._holds = holds
+        self._held_mb = 0.0  # evicted, held until show()
         self.entries = list(sizes_mb)
         self.evicted: list[float] = []
         self.size_read = asyncio.Event()
@@ -1435,19 +1436,23 @@ class _Cache:
             self.passes[-1].append(size)
         self.evicted_one.set()
 
-        if len(self.evicted) < self._shown_after:
-            self._not_shown_mb += size * self._gives_back
+        if self._holds:
+            self._held_mb += size * self._gives_back
             return int(size * _MIB)
-        held, self._not_shown_mb = self._not_shown_mb, 0.0
 
         def give_back() -> None:
-            self._disk.free_mb += size * self._gives_back + held
+            self._disk.free_mb += size * self._gives_back
 
         if self._after:
             asyncio.get_running_loop().call_later(self._after, give_back)
         else:
             give_back()
         return int(size * _MIB)
+
+    def show(self) -> None:
+        """Give back the space held so far (`holds`)."""
+        self._disk.free_mb += self._held_mb
+        self._held_mb = 0.0
 
     def eviction_order(self) -> SimpleNamespace:
         """A pass: each evict_next is this fake's evict_oldest (it keeps no listing)."""
@@ -2370,18 +2375,26 @@ class TestDiskGate:
         not see: its syncfs commits the intent log only, so two passes see nothing (on EC2: LOCAL_DISK at 0.39
         s, and 600 MB shown 12 s later). The second pass's space counts as still coming up to one ZFS
         transaction sync: admitted once it shows. Here the space of both removals shows 50 ms after the
-        second one (a wall-clock delay after each removal let a slow runner's second pass see the first
-        removal: one eviction); zfs_txg_timeout 0: 1 s."""
+        second pass took that wait (_zfs_settle), so no pass sees it before, whatever the runner's speed (a
+        wall-clock delay after each removal let a slow runner's second pass see the space: no wait taken);
+        zfs_txg_timeout 0: 1 s."""
         disk = _Disk(1000)
         ctrl = self._controller(tmp_path, floor_mb=894)  # a 1024 MB disk needs 150 MB more
-        cache = _Cache(tmp_path / "l2", disk, [200] * 4, after=0.05, shown_after=2)
+        cache = _Cache(tmp_path / "l2", disk, [200] * 4, holds=True)
         ctrl.add_cache(cache)
         txg = tmp_path / "zfs_txg_timeout"
         txg.write_text("0\n")
+        loop = asyncio.get_running_loop()
+
+        def txg_wait() -> _Settle:
+            loop.call_later(0.05, cache.show)  # the next transaction sync
+            return _zfs_settle()
+
         with (
             patch("exec_sandbox.admission.shutil.disk_usage", disk.usage),
             patch("exec_sandbox.admission._settle_removals", return_value=_OVERLAY),
             patch("exec_sandbox.admission._ZFS_TXG_TIMEOUT", txg),
+            patch("exec_sandbox.admission._zfs_settle", side_effect=txg_wait),
             patch("exec_sandbox.admission._syncfs"),
         ):
             async with asyncio.timeout(1.5):
