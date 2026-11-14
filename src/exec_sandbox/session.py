@@ -1,8 +1,7 @@
-"""Session - persistent VM for multi-step code execution.
+"""Session: one VM that stays alive across exec() calls.
 
-A Session keeps a VM alive across multiple exec() calls, enabling
-stateful workflows where variables, imports, and functions persist
-between executions. The underlying REPL process maintains state.
+Variables, imports, functions and files stay from one call to the next: the
+REPL process in the VM keeps them.
 
 Example:
     ```python
@@ -14,14 +13,16 @@ Example:
     ```
 
 Lifecycle:
-    - Created via scheduler.new(spec) or scheduler.reuse(instance_id) (returns a
-      Session that owns a VM)
-    - exec() calls execute code in the same VM (state persists)
-    - close() destroys the VM (called automatically by context manager)
-    - Idle timeout auto-closes after inactivity (time between operations)
-    - Failure closes: cancellation, unknown-outcome transport loss, exit 137,
-      a VM found dead, and the save() failures listed in Session.save are all
-      terminal — see Session.exec, Session.save and _guard()
+    - scheduler.new(spec) or scheduler.reuse(instance_id) returns a Session
+      that owns a VM.
+    - exec() runs code in that VM; the state stays.
+    - close() destroys the VM; the context manager calls it.
+    - The idle timeout closes the session after a time with no call.
+    - These failures close the session: cancellation, an unknown outcome
+      (OutcomeUnknownError), exit 137, a VM found dead, a VM that QEMU stopped
+      because the host disk is full (TransientError LOCAL_DISK at the next
+      call), and the save() failures listed in Session.save. Details: Session.exec
+      and Session.save.
 """
 
 from __future__ import annotations
@@ -135,7 +136,7 @@ class Session:
 
     @property
     def closed(self) -> bool:
-        """Whether the session has been closed."""
+        """True when the session is closed."""
         return self._closed
 
     @property
@@ -162,7 +163,7 @@ class Session:
 
     @property
     def exec_count(self) -> int:
-        """Number of successful exec() calls."""
+        """Number of exec() calls that returned a result, whatever the exit code."""
         return self._exec_count
 
     @property
@@ -192,7 +193,10 @@ class Session:
         On the way out it also owns VM retirement for cancellation and
         unknown-outcome failures: any dispatched guest operation may still be
         running after CancelledError or OutcomeUnknownError, so the session
-        is closed before either propagates.
+        is closed before either propagates. A failed call that retired the VM
+        closes the session too: QEMU stopped it because the host disk is full
+        (TransientError LOCAL_DISK), or the REPL exited with code 137 between two
+        calls (TransientError GUEST_UNAVAILABLE).
         """
         self._check_open()
         async with self._exec_lock:
@@ -220,6 +224,12 @@ class Session:
                 # the reconciliation-required error so no API can reuse a VM
                 # whose command outcome is unknown.
                 await self._close_for_failure()
+                raise
+            except Exception:
+                # The call found the VM unusable and retired it: every next call
+                # would fail the same way. (The call changed the state checked above.)
+                if self._vm.state in (VmState.DESTROYING, VmState.DESTROYED):  # pyright: ignore[reportUnnecessaryContains]
+                    await self._close_for_failure()
                 raise
             finally:
                 if not self._closed:
@@ -313,7 +323,9 @@ class Session:
 
         A non-zero exit code does not close the session, with two exceptions:
         exit code 137, and a QEMU that stopped while it sent the result. In both
-        cases exec() returns the result, then closes the session.
+        cases exec() returns the result, then closes the session. Each error
+        below closes the session too, except SessionClosedError and
+        InvalidInputError.
 
         Args:
             code: Source code to execute.
@@ -328,8 +340,13 @@ class Session:
 
         Raises:
             TransientError: GUEST_UNAVAILABLE: the VM communication failed or timed out
-                before the code was sent (the session closes). A timeout of your code
-                does not raise: it returns exit_code -1 with the reason in stderr.
+                before the code was sent, or the guest could not start the code: its REPL
+                did not start, or it exited with code 137 after the last call, for example
+                on a SIGKILL from a background process (the session closes). A timeout of
+                your code does not raise: it returns exit_code -1 with the reason in stderr.
+                LOCAL_DISK: QEMU stopped the VM because the host disk is full (the
+                session closes; the writes since the last save are lost). A call in
+                flight at that moment raises OutcomeUnknownError with the same reason.
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN: the transport failed after the
                 code was sent; the session is closed. Check the side effects of the
                 code before you retry.
@@ -415,7 +432,9 @@ class Session:
         Args:
             path: Path relative to /home/user (for example "input.csv", "data/model.pkl").
             content: File content as bytes, a local Path, or an IO[bytes] stream.
-                A Path streams from disk: it is never fully loaded in memory.
+                Bytes are not copied; a Path or a stream is read in 128 KiB chunks.
+                The encoded chunks that wait to be sent use at most about 13.5 MiB per
+                write in progress, whatever the file size.
                 An IO[bytes] stream stays yours: exec-sandbox does not close it.
             make_executable: Give the file mode 0o755 (else 0o644).
 
@@ -425,8 +444,11 @@ class Session:
                 of file handles or memory), or a source read fails during the write: nothing
                 was written, the session stays open; a seekable stream is set back to its
                 position, a non-seekable stream must be passed again from its start.
+                LOCAL_DISK also when QEMU stopped the VM because the host disk under its
+                home disk is full: the session closes.
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN when the transport is lost after
-                the call was sent: the write may have been stored (the session closes).
+                the call was sent: the write may have been stored (the session closes); also
+                when the host disk fills while the call is in progress.
             SessionClosedError: The session is closed (checked first: whatever the
                 arguments, no local file is opened).
             InvalidInputError: ARGUMENT_INVALID when the content exceeds the max file
@@ -465,7 +487,8 @@ class Session:
             TransientError: GUEST_UNAVAILABLE on timeout or transport failure (you can
                 retry on a live VM; a cancellation or an unknown outcome closes the
                 session). LOCAL_DISK: this host could not write the local destination
-                (disk full, quota, I/O error, out of file handles).
+                (disk full, quota, I/O error, out of file handles); or QEMU stopped the VM
+                because the host disk under its home disk is full (the session closes).
             SessionClosedError: The session is closed (checked first, whatever the arguments).
             InvalidInputError: PATH_INVALID or GUEST_IO: file not found or validation failure.
                 ARGUMENT_INVALID: the destination stream is closed, not writable or a text
@@ -497,9 +520,11 @@ class Session:
 
         Raises:
             TransientError: GUEST_UNAVAILABLE: a timeout or a transport failure; you can
-                retry on a live VM.
+                retry on a live VM. LOCAL_DISK: QEMU stopped the VM because the host disk
+                under its home disk is full; the session closes.
             OutcomeUnknownError: GUEST_OUTCOME_UNKNOWN: the transport was lost after the
-                call was sent; the session closes.
+                call was sent, or the host disk filled while the call was in progress; the
+                session closes.
             SessionClosedError: The session is closed.
             InvalidInputError: PATH_INVALID or GUEST_IO: folder not found or validation failure.
         """
@@ -580,7 +605,8 @@ class Session:
 
         Warns (InstanceNotSavedWarning) when the session continues a saved
         instance and exec()/write_file() ran since the last save. A second call
-        does nothing. Raises InternalError (CLEANUP_UNCONFIRMED) when the end of the QEMU process is not confirmed.
+        starts no new cleanup: it raises the error of the first one again, if any.
+        Raises InternalError (CLEANUP_UNCONFIRMED) when the end of the QEMU process is not confirmed.
         """
         if not self._closed and self._unsaved and self._instance_ref is not None:
             warnings.warn(

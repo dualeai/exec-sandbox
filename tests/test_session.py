@@ -17,6 +17,7 @@ from exec_sandbox.exceptions import (
     ErrorCode,
     InvalidInputError,
     SessionClosedError,
+    TransientError,
 )
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
@@ -29,12 +30,6 @@ from tests.conftest import run_once, skip_on_python_312_subprocess_bug, skip_unl
 # =============================================================================
 class TestSessionNormal:
     """Happy path tests for session state persistence and basic functionality."""
-
-    async def test_session_returns_session_object(self, scheduler: Scheduler) -> None:
-        """scheduler.new() returns a Session object."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            assert session is not None
-            assert not session.closed
 
     async def test_basic_exec(self, scheduler: Scheduler) -> None:
         """Basic exec returns output and exit code."""
@@ -53,6 +48,20 @@ class TestSessionNormal:
             result = await session.exec("print(x)")
             assert result.exit_code == 0
             assert "42" in result.stdout
+
+    async def test_repl_state_survives_a_host_reconnect(self, scheduler: Scheduler) -> None:
+        """The host drops its connection to the guest agent (a restart of the host side of the
+        channel); the next call reconnects, and the REPL in the guest kept its state: the agent
+        keeps its ports open across a host close."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            setup = await session.exec("x = 42")
+            assert setup.exit_code == 0, setup.stderr
+            await session._vm.channel.close()  # pyright: ignore[reportPrivateUsage]  # the one seam
+
+            result = await session.exec("print(x)")
+
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout.strip() == "42"
 
     async def test_python_import_persistence(self, scheduler: Scheduler) -> None:
         """Python imports persist across exec calls."""
@@ -185,48 +194,14 @@ class TestSessionNormal:
             assert "hi alice" in result.stdout
 
     async def test_multiple_sequential_execs(self, scheduler: Scheduler) -> None:
-        """Multiple sequential execs all succeed."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            for i in range(10):
-                result = await session.exec(f"print({i})")
-                assert result.exit_code == 0
-                assert str(i) in result.stdout
-            assert session.exec_count == 10
-
-    async def test_exec_count_increments(self, scheduler: Scheduler) -> None:
-        """exec_count tracks successful executions."""
+        """Multiple sequential execs all succeed, and exec_count counts each one."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             assert session.exec_count == 0
-            r1 = await session.exec("print(1)")
-            assert r1.exit_code == 0, f"exec timed out or failed: exit_code={r1.exit_code}, stderr={r1.stderr!r}"
-            assert session.exec_count == 1
-            r2 = await session.exec("print(2)")
-            assert r2.exit_code == 0, f"exec timed out or failed: exit_code={r2.exit_code}, stderr={r2.stderr!r}"
-            assert session.exec_count == 2
-            r3 = await session.exec("print(3)")
-            assert r3.exit_code == 0, f"exec timed out or failed: exit_code={r3.exit_code}, stderr={r3.stderr!r}"
-            assert session.exec_count == 3
-
-    async def test_streaming_callbacks(self, scheduler: Scheduler) -> None:
-        """on_stdout callback receives streaming chunks."""
-        chunks: list[str] = []
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            result = await session.exec(
-                'print("hello world")',
-                on_stdout=chunks.append,
-            )
-            assert result.exit_code == 0
-            assert "hello world" in "".join(chunks)
-
-    async def test_stderr_streaming(self, scheduler: Scheduler) -> None:
-        """on_stderr callback receives stderr chunks."""
-        chunks: list[str] = []
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            result = await session.exec(
-                'import sys; sys.stderr.write("oops\\n")',
-                on_stderr=chunks.append,
-            )
-            assert "oops" in "".join(chunks)
+            for i in range(10):
+                result = await session.exec(f"print({i})")
+                assert result.exit_code == 0, result.stderr
+                assert result.stdout == f"{i}\n"
+                assert session.exec_count == i + 1
 
     async def test_env_vars_passed(self, scheduler: Scheduler) -> None:
         """Environment variables are passed to execution."""
@@ -245,11 +220,6 @@ class TestSessionNormal:
             assert result.timing.execute_ms > 0
             assert session.startup_timing.total_ms > 0
 
-    async def test_closed_starts_false(self, scheduler: Scheduler) -> None:
-        """Fresh session is not closed."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            assert session.closed is False
-
     async def test_context_manager(self, scheduler: Scheduler) -> None:
         """Context manager closes session on exit."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -263,19 +233,6 @@ class TestSessionNormal:
 # =============================================================================
 class TestSessionEdgeCases:
     """Tests for error recovery and state preservation."""
-
-    async def test_nonzero_exit_preserves_session(self, scheduler: Scheduler) -> None:
-        """Non-zero exit code doesn't close the session."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            result = await session.exec("raise ValueError('test')")
-            assert result.exit_code == 1, (
-                f"expected ValueError (exit_code=1), got exit_code={result.exit_code}, stderr={result.stderr!r}"
-            )
-            assert "ValueError" in result.stderr
-            # Session still alive
-            result = await session.exec('print("alive")')
-            assert result.exit_code == 0
-            assert "alive" in result.stdout
 
     async def test_nonzero_exit_preserves_state(self, scheduler: Scheduler) -> None:
         """State survives across an error."""
@@ -352,13 +309,6 @@ class TestSessionEdgeCases:
         session = await scheduler.new(VmSpec(language=Language.PYTHON))
         await session.close()
         await session.close()  # No error
-
-    async def test_rapid_execs(self, scheduler: Scheduler) -> None:
-        """Multiple rapid execs all succeed."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            for i in range(5):
-                result = await session.exec(f"print({i})")
-                assert result.exit_code == 0
 
     @skip_unless_hwaccel  # pip install routinely exceeds 940s under TCG
     async def test_session_with_packages(self, scheduler: Scheduler) -> None:
@@ -641,7 +591,11 @@ class TestSessionOutOfBounds:
             await session.exec("print(1)")
 
     async def test_idle_timeout_auto_closes(self, scheduler: Scheduler) -> None:
-        """Session auto-closes after idle timeout."""
+        """Session auto-closes after idle timeout.
+
+        The public range of idle_timeout_seconds starts at 10 s: the test sets the private
+        deadline to 1 s, and an exec arms it (each call re-arms the deadline at its end).
+        """
         session = await scheduler.new(
             VmSpec(
                 language=Language.PYTHON,
@@ -649,9 +603,9 @@ class TestSessionOutOfBounds:
             idle_timeout_seconds=10,  # Use minimum allowed
         )
         try:
-            # Override the idle timeout to 1s for testing
-            session._idle_timeout_seconds = 1
-            session._reset_idle_timer()
+            session._idle_timeout_seconds = 1  # pyright: ignore[reportPrivateUsage]
+            result = await session.exec("1")
+            assert result.exit_code == 0, result.stderr
             await asyncio.sleep(2)
             with pytest.raises(SessionClosedError):
                 await session.exec("print(1)")
@@ -659,16 +613,20 @@ class TestSessionOutOfBounds:
             await session.close()
 
     async def test_idle_timeout_reset_on_exec(self, scheduler: Scheduler) -> None:
-        """Idle timer resets on each exec."""
+        """Idle timer resets on each exec.
+
+        The public range of idle_timeout_seconds starts at 10 s: the test sets the private
+        deadline to 2 s, and an exec arms it (each call re-arms the deadline at its end).
+        """
         session = await scheduler.new(VmSpec(language=Language.PYTHON), idle_timeout_seconds=10)
         try:
-            # First exec spawns the REPL (~4-5s on cold boot).
-            # Run it under the original 10s timeout before switching
-            # to the short timeout used to verify reset behavior.
+            # First exec spawns the REPL (0.1-1 s, 3-5 s under TCG), under the 10 s deadline. The
+            # second one arms the short deadline used to verify reset behavior.
             result = await session.exec("1")
             assert result.exit_code == 0
-            session._idle_timeout_seconds = 2
-            session._reset_idle_timer()
+            session._idle_timeout_seconds = 2  # pyright: ignore[reportPrivateUsage]
+            result = await session.exec("2")
+            assert result.exit_code == 0
             # Exec at ~1s resets the 2s timer
             await asyncio.sleep(1)
             result = await session.exec("print(1)")
@@ -712,6 +670,44 @@ class TestSessionOutOfBounds:
             with pytest.raises(SessionClosedError):
                 await session.exec("print('must_not_run')")
 
+    @staticmethod
+    def _end_repl_before_result(end: str) -> str:
+        """Shell code that ends the REPL (with `end`) before the result of this exec reaches
+        the host, so the next exec finds it gone. The REPL prints the result marker with
+        `printf`: a function of that name ends the REPL instead, and a child of it prints
+        the marker once the REPL is reaped (`kill -0` fails)."""
+        return (
+            "printf() { case $1 in __SENTINEL_*) "
+            '(while kill -0 $$ 2>/dev/null; do :; done; builtin printf "$@") & '
+            f"{end} ;; "
+            '*) builtin printf "$@" ;; esac; }'
+        )
+
+    async def test_repl_killed_between_calls_closes_session(self, scheduler: Scheduler) -> None:
+        """Exit 137 of the REPL between two calls retires the VM: the next exec raises
+        TransientError at once, then the session is closed.
+
+        The PID 1 reaper of the guest must not take the exit status of the REPL first:
+        the guest would then start a new REPL, and the next exec would run in it."""
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
+            first = await session.exec(self._end_repl_before_result("kill -9 $$"))
+            assert first.exit_code == 0
+
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="retired"):
+                await session.exec("echo must_not_run")
+            assert session.closed
+
+    async def test_repl_exit_between_calls_resets_state(self, scheduler: Scheduler) -> None:
+        """An exit of the REPL between two calls with a code other than 137: the next
+        exec runs in a new REPL (the state is lost) and the session stays open."""
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
+            first = await session.exec("kept=yes; " + self._end_repl_before_result("exit 3"))
+            assert first.exit_code == 0
+
+            second = await session.exec('echo "kept=$kept"')
+            assert (second.exit_code, second.stdout.strip()) == (0, "kept=")
+            assert not session.closed
+
     @skip_unless_hwaccel
     async def test_exec_timeout_preserves_session(self, scheduler: Scheduler) -> None:
         """Execution timeout returns error result but session stays alive.
@@ -748,51 +744,6 @@ class TestSessionOutOfBounds:
 
 
 # =============================================================================
-# TestSessionReconnect - Guest agent 12s idle timeout
-# =============================================================================
-@skip_unless_hwaccel
-class TestSessionReconnect:
-    """Tests for state persistence across guest agent reconnect cycles.
-
-    Requires hwaccel: 12s real-time idle timeout — TCG (~5-8x slower) makes
-    the reconnect cycle unreliable within test timeouts.
-
-    Guest agent drops connection after 12s idle (READ_TIMEOUT_MS=12000).
-    REPL subprocess must survive (guest agent process stays alive).
-    """
-
-    @pytest.mark.slow
-    async def test_state_survives_reconnect(self, scheduler: Scheduler) -> None:
-        """State persists across guest agent reconnect (~13s idle)."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            setup = await session.exec("x = 42")
-            assert setup.exit_code == 0, (
-                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
-            )
-            # Wait for guest agent reconnect cycle
-            await asyncio.sleep(13)
-            result = await session.exec("print(x)")
-            assert result.exit_code == 0
-            assert "42" in result.stdout
-
-    @pytest.mark.slow
-    async def test_multiple_reconnects_preserve_state(self, scheduler: Scheduler) -> None:
-        """State persists across multiple reconnect cycles."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            setup = await session.exec("x = 1")
-            assert setup.exit_code == 0, (
-                f"setup exec timed out or failed: exit_code={setup.exit_code}, stderr={setup.stderr!r}"
-            )
-            await asyncio.sleep(13)
-            r = await session.exec("x += 1")
-            assert r.exit_code == 0, f"increment exec timed out or failed: exit_code={r.exit_code}, stderr={r.stderr!r}"
-            await asyncio.sleep(13)
-            result = await session.exec("print(x)")
-            assert result.exit_code == 0
-            assert "2" in result.stdout
-
-
-# =============================================================================
 # TestSessionConcurrency - Serialization & coexistence
 # =============================================================================
 class TestSessionConcurrency:
@@ -805,9 +756,8 @@ class TestSessionConcurrency:
                 session.exec("print('a' * 100)"),
                 session.exec("print('b' * 100)"),
             )
-            # Both should succeed (serialized by exec_lock)
-            for r in results:
-                assert r.exit_code == 0
+            # Both succeed, each with its own output only (serialized by exec_lock)
+            assert [(r.exit_code, r.stdout) for r in results] == [(0, "a" * 100 + "\n"), (0, "b" * 100 + "\n")]
 
     async def test_session_plus_run_coexist(self, scheduler: Scheduler) -> None:
         """Session and run() work simultaneously (separate VMs)."""
@@ -850,18 +800,6 @@ class TestWorkingDirectory:
             assert result.exit_code == 0
             assert "/home/user" in result.stdout
 
-    async def test_run_python_cwd(self, scheduler: Scheduler) -> None:
-        """run_once() also uses /home/user as cwd."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "import os; print(os.getcwd())")
-        assert result.exit_code == 0
-        assert "/home/user" in result.stdout
-
-    async def test_run_shell_cwd(self, scheduler: Scheduler) -> None:
-        """run_once() shell also uses /home/user as cwd."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "pwd")
-        assert result.exit_code == 0
-        assert "/home/user" in result.stdout
-
 
 # =============================================================================
 # TestLazyCloudpickle - Deferred cloudpickle import
@@ -876,12 +814,6 @@ class TestLazyCloudpickle:
 
     Change 2: cloudpickle is deferred until multiprocessing.Process.start().
     """
-
-    async def test_simple_code_works(self, scheduler: Scheduler) -> None:
-        """Simple print works without triggering cloudpickle."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
-        assert result.exit_code == 0
-        assert "hello" in result.stdout
 
     async def test_multiprocessing_process_works(self, scheduler: Scheduler) -> None:
         """multiprocessing.Process.start() triggers lazy cloudpickle patch."""

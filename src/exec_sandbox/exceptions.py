@@ -45,10 +45,10 @@ class ErrorAction(StrEnum):
     then repeat the call."""
 
     VERIFY = "VERIFY"
-    """You do not know the state the call left (the code was sent, then the transport was lost;
-    the store gave no clear answer to a save), or another save was stored first: read the state (side effects
-    of the code; for a save, whether describe_instance(id).recent_commits holds the
-    error.context["commit_id"]) before you do the work again."""
+    """Read the state before you do the work again: the side effects of the code; for a save,
+    whether describe_instance(id).recent_commits holds error.context["commit_id"]. The state the
+    call left is unknown (the code was sent, then the transport was lost; the store gave no clear
+    answer to a save), or another save was stored first."""
 
     RESTART = "RESTART"
     """The session is closed: open a new one."""
@@ -62,10 +62,11 @@ class ErrorAction(StrEnum):
     permissions or OS): change it; the same call fails again."""
 
     ROUTE = "ROUTE"
-    """Repeat the call on another worker: this one has another CPU architecture, CPU vendor or
-    accelerator, lacks a guest image the instance needs (and the store has no copy), runs a QEMU
-    that refuses the saved state, runs another exec-sandbox release than the one that saved the
-    instance, or has a smaller budget than the VM needs (see the error's `required` field)."""
+    """Repeat the call on another worker: this one has another CPU architecture, CPU vendor, guest
+    CPU model or accelerator, lacks a guest image the instance needs (and the store has no
+    copy), runs a QEMU that refuses the saved state, runs another exec-sandbox release than the
+    one that saved the instance, or has a smaller budget than the VM needs (see the error's
+    `required` field)."""
 
     RECREATE = "RECREATE"
     """The instance can no longer be used (deleted, expired, or its stored data is damaged): create a new one."""
@@ -94,14 +95,18 @@ class ErrorCode(StrEnum):
     CAPACITY = "CAPACITY"
     """No resources became free within the admission timeout."""
     GUEST_UNAVAILABLE = "GUEST_UNAVAILABLE"
-    """The guest could not take the call (transport failure, timeout or readiness failure before the call was sent)."""
+    """The guest could not take the call (transport failure, timeout or readiness failure before the
+    call was sent), or could not start the code (the REPL did not start, or it exited with code 137
+    between two calls). The code did not run."""
     GUEST_SILENT_AFTER_RESTORE = "GUEST_SILENT_AFTER_RESTORE"
-    """The guest of a memory snapshot restore did not answer once its state loaded."""
+    """The guest of a memory snapshot restore (an L1 memory snapshot or a saved instance) did not
+    answer once its state loaded. A silent L1 memory snapshot is removed, and the VM boots cold."""
     LOCAL_DISK = "LOCAL_DISK"
-    """A local file the call needs is missing (not a path the caller gave: that is ARGUMENT_INVALID),
+    """A local file the call needs is missing (not a path the caller gave: that is ARGUMENT_INVALID);
     or this host cannot open or write a local file now (disk full, quota, I/O error, out of file
-    handles or memory), or a local source cannot be read during a write_file (nothing was written;
-    the session stays open)."""
+    handles or memory); or a local source cannot be read during a write_file (nothing was written;
+    the session stays open); or the home disk of a new VM cannot fit on its filesystem; or the host
+    disk under a VM's home disk is full (QEMU stopped the VM; the session closes)."""
     PACKAGE_DOWNLOAD = "PACKAGE_DOWNLOAD"
     """The package manager could not download (network error or timeout)."""
     MIGRATION_FAILED = "MIGRATION_FAILED"
@@ -131,7 +136,7 @@ class ErrorCode(StrEnum):
     OUTPUT_LIMIT = "OUTPUT_LIMIT"
     """stdout or stderr went above the guest limit. The session stays open."""
     PATH_INVALID = "PATH_INVALID"
-    """A guest path breaks a rule (empty, too long, outside the sandbox, a directory)."""
+    """A guest path breaks a rule (empty, too long, outside the sandbox, a folder)."""
     GUEST_IO = "GUEST_IO"
     """The guest could not read, list or write that path (not found, no access, guest disk full)."""
     ARGUMENT_INVALID = "ARGUMENT_INVALID"
@@ -152,8 +157,9 @@ class ErrorCode(StrEnum):
 
     # ConfigError (FIX_CONFIG)
     HOST_DEPENDENCY = "HOST_DEPENDENCY"
-    """A binary, system user, cgroup or ACL support this worker needs is missing or too old, or a
-    binary this user cannot run."""
+    """A binary (QEMU, qemu-img, qemu-storage-daemon, gvproxy-wrapper), system user, cgroup or ACL
+    support this worker needs is missing or too old, or this user cannot run the binary. A binary
+    that hits a process, memory or file-handle limit raises TransientError instead."""
     EXTRA_MISSING = "EXTRA_MISSING"
     """A Python extra is not installed (the message names the pip command)."""
     SETTING_INVALID = "SETTING_INVALID"
@@ -166,8 +172,8 @@ class ErrorCode(StrEnum):
     PLATFORM_UNSUPPORTED = "PLATFORM_UNSUPPORTED"
     """The OS is not Linux or macOS."""
     MIGRATION_UNSUPPORTED = "MIGRATION_UNSUPPORTED"
-    """This worker's QEMU cannot save or load VM state: below the floor (at Scheduler start with an
-    instance store, at a save or a restore) or a capability refused."""
+    """This worker's QEMU cannot save or load VM state: below QEMU 11.0 (at Scheduler start with an
+    instance store, at a save or a restore), or a capability refused."""
     INSTANCE_CONFIG = "INSTANCE_CONFIG"
     """The worker's instance settings are wrong (store, keyring, a store that refuses or fails the probe)."""
     INSTANCE_KEY_MISSING = "INSTANCE_KEY_MISSING"
@@ -197,7 +203,7 @@ class ErrorCode(StrEnum):
     GUEST_PROTOCOL = "GUEST_PROTOCOL"
     """The guest sent a protocol or request error, or an answer of the wrong type."""
     INTERNAL = "INTERNAL"
-    """A broken invariant."""
+    """A broken invariant (a bug)."""
 
 
 class SandboxError(Exception):
@@ -301,7 +307,9 @@ class SessionClosedError(SandboxError):
 
     Every later call on it (exec, write_file, read_file, list_files, save)
     raises this error first, whatever its arguments: no argument check runs and
-    no local file is opened. Open a new session with new() or reuse().
+    no local file is opened. One exception: save() on a worker with no instance
+    store raises ConfigError (INSTANCE_CONFIG) first. Open a new session with
+    new() or reuse().
     """
 
     action = ErrorAction.RESTART
@@ -352,7 +360,7 @@ class ConfigError(SandboxError):
 class RouteError(SandboxError):
     """This worker cannot serve the call; a worker with the `required` values can.
 
-    `required` and `found` map the same keys (arch, accelerator, cpu_vendor,
+    `required` and `found` map the same keys (arch, accelerator, cpu_vendor, cpu_model,
     base_image, packages_image, qemu_version, release, memory_mb, cpu) to the
     needed and the local values; only differing keys are listed. Never delete a
     saved instance for this error.
@@ -512,9 +520,8 @@ class SocketAuthError(CommunicationError):
         actual_uid: int,
         context: dict[str, Any] | None,
     ) -> None:
-        ctx = context or {}
-        ctx.update({"expected_uid": expected_uid, "actual_uid": actual_uid})
-        super().__init__(message, context=ctx)
+        # A new dict: the caller's context stays as it was
+        super().__init__(message, context={**(context or {}), "expected_uid": expected_uid, "actual_uid": actual_uid})
         self.expected_uid = expected_uid
         self.actual_uid = actual_uid
 

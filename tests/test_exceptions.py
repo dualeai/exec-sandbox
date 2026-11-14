@@ -228,6 +228,15 @@ class TestInternalClasses:
         assert not issubclass(CommunicationError, SandboxError)
         assert issubclass(SocketAuthError, CommunicationError)
 
+    def test_socket_auth_error_leaves_the_callers_context_as_it_was(self) -> None:
+        """The error's context adds both uids; the dict the caller gave is not changed."""
+        given = {"socket": "/run/qmp.sock"}
+
+        error = SocketAuthError("peer uid 0", expected_uid=501, actual_uid=0, context=given)
+
+        assert error.context == {"socket": "/run/qmp.sock", "expected_uid": 501, "actual_uid": 0}
+        assert given == {"socket": "/run/qmp.sock"}
+
     def test_not_exported(self) -> None:
         assert "CommunicationError" not in exec_sandbox.__all__
         assert "SocketAuthError" not in exec_sandbox.__all__
