@@ -100,7 +100,7 @@ build:
 	@echo "🔨 Building QEMU images (arch=$(IMAGE_ARCH), variant=$(IMAGE_VARIANT))..."
 	./scripts/build-images.sh $$(echo "$(IMAGE_ARCH)" | sed 's/arm64/aarch64/') $(IMAGE_VARIANT)
 
-# Kept as alias for backwards compatibility and CI scripts.
+# Alias of build.
 build-images: build
 
 # ============================================================================
@@ -124,7 +124,7 @@ test-static:
 
 # Kernel hash functions must stay byte-identical between the two scripts:
 # extract-kernel.sh writes the .hash sidecar that build-kernel.sh reads —
-# divergence makes extract-kernel serve a stale vmlinux/initramfs silently.
+# divergence makes extract-kernel.sh serve a stale vmlinuz/vmlinux silently.
 test-kernel-hash-sync:
 	@a=$$(mktemp) && b=$$(mktemp) && \
 		sed -n '/^compute_hash() {/,/^}/p' scripts/build-kernel.sh | tail -n +2 > "$$a" && \
@@ -200,8 +200,9 @@ bench-pool:
 	uv run python scripts/benchmark_latency.py -n 10 --pool $(BENCH_POOL)
 
 # 2D overcommit optimizer — finds Pareto-optimal (CPU_OC, MEM_OC) configs.
-# Fires N VMs per combo across a 4x4 grid, ranks by Sharpe-like efficiency
-# (throughput / RSS fraction), and reports the efficient frontier.
+# Fires N VMs per combo across a 4x4 grid, ranks by latency efficiency
+# (10^6 / geometric mean of the admission, setup and exec p95), and reports
+# the efficient frontier.
 # Run on a KVM-capable host for production-representative results.
 # Usage: make bench-optimizer [N_VMS=200]
 bench-optimizer:
@@ -210,7 +211,7 @@ bench-optimizer:
 # VM density benchmark — measures host memory cost per VM.
 # Boots N VMs, holds them alive, samples host memory to compute marginal cost.
 # Usage: make bench-density [N_VMS=10]
-#        make bench-density-sweep          # sweep N=5,10,20 VMs
+#        make bench-density-sweep          # sweep N=3,5,10 VMs
 bench-density:
 	uv run --script scripts/benchmark_density.py $(if $(N_VMS),-n $(N_VMS),) --workload
 

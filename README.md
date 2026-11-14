@@ -782,7 +782,7 @@ exec-sandbox needs VM images (kernel, initramfs, qcow2 base images) and a binary
    3. `images/dist/` of a clone of the repository (a local build)
    4. the download cache ([Where files go](#where-files-go))
 2. When no folder holds both, exec-sandbox downloads them to the download cache. With `auto_download_assets=False`, the start fails with `ConfigError` (`ASSET_NOT_FOUND`) instead.
-3. With downloads on, the start also looks for gvproxy-wrapper: in the folder of the boot files first, then in the same folders. When no folder holds it, exec-sandbox downloads it to the download cache.
+3. With downloads on, the start also looks for gvproxy-wrapper: in the folder of the boot files first, then in `gvproxy-wrapper/bin/` of a clone of the repository (a local build), then in the same folders. When no folder holds it, exec-sandbox downloads it to the download cache.
 4. The base image of a language comes with the first VM of that language (all three at the start, with a warm pool): from the folder of the boot files, else from the download cache, where exec-sandbox downloads it when it is missing.
 
 exec-sandbox finds the release of its own version (`v{__version__}`) through the GitHub Releases API: set `GITHUB_TOKEN` for a higher rate limit than the one per IP address. It downloads each asset over HTTPS and checks it against the SHA-256 digest that the GitHub API gives (an asset without a digest downloads unchecked, with a warning).
