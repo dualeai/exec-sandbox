@@ -20,6 +20,7 @@ from exec_sandbox.files import disk as files_disk
 from exec_sandbox.files.disk import (
     allocated_bytes,
     clone_sparse,
+    clone_sparse_fd,
     create_file,
     create_sparse,
     make_private_dir,
@@ -185,16 +186,33 @@ class TestCloneSparse:
             assert clone_sparse(src, dst, stop=None) is True
         assert dst.stat().st_size == 0
 
-    def test_a_stopped_copy_raises_and_leaves_no_file(self, tmp_path: Path) -> None:
-        """A copy of the data (no copy-on-write) whose stop is set stops before its next chunk:
-        InterruptedError, and the partial copy is removed (aio_utils.run_stoppable)."""
-        src, dst = tmp_path / "src.img", tmp_path / "dst.img"
+    def test_a_copy_stopped_after_its_first_chunk_leaves_no_file(self, tmp_path: Path) -> None:
+        """A copy of the data (no copy-on-write) whose stop is set after its first chunk (the
+        disk has two data ranges: at least two chunks) stops before the next one: InterruptedError,
+        and the partial copy is removed, here a name in a folder fd (the local store's form)."""
+
+        class _SetAfterOneCheck(threading.Event):
+            def __init__(self) -> None:
+                super().__init__()
+                self.checks = 0
+
+            def is_set(self) -> bool:
+                self.checks += 1
+                return self.checks > 1
+
+        src = tmp_path / "src.img"
         self._written_disk(src)
-        stop = threading.Event()
-        stop.set()
-        with _copy_on_write(reflink=False), pytest.raises(InterruptedError, match=r"The copy was stopped"):
-            clone_sparse(src, dst, stop=stop)
-        assert not dst.exists()
+        stop = _SetAfterOneCheck()
+        src_fd = os.open(src, os.O_RDONLY)
+        folder = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with _copy_on_write(reflink=False), pytest.raises(InterruptedError, match=r"The copy was stopped"):
+                clone_sparse_fd(src_fd, "dst.img", dst_dir_fd=folder, stop=stop)
+        finally:
+            os.close(src_fd)
+            os.close(folder)
+        assert stop.checks == 2  # one chunk copied, then the stop
+        assert not (tmp_path / "dst.img").exists()
 
     def test_clone_is_independent(self, tmp_path: Path) -> None:
         """Writes to the clone never reach the source (each VM owns its disk)."""

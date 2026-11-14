@@ -8,6 +8,7 @@ import errno
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterator
@@ -268,10 +269,12 @@ class TestSaveFailures:
             await vm.exec("x = 1")
             saving = asyncio.create_task(vm.save())
             assert await asyncio.to_thread(copying.wait, 30)
+            started = time.monotonic()
             saving.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await saving
             assert ended.is_set()  # the copy ended before the cancel came out
+            assert time.monotonic() - started < 10  # the copy stopped: a waited copy takes 30 s
 
     async def test_scheduler_exit_waits_for_a_save_in_flight(
         self, store: tuple[Scheduler, str, object], scheduler_config: SchedulerConfig, s3_proxy: S3Proxy

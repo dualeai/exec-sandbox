@@ -2948,7 +2948,8 @@ class TestDestroyVmStatus:
             async with asyncio.timeout(10):
                 await unit_test_vm_manager.stop()
 
-        assert sorted(attempts) == ["stop-a", "stop-b", "stop-b", "stop-c"]
+        assert sorted(attempts[:3]) == ["stop-a", "stop-b", "stop-c"]  # b's retry does not hold a and c back
+        assert attempts[3:] == ["stop-b"]
         assert unit_test_vm_manager.get_active_vms() == {}
 
     async def test_destroy_commit_finishes_release_before_double_cancellation(self, unit_test_vm_manager) -> None:

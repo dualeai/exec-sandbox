@@ -341,12 +341,27 @@ mod tests {
     #[tokio::test]
     async fn installer_output_at_its_deadline_still_waits_for_the_pipes_to_close() {
         // The installer ended just before its deadline (passed here); a process outside its
-        // group holds the pipes for 0.3 s more: the output comes, not the "kept open" error
+        // group holds the pipes for 0.6 s more: the output comes, not the "kept open" error
         let (group, stdout, stderr) = ended_installer(
-            r#"f=$(mktemp -u); mkfifo "$f"; setsid sh -c 'echo > "$1"; exec sleep 0.3' sh "$f" & read -r _ < "$f"; rm -f "$f"; echo installed"#,
+            r#"f=$(mktemp -u); mkfifo "$f"; setsid sh -c 'echo > "$1"; exec sleep 0.6' sh "$f" & read -r _ < "$f"; rm -f "$f"; echo installed"#,
         )
         .await;
         let deadline = tokio::time::Instant::now();
+
+        let output = finish_installer_output(group, stdout, stderr, deadline).await;
+
+        assert_eq!(output, Some((vec!["installed".to_string()], vec![])));
+    }
+
+    #[tokio::test]
+    async fn installer_output_waits_until_a_deadline_later_than_the_grace() {
+        // A process outside the group holds the pipes for 1.5 s, past the 1 s grace but
+        // before the install deadline: the readers wait for the deadline, not the grace
+        let (group, stdout, stderr) = ended_installer(
+            r#"f=$(mktemp -u); mkfifo "$f"; setsid sh -c 'echo > "$1"; exec sleep 1.5' sh "$f" & read -r _ < "$f"; rm -f "$f"; echo installed"#,
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
 
         let output = finish_installer_output(group, stdout, stderr, deadline).await;
 

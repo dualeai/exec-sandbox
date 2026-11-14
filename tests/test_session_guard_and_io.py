@@ -2489,8 +2489,8 @@ class TestDualPortStreamDeadline:
 
     async def test_an_exec_the_guest_never_answers_ends_at_the_deadline(self, short_tmp_dir: Path) -> None:
         """The guest reads the exec and never answers: stream_messages raises
-        StreamDeadlineExceededError at its total deadline. The command was handed to the
-        transport before any await, so QemuVM reports an unknown outcome, never a retry."""
+        StreamDeadlineExceededError at its total deadline, on a real channel. (QemuVM maps it
+        to an unknown outcome: test_vm_manager test_true_stream_deadline_is_outcome_unknown_...)"""
         async with _FakeGuest(short_tmp_dir, []) as guest:
             channel = guest.channel()
             await channel.connect(timeout_seconds=5.0)
@@ -2527,7 +2527,9 @@ class TestDualPortConnectLifecycle:
 
     async def test_first_connect_after_a_restore_probes(self, short_tmp_dir: Path) -> None:
         """A channel of a guest restored from an L1 save (mark_restored, as restore_vm does):
-        its first connect sends one ping, as a reconnection does, and gets the pong."""
+        its first connect sends one ping, as a reconnection does, and gets the pong. That
+        restore_vm makes the call is checked on a VM: without the probe, the restore of a
+        zeroed RAM template hangs (test_l1_damaged_entry, test_zeroed_ram_template_...)."""
         async with _FakeGuest(short_tmp_dir, []) as guest:
             channel = guest.channel()
             channel.mark_restored()
