@@ -4,7 +4,7 @@ These tests verify that orphan VMs (VMs where the host disconnected without
 proper cleanup) consume minimal CPU instead of busy-looping at 100%.
 
 The fix involves two components:
-1. vm_manager.py: QemuVM.destroy() now properly terminates processes
+1. qemu_vm.py: QemuVM.destroy() ends the QEMU and gvproxy processes
 2. guest-agent: Detects EPOLLHUP on virtio-serial disconnect and backs off
 
 Background:
@@ -15,20 +15,19 @@ Background:
 
 These tests intentionally orphan VMs to verify the fix works under various
 scenarios including:
-- Simple orphan (no destroy called)
+- Single orphan over ~15 s (no destroy called)
 - Orphan with network (gvproxy)
 - Multiple concurrent orphans
 """
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import psutil
 import pytest
 
 from exec_sandbox.models import Language
 from exec_sandbox.platform_utils import ProcessWrapper
-from exec_sandbox.qemu_vm import QemuVM
-from exec_sandbox.resource_cleanup import cleanup_vm_processes
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import skip_unless_hwaccel
@@ -37,6 +36,9 @@ from tests.cpu_helpers import (
     collect_cpu_samples,
     collect_cpu_samples_bulk,
 )
+
+if TYPE_CHECKING:
+    from exec_sandbox.qemu_vm import QemuVM
 
 
 def is_process_alive(proc: ProcessWrapper | None) -> bool:
@@ -49,19 +51,6 @@ def is_process_alive(proc: ProcessWrapper | None) -> bool:
         return False
 
 
-async def kill_vm_processes(vm: QemuVM) -> None:
-    """Kill VM QEMU and gvproxy processes for cleanup."""
-    await cleanup_vm_processes(
-        vm.process,
-        vm.gvproxy_proc,
-        vm_id=vm.vm_id,
-        qemu_term_timeout=1.0,
-        qemu_kill_timeout=1.0,
-        gvproxy_term_timeout=1.0,
-        gvproxy_kill_timeout=1.0,
-    )
-
-
 @pytest.mark.asyncio
 @skip_unless_hwaccel
 class TestOrphanVmCpu:
@@ -70,36 +59,6 @@ class TestOrphanVmCpu:
     Requires hwaccel: CPU idle measurement is meaningless under TCG — the
     TCG JIT thread always spins, so the orphan idle invariant cannot hold.
     """
-
-    async def test_orphan_vm_stays_idle(self, vm_manager: VmManager) -> None:
-        """Orphan VM (no destroy called) should use minimal CPU.
-
-        This test creates a VM, then lets it go out of scope without
-        calling destroy. The VM becomes orphaned when the host closes
-        the virtio-serial connection. The guest-agent should detect
-        POLLHUP and back off, keeping CPU usage minimal.
-        """
-        vm = await vm_manager.create_vm(
-            VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
-            tenant_id="test-orphan",
-            task_id="idle-test",
-        )
-
-        assert vm.process.pid is not None, "QEMU process should have a PID"
-
-        try:
-            # Close the channel but don't call destroy (simulate orphan)
-            await vm.channel.close()
-
-            # Wait for guest-agent to detect disconnect and back off
-            await asyncio.sleep(2)
-
-            # Percentile-based CPU measurement (absorbs CI noise)
-            samples = await collect_cpu_samples(vm.process, n_samples=10)
-            assert_cpu_idle(samples, label="orphan QEMU")
-
-        finally:
-            await kill_vm_processes(vm)
 
     async def test_orphan_vm_with_network_stays_idle(self, vm_manager: VmManager) -> None:
         """Orphan VM with network (gvproxy) should use minimal CPU.
@@ -110,6 +69,7 @@ class TestOrphanVmCpu:
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("example.com",)),
             tenant_id="test-orphan-net",
             task_id="idle-net-test",
+            cache_leases=(),
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -129,7 +89,7 @@ class TestOrphanVmCpu:
             assert_cpu_idle(gvproxy_samples, label="orphan gvproxy")
 
         finally:
-            await kill_vm_processes(vm)
+            await vm_manager.destroy_vm(vm)
 
     async def test_multiple_orphan_vms_stay_idle(self, vm_manager: VmManager) -> None:
         """Multiple orphan VMs should all stay idle.
@@ -147,6 +107,7 @@ class TestOrphanVmCpu:
                     VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
                     tenant_id="test-multi-orphan",
                     task_id=f"vm-{i}",
+                    cache_leases=(),
                 )
                 for i in range(num_vms)
             ]
@@ -168,7 +129,7 @@ class TestOrphanVmCpu:
 
         finally:
             for vm in vms:
-                await kill_vm_processes(vm)
+                await vm_manager.destroy_vm(vm)
 
     async def test_orphan_vm_cpu_over_time(self, vm_manager: VmManager) -> None:
         """Orphan VM CPU should remain low over extended period.
@@ -180,6 +141,7 @@ class TestOrphanVmCpu:
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-orphan-time",
             task_id="extended-test",
+            cache_leases=(),
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -194,7 +156,7 @@ class TestOrphanVmCpu:
             assert_cpu_idle(samples, label="orphan QEMU over time")
 
         finally:
-            await kill_vm_processes(vm)
+            await vm_manager.destroy_vm(vm)
 
 
 @pytest.mark.asyncio
@@ -213,6 +175,7 @@ class TestDestroyProcessCleanup:
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test-destroy",
             task_id="kill-test",
+            cache_leases=(),
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -220,13 +183,8 @@ class TestDestroyProcessCleanup:
         # Verify process is running
         assert is_process_alive(vm.process), "QEMU should be running before destroy"
 
-        # Call destroy (should kill process)
-        await vm.destroy()
-
-        # Wait a moment for process to die
-        await asyncio.sleep(1)
-
-        # Verify process is dead
+        # destroy() returns once the process is gone: no wait after it
+        assert await vm.destroy() is True
         assert not is_process_alive(vm.process), "QEMU process should be dead after destroy"
 
     async def test_destroy_kills_gvproxy_process(self, vm_manager: VmManager) -> None:
@@ -235,6 +193,7 @@ class TestDestroyProcessCleanup:
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=True, allowed_domains=("example.com",)),
             tenant_id="test-destroy-net",
             task_id="kill-gvproxy-test",
+            cache_leases=(),
         )
 
         assert vm.process.pid is not None, "QEMU process should have a PID"
@@ -245,10 +204,7 @@ class TestDestroyProcessCleanup:
         assert is_process_alive(vm.process), "QEMU should be running"
         assert is_process_alive(vm.gvproxy_proc), "gvproxy should be running"
 
-        # Call destroy
-        await vm.destroy()
-        await asyncio.sleep(1)
-
-        # Verify both are dead
+        # destroy() returns once both processes are gone: no wait after it
+        assert await vm.destroy() is True
         assert not is_process_alive(vm.process), "QEMU should be dead"
         assert not is_process_alive(vm.gvproxy_proc), "gvproxy should be dead"

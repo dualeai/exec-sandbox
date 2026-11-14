@@ -72,11 +72,18 @@ class TimingBreakdown(BaseModel):
 class StartupTiming(BaseModel):
     """How the session's VM started (Session.startup_timing). All times in ms, host-measured.
 
+    total_ms covers the new() or reuse() call only; each exec() has its own
+    time (ExecutionResult.timing.execute_ms).
+
     Phases do not overlap: total_ms = admission_ms + setup_ms + boot_ms
     (+ instance_load_ms after reuse(), + small unmeasured gaps). A warm pool hit
     has admission_ms = boot_ms = 0; an L1 restore has boot_ms = 0 and
     l1_restore_ms set; reuse() has boot_ms = 0 and setup_ms = the restore of the
     saved state.
+
+    After a cold boot, the first exec() starts the interpreter: its execute_ms
+    includes that start (about 0.2-0.7 s with KVM or HVF, 3-5 s under TCG) and
+    can be longer than total_ms. A warm-pool or L1 VM has its REPL started.
 
     The cold-boot parts add up to about 20-30 ms less than boot_ms, because some
     steps are not measured.
@@ -84,7 +91,7 @@ class StartupTiming(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    total_ms: int = Field(description="The whole new() or reuse() call")
+    total_ms: int = Field(description="The whole new() or reuse() call (exec() calls not included)")
     admission_ms: int = Field(description="Wait for a resource slot (0 for warm pool hits)")
     setup_ms: int = Field(
         description="Cache lookup, overlay, cgroup (after reuse(): the restore of the saved state); excludes admission and boot"
@@ -94,8 +101,10 @@ class StartupTiming(BaseModel):
     l1_cache_hit: bool = Field(description="The VM was restored from the L1 memory snapshot")
     l1_restore_ms: int | None = Field(description="L1 restore time (None unless l1_cache_hit)")
     overlay_ms: int = Field(description="Overlay acquisition (cold boot only, else 0)")
-    qemu_cmd_build_ms: int = Field(description="Command build, socket cleanup, channel creation (cold boot only)")
-    gvproxy_start_ms: int = Field(description="gvproxy start (cold boot with network only)")
+    qemu_cmd_build_ms: int = Field(description="QEMU command build (cold boot only, else 0)")
+    gvproxy_start_ms: int = Field(
+        description="gvproxy start up to its process (cold boot with network only; its ready wait is in guest_wait_ms)"
+    )
     qemu_fork_ms: int = Field(description="QEMU process fork/exec (cold boot only)")
     guest_wait_ms: int = Field(description="Wait for the guest agent (cold boot only)")
     boot_retries: int = Field(description="Boot retries after CPU contention (0 = first try or no boot)")

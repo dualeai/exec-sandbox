@@ -51,6 +51,7 @@ class TestZramConfiguration:
             VmSpec(language=Language.PYTHON, memory_mb=192, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="zram-config-192mb",
+            cache_leases=(),
         )
         try:
             result = await vm.execute(
@@ -283,6 +284,8 @@ while True:
 """
 
 
+# slow: not for its time (about 1 s) but to run alone (-n 0): its memory pressure slows the VMs of
+# parallel tests, and their time limits fail (a QMP stop, a sudo bound: 2 of 3 runs)
 @pytest.mark.slow
 @skip_unless_hwaccel
 class TestZramMemLimit:
@@ -373,6 +376,8 @@ class TestZramMemLimit:
 class TestConcurrentVMs:
     """Tests for multiple VMs running concurrently with memory features."""
 
+    # slow: not for its time (about 1 s) but to run alone (-n 0): its memory pressure slows the VMs of
+    # parallel tests, and their time limits fail (a QMP stop, a sudo bound: 2 of 3 runs)
     @pytest.mark.slow
     @skip_unless_fast_virt
     async def test_concurrent_vms_with_heavy_memory_pressure(self, images_dir: Path) -> None:

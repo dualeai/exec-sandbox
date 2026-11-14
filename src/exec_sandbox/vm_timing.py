@@ -13,19 +13,26 @@ class VmTiming:
 
     All values are in milliseconds. None indicates the timing was not recorded
     (e.g., feature was disabled or error occurred before that phase).
+    VmManager sets them (create_vm; restore_vm sets only setup_ms and boot_ms).
 
     High-level timing:
-        setup_ms: Total time for resource setup (overlay, cgroup, etc.)
-        boot_ms: Total time for VM boot (kernel + guest agent init)
+        setup_ms: Total time for resource setup (working folder, overlay, cgroup, channel);
+            for a restore (L1 or saved instance), the whole restore
+        boot_ms: Time from the end of setup to a ready guest agent (QEMU command build,
+            gvproxy start, QEMU spawn, kernel and guest agent init); 0 for a restore
 
     Granular setup timing:
         overlay_ms: Time to acquire overlay from pool or create new
 
     Granular boot timing:
         qemu_cmd_build_ms: Time to build QEMU command line
-        gvproxy_start_ms: Time to start gvproxy (0 if network disabled)
+        gvproxy_start_ms: Time to start the gvproxy process (0 if network disabled); its ready
+            wait overlaps the boot (in guest_wait_ms)
         qemu_fork_ms: Time for QEMU process fork/exec
         guest_wait_ms: Time waiting for guest agent ready signal
+
+    Retries:
+        boot_retries: Boot attempts that failed before the one that succeeded (create_vm)
     """
 
     # High-level timing (aggregates)

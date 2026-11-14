@@ -31,8 +31,3 @@ VALID_STATE_TRANSITIONS: dict[VmState, set[VmState]] = {
     VmState.DESTROYING: {VmState.DESTROYED},
     VmState.DESTROYED: set(),  # Terminal state - no transitions allowed
 }
-
-# Validate all states have transition rules defined
-if set(VmState) != set(VALID_STATE_TRANSITIONS.keys()):
-    _missing = set(VmState) - set(VALID_STATE_TRANSITIONS.keys())
-    raise RuntimeError(f"Missing states in transition table: {_missing}")
