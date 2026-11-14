@@ -259,8 +259,8 @@ for v in sorted(versions, reverse=True):
 # channel-rust-X.Y.toml tracks that minor's newest patch — the exact artifact
 # the rust:X.Y-slim image tag ships, so its date gates what is consumed).
 # Output: "<major.minor> <channel-date>". When the walk exhausts (cap, major
-# rollover, or missing manifest) the newest too-young pair is returned and
-# the CALLER's gate freezes to the previous lock pin.
+# rollover, or missing manifest) the last (oldest) too-young pair it fetched
+# is returned and the CALLER's gate freezes to the previous lock pin.
 #
 # Section-scoped parse: manifests list sections alphabetically and
 # [pkg.cargo] carries a version line (0.x) BEFORE [pkg.rust]. Each ~850KB

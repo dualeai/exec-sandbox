@@ -2,8 +2,8 @@
 # CI resource monitor for runner crash diagnosis
 # Prints system metrics every MONITOR_INTERVAL seconds to stderr, prefixed with [MONITOR].
 # Uses stderr to avoid interleaving with pytest stdout mid-line.
-# GitHub Actions captures both fds, so metrics printed before a crash
-# will be visible even if the runner dies (no logs survive a hard kill).
+# GitHub Actions streams both fds to the job log, so the metrics printed
+# before a runner crash stay visible; a hard kill leaves no other logs.
 #
 # Usage: ./scripts/ci-resource-monitor.sh &
 # Environment: MONITOR_INTERVAL=30 (default)

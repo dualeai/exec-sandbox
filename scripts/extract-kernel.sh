@@ -1,9 +1,10 @@
 #!/bin/bash
 # Build custom kernel and initramfs for QEMU microVM
 #
-# Orchestrates kernel build (build-kernel.sh) and initramfs creation
-# (build-initramfs.sh). The custom kernel has all boot-critical drivers
-# built-in (CONFIG_MODULES=n), eliminating module loading entirely.
+# Orchestrates kernel build (build-kernel.sh), vmlinux extraction for x86_64
+# (extract-vmlinux.sh) and initramfs creation (build-initramfs.sh). The
+# custom kernel has all boot-critical drivers built-in (CONFIG_MODULES=n),
+# eliminating module loading entirely.
 #
 # Usage:
 #   ./scripts/extract-kernel.sh              # Build for current arch
@@ -125,8 +126,8 @@ extract_for_arch() {
 
     # vmlinux (uncompressed ELF for PVH direct boot) has no .hash sidecar —
     # it's derived from vmlinuz and only matters for x86_64. If vmlinuz is
-    # cached but vmlinux is missing (e.g. first build after adding PVH support,
-    # or a prior build that failed extraction), we must still run extraction.
+    # cached but vmlinux is missing (e.g. a prior build failed extraction),
+    # we must still run extraction.
     local need_vmlinux=false
     if [ "$target_arch" = "x86_64" ] && [ ! -f "$OUTPUT_DIR/vmlinux-x86_64" ]; then
         need_vmlinux=true
@@ -139,8 +140,8 @@ extract_for_arch() {
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Build custom kernel if needed (build-kernel.sh handles its own caching internally,
-    # but we also track the hash here for the outer cache layer)
+    # Build custom kernel if needed. build-kernel.sh reads the vmlinuz .hash
+    # sidecar but never writes it; this script writes it after the build.
     if [ "$need_kernel" = true ]; then
         "$SCRIPT_DIR/build-kernel.sh" "$target_arch"
         save_hash "$vmlinuz_file" "$kernel_hash"
@@ -149,12 +150,13 @@ extract_for_arch() {
     # Extract uncompressed vmlinux for PVH direct boot (x86_64 only, ~50ms faster).
     #
     # vmlinux is the raw ELF kernel extracted from the compressed vmlinuz
-    # (bzImage). QEMU's -kernel flag with microvm/PVH uses it to skip the
-    # real-mode boot stub, saving ~50ms per VM boot.
+    # (bzImage). QEMU's -kernel flag boots it through the PVH entry point,
+    # which skips the real-mode setup and the in-guest decompression,
+    # saving ~50ms per VM boot.
     #
     # Extraction runs when:
     #   - vmlinux is missing (first build, or prior build failed extraction)
-    #   - vmlinuz was freshly rebuilt (kernel version changed)
+    #   - vmlinuz was freshly rebuilt (kernel inputs changed)
     # When both vmlinuz and vmlinux exist and vmlinuz is unchanged, skip.
     #
     # aarch64 does not use vmlinux — Image (flat binary) is loaded directly
@@ -174,7 +176,7 @@ extract_for_arch() {
             chmod 644 "$vmlinux_file"
             # Verify PVH note (XEN_ELFNOTE_PHYS32_ENTRY) — the ELF note that
             # tells QEMU/KVM where to jump for PVH boot. Without it, QEMU
-            # falls back to real-mode boot, negating the latency win.
+            # refuses to boot the ELF kernel.
             # Uses Docker because readelf is not installed on macOS hosts.
             if ! docker run --rm -v "$OUTPUT_DIR:/output" --platform linux/amd64 \
                 "alpine:${ALPINE_VERSION}@${ALPINE_IMAGE_DIGEST}" sh -c "apk add --no-cache binutils >/dev/null 2>&1 && readelf -n /output/vmlinux-x86_64 2>/dev/null | grep -q Xen"; then
