@@ -41,10 +41,10 @@ import psutil
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.cgroup import can_contain_processes
-from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.files.disk import make_private_dir
 from exec_sandbox.platform_utils import HostOS, ProcessWrapper, child_env, detect_host_os
-from exec_sandbox.system_probes import posix_acl_xattr
+from exec_sandbox.system_probes import posix_acl_xattr, run_probe
 
 # macOS <sys/acl.h>
 _ACL_TYPE_EXTENDED = 0x00000100
@@ -62,13 +62,11 @@ class _ProbeCache:
 
     qemu_vm_user: bool | None = None
     qemu_as_qemu_vm: bool | None = None  # The QEMU identity of this process (one decision)
-    setfacl_available: bool | None = None
 
     def reset(self) -> None:
         """Forget every result (tests: a probe a test mocked must not stay for the next test)."""
         self.qemu_vm_user = None
         self.qemu_as_qemu_vm = None
-        self.setfacl_available = None
 
 
 _probe_cache = _ProbeCache()
@@ -121,6 +119,44 @@ def make_owned_dir(path: Path, *, setting: str) -> None:
             hint=problem[1],
             instance_id=None,
         )
+
+
+_CACHE_DIR_SETUP_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOTDIR, errno.ELOOP, errno.EEXIST})
+"""Errors of a cache folder that the same call gets again: no access, a read-only disk, a file
+in its path or in its place, a symlink loop."""
+
+
+def cache_dir_error(e: OSError, *, path: Path, failure: str, setting: str) -> ConfigError | TransientError:
+    """The error of cache folder `path` (chosen by `setting`) that `failure` names. One the
+    setting fixes (_CACHE_DIR_SETUP_ERRNOS) is ConfigError SETTING_INVALID. Any other is this
+    host's and can pass later (disk full, quota, I/O error, out of file handles):
+    TransientError LOCAL_DISK."""
+    message = f"Cache folder {path} {failure}: {e.strerror or type(e).__name__}"
+    context = {"cache_dir": str(path), "errno": e.errno}
+    if e.errno in _CACHE_DIR_SETUP_ERRNOS:
+        return ConfigError(
+            message,
+            code=ErrorCode.SETTING_INVALID,
+            context=context,
+            hint=f"Set {setting} to a folder this user can write, on a writable disk.",
+            instance_id=None,
+        )
+    return TransientError(message, code=ErrorCode.LOCAL_DISK, context=context, hint=None, instance_id=None)
+
+
+def make_cache_dir(path: Path, *, setting: str) -> None:
+    """make_owned_dir for a cache folder the library makes itself.
+
+    Raises:
+        ConfigError: SETTING_INVALID, naming `setting` and the fix: a folder that is not
+            private (make_owned_dir), or that cannot be made (no access, a read-only disk, a
+            file in its path or in its place, a symlink loop)
+        TransientError: LOCAL_DISK: a host error (disk full, quota, I/O error)
+    """
+    try:
+        make_owned_dir(path, setting=setting)
+    except OSError as e:
+        raise cache_dir_error(e, path=path, failure="cannot be made", setting=setting) from e
 
 
 def private_dir_problem(root: Path, st: os.stat_result, *, forbidden: int) -> tuple[str, str] | None:
@@ -391,41 +427,18 @@ def get_expected_socket_uid(use_qemu_vm_user: bool) -> int:
 
 
 async def probe_qemu_vm_user() -> bool:
-    """Check if qemu-vm user exists for process isolation (cached).
+    """Whether the qemu-vm user exists for process isolation (Linux only; cached).
 
-    Returns False on macOS since qemu-vm user is Linux-only.
-
-    Returns:
-        True if qemu-vm user exists, False otherwise
+    The first call reads the user database (get_qemu_vm_uid) in a worker thread: for a
+    missing user, NSS may ask LDAP or SSSD over the network.
     """
-    # Fast path: return cached result
-    if _probe_cache.qemu_vm_user is not None:
-        return _probe_cache.qemu_vm_user
-
-    # Skip on non-Linux - not applicable
-    if detect_host_os() != HostOS.LINUX:
-        _probe_cache.qemu_vm_user = False
-        return False
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/bin/id",
-            "qemu-vm",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
-        )
-        await asyncio.wait_for(proc.wait(), timeout=5)
-        _probe_cache.qemu_vm_user = proc.returncode == 0
-        if _probe_cache.qemu_vm_user:
+    if _probe_cache.qemu_vm_user is None:
+        exists = detect_host_os() == HostOS.LINUX and await asyncio.to_thread(get_qemu_vm_uid) is not None
+        if exists:
             logger.info("qemu-vm user available (process isolation enabled)")
         else:
             logger.debug("qemu-vm user not found (process isolation disabled)")
-    except (OSError, TimeoutError) as e:
-        logger.debug(f"qemu-vm user probe failed: {e}")
-        _probe_cache.qemu_vm_user = False
-
+        _probe_cache.qemu_vm_user = exists
     return _probe_cache.qemu_vm_user
 
 
@@ -448,7 +461,7 @@ async def probe_qemu_as_qemu_vm() -> bool:
     """
     if _probe_cache.qemu_as_qemu_vm is not None:
         return _probe_cache.qemu_as_qemu_vm
-    if detect_host_os() != HostOS.LINUX or not await probe_qemu_vm_user():
+    if not await probe_qemu_vm_user():  # Linux only
         decision, problem = False, None
     elif os.geteuid() == get_qemu_vm_uid():
         decision, problem = False, None  # QEMU already runs as qemu-vm: no sudo
@@ -573,29 +586,20 @@ async def _qemu_vm_path_problem() -> str | None:
             "inside), and only a cgroup ends a qemu-vm QEMU and proves its end; see the README's cgroup setup"
         )
     # Each sudo of the probe runs with -k: cached credentials (a sudo typed in this terminal
-    # minutes ago) would pass now and fail every later VM start when they expire.
+    # minutes ago) would pass now and fail every later VM start when they expire. Each is
+    # bounded (run_probe): a stuck sudo (PAM, SSSD, a hostname lookup) gives a problem, not
+    # a VM start that never ends.
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "sudo",
-            "-n",
-            "-k",
-            *_AS_QEMU_VM,
-            "/bin/sh",
-            "-c",
-            "umask; id -g",
-            stdin=asyncio.subprocess.DEVNULL,
+        returncode, stdout, _ = await run_probe(
+            ("sudo", "-n", "-k", *_AS_QEMU_VM, "/bin/sh", "-c", "umask; id -g"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
     except (OSError, TimeoutError) as e:
         return f"`sudo -n -u qemu-vm` could not run ({e}); add `<user> ALL=(qemu-vm) NOPASSWD: ALL` to sudoers"
     lines = stdout.decode(errors="replace").split()
-    if proc.returncode != 0 or len(lines) != 2 or not all(line.isdigit() for line in lines):  # noqa: PLR2004
-        return (
-            f"`sudo -n -u qemu-vm` failed (exit {proc.returncode}); add `<user> ALL=(qemu-vm) NOPASSWD: ALL` to sudoers"
-        )
+    if returncode != 0 or len(lines) != 2 or not all(line.isdigit() for line in lines):  # noqa: PLR2004
+        return f"`sudo -n -u qemu-vm` failed (exit {returncode}); add `<user> ALL=(qemu-vm) NOPASSWD: ALL` to sudoers"
     umask, gid = int(lines[0], 8), int(lines[1])
     if umask & stat.S_IWGRP:
         return f"commands run as qemu-vm get umask {lines[0]}: QEMU sockets would have no group write"
@@ -614,9 +618,13 @@ async def _qemu_vm_path_problem() -> str | None:
             ("chown", ["-k", "chown", "qemu-vm:qemu-vm", str(probe)]),
             ("rm", ["-k", "rm", "-rf", str(folder)]),
         ):
-            proc = await sudo_exec(run)
-            await proc.communicate()
-            if proc.returncode != 0:
+            try:
+                returncode, _, _ = await run_probe(
+                    ("sudo", "-n", *run), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+            except (OSError, TimeoutError):
+                returncode = None
+            if returncode != 0:
                 return f"`sudo -n {command}` as root does not work; add the sudoers lines of the README"
     finally:
         await asyncio.to_thread(shutil.rmtree, folder, ignore_errors=True)
@@ -628,32 +636,6 @@ async def _qemu_vm_path_problem() -> str | None:
 # =============================================================================
 
 
-async def _probe_setfacl() -> bool:
-    """Check if setfacl is available (cached)."""
-    if _probe_cache.setfacl_available is not None:
-        return _probe_cache.setfacl_available
-
-    if detect_host_os() != HostOS.LINUX:
-        _probe_cache.setfacl_available = False
-        return False
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "setfacl",
-            "--version",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
-        )
-        await asyncio.wait_for(proc.wait(), timeout=5)
-        _probe_cache.setfacl_available = proc.returncode == 0
-    except (OSError, TimeoutError):
-        _probe_cache.setfacl_available = False
-
-    return _probe_cache.setfacl_available
-
-
 async def set_acl_user(paths: Sequence[Path], *, user: str, perms: str) -> bool:
     """Set the ACL entry of one user on files: setfacl -m u:{user}:{perms} {paths} (one process).
 
@@ -663,11 +645,8 @@ async def set_acl_user(paths: Sequence[Path], *, user: str, perms: str) -> bool:
         perms: Permission string (e.g., "rw", "rwx", "r"); replaces the user's entry
 
     Returns:
-        True if successful, False otherwise (including on macOS)
+        True if successful, False otherwise (no setfacl, as on macOS: the exec fails)
     """
-    if not await _probe_setfacl():
-        return False
-
     try:
         proc = await asyncio.create_subprocess_exec(
             "setfacl",
@@ -695,34 +674,18 @@ async def set_acl_user(paths: Sequence[Path], *, user: str, perms: str) -> bool:
 # =============================================================================
 
 
-async def chmod_async(path: Path, mode: str) -> bool:
-    """Change file mode bits asynchronously.
+_ALL_X: Final = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
 
-    Args:
-        path: File or directory path
-        mode: Mode string - octal ('755') or symbolic ('a+x', 'u+rw')
 
-    Returns:
-        True if successful, False otherwise
-    """
+def _add_execute_bits(folder: Path, mode: int) -> bool:
+    """chmod a+x on `folder`, whose mode is `mode` (get_mode). One metadata call, direct as
+    get_mode. False when it fails (a folder of another user)."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "chmod",
-            mode,
-            str(path),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_env(),
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.debug(f"chmod {mode} {path} failed: {stderr.decode().strip()}")
-            return False
-        return True
+        folder.chmod(stat.S_IMODE(mode) | _ALL_X)
     except OSError as e:
-        logger.debug(f"chmod failed: {e}")
+        logger.debug(f"chmod a+x {folder} failed: {e.strerror or e}")
         return False
+    return True
 
 
 async def chmod_executable(path: Path) -> None:
@@ -811,18 +774,14 @@ async def chown_async(path: Path, user: str, group: str, *, owner_uid: int) -> b
 # =============================================================================
 
 
-async def sudo_exec(
-    args: list[str],
-    stdout: int | None = asyncio.subprocess.PIPE,
-    stderr: int | None = asyncio.subprocess.PIPE,
-) -> ProcessWrapper:
+async def sudo_exec(args: list[str], *, stdout: int, stderr: int) -> ProcessWrapper:
     """Run command with `sudo -n` in a new session: never a password prompt (with a terminal,
     sudo would wait for one and the caller would hang); without a NOPASSWD rule the command fails.
 
     Args:
         args: Command and arguments (without 'sudo -n' prefix)
-        stdout: stdout handling (default PIPE)
-        stderr: stderr handling (default PIPE)
+        stdout: stdout handling (asyncio.subprocess.DEVNULL, PIPE or a file descriptor)
+        stderr: stderr handling (the same)
 
     Returns:
         ProcessWrapper for the sudo process
@@ -948,6 +907,8 @@ def _keep(path: str, processes: list[psutil.Process]) -> None:
 
 
 def _sudo_children(pid: int | None) -> list[psutil.Process]:
+    """What sudo `pid` started, at every level (the root rm), or none when sudo ended or
+    cannot be read."""
     try:
         return psutil.Process(pid).children(recursive=True)
     except (psutil.Error, ValueError):  # ended (NoSuchProcess), or not readable
@@ -1043,23 +1004,18 @@ async def sudo_rm(path: Path) -> bool:
 
 
 async def grant_qemu_vm_access(path: Path) -> bool:
-    """Grant qemu-vm user read/write access to a file via ACL.
+    """Grant qemu-vm user read/write access to a file via ACL, for a process that runs QEMU
+    as qemu-vm (probe_qemu_as_qemu_vm: the user exists).
 
     This is more secure than chmod 666 as it only grants access to
     the specific user that needs it.
-
-    No-op if qemu-vm user doesn't exist or on macOS.
 
     Args:
         path: File path (typically a socket)
 
     Returns:
-        True if ACL was set, False if skipped or failed
+        True if ACL was set, False if it failed
     """
-    if not await probe_qemu_vm_user():
-        logger.debug("qemu-vm user not available, skipping ACL")
-        return False
-
     return await set_acl_user([path], user="qemu-vm", perms="rw")
 
 
@@ -1152,18 +1108,6 @@ def grant_qemu_vm_dir_access(path: Path) -> bool:
     return st.st_gid == gid and stat.S_IMODE(st.st_mode) == QEMU_VM_DIR_MODE
 
 
-async def grant_qemu_vm_private_file_access(path: Path) -> bool:
-    """Grant qemu-vm read+write on a private (0600) file by ACL, plus parent traversal.
-
-    The host keeps owning the file (it can still read, copy and delete it
-    without sudo); other accounts get nothing. Needs setfacl.
-
-    Returns:
-        True if access was granted, False if any step failed
-    """
-    return await grant_qemu_vm_acl([path], perms="rw")
-
-
 async def grant_qemu_vm_acl(paths: Sequence[Path], *, perms: str) -> bool:
     """Give qemu-vm exactly `perms` ("r", "rw") on files this process owns, by ACL, and make
     the folders above them traversable (ensure_traversable).
@@ -1206,8 +1150,8 @@ async def ensure_traversable(path: Path) -> bool:
     """Make every folder above `path` traversable (a+x) for the qemu-vm user, innermost
     first; the filesystem root is left as it is.
 
-    Checks the mode of each folder first and spawns `chmod a+x` only when an
-    execute bit is missing (every VM start checks ~6 parents; most already pass).
+    Checks the mode of each folder first and runs chmod only when an execute bit is
+    missing (every VM start checks ~6 parents; most already pass).
 
     Args:
         path: File whose parent folders qemu-vm must traverse
@@ -1215,12 +1159,11 @@ async def ensure_traversable(path: Path) -> bool:
     Returns:
         True if all folders were made traversable, False if any failed
     """
-    all_x = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
     success = True
     for dir_path in list(path.parents)[:-1]:
         mode = get_mode(dir_path)
-        if mode is not None and mode & all_x == all_x:
+        if mode is not None and mode & _ALL_X == _ALL_X:
             continue
-        if not await chmod_async(dir_path, "a+x"):
+        if mode is None or not _add_execute_bits(dir_path, mode):
             success = False
     return success

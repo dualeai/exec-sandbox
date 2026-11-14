@@ -41,7 +41,11 @@ class TestKvmAccess:
         else:
             (record,) = warnings
             assert record.levelno == logging.WARNING
-            assert "sudo usermod -aG kvm $USER" in record.getMessage()
+            assert record.getMessage() == (
+                "KVM not available: this user cannot read and write /dev/kvm, so VMs use software emulation "
+                "(TCG, about 5-8 times slower). Add the user to the kvm group (sudo usermod -aG kvm $USER), "
+                "then log in again."
+            )
 
 
 async def _no_subprocess(*_args: object, **_kwargs: object) -> object:
@@ -73,8 +77,14 @@ class TestSetprivProbe:
         assert results == [works] * 3
         assert calls.read_text() == "--pdeathsig KILL -- /bin/sh -c :\n"  # cached: one run
         warnings = [r.getMessage() for r in caplog.records if "setpriv" in r.getMessage()]
-        assert len(warnings) == (0 if works else 1)
-        assert works or "util-linux 2.33" in warnings[0]
+        assert warnings == (
+            []
+            if works
+            else [
+                "setpriv --pdeathsig unavailable (util-linux 2.33+): each child that ends with this process "
+                "(QEMU as this user, gvproxy, qemu-storage-daemon) starts through a fork of this process"
+            ]
+        )
 
     async def test_missing_setpriv_is_false(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PATH", str(tmp_path))  # no setpriv there
@@ -84,6 +94,36 @@ class TestSetprivProbe:
     async def test_false_off_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(system_probes, "detect_host_os", lambda: HostOS.MACOS)
         assert await probe_setpriv_pdeathsig() is False
+
+
+class TestProbeCommands:
+    """A probe command (run_probe) that does not end, or whose probe is cancelled, is killed
+    and reaped before the probe ends: no probe leaves a process behind."""
+
+    @pytest.mark.parametrize("end", ["timeout", "cancel"])
+    async def test_a_probe_leaves_no_process(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, end: str) -> None:
+        """A QEMU that never answers --version. Its pid comes through a FIFO: the test reads it
+        once the stand-in runs. The version probe gives up at its bound (None), or is
+        cancelled; either way the stand-in is gone when the probe ends."""
+        pid_pipe = tmp_path / "pid"
+        os.mkfifo(pid_pipe)
+        qemu = tmp_path / "qemu-system"
+        qemu.write_text(f"#!/bin/sh\necho $$ > {pid_pipe}\nexec sleep 30\n")
+        qemu.chmod(0o755)
+        for name in ("EXEC_SANDBOX_QEMU_BIN_X86", "EXEC_SANDBOX_QEMU_BIN_ARM"):
+            monkeypatch.setenv(name, str(qemu))
+        monkeypatch.setattr(system_probes, "_PROBE_TIMEOUT_SECONDS", 0.5)
+
+        probe = asyncio.create_task(system_probes.probe_qemu_version())
+        pid = int(await asyncio.to_thread(pid_pipe.read_text))
+        if end == "cancel":
+            probe.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await probe
+        else:
+            assert await probe is None
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 class TestDirectIoProbe:
@@ -129,7 +169,7 @@ class TestDirectIoProbe:
         ]
         assert list(tmp_path.iterdir()) == []  # the file the kernel made before it refused goes too
 
-    async def test_another_probe_error_is_this_saves_only(
+    async def test_another_open_error_is_not_cached(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """No space, a quota, file handles: the device may take O_DIRECT; the next save probes again."""
@@ -139,7 +179,9 @@ class TestDirectIoProbe:
             assert await system_probes.probe_direct_io(tmp_path) is False
 
         assert len(flags_seen) == 2  # not cached
-        assert all(r.getMessage().startswith("O_DIRECT probe of the folder failed") for r in caplog.records)
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            "O_DIRECT probe of the folder failed: writes there are buffered this time"
+        ] * 2  # one per call
         assert list(tmp_path.iterdir()) == []
 
     async def test_an_os_with_no_o_direct_answers_no(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -321,8 +363,8 @@ class TestProbeCache:
         cache.reset(attr)
         assert getattr(cache, attr) == {}
         system_probes.probe_cache.reset(attr)
-        if attr == "direct_io":
-            assert await system_probes.probe_direct_io(tmp_path) in (True, False)
+        if attr == "direct_io":  # a disk folder takes O_DIRECT where the OS has it (macOS has none)
+            assert await system_probes.probe_direct_io(tmp_path) is hasattr(os, "O_DIRECT")
         else:
             assert system_probes.posix_acl_xattr(tmp_path) is None  # a new folder: no ACL beyond its mode
 

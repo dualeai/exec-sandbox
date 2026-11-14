@@ -16,13 +16,14 @@ import resource
 import sys
 import time
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from functools import wraps
 from pathlib import Path
 from typing import Any, ClassVar, Final, ParamSpec, TypeVar, cast
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
+from exec_sandbox.aio_utils import await_cancellation_safe
 from exec_sandbox.cgroup import CGROUP_V2_BASE_PATH, cgroup_v2_available, resolve_self_cgroup_v2
 from exec_sandbox.exceptions import ErrorCode, SandboxError, spawn_error
 from exec_sandbox.files.disk import LINUX_MEMORY_FILESYSTEMS, OVERLAYFS_SUPER_MAGIC, overlay_upper, statfs_type
@@ -40,7 +41,6 @@ __all__ = [
     "ProbeCache",
     "can_access",
     "check_hvf_available",
-    "check_hwaccel_available",
     "check_kvm_available",
     "check_tsc_deadline",
     "detect_accel_type",
@@ -59,10 +59,13 @@ __all__ = [
     "qemu_unrunnable_error",
     "raise_fd_limit",
     "raise_nproc_limit",
+    "run_probe",
     "warn_cgroup_pids_limit",
+    "warn_damon",
     "warn_max_map_count",
     "warn_overcommit",
     "warn_threads_max",
+    "warn_zswap",
 ]
 
 # ============================================================================
@@ -557,6 +560,34 @@ def _probed_qemu_binary() -> str:
     return qemu_system_binary(QemuBinaries(), arch=detect_host_arch())
 
 
+_PROBE_TIMEOUT_SECONDS: Final = 5.0
+"""Upper bound of a probe command (sysctl, `qemu -accel help`, a sudo): each ends in ms."""
+
+
+async def run_probe(cmd: Sequence[str], *, stdout: int, stderr: int) -> tuple[int | None, bytes, bytes]:
+    """Run the probe command `cmd` to its end (stdin /dev/null, child_env()), at most
+    _PROBE_TIMEOUT_SECONDS: (exit status, stdout, stderr). On the timeout or a cancel, the
+    command is killed and reaped before the call ends: no probe leaves a process behind.
+    stdout and stderr: asyncio.subprocess.PIPE or DEVNULL.
+
+    Raises:
+        OSError: the command did not start (FileNotFoundError: not found)
+        TimeoutError: it did not end within the bound
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=child_env()
+    )
+    try:
+        async with asyncio.timeout(_PROBE_TIMEOUT_SECONDS):
+            out, err = await proc.communicate()
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await await_cancellation_safe(proc.wait())
+        raise
+    return proc.returncode, out, err
+
+
 @_async_cached_probe("qemu_accels")
 async def probe_qemu_accelerators() -> set[str]:
     """Probe QEMU binary for available accelerators (cached).
@@ -579,21 +610,14 @@ async def probe_qemu_accelerators() -> set[str]:
     qemu_bin = _probed_qemu_binary()
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            qemu_bin,
-            "-accel",
-            "help",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_env(),
+        returncode, stdout, _ = await run_probe(
+            (qemu_bin, "-accel", "help"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode != 0:
+        if returncode != 0:
             logger.warning(
                 "QEMU accelerator probe failed",
-                extra={"qemu_bin": qemu_bin, "returncode": proc.returncode},
+                extra={"qemu_bin": qemu_bin, "returncode": returncode},
             )
             return set()
 
@@ -641,18 +665,12 @@ async def probe_qemu_version() -> tuple[int, int, int] | None:
     probe_cache.qemu_unrunnable = None
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            qemu_bin,
-            "--version",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
+        returncode, stdout, _ = await run_probe(
+            (qemu_bin, "--version"), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode != 0:
-            logger.warning("QEMU version probe failed", extra={"returncode": proc.returncode})
+        if returncode != 0:
+            logger.warning("QEMU version probe failed", extra={"returncode": returncode})
             return None
 
         # Parse "QEMU emulator version X.Y.Z" (handles suffixes like "(Homebrew)")
@@ -867,17 +885,16 @@ async def check_kvm_available() -> bool:
     # Some environments (nested VMs, containers) have /dev/kvm but it doesn't work
     # Uses subprocess to avoid blocking the event loop with ioctl()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-c",
-            f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
-            stdin=asyncio.subprocess.DEVNULL,
+        returncode, stdout, _ = await run_probe(
+            (
+                sys.executable,
+                "-c",
+                f"import fcntl; f=open('{kvm_path}','rb'); print(fcntl.ioctl(f.fileno(), {_KVM_GET_API_VERSION}))",
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode != 0:
+        if returncode != 0:
             logger.warning("KVM device accessible but ioctl failed")
             return False
 
@@ -929,17 +946,12 @@ async def check_hvf_available() -> bool:
     """
     try:
         # sysctl kern.hv_support returns 1 if Hypervisor.framework is available
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/sbin/sysctl",
-            "-n",
-            "kern.hv_support",
-            stdin=asyncio.subprocess.DEVNULL,
+        returncode, stdout, _ = await run_probe(
+            ("/usr/sbin/sysctl", "-n", "kern.hv_support"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        hvf_kernel_support = proc.returncode == 0 and stdout.decode().strip() == "1"
+        hvf_kernel_support = returncode == 0 and stdout.decode().strip() == "1"
 
         if not hvf_kernel_support:
             logger.debug("HVF not available: kern.hv_support is not enabled")
@@ -963,25 +975,6 @@ async def check_hvf_available() -> bool:
 
     logger.debug("HVF available and working (kernel + QEMU verified)")
     return True
-
-
-async def check_hwaccel_available() -> bool:
-    """Check if hardware acceleration (KVM or HVF) is available.
-
-    TCG (software emulation) is ~5-8x slower than hardware virtualization,
-    making timing-sensitive tests unreliable.
-
-    Returns:
-        True if KVM (Linux) or HVF (macOS) is available
-        False otherwise (will use TCG software emulation)
-    """
-    host_os = detect_host_os()
-
-    if host_os == HostOS.LINUX:
-        return await check_kvm_available()
-    if host_os == HostOS.MACOS:
-        return await check_hvf_available()
-    return False
 
 
 @_async_cached_probe("tsc_deadline")
@@ -1050,17 +1043,12 @@ async def _check_tsc_deadline_macos() -> bool:
     Note: Called from check_tsc_deadline() which handles caching and locking.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/sbin/sysctl",
-            "-n",
-            "machdep.cpu.features",
-            stdin=asyncio.subprocess.DEVNULL,
+        returncode, stdout, _ = await run_probe(
+            ("/usr/sbin/sysctl", "-n", "machdep.cpu.features"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
+        if returncode == 0:
             features = stdout.decode().upper()
             has_tsc = "TSC_DEADLINE" in features or "TSCDEAD" in features
             if has_tsc:
@@ -1272,30 +1260,23 @@ try:
 except Exception:
     sys.exit(3)  # Error
 """
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-c",
-            probe_script,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=child_env(),
+        returncode, _, _ = await run_probe(
+            (sys.executable, "-c", probe_script), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
         )
-        await asyncio.wait_for(proc.wait(), timeout=5)
 
-        if proc.returncode == 0:
+        if returncode == 0:
             logger.info(
                 "io_uring syscall available",
                 extra={"kernel": platform.release()},
             )
             return True
-        if proc.returncode == 1:
+        if returncode == 1:
             logger.info(
                 "io_uring syscall not available (ENOSYS)",
                 extra={"kernel": platform.release()},
             )
             return False
-        if proc.returncode == 2:  # noqa: PLR2004
+        if returncode == 2:  # noqa: PLR2004
             logger.warning(
                 "io_uring blocked by seccomp/container policy",
                 extra={"kernel": platform.release()},
@@ -1304,7 +1285,7 @@ except Exception:
 
         logger.warning(
             "io_uring probe failed with unexpected result",
-            extra={"exit_code": proc.returncode},
+            extra={"exit_code": returncode},
         )
         return False
 
@@ -1331,33 +1312,32 @@ async def probe_unshare_support() -> bool:
         True if unshare works, False otherwise (skip namespace isolation)
     """
     # Skip on non-Linux - unshare is Linux-specific
-    if detect_host_os() == HostOS.MACOS:
+    if detect_host_os() != HostOS.LINUX:
         return False
 
     try:
         # Test unshare with minimal namespaces (pid requires fork)
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/bin/unshare",
-            "--pid",
-            "--fork",
-            "--kill-child=SIGKILL",  # the VM command uses it: util-linux 2.32+
-            "--",
-            "/usr/bin/true",
-            stdin=asyncio.subprocess.DEVNULL,
+        returncode, _, stderr = await run_probe(
+            (
+                "/usr/bin/unshare",
+                "--pid",
+                "--fork",
+                "--kill-child=SIGKILL",  # the VM command uses it: util-linux 2.32+
+                "--",
+                "/usr/bin/true",
+            ),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=child_env(),
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode == 0:
+        if returncode == 0:
             logger.info("unshare available (namespace isolation enabled)")
             return True
 
         stderr_text = stderr.decode().strip() if stderr else ""
         logger.warning(
             "unshare unavailable (namespace isolation disabled)",
-            extra={"exit_code": proc.returncode, "stderr": stderr_text[:200]},
+            extra={"exit_code": returncode, "stderr": stderr_text[:200]},
         )
         return False
     except (OSError, TimeoutError) as e:
@@ -1377,26 +1357,17 @@ async def probe_setpriv_pdeathsig() -> bool:
         return False
     try:
         # The launch form: setpriv, then /bin/sh (subprocess_utils._launch_command)
-        proc = await asyncio.create_subprocess_exec(
-            "setpriv",
-            "--pdeathsig",
-            "KILL",
-            "--",
-            "/bin/sh",
-            "-c",
-            ":",
-            stdin=asyncio.subprocess.DEVNULL,
+        returncode, _, stderr = await run_probe(
+            ("setpriv", "--pdeathsig", "KILL", "--", "/bin/sh", "-c", ":"),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=child_env(),
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
     except (OSError, TimeoutError) as e:
         reason: dict[str, object] = {"error": str(e), "error_type": type(e).__name__}
     else:
-        if proc.returncode == 0:
+        if returncode == 0:
             return True
-        reason = {"exit_code": proc.returncode, "stderr": stderr.decode(errors="replace").strip()[:200]}
+        reason = {"exit_code": returncode, "stderr": stderr.decode(errors="replace").strip()[:200]}
     logger.warning(
         "setpriv --pdeathsig unavailable (util-linux 2.33+): each child that ends with this process "
         "(QEMU as this user, gvproxy, qemu-storage-daemon) starts through a fork of this process",

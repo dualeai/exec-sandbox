@@ -28,12 +28,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import psutil
 import pytest
 
-from exec_sandbox import constants, permission_utils
-from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox import constants, permission_utils, system_probes
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
 from exec_sandbox.permission_utils import (
     QEMU_VM_SUDO,
-    _probe_setfacl,
-    chmod_async,
+    _add_execute_bits,
     chmod_executable,
     chown_async,
     ensure_traversable,
@@ -44,6 +43,7 @@ from exec_sandbox.permission_utils import (
     grant_qemu_vm_acl,
     grant_qemu_vm_dir_access,
     grant_qemu_vm_file_access,
+    make_cache_dir,
     make_owned_dir,
     private_tree_problem,
     probe_qemu_as_qemu_vm,
@@ -484,6 +484,16 @@ class TestSudoRmChild:
         assert not folder.exists()
 
 
+async def _forked(marker: Path) -> None:
+    """Wait until the stand-in sudo has forked its rm: it writes the rm's pid to `marker` (10 s at most).
+    A poll: another process writes the file, so there is no event to wait on."""
+    for _ in range(1000):
+        if marker.exists() and marker.read_text().strip():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"the stand-in sudo did not fork its rm: no pid in {marker}")
+
+
 class TestSudoRmOutcomes:
     """What sudo_rm tells and keeps when sudo ends at the bound, fails, or leaves a root rm."""
 
@@ -706,9 +716,10 @@ class TestSudoRmOutcomes:
         second rm while they run."""
         folder = tmp_path / "vm-1"
         folder.mkdir()
-        TestSudoRmChild._stand_in(tmp_path, monkeypatch, "sleep 30 &\nexec sleep 30", bound=10.0)
+        forked = tmp_path / "forked"
+        TestSudoRmChild._stand_in(tmp_path, monkeypatch, f'sleep 30 &\necho $! > "{forked}"\nexec sleep 30', bound=10.0)
         call = asyncio.create_task(sudo_rm(folder))
-        await asyncio.sleep(1.0)  # the stand-in forked its rm
+        await _forked(forked)  # the stand-in forked its rm
         call.cancel()
         with pytest.raises(asyncio.CancelledError):
             await call
@@ -729,7 +740,8 @@ class TestSudoRmOutcomes:
         run: the next call starts no second rm on the same tree."""
         folder = tmp_path / "vm-1"
         folder.mkdir()
-        TestSudoRmChild._stand_in(tmp_path, monkeypatch, "sleep 30 &\nexec sleep 30", bound=1.0)
+        forked = tmp_path / "forked"
+        TestSudoRmChild._stand_in(tmp_path, monkeypatch, f'sleep 30 &\necho $! > "{forked}"\nexec sleep 30', bound=1.0)
         starts: list[list[str]] = []
         calls: list[asyncio.Task[bool]] = []
         waits = [0]
@@ -741,7 +753,7 @@ class TestSudoRmOutcomes:
             proc = await real_sudo_exec(args, **kwargs)
             if point == "spawn":
                 calls[0].cancel()
-            await asyncio.sleep(0.5)  # the stand-in forks its rm
+            await _forked(forked)  # the stand-in forks its rm
             return proc
 
         async def to_thread(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -849,20 +861,21 @@ class TestProbeQemuVmUser:
         assert await probe_qemu_vm_user() is exists
 
     async def test_cached_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """One `id qemu-vm` process for the life of this process, whatever the answer."""
-        spawned: list[tuple[str, ...]] = []
-        real_spawn = asyncio.create_subprocess_exec
+        """One user database lookup, in a worker thread, for the life of this process,
+        whatever the answer."""
+        lookups: list[object] = []
+        real_to_thread = asyncio.to_thread
 
-        async def counted_spawn(*cmd: str, **kwargs: Any) -> asyncio.subprocess.Process:
-            spawned.append(cmd)
-            return await real_spawn(*cmd, **kwargs)
+        async def counted_to_thread(func: Callable[[], object]) -> object:
+            lookups.append(func)
+            return await real_to_thread(func)
 
         monkeypatch.setattr("exec_sandbox.permission_utils.detect_host_os", lambda: HostOS.LINUX)
-        monkeypatch.setattr(permission_utils, "asyncio", asyncio_with(create_subprocess_exec=counted_spawn))
+        monkeypatch.setattr(permission_utils, "asyncio", asyncio_with(to_thread=counted_to_thread))
         first = await probe_qemu_vm_user()
 
         assert await probe_qemu_vm_user() is first
-        assert spawned == [("/usr/bin/id", "qemu-vm")]
+        assert lookups == [get_qemu_vm_uid]
 
     @skip_unless_macos
     async def test_false_on_macos(self) -> None:
@@ -872,14 +885,27 @@ class TestProbeQemuVmUser:
 
 
 class _Proc:
-    """An asyncio subprocess stand-in: its exit code and stdout."""
+    """An asyncio subprocess stand-in: its exit code and stdout; with `ends=False`, a command
+    that never ends until it is killed."""
 
-    def __init__(self, returncode: int, stdout: bytes) -> None:
-        self.returncode = returncode
+    def __init__(self, returncode: int, stdout: bytes, *, ends: bool = True) -> None:
+        self.returncode: int | None = returncode if ends else None
         self._stdout = stdout
+        self._end = asyncio.Event()
+        if ends:
+            self._end.set()
 
     async def communicate(self) -> tuple[bytes, bytes]:
+        await self._end.wait()
         return self._stdout, b""
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self._end.set()
+
+    async def wait(self) -> int | None:
+        await self._end.wait()
+        return self.returncode
 
 
 class TestLocalUsersWithPrimaryGroup:
@@ -955,28 +981,28 @@ class TestProbeQemuAsQemuVm:
         group_members: tuple[str, ...] = ("runner",),
         primary_group_users: tuple[str, ...] = ("qemu-vm",),
         extra_group_lines: str = "",
+        stuck: str | None = None,
     ) -> list[tuple[str, ...]]:
         """Patch the host; returns the list of commands the probe runs. This process's user is
         `runner`; qemu-vm's group (986) has `group_members`, and `primary_group_users` have it
-        as their primary group."""
+        as their primary group. The sudo of the command `stuck` (chown, rm) never ends."""
         commands: list[tuple[str, ...]] = []
 
         async def exec_(*cmd: str, **_kwargs: Any) -> _Proc:
             commands.append(cmd)
-            return _Proc(sudo_rc, sudo_report)
-
-        async def sudo_exec(args: list[str]) -> _Proc:
-            commands.append(("sudo", "-n", *args))  # what sudo_exec runs
-            if "chown" in args:
+            if stuck is not None and stuck in cmd:
+                return _Proc(0, b"", ends=False)
+            if "chown" in cmd:
                 return _Proc(0 if chown_ok else 1, b"")
-            return _Proc(rm_rc, b"")
+            if "rm" in cmd:
+                return _Proc(rm_rc, b"")
+            return _Proc(sudo_rc, sudo_report)
 
         mod = "exec_sandbox.permission_utils"
         monkeypatch.setattr(f"{mod}.detect_host_os", lambda: HostOS.LINUX)
         monkeypatch.setattr(f"{mod}.probe_qemu_vm_user", AsyncMock(return_value=True))
         monkeypatch.setattr(f"{mod}.get_qemu_vm_uid", lambda: 999)
-        monkeypatch.setattr(f"{mod}.asyncio.create_subprocess_exec", exec_)
-        monkeypatch.setattr(f"{mod}.sudo_exec", sudo_exec)
+        monkeypatch.setattr(system_probes, "asyncio", asyncio_with(create_subprocess_exec=exec_))  # run_probe
         monkeypatch.setattr(f"{mod}.os.geteuid", lambda: euid)
         monkeypatch.setattr(f"{mod}.os.getegid", lambda: 1000)
         monkeypatch.setattr(f"{mod}.os.getgroups", lambda: [1000, 986] if groups is None else groups)
@@ -1056,6 +1082,22 @@ class TestProbeQemuAsQemuVm:
         warnings = self._warnings(caplog)
         assert len(warnings) == 1
         assert reason in warnings[0]
+
+    @pytest.mark.parametrize(("command", "root_sudos"), [("chown", ["chown"]), ("rm", ["chown", "rm"])])
+    async def test_a_root_sudo_that_never_ends_falls_back_at_the_bound(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, command: str, root_sudos: list[str]
+    ) -> None:
+        """A sudo stuck in PAM, SSSD or a hostname lookup: the probe ends at its bound with
+        the step's warning, not never (each VM start waits for this probe)."""
+        commands = self._host(monkeypatch, stuck=command)
+        monkeypatch.setattr(system_probes, "_PROBE_TIMEOUT_SECONDS", 0.05)
+
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.permission_utils"):
+            assert await asyncio.wait_for(probe_qemu_as_qemu_vm(), timeout=5) is False
+
+        assert [c[3] for c in commands[1:]] == root_sudos
+        (warning,) = self._warnings(caplog)
+        assert warning.endswith(f"`sudo -n {command}` as root does not work; add the sudoers lines of the README")
 
     async def test_unreadable_passwd_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1144,50 +1186,21 @@ class TestQemuVmLaunchPrefix:
         assert stdout.decode().strip() == "0007"
 
 
-class TestChmodAsync:
-    """Tests for chmod_async function."""
+class TestAddExecuteBits:
+    """_add_execute_bits: chmod a+x from the mode get_mode read, or False."""
 
-    async def test_chmod_octal_mode(self, tmp_path: Path) -> None:
-        """chmod_async works with octal mode string."""
-        test_file = tmp_path / "test.txt"
-        test_file.write_text("content")
+    def test_keeps_the_other_bits(self, tmp_path: Path) -> None:
+        """A 0o2750 folder ends 0o2751: the setgid bit and the other bits stay."""
+        folder = tmp_path / "setgid"
+        folder.mkdir()
+        folder.chmod(0o2750)
 
-        result = await chmod_async(test_file, "644")
+        assert _add_execute_bits(folder, folder.stat().st_mode) is True
 
-        assert result is True
-        # Verify mode changed (mask with 0o777 to get permission bits)
-        assert (test_file.stat().st_mode & 0o777) == 0o644
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o2751
 
-    async def test_chmod_symbolic_mode(self, tmp_path: Path) -> None:
-        """chmod_async works with symbolic mode."""
-        test_file = tmp_path / "test.txt"
-        test_file.write_text("content")
-        test_file.chmod(0o600)
-
-        result = await chmod_async(test_file, "a+r")
-
-        assert result is True
-        # Verify readable by all
-        mode = test_file.stat().st_mode & 0o777
-        assert mode & 0o004  # Other read bit set
-
-    async def test_chmod_nonexistent_file(self, tmp_path: Path) -> None:
-        """chmod_async returns False for nonexistent file."""
-        nonexistent = tmp_path / "nonexistent.txt"
-
-        result = await chmod_async(nonexistent, "644")
-
-        assert result is False
-
-    async def test_chmod_directory(self, tmp_path: Path) -> None:
-        """chmod_async works on directories."""
-        test_dir = tmp_path / "testdir"
-        test_dir.mkdir()
-
-        result = await chmod_async(test_dir, "755")
-
-        assert result is True
-        assert (test_dir.stat().st_mode & 0o777) == 0o755
+    def test_missing_folder_returns_false(self, tmp_path: Path) -> None:
+        assert _add_execute_bits(tmp_path / "gone", 0o40700) is False
 
 
 class TestChmodExecutable:
@@ -1267,8 +1280,8 @@ class TestCanAccess:
 
 class TestEnsureTraversable:
     """ensure_traversable(path): a+x on every folder above `path` but the filesystem root,
-    innermost first, and only where an execute bit is missing. chmod_async is recorded, not
-    run, for the folders above tmp_path: they belong to the system."""
+    innermost first, and only where an execute bit is missing. _add_execute_bits is recorded,
+    not run, for the folders above tmp_path: they belong to the system."""
 
     @staticmethod
     async def _chmods(path: Path, *, tmp_path: Path, result: bool) -> tuple[bool, list[Path]]:
@@ -1277,14 +1290,13 @@ class TestEnsureTraversable:
         A real chmod for a folder in tmp_path when `result` is True; else `result`."""
         done: list[Path] = []
 
-        async def chmod(dir_path: Path, mode: str) -> bool:
-            assert mode == "a+x"
+        def chmod(dir_path: Path, mode: int) -> bool:
             done.append(dir_path)
             if result and dir_path.is_relative_to(tmp_path):
-                return await chmod_async(dir_path, mode)
+                return _add_execute_bits(dir_path, mode)
             return result
 
-        with patch("exec_sandbox.permission_utils.chmod_async", side_effect=chmod):
+        with patch("exec_sandbox.permission_utils._add_execute_bits", side_effect=chmod):
             ok = await ensure_traversable(path)
         return ok, done
 
@@ -1369,39 +1381,13 @@ class TestAclOperations:
 
         assert result is False
 
-    async def test_grant_qemu_vm_access_no_user(self, tmp_path: Path) -> None:
-        """grant_qemu_vm_access returns False if qemu-vm user doesn't exist."""
-        test_file = tmp_path / "test.sock"
-        test_file.write_text("")
-
-        # Mock probe to return False (no qemu-vm user)
-        with patch(
-            "exec_sandbox.permission_utils.probe_qemu_vm_user",
-            new_callable=AsyncMock,
-            return_value=False,
-        ):
-            result = await grant_qemu_vm_access(test_file)
-
-        assert result is False
-
 
 @skip_unless_linux
 class TestLinuxAclBinaries:
-    """Tests for Linux ACL binary availability.
-
-    These tests verify that setfacl is available on Linux.
-    They ASSERT (not skip) to catch missing binaries in CI.
-    """
-
-    async def test_setfacl_available(self) -> None:
-        """setfacl must be available on Linux."""
-        result = await _probe_setfacl()
-        assert result is True, "setfacl binary must be available on Linux"
+    """setfacl works on Linux: the test ASSERTS (not skips) to catch a missing binary in CI."""
 
     async def test_set_acl_works(self, tmp_path: Path) -> None:
-        """set_acl_user actually sets ACL on Linux."""
-        import pwd
-
+        """set_acl_user adds the user's entry with the permissions asked (getfacl reads it back)."""
         test_file = tmp_path / "acl_test.txt"
         test_file.write_text("content")
         current_user = pwd.getpwuid(os.getuid()).pw_name
@@ -1409,6 +1395,7 @@ class TestLinuxAclBinaries:
         result = await set_acl_user([test_file], user=current_user, perms="rw")
 
         assert result is True, "set_acl_user must succeed on Linux"
+        assert read_acl(test_file)[f"user:{current_user}"] == "rw-"
 
 
 class TestSudoRm:
@@ -1446,7 +1433,9 @@ class TestSudoNeverPrompts:
     async def test_sudo_exec(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = _record_calls(tmp_path, monkeypatch, "sudo", exit_code=0)
 
-        proc = await sudo_exec(["rm", "-rf", "/x"])
+        proc = await sudo_exec(
+            ["rm", "-rf", "/x"], stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
         await proc.communicate()
 
         assert calls() == [["-n", "rm", "-rf", "/x"]]
@@ -1508,6 +1497,49 @@ class TestGrantReadAccess:
         assert stat.S_IMODE(key.stat().st_mode) == 0o600
 
 
+class TestMakeCacheDir:
+    """make_cache_dir: a folder the setting can fix is ConfigError SETTING_INVALID naming the
+    setting; a host error is TransientError LOCAL_DISK (it can pass later)."""
+
+    def test_a_file_in_the_path_is_a_setting_to_fix(self, tmp_path: Path) -> None:
+        (tmp_path / "file").write_bytes(b"")
+        with pytest.raises(ConfigError) as exc:
+            make_cache_dir(tmp_path / "file" / "cache", setting="EXEC_SANDBOX_CACHE_DIR")
+        assert exc.value.code is ErrorCode.SETTING_INVALID
+        assert exc.value.context["errno"] == errno.ENOTDIR
+        assert exc.value.hint is not None
+        assert "EXEC_SANDBOX_CACHE_DIR" in exc.value.hint
+
+    @pytest.mark.parametrize(
+        ("error", "expected", "code"),
+        [
+            (errno.EACCES, ConfigError, ErrorCode.SETTING_INVALID),
+            (errno.EROFS, ConfigError, ErrorCode.SETTING_INVALID),
+            (errno.EEXIST, ConfigError, ErrorCode.SETTING_INVALID),
+            (errno.ENOSPC, TransientError, ErrorCode.LOCAL_DISK),
+            (errno.EDQUOT, TransientError, ErrorCode.LOCAL_DISK),
+            (errno.EIO, TransientError, ErrorCode.LOCAL_DISK),
+            (errno.EMFILE, TransientError, ErrorCode.LOCAL_DISK),
+        ],
+    )
+    def test_the_error_follows_the_errno(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        error: int,
+        expected: type[ConfigError | TransientError],
+        code: ErrorCode,
+    ) -> None:
+        def fails(_path: Path) -> None:
+            raise OSError(error, os.strerror(error))
+
+        monkeypatch.setattr(permission_utils, "make_private_dir", fails)
+        with pytest.raises(expected) as exc:
+            make_cache_dir(tmp_path / "cache", setting="disk_snapshot_cache_dir")
+        assert exc.value.code is code
+        assert exc.value.context == {"cache_dir": str(tmp_path / "cache"), "errno": error}
+
+
 class TestMakeOwnedDir:
     """make_private_dir, then a folder that exists must be private too."""
 
@@ -1555,7 +1587,8 @@ class TestMakeOwnedDir:
     def test_link_is_refused(self, tmp_path: Path) -> None:
         (tmp_path / "real").mkdir(mode=0o700)
         (tmp_path / "cache").symlink_to(tmp_path / "real")
-        with pytest.raises(OSError):  # O_NOFOLLOW
+        # O_NOFOLLOW | O_DIRECTORY on the link: ELOOP on Linux, ENOTDIR on macOS
+        with pytest.raises(OSError, check=lambda e: e.errno in {errno.ELOOP, errno.ENOTDIR}):
             make_owned_dir(tmp_path / "cache", setting="cache_dir")
 
 
@@ -1567,7 +1600,11 @@ class TestMakeOwnedDir:
 async def _sudo_chown_to_root(*paths: Path) -> bool:
     """Test setup: give `paths` (files or folders) to root. Not chown_async: it gives only a
     regular file of a known owner, never a folder."""
-    proc = await sudo_exec(["chown", "root:root", "--", *map(str, paths)])
+    proc = await sudo_exec(
+        ["chown", "root:root", "--", *map(str, paths)],
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
     await proc.communicate()
     return proc.returncode == 0
 
@@ -1657,25 +1694,6 @@ class TestSudoRmReal:
 @skip_unless_linux
 class TestAclRealLinux:
     """Real ACL tests on Linux - require setfacl."""
-
-    async def test_set_acl_user(self, tmp_path: Path) -> None:
-        """set_acl_user adds the user's entry."""
-        test_file = tmp_path / "acl_test.txt"
-        test_file.write_text("content")
-
-        # Set ACL for current user
-        import pwd
-
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-
-        result = await set_acl_user([test_file], user=current_user, perms="rw")
-        if not result:
-            pytest.skip("setfacl not available")
-
-        acl = read_acl(test_file)
-
-        assert f"user:{current_user}" in acl
-        assert "rw" in acl[f"user:{current_user}"]
 
     async def test_grant_qemu_vm_access_real(self, tmp_path: Path) -> None:
         """grant_qemu_vm_access sets ACL for qemu-vm user."""
@@ -1790,10 +1808,10 @@ class TestGrantQemuVmFileAccess:
         test_file.write_bytes(b"\x00")
         test_file.chmod(0o600)
 
-        async def chmod(dir_path: Path, mode: str) -> bool:
-            return await chmod_async(dir_path, mode) if dir_path.is_relative_to(tmp_path) else True
+        def chmod(dir_path: Path, mode: int) -> bool:
+            return _add_execute_bits(dir_path, mode) if dir_path.is_relative_to(tmp_path) else True
 
-        with patch("exec_sandbox.permission_utils.chmod_async", side_effect=chmod):
+        with patch("exec_sandbox.permission_utils._add_execute_bits", side_effect=chmod):
             assert await grant_qemu_vm_file_access(test_file, writable=False) is True
 
         assert stat.S_IMODE(test_file.parent.stat().st_mode) == 0o711
@@ -1959,8 +1977,7 @@ class TestQemuVmAcl:
 
     async def test_one_setfacl_for_the_files_that_differ(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Read wanted: a file with r already is skipped; a file with rw (write must go)
-        and a file without an entry get one setfacl (a stand-in on PATH records it, after
-        the `setfacl --version` probe)."""
+        and a file without an entry get one setfacl (a stand-in on PATH records it)."""
         read, write, bare = tmp_path / "read", tmp_path / "write", tmp_path / "bare"
         self._linux(
             monkeypatch,
@@ -1972,7 +1989,7 @@ class TestQemuVmAcl:
         calls = _record_calls(tmp_path, monkeypatch, "setfacl", exit_code=0)
         with patch("exec_sandbox.permission_utils.ensure_traversable", new_callable=AsyncMock, return_value=True):
             assert await grant_qemu_vm_acl([read, write, bare], perms="r") is True
-        assert calls() == [["--version"], ["-m", "u:qemu-vm:r", str(write), str(bare)]]
+        assert calls() == [["-m", "u:qemu-vm:r", str(write), str(bare)]]
 
     async def test_nothing_to_do_spawns_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         self._linux(monkeypatch, {str(tmp_path / "f"): _acl_xattr((_USER, 4, 999), (_MASK, 4, _NO_ID))})
