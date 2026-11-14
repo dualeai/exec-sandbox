@@ -21,9 +21,8 @@ from typing import Any
 import psutil
 import pytest
 
-from exec_sandbox import Scheduler, SchedulerConfig, constants
+from exec_sandbox import Scheduler, SchedulerConfig
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
-from exec_sandbox.guest_channel import OP_QUEUE_DEPTH
 from exec_sandbox.vm_spec import VmSpec
 from exec_sandbox.warm_vm_pool import Language
 from tests.conftest import run_once, skip_unless_hwaccel
@@ -216,11 +215,10 @@ def allow_network(request: pytest.FixtureRequest) -> bool:
 
 
 class PeakMemoryTracker:
-    """Track peak RSS memory during async operations."""
+    """Track peak RSS memory during async operations (a sample every 50 ms)."""
 
-    def __init__(self, sample_interval: float = 0.05):
+    def __init__(self) -> None:
         self.process = psutil.Process()
-        self.sample_interval = sample_interval
         self.peak_rss = 0
         self._running = False
         self._task: asyncio.Task[None] | None = None
@@ -229,7 +227,7 @@ class PeakMemoryTracker:
         while self._running:
             current_rss = self.process.memory_info().rss
             self.peak_rss = max(self.peak_rss, current_rss)
-            await asyncio.sleep(self.sample_interval)
+            await asyncio.sleep(0.05)
 
     def start(self, baseline_rss: int) -> None:
         self.peak_rss = baseline_rss
@@ -250,38 +248,65 @@ class PeakMemoryTracker:
 # File sizes (MB) shared across all file I/O memory tests
 _FILE_IO_SIZES_MB = [1, 10]
 
-# --- Streaming pipeline overhead thresholds ---
+# --- Write pipeline bound (tracemalloc) ---
 #
-# Both write and read paths use bounded queues (maxsize=OP_QUEUE_DEPTH).
-# Per queued item: FILE_TRANSFER_CHUNK_SIZE bytes compressed → base64 (4/3 expansion).
-# Queue capacity dominates the peak; 25% headroom covers look-ahead pipelining
-# frames (up to 2 in-flight beyond the queue), executor transients, compressor
-# state, and tracemalloc measurement jitter.
-# Memory is O(queue_capacity) — bounded, must NOT scale with file size.
-_QUEUE_CAPACITY_MB = OP_QUEUE_DEPTH * constants.FILE_TRANSFER_CHUNK_SIZE * 4 / 3 / (1024 * 1024)
-_PIPELINE_HEADROOM = 1.25
-# Write path: look-ahead pipelining fills the bounded write queue before
-# backpressure kicks in.
-_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB = _QUEUE_CAPACITY_MB * _PIPELINE_HEADROOM
-# Tracemalloc overhead for bytes-input write: BytesIO copy is tracked at ~file_size,
-# plus ~3MB from in-flight queue frames and compressor state.
-_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB = 3
-# Read path: op_queue (maxsize=OP_QUEUE_DEPTH) buffers FileChunkResponseMessage
-# models while consumer awaits disk I/O per chunk.
-_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = _QUEUE_CAPACITY_MB * _PIPELINE_HEADROOM
+# write_file() makes one frame per 128 KiB chunk (zstd, then base64 in a JSON
+# line) and queues it for the write worker of the channel. The frames that can
+# be alive at the same time:
+# - the write queue: 64 frames;
+# - the transport: the batch of 16 frames that the worker writes before one
+#   drain(), plus the partly sent frame of the batch before (drain() returns at
+#   the low-water mark, and the transport keeps that frame whole);
+# - the producer: the frame it builds, with the raw chunk, the zstd output and
+#   four copies of the frame (base64 str, JSON str, encoded bytes, + newline).
+# The bound does not grow with the file size. The guest sets where the peak
+# falls under it: a slow drain (TCG) brings it close, a fast one keeps it
+# lower. Bytes input is not copied (BytesIO shares the buffer of a bytes
+# object), so bytes and Path input have the same bound.
+#
+# The bounds are numbers, computed by hand from the design values above: a
+# bound made from the code's constants grows with them, so a larger queue
+# would pass. The numbers:
+# - largest zstd output of a 131,072 B chunk (ZSTD_COMPRESSBOUND):
+#   131,072 + 131,072 / 256 = 131,584 B;
+# - largest frame: base64 of it, 4 * ceil(131,584 / 3) = 175,448 B, plus the
+#   JSON envelope {"action": "file_chunk", "op_id": <32 chars>, "data": ""} and
+#   its newline, 82 B: 175,530 B;
+# - the frame being built: 131,072 + 131,584 + 4 * 175,530 = 964,776 B;
+# - 81 frames in flight (64 queued + 16 + 1 in the transport):
+#   81 * 175,530 + 964,776 = 15,182,706 B = 14.48 MiB, plus 0.5 MiB of fixed
+#   objects (request models, futures, executor work items): 14.98 MiB.
+_WRITE_PIPELINE_PEAK_MB = 15.0
+_WRITE_BOUND_TEXT = "81 frames in flight of 175,530 B, one frame being built (964,776 B), 0.5 MB fixed"
+
+# The encoded write frames of one write that can be alive at once (MB), by file
+# size: the whole file when it fits in the pipeline, plus the frame being built.
+# 1 MiB: 8 frames, 8 * 175,530 + 964,776 B = 2.26 MiB; 10 MiB: 80 frames, 14.31 MiB.
+_WRITE_FRAMES_IN_FLIGHT_MB = {1: 2.3, 10: 14.4}
+
+
+# File sizes of the write peak tests. 32 MiB is above the pipeline capacity
+# (about 10 MiB of chunks): a peak that grows with the file goes over the bound.
+_WRITE_PEAK_SIZES_MB = [1, 10, 32]
+
+# --- Read pipeline bound (tracemalloc) ---
+#
+# read_file(): the operation queue (64 messages) holds the chunk messages of
+# the guest (base64: 4/3 of a 128 KiB chunk each) while the consumer writes
+# each chunk to disk: 64 * 131,072 * 4 / 3 B = 10.67 MiB. 25% headroom: the
+# chunk in hand, the decoder and tracemalloc jitter: 13.33 MiB.
+_FILE_IO_TRACEMALLOC_READ_OVERHEAD_MB = 13.4
 # Pipeline overhead for psutil RSS tests (includes C allocators, page cache,
 # write queue fill during sustained transfers, and free-threaded Python overhead).
 # 3.14t adds ~2-4MB residual overhead from per-object locks even after warmup.
 # Threshold covers 3.14t worst case with headroom.
 _FILE_IO_RSS_OVERHEAD_MB = 24
-# Streaming chunk pipeline headroom for RSS tests (~500KB real, padded for jitter).
-_FILE_IO_RSS_STREAMING_OVERHEAD_MB = 2
 # Intra-session accumulation ceiling (tracemalloc current, NOT RSS).
 # RSS is unreliable here: allocators never return pages to the OS after
 # many large alloc/free cycles (allocator hysteresis), inflating RSS by
-# the peak allocation high-water mark (BytesIO copy + queue fill ≈ 22 MB
-# for 10 MB files).  tracemalloc.get_traced_memory()[0] measures live
-# Python objects only — immune to OS allocator behavior.
+# the peak allocation high-water mark (the content and the write frames in
+# flight: about 25 MB for 10 MB files).  tracemalloc.get_traced_memory()[0]
+# measures live Python objects only — immune to OS allocator behavior.
 _FILE_IO_INTRA_SESSION_LEAK_MB = 5
 
 # --- Output cap overhead thresholds ---
@@ -371,7 +396,7 @@ async def test_no_memory_leak_file_io_in_session(
     Uses tracemalloc (current allocation, not peak) instead of psutil RSS.
     RSS is unreliable here: OS allocators keep the high-water mark after
     many large alloc/free cycles (allocator hysteresis), inflating the
-    measurement by the peak allocation (~BytesIO copy + queue fill) even
+    measurement by the peak allocation (~content + write frames in flight) even
     though all objects are freed.  tracemalloc measures live Python objects
     only, making the test deterministic across platforms and allocators.
 
@@ -455,7 +480,7 @@ async def test_peak_ram_file_io(file_io_size_mb: int, scheduler_config: Schedule
     threshold_mb = file_io_size_mb + _FILE_IO_RSS_OVERHEAD_MB
     assert peak_growth_mb < threshold_mb, (
         f"Peak RAM too high: {peak_growth_mb:.1f}MB for {file_io_size_mb}MB file I/O "
-        f"(threshold: {threshold_mb}MB = {file_io_size_mb}MB BytesIO + "
+        f"(threshold: {threshold_mb}MB = {file_io_size_mb}MB content + "
         f"{_FILE_IO_RSS_OVERHEAD_MB}MB pipeline overhead)"
     )
 
@@ -530,8 +555,8 @@ async def test_peak_ram_per_vm(concurrent_vms: int, allow_network: bool, images_
 async def test_peak_ram_read_file(file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path) -> None:
     """Measure peak RSS during a read_file-only cycle (separate from write+read).
 
-    Baseline is taken AFTER write_file completes, so content + BytesIO are
-    already accounted for.  Bounded op_queue (maxsize=OP_QUEUE_DEPTH) and
+    Baseline is taken AFTER write_file completes, so the content is already
+    accounted for.  Bounded op_queue (64 messages) and
     StreamReader buffer keep read-path memory at O(chunk_size).
     Threshold: _FILE_IO_RSS_OVERHEAD_MB flat (VM lifecycle + queue fill +
     C allocator overhead + 3.14t mimalloc residual).
@@ -598,10 +623,13 @@ async def test_peak_ram_concurrent_file_io(
 
     Per-session peak during transfer:
       - File handle from _resolve_content: ~0 bytes (not a copy)
-      - Chunk pipeline (128 KB read + compress + base64 + JSON): ~500 KB
+      - Encoded write frames in flight (_WRITE_FRAMES_IN_FLIGHT_MB): the whole
+        file when it fits in the write pipeline, up to about 14.5 MiB per write
+        in progress (64 queued + 16 + 1 transport frames
+        of ~175 KB, plus the frame being built). The read that follows holds
+        less (64 messages).
       - VM/channel overhead: ~_PEAK_RAM_PER_VM_MB
-    Threshold: N * (per_vm_overhead + 1 MB streaming headroom).
-    Flat per file size — proves streaming is O(chunk_size), not O(file_size).
+    Threshold: N * (per_vm_overhead + write frames in flight).
     """
     size_bytes = file_io_size_mb * 1024 * 1024
 
@@ -637,12 +665,13 @@ async def test_peak_ram_concurrent_file_io(
 
     peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
 
-    # Flat per session: VM overhead + streaming pipeline (~500 KB)
-    threshold_mb = concurrent_sessions * (_PEAK_RAM_PER_VM_MB + _FILE_IO_RSS_STREAMING_OVERHEAD_MB)
+    # Per session: VM overhead + the write frames in flight
+    streaming_mb = _WRITE_FRAMES_IN_FLIGHT_MB[file_io_size_mb]
+    threshold_mb = concurrent_sessions * (_PEAK_RAM_PER_VM_MB + streaming_mb)
     assert peak_growth_mb < threshold_mb, (
         f"Peak RAM too high: {peak_growth_mb:.1f}MB for {concurrent_sessions} sessions x {file_io_size_mb}MB "
-        f"(threshold: {threshold_mb}MB = {concurrent_sessions} x "
-        f"({_PEAK_RAM_PER_VM_MB}MB/VM + {_FILE_IO_RSS_STREAMING_OVERHEAD_MB}MB streaming))"
+        f"(threshold: {threshold_mb:.1f}MB = {concurrent_sessions} x "
+        f"({_PEAK_RAM_PER_VM_MB}MB/VM + {streaming_mb:.1f}MB write frames in flight))"
     )
 
 
@@ -651,19 +680,33 @@ async def test_peak_ram_concurrent_file_io(
 # =============================================================================
 
 
+@pytest.fixture(params=_WRITE_PEAK_SIZES_MB, ids=[f"{s}MB" for s in _WRITE_PEAK_SIZES_MB])
+def write_peak_size_mb(request: pytest.FixtureRequest) -> int:
+    """File size in MB of the write_file peak tests (32 MiB is above the pipeline capacity)."""
+    return request.param
+
+
+def _write_bound_message(*, source: str, size_mb: int, peak_mb: float) -> str:
+    """The assertion message of a write_file peak test: the peak and how the bound is made."""
+    return (
+        f"tracemalloc peak too high for write_file ({source}, {size_mb}MB): {peak_mb:.2f}MB, bound "
+        f"{_WRITE_PIPELINE_PEAK_MB:.2f}MB = {_WRITE_BOUND_TEXT}"
+    )
+
+
 @pytest.mark.slow
-async def test_tracemalloc_peak_write_file(file_io_size_mb: int, scheduler_config: SchedulerConfig) -> None:
-    """Measure Python-level allocation peak during write_file with bytes input.
+async def test_tracemalloc_peak_write_file(write_peak_size_mb: int, scheduler_config: SchedulerConfig) -> None:
+    """Python allocation peak of write_file with bytes input: under the write pipeline bound.
 
-    Uses tracemalloc for exact Python allocation tracking (catches sub-ms
-    spikes that 50ms psutil sampling misses).  Note: zstd C allocations
-    are NOT tracked — this is complementary to psutil RSS tests.
+    tracemalloc catches sub-ms spikes that 50 ms psutil sampling misses. The
+    zstd C allocations are not traced: the psutil RSS tests cover them.
 
-    content (os.urandom) is allocated BEFORE tracemalloc.start(), so NOT tracked.
-    Tracked: BytesIO(content) copy in _resolve_content (~1x file_size) + chunk
-    pipeline (in-flight queue frames + compressor state).  Threshold: file_size + 3 MB.
+    content (os.urandom) is allocated BEFORE tracemalloc.start(), so it is not
+    traced, and BytesIO(content) does not copy it. Traced: the frames in flight
+    (_WRITE_PIPELINE_PEAK_MB). One bound for every size: at 32 MiB, a copy of
+    the content or a pipeline that grows with the file goes over it.
     """
-    size_bytes = file_io_size_mb * 1024 * 1024
+    size_bytes = write_peak_size_mb * 1024 * 1024
 
     async with Scheduler(scheduler_config) as scheduler:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -676,27 +719,21 @@ async def test_tracemalloc_peak_write_file(file_io_size_mb: int, scheduler_confi
                 tracemalloc.stop()
 
     peak_mb = peak_bytes / 1024 / 1024
-    threshold_mb = file_io_size_mb + _FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB
-
-    assert peak_mb < threshold_mb, (
-        f"tracemalloc peak too high for write_file (bytes): {peak_mb:.1f}MB "
-        f"(threshold: {threshold_mb}MB = {file_io_size_mb}MB BytesIO copy + "
-        f"{_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB}MB chunk overhead)"
+    assert peak_mb < _WRITE_PIPELINE_PEAK_MB, _write_bound_message(
+        source="bytes", size_mb=write_peak_size_mb, peak_mb=peak_mb
     )
 
 
 @pytest.mark.slow
 async def test_tracemalloc_peak_write_file_from_path(
-    file_io_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
+    write_peak_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
 ) -> None:
-    """Measure Python-level allocation peak during write_file with Path input.
+    """Python allocation peak of write_file with Path input: the same bound as bytes input.
 
-    Path input: _resolve_content opens a file handle, no full-content copy.
-    Write queue (maxsize=64) with look-ahead pipelining can hold up to
-    ~11MB of in-flight compressed+encoded frames.  Memory is O(queue_capacity),
-    bounded but not O(chunk_size).
+    _resolve_content opens a file handle; write_file reads it chunk by chunk.
+    Traced: the frames in flight (_WRITE_PIPELINE_PEAK_MB), whatever the file size.
     """
-    size_bytes = file_io_size_mb * 1024 * 1024
+    size_bytes = write_peak_size_mb * 1024 * 1024
     src = tmp_path / "tracemalloc_src.bin"
     src.write_bytes(os.urandom(size_bytes))
 
@@ -710,11 +747,8 @@ async def test_tracemalloc_peak_write_file_from_path(
                 tracemalloc.stop()
 
     peak_mb = peak_bytes / 1024 / 1024
-
-    assert peak_mb < _FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB, (
-        f"tracemalloc peak too high for write_file (Path): {peak_mb:.1f}MB "
-        f"(threshold: {_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB}MB — "
-        f"write queue capacity bounds in-flight data)"
+    assert peak_mb < _WRITE_PIPELINE_PEAK_MB, _write_bound_message(
+        source="Path", size_mb=write_peak_size_mb, peak_mb=peak_mb
     )
 
 
@@ -725,9 +759,9 @@ async def test_tracemalloc_peak_read_file(
     """Measure Python-level allocation peak during read_file.
 
     Read loop: op_queue.get() → base64.b64decode → decompress → disk write,
-    per 128 KB chunk.  Bounded op_queue (maxsize=OP_QUEUE_DEPTH) caps in-flight
+    per 128 KB chunk.  Bounded op_queue (64 messages) caps in-flight
     data at O(queue_capacity).
-    Threshold derived from OP_QUEUE_DEPTH x chunk wire size + pipeline jitter.
+    Threshold: 64 messages x chunk wire size + pipeline jitter (hand-computed).
     Must NOT scale with file size — proves streaming is bounded.
     """
     size_bytes = file_io_size_mb * 1024 * 1024
@@ -771,10 +805,11 @@ async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: Sche
     compilation inflates per-VM RSS, causing false positives.
 
     Uses Path input so _resolve_content opens a file handle (no copy).
-    Streaming processes 128 KB chunks — ~500 KB alive at any point.
+    Streaming reads 128 KB chunks; up to about 14.5 MiB of encoded write
+    frames are in flight, whatever the file size (both sizes fill the pipeline).
     Baseline is taken before Scheduler creation, so growth includes VM
-    lifecycle overhead (~_PEAK_RAM_PER_VM_MB) + streaming (~500 KB).
-    Flat threshold proves streaming is O(chunk_size), not O(file_size):
+    lifecycle overhead (~_PEAK_RAM_PER_VM_MB) + the frames in flight.
+    Flat threshold proves streaming is bounded, not O(file_size):
     a 30 MB and 50 MB file must fit under the SAME threshold.
 
     Warmup run absorbs one-time init costs — see test_no_memory_leak_without_network
@@ -801,73 +836,15 @@ async def test_peak_ram_large_file_io(large_file_mb: int, scheduler_config: Sche
     peak_growth_mb = (peak_rss - baseline_rss) / 1024 / 1024
 
     # Flat threshold: VM lifecycle + full pipeline RSS overhead.
-    # During sustained large-file transfers the write queue (64 x ~175 KB)
-    # fills up, and C allocators / kernel buffers add further overhead.
-    # _FILE_IO_RSS_OVERHEAD_MB captures this (vs the minimal per-session
-    # _FILE_IO_RSS_STREAMING_OVERHEAD_MB used in the concurrent test).
+    # During sustained large-file transfers the write pipeline (about 14.5 MiB:
+    # _WRITE_FRAMES_IN_FLIGHT_MB) fills up, and C allocators / kernel buffers
+    # add further overhead. _FILE_IO_RSS_OVERHEAD_MB captures this.
     threshold_mb = _PEAK_RAM_PER_VM_MB + _FILE_IO_RSS_OVERHEAD_MB
     assert peak_growth_mb < threshold_mb, (
         f"Peak RAM too high for {large_file_mb}MB file: {peak_growth_mb:.1f}MB "
         f"(flat threshold: {threshold_mb}MB = {_PEAK_RAM_PER_VM_MB}MB VM + "
         f"{_FILE_IO_RSS_OVERHEAD_MB}MB pipeline overhead). "
         f"Streaming is O(chunk_size), not O(file_size)."
-    )
-
-
-# =============================================================================
-# bytes vs Path Input Memory Comparison
-# =============================================================================
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("comparison_size_mb", [10], ids=["10MB"])
-async def test_bytes_vs_path_memory_difference(
-    comparison_size_mb: int, scheduler_config: SchedulerConfig, tmp_path: Path
-) -> None:
-    """Compare tracemalloc peaks for bytes vs Path write_file inputs.
-
-    Both paths share the same bounded chunk pipeline (write queue maxsize=64).
-    Bytes input: BytesIO copy (~file_size) + in-flight queue frames.
-    Path input: file handle (no copy) + in-flight queue frames.
-    Both bounded by write queue capacity (~11MB).
-    """
-    size_bytes = comparison_size_mb * 1024 * 1024
-    src = tmp_path / "compare_src.bin"
-    src.write_bytes(os.urandom(size_bytes))
-
-    # Measure bytes input peak
-    async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            content = src.read_bytes()
-            tracemalloc.start()
-            try:
-                await session.write_file("compare_bytes.bin", content)
-                _, bytes_peak = tracemalloc.get_traced_memory()
-            finally:
-                tracemalloc.stop()
-            del content
-
-    # Measure Path input peak
-    async with Scheduler(scheduler_config) as scheduler:
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            tracemalloc.start()
-            try:
-                await session.write_file("compare_path.bin", src)
-                _, path_peak = tracemalloc.get_traced_memory()
-            finally:
-                tracemalloc.stop()
-
-    bytes_peak_mb = bytes_peak / 1024 / 1024
-    path_peak_mb = path_peak / 1024 / 1024
-
-    bytes_threshold_mb = comparison_size_mb + _FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB
-    assert bytes_peak_mb < bytes_threshold_mb, (
-        f"bytes input peak ({bytes_peak_mb:.1f}MB) should be < {bytes_threshold_mb}MB — "
-        f"BytesIO copy ({comparison_size_mb}MB) + {_FILE_IO_TRACEMALLOC_BYTES_OVERHEAD_MB}MB pipeline overhead"
-    )
-    assert path_peak_mb < _FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB, (
-        f"Path input peak ({path_peak_mb:.1f}MB) should be < {_FILE_IO_TRACEMALLOC_WRITE_OVERHEAD_MB}MB — "
-        f"bounded by write queue capacity"
     )
 
 

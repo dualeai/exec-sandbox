@@ -3,15 +3,17 @@
 Defines request/response types for host-guest communication via virtio-serial.
 Protocol: JSON newline-delimited over dual-port channel (command + event).
 
-Security: All fields validated by guest agent (see guest-agent/src/main.rs).
+Security: the guest agent validates every field again (guest-agent/src/validation.rs,
+file_io.rs, packages.rs).
 """
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from exec_sandbox.constants import (
     ENV_VAR_FORBIDDEN_CONTROL_CHARS,
@@ -22,6 +24,23 @@ from exec_sandbox.constants import (
     MAX_FILE_PATH_LENGTH,
 )
 from exec_sandbox.models import Language  # noqa: TC001 - Required at runtime for Pydantic
+
+_FORBIDDEN_CHAR = re.compile(
+    "[" + "".join(re.escape(chr(code)) for code in sorted(ENV_VAR_FORBIDDEN_CONTROL_CHARS)) + "]"
+)
+"""One of ENV_VAR_FORBIDDEN_CONTROL_CHARS."""
+
+
+def _forbidden_char(text: str) -> int | None:
+    """The code of the first ENV_VAR_FORBIDDEN_CONTROL_CHARS character in `text`, or None.
+    Each of them is a control character, so printable text has none: str.isprintable() checks
+    that in C first (a loop over each character in Python took 5.5 ms of event loop time for
+    100 values of 4096 characters)."""
+    if text.isprintable():
+        return None
+    found = _FORBIDDEN_CHAR.search(text)
+    return None if found is None else ord(found.group())
+
 
 # ============================================================================
 # Request Models
@@ -81,7 +100,9 @@ class ExecuteCodeRequest(GuestAgentRequest):
     # The host translates the guest's code_error response to InvalidInputError (CODE_INVALID)
     # via guest_error_to_exception. No Pydantic validator here.
 
-    timeout: int = Field(ge=0, le=300, default=0, description="Execution timeout in seconds (0=no timeout, max 300s)")
+    timeout: int = Field(
+        ge=0, le=300, default=0, description="Execution timeout in seconds (0 = the default, 300 s; max 300 s)"
+    )
     env_vars: dict[str, str] = Field(
         default_factory=dict,
         description="Environment variables (max 100, blocked vars enforced by guest agent)",
@@ -109,40 +130,41 @@ class ExecuteCodeRequest(GuestAgentRequest):
                     f"Env var '{key}' value too large: {len(value)} bytes (max {MAX_ENV_VAR_VALUE_LENGTH})"
                 )
 
-            # Check for control characters in name
-            for char in key:
-                if ord(char) in ENV_VAR_FORBIDDEN_CONTROL_CHARS:
-                    raise ValueError(f"Env var name contains forbidden control character: 0x{ord(char):02X}")
-
-            # Check for control characters in value
-            for char in value:
-                if ord(char) in ENV_VAR_FORBIDDEN_CONTROL_CHARS:
-                    raise ValueError(f"Env var '{key}' value contains forbidden control character: 0x{ord(char):02X}")
+            # Check for control characters in name, then in value (the first one found)
+            if (code := _forbidden_char(key)) is not None:
+                raise ValueError(f"Env var name contains forbidden control character: 0x{code:02X}")
+            if (code := _forbidden_char(value)) is not None:
+                raise ValueError(f"Env var '{key}' value contains forbidden control character: 0x{code:02X}")
 
         return v
 
 
 class InstallPackagesRequest(GuestAgentRequest):
-    """Install packages via pip (Python) or bun (JavaScript).
+    """Install packages with `uv pip install` (Python) or `bun add` (JavaScript); the
+    guest refuses raw.
 
     Guest agent enforces:
     - Package count limit: 50
-    - Package name length: 214 chars (PyPI limit)
+    - Package name length: 214 chars (npm's limit)
     - Version specifier required: pandas==2.0.0, lodash@4.17.21
     - Path traversal protection: no /, .., \\
-    - Timeout: 300s
+    - Timeout: at most 300 s (0 = the default, 300 s)
 
     Response: Streaming messages (OutputChunkMessage for stdout/stderr, ExecutionCompleteMessage for completion).
     """
 
     action: Literal["install_packages"] = Field(default="install_packages")  # type: ignore[assignment]
-    language: Language = Field(description="Programming language (python=pip/uv, javascript=bun, raw=shell)")
+    language: Language = Field(
+        description="Programming language (python: uv pip, javascript: bun add; raw has no package manager and is refused)"
+    )
     packages: list[str] = Field(
         min_length=1,
         max_length=50,
         description="Package list with version specifiers (e.g., ['pandas==2.0.0', 'lodash@4.17.21'])",
     )
-    timeout: int = Field(ge=0, le=300, default=300, description="Installation timeout in seconds (max 300s)")
+    timeout: int = Field(
+        ge=0, le=300, default=300, description="Installation timeout in seconds (0 = the default, 300 s; max 300 s)"
+    )
 
 
 # ============================================================================
@@ -165,7 +187,7 @@ class WriteFileRequest(GuestAgentRequest):
     Guest agent enforces:
     - Path length: PATH_MAX 4096 bytes, NAME_MAX 255 bytes per component
     - Path traversal: no escape from /home/user
-    - File size: max 500MB (streaming zstd, ~64KB peak memory)
+    - File size: max 500 MiB (streamed in zstd chunks: memory does not grow with the file)
     - Permissions: 0o644 default, 0o755 with make_executable=True
 
     Response: FileWriteAckMessage (after file_end).
@@ -228,13 +250,13 @@ class GuestAgentResponse(BaseModel):
 class OutputChunkMessage(GuestAgentResponse):
     """Streaming output chunk from code execution.
 
-    Batching strategy (Jan 2026 best practice):
-    - Flush every 50ms (real-time feel, not 1s which is too slow)
-    - OR every 64KB accumulated (prevent memory exhaustion)
-    - OR on process completion (final flush)
+    The guest batches output and flushes it:
+    - every 50ms (output shows almost at once), and at once for the first output
+      after 50ms with no output,
+    - or once 64KB has accumulated (memory stays bounded),
+    - or when the process ends (final flush).
 
-    This allows real-time console debugging without memory issues on large outputs.
-    Uses backpressure via bounded channel when buffer is full.
+    A full write queue (a bounded channel) makes the guest wait: backpressure.
     """
 
     type: Literal["stdout", "stderr"] = Field(description="Output stream type")
@@ -247,8 +269,9 @@ class OutputChunkMessage(GuestAgentResponse):
 class ExecutionCompleteMessage(GuestAgentResponse):
     """Final completion message for ANY command (exec, install_packages, etc).
 
-    Sent after stdout/stderr streaming completes. ALL commands stream output
-    via OutputChunkMessage first, then send this minimal completion signal.
+    Sent after the command's output (OutputChunkMessage): an exec streams its
+    output while it runs; install_packages sends its output once the install
+    ends. Each command then sends this completion message.
     """
 
     type: Literal["complete"] = "complete"
@@ -306,13 +329,16 @@ class FileWriteAckMessage(GuestAgentResponse):
 class FileChunkResponseMessage(GuestAgentResponse):
     """A chunk of zstd-compressed file data (guest → host).
 
-    Part of a streaming file read response. Each chunk contains
-    base64-encoded zstd-compressed data belonging to a single zstd frame.
+    Part of a streaming file read response. Each chunk contains zstd-compressed
+    data belonging to a single zstd frame, base64 in JSON: pydantic decodes it while it
+    parses the message (115 -> 40 us per 128 KB chunk on the event loop, Apple M).
     """
+
+    model_config = ConfigDict(val_json_bytes="base64", ser_json_bytes="base64")
 
     type: Literal["file_chunk"] = "file_chunk"
     op_id: str = Field(description="Operation ID from ReadFileRequest")  # type: ignore[assignment]
-    data: str = Field(description="Base64-encoded zstd-compressed chunk")
+    data: bytes = Field(description="zstd-compressed chunk (base64 in JSON)")
 
 
 class FileReadCompleteMessage(GuestAgentResponse):

@@ -12,7 +12,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis.strategies import characters, integers, sampled_from, text
 from pydantic import ValidationError
 
-from exec_sandbox.constants import MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH
+from exec_sandbox.constants import ENV_VAR_FORBIDDEN_CONTROL_CHARS
 from exec_sandbox.guest_agent_protocol import (
     ExecuteCodeRequest,
     ExecutionCompleteMessage,
@@ -34,6 +34,11 @@ from exec_sandbox.guest_agent_protocol import (
     WriteFileRequest,
 )
 from exec_sandbox.models import FileInfo, Language
+
+_CODE_LIMIT = 1024 * 1024
+"""Largest code an ExecuteCodeRequest takes: 1 MiB, written out (not the library's constant)."""
+_PATH_LIMIT = 4096
+"""Longest file path a file request takes: Linux PATH_MAX, written out (not the library's constant)."""
 
 # ============================================================================
 # Request Models
@@ -182,12 +187,12 @@ class TestExecuteCodeRequest:
     def test_code_max_length(self) -> None:
         """ExecuteCodeRequest enforces 1 MiB code limit."""
         # Valid: 1 MiB exactly
-        large_code = "x" * MAX_CODE_SIZE
+        large_code = "x" * _CODE_LIMIT
         req = ExecuteCodeRequest(language=Language.PYTHON, code=large_code)
-        assert len(req.code) == MAX_CODE_SIZE
+        assert len(req.code) == _CODE_LIMIT
 
         # Invalid: > 1 MiB
-        too_large = "x" * (MAX_CODE_SIZE + 1)
+        too_large = "x" * (_CODE_LIMIT + 1)
         with pytest.raises(ValidationError):
             ExecuteCodeRequest(language=Language.PYTHON, code=too_large)
 
@@ -288,6 +293,17 @@ class TestEnvVarValidation:
                 env_vars={"FOO": "delete\x7f"},
             )
         assert "control character" in str(exc_info.value).lower()
+
+    def test_error_names_the_first_forbidden_character(self) -> None:
+        """Allowed characters that are not printable (tab, U+2028) come before the first
+        forbidden one: the error names that one (ESC), not a later one (NUL)."""
+        with pytest.raises(ValidationError, match="forbidden control character: 0x1B"):
+            ExecuteCodeRequest(language=Language.PYTHON, code="x", env_vars={"FOO": "a\t\u2028b\x1b\x00" * 100})
+
+    def test_each_forbidden_character_is_not_printable(self) -> None:
+        """The check skips printable text (str.isprintable): it is exact only while no
+        forbidden character is printable."""
+        assert not any(chr(code).isprintable() for code in ENV_VAR_FORBIDDEN_CONTROL_CHARS)
 
     def test_env_var_name_too_long(self) -> None:
         """Env var name exceeding 256 chars is rejected."""
@@ -830,13 +846,13 @@ class TestWriteFileRequest:
 
     def test_path_max_length(self) -> None:
         """WriteFileRequest accepts path at max length."""
-        long_path = "a" * MAX_FILE_PATH_LENGTH
+        long_path = "a" * _PATH_LIMIT
         req = WriteFileRequest(op_id="test", path=long_path)
-        assert len(req.path) == MAX_FILE_PATH_LENGTH
+        assert len(req.path) == _PATH_LIMIT
 
     def test_path_exceeds_max_length(self) -> None:
         """WriteFileRequest rejects path exceeding max length."""
-        too_long = "a" * (MAX_FILE_PATH_LENGTH + 1)
+        too_long = "a" * (_PATH_LIMIT + 1)
         with pytest.raises(ValidationError):
             WriteFileRequest(op_id="test", path=too_long)
 
@@ -885,13 +901,13 @@ class TestReadFileRequest:
 
     def test_path_max_length(self) -> None:
         """ReadFileRequest accepts path at max length."""
-        long_path = "b" * MAX_FILE_PATH_LENGTH
+        long_path = "b" * _PATH_LIMIT
         req = ReadFileRequest(op_id="test", path=long_path)
-        assert len(req.path) == MAX_FILE_PATH_LENGTH
+        assert len(req.path) == _PATH_LIMIT
 
     def test_path_exceeds_max_length(self) -> None:
         """ReadFileRequest rejects path exceeding max length."""
-        too_long = "b" * (MAX_FILE_PATH_LENGTH + 1)
+        too_long = "b" * (_PATH_LIMIT + 1)
         with pytest.raises(ValidationError):
             ReadFileRequest(op_id="test", path=too_long)
 
@@ -936,13 +952,13 @@ class TestListFilesRequest:
 
     def test_path_max_length(self) -> None:
         """ListFilesRequest accepts path at max length."""
-        long_path = "c" * MAX_FILE_PATH_LENGTH
+        long_path = "c" * _PATH_LIMIT
         req = ListFilesRequest(path=long_path)
-        assert len(req.path) == MAX_FILE_PATH_LENGTH
+        assert len(req.path) == _PATH_LIMIT
 
     def test_path_exceeds_max_length(self) -> None:
         """ListFilesRequest rejects path exceeding max length."""
-        too_long = "c" * (MAX_FILE_PATH_LENGTH + 1)
+        too_long = "c" * (_PATH_LIMIT + 1)
         with pytest.raises(ValidationError):
             ListFilesRequest(path=too_long)
 
@@ -1004,30 +1020,24 @@ class TestFileWriteAckMessage:
 class TestFileChunkResponseMessage:
     """Tests for FileChunkResponseMessage model."""
 
-    def test_chunk_fields(self) -> None:
-        """FileChunkResponseMessage has correct fields."""
-        msg = FileChunkResponseMessage(op_id="abc123", data="SGVsbG8=")
-        assert msg.type == "file_chunk"
-        assert msg.op_id == "abc123"
-        assert msg.data == "SGVsbG8="
+    def test_the_guest_json_gives_the_decoded_bytes(self) -> None:
+        """The guest sends the chunk as base64 in JSON: the parsed message holds its bytes."""
+        msg = FileChunkResponseMessage.model_validate_json(
+            '{"type": "file_chunk", "op_id": "abc123", "data": "SGVsbG8="}'
+        )
+        assert (msg.type, msg.op_id, msg.data) == ("file_chunk", "abc123", b"Hello")
 
-    def test_serialize(self) -> None:
-        """FileChunkResponseMessage serializes correctly."""
-        msg = FileChunkResponseMessage(op_id="test", data="AQID")
-        data = msg.model_dump()
-        assert data == {
-            "type": "file_chunk",
-            "op_id": "test",
-            "data": "AQID",
-        }
+    def test_json_round_trip(self) -> None:
+        """The bytes go out as base64 in JSON and come back the same (pydantic writes the URL-safe
+        alphabet and reads both)."""
+        msg = FileChunkResponseMessage(op_id="abc", data=b"\x00\x01\xff zstd")
+        assert FileChunkResponseMessage.model_validate_json(msg.model_dump_json()) == msg
 
-    def test_serialize_to_json(self) -> None:
-        """FileChunkResponseMessage serializes to JSON and back."""
-        msg = FileChunkResponseMessage(op_id="abc", data="SGVsbG8=")
-        json_str = msg.model_dump_json()
-        restored = FileChunkResponseMessage.model_validate_json(json_str)
-        assert restored.op_id == "abc"
-        assert restored.data == "SGVsbG8="
+    def test_data_that_is_not_base64_is_refused(self) -> None:
+        """A chunk whose data is no base64: a validation error at the parse, so the dispatcher
+        drops the frame; read_file then gets the other chunks only (its size check fails)."""
+        with pytest.raises(ValidationError):
+            FileChunkResponseMessage.model_validate_json('{"type": "file_chunk", "op_id": "x", "data": "not base64!"}')
 
 
 class TestFileReadCompleteMessage:
@@ -1206,15 +1216,15 @@ class TestStreamingMessageFileIO:
         assert msg.bytes_written == 128
 
     def test_parse_file_chunk(self) -> None:
-        """Parse FileChunkResponseMessage from dict."""
+        """Parse FileChunkResponseMessage from dict (Python objects: the data is bytes)."""
         from pydantic import TypeAdapter
 
         adapter: TypeAdapter[StreamingMessage] = TypeAdapter(StreamingMessage)
-        data = {"type": "file_chunk", "op_id": "abc123", "data": "SGVsbG8="}
+        data = {"type": "file_chunk", "op_id": "abc123", "data": b"Hello"}
         msg = adapter.validate_python(data)
         assert isinstance(msg, FileChunkResponseMessage)
         assert msg.op_id == "abc123"
-        assert msg.data == "SGVsbG8="
+        assert msg.data == b"Hello"
 
     def test_parse_file_chunk_from_json(self) -> None:
         """Parse FileChunkResponseMessage from JSON string."""
@@ -1225,7 +1235,7 @@ class TestStreamingMessageFileIO:
         msg = adapter.validate_json(json_str)
         assert isinstance(msg, FileChunkResponseMessage)
         assert msg.op_id == "test"
-        assert msg.data == "AQID"
+        assert msg.data == b"\x01\x02\x03"  # decoded from base64
 
     def test_parse_file_read_complete(self) -> None:
         """Parse FileReadCompleteMessage from dict."""
@@ -1306,12 +1316,6 @@ class TestFilePathValidationPropertyBased:
     across WriteFileRequest, ReadFileRequest, and ListFilesRequest.
     """
 
-    # Strategy for safe relative path segments (alphanumeric + common filename chars)
-    safe_path_chars = characters(
-        whitelist_categories=("Lu", "Ll", "Nd"),
-        whitelist_characters="_-./",
-    )
-
     @given(
         segment=text(
             alphabet=characters(
@@ -1347,7 +1351,7 @@ class TestFilePathValidationPropertyBased:
     def test_overlong_paths_rejected(self, extra: str) -> None:
         """Property: Paths exceeding PATH_MAX must be rejected."""
         # Build a path that is guaranteed to exceed PATH_MAX
-        path = "a" * (MAX_FILE_PATH_LENGTH + 1) + extra
+        path = "a" * (_PATH_LIMIT + 1) + extra
         with pytest.raises(ValidationError):
             WriteFileRequest(op_id="test", path=path)
         with pytest.raises(ValidationError):

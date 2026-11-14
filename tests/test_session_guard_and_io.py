@@ -1,23 +1,22 @@
 # pyright: reportPrivateUsage=false
-# OperationInbox deliberately exposes no direct-enqueue/inspection surface in
-# production; tests pre-fill and inspect via the private _queue instead.
-"""Unit tests for Session._guard(), _resolve_content(), write_file streaming protocol,
-FileOpDispatcher routing, DualPortChannel reconnection probe, and idle timer lifecycle.
+"""Unit tests of the Session calls (lifecycle checks, lock, idle deadline, write_file
+sources), of the QemuVM file calls on a fake guest channel (frames on the wire, error
+mapping), of FileOpDispatcher routing, and of the DualPortChannel reconnection probe.
 
-Tests the orchestration layer WITHOUT requiring VMs. All VM/channel interactions
-are mocked. Covers:
-- _guard() lifecycle checks, lock serialization, idle timer suspension
-  during operations, and fail-fast retirement of dead VMs
-- _resolve_content() sync/async file reads, boundary validation
-- WriteFileRequest header serialization: validity, escaping
-- FileOpDispatcher message routing by op_id
-- DualPortChannel._probe_guest_ready() reconnection probe
-- Idle timer task lifecycle: orphan prevention, self-cancel, stress
+No VM: the Session tests use a mocked QemuVM; the QemuVM tests use a real QemuVM on a
+mocked channel. Covers:
+- Session calls: closed checks, lock serialization, idle deadline suspended during a
+  call, fail-fast retirement of dead VMs, close paths
+- write_file sources (bytes, Path, stream): checks, size limits, local errors
+- QemuVM write_file and read_file: frames sent, content round trip, error mapping
+- FileOpDispatcher message routing by op_id, transport failure
+- DualPortChannel reconnection probe and close
 """
 
 import asyncio
 import base64
 import errno
+import gc
 import io
 import json
 import os
@@ -25,6 +24,10 @@ import random
 import re
 import tempfile
 import threading
+import time
+import weakref
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 from unittest.mock import AsyncMock, MagicMock
@@ -32,7 +35,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from exec_sandbox import constants
-from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_CODE_SIZE, MAX_FILE_PATH_LENGTH, MAX_FILE_SIZE_BYTES
+from exec_sandbox.constants import FILE_TRANSFER_CHUNK_SIZE, MAX_CODE_SIZE, MAX_FILE_SIZE_BYTES
 from exec_sandbox.exceptions import (
     CommunicationError,
     ConfigError,
@@ -52,10 +55,10 @@ from exec_sandbox.guest_agent_protocol import (
     FileReadCompleteMessage,
     FileWriteAckMessage,
     OutputChunkMessage,
+    PingRequest,
     PongMessage,
     StreamingErrorMessage,
     StreamingMessage,
-    WriteFileRequest,
 )
 from exec_sandbox.guest_channel import (
     OP_QUEUE_DEPTH,
@@ -65,22 +68,15 @@ from exec_sandbox.guest_channel import (
     UnixSocketChannel,
 )
 from exec_sandbox.models import ExecutionResult, ExposedPort, FileInfo, Language, StartupTiming, TimingBreakdown
-from exec_sandbox.qemu_vm import QemuVM, local_path_error
+from exec_sandbox.qemu_vm import QemuVM, local_path_error, zstd
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.vm_types import VmState
-from tests.conftest import make_destroy_mock
+from exec_sandbox.vm_types import AccelType, VmState
+from tests.conftest import NonSeekableIO, make_destroy_mock
 
 # ============================================================================
 # Helpers — build a Session with mocked VM + VmManager
 # ============================================================================
-
-
-def _real_enqueue_registered(inbox: OperationInbox, _data: bytes) -> None:
-    """Mirror DualPortChannel.enqueue_registered's two contract lines so mocks
-    cannot drift on the ensure-open-before-mark ordering."""
-    inbox.ensure_open()
-    inbox.mark_command_sent()
 
 
 def _make_exec_result(exit_code: int = 0) -> ExecutionResult:
@@ -166,6 +162,55 @@ def _make_session(
         default_timeout_seconds=default_timeout_seconds,
     )
     return session, mock_vm, mock_vm_manager
+
+
+@dataclass
+class _Upload:
+    """One write_file call that the mocked VM got."""
+
+    path: str
+    data: bytes  # the bytes from the stream position to its end
+    make_executable: bool
+    stream: IO[bytes]
+
+
+def _record_uploads(vm: AsyncMock) -> list[_Upload]:
+    """Make the mocked VM's write_file read its stream to the end (as the real one does)
+    and record each call."""
+    uploads: list[_Upload] = []
+
+    async def write_file(path: str, content: IO[bytes], *, make_executable: bool = False) -> None:
+        uploads.append(_Upload(path, content.read(), make_executable, content))
+
+    vm.write_file.side_effect = write_file
+    return uploads
+
+
+def _record_upload_sizes(vm: AsyncMock) -> list[int]:
+    """Make the mocked VM's write_file record the bytes left in its stream, without a read
+    (for the 500 MiB limit cases)."""
+    sizes: list[int] = []
+
+    async def write_file(_path: str, content: IO[bytes], *, make_executable: bool = False) -> None:
+        start = content.tell()
+        sizes.append(content.seek(0, os.SEEK_END) - start)
+
+    vm.write_file.side_effect = write_file
+    return sizes
+
+
+def _sparse_file(path: Path, size: int) -> Path:
+    """A file of `size` bytes with no data blocks: the 500 MiB limit cases need no disk."""
+    with path.open("wb") as f:
+        f.truncate(size)
+    return path
+
+
+def _assert_freed(session_ref: "weakref.ref[Session]") -> None:
+    """The closed session is freed when the test drops it: no armed idle deadline (a loop
+    timer that holds the session) stays after the close."""
+    gc.collect()
+    assert session_ref() is None, "an idle deadline holds the closed session"
 
 
 # ============================================================================
@@ -380,20 +425,48 @@ class TestGuardNormal:
         mock_vm.list_files.assert_awaited_once_with("subdir")
         assert len(result) == 1
 
-    async def test_write_file_bytes_calls_vm(self) -> None:
-        """write_file() with bytes delegates to VM under _guard."""
+    @pytest.mark.parametrize("content", [b"data", b""], ids=["bytes", "empty"])
+    async def test_write_file_bytes_calls_vm(self, content: bytes) -> None:
+        """write_file() with bytes gives the VM a stream of these bytes, the path and the
+        flag; the session closes the stream it made."""
         session, mock_vm, _ = _make_session()
-        await session.write_file("out.bin", b"data", make_executable=True)
-        mock_vm.write_file.assert_awaited_once()
-        call_args = mock_vm.write_file.call_args
-        assert call_args[0][0] == "out.bin"
-        # Content is now an IO[bytes] stream (BytesIO wrapping the bytes)
-        assert call_args[1]["make_executable"] is True
+        uploads = _record_uploads(mock_vm)
+        await session.write_file("out.bin", content, make_executable=True)
+        assert [(u.path, u.data, u.make_executable) for u in uploads] == [("out.bin", content, True)]
+        assert uploads[0].stream.closed
 
 
 # ============================================================================
 # _guard() — Closed session (fast path, before lock)
 # ============================================================================
+
+
+class TestGuardFailureThatRetiresTheVm:
+    """A failed call that left the VM non-reusable closes the session (QemuVM retires a VM
+    that QEMU stopped at a full host disk, then raises LOCAL_DISK); one that left it
+    usable keeps the session open."""
+
+    @pytest.mark.parametrize("retired", [True, False], ids=["vm-retired", "vm-usable"])
+    async def test_failed_file_call(self, retired: bool) -> None:
+        session, vm, manager = _make_session()
+
+        async def fail(_path: str) -> list[FileInfo]:
+            if retired:
+                vm.state = VmState.DESTROYING
+            raise TransientError(
+                "VM stopped: the host disk is full",
+                code=ErrorCode.LOCAL_DISK,
+                context=None,
+                hint=None,
+                instance_id=None,
+            )
+
+        vm.list_files.side_effect = fail
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
+            await session.list_files("")
+
+        assert session.closed is retired
+        assert manager.destroy_vm.await_count == int(retired)
 
 
 class TestGuardClosedFastPath:
@@ -470,59 +543,44 @@ class TestGuardClosedFastPath:
 
 
 class TestGuardClosedDuringLockWait:
-    """Tests the re-check inside the lock (step 3).
+    """A call that waits for the session lock checks again, when it gets the lock, that
+    the session is open: close() does not take the lock."""
 
-    Strategy: coroutine A acquires lock via a slow VM op, sets _closed=True
-    before releasing lock. Coroutine B passes step 1 (not closed), blocks
-    on the lock, then when A releases, B acquires and hits step 3.
-    """
-
-    async def test_read_file_closed_while_waiting_for_lock(self, tmp_path: Path) -> None:
-        """read_file() raises 'closed while waiting' when session closes mid-wait."""
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(lambda s, _p: s.exec("x = 1"), id="exec"),
+            pytest.param(lambda s, _p: s.write_file("f.txt", b"data"), id="write_file"),
+            pytest.param(lambda s, p: s.read_file("f.txt", destination=p / "f.bin"), id="read_file"),
+            pytest.param(lambda s, _p: s.list_files(), id="list_files"),
+        ],
+    )
+    async def test_call_waiting_for_the_lock_fails_when_the_session_closes(self, call: Any, tmp_path: Path) -> None:
+        """A first call holds the lock; a second call waits for it; close() runs. The second
+        call then gets SessionClosedError and does not reach the VM."""
         session, mock_vm, _ = _make_session()
-        lock_held = asyncio.Event()
+        holding, release = asyncio.Event(), asyncio.Event()
 
-        async def slow_read_and_close(path: str, *, destination: Path) -> None:
-            lock_held.set()
-            await asyncio.sleep(0.15)
-            # Close session while still holding the lock
-            session._closed = True
+        async def held_list(_path: str = "") -> list[FileInfo]:
+            holding.set()
+            await release.wait()
+            return []
 
-        mock_vm.read_file = AsyncMock(side_effect=slow_read_and_close)
+        mock_vm.list_files.side_effect = held_list
+        first = asyncio.create_task(session.list_files())
+        await holding.wait()
+        waiting = asyncio.create_task(call(session, tmp_path))
+        await asyncio.sleep(0)  # the second call passes the open check and waits for the lock
+        await session.close()
+        release.set()
 
-        # Task A: holds lock, sets _closed = True before releasing
-        task_a = asyncio.create_task(session.read_file("first.txt", destination=tmp_path / "first.bin"))
-
-        # Wait for A to hold the lock
-        await lock_held.wait()
-
-        # Task B: passes step 1 (not closed yet), blocks on lock
-        # When A releases lock, B acquires it and sees _closed=True → step 3
-        with pytest.raises(SessionClosedError, match="closed while waiting"):
-            await session.list_files()
-
-        await task_a
-
-    async def test_list_files_closed_while_waiting_for_lock(self, tmp_path: Path) -> None:
-        """list_files() raises 'closed while waiting' when session closes mid-wait."""
-        session, mock_vm, _ = _make_session()
-        lock_held = asyncio.Event()
-
-        async def slow_list_and_close(path: str = "") -> list[FileInfo]:
-            lock_held.set()
-            await asyncio.sleep(0.15)
-            session._closed = True
-            return [FileInfo(name="x.txt", is_dir=False, size=1)]
-
-        mock_vm.list_files = AsyncMock(side_effect=slow_list_and_close)
-
-        task_a = asyncio.create_task(session.list_files())
-        await lock_held.wait()
-
-        with pytest.raises(SessionClosedError, match="closed while waiting"):
-            await session.read_file("blocked.txt", destination=tmp_path / "blocked.bin")
-
-        await task_a
+        with pytest.raises(SessionClosedError, match=r"^Session closed while waiting for lock$"):
+            await waiting
+        assert await first == []
+        assert mock_vm.list_files.await_count == 1
+        mock_vm.execute.assert_not_awaited()
+        mock_vm.write_file.assert_not_awaited()
+        mock_vm.read_file.assert_not_awaited()
 
 
 # ============================================================================
@@ -638,123 +696,105 @@ class TestGuardConcurrentFileIO:
 
 
 # ============================================================================
-# _resolve_content() — Normal cases
+# write_file() sources — bytes, Path, caller stream
 # ============================================================================
 
 
-class TestResolveContentNormal:
-    """Happy-path tests for _resolve_content()."""
+class TestWriteFileSource:
+    """write_file gives the VM one readable stream of the content. The session closes a
+    stream it made (bytes, Path); a stream of the caller stays open."""
 
-    async def test_bytes_returns_bytesio_owned(self) -> None:
-        """Bytes content is wrapped in BytesIO, owned=True."""
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(b"hello")
-        assert owned is True
-        assert stream.read() == b"hello"
-        stream.close()
+    @pytest.mark.parametrize("size", [13, 2 * 1024 * 1024], ids=["small", "2MiB"])
+    async def test_path_content_reaches_the_vm_and_the_file_is_closed(self, tmp_path: Path, size: int) -> None:
+        content = os.urandom(size)
+        source = tmp_path / "source.bin"
+        source.write_bytes(content)
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
 
-    async def test_path_returns_file_handle_owned(self, tmp_path: Path) -> None:
-        """Path returns an open file handle (streams from disk), owned=True."""
-        f = tmp_path / "small.txt"
-        f.write_bytes(b"small content")
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(f)
-        assert owned is True
-        assert stream.read() == b"small content"
-        stream.close()
+        await session.write_file("out.bin", source)
 
-    async def test_path_large_file_streams(self, tmp_path: Path) -> None:
-        """Large file returns a file handle (never loaded fully by _resolve_content)."""
-        f = tmp_path / "large.bin"
-        content = b"x" * (2 * 1024 * 1024)  # 2MB
-        f.write_bytes(content)
+        assert [(u.path, u.data) for u in uploads] == [("out.bin", content)]
+        assert uploads[0].stream.closed
 
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(f)
-        assert owned is True
-        assert stream.read() == content
-        stream.close()
-
-    async def test_io_bytes_returns_same_buf_not_owned(self) -> None:
-        """IO[bytes] input returns the same buffer, owned=False."""
-        session, _, _ = _make_session()
+    async def test_caller_stream_reaches_the_vm_and_stays_open(self) -> None:
+        """An IO[bytes] stream of the caller goes to the VM as it is; the session does not close it."""
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
         buf = io.BytesIO(b"hello")
-        stream, owned = await session._resolve_content(buf)
-        assert owned is False
-        assert stream is buf
-        assert stream.read() == b"hello"
 
-    async def test_write_file_resolve_before_lock(self, tmp_path: Path) -> None:
-        """write_file() resolves Path BEFORE acquiring the exec lock.
+        await session.write_file("out.bin", buf)
 
-        If _resolve_content ran inside the lock, a concurrent read_file
-        would have to wait for disk I/O. Instead, disk I/O and lock
-        acquisition are decoupled.
-        """
-        from typing import IO
+        assert [(u.stream, u.data) for u in uploads] == [(buf, b"hello")]
+        assert not buf.closed
 
-        session, _, _ = _make_session()
+    async def test_path_source_opens_without_the_session_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Path source is opened before the call takes the session lock: while its open
+        waits for a slow local disk, another call of the session runs."""
+        source = tmp_path / "source.bin"
+        source.write_bytes(b"x" * 100)
+        loop_thread = threading.get_ident()
+        reached, released = threading.Event(), threading.Event()
+        fdopen = os.fdopen
 
-        f = tmp_path / "big.bin"
-        f.write_bytes(b"x" * 100)
+        def held(fd: int, *args: Any, **kwargs: Any) -> IO[Any]:
+            stream = fdopen(fd, *args, **kwargs)
+            reached.set()
+            if threading.get_ident() != loop_thread:  # an open on the loop must not block the test
+                released.wait(10)
+            return stream
 
-        # Spy on _resolve_content to track call order relative to lock
-        resolve_called = asyncio.Event()
-        original_resolve = session._resolve_content
+        monkeypatch.setattr(os, "fdopen", held)
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
+        writing = asyncio.create_task(session.write_file("out.bin", source))
+        try:
+            assert await asyncio.to_thread(reached.wait, 10)
+            # The bound only ends a failed run: with the lock held, list_files waits for the open.
+            listed = await asyncio.wait_for(session.list_files(), timeout=5)
+        finally:
+            released.set()
+        await writing
 
-        async def spied_resolve(content: bytes | Path | IO[bytes]) -> tuple[IO[bytes], bool]:
-            result = await original_resolve(content)
-            resolve_called.set()
-            # Wait a bit to ensure read_file tries to acquire the lock
-            await asyncio.sleep(0.1)
-            return result
-
-        session._resolve_content = spied_resolve  # type: ignore[method-assign]
-
-        async def write_task() -> None:
-            await session.write_file("out.bin", f)
-
-        async def read_task() -> None:
-            await resolve_called.wait()
-            # This should NOT be blocked by _resolve_content
-            await session.read_file("any.txt", destination=tmp_path / "any.bin")
-
-        # Both should complete — read_file isn't blocked by file I/O
-        await asyncio.gather(write_task(), read_task())
-
-        await session.close()
+        assert listed == [FileInfo(name="a.txt", is_dir=False, size=10)]
+        assert [u.data for u in uploads] == [b"x" * 100]
 
     async def test_path_checked_and_opened_off_the_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A Path source is opened and checked (type, size: fstat) in a worker thread: the
         caller's path can be on a network disk, where each call waits for the disk."""
         f = tmp_path / "src.bin"
         f.write_bytes(b"data")
-        callers: list[int] = []
-        stat, open_ = Path.stat, os.open
-
-        def spied_stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-            if self == f:
-                callers.append(threading.get_ident())
-            return stat(self, *args, **kwargs)
+        inode = f.stat().st_ino
+        callers: list[tuple[str, int]] = []
+        open_, fstat = os.open, os.fstat
 
         def spied_open(path: Any, *args: Any, **kwargs: Any) -> int:
             if Path(path) == f:
-                callers.append(threading.get_ident())
+                callers.append(("open", threading.get_ident()))
             return open_(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "stat", spied_stat)
+        def spied_fstat(fd: int) -> os.stat_result:
+            st = fstat(fd)
+            if st.st_ino == inode:
+                callers.append(("fstat", threading.get_ident()))
+            return st
+
         monkeypatch.setattr(os, "open", spied_open)
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(f)
-        with stream:
-            assert owned is True
-            assert stream.read() == b"data"
-        assert callers  # the open
-        assert threading.get_ident() not in callers
+        monkeypatch.setattr(os, "fstat", spied_fstat)
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
+        await session.write_file("out.bin", f)
+
+        assert [u.data for u in uploads] == [b"data"]
+        assert {step for step, _ in callers} == {"open", "fstat"}
+        assert threading.get_ident() not in {thread for _, thread in callers}
 
     async def test_cancel_while_opening_closes_the_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A caller cancelled while its Path source is being opened: the cancel waits for the
-        open, closes the file it opened (no file object without an owner), then propagates."""
+        open, closes the file it opened (no file object without an owner), then propagates.
+        The VM is not asked and the session stays open."""
         f = tmp_path / "src.bin"
         f.write_bytes(b"data")
         loop_thread = threading.get_ident()
@@ -771,19 +811,21 @@ class TestResolveContentNormal:
             return stream
 
         monkeypatch.setattr(os, "fdopen", held)
-        session, _, _ = _make_session()
-        resolving = asyncio.create_task(session._resolve_content(f))
+        session, mock_vm, _ = _make_session()
+        writing = asyncio.create_task(session.write_file("out.bin", f))
         try:
             assert await asyncio.to_thread(reached.wait, 10)
-            resolving.cancel()
+            writing.cancel()
             await asyncio.sleep(0.05)
-            assert not resolving.done(), "the cancel did not wait for the open"
+            assert not writing.done(), "the cancel did not wait for the open"
         finally:
             released.set()
         with pytest.raises(asyncio.CancelledError):
-            await resolving
+            await writing
         (stream,) = opened
         assert stream.closed
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     @pytest.mark.timeout(30)
     async def test_fifo_source_is_refused_at_once(self, tmp_path: Path) -> None:
@@ -791,28 +833,37 @@ class TestResolveContentNormal:
         refused as not a regular file, without waiting for a writer."""
         fifo = tmp_path / "pipe"
         os.mkfifo(fifo)
-        session, _, _ = _make_session()
+        session, mock_vm, _ = _make_session()
         with pytest.raises(
-            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="not a regular file"
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^Source pipe is not a regular file$",
         ):
-            await asyncio.wait_for(session._resolve_content(fifo), timeout=5)
+            await asyncio.wait_for(session.write_file("out.bin", fifo), timeout=5)
+        mock_vm.write_file.assert_not_awaited()
 
 
 # ============================================================================
-# _resolve_content() — Edge cases (boundaries)
+# write_file() sources — limits and unusable streams
 # ============================================================================
 
 
-class TestResolveContentEdgeCases:
-    """Boundary value tests for _resolve_content()."""
+class TestWriteFileSourceLimits:
+    """Size limit (500 MiB) of each source kind, and streams that cannot be read as bytes.
+    A refused source is the caller's error (ARGUMENT_INVALID), found before the call takes
+    the session: the VM is not asked and the session stays open."""
 
     async def test_closed_stream_is_refused(self) -> None:
         """A closed IO source: refused before the write starts (a read would raise a builtin ValueError)."""
-        session, _, _ = _make_session()
+        session, mock_vm, _ = _make_session()
         stream = io.BytesIO(b"data")
         stream.close()
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID):
-            await session._resolve_content(stream)
+        with pytest.raises(
+            InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match=r"^Stream content is closed$"
+        ):
+            await session.write_file("out.bin", stream)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     @pytest.mark.parametrize(
         ("make_source", "match"),
@@ -844,110 +895,115 @@ class TestResolveContentEdgeCases:
         assert not session.closed
 
     async def test_bytes_exactly_at_max_size_accepted(self) -> None:
-        """Bytes of exactly MAX_FILE_SIZE_BYTES are accepted."""
-        session, _, _ = _make_session()
-        content = b"x" * MAX_FILE_SIZE_BYTES
-        stream, owned = await session._resolve_content(content)
-        assert owned is True
-        assert stream.read() == content
-        stream.close()
+        session, mock_vm, _ = _make_session()
+        sizes = _record_upload_sizes(mock_vm)
+        await session.write_file("out.bin", bytes(MAX_FILE_SIZE_BYTES))
+        assert sizes == [MAX_FILE_SIZE_BYTES]
 
     async def test_bytes_one_over_max_rejected(self) -> None:
-        """Bytes of MAX_FILE_SIZE_BYTES + 1 raise InvalidInputError ARGUMENT_INVALID."""
-        session, _, _ = _make_session()
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
-            await session._resolve_content(b"x" * (MAX_FILE_SIZE_BYTES + 1))
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^Content is 524288001 bytes, exceeds 524288000$",
+        ):
+            await session.write_file("out.bin", bytes(MAX_FILE_SIZE_BYTES + 1))
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     async def test_path_exactly_at_max_size_accepted(self, tmp_path: Path) -> None:
-        """Path pointing to file of exactly MAX_FILE_SIZE_BYTES is accepted."""
-        f = tmp_path / "exact.bin"
-        f.write_bytes(b"x" * MAX_FILE_SIZE_BYTES)
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(f)
-        assert owned is True
-        assert stream.read() == b"x" * MAX_FILE_SIZE_BYTES
-        stream.close()
+        source = _sparse_file(tmp_path / "exact.bin", MAX_FILE_SIZE_BYTES)
+        session, mock_vm, _ = _make_session()
+        sizes = _record_upload_sizes(mock_vm)
+        await session.write_file("out.bin", source)
+        assert sizes == [MAX_FILE_SIZE_BYTES]
 
     async def test_path_one_over_max_rejected(self, tmp_path: Path) -> None:
-        """Path to file of MAX_FILE_SIZE_BYTES + 1 raises InvalidInputError ARGUMENT_INVALID."""
-        f = tmp_path / "over.bin"
-        f.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
-        session, _, _ = _make_session()
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
-            await session._resolve_content(f)
-
-    async def test_empty_bytes_accepted(self) -> None:
-        """Empty bytes (0 length) are accepted."""
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(b"")
-        assert owned is True
-        assert stream.read() == b""
-        stream.close()
+        source = _sparse_file(tmp_path / "over.bin", MAX_FILE_SIZE_BYTES + 1)
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^File over\.bin is 524288001 bytes, exceeds 524288000$",
+        ):
+            await session.write_file("out.bin", source)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     async def test_empty_file_accepted(self, tmp_path: Path) -> None:
-        """Empty file (0 bytes) is accepted."""
-        f = tmp_path / "empty.bin"
-        f.write_bytes(b"")
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(f)
-        assert owned is True
-        assert stream.read() == b""
-        stream.close()
+        source = tmp_path / "empty.bin"
+        source.write_bytes(b"")
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
+        await session.write_file("out.bin", source)
+        assert [u.data for u in uploads] == [b""]
 
-    async def test_seekable_io_bytes_at_max_size_accepted(self) -> None:
-        """Seekable IO[bytes] of exactly MAX_FILE_SIZE_BYTES is accepted."""
-        session, _, _ = _make_session()
-        buf = io.BytesIO(b"x" * MAX_FILE_SIZE_BYTES)
-        stream, owned = await session._resolve_content(buf)
-        assert owned is False
-        assert stream is buf
+    async def test_seekable_stream_at_max_size_accepted(self) -> None:
+        session, mock_vm, _ = _make_session()
+        sizes = _record_upload_sizes(mock_vm)
+        await session.write_file("out.bin", io.BytesIO(bytes(MAX_FILE_SIZE_BYTES)))
+        assert sizes == [MAX_FILE_SIZE_BYTES]
 
-    async def test_seekable_io_bytes_over_max_rejected(self) -> None:
-        """Seekable IO[bytes] exceeding MAX_FILE_SIZE_BYTES raises InvalidInputError ARGUMENT_INVALID."""
-        session, _, _ = _make_session()
-        buf = io.BytesIO(b"x" * (MAX_FILE_SIZE_BYTES + 1))
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
-            await session._resolve_content(buf)
+    async def test_seekable_stream_over_max_rejected(self) -> None:
+        session, mock_vm, _ = _make_session()
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
+            match=r"^Stream content is 524288001 bytes, exceeds 524288000$",
+        ):
+            await session.write_file("out.bin", io.BytesIO(bytes(MAX_FILE_SIZE_BYTES + 1)))
+        mock_vm.write_file.assert_not_awaited()
 
-    async def test_non_seekable_io_bytes_skips_validation(self) -> None:
-        """Non-seekable IO[bytes] skips size validation."""
-        from tests.conftest import NonSeekableIO
+    async def test_seekable_stream_limit_counts_from_its_position(self) -> None:
+        """The limit counts the bytes from the stream position, not from its start: a stream
+        one byte over the limit, read from offset 1, is accepted."""
+        session, mock_vm, _ = _make_session()
+        sizes = _record_upload_sizes(mock_vm)
+        buf = io.BytesIO(bytes(MAX_FILE_SIZE_BYTES + 1))
+        buf.seek(1)
+        await session.write_file("out.bin", buf)
+        assert sizes == [MAX_FILE_SIZE_BYTES]
 
-        session, _, _ = _make_session()
-        raw = NonSeekableIO(b"x" * 100)
-        buf = io.BufferedReader(raw)
-        stream, owned = await session._resolve_content(buf)  # type: ignore[arg-type]
-        assert owned is False
-        assert stream is buf
+    async def test_non_seekable_stream_has_no_size_check(self) -> None:
+        """A non-seekable stream has no size to check before the write: it goes to the VM
+        (the guest enforces the limit as it receives the bytes)."""
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
+        buf = io.BufferedReader(NonSeekableIO(b"x" * 100))
+        await session.write_file("out.bin", buf)
+        assert [(u.stream, u.data) for u in uploads] == [(buf, b"x" * 100)]
 
-    async def test_seekable_io_bytes_preserves_position(self) -> None:
-        """Size validation restores the original stream position."""
-        session, _, _ = _make_session()
+    async def test_seekable_stream_keeps_its_position(self) -> None:
+        """The size check sets the stream back to its position: the VM reads from there."""
+        session, mock_vm, _ = _make_session()
+        uploads = _record_uploads(mock_vm)
         buf = io.BytesIO(b"prefix" + b"data")
-        buf.seek(6)  # Position past "prefix"
-        _, owned = await session._resolve_content(buf)
-        assert owned is False
-        assert buf.tell() == 6  # Position preserved
+        buf.seek(6)
+        await session.write_file("out.bin", buf)
+        assert [u.data for u in uploads] == [b"data"]
 
 
 # ============================================================================
-# _resolve_content() — Out of bounds
+# write_file() sources — local errors
 # ============================================================================
 
 
-class TestResolveContentOutOfBounds:
-    """Error handling in _resolve_content()."""
+class TestWriteFileSourceErrors:
+    """A Path source that cannot be opened: the caller's error (ARGUMENT_INVALID) when the
+    same call fails again, else this host's (LOCAL_DISK). The VM is not asked and the
+    session stays open."""
 
     async def test_nonexistent_path_raises_argument_invalid(self, tmp_path: Path) -> None:
-        """Path to non-existent file raises InvalidInputError ARGUMENT_INVALID."""
-        session, _, _ = _make_session()
+        session, mock_vm, _ = _make_session()
         ghost = tmp_path / "ghost.txt"
         with pytest.raises(
             InvalidInputError,
             check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
             match=rf"^Source file cannot be opened \(No such file or directory\): {re.escape(str(ghost))}$",
         ):
-            await session._resolve_content(ghost)
+            await session.write_file("out.bin", ghost)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     @pytest.mark.parametrize("case", ["no-read-access", "symlink-loop", "file-in-path"])
     async def test_unopenable_source_raises_argument_invalid(self, tmp_path: Path, case: str) -> None:
@@ -964,14 +1020,16 @@ class TestResolveContentOutOfBounds:
         else:  # ENOTDIR
             (tmp_path / "a-file").write_bytes(b"")
             source = tmp_path / "a-file" / "source.bin"
-        session, _, _ = _make_session()
+        session, mock_vm, _ = _make_session()
         with pytest.raises(
             InvalidInputError,
             check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
             match=rf"^Source file cannot be opened \(.+\): {re.escape(str(source))}$",
         ) as exc_info:
-            await session._resolve_content(source)
+            await session.write_file("out.bin", source)
         assert isinstance(exc_info.value.__cause__, OSError)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
     @pytest.mark.parametrize(
         ("step", "code"),
@@ -1028,171 +1086,214 @@ class TestResolveContentOutOfBounds:
         """Path pointing to a directory: not a regular file."""
         d = tmp_path / "subdir"
         d.mkdir()
-        session, _, _ = _make_session()
+        session, mock_vm, _ = _make_session()
         with pytest.raises(
             InvalidInputError,
             check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
-            match="Source subdir is not a regular file",
+            match=r"^Source subdir is not a regular file$",
         ):
-            await session._resolve_content(d)
+            await session.write_file("out.bin", d)
+        mock_vm.write_file.assert_not_awaited()
+        assert not session.closed
 
 
 # ============================================================================
-# _resolve_content() — TOCTOU guard (file grows between stat and read)
+# QemuVM file calls — a real QemuVM on a fake guest channel
 # ============================================================================
 
 
-class TestResolveContentToctou:
-    """TOCTOU: stat-based size check before opening file handle."""
-
-    async def test_file_over_stat_limit_rejected(self, tmp_path: Path) -> None:
-        """File whose stat() reports > MAX_FILE_SIZE_BYTES is rejected."""
-        f = tmp_path / "big.bin"
-        f.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
-        session, _, _ = _make_session()
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID, match="exceeds"):
-            await session._resolve_content(f)
-
-    async def test_file_stays_within_limit_accepted(self, tmp_path: Path) -> None:
-        """File within limit returns a readable stream."""
-        f = tmp_path / "stable.bin"
-        content = b"x" * 1000
-        f.write_bytes(content)
-        session, _, _ = _make_session()
-        stream, owned = await session._resolve_content(f)
-        assert owned is True
-        assert stream.read() == content
-        stream.close()
+_DEADLINE_DIAGNOSTICS = {
+    "console_log": "[WARN] last guest line",
+    "qemu_status": "running",
+    "qemu_cpu_seconds": 1.5,
+    "qemu_threads": 8,
+}
+"""What a stubbed QemuVM.deadline_diagnostics returns: a host deadline error must carry it."""
 
 
-# ============================================================================
-# QemuVM.write_file() — Path validation (bypassed Pydantic validators)
-# ============================================================================
+async def _file_io_vm(vm_id: str, *answers: StreamingMessage) -> tuple[QemuVM, AsyncMock, OperationInbox]:
+    """A real QemuVM on a fake guest channel. register_op gives one inbox that holds the
+    guest's `answers`; enqueue_registered is the real channel code (check the inbox, mark
+    the command sent, send it with enqueue_raw); enqueue_raw records each frame sent on the
+    command port. deadline_diagnostics (QMP and process probes) gives _DEADLINE_DIAGNOSTICS."""
+    inbox = OperationInbox()
+    for answer in answers:
+        assert await inbox.route(answer)
+    channel = AsyncMock(spec=DualPortChannel)
+    channel.register_op.return_value = inbox
+
+    async def enqueue_registered(registered: OperationInbox, data: bytes) -> None:
+        await DualPortChannel.enqueue_registered(channel, registered, data)  # type: ignore[arg-type]
+
+    channel.enqueue_registered.side_effect = enqueue_registered
+    process = MagicMock()
+    process.returncode = None
+    vm = QemuVM(
+        vm_id,
+        process=process,
+        cgroup=None,
+        workdir=MagicMock(use_qemu_vm_user=False),
+        channel=channel,
+        spec=VmSpec(language=Language.PYTHON),
+        console_lines=deque(maxlen=10),
+        base_image=Path("/test/base.qcow2"),
+        packages_image=None,
+        accel_type=AccelType.KVM,
+        release_callback=AsyncMock(side_effect=AssertionError("this test does not destroy the VM")),
+    )
+    vm.deadline_diagnostics = AsyncMock(return_value=_DEADLINE_DIAGNOSTICS)  # type: ignore[method-assign]
+    return vm, channel, inbox
+
+
+def _frames(channel: AsyncMock) -> list[dict[str, Any]]:
+    """The frames the VM sent on the command port, in order. Each frame is one JSON line."""
+    frames: list[dict[str, Any]] = []
+    for call in channel.enqueue_raw.await_args_list:
+        data: bytes = call.args[0]
+        assert data.endswith(b"\n")
+        assert data.count(b"\n") == 1, "a frame must be one line"
+        frames.append(json.loads(data))
+    return frames
+
+
+def _sent_content(frames: list[dict[str, Any]]) -> bytes:
+    """The file content in the file_chunk frames, decoded with a new zstd decoder."""
+    compressed = b"".join(base64.b64decode(f["data"]) for f in frames if f["action"] == "file_chunk")
+    return zstd.ZstdDecompressor().decompress(compressed)
+
+
+def _guest_file(payload: bytes, *, path: str = "file.bin", parts: int = 1) -> list[StreamingMessage]:
+    """What the guest sends for read_file: the payload in one zstd stream cut in `parts`
+    chunk messages, then the completion with its path and size."""
+    compressor = zstd.ZstdCompressor(level=3)
+    compressed = compressor.compress(payload) + compressor.flush()
+    step = -(-len(compressed) // parts)
+    chunks: list[StreamingMessage] = [
+        FileChunkResponseMessage(op_id="read-op", data=compressed[i : i + step])
+        for i in range(0, len(compressed), step)
+    ]
+    return [*chunks, FileReadCompleteMessage(op_id="read-op", path=path, size=len(payload))]
 
 
 class TestWriteFilePathValidation:
-    """Path validation that mirrors WriteFileRequest Pydantic validators."""
+    """QemuVM.write_file checks the path before it sends anything (the guest checks it again)."""
 
     async def test_empty_path_rejected(self) -> None:
-        """Empty path raises InvalidInputError PATH_INVALID."""
-        import io
-
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "test-vm"
-        vm.channel = AsyncMock()
-
-        # Call the real write_file method
+        vm, channel, _ = await _file_io_vm("test-vm")
         with pytest.raises(
-            InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID, match="must not be empty"
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.PATH_INVALID,
+            match=r"^write_file path must not be empty$",
         ):
-            await QemuVM.write_file(vm, "", io.BytesIO(b"data"))
+            await vm.write_file("", io.BytesIO(b"data"))
+        channel.connect.assert_not_awaited()
+        channel.enqueue_raw.assert_not_awaited()
 
     async def test_path_at_max_length_accepted(self) -> None:
-        """Path of exactly MAX_FILE_PATH_LENGTH chars is accepted."""
-        import io
-
-        from exec_sandbox.guest_agent_protocol import FileWriteAckMessage
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "test-vm"
-        vm.channel = AsyncMock()
-        vm.channel.connect = AsyncMock()
-        vm.channel.enqueue_raw = AsyncMock()
-        vm.channel.unregister_op = AsyncMock()
-        ack = FileWriteAckMessage(op_id="test", path="x" * MAX_FILE_PATH_LENGTH, bytes_written=4)
-        op_queue = OperationInbox()
-        op_queue._queue.put_nowait(ack)
-        vm.channel.register_op = AsyncMock(return_value=op_queue)
-        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
-
-        # Should not raise
-        await QemuVM.write_file(vm, "x" * MAX_FILE_PATH_LENGTH, io.BytesIO(b"data"))
+        """A path of 4096 characters (PATH_MAX) goes to the guest."""
+        path = "x" * 4096
+        vm, channel, _ = await _file_io_vm("test-vm", FileWriteAckMessage(op_id="w", path=path, bytes_written=4))
+        await vm.write_file(path, io.BytesIO(b"data"))
+        assert _frames(channel)[0]["path"] == path
 
     async def test_path_over_max_length_rejected(self) -> None:
-        """Path exceeding MAX_FILE_PATH_LENGTH raises InvalidInputError PATH_INVALID."""
-        import io
+        vm, channel, _ = await _file_io_vm("test-vm")
+        with pytest.raises(
+            InvalidInputError,
+            check=lambda e: e.code is ErrorCode.PATH_INVALID,
+            match=r"^write_file path is 4097 chars, exceeds 4096$",
+        ):
+            await vm.write_file("x" * 4097, io.BytesIO(b"data"))
+        channel.connect.assert_not_awaited()
+        channel.enqueue_raw.assert_not_awaited()
 
-        from exec_sandbox.qemu_vm import QemuVM
+    async def test_dropped_header_error_is_not_retried(self) -> None:
+        """The guest never drops a request (it keeps its ports open), so a "No active
+        write" protocol error is a bug to report: it propagates at once, with no retry
+        and no channel reset."""
+        error = StreamingErrorMessage(op_id="w", error_type="protocol_error", message="No active write for op_id 'x'")
+        vm, channel, _ = await _file_io_vm("protocol-error-vm", error)
 
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "test-vm"
-        vm.channel = AsyncMock()
+        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL, match="No active write"):
+            await vm.write_file("target.bin", io.BytesIO(b"data"))
 
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID, match="exceeds"):
-            await QemuVM.write_file(vm, "x" * (MAX_FILE_PATH_LENGTH + 1), io.BytesIO(b"data"))
+        channel.register_op.assert_awaited_once()
+        assert [f["action"] for f in _frames(channel)].count("write_file") == 1
+        channel.close.assert_not_awaited()
 
-    async def test_other_protocol_error_is_not_retried(self) -> None:
-        """Only the dropped header ("No active write") is retried: another protocol error
-        propagates at once and keeps the connection."""
-        from exec_sandbox.qemu_vm import QemuVM
 
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "protocol-error-vm"
-        vm.channel = AsyncMock()
-        vm._write_file_protocol = AsyncMock(
-            side_effect=InternalError(
-                "write_file: [protocol_error] frame corruption",
-                code=ErrorCode.GUEST_PROTOCOL,
-                context=None,
-                hint=None,
-                instance_id=None,
-            )
+class TestWriteFileWire:
+    """The frames QemuVM.write_file sends: a write_file header, the content in file_chunk
+    frames (one zstd stream, base64), then file_end, all with the same op_id."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "test.txt",
+            'my"file.txt',
+            "dir\\file.txt",
+            "line1\nline2.txt",
+            "col1\tcol2.tsv",
+            "données/résultat.csv",
+            "data/output_\U0001f680.json",
+            'a"b\\c/d\be\ff\ng\rh\ti',
+        ],
+        ids=["plain", "quote", "backslash", "newline", "tab", "unicode", "emoji", "all-json-escapes"],
+    )
+    @pytest.mark.parametrize("make_executable", [False, True], ids=["0644", "0755"])
+    async def test_header_carries_path_and_mode_on_one_line(self, path: str, make_executable: bool) -> None:
+        """Each frame is one JSON line, also for a path with quotes, backslashes or control
+        characters (a newline in the path would end the frame). The header carries the host
+        clock at send time (the guest steps its clock forward to it)."""
+        vm, channel, _ = await _file_io_vm("test-vm", FileWriteAckMessage(op_id="w", path=path, bytes_written=4))
+        before = time.time_ns()
+        await vm.write_file(path, io.BytesIO(b"data"), make_executable=make_executable)
+        after = time.time_ns()
+
+        header, *_, end = _frames(channel)
+        op_id = end["op_id"]
+        assert before <= header.pop("host_time_ns") <= after
+        assert header == {"action": "write_file", "op_id": op_id, "path": path, "make_executable": make_executable}
+        assert end == {"action": "file_end", "op_id": op_id}
+        assert re.fullmatch(r"[0-9a-f]{32}", op_id)
+
+    @pytest.mark.parametrize(
+        "size",
+        [0, 30, 2 * FILE_TRANSFER_CHUNK_SIZE + 7],
+        ids=["empty", "small", "three-chunks"],
+    )
+    async def test_content_round_trips_through_the_chunks(self, size: int) -> None:
+        """The file_chunk frames decode (base64, then one zstd stream) to the source bytes;
+        the ack binds the byte count."""
+        content = os.urandom(size)
+        vm, channel, _ = await _file_io_vm(
+            "test-vm", FileWriteAckMessage(op_id="w", path="out.bin", bytes_written=size)
         )
+        await vm.write_file("out.bin", io.BytesIO(content))
 
-        with pytest.raises(InternalError, check=lambda e: e.code is ErrorCode.GUEST_PROTOCOL, match="frame corruption"):
-            await QemuVM.write_file(vm, "target.bin", io.BytesIO(b"data"))
+        frames = _frames(channel)
+        actions = [f["action"] for f in frames]
+        assert actions == ["write_file", *["file_chunk"] * (len(actions) - 2), "file_end"]
+        assert {f["op_id"] for f in frames} == {frames[-1]["op_id"]}
+        assert _sent_content(frames) == content
+        channel.unregister_op.assert_awaited_once_with(frames[-1]["op_id"])
 
-        vm._write_file_protocol.assert_awaited_once()
-        vm.channel.close.assert_not_awaited()
+    async def test_compressible_content_is_compressed(self) -> None:
+        """1 MiB of zeros goes on the wire in far fewer bytes than the file."""
+        content = bytes(1024 * 1024)
+        vm, channel, _ = await _file_io_vm(
+            "test-vm", FileWriteAckMessage(op_id="w", path="zeros.bin", bytes_written=len(content))
+        )
+        await vm.write_file("zeros.bin", io.BytesIO(content))
 
-    async def test_retry_restores_the_callers_initial_stream_position(self) -> None:
-        """A stale-header retry resends exactly the caller-selected suffix."""
-        from exec_sandbox.qemu_vm import QemuVM
-
-        content = io.BytesIO(b"prefix-payload")
-        content.seek(len(b"prefix-"))
-        positions: list[int] = []
-
-        async def protocol(*_args: object, **_kwargs: object) -> None:
-            positions.append(content.tell())
-            content.read(1)
-            if len(positions) == 1:
-                raise InternalError(
-                    "No active write", code=ErrorCode.GUEST_PROTOCOL, context=None, hint=None, instance_id=None
-                )
-
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "retry-position-vm"
-        vm.channel = AsyncMock()
-        vm._write_file_protocol = AsyncMock(side_effect=protocol)
-
-        await QemuVM.write_file(vm, "target.bin", content)
-
-        assert positions == [len(b"prefix-"), len(b"prefix-")]
+        frames = _frames(channel)
+        wire = sum(len(f["data"]) for f in frames if f["action"] == "file_chunk")
+        assert wire < len(content) // 100
+        assert _sent_content(frames) == content
 
 
 class TestWriteFileCommitProtocol:
     """A file_end frame is a commit record, never best-effort cleanup."""
-
-    @staticmethod
-    def _make_vm(response: StreamingMessage | None = None) -> tuple[MagicMock, OperationInbox]:
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "write-commit-vm"
-        vm.channel = AsyncMock()
-        vm.channel.connect = AsyncMock()
-        vm.channel.enqueue_raw = AsyncMock()
-        vm.channel.unregister_op = AsyncMock()
-        inbox = OperationInbox()
-        if response is not None:
-            inbox._queue.put_nowait(response)
-        vm.channel.register_op = AsyncMock(return_value=inbox)
-        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
-        return vm, inbox
 
     @pytest.mark.parametrize("seekable", [False, True], ids=["non-seekable", "seekable"])
     async def test_source_failure_after_header_aborts_as_local_disk(self, seekable: bool) -> None:
@@ -1201,7 +1302,6 @@ class TestWriteFileCommitProtocol:
         closes: the host closes the channel and reports nothing written (RETRY: LOCAL_DISK),
         not an unknown outcome (VERIFY, which closes the session). A seekable source goes
         back to where the call found it, so the same call can run again."""
-        from exec_sandbox.qemu_vm import QemuVM
 
         class FailingSource(io.BytesIO):
             reads = 0
@@ -1217,24 +1317,21 @@ class TestWriteFileCommitProtocol:
 
         source = FailingSource(b"head" + os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE))
         source.seek(4)
-        vm, _inbox = self._make_vm()
+        vm, channel, _ = await _file_io_vm("write-commit-vm")
         with pytest.raises(
             TransientError,
             check=lambda e: e.code is ErrorCode.LOCAL_DISK and e.context["errno"] == errno.EIO,
             match=rf"^VM write-commit-vm write_file could not read the local source \({os.strerror(errno.EIO)}\)$",
         ) as exc_info:
-            await QemuVM._write_file_protocol(vm, "target.bin", source, make_executable=False)
+            await vm.write_file("target.bin", source, make_executable=False)
         assert isinstance(exc_info.value.__cause__, OSError)
-        vm.channel.enqueue_registered.assert_awaited_once()  # the header was sent
-        actions = [json.loads(call.args[0])["action"] for call in vm.channel.enqueue_raw.await_args_list]
-        assert actions == ["file_chunk"]  # a chunk went out, never a file_end
-        vm.channel.close.assert_awaited_once()  # the guest drops the partial write
-        vm.channel.unregister_op.assert_awaited_once()
+        assert [f["action"] for f in _frames(channel)] == ["write_file", "file_chunk"]  # never a file_end
+        channel.close.assert_awaited_once()  # the guest drops the partial write
+        channel.unregister_op.assert_awaited_once()
         assert source.tell() == (4 if seekable else 4 + FILE_TRANSFER_CHUNK_SIZE)
 
     async def test_failed_chunk_enqueue_never_starts_the_next_source_read(self) -> None:
         """A failed enqueue cannot return while look-ahead still owns the stream."""
-        from exec_sandbox.qemu_vm import QemuVM
 
         class CountingReader:
             reads = 0
@@ -1245,61 +1342,60 @@ class TestWriteFileCommitProtocol:
                     return os.urandom(FILE_TRANSFER_CHUNK_SIZE)
                 return b""
 
+        async def failing_chunks(data: bytes) -> None:
+            if json.loads(data)["action"] == "file_chunk":
+                raise OSError("injected enqueue failure")
+
         reader = CountingReader()
-        vm, _inbox = self._make_vm()
-        vm.channel.enqueue_raw = AsyncMock(side_effect=OSError("injected enqueue failure"))
+        vm, channel, _ = await _file_io_vm("write-commit-vm")
+        channel.enqueue_raw.side_effect = failing_chunks
 
         with pytest.raises(
             OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="after dispatch"
         ):
-            await QemuVM._write_file_protocol(vm, "target.bin", reader, make_executable=False)  # type: ignore[arg-type]
+            await vm.write_file("target.bin", reader)  # type: ignore[arg-type]
 
         assert reader.reads == 1
 
     async def test_prefailed_registration_is_reported_before_dispatch(self) -> None:
         """A dead registered inbox proves that no header reached the write queue."""
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm, inbox = self._make_vm()
+        vm, channel, inbox = await _file_io_vm("write-commit-vm")
         inbox.fail("event transport already closed")
-        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
 
         with pytest.raises(
             TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="before dispatch"
         ):
-            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"), make_executable=False)
+            await vm.write_file("target.bin", io.BytesIO(b"payload"))
 
-        vm.channel.enqueue_raw.assert_not_awaited()
+        channel.enqueue_raw.assert_not_awaited()
 
     async def test_ack_timeout_after_commit_is_outcome_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from exec_sandbox.qemu_vm import QemuVM
-
         monkeypatch.setattr(constants, "FILE_IO_TIMEOUT_SECONDS", 0.01)
-        vm, _inbox = self._make_vm()
+        vm, channel, _ = await _file_io_vm("write-commit-vm")
         with pytest.raises(
             OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="after dispatch"
         ) as exc_info:
-            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"), make_executable=False)
+            await vm.write_file("target.bin", io.BytesIO(b"payload"))
 
         assert isinstance(exc_info.value.__cause__, TimeoutError)
-        actions = [json.loads(call.args[0])["action"] for call in vm.channel.enqueue_raw.await_args_list]
-        assert actions[-1] == "file_end"
+        assert _frames(channel)[-1]["action"] == "file_end"
+        # A host deadline carries the guest console and the QEMU state.
+        assert exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()
+        vm.deadline_diagnostics.assert_awaited_once_with(operation="write_file")  # type: ignore[attr-defined]
 
     @pytest.mark.parametrize(
         ("ack_path", "ack_size"),
         [("different.bin", 7), ("target.bin", 6)],
     )
     async def test_ack_must_bind_path_and_source_size(self, ack_path: str, ack_size: int) -> None:
-        from exec_sandbox.qemu_vm import QemuVM
-
         ack = FileWriteAckMessage(op_id="write-op", path=ack_path, bytes_written=ack_size)
-        vm, _inbox = self._make_vm(ack)
+        vm, _channel, _ = await _file_io_vm("write-commit-vm", ack)
         with pytest.raises(
             OutcomeUnknownError,
             check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN,
             match="acknowledgement did not bind",
         ):
-            await QemuVM._write_file_protocol(vm, "target.bin", io.BytesIO(b"payload"), make_executable=False)
+            await vm.write_file("target.bin", io.BytesIO(b"payload"))
 
 
 class TestReadFileTerminalIntegrity:
@@ -1308,66 +1404,62 @@ class TestReadFileTerminalIntegrity:
     host's (LOCAL_DISK), never the guest's (GUEST_UNAVAILABLE)."""
 
     async def test_declared_size_mismatch_is_communication_failure(self) -> None:
-        from exec_sandbox.qemu_vm import QemuVM
+        """A completion that declares more bytes than came: a transport fault (the read can
+        run again), never a short file reported as complete."""
+        complete = FileReadCompleteMessage(op_id="read-op", path="file.bin", size=1)
+        vm, _channel, _ = await _file_io_vm("test-vm", complete)
+        destination = io.BytesIO()
+        with pytest.raises(
+            TransientError,
+            check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE,
+            match=r"^VM test-vm read_file communication failed: .*declared_size=1, received_size=0$",
+        ):
+            await vm.read_file("file.bin", destination=destination)
 
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "test-vm"
-        vm.channel = AsyncMock()
-        inbox = OperationInbox()
-        inbox._queue.put_nowait(FileReadCompleteMessage(op_id="read-op", path="file.bin", size=1))
-        vm.channel.register_op = AsyncMock(return_value=inbox)
-        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
+    async def test_request_names_the_file(self) -> None:
+        vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
+        await vm.read_file("file.bin", destination=io.BytesIO())
+        (request,) = _frames(channel)
+        assert isinstance(request.pop("host_time_ns"), int)
+        assert request == {"action": "read_file", "op_id": request["op_id"], "path": "file.bin"}
+        channel.unregister_op.assert_awaited_once_with(request["op_id"])
 
-        with pytest.raises(CommunicationError, match="declared_size=1, received_size=0"):
-            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", io.BytesIO())
+    @pytest.mark.parametrize("parts", [1, 3], ids=["one-chunk", "three-chunks"])
+    async def test_stream_destination_gets_every_byte(self, parts: int) -> None:
+        """The chunks of one zstd stream decode in order, also across chunk boundaries."""
+        payload = os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE + 7)
+        vm, _channel, _ = await _file_io_vm("test-vm", *_guest_file(payload, parts=parts))
+        destination = io.BytesIO(b"prefix")
+        destination.seek(6)
+        await vm.read_file("file.bin", destination=destination)
+        assert destination.getvalue() == b"prefix" + payload
 
-    @staticmethod
-    def _file_read_vm(payload: bytes) -> MagicMock:
-        from exec_sandbox.qemu_vm import QemuVM, zstd
-
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "test-vm"
-        vm.channel = AsyncMock()
-        inbox = OperationInbox()
-        compressor = zstd.ZstdCompressor(level=constants.FILE_TRANSFER_ZSTD_LEVEL)
-        compressed = compressor.compress(payload) + compressor.flush()
-        inbox._queue.put_nowait(
-            FileChunkResponseMessage(op_id="read-op", data=base64.b64encode(compressed).decode("ascii"))
-        )
-        inbox._queue.put_nowait(FileReadCompleteMessage(op_id="read-op", path="file.bin", size=len(payload)))
-        vm.channel.register_op = AsyncMock(return_value=inbox)
-        vm.channel.enqueue_registered = AsyncMock(side_effect=_real_enqueue_registered)
-        return vm
-
-    @staticmethod
-    def _bound(vm: MagicMock) -> MagicMock:
-        """read_file with its real helpers (a spec mock stubs them)."""
-        from functools import partial
-
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm._read_file_to_path = partial(QemuVM._read_file_to_path, vm)
-        vm._recv_file_chunks = partial(QemuVM._recv_file_chunks, vm)
-        return vm
+    @pytest.mark.parametrize("damage", ["first-chunk-lost", "last-chunk-twice"])
+    async def test_a_broken_compressed_stream_is_a_guest_error(self, damage: str) -> None:
+        """A chunk dropped on the way (bad base64) or sent twice breaks the one zstd stream:
+        read_file raises the library's guest error, never a raw ZstdError or EOFError."""
+        payload = os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE + 7)
+        *chunks, complete = _guest_file(payload, parts=3)
+        sent = chunks[1:] if damage == "first-chunk-lost" else [*chunks, chunks[-1]]
+        vm, _channel, _ = await _file_io_vm("test-vm", *sent, complete)
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE) as exc_info:
+            await vm.read_file("file.bin", destination=io.BytesIO())
+        assert "compressed stream broke" in str(exc_info.value)
 
     async def test_path_destination_is_written_whole(self, tmp_path: Path) -> None:
-        from exec_sandbox.qemu_vm import QemuVM
-
         payload = b"payload of the guest file"
         destination = tmp_path / "out" / "file.bin"
-        vm = self._bound(self._file_read_vm(payload))
-        await QemuVM.read_file(vm, "file.bin", destination=destination)
+        vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(payload))
+        await vm.read_file("file.bin", destination=destination)
         assert destination.read_bytes() == payload
         assert sorted(p.name for p in destination.parent.iterdir()) == ["file.bin"]  # no temp file left
-        vm.channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_awaited_once()
 
     @pytest.mark.parametrize("case", ["file-in-path", "no-write-access", "folder-at-destination"])
     async def test_destination_the_caller_can_fix_is_argument_invalid(self, tmp_path: Path, case: str) -> None:
         """A destination path the caller can fix (a file in its path: mkdir ENOTDIR; a folder
         with no write access: EACCES; a folder where the file goes: rename EISDIR) fails the
         same way on every retry: FIX_INPUT (ARGUMENT_INVALID), not RETRY."""
-        from exec_sandbox.qemu_vm import QemuVM
-
         if case == "file-in-path":
             (tmp_path / "a-file").write_bytes(b"")
             destination, expected = tmp_path / "a-file" / "sub" / "file.bin", errno.ENOTDIR
@@ -1380,7 +1472,7 @@ class TestReadFileTerminalIntegrity:
         else:
             destination, expected = tmp_path / "folder", errno.EISDIR
             destination.mkdir()
-        vm = self._bound(self._file_read_vm(b"payload"))
+        vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
         reason = re.escape(os.strerror(expected))
         try:
             with pytest.raises(
@@ -1388,13 +1480,13 @@ class TestReadFileTerminalIntegrity:
                 check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID and e.context["errno"] == expected,
                 match=rf"^VM test-vm read_file could not write the local destination \({reason}\)$",
             ) as exc_info:
-                await QemuVM.read_file(vm, "file.bin", destination=destination)
+                await vm.read_file("file.bin", destination=destination)
         finally:
             if case == "no-write-access":
                 (tmp_path / "locked").chmod(0o700)
         assert isinstance(exc_info.value.__cause__, OSError)
         assert exc_info.value.context["path"] == "file.bin"
-        vm.channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_awaited_once()
         assert list(tmp_path.rglob("*.tmp")) == []  # no temp file left
 
     @pytest.mark.parametrize(
@@ -1410,35 +1502,32 @@ class TestReadFileTerminalIntegrity:
         """A NUL byte in the destination path or a destination with no file name raises
         ValueError in Path/os calls: the caller's error, and the cleanup's own ValueError
         (unlink of the temp path) does not hide it. The guest is not asked."""
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm = self._bound(self._file_read_vm(b"payload"))
+        vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
         with pytest.raises(
             InvalidInputError,
             check=lambda e: e.code is ErrorCode.ARGUMENT_INVALID,
             match=r"^VM test-vm read_file could not write the local destination \(.+\)$",
         ) as exc_info:
-            await QemuVM.read_file(vm, "file.bin", destination=make_destination(tmp_path))
+            await vm.read_file("file.bin", destination=make_destination(tmp_path))
         assert isinstance(exc_info.value.__cause__, ValueError)
-        vm.channel.register_op.assert_not_awaited()
-        vm.channel.unregister_op.assert_awaited_once()
+        channel.register_op.assert_not_awaited()
+        channel.unregister_op.assert_awaited_once()
         assert list(tmp_path.iterdir()) == []
 
     async def test_host_disk_error_is_local_disk(self) -> None:
         """A full disk can pass later: RETRY (LOCAL_DISK), named by its reason."""
-        from exec_sandbox.qemu_vm import QemuVM
 
         class FullDisk:
             def write(self, _data: bytes) -> int:
                 raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 
-        vm = self._file_read_vm(b"payload")
+        vm, _channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
         with pytest.raises(
             TransientError,
             check=lambda e: e.code is ErrorCode.LOCAL_DISK and e.context["errno"] == errno.ENOSPC,
             match=rf"^VM test-vm read_file could not write the local destination \({os.strerror(errno.ENOSPC)}\)$",
         ):
-            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", FullDisk())  # type: ignore[arg-type]
+            await vm.read_file("file.bin", destination=FullDisk())  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         ("make_error", "match"),
@@ -1460,39 +1549,34 @@ class TestReadFileTerminalIntegrity:
     async def test_transport_failure_is_guest_unavailable(
         self, tmp_path: Path, make_error: Any, match: str, kind: str
     ) -> None:
-        """One transport mapping for both destination kinds (OB5): a timeout, a socket error
+        """One transport mapping for both destination kinds: a timeout, a socket error
         or a channel error is the guest's (GUEST_UNAVAILABLE, RETRY), never LOCAL_DISK or a
         builtin. The temp file goes; the op is unregistered once."""
-        from exec_sandbox.qemu_vm import QemuVM
-
         error = make_error()
-        vm = self._bound(self._file_read_vm(b"payload"))
-        vm.channel.connect = AsyncMock(side_effect=error)
+        vm, channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
+        channel.connect.side_effect = error
         destination: Path | IO[bytes] = tmp_path / "file.bin" if kind == "path" else io.BytesIO()
         with pytest.raises(
             TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match=match
         ) as exc_info:
-            await QemuVM.read_file(vm, "file.bin", destination=destination)
+            await vm.read_file("file.bin", destination=destination)
         assert exc_info.value.__cause__ is error
-        vm.channel.unregister_op.assert_awaited_once()
+        channel.unregister_op.assert_awaited_once()
         assert list(tmp_path.iterdir()) == []
+        # Only a deadline carries the guest console and the QEMU state.
+        has_diagnostics = exc_info.value.context.items() >= _DEADLINE_DIAGNOSTICS.items()
+        assert has_diagnostics is isinstance(error, TimeoutError)
 
     async def test_failed_stream_leaves_no_temp_file(self, tmp_path: Path) -> None:
         """The guest stream fails after the temp file opened: the temp file goes, the
         destination is not created, and the error stays the guest's."""
-        from exec_sandbox.qemu_vm import QemuVM
-
-        vm = self._bound(self._file_read_vm(b"payload"))
-        inbox = OperationInbox()
-        inbox._queue.put_nowait(StreamingErrorMessage(op_id="read-op", error_type="io_error", message="gone"))
-        vm.channel.register_op = AsyncMock(return_value=inbox)
+        failure = StreamingErrorMessage(op_id="read-op", error_type="io_error", message="gone")
+        vm, _channel, _ = await _file_io_vm("test-vm", failure)
         with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
-            await QemuVM.read_file(vm, "file.bin", destination=tmp_path / "file.bin")
+            await vm.read_file("file.bin", destination=tmp_path / "file.bin")
         assert list(tmp_path.iterdir()) == []
 
     async def test_short_destination_writes_are_completed(self) -> None:
-        from exec_sandbox.qemu_vm import QemuVM
-
         class ShortWriter:
             def __init__(self) -> None:
                 self.value = bytearray()
@@ -1504,44 +1588,30 @@ class TestReadFileTerminalIntegrity:
 
         payload = b"short writes still preserve every byte"
         writer = ShortWriter()
-        vm = self._file_read_vm(payload)
-        await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", writer)  # type: ignore[arg-type]
+        vm, _channel, _ = await _file_io_vm("test-vm", *_guest_file(payload))
+        await vm.read_file("file.bin", destination=writer)  # type: ignore[arg-type]
         assert bytes(writer.value) == payload
 
-    async def test_zero_progress_destination_write_is_rejected(self) -> None:
-        from exec_sandbox.qemu_vm import QemuVM
+    @pytest.mark.parametrize(
+        "written",
+        [
+            pytest.param(lambda _data: 0, id="zero"),
+            pytest.param(lambda _data: None, id="none"),  # a raw non-blocking writer on would-block
+            pytest.param(lambda data: len(data) + 1, id="over-reporting"),
+        ],
+    )
+    async def test_destination_write_without_progress_is_rejected(self, written: Any) -> None:
+        """A writer that reports no progress (0, or None from a raw non-blocking writer) or
+        more bytes than it got cannot report success: LOCAL_DISK (an OSError), not a
+        TypeError or a short file."""
 
-        class ZeroWriter:
-            def write(self, _data: bytes) -> int:
-                return 0
+        class Writer:
+            def write(self, data: bytes) -> int | None:
+                return written(data)
 
-        vm = self._file_read_vm(b"payload")
+        vm, _channel, _ = await _file_io_vm("test-vm", *_guest_file(b"payload"))
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
-            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", ZeroWriter())  # type: ignore[arg-type]
-
-    async def test_none_returning_destination_write_is_rejected(self) -> None:
-        """A raw non-blocking writer returns None on would-block — OSError, not TypeError."""
-        from exec_sandbox.qemu_vm import QemuVM
-
-        class NoneWriter:
-            def write(self, _data: bytes) -> None:
-                return None
-
-        vm = self._file_read_vm(b"payload")
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
-            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", NoneWriter())  # type: ignore[arg-type]
-
-    async def test_over_reporting_destination_write_is_rejected(self) -> None:
-        """A writer claiming more progress than requested must not report success."""
-        from exec_sandbox.qemu_vm import QemuVM
-
-        class OverWriter:
-            def write(self, data: bytes) -> int:
-                return len(data) + 1
-
-        vm = self._file_read_vm(b"payload")
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK, match="no write progress"):
-            await QemuVM._recv_file_chunks(vm, "file.bin", "read-op", OverWriter())  # type: ignore[arg-type]
+            await vm.read_file("file.bin", destination=Writer())  # type: ignore[arg-type]
 
 
 class TestLocalPathError:
@@ -1613,198 +1683,6 @@ class TestLocalPathError:
 
 
 # ============================================================================
-# WriteFileRequest header serialization
-# ============================================================================
-
-
-class TestWriteFileHeaderSerialization:
-    """Unit tests for WriteFileRequest header serialization.
-
-    Validates the header frame used in the streaming file write protocol,
-    without requiring a VM.
-    """
-
-    @staticmethod
-    def _build_header(path: str, op_id: str = "test123", make_executable: bool = False) -> bytes:
-        """Build a WriteFileRequest header frame (newline-delimited JSON)."""
-        req = WriteFileRequest(op_id=op_id, path=path, make_executable=make_executable)
-        return req.model_dump_json(by_alias=False, exclude_none=True).encode() + b"\n"
-
-    def test_header_is_valid_json(self) -> None:
-        """The header frame is valid JSON (newline-delimited)."""
-        frame = self._build_header("test.txt")
-        parsed = json.loads(frame.rstrip(b"\n"))
-        assert parsed["action"] == "write_file"
-        assert parsed["op_id"] == "test123"
-        assert parsed["path"] == "test.txt"
-        assert parsed["make_executable"] is False
-
-    def test_header_make_executable_true(self) -> None:
-        """make_executable=True emits JSON true."""
-        frame = self._build_header("run.sh", make_executable=True)
-        parsed = json.loads(frame)
-        assert parsed["make_executable"] is True
-
-    def test_header_make_executable_false(self) -> None:
-        """make_executable=False emits JSON false."""
-        frame = self._build_header("data.csv")
-        parsed = json.loads(frame)
-        assert parsed["make_executable"] is False
-
-    def test_header_roundtrips_via_pydantic(self) -> None:
-        """Header frame round-trips through Pydantic model."""
-        frame = self._build_header("payload.bin", op_id="abc123", make_executable=True)
-        parsed = json.loads(frame)
-        req = WriteFileRequest(**parsed)
-        assert req.action == "write_file"
-        assert req.op_id == "abc123"
-        assert req.path == "payload.bin"
-        assert req.make_executable is True
-
-    def test_header_ends_with_newline(self) -> None:
-        """Header frame ends with exactly one newline (protocol requirement)."""
-        frame = self._build_header("test.txt")
-        assert frame.endswith(b"\n")
-        assert not frame.endswith(b"\n\n")
-
-
-# ============================================================================
-# WriteFileRequest header — JSON escaping (weird cases)
-# ============================================================================
-
-
-class TestWriteFileHeaderEscaping:
-    """Test that Pydantic's JSON serialization properly escapes special characters in path."""
-
-    _build_header = staticmethod(TestWriteFileHeaderSerialization._build_header)
-
-    def test_double_quotes_in_path(self) -> None:
-        """Path with double quotes is properly escaped."""
-        frame = self._build_header('my"file.txt')
-        parsed = json.loads(frame)
-        assert parsed["path"] == 'my"file.txt'
-
-    def test_backslash_in_path(self) -> None:
-        """Path with backslash is properly escaped."""
-        frame = self._build_header("dir\\file.txt")
-        parsed = json.loads(frame)
-        assert parsed["path"] == "dir\\file.txt"
-
-    def test_newline_in_path(self) -> None:
-        r"""Path with newline is escaped (would break \n-delimited protocol)."""
-        frame = self._build_header("line1\nline2.txt")
-        # The frame itself must be a single line (newline-delimited protocol)
-        lines = frame.split(b"\n")
-        # Should be exactly 2 parts: the JSON frame and the empty string after final \n
-        assert len(lines) == 2
-        parsed = json.loads(lines[0])
-        assert parsed["path"] == "line1\nline2.txt"
-
-    def test_tab_in_path(self) -> None:
-        """Path with tab character is escaped."""
-        frame = self._build_header("col1\tcol2.tsv")
-        parsed = json.loads(frame)
-        assert parsed["path"] == "col1\tcol2.tsv"
-
-    def test_unicode_in_path(self) -> None:
-        """Path with Unicode characters round-trips correctly."""
-        frame = self._build_header("données/résultat.csv")
-        parsed = json.loads(frame)
-        assert parsed["path"] == "données/résultat.csv"
-
-    def test_emoji_in_path(self) -> None:
-        """Path with emoji round-trips correctly."""
-        frame = self._build_header("data/output_\U0001f680.json")
-        parsed = json.loads(frame)
-        assert parsed["path"] == "data/output_\U0001f680.json"
-
-    def test_all_json_metacharacters(self) -> None:
-        r"""Path with all JSON escape-worthy characters: " \ / \b \f \n \r \t."""
-        nasty_path = 'a"b\\c/d\be\ff\ng\rh\ti'
-        frame = self._build_header(nasty_path)
-        parsed = json.loads(frame)
-        assert parsed["path"] == nasty_path
-
-
-# ============================================================================
-# Zstd streaming compress/decompress round-trip (mirrors write_file/read_file)
-# ============================================================================
-
-
-class TestZstdStreamingRoundtrip:
-    """Verify the streaming zstd pattern used by write_file and read_file.
-
-    write_file: ZstdCompressor.compress(chunk) + flush() — incremental.
-    read_file:  ZstdDecompressor.decompress(chunk)        — incremental.
-    """
-
-    @staticmethod
-    def _get_zstd():  # type: ignore[no-untyped-def]
-        """Import the zstd module matching the runtime."""
-        import sys
-
-        if sys.version_info >= (3, 14):
-            from compression import zstd  # type: ignore[import-not-found]
-        else:
-            from backports import zstd  # type: ignore[import-untyped,no-redef]
-        return zstd
-
-    def test_streaming_roundtrip_small(self) -> None:
-        """Small content survives streaming compress/decompress."""
-        _zstd = self._get_zstd()
-        content = b"hello world via streaming zstd"
-
-        # Compress incrementally (same pattern as write_file)
-        compressor = _zstd.ZstdCompressor(level=3)
-        compressed = compressor.compress(content) + compressor.flush()
-
-        # Decompress incrementally (same pattern as read_file)
-        decompressor = _zstd.ZstdDecompressor()
-        result = decompressor.decompress(compressed)
-        assert result == content
-
-    def test_streaming_roundtrip_chunked(self) -> None:
-        """Content split into FILE_TRANSFER_CHUNK_SIZE chunks compresses and decompresses."""
-        import os
-
-        _zstd = self._get_zstd()
-        content = os.urandom(256 * 1024)  # 256KB
-
-        # Compress chunk by chunk (mirrors write_file loop)
-        compressor = _zstd.ZstdCompressor(level=3)
-        compressed_parts: list[bytes] = []
-        chunk_size = FILE_TRANSFER_CHUNK_SIZE
-        for offset in range(0, len(content), chunk_size):
-            part = compressor.compress(content[offset : offset + chunk_size])
-            if part:
-                compressed_parts.append(part)
-        remaining = compressor.flush()
-        if remaining:
-            compressed_parts.append(remaining)
-
-        # Decompress the concatenated compressed stream (mirrors read_file)
-        decompressor = _zstd.ZstdDecompressor()
-        result = decompressor.decompress(b"".join(compressed_parts))
-        assert result == content
-
-    def test_streaming_roundtrip_empty(self) -> None:
-        """Empty content survives streaming round-trip."""
-        _zstd = self._get_zstd()
-        compressor = _zstd.ZstdCompressor(level=3)
-        compressed = compressor.compress(b"") + compressor.flush()
-        result = _zstd.ZstdDecompressor().decompress(compressed)
-        assert result == b""
-
-    def test_compressed_is_smaller_for_repetitive_data(self) -> None:
-        """Highly compressible content produces smaller compressed output."""
-        _zstd = self._get_zstd()
-        content = b"\x00" * (1024 * 1024)
-        compressor = _zstd.ZstdCompressor(level=3)
-        compressed = compressor.compress(content) + compressor.flush()
-        assert len(compressed) < len(content)
-
-
-# ============================================================================
 # FileOpDispatcher routing tests
 # ============================================================================
 
@@ -1814,472 +1692,239 @@ def _feed(reader: asyncio.StreamReader, msg: dict[str, object]) -> None:
     reader.feed_data(json.dumps(msg).encode() + b"\n")
 
 
-async def _drain(queue: OperationInbox, timeout: float = 0.5) -> list[StreamingMessage]:
-    """Drain all messages from a queue with a short timeout."""
-    msgs: list[StreamingMessage] = []
-    try:
-        while True:
-            msgs.append(await asyncio.wait_for(queue.get(), timeout=timeout))
-    except TimeoutError:
-        pass
-    return msgs
+async def _received(inbox: OperationInbox) -> list[StreamingMessage]:
+    """Every message routed to the inbox, in order. The reader must be at EOF: the
+    dispatcher then fails the inbox after its routed messages (CommunicationError), so the
+    list is complete with no wait. The bound only ends a failed run."""
+    messages: list[StreamingMessage] = []
+    while True:
+        try:
+            messages.append(await asyncio.wait_for(inbox.get(), timeout=1.0))
+        except CommunicationError:
+            return messages
+
+
+_WIRE_TYPES = {
+    "file_chunk": ("FileChunkResponseMessage", "data", {}),
+    "error": ("StreamingErrorMessage", "message", {"error_type": "io_error"}),
+    "stdout": ("OutputChunkMessage", "chunk", {}),
+    "file_read_complete": ("FileReadCompleteMessage", "path", {"size": 1}),
+    "file_write_ack": ("FileWriteAckMessage", "path", {"bytes_written": 1}),
+    "file_list": ("FileListMessage", "path", {"entries": []}),
+}
+"""Event types with a free text field: the message class the host parses each into, the
+field that carries the test's marker, and the other required fields."""
+
+
+def _wire(field: str, marker: str) -> str:
+    """The marker as the guest sends that field: a file chunk's data is base64."""
+    return base64.b64encode(marker.encode()).decode() if field == "data" else marker
+
+
+def _marker(message: StreamingMessage) -> str:
+    field = next(field for name, field, _ in _WIRE_TYPES.values() if name == type(message).__name__)
+    value = getattr(message, field)
+    return value.decode() if isinstance(value, bytes) else value
 
 
 class TestFileOpDispatcherRouting:
-    """Tests the FileOpDispatcher dispatch layer in isolation.
+    """FileOpDispatcher on a real asyncio.StreamReader fed with guest frames: each message
+    goes to the inbox of its op_id, in order; a message with no op_id, or with an op_id that
+    has no inbox, goes nowhere."""
 
-    Uses real asyncio.StreamReader + feed_data(). No VMs, no mocks.
-    We control exactly what bytes arrive and in what order.
-    """
-
-    # ------------------------------------------------------------------
-    # Normal cases
-    # ------------------------------------------------------------------
-
-    async def test_error_with_op_id_routes_to_op_queue(self) -> None:
-        """Error with op_id routes to the registered op queue, not default."""
+    @pytest.mark.parametrize(
+        ("frame", "message_type"),
+        [
+            pytest.param(
+                {"type": "error", "error_type": "io_error", "message": "fail"}, StreamingErrorMessage, id="error"
+            ),
+            pytest.param({"type": "file_chunk", "data": "AAAA"}, FileChunkResponseMessage, id="file_chunk"),
+            pytest.param({"type": "pong", "version": "1.0"}, PongMessage, id="pong"),
+            pytest.param(
+                {"type": "complete", "exit_code": 0, "execution_time_ms": 100}, ExecutionCompleteMessage, id="complete"
+            ),
+            pytest.param({"type": "stdout", "chunk": "hello"}, OutputChunkMessage, id="stdout"),
+            pytest.param({"type": "file_list", "path": "", "entries": []}, FileListMessage, id="file_list"),
+            pytest.param(
+                {"type": "file_read_complete", "path": "a", "size": 1}, FileReadCompleteMessage, id="file_read_complete"
+            ),
+            pytest.param(
+                {"type": "file_write_ack", "path": "a", "bytes_written": 1}, FileWriteAckMessage, id="file_write_ack"
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("op_id", ["op-A", ""], ids=["op-id", "empty-op-id"])
+    async def test_message_reaches_the_inbox_of_its_op_id(
+        self, frame: dict[str, object], message_type: type[StreamingMessage], op_id: str
+    ) -> None:
+        """Each event type with an op_id reaches its inbox; an empty op_id is an op_id too."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
+        inbox = await dispatcher.register_op(op_id)
+        _feed(reader, {**frame, "op_id": op_id})
+        reader.feed_eof()
 
-        op_queue = await dispatcher.register_op("op-A")
-        _feed(reader, {"type": "error", "error_type": "io_error", "message": "fail", "op_id": "op-A"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, StreamingErrorMessage)
-        assert msg.op_id == "op-A"
-        assert msg.message == "fail"
-
-        # Default queue should be empty
-
+        assert [(type(m), m.op_id) for m in await _received(inbox)] == [(message_type, op_id)]
         await dispatcher.stop()
 
-    async def test_error_without_op_id_is_discarded(self) -> None:
-        """Error without op_id is discarded (no default queue)."""
+    @pytest.mark.parametrize(
+        "stray",
+        [
+            pytest.param({"type": "pong", "version": "1.0"}, id="no-op-id-pong"),
+            pytest.param({"type": "error", "error_type": "timeout", "message": "fail"}, id="no-op-id-error"),
+            pytest.param({"type": "pong", "version": "1.0", "op_id": "op-UNKNOWN"}, id="unregistered-pong"),
+            pytest.param(
+                {"type": "error", "error_type": "io_error", "message": "fail", "op_id": "op-UNKNOWN"},
+                id="unregistered-error",
+            ),
+        ],
+    )
+    async def test_message_without_a_registered_op_id_is_discarded(self, stray: dict[str, object]) -> None:
+        """A message with no op_id, or with an op_id that has no inbox, reaches no inbox; the
+        next message is routed as usual."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
+        inbox = await dispatcher.register_op("op-A")
+        _feed(reader, stray)
+        _feed(reader, {"type": "file_list", "path": "next", "entries": [], "op_id": "op-A"})
+        reader.feed_eof()
 
-        op_queue = await dispatcher.register_op("op-A")
-        # Error without op_id — discarded
-        _feed(reader, {"type": "error", "error_type": "timeout", "message": "fail"})
-        # Subsequent message with op_id — routed correctly
-        _feed(reader, {"type": "error", "op_id": "op-A", "error_type": "x", "message": "y"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, StreamingErrorMessage)
-        assert msg.op_id == "op-A"
-
+        assert [(type(m), _marker(m)) for m in await _received(inbox)] == [(FileListMessage, "next")]
         await dispatcher.stop()
 
-    async def test_file_chunk_routes_to_op_queue(self) -> None:
-        """File chunk with op_id routes to the registered op queue."""
+    async def test_message_after_unregister_is_discarded(self) -> None:
+        """After unregister_op, a late message for the op reaches no inbox: the old inbox
+        raises CommunicationError (it never gets the late message), the other ops go on."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-
-        op_queue = await dispatcher.register_op("op-A")
-        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "AAAA"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, FileChunkResponseMessage)
-        assert msg.op_id == "op-A"
-
-        await dispatcher.stop()
-
-    async def test_non_file_message_without_op_id_is_discarded(self) -> None:
-        """Pong without op_id is discarded, doesn't pollute op queues."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("op-A")
-        # Pong without op_id — discarded
-        _feed(reader, {"type": "pong", "version": "1.0"})
-        # Subsequent message with op_id — still routes correctly
-        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "op-A"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, PongMessage)
-        assert msg.op_id == "op-A"
-
-        await dispatcher.stop()
-
-    # ------------------------------------------------------------------
-    # Concurrent interleaved routing
-    # ------------------------------------------------------------------
-
-    async def test_interleaved_3_ops_mixed_success_and_error(self) -> None:
-        """3 ops interleaved: A succeeds, B errors, C succeeds. Each queue gets only its messages."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        qa = await dispatcher.register_op("op-A")
-        qb = await dispatcher.register_op("op-B")
-        qc = await dispatcher.register_op("op-C")
-
-        # Feed in worst-case interleaved order
-        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "a1"})
-        _feed(reader, {"type": "error", "error_type": "io_error", "message": "B failed", "op_id": "op-B"})
-        _feed(reader, {"type": "file_chunk", "op_id": "op-C", "data": "c1"})
-        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "a2"})
-        _feed(reader, {"type": "file_read_complete", "op_id": "op-C", "path": "c.txt", "size": 10})
-        _feed(reader, {"type": "file_read_complete", "op_id": "op-A", "path": "a.txt", "size": 20})
-
-        a_msgs = await _drain(qa)
-        b_msgs = await _drain(qb)
-        c_msgs = await _drain(qc)
-
-        assert len(a_msgs) == 3  # 2 chunks + 1 complete
-        assert len(b_msgs) == 1  # 1 error
-        assert len(c_msgs) == 2  # 1 chunk + 1 complete
-        assert isinstance(b_msgs[0], StreamingErrorMessage)
-
-        await dispatcher.stop()
-
-    async def test_interleaved_writes_errors_dont_leak(self) -> None:
-        """Write errors route to correct op queues, nothing leaks to default."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        q1 = await dispatcher.register_op("w1")
-        q2 = await dispatcher.register_op("w2")
-        q3 = await dispatcher.register_op("w3")
-
-        _feed(reader, {"type": "error", "error_type": "path_error", "message": "path invalid", "op_id": "w1"})
-        _feed(reader, {"type": "file_write_ack", "op_id": "w2", "path": "ok.txt", "bytes_written": 100})
-        _feed(reader, {"type": "error", "error_type": "io_error", "message": "disk full", "op_id": "w3"})
-
-        m1 = await _drain(q1)
-        m2 = await _drain(q2)
-        m3 = await _drain(q3)
-
-        assert len(m1) == 1
-        assert isinstance(m1[0], StreamingErrorMessage)
-        assert "path" in m1[0].message
-
-        assert len(m2) == 1
-        assert isinstance(m2[0], FileWriteAckMessage)
-
-        assert len(m3) == 1
-        assert isinstance(m3[0], StreamingErrorMessage)
-        assert "disk" in m3[0].message
-
-        await dispatcher.stop()
-
-    async def test_concurrent_5_ops_all_error(self) -> None:
-        """5 ops each receive their own error, default stays empty."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        queues = {}
-        for i in range(5):
-            queues[f"op-{i}"] = await dispatcher.register_op(f"op-{i}")
-
-        for i in range(5):
-            _feed(reader, {"type": "error", "error_type": "io_error", "message": f"err-{i}", "op_id": f"op-{i}"})
-
-        for i in range(5):
-            msgs = await _drain(queues[f"op-{i}"])
-            assert len(msgs) == 1
-            assert isinstance(msgs[0], StreamingErrorMessage)
-            assert msgs[0].message == f"err-{i}"
-
-        await dispatcher.stop()
-
-    async def test_concurrent_5_ops_all_success(self) -> None:
-        """5 ops each receive interleaved chunks and completions."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        queues = {}
-        for i in range(5):
-            queues[f"op-{i}"] = await dispatcher.register_op(f"op-{i}")
-
-        # Interleave: chunk for each, then complete for each
-        for i in range(5):
-            _feed(reader, {"type": "file_chunk", "op_id": f"op-{i}", "data": f"d{i}"})
-        for i in range(5):
-            _feed(reader, {"type": "file_read_complete", "op_id": f"op-{i}", "path": f"f{i}.txt", "size": i * 10})
-
-        for i in range(5):
-            msgs = await _drain(queues[f"op-{i}"])
-            assert len(msgs) == 2  # 1 chunk + 1 complete
-            assert isinstance(msgs[0], FileChunkResponseMessage)
-            assert isinstance(msgs[1], FileReadCompleteMessage)
-
-        await dispatcher.stop()
-
-    # ------------------------------------------------------------------
-    # Edge cases
-    # ------------------------------------------------------------------
-
-    async def test_error_with_unregistered_op_id_is_discarded(self) -> None:
-        """Error with op_id not in _op_queues is discarded (not routed to default)."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        qa = await dispatcher.register_op("op-A")
-        _feed(reader, {"type": "error", "error_type": "io_error", "message": "fail", "op_id": "op-UNKNOWN"})
-
-        # Give dispatch loop time to process
-        await asyncio.sleep(0.05)
-
-        # Message should be discarded, not in default queue or op-A queue
-
-        assert qa._queue.empty()
-
-        await dispatcher.stop()
-
-    async def test_empty_string_op_id_routes_to_op_queue(self) -> None:
-        """Empty string op_id is a valid op_id and routes to its registered queue."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        q_empty = await dispatcher.register_op("")
-        _feed(reader, {"type": "error", "error_type": "io_error", "message": "fail", "op_id": ""})
-
-        msg = await asyncio.wait_for(q_empty.get(), timeout=1.0)
-        assert isinstance(msg, StreamingErrorMessage)
-
-        await dispatcher.stop()
-
-    async def test_error_after_op_unregistered_is_discarded(self) -> None:
-        """Error for unregistered op is discarded (prevents default queue pollution)."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        await dispatcher.register_op("op-A")
-        await dispatcher.unregister_op("op-A")
-        _feed(reader, {"type": "error", "error_type": "io_error", "message": "fail", "op_id": "op-A"})
-
-        # Give dispatch loop time to process
-        await asyncio.sleep(0.05)
-
-        # Message should be discarded, not pollute default queue
-
-        await dispatcher.stop()
-
-    async def test_rapid_register_unregister_during_dispatch(self) -> None:
-        """First message routes to op queue, second (after unregister) is discarded."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("op-A")
-        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "first"})
-
-        # Wait for first message to be dispatched
-        msg1 = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg1, FileChunkResponseMessage)
+        old = await dispatcher.register_op("op-A")
+        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": _wire("data", "first")})
+        first = await asyncio.wait_for(old.get(), timeout=1.0)
+        assert isinstance(first, FileChunkResponseMessage)
+        assert first.data == b"first"
 
         await dispatcher.unregister_op("op-A")
-        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "second"})
+        other = await dispatcher.register_op("op-B")
+        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": _wire("data", "late")})
+        _feed(reader, {"type": "file_chunk", "op_id": "op-B", "data": _wire("data", "other")})
+        reader.feed_eof()
 
-        # Give dispatch loop time to process
-        await asyncio.sleep(0.05)
-
-        # Second message should be discarded, not in default queue
-
+        assert [_marker(m) for m in await _received(other)] == ["other"]
+        with pytest.raises(CommunicationError, match=r"^operation unregistered$"):
+            await old.get()
         await dispatcher.stop()
 
-    # ------------------------------------------------------------------
-    # Weird / out-of-bounds cases
-    # ------------------------------------------------------------------
-
-    async def test_pong_discarded_error_with_op_id_routed(self) -> None:
-        """Pong without op_id is discarded, error with op_id routes to op queue."""
+    async def test_interleaved_messages_reach_only_their_operation_in_order(self) -> None:
+        """100 operations get up to 5 messages each, of every event type, in a shuffled
+        order: each inbox gets exactly the messages of its op_id, in the order they came."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-
-        op_queue = await dispatcher.register_op("op-A")
-        # Pong without op_id — discarded
-        _feed(reader, {"type": "pong", "version": "1.0"})
-        # Error with op_id — routed to op queue
-        _feed(reader, {"type": "error", "op_id": "op-A", "error_type": "x", "message": "y"})
-
-        err = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(err, StreamingErrorMessage)
-        assert err.op_id == "op-A"
-
-        await dispatcher.stop()
-
-    async def test_100_ops_interleaved_all_route_correctly(self) -> None:
-        """100 ops with shuffled messages all route to correct queues."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        queues: dict[str, OperationInbox] = {}
-        for i in range(100):
-            queues[f"op-{i}"] = await dispatcher.register_op(f"op-{i}")
-
-        # Build messages: 50 successes (file_read_complete) + 50 errors, shuffled
-        messages: list[dict[str, object]] = [
-            {"type": "file_read_complete", "op_id": f"op-{i}", "path": f"f{i}", "size": i} for i in range(50)
-        ]
-        messages.extend(
-            {"type": "error", "op_id": f"op-{i}", "error_type": "io_error", "message": f"err-{i}"}
-            for i in range(50, 100)
-        )
-
         rng = random.Random(42)
-        rng.shuffle(messages)
+        ops = [f"op-{i}" for i in range(100)]
+        inboxes = {op: await dispatcher.register_op(op) for op in ops}
+        slots = [op for op in ops for _ in range(rng.randint(1, 5))]
+        rng.shuffle(slots)
+        expected: dict[str, list[tuple[str, str]]] = {op: [] for op in ops}
+        for n, op in enumerate(slots):
+            wire_type = rng.choice(list(_WIRE_TYPES))
+            class_name, field, required = _WIRE_TYPES[wire_type]
+            marker = f"{op}/{n}"
+            _feed(reader, {"type": wire_type, "op_id": op, field: _wire(field, marker), **required})
+            expected[op].append((class_name, marker))
+        reader.feed_eof()
 
-        for msg in messages:
-            _feed(reader, msg)
-
-        for i in range(100):
-            msgs = await _drain(queues[f"op-{i}"])
-            assert len(msgs) == 1, f"op-{i} got {len(msgs)} messages"
-
+        for op in ops:
+            received = [(type(m).__name__, _marker(m)) for m in await _received(inboxes[op])]
+            assert received == expected[op], op
         await dispatcher.stop()
 
-    async def test_same_op_id_receives_multiple_messages_in_order(self) -> None:
-        """10 chunks for same op_id arrive in FIFO order."""
+    async def test_cancelled_get_loses_no_message(self) -> None:
+        """A get() cancelled in the loop turn that its message comes in (a wait_for timeout)
+        leaves the message in the inbox: the next get() returns it."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
+        inbox = await dispatcher.register_op("op-A")
+        waiting = asyncio.create_task(inbox.get())
+        await asyncio.sleep(0)  # get() waits on its empty inbox
+        assert await inbox.route(OutputChunkMessage(type="stdout", chunk="kept", op_id="op-A"))
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
 
-        op_queue = await dispatcher.register_op("op-A")
-
-        for i in range(10):
-            _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": f"chunk-{i}"})
-
-        msgs = await _drain(op_queue)
-        assert len(msgs) == 10
-        for i, msg in enumerate(msgs):
-            assert isinstance(msg, FileChunkResponseMessage)
-            assert msg.data == f"chunk-{i}"
-
+        message = await asyncio.wait_for(inbox.get(), timeout=1.0)
+        assert isinstance(message, OutputChunkMessage)
+        assert message.chunk == "kept"
         await dispatcher.stop()
 
 
 class TestDispatchLoopConnectionReset:
-    """Tests that _dispatch_loop exits cleanly on OSError variants.
-
-    The dispatch loop catches (IncompleteReadError, OSError) so that
-    connection resets — normal during peer disconnect or memory stress —
-    are treated the same as EOF.
-
-    IMPORTANT: after injecting the error, we await the task directly to
-    confirm the loop exited via the except clause.  Calling stop() first
-    would cancel the task, making the test exercise CancelledError instead.
-    """
-
-    # ------------------------------------------------------------------
-    # Normal cases — parametrized over every error variant
-    # ------------------------------------------------------------------
+    """The dispatch loop ends on EOF or a socket error (a peer disconnect, memory stress)
+    as on a closed transport: each registered operation gets CommunicationError with the
+    reason, after the messages routed before it; stop() stays safe."""
 
     @pytest.mark.parametrize(
-        ("error_cls", "error_args"),
+        ("end", "reason"),
         [
-            pytest.param(ConnectionResetError, ("reset",), id="ConnectionResetError"),
-            pytest.param(BrokenPipeError, ("broken",), id="BrokenPipeError"),
-            pytest.param(OSError, (104, "Connection aborted"), id="OSError-custom-errno"),
+            pytest.param(
+                lambda r: r.set_exception(ConnectionResetError("reset")),
+                "^event channel failed: reset$",
+                id="ConnectionResetError",
+            ),
+            pytest.param(
+                lambda r: r.set_exception(ConnectionResetError()),
+                "^event channel failed: ConnectionResetError$",
+                id="ConnectionResetError-no-text",
+            ),
+            pytest.param(
+                lambda r: r.set_exception(BrokenPipeError("broken")),
+                "^event channel failed: broken$",
+                id="BrokenPipeError",
+            ),
+            pytest.param(
+                lambda r: r.set_exception(OSError(104, "Connection aborted")),
+                r"^event channel failed: \[Errno 104\] Connection aborted$",
+                id="OSError-custom-errno",
+            ),
+            pytest.param(lambda r: r.feed_eof(), "^event channel reached EOF with 0 trailing bytes$", id="EOF"),
         ],
     )
-    async def test_loop_exits_cleanly_on_oserror(
-        self, error_cls: type[OSError], error_args: tuple[object, ...]
-    ) -> None:
-        """Dispatch loop exits via except clause, task completes normally."""
+    async def test_transport_end_fails_registered_ops_with_its_reason(self, end: Any, reason: str) -> None:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-        await asyncio.sleep(0)  # let loop enter readuntil()
+        inbox = await dispatcher.register_op("op-A")
+        await asyncio.sleep(0)  # the loop waits in readuntil()
 
-        reader.set_exception(error_cls(*error_args))
+        end(reader)
 
-        # Wait for the loop to exit via the except clause (not cancellation)
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
-
+        with pytest.raises(CommunicationError, match=reason):
+            await asyncio.wait_for(inbox.get(), timeout=1.0)
+        assert not dispatcher.is_alive()
         await dispatcher.stop()
-        assert dispatcher._task is None
-
-    async def test_loop_exits_cleanly_on_eof(self) -> None:
-        """IncompleteReadError (EOF) exits cleanly — regression guard."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-        await asyncio.sleep(0)  # let loop enter readuntil()
-
-        reader.feed_eof()
-
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
-
-        await dispatcher.stop()
-        assert dispatcher._task is None
-
-    # ------------------------------------------------------------------
-    # Edge cases
-    # ------------------------------------------------------------------
+        await dispatcher.stop()  # a second stop does nothing
+        assert not dispatcher.is_alive()
 
     async def test_messages_before_reset_are_delivered(self) -> None:
-        """Messages routed before ConnectionResetError are still in their queues."""
+        """A message routed before ConnectionResetError stays in its inbox, ahead of the failure."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
-
         op_queue = await dispatcher.register_op("op-A")
-        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": "before-reset"})
+        _feed(reader, {"type": "file_chunk", "op_id": "op-A", "data": _wire("data", "before-reset")})
+        await asyncio.sleep(0)  # the loop routes the message, then waits in readuntil()
 
-        # Wait for message to be dispatched
+        reader.set_exception(ConnectionResetError())
+
         msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
         assert isinstance(msg, FileChunkResponseMessage)
-        assert msg.data == "before-reset"
-
-        # Now simulate reset — loop is back in readuntil()
-        reader.set_exception(ConnectionResetError())
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
-
-        await dispatcher.stop()
-        assert dispatcher._task is None
-
-    async def test_stop_after_loop_exit_is_idempotent(self) -> None:
-        """Calling stop() twice after the loop already exited doesn't raise."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-        await asyncio.sleep(0)  # let loop enter readuntil()
-
-        reader.set_exception(ConnectionResetError())
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
-
-        await dispatcher.stop()
-        await dispatcher.stop()  # second stop — no-op
-        assert dispatcher._task is None
-
-    # ------------------------------------------------------------------
-    # Weird / out-of-bounds cases
-    # ------------------------------------------------------------------
-
-    async def test_oserror_wakes_registered_queue_with_transport_failure(self) -> None:
-        """An active operation receives a terminal transient transport event."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("op-A")
-
-        reader.set_exception(ConnectionResetError())
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
-
+        assert msg.data == b"before-reset"
         with pytest.raises(CommunicationError, match="ConnectionResetError"):
             await asyncio.wait_for(op_queue.get(), timeout=1.0)
-
         await dispatcher.stop()
 
     async def test_eof_wakes_full_queue_without_losing_buffered_messages(self) -> None:
@@ -2290,18 +1935,16 @@ class TestDispatchLoopConnectionReset:
 
         op_queue = await dispatcher.register_op("op-full")
         for index in range(OP_QUEUE_DEPTH):
-            op_queue._queue.put_nowait(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-full"))
+            assert await op_queue.route(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-full"))
 
         reader.feed_eof()
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
 
         messages = [await asyncio.wait_for(op_queue.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH)]
-        assert len(messages) == OP_QUEUE_DEPTH
-        assert isinstance(messages[0], OutputChunkMessage)
-        assert messages[0].chunk == "0"
+        assert [m.chunk for m in messages if isinstance(m, OutputChunkMessage)] == [
+            str(index) for index in range(OP_QUEUE_DEPTH)
+        ]
         with pytest.raises(CommunicationError, match="EOF"):
-            await op_queue.get()
+            await asyncio.wait_for(op_queue.get(), timeout=1.0)
 
         await dispatcher.stop()
 
@@ -2310,9 +1953,10 @@ class TestDispatchLoopConnectionReset:
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
+        first = await dispatcher.register_op("first-op")
         reader.feed_eof()
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+        with pytest.raises(CommunicationError, match="EOF"):  # the loop ended
+            await asyncio.wait_for(first.get(), timeout=1.0)
 
         op_queue = await dispatcher.register_op("late-op")
         with pytest.raises(CommunicationError, match="EOF"):
@@ -2328,12 +1972,10 @@ class TestDispatchLoopConnectionReset:
 
         op_queue = await dispatcher.register_op("op-complete")
         for index in range(OP_QUEUE_DEPTH - 1):
-            op_queue._queue.put_nowait(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-complete"))
-        op_queue._queue.put_nowait(ExecutionCompleteMessage(exit_code=0, execution_time_ms=1, op_id="op-complete"))
+            assert await op_queue.route(OutputChunkMessage(type="stdout", chunk=str(index), op_id="op-complete"))
+        assert await op_queue.route(ExecutionCompleteMessage(exit_code=0, execution_time_ms=1, op_id="op-complete"))
 
         reader.feed_eof()
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
 
         messages = [await asyncio.wait_for(op_queue.get(), timeout=1.0) for _ in range(OP_QUEUE_DEPTH)]
         assert [message.chunk for message in messages[:-1] if isinstance(message, OutputChunkMessage)] == [
@@ -2341,7 +1983,7 @@ class TestDispatchLoopConnectionReset:
         ]
         assert isinstance(messages[-1], ExecutionCompleteMessage)
         with pytest.raises(CommunicationError, match="EOF"):
-            await op_queue.get()
+            await asyncio.wait_for(op_queue.get(), timeout=1.0)
 
         await dispatcher.stop()
 
@@ -2360,14 +2002,15 @@ class TestDispatchLoopConnectionReset:
         assert [message.chunk for message in messages if isinstance(message, OutputChunkMessage)] == [
             str(index) for index in range(OP_QUEUE_DEPTH + 1)
         ]
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
         with pytest.raises(CommunicationError, match="EOF"):
-            await op_queue.get()
+            await asyncio.wait_for(op_queue.get(), timeout=1.0)
         await dispatcher.stop()
 
     async def test_unregister_full_queue_releases_dispatcher_for_later_operation(self) -> None:
-        """A cancelled full inbox cannot wedge the one global dispatch task."""
+        """A cancelled full inbox cannot wedge the one global dispatch task.
+
+        The setup reads the private queue once: no public call tells that the dispatcher
+        waits on a full inbox, and without that state the test proves nothing."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
         dispatcher.start()
@@ -2385,8 +2028,8 @@ class TestDispatchLoopConnectionReset:
         assert isinstance(message, ExecutionCompleteMessage)
 
         reader.feed_eof()
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
+        with pytest.raises(CommunicationError, match="EOF"):
+            await asyncio.wait_for(later.get(), timeout=1.0)
         await dispatcher.stop()
 
     async def test_qemu_exit_drains_reader_buffered_terminal_before_failure(self) -> None:
@@ -2480,11 +2123,57 @@ class TestDispatchLoopConnectionReset:
         op_queue.mark_command_sent()
         reader.feed_eof()
 
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
         with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.GUEST_OUTCOME_UNKNOWN, match="EOF"):
-            await op_queue.get()
+            await asyncio.wait_for(op_queue.get(), timeout=1.0)
         await dispatcher.stop()
+
+    async def test_stop_raises_the_callers_cancel_once_it_has_stopped(self) -> None:
+        """The caller of stop() is cancelled while the loop ends: stop() raises that cancel,
+        never hides it, and only after the loop has ended and the ops are failed. The
+        loop is cancelled before its first step, so it fails no op itself."""
+        dispatcher = FileOpDispatcher(asyncio.StreamReader())
+        inbox = await dispatcher.register_op("op-A")
+
+        async def start_then_stop() -> None:
+            dispatcher.start()
+            await dispatcher.stop()  # the loop has not run yet
+
+        stopper = asyncio.create_task(start_then_stop())
+        await asyncio.sleep(0)  # stop() has cancelled the loop and waits for its end
+        stopper.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await stopper
+        assert not dispatcher.is_alive()
+        with pytest.raises(CommunicationError, match=r"^event dispatcher stopped$"):
+            await asyncio.wait_for(inbox.get(), timeout=1.0)
+
+    @pytest.mark.parametrize("close_channel", [False, True], ids=["dispatcher-stop", "channel-close"])
+    async def test_stop_in_a_cancel_handler_does_not_cancel_again(self, close_channel: bool) -> None:
+        """A cleanup in a cancel handler (destroy_vm in a pool's handler, ephemeral_vm's
+        finally) stops the dispatcher, or closes the channel, while its task's cancel count
+        is already 1: it ends, with no new cancel, and the cleanup goes on."""
+        dispatcher = FileOpDispatcher(asyncio.StreamReader())
+        dispatcher.start()
+        channel = _make_close_channel(dispatcher)
+        steps: list[str] = []
+
+        async def cancelled_then_clean_up() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await (channel.close() if close_channel else dispatcher.stop())
+                steps.append("after the stop")  # destroy_vm: kill QEMU
+                raise
+
+        task = asyncio.create_task(cancelled_then_clean_up())
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert steps == ["after the stop"]
+        assert not dispatcher.is_alive()
 
     async def test_limit_overrun_wakes_ops_and_stop_remains_safe(self) -> None:
         """An oversized event frame fails active ops and cannot poison close()."""
@@ -2494,10 +2183,9 @@ class TestDispatchLoopConnectionReset:
         op_queue = await dispatcher.register_op("oversized")
         reader.feed_data(b"x" * 64 + b"\n")
 
-        assert dispatcher._task is not None
-        await asyncio.wait_for(dispatcher._task, timeout=1.0)
         with pytest.raises(CommunicationError, match="reader limit"):
-            await op_queue.get()
+            await asyncio.wait_for(op_queue.get(), timeout=1.0)
+        assert not dispatcher.is_alive()
         await dispatcher.stop()
 
 
@@ -2506,90 +2194,76 @@ class TestDispatchLoopConnectionReset:
 # ============================================================================
 
 
-def _make_close_channel(
-    *,
-    has_dispatcher: bool = True,
-    stop_side_effect: BaseException | None = None,
-) -> DualPortChannel:
-    """Build a DualPortChannel with mocked internals for close() testing."""
+def _make_close_channel(dispatcher: FileOpDispatcher | AsyncMock | None) -> DualPortChannel:
+    """A DualPortChannel with mocked ports (no sockets) and the given dispatcher."""
     ch = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-    if has_dispatcher:
-        mock_disp = AsyncMock(spec=FileOpDispatcher)
-        if stop_side_effect is not None:
-            mock_disp.stop = AsyncMock(side_effect=stop_side_effect)
-        ch._dispatcher = mock_disp
+    ch._dispatcher = dispatcher  # type: ignore[assignment]
     ch._cmd_channel = AsyncMock(spec=UnixSocketChannel)
     ch._event_channel = AsyncMock(spec=UnixSocketChannel)
     return ch
 
 
 class TestDualPortChannelCloseResiliency:
-    """Tests that DualPortChannel.close() always clears _dispatcher.
+    """close() stops the dispatcher, closes both ports, and always drops the dispatcher,
+    also when its stop raises: a later call must not use a dispatcher that failed (a
+    poisoned dispatcher would block each health check retry)."""
 
-    Uses try/finally so that _dispatcher = None runs even if stop() raises,
-    preventing a poisoned dispatcher from blocking subsequent health check retries.
-    """
-
-    # ------------------------------------------------------------------
-    # Normal cases
-    # ------------------------------------------------------------------
-
-    async def test_close_clears_dispatcher_and_closes_channels(self) -> None:
-        """Normal close: dispatcher cleared, both channels closed."""
-        ch = _make_close_channel()
+    async def test_close_fails_ops_in_flight_and_closes_both_ports(self) -> None:
+        reader = asyncio.StreamReader()
+        dispatcher = FileOpDispatcher(reader)
+        dispatcher.start()
+        ch = _make_close_channel(dispatcher)
+        inbox = await ch.register_op("op-A")
 
         await ch.close()
 
-        assert ch._dispatcher is None
+        with pytest.raises(CommunicationError, match=r"^event dispatcher stopped$"):
+            await asyncio.wait_for(inbox.get(), timeout=1.0)
+        assert not dispatcher.is_alive()
         ch._cmd_channel.close.assert_awaited_once()
         ch._event_channel.close.assert_awaited_once()
+        with pytest.raises(RuntimeError, match="channel not connected"):
+            await ch.register_op("op-B")
 
     async def test_close_with_no_dispatcher_still_closes_channels(self) -> None:
-        """close() when _dispatcher is None still closes channels."""
-        ch = _make_close_channel(has_dispatcher=False)
-        assert ch._dispatcher is None
+        ch = _make_close_channel(None)
 
         await ch.close()
 
-        assert ch._dispatcher is None
         ch._cmd_channel.close.assert_awaited_once()
         ch._event_channel.close.assert_awaited_once()
 
-    # ------------------------------------------------------------------
-    # Edge cases
-    # ------------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "error",
+        [RuntimeError("dispatch task exploded"), KeyboardInterrupt(), asyncio.CancelledError()],
+        ids=["RuntimeError", "KeyboardInterrupt", "caller-cancel"],
+    )
+    async def test_close_drops_dispatcher_when_stop_raises(self, error: BaseException) -> None:
+        """The stop error propagates; both ports are closed all the same, and the
+        channel has no dispatcher after it."""
+        dispatcher = AsyncMock(spec=FileOpDispatcher)
+        dispatcher.stop.side_effect = error
+        ch = _make_close_channel(dispatcher)
 
-    async def test_close_clears_dispatcher_when_stop_raises(self) -> None:
-        """If stop() raises RuntimeError, _dispatcher is still cleared to None."""
-        ch = _make_close_channel(stop_side_effect=RuntimeError("dispatch task exploded"))
-
-        with pytest.raises(RuntimeError, match="dispatch task exploded"):
+        with pytest.raises(type(error)):
             await ch.close()
 
-        # Critical: dispatcher must be cleared despite the error
-        assert ch._dispatcher is None
+        ch._cmd_channel.close.assert_awaited_once()
+        ch._event_channel.close.assert_awaited_once()
+        with pytest.raises(RuntimeError, match="channel not connected"):
+            await ch.register_op("op-A")
 
     async def test_close_idempotent(self) -> None:
-        """Calling close() twice is safe — second call is a no-op for dispatcher."""
-        ch = _make_close_channel()
+        """A second close() stops nothing more and closes the ports again without error."""
+        dispatcher = AsyncMock(spec=FileOpDispatcher)
+        ch = _make_close_channel(dispatcher)
 
         await ch.close()
-        await ch.close()  # second call — _dispatcher already None
+        await ch.close()
 
-        assert ch._dispatcher is None
-
-    # ------------------------------------------------------------------
-    # Weird / out-of-bounds cases
-    # ------------------------------------------------------------------
-
-    async def test_close_clears_dispatcher_on_base_exception(self) -> None:
-        """Even BaseException (e.g. KeyboardInterrupt) from stop() clears _dispatcher."""
-        ch = _make_close_channel(stop_side_effect=KeyboardInterrupt())
-
-        with pytest.raises(KeyboardInterrupt):
-            await ch.close()
-
-        assert ch._dispatcher is None
+        dispatcher.stop.assert_awaited_once()
+        with pytest.raises(RuntimeError, match="channel not connected"):
+            await ch.register_op("op-A")
 
 
 # ============================================================================
@@ -2606,12 +2280,6 @@ class TestExposedPorts:
         mock_vm.exposed_ports = [ExposedPort(internal=8080, external=3000)]
         assert session.exposed_ports == [ExposedPort(internal=8080, external=3000)]
 
-    async def test_exposed_ports_empty_when_no_ports(self) -> None:
-        """exposed_ports returns empty list when VM has no exposed ports."""
-        session, mock_vm, _ = _make_session()
-        mock_vm.exposed_ports = []
-        assert session.exposed_ports == []
-
     async def test_exposed_ports_accessible_after_close(self) -> None:
         """exposed_ports is still accessible after session is closed."""
         session, mock_vm, _ = _make_session()
@@ -2624,104 +2292,103 @@ class TestExposedPorts:
 # DualPortChannel reconnection probe tests
 # ============================================================================
 #
-# Tests the _probe_guest_ready behaviour: observable outcomes (returns vs
-# raises) given a simulated guest that is ready, transiently unresponsive,
-# or permanently down.  No mock-interaction assertions — type-checking
-# already validates the interface contracts.
+# connect() on a channel that was connected before pings the guest until a pong
+# comes. No sockets: _raw_connect (open both sockets) and close are mocks, and
+# send_request plays the guest. The tests check what connect() returns or raises,
+# the pings sent, and each socket reset (close, then _raw_connect).
 # ============================================================================
 
 
-def _make_probe_channel(
-    send_request_side_effect: object,
-) -> DualPortChannel:
-    """Build a DualPortChannel with a scripted guest response sequence.
-
-    Pass a list where each entry is either a message the guest returns
-    or an exception that simulates a transport failure.  The probe's
-    retry loop consumes one entry per attempt.
-    """
+def _new_channel() -> DualPortChannel:
+    """A DualPortChannel that opens no socket (_raw_connect and close are mocks)."""
     channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-    channel.send_request = AsyncMock(side_effect=send_request_side_effect)
-    channel._raw_connect = AsyncMock()
-    channel.close = AsyncMock()
+    channel._raw_connect = AsyncMock()  # type: ignore[method-assign]
+    channel.close = AsyncMock()  # type: ignore[method-assign]
+    channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))  # type: ignore[method-assign]
     return channel
 
 
+async def _make_probe_channel(guest: object) -> DualPortChannel:
+    """A channel past its first connect, so the next connect() probes the guest. `guest`
+    is the send_request side effect: a list with one answer (a message, or an exception for
+    a transport failure) per ping, or a function. The mocks count from zero."""
+    channel = _new_channel()
+    await channel.connect(timeout_seconds=5.0)
+    channel._raw_connect.reset_mock()  # type: ignore[attr-defined]
+    channel.send_request = AsyncMock(side_effect=guest)  # type: ignore[method-assign]
+    return channel
+
+
+def _pings(channel: DualPortChannel) -> int:
+    """The pings the probe sent: every request is a PingRequest."""
+    requests = [call.args[0] for call in channel.send_request.await_args_list]  # type: ignore[attr-defined]
+    assert all(isinstance(request, PingRequest) for request in requests), requests
+    return len(requests)
+
+
 class TestDualPortConnectLifecycle:
-    """Tests for connect() orchestration: when probing happens (and when it doesn't)."""
+    """When connect() probes the guest (a reconnection), and when it does not."""
 
     async def test_first_connect_does_not_probe(self) -> None:
-        """Boot-time connect has zero probe overhead."""
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._raw_connect = AsyncMock()
-        channel._probe_guest_ready = AsyncMock()
+        """Boot-time connect sends no ping."""
+        channel = _new_channel()
 
         await channel.connect(timeout_seconds=5.0)
 
-        assert channel._has_been_connected is True
-        # Probe should not have fired — this is the boot path
-        channel._probe_guest_ready.assert_not_awaited()
+        channel._raw_connect.assert_awaited_once_with(5.0)  # type: ignore[attr-defined]
+        assert _pings(channel) == 0
 
     async def test_reconnect_does_probe(self) -> None:
-        """After a successful connect, subsequent connects probe the guest."""
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._raw_connect = AsyncMock()
-        channel._probe_guest_ready = AsyncMock()
-        channel.close = AsyncMock()
+        """After a successful connect, the next connect sends one ping and gets the pong."""
+        channel = _new_channel()
 
-        await channel.connect(timeout_seconds=5.0)  # first
-        await channel.connect(timeout_seconds=5.0)  # second — should probe
+        await channel.connect(timeout_seconds=5.0)
+        await channel.connect(timeout_seconds=5.0)
 
-        channel._probe_guest_ready.assert_awaited_once()
+        assert _pings(channel) == 1
 
     async def test_idempotent_when_already_connected(self) -> None:
-        """connect() on an already-connected channel is a no-op."""
-        channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._raw_connect = AsyncMock()
-        channel._cmd_channel.is_connected = MagicMock(return_value=True)
-        channel._event_channel.is_connected = MagicMock(return_value=True)
+        """connect() on an already-connected channel opens nothing and sends no ping."""
+        channel = _new_channel()
+        channel._cmd_channel.is_connected = MagicMock(return_value=True)  # type: ignore[method-assign]
+        channel._event_channel.is_connected = MagicMock(return_value=True)  # type: ignore[method-assign]
 
         await channel.connect(timeout_seconds=5.0)
 
-        # _raw_connect should not have been called — already connected
-        channel._raw_connect.assert_not_awaited()
+        channel._raw_connect.assert_not_awaited()  # type: ignore[attr-defined]
+        assert _pings(channel) == 0
 
-    async def test_has_been_connected_survives_close(self) -> None:
-        """close() does not reset the flag, so next connect will always probe."""
+    async def test_connect_after_close_probes(self) -> None:
+        """close() does not make the channel new: the connect after it probes the guest."""
         channel = DualPortChannel(cmd_socket="/tmp/cmd.sock", event_socket="/tmp/event.sock", expected_uid=1000)
-        channel._raw_connect = AsyncMock()
-        channel._probe_guest_ready = AsyncMock()
-        channel.close = AsyncMock()
+        channel._raw_connect = AsyncMock()  # type: ignore[method-assign]
+        channel.send_request = AsyncMock(return_value=PongMessage(version="1.0"))  # type: ignore[method-assign]
 
         await channel.connect(timeout_seconds=5.0)
-        await channel.close()
+        await channel.close()  # the real close: no socket is open
+        await channel.connect(timeout_seconds=5.0)
 
-        assert channel._has_been_connected is True
+        assert _pings(channel) == 1
 
 
 class TestDualPortProbeSuccess:
-    """Probe returns (doesn't raise) when the guest eventually responds."""
+    """connect() returns when the guest answers a ping in its budget."""
 
     async def test_guest_ready_immediately(self) -> None:
-        """Guest responds with PongMessage on first attempt — probe returns."""
-        channel = _make_probe_channel([PongMessage(version="1.0")])
-        # Should not raise
-        await channel._probe_guest_ready(caller_timeout=5.0)
+        """Guest responds with PongMessage on first attempt."""
+        channel = await _make_probe_channel([PongMessage(version="1.0")])
+        await channel.connect(timeout_seconds=5.0)
+        assert _pings(channel) == 1
 
     async def test_guest_ready_after_transient_timeouts(self) -> None:
-        """Guest unresponsive twice then ready — probe returns."""
-        channel = _make_probe_channel(
-            [
-                TimeoutError(),
-                TimeoutError(),
-                PongMessage(version="1.0"),
-            ]
-        )
-        await channel._probe_guest_ready(caller_timeout=5.0)
+        """Guest unresponsive twice then ready."""
+        channel = await _make_probe_channel([TimeoutError(), TimeoutError(), PongMessage(version="1.0")])
+        await channel.connect(timeout_seconds=5.0)
+        assert _pings(channel) == 3
 
     async def test_guest_ready_after_mixed_transport_errors(self) -> None:
         """Different transport failures then success — probe is resilient."""
-        channel = _make_probe_channel(
+        channel = await _make_probe_channel(
             [
                 TimeoutError(),
                 OSError("reset"),
@@ -2730,312 +2397,103 @@ class TestDualPortProbeSuccess:
                 PongMessage(version="1.0"),
             ]
         )
-        await channel._probe_guest_ready(caller_timeout=5.0)
+        await channel.connect(timeout_seconds=5.0)
+        assert _pings(channel) == 5
 
     async def test_guest_ready_on_last_possible_attempt(self) -> None:
         """Guest responds on the very last retry — boundary case."""
         max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [PongMessage(version="1.0")])
-        # Should succeed, not raise
-        await channel._probe_guest_ready(caller_timeout=5.0)
+        channel = await _make_probe_channel([TimeoutError()] * (max_retries - 1) + [PongMessage(version="1.0")])
+        await channel.connect(timeout_seconds=5.0)
+        assert _pings(channel) == max_retries
 
-    async def test_lost_first_ping_costs_a_short_wait(self) -> None:
-        """QEMU accepted before the guest reopened its port: the first ping is lost.
-
-        The first attempt waits 50 ms, so the probe ends in ~0.1 s (with a 0.5 s
-        first wait it took 0.55 s)."""
+    async def test_unanswered_first_ping_costs_a_short_wait(self) -> None:
+        """The first ping gets no answer in time: the next ping on the same connection
+        ends the probe in ~0.1 s (the first wait is 50 ms)."""
         answered: list[bool] = []
 
         async def guest(*_args: object, **_kwargs: object) -> PongMessage:
             if not answered:
                 answered.append(False)
-                await asyncio.Event().wait()  # the lost ping: no answer ever
+                await asyncio.Event().wait()  # no answer in time
             return PongMessage(version="1.0")
 
-        channel = _make_probe_channel(guest)
+        channel = await _make_probe_channel(guest)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        await channel._probe_guest_ready(caller_timeout=5.0)
+        await channel.connect(timeout_seconds=5.0)
 
         assert loop.time() - start < 0.3
 
+    async def test_slow_pong_never_resets_the_connection(self) -> None:
+        """A ping with no answer yet is slow, not lost: the probe sends the next ping on
+        the same connection. Closing it would show the guest a host disconnect for each
+        slow pong."""
+        channel = await _make_probe_channel(
+            [TimeoutError(), TimeoutError(), TimeoutError(), PongMessage(version="1.0")]
+        )
+
+        await channel.connect(timeout_seconds=5.0)
+
+        assert _pings(channel) == 4
+        channel.close.assert_not_awaited()  # type: ignore[attr-defined]
+        channel._raw_connect.assert_awaited_once_with(5.0)  # type: ignore[attr-defined]  # the reconnection only
+
+    async def test_failed_connection_is_opened_again(self) -> None:
+        """Only a connection that failed is closed and opened again before the next ping."""
+        channel = await _make_probe_channel([ConnectionError("reset"), PongMessage(version="1.0")])
+
+        await channel.connect(timeout_seconds=5.0)
+
+        assert _pings(channel) == 2
+        channel.close.assert_awaited_once()  # type: ignore[attr-defined]
+        assert channel._raw_connect.await_args_list == [((5.0,),), ((5.0,),)]  # type: ignore[attr-defined]
+
 
 class TestDualPortProbeFailure:
-    """Probe raises TimeoutError when the guest never becomes ready."""
+    """connect() raises TimeoutError when the guest never answers in the probe budget."""
 
     async def test_all_attempts_timeout(self) -> None:
         """Guest never responds — TimeoutError with descriptive message."""
         max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        channel = _make_probe_channel([TimeoutError()] * max_retries)
+        channel = await _make_probe_channel([TimeoutError()] * max_retries)
 
-        with pytest.raises(TimeoutError, match=f"after {max_retries} reconnection attempts"):
-            await channel._probe_guest_ready(caller_timeout=5.0)
-        # One reconnect between attempts, none after the last: it would only delay the error.
-        assert channel._raw_connect.await_count == max_retries - 1
-        assert channel.close.await_count == max_retries - 1
+        with pytest.raises(TimeoutError, match=f"^Guest agent did not respond to ping after {max_retries} attempts$"):
+            await channel.connect(timeout_seconds=5.0)
+        # Every ping goes on the same connection.
+        assert _pings(channel) == max_retries
+        channel._raw_connect.assert_awaited_once()  # type: ignore[attr-defined]  # the reconnection only
+        channel.close.assert_not_awaited()  # type: ignore[attr-defined]
 
     async def test_all_attempts_connection_error(self) -> None:
         """Guest socket broken every time — same TimeoutError."""
         max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
-        channel = _make_probe_channel([ConnectionError()] * max_retries)
+        channel = await _make_probe_channel([ConnectionError()] * max_retries)
 
-        with pytest.raises(TimeoutError, match="reconnection attempts"):
-            await channel._probe_guest_ready(caller_timeout=5.0)
+        with pytest.raises(TimeoutError, match="attempts"):
+            await channel.connect(timeout_seconds=5.0)
+        # One reconnect between attempts, none after the last: it would only delay the error.
+        assert channel.close.await_count == max_retries - 1  # type: ignore[attr-defined]
+        assert channel._raw_connect.await_count == 1 + (max_retries - 1)  # type: ignore[attr-defined]
 
     async def test_guest_returns_wrong_message_type(self) -> None:
         """Guest returns StreamingErrorMessage instead of PongMessage — treated as failure."""
         max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         wrong_msg = StreamingErrorMessage(error_type="unknown", message="not a pong")
-        channel = _make_probe_channel([wrong_msg] * max_retries)
+        channel = await _make_probe_channel([wrong_msg] * max_retries)
 
-        with pytest.raises(TimeoutError, match="reconnection attempts"):
-            await channel._probe_guest_ready(caller_timeout=5.0)
+        with pytest.raises(TimeoutError, match="attempts"):
+            await channel.connect(timeout_seconds=5.0)
+        assert _pings(channel) == max_retries
 
     async def test_one_more_failure_than_budget_still_raises(self) -> None:
         """MAX_RETRIES-1 failures + wrong message type = still raises."""
         max_retries = len(constants.GUEST_RECONNECT_PROBE_TIMEOUTS)
         wrong_msg = StreamingErrorMessage(error_type="unknown", message="bad")
-        channel = _make_probe_channel([TimeoutError()] * (max_retries - 1) + [wrong_msg])
+        channel = await _make_probe_channel([TimeoutError()] * (max_retries - 1) + [wrong_msg])
 
         with pytest.raises(TimeoutError):
-            await channel._probe_guest_ready(caller_timeout=5.0)
-
-
-# ============================================================================
-# op_id routing — stale message isolation
-# ============================================================================
-
-
-class TestOpIdDispatcherRouting:
-    """Tests op_id-based message routing through the dispatcher.
-
-    Verifies that messages with op_id are routed to per-op queues,
-    and stale messages (unregistered op_id) are discarded.
-    """
-
-    async def test_pong_with_op_id_routes_to_op_queue(self) -> None:
-        """PongMessage with op_id routes to registered op queue."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("ping-1")
-        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "ping-1"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, PongMessage)
-        assert msg.op_id == "ping-1"
-
-        await dispatcher.stop()
-
-    async def test_complete_with_op_id_routes_to_op_queue(self) -> None:
-        """ExecutionCompleteMessage with op_id routes to registered op queue."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("exec-1")
-        _feed(reader, {"type": "complete", "exit_code": 0, "execution_time_ms": 100, "op_id": "exec-1"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, ExecutionCompleteMessage)
-        assert msg.op_id == "exec-1"
-
-        await dispatcher.stop()
-
-    async def test_stdout_with_op_id_routes_to_op_queue(self) -> None:
-        """OutputChunkMessage with op_id routes to registered op queue."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("exec-1")
-        _feed(reader, {"type": "stdout", "chunk": "hello", "op_id": "exec-1"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, OutputChunkMessage)
-        assert msg.op_id == "exec-1"
-
-        await dispatcher.stop()
-
-    async def test_file_list_with_op_id_routes_to_op_queue(self) -> None:
-        """FileListMessage with op_id routes to registered op queue."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("list-1")
-        _feed(reader, {"type": "file_list", "path": "", "entries": [], "op_id": "list-1"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, FileListMessage)
-        assert msg.op_id == "list-1"
-
-        await dispatcher.stop()
-
-    async def test_stale_pong_discarded(self) -> None:
-        """Stale PongMessage (unregistered op_id) is discarded, not queued."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        # Feed a stale PongMessage from a previous probe — no queue registered
-        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "probe-1"})
-
-        # Now register a queue for list_files and feed its response
-        op_queue = await dispatcher.register_op("list-1")
-        _feed(reader, {"type": "file_list", "path": "", "entries": [], "op_id": "list-1"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, FileListMessage)
-        assert msg.op_id == "list-1"
-
-        # Default queue empty — stale pong was discarded
-
-        await dispatcher.stop()
-
-    async def test_message_without_op_id_is_discarded(self) -> None:
-        """Message without op_id is discarded (no default queue)."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("probe-1")
-        # Pong without op_id — discarded
-        _feed(reader, {"type": "pong", "version": "1.0"})
-        # Subsequent op_id message — still routes
-        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "probe-1"})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, PongMessage)
-        assert msg.op_id == "probe-1"
-
-        await dispatcher.stop()
-
-    async def test_interleaved_exec_and_list(self) -> None:
-        """Two ops interleaved: exec and list_files, each gets its own messages."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        exec_queue = await dispatcher.register_op("exec-1")
-        list_queue = await dispatcher.register_op("list-1")
-
-        # Interleave messages
-        _feed(reader, {"type": "stdout", "chunk": "hello", "op_id": "exec-1"})
-        _feed(reader, {"type": "file_list", "path": "", "entries": [], "op_id": "list-1"})
-        _feed(reader, {"type": "stderr", "chunk": "err", "op_id": "exec-1"})
-        _feed(reader, {"type": "complete", "exit_code": 0, "execution_time_ms": 50, "op_id": "exec-1"})
-
-        exec_msgs = await _drain(exec_queue)
-        list_msgs = await _drain(list_queue)
-
-        assert len(exec_msgs) == 3  # stdout, stderr, complete
-        assert len(list_msgs) == 1  # file_list
-        assert isinstance(exec_msgs[-1], ExecutionCompleteMessage)
-        assert isinstance(list_msgs[0], FileListMessage)
-
-        await dispatcher.stop()
-
-    async def test_empty_op_id_routes_to_op_queue(self) -> None:
-        """Empty string op_id is truthy and routes to op queue."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("")
-        _feed(reader, {"type": "pong", "version": "1.0", "op_id": ""})
-
-        msg = await asyncio.wait_for(op_queue.get(), timeout=1.0)
-        assert isinstance(msg, PongMessage)
-
-        await dispatcher.stop()
-
-    async def test_message_after_unregister_discarded(self) -> None:
-        """Message arriving after unregister_op is discarded."""
-        reader = asyncio.StreamReader()
-        dispatcher = FileOpDispatcher(reader)
-        dispatcher.start()
-
-        op_queue = await dispatcher.register_op("op-1")
-        await dispatcher.unregister_op("op-1")
-
-        _feed(reader, {"type": "pong", "version": "1.0", "op_id": "op-1"})
-        # Wait a bit for the dispatch loop to process
-        await asyncio.sleep(0.1)
-
-        assert op_queue._queue.empty()
-
-        await dispatcher.stop()
-
-
-# ============================================================================
-# UnixSocketChannel — write worker failure handling
-# ============================================================================
-
-
-# Exception scenarios for dead write worker parametrize
-_DEAD_WORKER_CASES = [
-    pytest.param(asyncio.CancelledError(), "Write worker was cancelled", id="cancelled"),
-    pytest.param(ConnectionResetError("broken pipe"), "Write worker crashed: ConnectionResetError", id="crashed"),
-    pytest.param(None, "Write worker exited unexpectedly", id="clean-exit"),
-]
-
-
-class TestWriteWorkerFailureHandling:
-    """Tests for UnixSocketChannel behavior when the write worker is dead.
-
-    Covers the fail-fast checks at the top of send_request() and
-    stream_messages() that inspect _write_task.result() before proceeding.
-    """
-
-    @staticmethod
-    def _make_channel_with_dead_writer(
-        task_exception: BaseException | None = None,
-    ) -> UnixSocketChannel:
-        """Build a UnixSocketChannel whose write worker has already finished.
-
-        Args:
-            task_exception: If set, the write task finished with this exception.
-                If None, the task finished cleanly (no exception).
-        """
-        ch = UnixSocketChannel("/fake/socket.sock", expected_uid=0)
-        # Simulate connected state
-        ch._reader = asyncio.StreamReader()
-        ch._writer = MagicMock()
-
-        # Build a pre-resolved future to simulate a dead write worker.
-        # Using a Future (not Task) is fine — code under test only calls
-        # .done() and .result(), which are shared API.
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[None] = loop.create_future()
-        if task_exception is not None:
-            fut.set_exception(task_exception)
-        else:
-            fut.set_result(None)
-        ch._write_task = fut  # type: ignore[assignment]  # Future, not Task — OK for test
-        return ch
-
-    @pytest.mark.parametrize("task_exception,expected_match", _DEAD_WORKER_CASES)
-    async def test_send_request_dead_write_worker(
-        self, task_exception: BaseException | None, expected_match: str
-    ) -> None:
-        """send_request() raises RuntimeError when write worker is dead."""
-        ch = self._make_channel_with_dead_writer(task_exception)
-
-        with pytest.raises(RuntimeError, match=expected_match):
-            await ch.send_request(PongMessage(version="1.0"))  # type: ignore[arg-type]
-
-    @pytest.mark.parametrize("task_exception,expected_match", _DEAD_WORKER_CASES)
-    async def test_stream_messages_dead_write_worker(
-        self, task_exception: BaseException | None, expected_match: str
-    ) -> None:
-        """stream_messages() raises RuntimeError when write worker is dead."""
-        ch = self._make_channel_with_dead_writer(task_exception)
-
-        with pytest.raises(RuntimeError, match=expected_match):
-            async for _ in ch.stream_messages(PongMessage(version="1.0"), timeout=5):  # type: ignore[arg-type]
-                pass
+            await channel.connect(timeout_seconds=5.0)
 
 
 # ============================================================================
@@ -3044,14 +2502,16 @@ class TestWriteWorkerFailureHandling:
 
 
 class TestIdleTimerLifecycleNormal:
-    """close() and operations leave no armed idle deadline."""
+    """After each close path, no idle deadline stays armed: an armed deadline is a loop
+    timer that holds the session (for idle_timeout_seconds: 300 s here), so a closed
+    session that the caller drops must be freed at once."""
 
     async def test_close_disarms_timer(self) -> None:
-        """close() cancels the pending idle deadline."""
         session, _, _ = _make_session()
-        assert session._idle_timer_handle is not None
         await session.close()
-        assert session._idle_timer_handle is None
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
     async def test_multiple_exec_then_close_disarms(self) -> None:
         """Each exec() re-arms the deadline; close() disarms the final one."""
@@ -3059,37 +2519,53 @@ class TestIdleTimerLifecycleNormal:
         for _ in range(5):
             await session.exec("x = 1")
         await session.close()
-        assert session._idle_timer_handle is None
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
     async def test_context_manager_disarms(self) -> None:
         """async with Session disarms via __aexit__."""
         session, _, _ = _make_session()
         async with session:
             await session.exec("x = 1")
-        assert session._idle_timer_handle is None
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
 
 class TestIdleTimerLifecycleEdge:
-    """Edge cases for the idle deadline handle."""
+    """Edge cases for the idle deadline."""
 
     async def test_double_close_no_error(self) -> None:
-        """Second close() is idempotent — no crash, timer stays disarmed."""
-        session, _, _ = _make_session()
+        """Second close() is idempotent: no error, one destroy, no deadline armed."""
+        session, _, manager = _make_session()
         await session.close()
         await session.close()
-        assert session._idle_timer_handle is None
+        manager.destroy_vm.assert_awaited_once()
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
     async def test_close_from_exec_error_path(self) -> None:
-        """VM failure in exec() triggers close() internally — timer disarmed."""
+        """VM failure in exec() closes the session: the call does not arm a deadline again."""
         session, mock_vm, _ = _make_session()
-        mock_vm.execute = AsyncMock(side_effect=RuntimeError("VM died"))
+
+        async def vm_died(**_kwargs: object) -> ExecutionResult:
+            raise RuntimeError("VM died")  # a new error each call: the mock holds no traceback
+
+        mock_vm.execute.side_effect = vm_died
         with pytest.raises(RuntimeError, match="VM died"):
             await session.exec("x = 1")
         assert session.closed
-        assert session._idle_timer_handle is None
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
     async def test_reset_replaces_pending_handle(self) -> None:
-        """Re-arming cancels the prior handle and installs a fresh one."""
+        """Re-arming cancels the prior handle and installs a fresh one.
+
+        Private-level: no public call re-arms an armed deadline (_guard cancels it
+        first), so only a direct call reaches this defensive path."""
         session, _, _ = _make_session()
         first = session._idle_timer_handle
         session._reset_idle_timer()
@@ -3098,46 +2574,37 @@ class TestIdleTimerLifecycleEdge:
         await session.close()
 
     async def test_natural_idle_timeout_closes_session(self) -> None:
-        """The deadline callback fires and closes the session with no crash."""
+        """The deadline fires and closes the session: one destroy, no error."""
         session, _, manager = _make_session(idle_timeout_seconds=0)
-        # call_later(0) fires on the next loop turn and spawns the close task;
-        # await it so destroy_vm completes before asserting (session.closed
-        # flips True before _close_impl reaches its destroy_vm await).
-        for _ in range(10):
+        for _ in range(10):  # call_later(0) fires on the next loop turn
             await asyncio.sleep(0)
-            if session._idle_close_task is not None:
+            if session.closed:
                 break
-        assert session._idle_close_task is not None
-        await session._idle_close_task
         assert session.closed
-        assert session._idle_timer_handle is None
+        await session.close()  # waits for the cleanup that the deadline started
         manager.destroy_vm.assert_awaited_once()
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
 
 class TestIdleTimerLifecycleStress:
     """Stress scenarios for the idle deadline."""
 
-    async def test_rapid_reset_storm(self) -> None:
-        """50 rapid re-arms leak nothing — each cancels the prior handle."""
-        session, _, _ = _make_session()
-        for _ in range(50):
-            session._reset_idle_timer()
-        await session.close()
-        assert session._idle_timer_handle is None
-
     async def test_concurrent_close_and_exec(self) -> None:
-        """Race close() against exec() — one wins, timer disarmed either way."""
-        session, _, _ = _make_session()
-        results = await asyncio.gather(
-            session.close(),
-            session.exec("x = 1"),
-            return_exceptions=True,
-        )
-        # One of the two may raise SessionClosedError
-        errors = [r for r in results if isinstance(r, SessionClosedError)]
-        assert len(errors) <= 1
-        assert session.closed
-        assert session._idle_timer_handle is None
+        """close() starts and does not wait for the lock: an exec() that starts while the VM
+        destroy runs finds the session closed, does not reach the VM, and arms no deadline."""
+        session, mock_vm, manager = _make_session()
+        closing = asyncio.create_task(session.close())
+        await asyncio.sleep(0)  # close() marks the session closed, then waits for the destroy
+        with pytest.raises(SessionClosedError, match=r"^Session is closed$"):
+            await session.exec("x = 1")
+        await closing
+        mock_vm.execute.assert_not_awaited()
+        manager.destroy_vm.assert_awaited_once()
+        session_ref = weakref.ref(session)
+        del session
+        _assert_freed(session_ref)
 
     async def test_concurrent_close_waits_for_shared_destroy(self) -> None:
         """All close callers wait for the one in-flight VM destruction."""

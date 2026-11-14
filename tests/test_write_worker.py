@@ -1,13 +1,126 @@
-"""Tests for UnixSocketChannel._write_worker error handling."""
+"""Tests for the write path of UnixSocketChannel: frames to the guest, the batched drain, the
+end of the connection, and the errors of its write worker.
+
+The public behavior runs on a real Unix socket (the guest side is a server in this process).
+The batch size and the errors of the write worker show only in its calls to the stream
+writer: those tests drive _write_worker on a mocked writer.
+"""
 
 import asyncio
 import contextlib
 import logging
+import os
+import socket
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from exec_sandbox.guest_channel import FileOpDispatcher, UnixSocketChannel
+from exec_sandbox.guest_channel import SOCKET_SEND_BUFFER_BYTES, FileOpDispatcher, UnixSocketChannel
+
+
+@dataclass
+class _Guest:
+    """The guest end of a channel's socket."""
+
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+
+
+@pytest.fixture
+async def connected(short_tmp_dir: Path) -> AsyncIterator[tuple[UnixSocketChannel, _Guest]]:
+    """A UnixSocketChannel connected to a Unix socket server in this process, and the server's
+    end of the connection."""
+    accepted: asyncio.Future[_Guest] = asyncio.get_running_loop().create_future()
+
+    async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        accepted.set_result(_Guest(reader, writer))
+
+    path = short_tmp_dir / "cmd.sock"
+    server = await asyncio.start_unix_server(on_connect, path=str(path))
+    channel = UnixSocketChannel(str(path), expected_uid=os.getuid())
+    try:
+        await channel.connect(timeout_seconds=1)
+        guest = await asyncio.wait_for(accepted, timeout=1)
+        yield channel, guest
+        await channel.close()
+        guest.writer.close()
+    finally:
+        server.close()
+
+
+# ============================================================================
+# TestChannelWrites - enqueue_write, is_connected and close on a real socket
+# ============================================================================
+
+
+class TestChannelWrites:
+    async def test_frames_reach_the_guest_in_order(self, connected: tuple[UnixSocketChannel, _Guest]) -> None:
+        """More frames than one batch (16) reach the guest, all of them, in order."""
+        channel, guest = connected
+        frames = [f"msg{i}\n".encode() for i in range(20)]
+
+        for frame in frames:
+            await channel.enqueue_write(frame)
+
+        received = await asyncio.wait_for(guest.reader.readexactly(sum(map(len, frames))), timeout=1)
+        assert received == b"".join(frames)
+
+    async def test_idle_channel_stays_connected_and_writes_later(
+        self, connected: tuple[UnixSocketChannel, _Guest]
+    ) -> None:
+        """With nothing to write, the write worker waits (no poll, no exit): the channel stays
+        connected, and a later frame reaches the guest."""
+        channel, guest = connected
+        for _ in range(10):  # loop turns in which a worker that does not wait would end
+            await asyncio.sleep(0)
+
+        assert channel.is_connected()
+        await channel.enqueue_write(b"later\n")
+        assert await asyncio.wait_for(guest.reader.readline(), timeout=1) == b"later\n"
+
+    async def test_close_sends_queued_frames_then_ends_the_connection(
+        self, connected: tuple[UnixSocketChannel, _Guest]
+    ) -> None:
+        """close() writes the frames still in the queue, then ends the connection: the guest
+        reads them, then the end of the stream; the channel is no longer connected."""
+        channel, guest = connected
+        for i in range(3):
+            await channel.enqueue_write(f"last{i}\n".encode())
+
+        await channel.close()
+
+        assert await asyncio.wait_for(guest.reader.read(), timeout=1) == b"last0\nlast1\nlast2\n"
+        assert not channel.is_connected()
+
+    async def test_send_buffer_holds_a_file_chunk(self, connected: tuple[UnixSocketChannel, _Guest]) -> None:
+        """connect() raises the send buffer of the socket (macOS gives a Unix socket 8KB) so
+        that one send writes the largest frame, a file chunk."""
+        channel, _ = connected
+        assert channel._writer is not None
+        sock = channel._writer.get_extra_info("socket")
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) >= SOCKET_SEND_BUFFER_BYTES
+
+    async def test_not_connected_before_connect(self) -> None:
+        """A channel that never connected is not connected."""
+        assert not UnixSocketChannel("/fake/sock", expected_uid=0).is_connected()
+
+    async def test_queue_full_backpressure(self) -> None:
+        """64 frames fill the queue of a channel whose worker does not drain it (not connected:
+        no worker): the next enqueue_write raises RuntimeError at its timeout."""
+        channel = UnixSocketChannel("/fake/sock", expected_uid=0)
+        for i in range(64):
+            await channel.enqueue_write(f"msg{i}".encode(), timeout=0.1)
+
+        with pytest.raises(RuntimeError, match="Write queue full"):
+            await channel.enqueue_write(b"overflow", timeout=0.01)
+
+
+# ============================================================================
+# The write worker on a mocked writer
+# ============================================================================
 
 
 @pytest.fixture
@@ -35,90 +148,45 @@ async def _stop_worker(ch: UnixSocketChannel, task: asyncio.Task[None]) -> None:
         await asyncio.wait_for(task, timeout=5.0)
 
 
-# ============================================================================
-# TestWriteWorkerShutdown - normal lifecycle
-# ============================================================================
-
-
-class TestWriteWorkerShutdown:
-    @pytest.mark.asyncio
-    async def test_cancel_stops_worker(self, channel: UnixSocketChannel):
-        """Cancelling the worker task is the authoritative stop."""
-        task = await _start_worker(channel)
-
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5.0)
-
-        assert task.done()
-
-    @pytest.mark.asyncio
-    async def test_stays_alive_blocking_on_empty_queue(self, channel: UnixSocketChannel):
-        """Worker blocks on an empty queue indefinitely, stops on cancel."""
-        task = await _start_worker(channel)
-
-        # No wakeup poll: the worker just blocks on queue.get() while idle.
-        await asyncio.sleep(0.2)
-        assert not task.done(), "Worker should still be running"
-
-        await _stop_worker(channel, task)
-        assert task.done()
-
-
-# ============================================================================
-# TestWriteWorkerWrites - data processing
-# ============================================================================
-
-
-class TestWriteWorkerWrites:
-    @pytest.mark.asyncio
-    async def test_single_write_and_drain(self, channel: UnixSocketChannel):
-        """Put 1 item in queue, verify write() + drain() called."""
-        task = await _start_worker(channel)
-
-        await channel._write_queue.put(b"hello\n")
-        # Give worker time to process
-        await asyncio.sleep(0.1)
-
-        assert channel._writer is not None
-        channel._writer.write.assert_called_once_with(b"hello\n")
-        channel._writer.drain.assert_awaited_once()
-
-        await _stop_worker(channel, task)
-
-    @pytest.mark.asyncio
-    async def test_batches_up_to_16_items(self, channel: UnixSocketChannel):
-        """Pre-fill 20 items, verify first batch is 16 (1 get + 15 get_nowait)."""
-        # Pre-fill queue before starting worker so all items are available
+class TestWriteWorkerBatch:
+    async def test_batches_up_to_16_items(self, channel: UnixSocketChannel) -> None:
+        """20 queued frames: a batch of 16 (1 get + 15 get_nowait) and a batch of 4, one drain
+        each. The batch shows only in the drain calls: the bytes on the wire are the same."""
         for i in range(20):
             await channel._write_queue.put(f"msg{i}\n".encode())
 
         task = await _start_worker(channel)
-        # Give worker time to process
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(channel._write_queue.join(), timeout=1)
+        for _ in range(3):  # the drain after the last batch
+            await asyncio.sleep(0)
 
         assert channel._writer is not None
-        # First batch: 16 writes (1 from get + 15 from get_nowait), then 1 drain
-        # Second batch: 4 remaining writes, then 1 drain
         assert channel._writer.write.call_count == 20
-        # drain is called once per batch: first batch of 16, then batch of 4
         assert channel._writer.drain.await_count == 2
 
         await _stop_worker(channel, task)
 
-    @pytest.mark.asyncio
-    async def test_writer_none_skips_write(self, channel: UnixSocketChannel):
-        """With _writer=None, data is dequeued but no write/drain calls."""
-        channel._writer = None
+    async def test_cancel_with_queued_data_stops_the_worker(self, channel: UnixSocketChannel) -> None:
+        """A cancel in the same loop turn as new data stops the worker (no error of its own)."""
         task = await _start_worker(channel)
 
-        await channel._write_queue.put(b"ignored\n")
-        await asyncio.sleep(0.1)
+        await channel._write_queue.put(b"last\n")
+        task.cancel()
 
-        # Data was consumed (queue empty)
-        assert channel._write_queue.empty()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
 
-        await _stop_worker(channel, task)
+    async def test_closing_transport_is_not_connected(self, channel: UnixSocketChannel) -> None:
+        """A transport that is closing (its connection was lost while the worker waits) is not
+        connected, before any write fails. A mocked writer: on a real socket the loss shows
+        only at the next write."""
+        assert channel._writer is not None
+        channel._writer.is_closing = MagicMock(return_value=True)
+        channel._write_task = await _start_worker(channel)
+        try:
+            assert not channel.is_connected()
+        finally:
+            await _stop_worker(channel, channel._write_task)
 
 
 # ============================================================================
@@ -140,11 +208,14 @@ _WRITER_ERROR_CASES = [
 
 
 class TestWriteWorkerErrorHandling:
+    """A write error ends the worker (the channel then reports it is not connected), logged
+    except "Event loop is closed" (the interpreter shutdown). The errors are raised by a mocked
+    writer: a real socket cannot raise each of them on demand."""
+
     @pytest.mark.parametrize("error_msg,expect_log", _GET_ERROR_CASES)
-    @pytest.mark.asyncio
     async def test_get_raises_runtime_error(
         self, channel: UnixSocketChannel, caplog: pytest.LogCaptureFixture, error_msg: str, expect_log: bool
-    ):
+    ) -> None:
         """RuntimeError from queue.get() — silent for 'Event loop is closed', logged otherwise."""
         with patch.object(
             channel._write_queue,
@@ -155,7 +226,6 @@ class TestWriteWorkerErrorHandling:
                 task = await _start_worker(channel)
                 await asyncio.wait_for(task, timeout=5.0)
 
-        assert task.done()
         assert task.exception() is None
         if expect_log:
             assert "write worker error" in caplog.text.lower()
@@ -163,7 +233,6 @@ class TestWriteWorkerErrorHandling:
             assert "write worker error" not in caplog.text.lower()
 
     @pytest.mark.parametrize("mock_attr,mock_cls,exc,expect_log", _WRITER_ERROR_CASES)
-    @pytest.mark.asyncio
     async def test_writer_method_error(
         self,
         *,
@@ -173,131 +242,25 @@ class TestWriteWorkerErrorHandling:
         mock_cls: type,
         exc: Exception,
         expect_log: bool,
-    ):
-        """Errors from writer.write()/drain() — silent for 'Event loop is closed', logged otherwise."""
+    ) -> None:
+        """Errors from writer.write()/drain() end the worker — silent for 'Event loop is
+        closed', logged otherwise — and the channel is no longer connected."""
         assert channel._writer is not None
         setattr(channel._writer, mock_attr, mock_cls(side_effect=exc))
+        channel._writer.is_closing = MagicMock(return_value=False)
 
         with caplog.at_level(logging.ERROR, logger="exec_sandbox.guest_channel"):
-            task = await _start_worker(channel)
+            channel._write_task = await _start_worker(channel)
+            assert channel.is_connected()
             await channel._write_queue.put(b"data\n")
-            await asyncio.wait_for(task, timeout=5.0)
+            await asyncio.wait_for(channel._write_task, timeout=5.0)
 
-        assert task.done()
-        assert task.exception() is None
+        assert channel._write_task.exception() is None
+        assert not channel.is_connected()
         if expect_log:
             assert "write worker error" in caplog.text.lower()
         else:
             assert "write worker error" not in caplog.text.lower()
-
-
-# ============================================================================
-# TestWriteWorkerEdgeCases - weird / out-of-bound
-# ============================================================================
-
-
-class TestWriteWorkerEdgeCases:
-    @pytest.mark.asyncio
-    async def test_queue_full_backpressure(self, channel: UnixSocketChannel):
-        """Fill queue to maxsize (64), verify enqueue_write raises RuntimeError."""
-        # Fill the queue without starting the worker (nothing draining)
-        for i in range(64):
-            await channel._write_queue.put(f"msg{i}".encode())
-
-        with pytest.raises(RuntimeError, match="Write queue full"):
-            await channel.enqueue_write(b"overflow", timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_concurrent_cancel_and_data(self, channel: UnixSocketChannel):
-        """Enqueue data then cancel immediately — no crash, worker stops."""
-        task = await _start_worker(channel)
-
-        # Race: enqueue data and cancel in the same turn.
-        await channel._write_queue.put(b"last\n")
-        task.cancel()
-
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5.0)
-        assert task.done()
-
-    @pytest.mark.asyncio
-    async def test_worker_exits_on_cancelled_error(self, channel: UnixSocketChannel):
-        """Cancelling the worker task raises CancelledError."""
-        task = await _start_worker(channel)
-
-        # Let the worker enter its loop
-        await asyncio.sleep(0.05)
-
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-
-# ============================================================================
-# TestIsConnected - truth table for is_connected()
-# ============================================================================
-
-
-async def _make_done_task() -> asyncio.Task[None]:
-    """Create a genuine Task that has already completed."""
-
-    async def _noop() -> None:
-        pass
-
-    task = asyncio.create_task(_noop())
-    await task  # Let it finish
-    return task
-
-
-def _make_running_task() -> asyncio.Task[None]:
-    """Create a task that never finishes (running)."""
-    return asyncio.create_task(asyncio.sleep(3600))
-
-
-_IS_CONNECTED_CASES = [
-    pytest.param(True, True, False, "running", True, id="all-healthy"),
-    pytest.param(False, True, False, "running", False, id="no-reader"),
-    pytest.param(True, False, False, "running", False, id="no-writer"),
-    pytest.param(True, True, True, "running", False, id="writer-closing"),
-    pytest.param(True, True, False, "done", False, id="write-task-done"),
-]
-
-
-class TestIsConnected:
-    @pytest.mark.parametrize("has_reader,has_writer,is_closing,task_state,expected", _IS_CONNECTED_CASES)
-    @pytest.mark.asyncio
-    async def test_is_connected_truth_table(
-        self,
-        *,
-        channel: UnixSocketChannel,
-        has_reader: bool,
-        has_writer: bool,
-        is_closing: bool,
-        task_state: str,
-        expected: bool,
-    ):
-        """Parametrized truth table for is_connected()."""
-        if not has_reader:
-            channel._reader = None
-        if not has_writer:
-            channel._writer = None
-        else:
-            assert channel._writer is not None
-            channel._writer.is_closing = MagicMock(return_value=is_closing)
-
-        if task_state == "done":
-            channel._write_task = await _make_done_task()
-        else:
-            channel._write_task = _make_running_task()
-
-        try:
-            assert channel.is_connected() is expected
-        finally:
-            # Cleanup running tasks
-            if channel._write_task and not channel._write_task.done():
-                channel._write_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await channel._write_task
 
 
 # ============================================================================
@@ -306,8 +269,7 @@ class TestIsConnected:
 
 
 class TestFileOpDispatcherIsAlive:
-    @pytest.mark.asyncio
-    async def test_alive_then_dead_on_eof(self):
+    async def test_alive_then_dead_on_eof(self) -> None:
         """Dispatcher is_alive() returns True while running, False after EOF."""
         reader = asyncio.StreamReader()
         dispatcher = FileOpDispatcher(reader)
