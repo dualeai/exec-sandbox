@@ -55,13 +55,11 @@ class TestKernelEntropyHealth:
         ],
     )
     async def test_entropy_pool_seeded(self, scheduler: Scheduler, language: Language, code: str) -> None:
-        """CRNG has 256 bits entropy (random.trust_cpu=on working)."""
+        """CRNG is seeded: entropy_avail is 256, the full pool (a kernel since 5.18 reports 256 once
+        the CRNG is ready, less before)."""
         result = await run_once(scheduler, VmSpec(language=language), code)
 
-        assert result.exit_code == 0
-        entropy = int(result.stdout.strip())
-        # Modern kernels with CONFIG_RANDOM_TRUST_CPU maintain 256 bits
-        assert entropy >= 256, f"Entropy starvation: only {entropy} bits"
+        assert (result.exit_code, result.stdout) == (0, "256\n"), result.stderr
 
     async def test_urandom_nonblocking(self, scheduler: Scheduler) -> None:
         """getrandom() doesn't block - CRNG ready at boot."""
@@ -81,7 +79,7 @@ print("PASS" if elapsed_ms < 100 else "FAIL_BLOCKED")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout, "getrandom() blocked - entropy starvation"
+        assert result.stdout.splitlines()[-1] == "PASS", f"getrandom() blocked - entropy starvation: {result.stdout}"
 
 
 # =============================================================================
@@ -133,7 +131,7 @@ else:
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_entropy_bits_per_byte(self, scheduler: Scheduler) -> None:
         """Shannon entropy should be ~7.99 bits/byte for random data."""
@@ -161,7 +159,7 @@ print("PASS" if entropy > 7.9 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_serial_correlation(self, scheduler: Scheduler) -> None:
         """Serial correlation coefficient should be near zero."""
@@ -195,7 +193,7 @@ print("PASS" if abs(corr) < 0.01 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_compression_ratio(self, scheduler: Scheduler) -> None:
         """Random data should be incompressible (ratio > 0.99)."""
@@ -215,7 +213,7 @@ print("PASS" if ratio > 0.99 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_monte_carlo_pi(self, scheduler: Scheduler) -> None:
         """Monte Carlo pi estimation - tests 2D uniformity.
@@ -255,7 +253,7 @@ else:
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
 
 # =============================================================================
@@ -290,7 +288,7 @@ print("PASS")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_python_hashlib_random(self, scheduler: Scheduler) -> None:
         """Python hashlib with random data produces unique hashes."""
@@ -311,7 +309,7 @@ print("PASS" if len(hashes) == 100 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_javascript_crypto_random(self, scheduler: Scheduler) -> None:
         """Node/Bun crypto.randomBytes works."""
@@ -336,7 +334,7 @@ console.log(buf1.length === 1024 && !same && uuid.length === 36 ? "PASS" : "FAIL
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_javascript_compression_test(self, scheduler: Scheduler) -> None:
         """JavaScript random data is incompressible."""
@@ -357,7 +355,7 @@ console.log(ratio > 0.99 ? "PASS" : "FAIL");
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_raw_dev_urandom(self, scheduler: Scheduler) -> None:
         """Shell access to /dev/urandom works."""
@@ -376,7 +374,7 @@ fi
         result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
 
 # =============================================================================
@@ -467,7 +465,7 @@ print("PASS" if max_run <= 6 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_adaptive_proportion(self, scheduler: Scheduler) -> None:
         """No single byte value dominates (checks for stuck bits)."""
@@ -492,7 +490,7 @@ print("PASS" if proportion < 0.008 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout
 
     async def test_bit_balance(self, scheduler: Scheduler) -> None:
         """Bits should be roughly 50% zeros and 50% ones."""
@@ -515,4 +513,4 @@ print("PASS" if 0.499 < ratio < 0.501 else "FAIL")
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 0
-        assert "PASS" in result.stdout
+        assert result.stdout.splitlines()[-1] == "PASS", result.stdout

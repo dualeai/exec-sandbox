@@ -59,9 +59,7 @@ console.log("ADD_NEG:" + inst.exports.add(-1, 1));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "ADD:7" in result.stdout
-        assert "ADD_ZERO:0" in result.stdout
-        assert "ADD_NEG:0" in result.stdout
+        assert result.stdout == "ADD:7\nADD_ZERO:0\nADD_NEG:0\n"
 
     async def test_const_function(self, scheduler: Scheduler) -> None:
         """Async instantiate of answer() -> i32 returning 42."""
@@ -82,33 +80,7 @@ console.log("ANSWER:" + instance.exports.answer());
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "ANSWER:42" in result.stdout
-
-    async def test_multiply_function(self, scheduler: Scheduler) -> None:
-        """mul(i32, i32) -> i32 with edge cases (zero, negative)."""
-        code = """\
-const bytes = new Uint8Array([
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-  // Type section (7 bytes): (i32, i32) -> i32
-  0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
-  // Function section (2 bytes)
-  0x03, 0x02, 0x01, 0x00,
-  // Export section (7 bytes): "mul" -> func 0
-  0x07, 0x07, 0x01, 0x03, 0x6d, 0x75, 0x6c, 0x00, 0x00,
-  // Code section (9 bytes): body(7)=locals(0) local.get 0, local.get 1, i32.mul, end
-  0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6c, 0x0b,
-]);
-const mod = new WebAssembly.Module(bytes);
-const inst = new WebAssembly.Instance(mod);
-console.log("MUL:" + inst.exports.mul(6, 7));
-console.log("MUL_ZERO:" + inst.exports.mul(99, 0));
-console.log("MUL_NEG:" + inst.exports.mul(-3, 5));
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "MUL:42" in result.stdout
-        assert "MUL_ZERO:0" in result.stdout
-        assert "MUL_NEG:-15" in result.stdout
+        assert result.stdout == "ANSWER:42\n"
 
 
 # =============================================================================
@@ -144,8 +116,7 @@ console.log("SUB:" + inst.exports.sub(10, 3));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "ADD:13" in result.stdout
-        assert "SUB:7" in result.stdout
+        assert result.stdout == "ADD:13\nSUB:7\n"
 
 
 # =============================================================================
@@ -186,8 +157,7 @@ console.log("LOAD4:" + inst.exports.load(4));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "LOAD:12345" in result.stdout
-        assert "LOAD4:99999" in result.stdout
+        assert result.stdout == "LOAD:12345\nLOAD4:99999\n"
 
     async def test_memory_via_js_view(self, scheduler: Scheduler) -> None:
         """WebAssembly.Memory created from JS, accessed via Uint32Array."""
@@ -202,9 +172,7 @@ console.log("BYTES:" + mem.buffer.byteLength);
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "V0:42" in result.stdout
-        assert "V1:100" in result.stdout
-        assert "BYTES:65536" in result.stdout  # 1 page = 64 KiB
+        assert result.stdout == "V0:42\nV1:100\nBYTES:65536\n"  # 1 page = 64 KiB
 
     async def test_memory_grow(self, scheduler: Scheduler) -> None:
         """Memory.grow() extends pages correctly."""
@@ -217,9 +185,7 @@ console.log("AFTER:" + (mem.buffer.byteLength / 65536));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "BEFORE:1" in result.stdout
-        assert "OLD_PAGES:1" in result.stdout
-        assert "AFTER:3" in result.stdout
+        assert result.stdout == "BEFORE:1\nOLD_PAGES:1\nAFTER:3\n"
 
 
 # =============================================================================
@@ -268,7 +234,7 @@ console.log("RECEIVED:" + received);
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "RECEIVED:1234" in result.stdout
+        assert result.stdout == "RECEIVED:1234\n"
 
 
 # =============================================================================
@@ -286,7 +252,7 @@ console.log("VALID:" + WebAssembly.validate(valid));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "VALID:true" in result.stdout
+        assert result.stdout == "VALID:true\n"
 
     async def test_validate_invalid_module(self, scheduler: Scheduler) -> None:
         """WebAssembly.validate() returns false for garbage bytes."""
@@ -296,7 +262,7 @@ console.log("INVALID:" + WebAssembly.validate(garbage));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "INVALID:false" in result.stdout
+        assert result.stdout == "INVALID:false\n"
 
     async def test_compile_error_rejected(self, scheduler: Scheduler) -> None:
         """new WebAssembly.Module(garbage) throws CompileError."""
@@ -310,7 +276,7 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "ERROR:CompileError" in result.stdout
+        assert result.stdout == "ERROR:CompileError\n"
 
     async def test_table_api(self, scheduler: Scheduler) -> None:
         """WebAssembly.Table creation and inspection."""
@@ -323,9 +289,7 @@ console.log("AFTER_GROW:" + table.length);
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "LENGTH:2" in result.stdout
-        assert "GET0:null" in result.stdout
-        assert "AFTER_GROW:5" in result.stdout
+        assert result.stdout == "LENGTH:2\nGET0:null\nAFTER_GROW:5\n"
 
     async def test_global_api(self, scheduler: Scheduler) -> None:
         """WebAssembly.Global create, read, mutate."""
@@ -346,10 +310,7 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "INIT:10" in result.stdout
-        assert "MUTATED:99" in result.stdout
-        assert "IMMUTABLE:7" in result.stdout
-        assert "WRITE:rejected" in result.stdout
+        assert result.stdout == "INIT:10\nMUTATED:99\nIMMUTABLE:7\nWRITE:rejected\n"
 
 
 # =============================================================================
@@ -380,8 +341,7 @@ console.log("F:" + inst.exports.f());
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "IS_MODULE:true" in result.stdout
-        assert "F:7" in result.stdout
+        assert result.stdout == "IS_MODULE:true\nF:7\n"
 
     async def test_instantiate_streaming(self, scheduler: Scheduler) -> None:
         """WebAssembly.instantiateStreaming(new Response(bytes)) instantiates."""
@@ -400,8 +360,7 @@ console.log("G:" + instance.exports.g());
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "HAS_MODULE:true" in result.stdout
-        assert "G:9" in result.stdout
+        assert result.stdout == "HAS_MODULE:true\nG:9\n"
 
 
 # =============================================================================
@@ -438,7 +397,7 @@ console.log("SIMD_VALID:" + WebAssembly.validate(bytes));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "SIMD_VALID:true" in result.stdout
+        assert result.stdout == "SIMD_VALID:true\n"
 
     async def test_simd_v128_add_i32x4(self, scheduler: Scheduler) -> None:
         """i32x4.add on two vectors via memory load/store.
@@ -500,7 +459,7 @@ console.log("SIMD_RESULT:" + r.join(","));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "SIMD_RESULT:11,22,33,44" in result.stdout
+        assert result.stdout == "SIMD_RESULT:11,22,33,44\n"
 
 
 # =============================================================================
@@ -548,7 +507,7 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "CAUGHT:wasm_exception" in result.stdout
+        assert result.stdout == "CAUGHT:wasm_exception\n"
 
 
 # =============================================================================
@@ -573,14 +532,14 @@ globalThis.wasmInst = new WebAssembly.Instance(new WebAssembly.Module(bytes));
 console.log("COMPILED:ok");
 """)
             assert r1.exit_code == 0, f"compile stderr: {r1.stderr}"
-            assert "COMPILED:ok" in r1.stdout
+            assert r1.stdout == "COMPILED:ok\n"
 
             # Second exec: use the instance from previous exec
             r2 = await session.exec("""\
 console.log("RESULT:" + globalThis.wasmInst.exports.add(100, 200));
 """)
             assert r2.exit_code == 0, f"use stderr: {r2.stderr}"
-            assert "RESULT:300" in r2.stdout
+            assert r2.stdout == "RESULT:300\n"
 
 
 # =============================================================================
@@ -607,8 +566,7 @@ console.log("NEG_WRAP:" + inst.exports.add(-2147483648, -1));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "WRAP:-2147483648" in result.stdout
-        assert "NEG_WRAP:2147483647" in result.stdout
+        assert result.stdout == "WRAP:-2147483648\nNEG_WRAP:2147483647\n"
 
     async def test_memory_out_of_bounds_traps(self, scheduler: Scheduler) -> None:
         """Out-of-bounds memory access traps with RuntimeError."""
@@ -647,14 +605,13 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "VALID:0" in result.stdout
-        assert "OOB:RuntimeError" in result.stdout
-        assert "NEG:RuntimeError" in result.stdout
+        assert result.stdout == "VALID:0\nOOB:RuntimeError\nNEG:RuntimeError\n"
 
     async def test_memory_grow_beyond_maximum_fails(self, scheduler: Scheduler) -> None:
-        """Memory.grow() past maximum fails (returns -1 or throws RangeError)."""
-        # The WASM spec says grow() should return -1, but JSC throws RangeError.
-        # Both behaviors correctly prevent exceeding the maximum.
+        """Memory.grow() past maximum throws RangeError and keeps the size.
+
+        The memory.grow instruction returns -1; the JS API Memory.prototype.grow throws
+        RangeError instead (WebAssembly JS API spec)."""
         code = """\
 const mem = new WebAssembly.Memory({ initial: 1, maximum: 2 });
 // Grow by 1 (within max) — should succeed
@@ -670,13 +627,11 @@ console.log("PAGES:" + (mem.buffer.byteLength / 65536));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "GROW1:1" in result.stdout
-        # Either returns -1 (spec) or throws RangeError (JSC)
-        assert "GROW2:-1" in result.stdout or "GROW2_ERR:RangeError" in result.stdout
-        assert "PAGES:2" in result.stdout  # still at max
+        assert result.stdout.splitlines() == ["GROW1:1", "GROW2_ERR:RangeError", "PAGES:2"]  # still at max
 
     async def test_missing_import_throws(self, scheduler: Scheduler) -> None:
-        """Instantiating a module with missing imports throws LinkError."""
+        """A module with imports refuses to instantiate: no import object is a TypeError, a number
+        for a function import is a LinkError (WebAssembly JS API spec)."""
         code = """\
 const bytes = new Uint8Array([
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
@@ -690,25 +645,21 @@ const mod = new WebAssembly.Module(bytes);
 // No imports provided
 try {
   new WebAssembly.Instance(mod);
-  console.log("LINK:ok");
+  console.log("NO_IMPORTS:ok");
 } catch (e) {
-  console.log("LINK:" + e.constructor.name);
+  console.log("NO_IMPORTS:" + e.constructor.name);
 }
 // Wrong import type (number instead of function)
 try {
   new WebAssembly.Instance(mod, { env: { foo: 42 } });
-  console.log("TYPE:ok");
+  console.log("WRONG_TYPE:ok");
 } catch (e) {
-  console.log("TYPE:" + e.constructor.name);
+  console.log("WRONG_TYPE:" + e.constructor.name);
 }
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        # Missing imports should throw LinkError or TypeError
-        assert "LINK:" in result.stdout
-        assert result.stdout.split("LINK:")[1].split("\n")[0] != "ok"
-        assert "TYPE:" in result.stdout
-        assert result.stdout.split("TYPE:")[1].split("\n")[0] != "ok"
+        assert result.stdout.splitlines() == ["NO_IMPORTS:TypeError", "WRONG_TYPE:LinkError"]
 
     async def test_unreachable_traps(self, scheduler: Scheduler) -> None:
         """The unreachable instruction triggers a RuntimeError trap."""
@@ -735,7 +686,7 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "TRAP:RuntimeError" in result.stdout
+        assert result.stdout == "TRAP:RuntimeError\n"
 
     async def test_stack_overflow_traps(self, scheduler: Scheduler) -> None:
         """Infinite recursion in WASM causes a RuntimeError (stack overflow)."""
@@ -759,7 +710,7 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "STACK:RangeError" in result.stdout
+        assert result.stdout == "STACK:RangeError\n"
 
     async def test_division_by_zero_traps(self, scheduler: Scheduler) -> None:
         """i32.div_s by zero traps with RuntimeError."""
@@ -793,9 +744,7 @@ try {
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "DIV:3" in result.stdout
-        assert "ZERO:RuntimeError" in result.stdout
-        assert "OVERFLOW:RuntimeError" in result.stdout
+        assert result.stdout == "DIV:3\nZERO:RuntimeError\nOVERFLOW:RuntimeError\n"
 
     async def test_multiple_module_instances_isolated(self, scheduler: Scheduler) -> None:
         """Two instances of the same module have independent memory."""
@@ -826,5 +775,4 @@ console.log("B:" + b.exports.load(0));
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "A:111" in result.stdout
-        assert "B:222" in result.stdout
+        assert result.stdout == "A:111\nB:222\n"

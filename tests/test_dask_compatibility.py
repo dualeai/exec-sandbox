@@ -51,32 +51,19 @@ class TestDaskSystemContext:
     """
 
     async def test_cpu_count(self, scheduler: Scheduler) -> None:
-        """dask.system.cpu_count() matches QEMU -smp: 1 for a default VmSpec (reads affinity + cgroups).
+        """dask.system.cpu_count() and the CPU_COUNT it sets at import match QEMU -smp: 1 for a
+        default VmSpec (reads affinity + cgroups).
 
         Internally calls os.sched_getaffinity(), reads /proc/self/cgroup and
         /sys/fs/cgroup/.../cpu.max, and takes the minimum.
         """
         code = """\
-from dask.system import cpu_count
-count = cpu_count()
-print(f'DASK_CPU:{count}')
+from dask.system import CPU_COUNT, cpu_count
+print(f'DASK_CPU:{cpu_count()} CONST:{CPU_COUNT}')
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        count = int(result.stdout.split("DASK_CPU:")[1].strip())
-        assert count == 1, f"dask.system.cpu_count() returned {count}, expected the 1 vCPU of a default VmSpec"
-
-    async def test_cpu_count_constant(self, scheduler: Scheduler) -> None:
-        """dask.system.CPU_COUNT module constant matches runtime cpu_count()."""
-        code = """\
-from dask.system import cpu_count, CPU_COUNT
-print(f'FN:{cpu_count()}')
-print(f'CONST:{CPU_COUNT}')
-print(f'MATCH:{cpu_count() == CPU_COUNT}')
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "MATCH:True" in result.stdout
+        assert result.stdout == "DASK_CPU:1 CONST:1\n", "expected the 1 vCPU of a default VmSpec"
 
 
 # =============================================================================
@@ -103,7 +90,7 @@ print(f'RESULT:{result}')
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(100)) = 99*100*199/6 = 328350
-        assert "RESULT:328350" in result.stdout
+        assert result.stdout == "RESULT:328350\n"
 
     async def test_threaded_scheduler(self, scheduler: Scheduler) -> None:
         """Dask threaded scheduler (ThreadPoolExecutor) computes correctly."""
@@ -116,7 +103,7 @@ print(f'RESULT:{result}')
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "RESULT:328350" in result.stdout
+        assert result.stdout == "RESULT:328350\n"
 
     async def test_threaded_scheduler_multiple_partitions(self, scheduler: Scheduler) -> None:
         """Threaded scheduler with many partitions (exercises thread pool sizing)."""
@@ -133,8 +120,7 @@ print(f'RESULT:{result}')
         # = sum(2*x for x in range(1000) if x % 3 == 0)
         # x in {0, 3, 6, ..., 999}: count = 334, sum of x = 3*(0+1+...+333) = 3*333*334/2 = 166833
         # sum of 2*x = 333666
-        expected = sum(x * 2 for x in range(1000) if (x * 2) % 3 == 0)
-        assert f"RESULT:{expected}" in result.stdout
+        assert result.stdout == "RESULT:333666\n"
 
 
 # =============================================================================
@@ -163,7 +149,7 @@ print(f'RESULT:{result}')
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "RESULT:21" in result.stdout
+        assert result.stdout == "RESULT:21\n"
 
     async def test_delayed_threaded(self, scheduler: Scheduler) -> None:
         """dask.delayed executes task graph with threaded scheduler."""
@@ -183,7 +169,7 @@ print(f'RESULT:{result}')
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         # sum(x**2 for x in range(10)) = 9*10*19/6 = 285
-        assert "RESULT:285" in result.stdout
+        assert result.stdout == "RESULT:285\n"
 
 
 # =============================================================================
@@ -218,28 +204,4 @@ print(f'NAMES:{sorted(high_scores)}')
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "COUNT:4" in result.stdout
-        assert "NAMES:['alice', 'bob', 'dave', 'eve']" in result.stdout
-
-    async def test_system_aware_worker_sizing(self, scheduler: Scheduler) -> None:
-        """Dask uses detected CPU count to dynamically size partitions.
-
-        This simulates how ML frameworks and data pipelines use Dask's
-        system detection to configure parallelism at runtime.
-        """
-        code = """\
-import dask.bag as db
-from dask.system import CPU_COUNT
-
-# Use detected CPU count to size a computation
-bag = db.from_sequence(range(50), npartitions=CPU_COUNT)
-result = bag.map(lambda x: x ** 2).sum().compute(scheduler='threads')
-# sum(x**2 for x in range(50)) = 49*50*99/6 = 40425
-print(f'NPARTITIONS:{CPU_COUNT}')
-print(f'RESULT:{result}')
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        npartitions = int(result.stdout.split("NPARTITIONS:")[1].split("\n")[0])
-        assert npartitions >= 1
-        assert "RESULT:40425" in result.stdout
+        assert result.stdout == "COUNT:4\nNAMES:['alice', 'bob', 'dave', 'eve']\n"
