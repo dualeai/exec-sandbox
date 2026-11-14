@@ -74,14 +74,14 @@ fn mount_virtual_filesystems() {
         "tmpfs",
         "/tmp",
         "tmpfs",
-        sys::MS_NOSUID | sys::MS_NODEV,
+        libc::MS_NOSUID | libc::MS_NODEV,
         &format!(
             "size={half_mem_bytes},nr_inodes=16384,mode=1777,usrquota,usrquota_block_hardlimit={half_mem_bytes},noswap"
         ),
     );
 }
 
-// B5: /dev/fd symlinks deferred to guest-agent phase 2.
+// The /dev/fd and /dev/std* symlinks: the guest agent makes them in phase 2.
 // Not needed for guest-agent startup or kernel boot. Required for bash
 // process substitution <() and /dev/std* portability.
 // See: https://gitlab.alpinelinux.org/alpine/aports/-/issues/1465
@@ -135,7 +135,7 @@ fn require_block_device_by_serial(serial: &str) -> String {
 /// is empty), so bind-mount /dev into the rootfs and chroot into it first.
 fn mkfs_in_lower(dev: &str) -> bool {
     let root_dev = "/lower/dev";
-    if sys::mount("/dev", root_dev, "", sys::MS_BIND, "") != 0 {
+    if sys::mount("/dev", root_dev, "", libc::MS_BIND, "") != 0 {
         log_error!(
             "bind mount /dev -> {} failed: errno={}",
             root_dev,
@@ -170,7 +170,7 @@ fn mount_rootfs() {
     let base_dev = find_block_device_by_serial("base").unwrap_or_else(|| "/dev/vda".to_string());
     let snap_dev = sys::cmdline_has("init.snap=1").then(|| require_block_device_by_serial("snap"));
 
-    let erofs_flags = sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV;
+    let erofs_flags = libc::MS_RDONLY | libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
     let need_rw = sys::cmdline_has("init.rw=1");
 
     if let Some(ref snap) = snap_dev {
@@ -202,9 +202,9 @@ fn mount_rootfs() {
             }
         }
         let snap_flags = if need_rw {
-            sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+            libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV
         } else {
-            sys::MS_RDONLY | sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV
+            libc::MS_RDONLY | libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV
         };
         if sys::mount(snap, "/upper_dev", "ext4", snap_flags, "") != 0 {
             log_error!("mount {} (ext4) failed", snap);
@@ -216,7 +216,7 @@ fn mount_rootfs() {
             let _ = fs::create_dir_all("/upper_dev/upper");
             let _ = fs::create_dir_all("/upper_dev/work");
             let ovl_opts = "lowerdir=/lower,upperdir=/upper_dev/upper,workdir=/upper_dev/work";
-            if sys::mount("overlay", "/mnt", "overlay", sys::MS_NOATIME, ovl_opts) != 0 {
+            if sys::mount("overlay", "/mnt", "overlay", libc::MS_NOATIME, ovl_opts) != 0 {
                 log_error!("overlayfs mount failed (rw)");
                 sys::fallback_shell();
             }
@@ -228,7 +228,7 @@ fn mount_rootfs() {
                 "overlay",
                 "/mnt",
                 "overlay",
-                sys::MS_RDONLY | sys::MS_NOATIME,
+                libc::MS_RDONLY | libc::MS_NOATIME,
                 ovl_opts,
             ) != 0
             {
@@ -298,7 +298,7 @@ fn mount_home() {
         log_error!("mkfs.ext4 {} failed", home);
         sys::fallback_shell();
     }
-    let flags = sys::MS_NOATIME | sys::MS_NOSUID | sys::MS_NODEV;
+    let flags = libc::MS_NOATIME | libc::MS_NOSUID | libc::MS_NODEV;
     if sys::mount(&home, "/home/user", "ext4", flags, "discard") != 0 {
         log_error!(
             "mount {} on /home/user failed: errno={}",
@@ -347,7 +347,7 @@ fn enter_rootfs() {
             dot.as_ptr(),
             root.as_ptr(),
             std::ptr::null(),
-            sys::MS_MOVE,
+            libc::MS_MOVE,
             std::ptr::null(),
         );
     }
@@ -427,12 +427,10 @@ fn main() {
     mount_virtual_filesystems();
     let t1 = sys::monotonic_us();
 
-    // B5: /dev symlinks deferred to guest-agent
-
     device::redirect_to_console();
     log_timing("mount_vfs", t0, t1);
 
-    // B2: Wait for vda + virtio-ports in parallel (independent devices)
+    // Wait for vda and the virtio ports in parallel (independent devices)
     // /dev/vda always exists (first virtio-blk enumerated by kernel), though its
     // actual role (base vs snapshot) varies by architecture — mount_rootfs resolves
     // the correct mapping via serial numbers.
