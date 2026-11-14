@@ -1,17 +1,16 @@
 """Unit tests for SchedulerConfig.
 
-Tests configuration validation and get_images_dir() path resolution.
+Tests configuration validation and the default cache folders.
 No mocks - uses real filesystem and environment variables.
 """
 
+import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.platform_utils import UserDir, get_user_dir
 
 # ============================================================================
 # Config Validation
@@ -22,15 +21,11 @@ class TestSchedulerConfigValidation:
     """Tests for SchedulerConfig field validation."""
 
     def test_defaults(self) -> None:
-        """SchedulerConfig has sensible defaults."""
+        """SchedulerConfig has sensible defaults (the cache folders: TestSchedulerConfigCacheDir)."""
         config = SchedulerConfig()
         assert config.warm_pool_size == 0
         assert config.default_timeout_seconds == 30
         assert config.images_dir is None
-        assert (
-            config.disk_snapshot_cache_dir
-            == get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "disk-snapshots"
-        )
         assert config.s3_bucket is None
         assert config.s3_region == "us-east-1"
         assert config.s3_snapshot_prefix == "snapshots/"
@@ -93,11 +88,6 @@ class TestSchedulerConfigS3:
         assert config.s3_region == "eu-west-1"
         assert config.s3_snapshot_prefix == "cache/"
 
-    def test_s3_disabled_by_default(self) -> None:
-        """S3 is disabled when bucket is None."""
-        config = SchedulerConfig()
-        assert config.s3_bucket is None
-
 
 # ============================================================================
 # Cache Dir Integration
@@ -105,17 +95,31 @@ class TestSchedulerConfigS3:
 
 
 class TestSchedulerConfigCacheDir:
-    """Tests for snapshot cache dir defaults using get_user_dir(kind=UserDir.CACHE)."""
+    """The default L1 and L2 cache folders: in EXEC_SANDBOX_CACHE_DIR, else in the OS cache
+    folder of the user. The expected paths are written out."""
 
-    def test_env_override_affects_default(self) -> None:
+    def test_default_is_the_user_cache_folder(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """No EXEC_SANDBOX_CACHE_DIR: macOS ~/Library/Caches/exec-sandbox, Linux
+        ~/.cache/exec-sandbox (no XDG_CACHE_HOME), "~" from HOME."""
+        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cache = tmp_path / ("Library/Caches" if sys.platform == "darwin" else ".cache") / "exec-sandbox"
+
+        config = SchedulerConfig()
+
+        assert config.disk_snapshot_cache_dir == cache / "disk-snapshots"
+        assert config.memory_snapshot_cache_dir == cache / "memory-snapshots"
+
+    def test_env_override_affects_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """EXEC_SANDBOX_CACHE_DIR env var changes both cache dir defaults."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/env/cache"}):
-            config = SchedulerConfig()
-            assert str(config.disk_snapshot_cache_dir).startswith("/env/cache")
-            assert str(config.memory_snapshot_cache_dir).startswith("/env/cache")
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", "/env/cache")
+        config = SchedulerConfig()
+        assert config.disk_snapshot_cache_dir == Path("/env/cache/disk-snapshots")
+        assert config.memory_snapshot_cache_dir == Path("/env/cache/memory-snapshots")
 
     def test_explicit_override_bypasses_user_cache_dir(self) -> None:
-        """Explicit path overrides the get_user_dir(kind=UserDir.CACHE) factory default."""
+        """An explicit path wins over the default."""
         config = SchedulerConfig(
             disk_snapshot_cache_dir=Path("/explicit/disk"),
             memory_snapshot_cache_dir=Path("/explicit/memory"),
@@ -123,18 +127,12 @@ class TestSchedulerConfigCacheDir:
         assert config.disk_snapshot_cache_dir == Path("/explicit/disk")
         assert config.memory_snapshot_cache_dir == Path("/explicit/memory")
 
-    def test_snapshot_subdirs_appended_to_cache_dir(self) -> None:
-        """Snapshot cache dirs end with expected subdirectory names."""
-        config = SchedulerConfig()
-        assert str(config.disk_snapshot_cache_dir).endswith("/disk-snapshots")
-        assert str(config.memory_snapshot_cache_dir).endswith("/memory-snapshots")
+    def test_default_factory_evaluates_at_instantiation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each SchedulerConfig() reads the environment again: the default is not frozen at import."""
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", "/first")
+        config1 = SchedulerConfig()
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", "/second")
+        config2 = SchedulerConfig()
 
-    def test_default_factory_evaluates_at_instantiation(self) -> None:
-        """default_factory evaluates at each SchedulerConfig() call, not frozen."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/first"}):
-            config1 = SchedulerConfig()
-
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/second"}):
-            config2 = SchedulerConfig()
-
-        assert config1.disk_snapshot_cache_dir != config2.disk_snapshot_cache_dir
+        assert config1.disk_snapshot_cache_dir == Path("/first/disk-snapshots")
+        assert config2.disk_snapshot_cache_dir == Path("/second/disk-snapshots")

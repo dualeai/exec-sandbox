@@ -10,18 +10,17 @@ import json
 import platform
 import shutil
 import threading
+from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from pydantic import ValidationError
 
 from exec_sandbox import package_validator
-from exec_sandbox.admission import ResourceAdmissionController
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.constants import DEFAULT_VM_MEMORY_OVERHEAD_MB
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorAction,
@@ -31,12 +30,15 @@ from exec_sandbox.exceptions import (
     RouteError,
     TransientError,
 )
+from exec_sandbox.files.locks import CacheEntry, EntryLease
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.models import ExecutionResult, ExposedPort, Language, PortMapping, StartupTiming, TimingBreakdown
 from exec_sandbox.qemu_vm import QemuVM
 from exec_sandbox.scheduler import Scheduler, settings_from_config
+from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_spec import VmSpec
+from exec_sandbox.vm_timing import VmTiming
 from exec_sandbox.vm_types import VmState
 from tests.conftest import (
     create_test_qcow2,
@@ -48,6 +50,8 @@ from tests.conftest import (
     skip_unless_fast_virt,
     skip_unless_hwaccel,
 )
+from tests.instance_fixtures import primed_l1_dir_fixture  # noqa: F401 - fixture "primed_l1_dir"
+from tests.test_files_locks import evictable
 
 # ============================================================================
 # Unit Tests - No QEMU needed
@@ -58,27 +62,15 @@ class TestSchedulerInit:
     """Tests for Scheduler initialization."""
 
     def test_init_default_config(self) -> None:
-        """Scheduler can be created with default config."""
+        """Without a config, the Scheduler has the default SchedulerConfig."""
         scheduler = Scheduler()
-        assert scheduler.config is not None
+        assert scheduler.config == SchedulerConfig()
 
     def test_init_custom_config(self) -> None:
         """Scheduler accepts custom config."""
         config = SchedulerConfig(default_timeout_seconds=60)
         scheduler = Scheduler(config)
         assert scheduler.config.default_timeout_seconds == 60
-
-    def test_not_started_initially(self) -> None:
-        """Scheduler is not started after __init__."""
-        scheduler = Scheduler()
-        assert scheduler._started is False
-
-    def test_internal_state_none_initially(self) -> None:
-        """Internal managers are None before start."""
-        scheduler = Scheduler()
-        assert scheduler._vm_manager is None
-        assert scheduler._snapshot_manager is None
-        assert scheduler._warm_pool is None
 
 
 class TestCreateSettings:
@@ -94,6 +86,17 @@ class TestCreateSettings:
         settings = self._settings(SchedulerConfig(), tmp_path)
         assert settings.s3_bucket == "env-bucket"
         assert settings.memory_overcommit_ratio == 3.5
+
+    def test_disk_overcommit_ratio_is_a_setting(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Like the memory and CPU ratios: the default, the env var, a config value that wins
+        over it, and the bounds (1.0: the whole disk; 64.0)."""
+        assert self._settings(SchedulerConfig(), tmp_path).disk_overcommit_ratio == 4.0
+        monkeypatch.setenv("EXEC_SANDBOX_DISK_OVERCOMMIT_RATIO", "2.0")
+        assert self._settings(SchedulerConfig(), tmp_path).disk_overcommit_ratio == 2.0
+        assert self._settings(SchedulerConfig(disk_overcommit_ratio=8.0), tmp_path).disk_overcommit_ratio == 8.0
+        for ratio in (0.5, 65.0):
+            with pytest.raises(ValidationError):
+                SchedulerConfig(disk_overcommit_ratio=ratio)
 
     def test_config_value_beats_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("EXEC_SANDBOX_S3_BUCKET", "env-bucket")
@@ -155,18 +158,13 @@ class TestSchedulerContextManager:
     """Tests for Scheduler context manager."""
 
     async def test_double_start_raises(self, tmp_path: Path) -> None:
-        """Starting already-started scheduler raises InvalidInputError SCHEDULER_STATE."""
-        test_images_dir = tmp_path / "images"
-        test_images_dir.mkdir()
+        """A second start of a started Scheduler raises InvalidInputError SCHEDULER_STATE."""
+        scheduler = Scheduler(SchedulerConfig(images_dir=tmp_path))
 
-        config = SchedulerConfig(images_dir=test_images_dir)
-        scheduler = Scheduler(config)
-
-        # Manually set _started to simulate already started
-        scheduler._started = True
-
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE) as exc_info:
-            await scheduler.__aenter__()
+        with _fake_start(scheduler, tmp_path):
+            async with scheduler:
+                with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE) as exc_info:
+                    await scheduler.__aenter__()
 
         assert "already started" in str(exc_info.value)
 
@@ -180,7 +178,10 @@ class TestSchedulerContextManager:
         assert "not started" in str(exc_info.value)
 
     async def test_cancelled_partial_startup_waits_for_owned_rollback(self, tmp_path: Path) -> None:
-        """Repeated cancellation cannot abandon a manager started by __aenter__."""
+        """Repeated cancellation cannot abandon a manager started by __aenter__.
+
+        The rollback task is private: a race window (a second cancel while the rollback runs)
+        that no public call can open on purpose."""
         scheduler = Scheduler(SchedulerConfig(images_dir=tmp_path, warm_pool_size=1))
         manager = MagicMock()
         manager.start = AsyncMock()
@@ -207,7 +208,9 @@ class TestSchedulerContextManager:
 
         with (
             patch("exec_sandbox.scheduler.ensure_assets", new_callable=AsyncMock, return_value=tmp_path),
-            patch.object(scheduler, "_create_settings", return_value=MagicMock(instance_store=None)),  # instances off
+            patch("exec_sandbox.scheduler.ensure_base_image", new_callable=AsyncMock),  # the pool's base images
+            # instances off
+            patch("exec_sandbox.scheduler.settings_from_config", return_value=MagicMock(instance_store=None)),
             patch("exec_sandbox.scheduler.VmManager", return_value=manager),
             patch("exec_sandbox.scheduler.DiskSnapshotManager", return_value=MagicMock(start=AsyncMock())),
             patch("exec_sandbox.scheduler.MemorySnapshotManager", return_value=memory),
@@ -232,6 +235,32 @@ class TestSchedulerContextManager:
         assert scheduler._shutdown_task is not None
         assert scheduler._shutdown_task.done()
         assert not scheduler._shutdown_task.cancelled()
+
+
+@contextlib.contextmanager
+def _fake_start(scheduler: Scheduler, tmp_path: Path) -> Iterator[tuple[MagicMock, MagicMock, MagicMock]]:
+    """A start of `scheduler` with no host work: no asset download, saved instances off, and a
+    fake VM manager, L2 cache and L1 cache (yielded in that order)."""
+    manager = MagicMock(start=AsyncMock(), stop=AsyncMock())
+    manager.get_active_vms.return_value = {}
+    disk = MagicMock(start=AsyncMock(), stop=AsyncMock())
+    memory = MagicMock(stop=AsyncMock())
+    with (
+        patch("exec_sandbox.scheduler.ensure_assets", new_callable=AsyncMock, return_value=tmp_path),
+        patch("exec_sandbox.scheduler.settings_from_config", return_value=MagicMock(instance_store=None)),
+        patch("exec_sandbox.scheduler.VmManager", return_value=manager),
+        patch("exec_sandbox.scheduler.DiskSnapshotManager", return_value=disk),
+        patch("exec_sandbox.scheduler.MemorySnapshotManager", return_value=memory),
+    ):
+        yield manager, disk, memory
+
+
+async def test_start_lets_admission_evict_both_caches(tmp_path: Path) -> None:
+    """Gate 4 evicts L2 and L1 entries before a VM waits for home disk space."""
+    scheduler = Scheduler(SchedulerConfig(images_dir=tmp_path))
+    with _fake_start(scheduler, tmp_path) as (manager, disk, memory):
+        async with scheduler:
+            assert manager.add_cache.call_args_list == [call(disk), call(memory)]
 
 
 class TestNewInstanceId:
@@ -276,6 +305,9 @@ class TestIdleTimeoutArgument:
 
     @pytest.mark.parametrize(("argument", "used"), [(None, 77), (10, 10), (3600, 3600)])
     async def test_new_session_gets_the_timeout(self, argument: int | None, used: int) -> None:
+        """The session gets the argument, else the config's value. The value is read from the
+        session: the public effect (a close after that many idle seconds, 10 s or more) is
+        too slow for a unit test; tests/test_session.py tests that the timer fires."""
         scheduler, _, prepared = TestOneShotTeardownConfirmation._mock_run(VmState.DESTROYED)
         scheduler.config = SchedulerConfig(session_idle_timeout_seconds=77)
         with patch.object(scheduler, "_prepare_vm", new_callable=AsyncMock, return_value=prepared):
@@ -343,6 +375,7 @@ class TestReuseRestoreFailure:
             vmstate=Path("/saved/c.vmstate"),
             base_image=Path("/saved/base.img"),
             packages_image=None,
+            folder=Path("/saved"),
         )
         instances = MagicMock()
         instances.load = AsyncMock(return_value=state)
@@ -383,6 +416,8 @@ class TestReuseRestoreFailure:
         )
         assert exc.value.__cause__ is error
         instances.release.assert_awaited_once_with(state)
+        # Admission leaves out the loaded state's files: they stay while the request waits
+        assert scheduler._vm_manager.reservation_context.call_args.kwargs["held"] == {Path("/saved")}  # type: ignore[union-attr]
 
     async def test_other_restore_failure_is_raised_as_it_is(self) -> None:
         error = TransientError(
@@ -397,6 +432,22 @@ class TestReuseRestoreFailure:
         instances.release.assert_awaited_once_with(state)
 
 
+def _fake_vm(vm_id: str) -> MagicMock:
+    """A QemuVM mock with the fields new() reads for the startup timing (0, no L1 restore),
+    in the READY state (the destroy mock publishes DESTROYED, or not: "unconfirmed")."""
+    vm = MagicMock(spec=QemuVM)
+    vm.vm_id = vm_id
+    vm.l1_restored = False
+    vm.state = VmState.READY
+    vm.process = MagicMock()
+    vm.process.returncode = None
+    # `timing` is an instance attribute, invisible to spec=QemuVM.
+    vm.timing = VmTiming(
+        boot_ms=0, overlay_ms=0, qemu_cmd_build_ms=0, gvproxy_start_ms=0, qemu_fork_ms=0, guest_wait_ms=0
+    )
+    return vm
+
+
 class TestOneShotTeardownConfirmation:
     """new() + exec() + close() must not claim success before process death is proven."""
 
@@ -409,22 +460,7 @@ class TestOneShotTeardownConfirmation:
             "confirmed" if destroyed_state is VmState.DESTROYED else "unconfirmed"
         )
 
-        vm = MagicMock(spec=QemuVM)
-        vm.vm_id = "one-shot-unconfirmed"
-        vm.boot_ms = 0
-        vm.overlay_ms = 0
-        vm.qemu_cmd_build_ms = 0
-        vm.gvproxy_start_ms = 0
-        vm.qemu_fork_ms = 0
-        vm.guest_wait_ms = 0
-        vm.l1_restored = False
-        vm.setup_ms = None
-        vm.state = VmState.READY  # the destroy mock publishes DESTROYED, or not ("unconfirmed")
-        vm.process = MagicMock()
-        vm.process.returncode = None
-        # `timing` is an instance attribute, invisible to spec=QemuVM.
-        vm.timing = MagicMock()
-        vm.timing.boot_retries = 0
+        vm = _fake_vm("one-shot-unconfirmed")
         vm.execute = AsyncMock(
             return_value=ExecutionResult(
                 stdout="ok\n",
@@ -494,8 +530,16 @@ class TestL1FallbackOwnership:
     """Cold-boot fallback cannot reuse a reservation retained by an L1 reaper.
 
     The L1 manager is real (its restore() runs) on a mocked VmManager; its key
-    and its cache lookup are stubbed to an entry in tmp_path.
+    and its cache lookup are stubbed to an entry in tmp_path. Each request is a
+    new() (then a close() of its session).
     """
+
+    @staticmethod
+    async def _new(scheduler: Scheduler, spec: VmSpec) -> Session:
+        """new(spec), then close the session (its VM id and ports stay readable)."""
+        session = await scheduler.new(spec)
+        await session.close()
+        return session
 
     @staticmethod
     def _mock_prepare(
@@ -513,13 +557,9 @@ class TestL1FallbackOwnership:
 
         manager = MagicMock()
         manager.reservation_context = MagicMock(return_value=reservation_context)
-        restored = MagicMock()
-        restored.vm_id = "l1-restored"
-        manager.restore_vm = AsyncMock(side_effect=restore_error, return_value=restored)
-        replacement = MagicMock()
-        replacement.vm_id = "cold-boot-replacement"
-        manager.create_vm = AsyncMock(return_value=replacement)
-        manager.destroy_vm = AsyncMock(return_value=True)
+        manager.restore_vm = AsyncMock(side_effect=restore_error, return_value=_fake_vm("l1-restored"))
+        manager.create_vm = AsyncMock(return_value=_fake_vm("cold-boot-replacement"))
+        manager.destroy_vm = make_destroy_mock("confirmed")
         scheduler._vm_manager = manager
 
         memory = l1_hit(manager, tmp_path)
@@ -542,9 +582,7 @@ class TestL1FallbackOwnership:
         with pytest.raises(
             InternalError, check=lambda e: e.code is ErrorCode.CLEANUP_UNCONFIRMED, match="cleanup was not confirmed"
         ):
-            await scheduler._prepare_vm(
-                VmSpec(language=Language.PYTHON, memory_mb=192), task_id="restore-cleanup-failed", on_boot_log=None
-            )
+            await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=192))
 
         manager.create_vm.assert_not_awaited()
 
@@ -564,12 +602,30 @@ class TestL1FallbackOwnership:
         )
         scheduler, manager, _reservation, _memory = self._mock_prepare(error, tmp_path)
 
-        await scheduler._prepare_vm(
-            VmSpec(language=Language.PYTHON, memory_mb=192), task_id="restore-rejected", on_boot_log=None
-        )
+        session = await self._new(scheduler, VmSpec(language=Language.PYTHON, memory_mb=192))
 
+        assert session.vm_id == "cold-boot-replacement"
         manager.create_vm.assert_awaited_once()
         assert not (tmp_path / "cached.vmstate").exists()
+
+    async def test_l1_entry_is_leased_through_admission(self, tmp_path: Path) -> None:
+        """Admission may evict cache entries for disk space: the L1 entry is leased before it
+        (and named in `held`, so gate 4 does not count on its space), and the request's
+        lease goes after the restore (the VM holds its own share)."""
+        scheduler, manager, _reservation, _memory = self._mock_prepare(None, tmp_path)
+        vmstate = tmp_path / "cached.vmstate"
+        evictable_at_admission: list[bool] = []
+        admission = manager.reservation_context.return_value.__aenter__
+        admission.side_effect = lambda *_args: (
+            evictable_at_admission.append(evictable(vmstate)) or admission.return_value
+        )
+
+        session = await self._new(scheduler, VmSpec(language=Language.PYTHON, memory_mb=192))
+
+        assert session.vm_id == "l1-restored"
+        assert evictable_at_admission == [False]
+        assert manager.reservation_context.call_args.kwargs["held"] == {vmstate}
+        assert evictable(vmstate)
 
     async def test_confirmed_transient_restore_failure_can_reuse_reservation(self, tmp_path: Path) -> None:
         scheduler, manager, reservation, _memory = self._mock_prepare(
@@ -579,11 +635,9 @@ class TestL1FallbackOwnership:
             tmp_path,
         )
 
-        vm, _ports, _cold, _admission_ms = await scheduler._prepare_vm(
-            VmSpec(language=Language.PYTHON, memory_mb=192), task_id="restore-transient", on_boot_log=None
-        )
+        session = await self._new(scheduler, VmSpec(language=Language.PYTHON, memory_mb=192))
 
-        assert vm.vm_id == "cold-boot-replacement"
+        assert session.vm_id == "cold-boot-replacement"
         assert manager.create_vm.await_args.kwargs["reservation"] is reservation
         assert (tmp_path / "cached.vmstate").exists()  # not refused by QEMU: kept
 
@@ -593,9 +647,10 @@ class TestL1FallbackOwnership:
             language=Language.PYTHON, memory_mb=192, expose_ports=[PortMapping(internal=8080, external=3000), 9000]
         )
 
-        vm, ports, _cold, _admission_ms = await scheduler._prepare_vm(spec, task_id="ports", on_boot_log=None)
+        session = await self._new(scheduler, spec)
+        ports = session.exposed_ports
 
-        assert vm.vm_id == "l1-restored"
+        assert session.vm_id == "l1-restored"
         assert all(isinstance(p, ExposedPort) for p in ports)
         assert [p.internal for p in ports] == [8080, 9000]
         assert ports[0].external == 3000  # explicit: kept
@@ -611,9 +666,7 @@ class TestL1FallbackOwnership:
         memory.schedule_background_save.side_effect = RuntimeError("schedule failed")  # type: ignore[attr-defined]
 
         with pytest.raises(RuntimeError, match="schedule failed"):
-            await scheduler._prepare_vm(
-                VmSpec(language=Language.PYTHON, memory_mb=192), task_id="post-create-schedule-failed", on_boot_log=None
-            )
+            await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=192))
 
         replacement = manager.create_vm.return_value
         manager.destroy_vm.assert_awaited_once_with(replacement)
@@ -635,11 +688,22 @@ class TestL1FallbackOwnership:
         restore, the cold boot and the background save get that same layer."""
         scheduler, manager, _reservation, memory = self._mock_prepare(restore_error, tmp_path)
         l2 = tmp_path / "l2.qcow2"
+        l2.write_bytes(b"l2")
+        lease = await CacheEntry(l2).lease()
+        assert lease is not None
         spec = VmSpec(language=Language.PYTHON, memory_mb=192, packages=("pandas==2.2.3",))
-        snapshots = MagicMock(get_or_create_snapshot=AsyncMock(return_value=l2))
+        snapshots = MagicMock(get_or_create_snapshot=AsyncMock(return_value=lease))
         scheduler._snapshot_manager = snapshots
+        evictable_at_admission: list[bool] = []
+        admission = manager.reservation_context.return_value.__aenter__
+        admission.side_effect = lambda *_args: evictable_at_admission.append(evictable(l2)) or admission.return_value
 
-        vm, _ports, _cold, _admission_ms = await scheduler._prepare_vm(spec, task_id="packages", on_boot_log=None)
+        session = await self._new(scheduler, spec)
+
+        # Leased from the lookup: admission (it may evict for disk space) cannot take the
+        # layer; the request releases its lease at its end (each VM holds its own share)
+        assert evictable_at_admission == [False]
+        assert evictable(l2)
 
         snapshots.get_or_create_snapshot.assert_awaited_once()
         assert {
@@ -649,30 +713,40 @@ class TestL1FallbackOwnership:
         } == {"language": Language.PYTHON, "packages": ["pandas==2.2.3"], "memory_mb": 192}
         memory.compute_cache_key.assert_awaited_once_with(spec, l2_path=l2)  # type: ignore[attr-defined]
         assert manager.restore_vm.await_args.kwargs["snapshot_drive"] == l2
+        assert manager.restore_vm.await_args.kwargs["cache_leases"][1] is lease
         if restore_error is None:
-            assert vm.vm_id == "l1-restored"
+            assert session.vm_id == "l1-restored"
             manager.create_vm.assert_not_awaited()
             memory.schedule_background_save.assert_not_awaited()  # type: ignore[attr-defined]
         else:
             assert manager.create_vm.await_args.kwargs["snapshot_drive"] == l2
+            assert manager.create_vm.await_args.kwargs["cache_leases"] == (lease,)
             memory.schedule_background_save.assert_awaited_once_with(  # type: ignore[attr-defined]
-                spec, key="cached", snapshot_drive=l2
+                spec, key="cached", snapshot_drive=lease
             )
 
 
 class TestPackageValidation:
     """Tests for package validation in Scheduler."""
 
-    @pytest.mark.parametrize("validation", [True, False], ids=["on", "off"])
-    async def test_package_outside_the_allow_list(self, validation: bool) -> None:
-        """new() with a package outside the allow-list: refused before any build or VM when
-        validation is on (InvalidInputError PACKAGE_NOT_ALLOWED); built when it is off."""
+    @staticmethod
+    def _started(*, validation: bool) -> tuple[Scheduler, MagicMock]:
+        """A started scheduler whose L2 build raises RuntimeError("the build started"): a new()
+        with packages ends there once the package check let it through. Returns (scheduler,
+        the L2 cache)."""
         scheduler = Scheduler(SchedulerConfig(enable_package_validation=validation, auto_download_assets=False))
         scheduler._started = True
         scheduler._settings = MagicMock()
         scheduler._vm_manager = MagicMock()
         snapshots = MagicMock(get_or_create_snapshot=AsyncMock(side_effect=RuntimeError("the build started")))
         scheduler._snapshot_manager = snapshots
+        return scheduler, snapshots
+
+    @pytest.mark.parametrize("validation", [True, False], ids=["on", "off"])
+    async def test_package_outside_the_allow_list(self, validation: bool) -> None:
+        """new() with a package outside the allow-list: refused before any build or VM when
+        validation is on (InvalidInputError PACKAGE_NOT_ALLOWED); built when it is off."""
+        scheduler, snapshots = self._started(validation=validation)
         spec = VmSpec(language=Language.PYTHON, packages=("surely-not-a-catalog-package==1.0",))
 
         if validation:
@@ -697,14 +771,19 @@ class TestPackageValidation:
             return json.loads(text)
 
         monkeypatch.setattr(package_validator, "json", SimpleNamespace(loads=spied_loads))
-        scheduler = Scheduler()
+        scheduler, _snapshots = self._started(validation=True)
+        allowed = (
+            VmSpec(language=Language.PYTHON, packages=("pandas==2.2.0",)),
+            VmSpec(language=Language.JAVASCRIPT, packages=("lodash@4.17.21",)),
+        )
         for _ in range(3):
-            await scheduler._validate_packages(["pandas==2.2.0"], Language.PYTHON)
-            await scheduler._validate_packages(["lodash@4.17.21"], Language.JAVASCRIPT)
+            for spec in allowed:
+                with pytest.raises(RuntimeError, match="the build started"):
+                    await scheduler.new(spec)
         with pytest.raises(
             InvalidInputError, check=lambda e: e.code is ErrorCode.PACKAGE_NOT_ALLOWED, match="not in python allow-list"
         ):
-            await scheduler._validate_packages(["surely-not-a-catalog-package==1.0"], Language.PYTHON)
+            await scheduler.new(VmSpec(language=Language.PYTHON, packages=("surely-not-a-catalog-package==1.0",)))
         assert len(parsers) == 2  # the PyPI and the npm catalog, once each
         assert threading.get_ident() not in parsers
 
@@ -713,36 +792,24 @@ class TestSchedulerConfig:
     """Tests for Scheduler config handling."""
 
     def test_config_immutable(self) -> None:
-        """Scheduler config is immutable."""
-        config = SchedulerConfig()
-        scheduler = Scheduler(config)
+        """The config of a Scheduler cannot change after it is made."""
+        scheduler = Scheduler(SchedulerConfig(default_timeout_seconds=60))
 
-        # Config should be the same object (frozen)
-        assert scheduler.config is config
-
-    def test_s3_not_configured_by_default(self) -> None:
-        """S3 snapshot manager not created without s3_bucket."""
-        config = SchedulerConfig()
-        scheduler = Scheduler(config)
-        assert config.s3_bucket is None
-
-    def test_warm_pool_disabled_by_default(self) -> None:
-        """Warm pool not created when warm_pool_size is 0."""
-        config = SchedulerConfig(warm_pool_size=0)
-        scheduler = Scheduler(config)
-        assert config.warm_pool_size == 0
+        with pytest.raises(ValidationError, match="frozen"):
+            scheduler.config.default_timeout_seconds = 5  # type: ignore[misc]
+        assert scheduler.config.default_timeout_seconds == 60
 
 
 class TestSchedulerSnapshotInit:
     """Tests for DiskSnapshotManager initialization in Scheduler."""
 
-    async def test_snapshot_manager_initialized_without_s3(self, scheduler_config: SchedulerConfig) -> None:
-        """DiskSnapshotManager is created even without S3 config (L2 cache works)."""
-        async with Scheduler(scheduler_config) as scheduler:
-            assert scheduler._snapshot_manager is not None
+    async def test_snapshot_manager_with_s3_uses_the_scheduler_vm_manager(self, images_dir: Path) -> None:
+        """With S3 settings, the Scheduler starts with an L2 cache whose build VMs come from its
+        own VM manager (admission counts them).
 
-    async def test_snapshot_manager_initialized_with_s3(self, images_dir: Path) -> None:
-        """DiskSnapshotManager is created with S3 config."""
+        Private fields: a build with S3 set would call S3, and the VM manager a build uses
+        shows only in a build VM. Without S3, TestBaseImageFetchBeforeSnapshot builds through
+        new()."""
         config = SchedulerConfig(
             images_dir=images_dir,
             s3_bucket="test-bucket",
@@ -751,23 +818,41 @@ class TestSchedulerSnapshotInit:
         )
         async with Scheduler(config) as scheduler:
             assert scheduler._snapshot_manager is not None
-
-    async def test_snapshot_manager_has_vm_manager(self, scheduler_config: SchedulerConfig) -> None:
-        """DiskSnapshotManager receives vm_manager reference."""
-        async with Scheduler(scheduler_config) as scheduler:
-            assert scheduler._snapshot_manager is not None
             assert scheduler._snapshot_manager.vm_manager is scheduler._vm_manager
 
 
+class _ColdBootError(Exception):
+    """create_vm was called: the request got to its cold boot (each request here ends there)."""
+
+
 class TestBaseImageFetchBeforeSnapshot:
-    """Regression tests: fetch_base_image ordering in _get_or_create_snapshot.
+    """Regression tests: ensure_base_image before the L2 snapshot of a new() with packages.
 
     When EXEC_SANDBOX_CACHE_DIR points to a fresh directory (pip-install user),
     ensure_assets() at startup only downloads kernel/initramfs/gvproxy (no
-    language param). If packages are requested, _compute_cache_key() needs the
-    base image on disk to hash it. Without the fetch_base_image() call in
-    _get_or_create_snapshot(), get_base_image() glob fails with ConfigError ASSET_NOT_FOUND.
+    language param). If packages are requested, the L2 cache key needs the
+    base image on disk to hash it. Without the ensure_base_image() call before
+    the L2 lookup, GuestImages.base_image() finds no file: ConfigError ASSET_NOT_FOUND.
+
+    Each request is a new() with packages (package check off) that ends at its cold boot:
+    create_vm raises _ColdBootError, and its snapshot_drive is the L2 snapshot.
     """
+
+    @pytest.fixture(autouse=True)
+    def _empty_download_cache(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty download cache: no base image of this user's cache stands in for the one
+        the test expects ensure_base_image to bring (GuestImages falls back to it)."""
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", str(tmp_path / "download-cache"))
+
+    @staticmethod
+    def _config(images: Path, *, auto_download: bool, **fields: Path) -> SchedulerConfig:
+        return SchedulerConfig(
+            images_dir=images,
+            auto_download_assets=auto_download,
+            enable_package_validation=False,
+            default_timeout_seconds=120,
+            **fields,
+        )
 
     @staticmethod
     def _make_fresh_images_dir(images_dir: Path, tmp_path: Path) -> tuple[Path, str]:
@@ -784,211 +869,183 @@ class TestBaseImageFetchBeforeSnapshot:
         return fresh_images, arch
 
     @staticmethod
-    def _mock_snapshot_result(scheduler: Scheduler, tmp_path: Path) -> Path:
-        """Mock get_or_create_snapshot to return a pre-created qcow2."""
+    def _mock_snapshot_result(scheduler: Scheduler, tmp_path: Path, events: list[object]) -> Path:
+        """get_or_create_snapshot appends "snapshot" to `events` and returns a lease on a
+        qcow2 made beforehand."""
         snap = tmp_path / f"snap-{random_test_id()}.qcow2"
+
+        async def leased(**_kwargs: object) -> EntryLease | None:
+            events.append("snapshot")
+            return await CacheEntry(snap).lease()
+
         scheduler._snapshot_manager.get_or_create_snapshot = AsyncMock(  # type: ignore[union-attr]
-            return_value=snap,
+            side_effect=leased,
         )
         snap.touch()
         return snap
 
     @staticmethod
-    def _setup_cold_boot_mocks(scheduler: Scheduler) -> MagicMock:
-        """Disable warm pool + memory snapshots, mock create_vm for cold boot path."""
-        mock_vm = MagicMock()
-        mock_vm.vm_id = f"vm-{random_test_id()}"
+    def _setup_cold_boot_mocks(scheduler: Scheduler) -> AsyncMock:
+        """No warm pool and no L1; create_vm raises _ColdBootError. Returns create_vm."""
         scheduler._warm_pool = None  # type: ignore[assignment]
         scheduler._memory_snapshot_manager = None  # type: ignore[assignment]
-        scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
-        return mock_vm
+        create_vm = AsyncMock(side_effect=_ColdBootError)
+        scheduler._vm_manager.create_vm = create_vm  # type: ignore[union-attr]
+        return create_vm
 
     async def test_missing_base_image_fetched_before_cache_key(self, images_dir: Path, tmp_path: Path) -> None:
         """Regression: fresh cache dir without base image does not raise ConfigError ASSET_NOT_FOUND.
 
-        Reproduces the original bug: _compute_cache_key() calls get_base_image()
-        which globs for python-*-base-*.qcow2. Without the fetch_base_image()
-        call, the glob finds nothing and raises ConfigError ASSET_NOT_FOUND.
-
-        This test uses a real DiskSnapshotManager (no mock on get_or_create_snapshot)
-        so that _compute_cache_key → get_base_image → glob actually runs.
+        The L2 cache key calls GuestImages.base_image(), which looks for the python base image.
+        Without the ensure_base_image() call, it finds no file and raises
+        ConfigError ASSET_NOT_FOUND. The DiskSnapshotManager is real (only its QEMU build
+        is replaced), so the key, the base image lookup and the L2 cache folder are real.
         """
         fresh_images, arch = self._make_fresh_images_dir(images_dir, tmp_path)
 
         cache_dir = tmp_path / "snapshot-cache"
-        cache_dir.mkdir()
+        cache_dir.mkdir(mode=0o700)
 
-        config = SchedulerConfig(
-            images_dir=fresh_images,
-            auto_download_assets=True,
-            default_timeout_seconds=120,
-            disk_snapshot_cache_dir=cache_dir,
-        )
+        config = self._config(fresh_images, auto_download=True, disk_snapshot_cache_dir=cache_dir)
         async with Scheduler(config) as scheduler:
-            # fetch_base_image mock: writes a real qcow2 at the expected path
+            create_vm = self._setup_cold_boot_mocks(scheduler)
+            # ensure_base_image mock: writes a real qcow2 at the expected path
             # (simulates what the real downloader does)
             base_image_path = fresh_images / f"python-3.14-base-{arch}.qcow2"
 
             async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
-                # Write a minimal valid qcow2 so get_base_image() glob succeeds
+                # Write a minimal valid qcow2 so GuestImages.base_image() finds it
                 await create_test_qcow2(base_image_path)
                 return base_image_path
 
             # Mock _create_snapshot to avoid QEMU boot — write to the real
-            # cache_key path so file_lock's "already exists" check stays correct.
+            # cache_key path so CacheEntry.saving's "already exists" check stays correct.
             async def mock_create_snapshot(language, packages, *, cache_key, **kwargs):  # type: ignore[no-untyped-def]
                 snap = cache_dir / f"{cache_key}.qcow2"
                 await create_test_qcow2(snap)
                 return snap
 
             with (
-                patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+                patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
                 patch.object(scheduler._snapshot_manager, "_create_snapshot", side_effect=mock_create_snapshot),
+                pytest.raises(_ColdBootError),  # ConfigError ASSET_NOT_FOUND without the fix
             ):
-                # This would raise ConfigError ASSET_NOT_FOUND without the fix
-                result = await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+                await scheduler.new(VmSpec(language=Language.PYTHON, packages=("pandas==2.0.0",)))
 
-            assert result.exists()
-            assert result.suffix == ".qcow2"
-
-    async def test_fetch_called_before_snapshot(self, images_dir: Path, tmp_path: Path) -> None:
-        """auto_download_assets=True + packages → fetch_base_image called before snapshot manager."""
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
-            fetch_called = False
-
-            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
-                nonlocal fetch_called
-                fetch_called = True
-
-            snap = self._mock_snapshot_result(scheduler, tmp_path)
-            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
-                result = await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
-
-            assert fetch_called, "fetch_base_image must be called before snapshot cache key computation"
-            assert result == snap
-
-    async def test_fetch_skipped_when_auto_download_disabled(self, images_dir: Path, tmp_path: Path) -> None:
-        """auto_download_assets=False → fetch_base_image NOT called (images must exist locally)."""
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=False, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
-            fetch_called = False
-
-            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
-                nonlocal fetch_called
-                fetch_called = True
-
-            self._mock_snapshot_result(scheduler, tmp_path)
-            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
-                await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
-
-            assert not fetch_called, "fetch_base_image should NOT be called when auto_download_assets=False"
+        snapshot = create_vm.await_args.kwargs["snapshot_drive"]
+        assert (snapshot.parent, snapshot.suffix) == (cache_dir, ".qcow2")
+        assert snapshot.exists()
 
     @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
-    async def test_fetch_called_with_correct_language(
-        self, images_dir: Path, tmp_path: Path, language: Language
-    ) -> None:
-        """fetch_base_image receives the correct language argument."""
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
-            captured_language = None
+    async def test_fetch_once_before_the_snapshot(self, images_dir: Path, tmp_path: Path, language: Language) -> None:
+        """auto_download_assets=True + packages: ensure_base_image runs once, with the request's
+        language, before the L2 lookup; the cold boot on that snapshot does not fetch again."""
+        async with Scheduler(self._config(images_dir, auto_download=True)) as scheduler:
+            create_vm = self._setup_cold_boot_mocks(scheduler)
+            events: list[object] = []
 
             async def mock_fetch(lang, **kwargs):  # type: ignore[no-untyped-def]
-                nonlocal captured_language
-                captured_language = lang
+                events.append(("fetch", lang))
 
-            self._mock_snapshot_result(scheduler, tmp_path)
-            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
-                await scheduler._get_or_create_snapshot(language, ["some-pkg==1.0"], 256)
-
-            assert captured_language == language
-
-    async def test_snapshot_path_skipped_without_packages(self, images_dir: Path, tmp_path: Path) -> None:
-        """Empty packages → _get_or_create_snapshot is never called by _prepare_vm.
-
-        The guard `if packages:` at the _prepare_vm call site prevents reaching
-        _get_or_create_snapshot (and therefore fetch_base_image at the snapshot
-        stage). Verify this by spying on _get_or_create_snapshot during a
-        _prepare_vm call with packages=[].
-        """
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
-            snapshot_spy = AsyncMock()
-            self._setup_cold_boot_mocks(scheduler)
-
+            snap = self._mock_snapshot_result(scheduler, tmp_path, events)
             with (
-                patch.object(scheduler, "_get_or_create_snapshot", snapshot_spy),
-                patch("exec_sandbox.scheduler.fetch_base_image", new_callable=AsyncMock),
+                patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
+                pytest.raises(_ColdBootError),
             ):
-                await scheduler._prepare_vm(
-                    VmSpec(language=Language.PYTHON), task_id=f"test-{random_test_id()}", on_boot_log=None
-                )
+                await scheduler.new(VmSpec(language=language, packages=("some-pkg==1.0",)))
 
-            snapshot_spy.assert_not_called()
+        assert events == [("fetch", language), "snapshot"]
+        assert create_vm.await_args.kwargs["snapshot_drive"] == snap
 
-    async def test_fetch_idempotent_on_cache_hit(self, images_dir: Path, tmp_path: Path) -> None:
-        """When base image already exists, fetch_base_image is called but completes fast."""
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
-            call_count = 0
+    async def test_fetch_skipped_when_auto_download_disabled(self, images_dir: Path, tmp_path: Path) -> None:
+        """auto_download_assets=False → ensure_base_image NOT called (images must exist locally)."""
+        async with Scheduler(self._config(images_dir, auto_download=False)) as scheduler:
+            self._setup_cold_boot_mocks(scheduler)
+            events: list[object] = []
 
             async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
-                nonlocal call_count
-                call_count += 1
+                events.append(("fetch", language))
 
-            self._mock_snapshot_result(scheduler, tmp_path)
-            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch):
-                # Call twice with same language
-                await scheduler._get_or_create_snapshot(Language.PYTHON, ["pkg==1.0"], 256)
-                await scheduler._get_or_create_snapshot(Language.PYTHON, ["pkg==1.0"], 256)
+            self._mock_snapshot_result(scheduler, tmp_path, events)
+            with (
+                patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
+                pytest.raises(_ColdBootError),
+            ):
+                await scheduler.new(VmSpec(language=Language.PYTHON, packages=("pandas==2.0.0",)))
 
-            assert call_count == 2, "fetch_base_image should be called each time (it's idempotent internally)"
+        assert events == ["snapshot"], "ensure_base_image should NOT be called when auto_download_assets=False"
+
+    async def test_snapshot_path_skipped_without_packages(self, images_dir: Path, tmp_path: Path) -> None:
+        """No packages: no L2 lookup, and the cold boot gets no snapshot drive."""
+        async with Scheduler(self._config(images_dir, auto_download=True)) as scheduler:
+            create_vm = self._setup_cold_boot_mocks(scheduler)
+
+            with (
+                patch.object(scheduler._snapshot_manager, "get_or_create_snapshot", new_callable=AsyncMock) as lookup,
+                patch("exec_sandbox.scheduler.ensure_base_image", new_callable=AsyncMock),
+                pytest.raises(_ColdBootError),
+            ):
+                await scheduler.new(VmSpec(language=Language.PYTHON))
+
+        lookup.assert_not_awaited()
+        assert create_vm.await_args.kwargs["snapshot_drive"] is None
+
+    async def test_fetch_called_for_each_request(self, images_dir: Path, tmp_path: Path) -> None:
+        """Each request with packages fetches the base image again (ensure_base_image is
+        idempotent and fast when the file is there): an image removed between two requests
+        comes back."""
+        async with Scheduler(self._config(images_dir, auto_download=True)) as scheduler:
+            self._setup_cold_boot_mocks(scheduler)
+            events: list[object] = []
+
+            async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
+                events.append(("fetch", language))
+
+            self._mock_snapshot_result(scheduler, tmp_path, events)
+            with patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch):
+                for _ in range(2):
+                    with pytest.raises(_ColdBootError):
+                        await scheduler.new(VmSpec(language=Language.PYTHON, packages=("pkg==1.0",)))
+
+        assert events == [("fetch", Language.PYTHON), "snapshot"] * 2
 
     async def test_fetch_failure_propagates(self, images_dir: Path, tmp_path: Path) -> None:
-        """fetch_base_image raising TransientError ASSET_DOWNLOAD propagates to caller."""
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
+        """ensure_base_image raising TransientError ASSET_DOWNLOAD propagates to caller."""
+        async with Scheduler(self._config(images_dir, auto_download=True)) as scheduler:
+            create_vm = self._setup_cold_boot_mocks(scheduler)
 
             async def mock_fetch_fail(language, **kwargs):  # type: ignore[no-untyped-def]
                 raise TransientError(
                     "Network unreachable", code=ErrorCode.ASSET_DOWNLOAD, context=None, hint=None, instance_id=None
                 )
 
-            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch_fail):
+            with patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch_fail):
                 with pytest.raises(
                     TransientError, check=lambda e: e.code is ErrorCode.ASSET_DOWNLOAD, match="Network unreachable"
                 ):
-                    await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+                    await scheduler.new(VmSpec(language=Language.PYTHON, packages=("pandas==2.0.0",)))
+
+        create_vm.assert_not_awaited()
 
     async def test_concurrent_fetch_same_language(self, images_dir: Path, tmp_path: Path) -> None:
-        """Two concurrent _get_or_create_snapshot calls for the same language succeed without races.
+        """Two concurrent requests with the same packages succeed without races.
 
-        Concurrent fetch_base_image calls must be idempotent and the file_lock in
-        get_or_create_snapshot must serialize snapshot creation so both callers
-        get the same result.
+        Concurrent ensure_base_image calls must be idempotent and CacheEntry.saving in
+        get_or_create_snapshot must serialize snapshot creation so both requests
+        boot on the same snapshot.
         """
         fresh_images, arch = self._make_fresh_images_dir(images_dir, tmp_path)
 
-        # Pre-create base image so image_hash is stable across concurrent calls
+        # Pre-create base image so its digest (image_digest) is stable across concurrent calls
         base_image_path = fresh_images / f"python-3.14-base-{arch}.qcow2"
         await create_test_qcow2(base_image_path)
 
         cache_dir = tmp_path / "snapshot-cache"
-        cache_dir.mkdir()
+        cache_dir.mkdir(mode=0o700)
 
-        config = SchedulerConfig(
-            images_dir=fresh_images,
-            auto_download_assets=True,
-            default_timeout_seconds=120,
-            disk_snapshot_cache_dir=cache_dir,
-        )
+        config = self._config(fresh_images, auto_download=True, disk_snapshot_cache_dir=cache_dir)
         async with Scheduler(config) as scheduler:
+            create_vm = self._setup_cold_boot_mocks(scheduler)
 
             async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
                 await asyncio.sleep(0.05)
@@ -1000,71 +1057,34 @@ class TestBaseImageFetchBeforeSnapshot:
                     await create_test_qcow2(snap)
                 return snap
 
+            spec = VmSpec(language=Language.PYTHON, packages=("pandas==2.0.0",))
             with (
-                patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+                patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
                 patch.object(scheduler._snapshot_manager, "_create_snapshot", side_effect=mock_create_snapshot),
             ):
-                result1, result2 = await asyncio.gather(
-                    scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256),
-                    scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256),
-                )
+                outcomes = await asyncio.gather(scheduler.new(spec), scheduler.new(spec), return_exceptions=True)
 
-            assert result1.exists()
-            assert result2.exists()
-            # Both should resolve to the same snapshot file (same cache key)
-            assert result1 == result2
-
-    async def test_fetch_called_once_when_packages_present(self, images_dir: Path, tmp_path: Path) -> None:
-        """With packages, fetch is called from _get_or_create_snapshot only; cold boot skips it.
-
-        When _get_or_create_snapshot returns a snapshot_path, the cold-boot guard
-        `if ... and not snapshot_path` in _prepare_vm prevents a second
-        fetch_base_image call. This test ensures fetch is invoked exactly once.
-        """
-
-        config = SchedulerConfig(images_dir=images_dir, auto_download_assets=True, default_timeout_seconds=120)
-        async with Scheduler(config) as scheduler:
-            fetch_count = 0
-
-            async def counting_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
-                nonlocal fetch_count
-                fetch_count += 1
-
-            self._setup_cold_boot_mocks(scheduler)
-            self._mock_snapshot_result(scheduler, tmp_path)
-
-            with patch("exec_sandbox.scheduler.fetch_base_image", side_effect=counting_fetch):
-                await scheduler._prepare_vm(
-                    VmSpec(language=Language.PYTHON, packages=["pandas==2.0.0"]),
-                    task_id=f"test-{random_test_id()}",
-                    on_boot_log=None,
-                )
-
-            # fetch called once from _get_or_create_snapshot, NOT again from cold boot
-            assert fetch_count == 1, (
-                f"fetch_base_image called {fetch_count} times, expected 1 "
-                "(cold boot should skip fetch when snapshot_path is set)"
-            )
+        assert [type(outcome) for outcome in outcomes] == [_ColdBootError, _ColdBootError]
+        snapshot_1, snapshot_2 = (call.kwargs["snapshot_drive"] for call in create_vm.await_args_list)
+        assert snapshot_1.exists()
+        # Both should resolve to the same snapshot file (same cache key)
+        assert snapshot_1 == snapshot_2
 
     async def test_fetch_ok_but_snapshot_creation_fails(self, images_dir: Path, tmp_path: Path) -> None:
-        """fetch_base_image succeeds but _create_snapshot raises TransientError QEMU_CRASHED.
+        """ensure_base_image succeeds but _create_snapshot raises TransientError QEMU_CRASHED.
 
         Verifies that the error propagates to the caller and that the
-        base image (written by fetch_base_image) is NOT cleaned up — only the
+        base image (written by ensure_base_image) is NOT cleaned up — only the
         snapshot file is cleaned up by _create_snapshot's own finally block.
         """
         fresh_images, arch = self._make_fresh_images_dir(images_dir, tmp_path)
 
         cache_dir = tmp_path / "snapshot-cache"
-        cache_dir.mkdir()
+        cache_dir.mkdir(mode=0o700)
 
-        config = SchedulerConfig(
-            images_dir=fresh_images,
-            auto_download_assets=True,
-            default_timeout_seconds=120,
-            disk_snapshot_cache_dir=cache_dir,
-        )
+        config = self._config(fresh_images, auto_download=True, disk_snapshot_cache_dir=cache_dir)
         async with Scheduler(config) as scheduler:
+            create_vm = self._setup_cold_boot_mocks(scheduler)
             base_image_path = fresh_images / f"python-3.14-base-{arch}.qcow2"
 
             async def mock_fetch(language, **kwargs):  # type: ignore[no-untyped-def]
@@ -1072,7 +1092,7 @@ class TestBaseImageFetchBeforeSnapshot:
                 return base_image_path
 
             with (
-                patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+                patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
                 patch.object(
                     scheduler._snapshot_manager,
                     "_create_snapshot",
@@ -1085,29 +1105,36 @@ class TestBaseImageFetchBeforeSnapshot:
                 with pytest.raises(
                     TransientError, check=lambda e: e.code is ErrorCode.QEMU_CRASHED, match="VM boot failed"
                 ):
-                    await scheduler._get_or_create_snapshot(Language.PYTHON, ["pandas==2.0.0"], 256)
+                    await scheduler.new(VmSpec(language=Language.PYTHON, packages=("pandas==2.0.0",)))
 
             # Base image should still exist (not cleaned up on downstream failure)
             assert base_image_path.exists(), "Base image must survive a downstream build failure"
+        create_vm.assert_not_awaited()
 
 
 class TestBaseImageFetchBeforeL1Restore:
-    """Regression tests: fetch_base_image ordering on the NO-PACKAGES path.
+    """Regression tests: ensure_base_image ordering on the NO-PACKAGES path.
 
     Companion to TestBaseImageFetchBeforeSnapshot (which covers the packages /
     L2 disk-snapshot path). On a fresh cache, ensure_assets() at startup only
     downloads kernel/initramfs/gvproxy — no base images. With no packages, the
-    L1 memory-snapshot compute_cache_key() (scheduler._prepare_vm) hashes the
-    base image via get_base_image(). If the cold-boot fetch_base_image() runs
-    AFTER that (the original bug), get_base_image() globs an empty dir and
-    raises ConfigError ASSET_NOT_FOUND. The fix hoists the fetch ahead of the L1 key in
-    the cold path.
+    L1 memory-snapshot compute_cache_key() (Scheduler._launch_for) hashes the
+    base image via GuestImages.base_image(). If the cold-boot ensure_base_image() ran
+    AFTER that, GuestImages.base_image() would find no file and raise ConfigError
+    ASSET_NOT_FOUND: the cold path fetches ahead of the L1 key.
 
     NOTE: these tests keep a REAL MemorySnapshotManager (they do NOT use
-    _setup_cold_boot_mocks, which nulls it and would hide the bug entirely).
+    _setup_cold_boot_mocks, which nulls it and would hide the bug entirely). Each
+    request is a new() that ends at its cold boot (create_vm raises _ColdBootError).
     """
 
-    # Base image filename per language (mirrors assets.fetch_base_image mapping).
+    @pytest.fixture(autouse=True)
+    def _empty_download_cache(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty download cache: no base image of this user's cache stands in for the one
+        the test expects ensure_base_image to bring (GuestImages falls back to it)."""
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", str(tmp_path / "download-cache"))
+
+    # Base image filename per language (mirrors the images.BASE_IMAGES mapping).
     _BASE_FILENAME: ClassVar[dict[Language, str]] = {
         Language.PYTHON: "python-3.14-base-{arch}.qcow2",
         Language.JAVASCRIPT: "node-1.4-base-{arch}.qcow2",
@@ -1130,8 +1157,8 @@ class TestBaseImageFetchBeforeL1Restore:
         """SchedulerConfig on a fresh (base-less) images dir with isolated caches."""
         l1 = tmp_path / "l1"
         l2 = tmp_path / "l2"
-        l1.mkdir(exist_ok=True)
-        l2.mkdir(exist_ok=True)
+        l1.mkdir(mode=0o700, exist_ok=True)
+        l2.mkdir(mode=0o700, exist_ok=True)
         return SchedulerConfig(
             images_dir=fresh,
             auto_download_assets=auto_download,
@@ -1142,10 +1169,10 @@ class TestBaseImageFetchBeforeL1Restore:
 
     @classmethod
     def _mock_fetch(cls, fresh: Path, arch: str, calls: list[Language]):  # type: ignore[no-untyped-def]
-        """Side-effect for fetch_base_image: record the call, write a real qcow2.
+        """Side-effect for ensure_base_image: record the call, write a real qcow2.
 
         Simulates the downloader landing the base image in base_images_dir so
-        the subsequent get_base_image() glob + image_hash() succeed.
+        the subsequent GuestImages.base_image() and image digest succeed.
         """
 
         async def _fetch(language: Language, **_kwargs) -> Path:  # type: ignore[no-untyped-def]
@@ -1162,9 +1189,9 @@ class TestBaseImageFetchBeforeL1Restore:
     ) -> None:
         """PRIMARY regression: no packages + fresh cache does NOT raise ConfigError ASSET_NOT_FOUND.
 
-        On the buggy (pre-fix) code this raises ConfigError ASSET_NOT_FOUND from
-        compute_cache_key -> get_base_image. It is the whole
-        guard for this bug: confirm it FAILS before the _prepare_vm fix lands.
+        With the fetch after the L1 key, this raises ConfigError ASSET_NOT_FOUND from
+        compute_cache_key -> GuestImages.base_image. It is the whole guard for this
+        order.
 
         Parametrized over PYTHON/JAVASCRIPT (RAW omitted; the fix is
         language-agnostic and the mock writes whichever filename it is told).
@@ -1172,23 +1199,20 @@ class TestBaseImageFetchBeforeL1Restore:
         fresh, arch = self._make_fresh_images_dir(images_dir, tmp_path)
         config = self._fresh_config(fresh, tmp_path, auto_download=True)
         async with Scheduler(config) as scheduler:
-            mock_vm = MagicMock()
-            mock_vm.vm_id = f"vm-{random_test_id()}"
-            scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
-            scheduler._memory_snapshot_manager.schedule_background_save = AsyncMock()  # type: ignore[union-attr]
+            create_vm = AsyncMock(side_effect=_ColdBootError)
+            scheduler._vm_manager.create_vm = create_vm  # type: ignore[union-attr]
             fetch_calls: list[Language] = []
 
-            with patch(
-                "exec_sandbox.scheduler.fetch_base_image",
-                side_effect=self._mock_fetch(fresh, arch, fetch_calls),
+            with (
+                patch(
+                    "exec_sandbox.scheduler.ensure_base_image", side_effect=self._mock_fetch(fresh, arch, fetch_calls)
+                ),
+                pytest.raises(_ColdBootError),  # ConfigError ASSET_NOT_FOUND on the buggy code
             ):
-                vm, _ports, _cold, _admission_ms = await scheduler._prepare_vm(
-                    VmSpec(language=language), task_id=f"test-{random_test_id()}", on_boot_log=None
-                )
+                await scheduler.new(VmSpec(language=language))
 
-            assert vm is mock_vm
-            scheduler._vm_manager.create_vm.assert_awaited_once()  # type: ignore[union-attr]
-            assert fetch_calls == [language], "fetch must run exactly once, before the L1 cache-key hash"
+        create_vm.assert_awaited_once()
+        assert fetch_calls == [language], "fetch must run exactly once, before the L1 cache-key hash"
 
     async def test_auto_download_disabled_missing_base_raises(self, images_dir: Path, tmp_path: Path) -> None:
         """auto_download_assets=False + no base -> ConfigError ASSET_NOT_FOUND; fetch NOT called.
@@ -1204,13 +1228,11 @@ class TestBaseImageFetchBeforeL1Restore:
             fetch_calls: list[Language] = []
 
             with patch(
-                "exec_sandbox.scheduler.fetch_base_image",
+                "exec_sandbox.scheduler.ensure_base_image",
                 side_effect=self._mock_fetch(fresh, arch, fetch_calls),
             ):
                 with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.ASSET_NOT_FOUND):
-                    await scheduler._prepare_vm(
-                        VmSpec(language=Language.PYTHON), task_id=f"test-{random_test_id()}", on_boot_log=None
-                    )
+                    await scheduler.new(VmSpec(language=Language.PYTHON))
 
             assert fetch_calls == [], "fetch must NOT be called when auto_download_assets=False"
             scheduler._vm_manager.create_vm.assert_not_awaited()  # type: ignore[union-attr]
@@ -1225,26 +1247,22 @@ class TestBaseImageFetchBeforeL1Restore:
         fresh, arch = self._make_fresh_images_dir(images_dir, tmp_path)
         config = self._fresh_config(fresh, tmp_path, auto_download=True)
         async with Scheduler(config) as scheduler:
-            mock_vm = MagicMock()
-            mock_vm.vm_id = f"vm-{random_test_id()}"
-            scheduler._vm_manager.create_vm = AsyncMock(return_value=mock_vm)  # type: ignore[union-attr]
-            scheduler._memory_snapshot_manager.schedule_background_save = AsyncMock()  # type: ignore[union-attr]
+            create_vm = AsyncMock(side_effect=_ColdBootError)
+            scheduler._vm_manager.create_vm = create_vm  # type: ignore[union-attr]
             fetch_calls: list[Language] = []
             check_spy = AsyncMock(wraps=scheduler._memory_snapshot_manager.check_cache)  # type: ignore[union-attr]
 
             with (
                 patch(
-                    "exec_sandbox.scheduler.fetch_base_image",
+                    "exec_sandbox.scheduler.ensure_base_image",
                     side_effect=self._mock_fetch(fresh, arch, fetch_calls),
                 ),
                 patch.object(scheduler._memory_snapshot_manager, "check_cache", check_spy),
+                pytest.raises(_ColdBootError),
             ):
-                vm, _ports, _cold, _admission_ms = await scheduler._prepare_vm(
-                    VmSpec(language=Language.PYTHON), task_id=f"test-{random_test_id()}", on_boot_log=lambda _line: None
-                )
+                await scheduler.new(VmSpec(language=Language.PYTHON), on_boot_log=lambda _line: None)
 
-            assert vm is mock_vm
-            scheduler._vm_manager.create_vm.assert_awaited_once()  # type: ignore[union-attr]
+            create_vm.assert_awaited_once()
             check_spy.assert_not_awaited()  # L1 skipped when on_boot_log set
             assert fetch_calls == [Language.PYTHON], "fetch must still run on the debug/no-L1 path"
 
@@ -1257,24 +1275,24 @@ class TestBaseImageFetchBeforeL1Restore:
         fresh, _arch = self._make_fresh_images_dir(images_dir, tmp_path)
         config = self._fresh_config(fresh, tmp_path, auto_download=True)
         async with Scheduler(config) as scheduler:
-            warm_vm = MagicMock()
-            warm_vm.vm_id = f"vm-{random_test_id()}"
+            warm_vm = _fake_vm(f"vm-{random_test_id()}")
             scheduler._warm_pool = MagicMock()  # type: ignore[assignment]
             scheduler._warm_pool.get_vm = AsyncMock(return_value=warm_vm)  # type: ignore[union-attr]
             scheduler._warm_pool.stop = AsyncMock()  # awaited during __aexit__ shutdown  # type: ignore[union-attr]
             scheduler._vm_manager.create_vm = AsyncMock()  # type: ignore[union-attr]
             fetch_calls: list[Language] = []
 
-            with patch(
-                "exec_sandbox.scheduler.fetch_base_image",
-                side_effect=self._mock_fetch(fresh, "aarch64", fetch_calls),
+            with (
+                patch(
+                    "exec_sandbox.scheduler.ensure_base_image",
+                    side_effect=self._mock_fetch(fresh, "aarch64", fetch_calls),
+                ),
+                patch.object(scheduler._vm_manager, "destroy_vm", make_destroy_mock()),  # the fake VM's close
             ):
-                vm, _ports, is_cold, _admission_ms = await scheduler._prepare_vm(
-                    VmSpec(language=Language.PYTHON), task_id=f"test-{random_test_id()}", on_boot_log=None
-                )
+                async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+                    assert session.vm_id == warm_vm.vm_id
+                    assert session.startup_timing.warm_pool_hit is True
 
-            assert vm is warm_vm
-            assert is_cold is False
             assert fetch_calls == [], "warm-pool hit must not download the base image"
             scheduler._vm_manager.create_vm.assert_not_awaited()  # type: ignore[union-attr]
 
@@ -1282,20 +1300,20 @@ class TestBaseImageFetchBeforeL1Restore:
 class TestWarmPoolStartupBaseFetch:
     """Regression tests: base images downloaded before warm-pool startup.
 
-    WarmVMPool.start() pre-boots one VM per language and hashes each base image
-    (compute_cache_key -> get_base_image). On a fresh cache that
+    WarmVMPool.start() pre-boots warm_pool_size VMs per language and hashes each base image
+    (compute_cache_key -> GuestImages.base_image). On a fresh cache that
     would raise ConfigError ASSET_NOT_FOUND, since ensure_assets() fetched only the
     kernel/initramfs. Scheduler.__aenter__ must fetch every pooled base image
     first (when auto_download_assets is enabled). Same user experience as the
-    per-run fix in _prepare_vm.
+    per-request fetch in Scheduler._launch_for.
     """
 
     @staticmethod
     def _warm_config(fresh: Path, tmp_path: Path, *, auto_download: bool) -> SchedulerConfig:
         l1 = tmp_path / "l1"
         l2 = tmp_path / "l2"
-        l1.mkdir(exist_ok=True)
-        l2.mkdir(exist_ok=True)
+        l1.mkdir(mode=0o700, exist_ok=True)
+        l2.mkdir(mode=0o700, exist_ok=True)
         return SchedulerConfig(
             images_dir=fresh,
             auto_download_assets=auto_download,
@@ -1329,7 +1347,7 @@ class TestWarmPoolStartupBaseFetch:
         mock_pool = self._mock_warm_pool(events)
 
         with (
-            patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+            patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
             patch("exec_sandbox.scheduler.WarmVMPool", return_value=mock_pool),
         ):
             async with Scheduler(config):
@@ -1355,7 +1373,7 @@ class TestWarmPoolStartupBaseFetch:
         mock_pool = self._mock_warm_pool(events)
 
         with (
-            patch("exec_sandbox.scheduler.fetch_base_image", side_effect=mock_fetch),
+            patch("exec_sandbox.scheduler.ensure_base_image", side_effect=mock_fetch),
             patch("exec_sandbox.scheduler.WarmVMPool", return_value=mock_pool),
         ):
             async with Scheduler(config):
@@ -1370,12 +1388,18 @@ class TestWarmPoolStartupBaseFetch:
 # ============================================================================
 
 
+async def _assert_not_started(scheduler: Scheduler) -> None:
+    """new() refuses at once: InvalidInputError SCHEDULER_STATE "not started"."""
+    with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE, match="not started"):
+        await scheduler.new(VmSpec(language=Language.PYTHON))
+
+
 class TestSchedulerShutdownOrdering:
     """Tests for Scheduler.__aexit__ shutdown ordering.
 
     The critical invariant: WarmVMPool.stop() must run BEFORE
     MemorySnapshotManager.stop(). Background L1 save tasks create
-    sacrificial VMs via vm_manager.create_vm(), which blocks on
+    sacrificial VMs via vm_manager.create_vm(cache_leases=()), which blocks on
     admission.acquire(). If the warm pool holds all resource slots,
     stopping MemorySnapshotManager first deadlocks — stop() awaits
     the background task, the task waits for a slot, and slots are
@@ -1419,7 +1443,7 @@ class TestSchedulerShutdownOrdering:
         assert call_order.index("warm_pool_stop") < call_order.index("memory_snapshot_stop")
 
     async def test_shutdown_completes_cleanly(self) -> None:
-        """All managers stop and _started becomes False."""
+        """All managers stop, and the Scheduler refuses new requests."""
         scheduler = self._make_scheduler()
 
         await scheduler.__aexit__(None, None, None)
@@ -1427,7 +1451,7 @@ class TestSchedulerShutdownOrdering:
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-        assert scheduler._started is False
+        await _assert_not_started(scheduler)
 
     async def test_instance_saves_drain_before_vms_and_store_go(self) -> None:
         """Saves in flight end (InstanceManager.drain) after the warm pool and the L1 saves
@@ -1470,9 +1494,7 @@ class TestSchedulerShutdownOrdering:
         shutdown = asyncio.create_task(scheduler.__aexit__(None, None, None))
         await pool_stop_entered.wait()
 
-        assert scheduler._started is False
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.SCHEDULER_STATE, match="not started"):
-            await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(1)")
+        await _assert_not_started(scheduler)
 
         release_pool_stop.set()
         await asyncio.wait_for(shutdown, timeout=1)
@@ -1490,22 +1512,20 @@ class TestSchedulerShutdownOrdering:
         scheduler._warm_pool.stop.side_effect = blocked_pool_stop  # type: ignore[union-attr]
         first_waiter = asyncio.create_task(scheduler.__aexit__(None, None, None))
         await pool_stop_entered.wait()
-        owned_shutdown = scheduler._shutdown_task
-        assert owned_shutdown is not None
 
         first_waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first_waiter
 
-        assert not owned_shutdown.cancelled()
         scheduler._memory_snapshot_manager.stop.assert_not_awaited()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_not_awaited()  # type: ignore[union-attr]
 
+        # The second waiter joins the same shutdown: it ends without a CancelledError, and
+        # each manager stops once
         second_waiter = asyncio.create_task(scheduler.__aexit__(None, None, None))
         release_pool_stop.set()
         await asyncio.wait_for(second_waiter, timeout=1)
 
-        assert scheduler._shutdown_task is owned_shutdown
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
@@ -1542,7 +1562,7 @@ class TestSchedulerShutdownOrdering:
         ):
             await scheduler.__aexit__(None, None, None)
 
-        assert scheduler._started is False
+        await _assert_not_started(scheduler)
 
     async def test_shutdown_background_save_unblocks_after_pool_drain(self) -> None:
         """Correct ordering unblocks a background save waiting on resources."""
@@ -1594,7 +1614,7 @@ class TestSchedulerShutdownOrdering:
 
         scheduler._warm_pool.stop.assert_awaited_once()  # type: ignore[union-attr]
         scheduler._memory_snapshot_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
-        assert scheduler._started is False
+        await _assert_not_started(scheduler)
 
     async def test_shutdown_destroys_remaining_active_vms(self) -> None:
         """Remaining active VMs are destroyed before vm_manager.stop()."""
@@ -1703,58 +1723,6 @@ class TestSchedulerShutdownOrdering:
         assert scheduler._vm_manager.destroy_vm.await_count == 2  # type: ignore[union-attr]
         scheduler._vm_manager.stop.assert_awaited_once()  # type: ignore[union-attr]
 
-    # ------------------------------------------------------------------
-    # Deadlock / out-of-bounds
-    # ------------------------------------------------------------------
-
-    async def test_shutdown_with_real_admission_controller(self, tmp_path: Path) -> None:
-        """End-to-end test with a real ResourceAdmissionController.
-
-        Uses a tight memory budget so two pool VMs fully exhaust capacity,
-        then a third acquire (background save) blocks until slots are freed.
-        Budget must account for DEFAULT_VM_MEMORY_OVERHEAD_MB added by acquire().
-        """
-
-        guest_mb = 512
-        total_per_vm = guest_mb + DEFAULT_VM_MEMORY_OVERHEAD_MB
-        # Budget fits exactly 2 VMs — third is blocked until one is released
-        budget_mb = total_per_vm * 2
-
-        admission = ResourceAdmissionController(
-            disk_dir=tmp_path,
-            disk_free_floor_mb=0,
-            memory_overcommit_ratio=1.0,
-            cpu_overcommit_ratio=1.0,
-            host_memory_reserve_ratio=0.0,
-            host_memory_mb=budget_mb,
-            host_cpu_count=4,
-        )
-
-        # Fill all memory slots (simulating warm pool VMs)
-        r1 = await admission.acquire(vm_id="pool-1", memory_mb=guest_mb, cpu_cores=1, timeout=1, disk_mb=0)
-        r2 = await admission.acquire(vm_id="pool-2", memory_mb=guest_mb, cpu_cores=1, timeout=1, disk_mb=0)
-
-        # Background task tries to acquire — should block (budget exhausted)
-        acquired = asyncio.Event()
-
-        async def background_save() -> None:
-            await admission.acquire(vm_id="save-vm", memory_mb=guest_mb, cpu_cores=1, timeout=10, disk_mb=0)
-            acquired.set()
-
-        save_task = asyncio.create_task(background_save())
-
-        # Give the task a moment to start blocking
-        await asyncio.sleep(0.05)
-        assert not acquired.is_set()
-
-        # Simulating warm_pool.stop() — release slots
-        await admission.release(r1)
-        await admission.release(r2)
-
-        # Simulating memory_snapshot.stop() — wait for the background task
-        await asyncio.wait_for(save_task, timeout=5)
-        assert acquired.is_set()
-
 
 # ============================================================================
 # Integration Tests - Require QEMU + Images
@@ -1770,27 +1738,11 @@ class TestSchedulerIntegration:
     """
 
     async def test_scheduler_lifecycle(self, scheduler_config: SchedulerConfig) -> None:
-        """Scheduler starts and stops cleanly."""
+        """Scheduler starts and stops cleanly: after the stop, new() refuses."""
         async with Scheduler(scheduler_config) as scheduler:
-            assert scheduler._started is True
-            assert scheduler._vm_manager is not None
+            await scheduler.wait_pool_ready()
 
-        # After exit
-        assert scheduler._started is False
-
-    async def test_run_simple_python(self, scheduler: Scheduler) -> None:
-        """Run simple Python code."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello from python')")
-
-        assert result.exit_code == 0
-        assert "hello from python" in result.stdout
-
-    async def test_run_python_calculation(self, scheduler: Scheduler) -> None:
-        """Run Python code with calculation."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print(2 + 2)")
-
-        assert result.exit_code == 0
-        assert "4" in result.stdout
+        await _assert_not_started(scheduler)
 
     async def test_run_python_multiline(self, scheduler: Scheduler) -> None:
         """Run multiline Python code."""
@@ -1869,13 +1821,13 @@ print("out2")
         )
 
         assert result.exit_code == 0
-        # Chunks should have been received
-        assert len(stdout_chunks) > 0 or "out1" in result.stdout
+        assert ("".join(stdout_chunks), "".join(stderr_chunks)) == ("out1\nout2\n", "err1\n")
 
     async def test_run_timeout(self, scheduler_config: SchedulerConfig) -> None:
         """A code timeout is a result, never an error: the guest stops the code at the
-        timeout (exit_code -1). The host deadline comes 10 s later (EXECUTION_TIMEOUT_MARGIN_SECONDS),
-        and a boot failure (VM_BOOT_TIMEOUT) is not a timeout of the code: both fail this test."""
+        timeout (exit_code -1), and the startup timing is there. The host deadline comes 10 s
+        later (EXECUTION_TIMEOUT_MARGIN_SECONDS), and a boot failure (VM_BOOT_TIMEOUT) is not a
+        timeout of the code: both fail this test."""
         config = SchedulerConfig(
             images_dir=scheduler_config.images_dir,
             default_timeout_seconds=2,
@@ -1887,8 +1839,11 @@ time.sleep(30)
 """
 
         async with Scheduler(config) as scheduler:
-            result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=1)
+            result, startup, _ports = await run_timed(
+                scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=1
+            )
         assert result.exit_code == -1
+        assert startup.total_ms > 0
 
     async def test_run_multiple_sequential(self, scheduler: Scheduler) -> None:
         """Multiple sequential runs work (VMs not reused)."""
@@ -1899,15 +1854,6 @@ time.sleep(30)
         assert "first" in result1.stdout
         assert result2.exit_code == 0
         assert "second" in result2.stdout
-
-    async def test_execution_result_metrics(self, scheduler: Scheduler) -> None:
-        """ExecutionResult contains timing metrics."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
-
-        assert result.exit_code == 0
-        # Metrics should be populated
-        if result.execution_time_ms is not None:
-            assert result.execution_time_ms >= 0
 
     async def test_on_boot_log_receives_boot_output(self, scheduler: Scheduler) -> None:
         """on_boot_log callback receives kernel/init boot output."""
@@ -1938,24 +1884,6 @@ time.sleep(30)
 
         assert (result.exit_code, result.stdout.strip()) == (0, "hello")
         assert len(lines) == 1
-
-
-class TestSchedulerJavaScript:
-    """JavaScript execution tests."""
-
-    async def test_run_simple_javascript(self, scheduler: Scheduler) -> None:
-        """Run simple JavaScript code."""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log('hello from javascript')")
-
-        assert result.exit_code == 0
-        assert "hello from javascript" in result.stdout
-
-    async def test_run_javascript_calculation(self, scheduler: Scheduler) -> None:
-        """Run JavaScript with calculation."""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log(2 + 2)")
-
-        assert result.exit_code == 0
-        assert "4" in result.stdout
 
 
 # ============================================================================
@@ -2045,13 +1973,55 @@ class TestTimingModels:
 # ============================================================================
 
 
+@pytest.fixture
+async def cold_scheduler(
+    scheduler_config: SchedulerConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Scheduler]:
+    """Every new() cold-boots: no warm pool, an empty L1 folder of its own, and no L1 save (no second VM)."""
+    config = scheduler_config.model_copy(update={"memory_snapshot_cache_dir": tmp_path / "l1"})
+    async with Scheduler(config) as sched:
+        memory = sched._memory_snapshot_manager  # pyright: ignore[reportPrivateUsage]  # the one seam
+        assert memory is not None
+        monkeypatch.setattr(memory, "schedule_background_save", AsyncMock(return_value=None))
+        yield sched
+
+
+@pytest.fixture
+async def l1_scheduler(scheduler_config: SchedulerConfig, primed_l1_dir: Path) -> AsyncGenerator[Scheduler]:
+    """Every new() of a default spec is an L1 restore: the run's primed L1 folder, no warm pool."""
+    config = scheduler_config.model_copy(update={"memory_snapshot_cache_dir": primed_l1_dir})
+    async with Scheduler(config) as sched:
+        yield sched
+
+
+async def _new_and_first_exec(scheduler: Scheduler) -> tuple[StartupTiming, ExecutionResult, float]:
+    """new() of a default Python VM and its first exec(), with the wall time of both (ms).
+
+    The wall time uses the event loop clock, the clock of total_ms and execute_ms.
+    """
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    async with await scheduler.new(VmSpec(language=Language.PYTHON)) as vm:
+        result = await vm.exec("print('hello')")
+        wall_ms = (loop.time() - start) * 1000
+        return vm.startup_timing, result, wall_ms
+
+
+# total_ms and execute_ms are each rounded to 1 ms: their sum can pass the wall time by up to 1 ms.
+_ROUNDING_MS = 2
+
+
 class TestSchedulerTimingIntegration:
     """Integration tests for scheduler timing behavior.
 
     These tests verify that:
-    1. timing is always populated (never None)
-    2. timing values are reasonable (non-negative, consistent)
-    3. warm_pool_hit is correctly set
+    1. timing values are consistent: new() and exec() are two separate spans
+    2. warm_pool_hit and l1_cache_hit tell how the VM started
+
+    A test whose result depends on how the VM starts chooses it (cold_scheduler,
+    l1_scheduler): the default L1 folder is shared, so the `scheduler` fixture
+    restores from L1 on a host that ran the tests before and cold-boots on a new
+    CI runner.
     """
 
     async def test_startup_phases_fit_in_the_total(self, scheduler: Scheduler) -> None:
@@ -2061,50 +2031,34 @@ class TestSchedulerTimingIntegration:
         assert startup.total_ms > 0
         assert startup.admission_ms + startup.setup_ms + startup.boot_ms <= startup.total_ms + 2
 
-    async def test_timing_total_reasonable(self, scheduler: Scheduler) -> None:
-        """Total time should be >= execute time."""
-        result, startup, _ports = await run_timed(scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
+    async def test_cold_boot_new_and_first_exec_fit_in_wall_time(self, cold_scheduler: Scheduler) -> None:
+        """Cold boot: new() and the first exec() are two separate spans inside the wall time.
 
-        # total_ms should be at least execute_ms
-        assert startup.total_ms >= result.timing.execute_ms
+        new() returns before the REPL starts, so the first exec() starts the
+        interpreter: its execute_ms can be longer than startup.total_ms.
+        """
+        startup, result, wall_ms = await _new_and_first_exec(cold_scheduler)
 
-    async def test_cold_boot_warm_pool_hit_false(self, scheduler: Scheduler) -> None:
-        """Cold boot (no warm pool) should have warm_pool_hit=False."""
-        # Default scheduler fixture has warm_pool_size=0
-        _result, startup, _ports = await run_timed(scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
+        assert (startup.warm_pool_hit, startup.l1_cache_hit) == (False, False), startup
+        assert result.exit_code == 0
+        assert startup.total_ms + result.timing.execute_ms <= wall_ms + _ROUNDING_MS, (startup, result.timing, wall_ms)
 
-        assert startup.warm_pool_hit is False
+    @skip_unless_hwaccel  # as every L1 test: the primed folder needs a warm-pool start
+    async def test_l1_restore_new_and_first_exec_fit_in_wall_time(self, l1_scheduler: Scheduler) -> None:
+        """L1 restore: new() and the first exec() are two separate spans inside the wall time."""
+        startup, result, wall_ms = await _new_and_first_exec(l1_scheduler)
 
-    async def test_cold_boot_has_nonzero_boot_time(self, scheduler: Scheduler) -> None:
+        assert startup.l1_cache_hit, startup
+        assert startup.boot_ms == 0
+        assert result.exit_code == 0
+        assert startup.total_ms + result.timing.execute_ms <= wall_ms + _ROUNDING_MS, (startup, result.timing, wall_ms)
+
+    async def test_cold_boot_has_nonzero_boot_time(self, cold_scheduler: Scheduler) -> None:
         """A cold boot (no warm pool, no L1 restore) spends real time booting (100-500 ms typical)."""
-        _result, startup, _ports = await run_timed(scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
+        _result, startup, _ports = await run_timed(cold_scheduler, VmSpec(language=Language.PYTHON), "print('hello')")
 
-        assert startup.warm_pool_hit is False
-        if not startup.l1_cache_hit:  # the L1 cache is shared between tests: a hit has boot_ms == 0
-            assert startup.boot_ms > 0
-
-    async def test_timing_with_timeout(self, scheduler_config: SchedulerConfig) -> None:
-        """Timing is populated even when execution times out (a result, never an error)."""
-        config = SchedulerConfig(
-            images_dir=scheduler_config.images_dir,
-            default_timeout_seconds=2,
-        )
-
-        code = "import time; time.sleep(10)"
-
-        async with Scheduler(config) as sched:
-            result, startup, _ports = await run_timed(sched, VmSpec(language=Language.PYTHON), code, timeout_seconds=1)
-        assert result.exit_code == -1  # a timeout is a result, not an error
-        assert startup.total_ms > 0
-
-    async def test_timing_with_error_code(self, scheduler: Scheduler) -> None:
-        """Timing is populated even when code exits with error."""
-        result, startup, _ports = await run_timed(
-            scheduler, VmSpec(language=Language.PYTHON), "import sys; sys.exit(42)"
-        )
-
-        assert result.exit_code == 42
-        assert startup.total_ms > 0
+        assert (startup.warm_pool_hit, startup.l1_cache_hit) == (False, False), startup
+        assert startup.boot_ms > 0
 
     async def test_timing_with_exception(self, scheduler: Scheduler) -> None:
         """Timing is populated even when code raises exception."""
@@ -2237,7 +2191,7 @@ class TestSchedulerWarmPoolTiming:
     These tests verify that warm pool hits have:
     1. warm_pool_hit=True
     2. boot_ms=0 (boot happened at startup, not request time)
-    3. execute_ms and total_ms reflect actual request time
+    3. execute_ms is the exec() call; startup.total_ms is only the pool checkout
 
     Note: setup_ms is not asserted because pool checkout time varies widely
     under TCG emulation with parallel test workers.
@@ -2254,31 +2208,13 @@ class TestSchedulerWarmPoolTiming:
         async with Scheduler(config) as sched:
             yield sched
 
-    async def test_warm_pool_hit_flag_true(self, warm_pool_scheduler: Scheduler) -> None:
-        """Warm pool hit should have warm_pool_hit=True."""
-        result, startup, _ports = await run_timed(
-            warm_pool_scheduler, VmSpec(language=Language.PYTHON), "print('hello')"
-        )
-
-        assert result.exit_code == 0
-        assert startup.warm_pool_hit is True
-
-    async def test_warm_pool_timing_zero_setup_boot(self, warm_pool_scheduler: Scheduler) -> None:
-        """Warm pool hit should have boot_ms=0 and small setup_ms (pool lookup)."""
-        _result, startup, _ports = await run_timed(
-            warm_pool_scheduler, VmSpec(language=Language.PYTHON), "print('hello')"
-        )
-
-        assert startup.warm_pool_hit is True
-        # Boot is "free" for warm pool - it happened at startup
-        assert startup.boot_ms == 0
-
     async def test_warm_pool_timing_has_execute_time(self, warm_pool_scheduler: Scheduler) -> None:
-        """Warm pool hit should have real execute_ms and total_ms."""
+        """Warm pool hit: execute_ms is the real exec() time; the startup has no admission wait and no boot."""
         result, startup, _ports = await run_timed(
             warm_pool_scheduler, VmSpec(language=Language.PYTHON), "import time; time.sleep(0.05); print('done')"
         )
 
+        assert result.exit_code == 0
         assert startup.warm_pool_hit is True
         # Execute time should reflect actual code execution (at least 50ms for sleep)
         assert result.timing.execute_ms >= 40  # Allow some variance

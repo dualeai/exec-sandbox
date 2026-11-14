@@ -41,21 +41,20 @@ class Settings(QemuBinaries):
     # QEMU binaries: QemuBinaries
     kernel_path: Path = Path("/images/kernels")
     base_images_dir: Path = Path("/images")  # qcow2 base images
+    # Where a base image that base_images_dir lacks is downloaded (the scheduler: the asset
+    # download cache); None: base images come from base_images_dir only
+    base_images_download_dir: Path | None = None
 
     # Execution — both caches under OS-specific cache directory
-    disk_snapshot_cache_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "disk-snapshots"
-    )
+    disk_snapshot_cache_dir: Path = Field(default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "disk-snapshots")
     memory_snapshot_cache_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "memory-snapshots"
+        default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "memory-snapshots"
     )
     # Home disk files of running VMs: on host disk, not the (often tmpfs) temp dir
-    home_disk_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "home-disks"
-    )
+    home_disk_dir: Path = Field(default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "home-disks")
 
     # Snapshot cache (2-tier: L2=local disk, L3=S3)
-    snapshot_cache_ttl_days: int = 14  # AWS Lambda SnapStart pattern
+    snapshot_cache_ttl_days: int = 14  # Tag ttl_days=N of each L3 upload: a bucket lifecycle rule can expire by it
     s3_bucket: str | None = None  # L3 cache on when set; also the bucket of the "s3" instance store
     s3_region: str = "us-east-1"
     s3_endpoint_url: str | None = None  # S3-compatible endpoint (R2, MinIO, Ceph RGW)
@@ -66,11 +65,11 @@ class Settings(QemuBinaries):
     # Saved instances: on when instance_store is set; the keyring is then required
     instance_store: InstanceStoreKind | None = None
     instance_store_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.DATA, app_name="exec-sandbox") / "instances"
+        default_factory=lambda: get_user_dir(kind=UserDir.DATA) / "instances"
     )  # root of the local store
     instance_keyring: SecretStr | None = None  # env EXEC_SANDBOX_INSTANCE_KEYRING
     instance_asset_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "instance-assets"
+        default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "instance-assets"
     )  # images by digest
 
     @model_validator(mode="after")
@@ -81,9 +80,10 @@ class Settings(QemuBinaries):
     # Resource overcommit (same bounds as SchedulerConfig: env vars reach these fields directly)
     memory_overcommit_ratio: float = Field(default=constants.DEFAULT_MEMORY_OVERCOMMIT_RATIO, ge=1.0, le=10.0)
     cpu_overcommit_ratio: float = Field(default=constants.DEFAULT_CPU_OVERCOMMIT_RATIO, ge=1.0, le=20.0)
+    disk_overcommit_ratio: float = Field(default=constants.DEFAULT_DISK_OVERCOMMIT_RATIO, ge=1.0, le=64.0)
     host_memory_reserve_ratio: float = Field(default=constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO, ge=0.01, le=0.5)
     host_cpu_reserve_cores: float = Field(default=constants.DEFAULT_HOST_CPU_RESERVE_CORES, ge=0.0, le=16.0)
-    # Host resource overrides (None = auto-detect via psutil)
+    # Host resource overrides, each on its own (None = detected: cgroup limit, else psutil).
     # Useful for testing or container deployments where psutil reports host resources
     host_memory_mb: float | None = None
     host_cpu_count: float | None = None

@@ -1,14 +1,13 @@
-"""Scheduler - main entry point for exec-sandbox.
-
-The Scheduler provides a simple API for executing code in isolated microVMs.
-Inspired by aiojobs - explicit resource management via async context manager.
+"""Scheduler: the entry point of exec-sandbox. It starts the VMs, runs code in
+them and destroys them; use it as an async context manager.
 
 Architecture:
 - VM lifecycle: a VM process is never shared. Each new() or reuse() starts a fresh VM,
   destroyed at close().
 - Warm pool: Pre-started VMs waiting for commands (faster than cold boot).
-- Snapshot cache: L2 (local disk cache) + L3 (S3) for package installation speedup.
-- Backpressure: resource-aware admission control prevents OOM from unbounded VM creation.
+- Snapshot cache: L1 memory snapshots (a restore in place of a boot); L2 disk
+  snapshots with the packages installed, and the L3 snapshot cache in S3.
+- Admission: a VM starts only when the host has the memory, CPU and disk for it.
 - Saved instances (with instance_store and instance_keyring): Session.save() stores
   a VM's state; reuse() starts a VM from it.
 
@@ -16,19 +15,19 @@ Example:
     ```python
     from exec_sandbox import Scheduler, SchedulerConfig, VmSpec
 
-    # Basic usage: one VM, one execution
+    # One session, one execution
     async with Scheduler() as scheduler:
-        async with await scheduler.new(VmSpec(language="python")) as vm:
-            result = await vm.exec("print('hello')")
+        async with await scheduler.new(VmSpec(language="python")) as session:
+            result = await session.exec("print('hello')")
             print(result.stdout)  # "hello\\n"
 
     # With packages and streaming
     DATA = VmSpec(language="python", packages=("pandas==3.0.1",))
     async with Scheduler() as scheduler:
-        async with await scheduler.new(DATA) as vm:
-            await vm.exec("import pandas; print(pandas.__version__)", on_stdout=print)
+        async with await scheduler.new(DATA) as session:
+            await session.exec("import pandas; print(pandas.__version__)", on_stdout=print)
 
-    # Production config with S3 cache
+    # With the L3 snapshot cache in S3
     async with Scheduler(SchedulerConfig(s3_bucket="my-snapshots")) as scheduler:
         ...
     ```
@@ -48,7 +47,8 @@ from exec_sandbox import constants
 from exec_sandbox._imports import require_instance_manager
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
-from exec_sandbox.assets import ensure_assets, fetch_base_image
+from exec_sandbox.asset_downloader import get_current_arch
+from exec_sandbox.assets import ensure_assets, ensure_base_image, images_download_dir
 from exec_sandbox.config import MAX_SESSION_IDLE_TIMEOUT_SECONDS, MIN_SESSION_IDLE_TIMEOUT_SECONDS, SchedulerConfig
 from exec_sandbox.disk_snapshot_manager import DiskSnapshotManager
 from exec_sandbox.exceptions import (
@@ -60,11 +60,14 @@ from exec_sandbox.exceptions import (
     host_mismatch,
     no_instance_store,
 )
+from exec_sandbox.files.locks import EntryLease  # noqa: TC001 - Used at runtime
+from exec_sandbox.images import kernel_dir_of
 from exec_sandbox.instance.ids import check_instance_id
 from exec_sandbox.memory_snapshot_manager import MemorySnapshotManager
 from exec_sandbox.migration_client import rejected_by_qemu
 from exec_sandbox.models import ExposedPort, Language, StartupTiming
 from exec_sandbox.package_validator import PackageValidator
+from exec_sandbox.platform_utils import arch_of
 from exec_sandbox.port_forward import resolve_port_mappings
 from exec_sandbox.session import Session
 from exec_sandbox.settings import Settings
@@ -84,7 +87,7 @@ from exec_sandbox.warm_vm_pool import WarmVMPool
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from exec_sandbox.instance.manager import InstanceManager
+    from exec_sandbox.instance.manager import InstanceManager, InstanceState
     from exec_sandbox.instance.models import InstanceInfo
     from exec_sandbox.qemu_vm import QemuVM
     from exec_sandbox.vm_spec import VmSpec
@@ -153,7 +156,6 @@ class Scheduler:
         self.config = config or SchedulerConfig()
         self._instances: InstanceManager | None = None
         self._instances_exit: contextlib.AsyncExitStack | None = None
-        self._images_dir: Path | None = None
         self._settings: Settings | None = None
         self._vm_manager: VmManager | None = None
         self._snapshot_manager: DiskSnapshotManager | None = None
@@ -214,13 +216,13 @@ class Scheduler:
         warn_damon()
 
         # Resolve images directory (downloads if needed and allowed)
-        self._images_dir = await ensure_assets(
+        images_dir = await ensure_assets(
             override=self.config.images_dir,
             download=self.config.auto_download_assets,
         )
 
         # Create Settings from SchedulerConfig
-        self._settings = self._create_settings()
+        self._settings = settings_from_config(self.config, images_dir=images_dir)
 
         logger.info(
             "Starting scheduler",
@@ -255,15 +257,20 @@ class Scheduler:
             # Initialize MemorySnapshotManager (L1 cache)
             self._memory_snapshot_manager = MemorySnapshotManager(self._settings, self._vm_manager)
 
+            # Admission evicts L2 and L1 entries before a VM waits for home disk space
+            self._vm_manager.add_cache(self._snapshot_manager)
+            self._vm_manager.add_cache(self._memory_snapshot_manager)
+
             # Initialize WarmVMPool (optional)
             if self.config.warm_pool_size > 0:
-                # The pool pre-boots one VM per language, and its startup hashes
-                # each base image (compute_cache_key -> get_base_image).
+                # The pool pre-boots warm_pool_size VMs per language, and its startup
+                # hashes each base image (compute_cache_key -> VmManager.images.base_image).
                 # On a fresh cache ensure_assets() fetched only kernel/initramfs, so
                 # download every pooled base image first, else start() raises
-                # ConfigError (ASSET_NOT_FOUND). Mirrors the per-run fetch in _prepare_vm.
+                # ConfigError (ASSET_NOT_FOUND). Mirrors the per-run fetch in _launch_for
+                # and _get_or_create_snapshot.
                 if self.config.auto_download_assets:
-                    await asyncio.gather(*(fetch_base_image(language.value) for language in Language))
+                    await asyncio.gather(*(ensure_base_image(language, images_dir=images_dir) for language in Language))
                 self._warm_pool = WarmVMPool(
                     self._vm_manager,
                     self.config,
@@ -413,8 +420,9 @@ class Scheduler:
             Session that runs the code. Use it as an async context manager.
 
         Raises:
-            TransientError: CAPACITY (no resources within the admission timeout), or
-                VM creation failed and can succeed later.
+            TransientError: CAPACITY (no resources within the admission timeout),
+                LOCAL_DISK (the home disk cannot fit on its filesystem, raised at once),
+                or VM creation failed and can succeed later.
             InvalidInputError: SCHEDULER_STATE (scheduler not started),
                 INSTANCE_INVALID_ID (`instance_id` breaks the id rule), ARGUMENT_INVALID
                 (`idle_timeout_seconds` out of range; a package without a version or with a
@@ -481,8 +489,8 @@ class Scheduler:
         Raises:
             TransientError: INSTANCE_STORE_UNAVAILABLE, CAPACITY (no resources within
                 the admission timeout), LOCAL_DISK (a local file error of the load: disk
-                full, work folder gone), or the VM could not start from the saved state
-                (the stored instance is unchanged).
+                full, work folder gone; or the home disk cannot fit on its filesystem), or
+                the VM could not start from the saved state (the stored instance is unchanged).
             InvalidInputError: INSTANCE_INVALID_ID (not a valid instance id, no request
                 is sent), SCHEDULER_STATE (scheduler not started), ARGUMENT_INVALID
                 (`idle_timeout_seconds` out of range, no request is sent).
@@ -490,9 +498,9 @@ class Scheduler:
                 worker), INSTANCE_KEY_MISSING (this worker's keyring lacks the instance's
                 key; do not delete the instance).
             RouteError: INSTANCE_HOST_MISMATCH: this worker cannot run it: arch,
-                accelerator, CPU vendor or exec-sandbox release differ from the saved ones
-                (checked before any download), a missing guest image, or a QEMU that
-                refuses the saved state.
+                accelerator, CPU vendor, guest CPU model or exec-sandbox release differ
+                from the saved ones (checked before any download), a missing guest image,
+                or a QEMU that refuses the saved state.
                 CAPACITY_NEVER_FITS: the spec is larger than the whole budget (raised at once).
             InstanceGoneError: INSTANCE_NOT_FOUND, INSTANCE_EXPIRED, INSTANCE_INTEGRITY
                 (the stored data was changed or damaged): start again with new().
@@ -506,24 +514,61 @@ class Scheduler:
         start = loop.time()
         snapshots = self._snapshot_manager
 
+        # The local L2 image is leased from its lookup on: admission (below) may evict
+        # cache entries for disk space, never this one. The VM takes its own share.
+        packages_lease: EntryLease | None = None
+
         async def packages_image(spec: VmSpec) -> Path | None:
             # A local L2 is used only if its digest matches; else load() downloads the
             # image by digest from the instance store.
-            return (
-                await snapshots.check_cache(language=spec.language, packages=list(spec.packages))
-                if spec.packages
-                else None
-            )
+            nonlocal packages_lease
+            if not spec.packages:
+                return None
+            lease = await snapshots.check_cache(language=spec.language, packages=list(spec.packages))
+            if packages_lease is not None:  # an earlier attempt of the load
+                packages_lease.release()
+            packages_lease = lease
+            return lease.path if lease is not None else None
 
-        state = await instances.load(instance_id, packages_image=packages_image)
+        try:
+            state = await instances.load(instance_id, packages_image=packages_image)
+            return await self._reuse_loaded(
+                instances,
+                instance_id,
+                state=state,
+                packages_lease=packages_lease,
+                start=start,
+                idle_timeout=idle_timeout,
+            )
+        finally:
+            if packages_lease is not None:
+                packages_lease.release()
+
+    async def _reuse_loaded(
+        self,
+        instances: InstanceManager,
+        instance_id: str,
+        *,
+        state: InstanceState,
+        packages_lease: EntryLease | None,
+        start: float,
+        idle_timeout: int,
+    ) -> Session:
+        """reuse() after the load: restore the VM of `state`, then the session."""
+        if self._vm_manager is None:
+            raise _internal(_NOT_INITIALIZED)
+        loop = asyncio.get_running_loop()
         load_ms = round((loop.time() - start) * 1000)
         spec = state.body.spec
+        leases = (packages_lease,) if packages_lease is not None and state.packages_image == packages_lease.path else ()
         try:
             resolved_ports = resolve_port_mappings(list(spec.expose_ports)) if spec.expose_ports else []
             task_id = f"reuse-{id(state)}"
             admission_start = loop.time()
+            # Kept while it waits: the loaded state's folder and the packages layer
+            held = frozenset({state.folder, *(lease.path for lease in leases)})
             async with self._vm_manager.reservation_context(
-                spec, vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}"
+                spec, vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}", held=held
             ) as reservation:
                 admission_ms = round((loop.time() - admission_start) * 1000)
                 try:
@@ -534,6 +579,7 @@ class Scheduler:
                         vmstate_path=state.vmstate,
                         base_image=state.base_image,
                         snapshot_drive=state.packages_image,
+                        cache_leases=leases,
                         expose_ports=resolved_ports or None,
                         reservation=reservation,
                     )
@@ -594,10 +640,10 @@ class Scheduler:
         return await self._require_instances(check_instance_id(instance_id)).describe(instance_id)
 
     async def delete_instance(self, instance_id: str) -> bool:
-        """Delete a saved instance: the head first (gone and unreadable at once),
-        then its stored objects. You can call it again: it returns False when no such
-        instance exists. An open
-        session of it fails at its next save() with InstanceGoneError (INSTANCE_NOT_FOUND).
+        """Delete a saved instance; return True if it existed, False if not (a second
+        call is safe). The head goes first (gone and unreadable at once), then the
+        stored objects. An open session of it fails at its next save() with
+        InstanceGoneError (INSTANCE_NOT_FOUND).
         Needs read, list and delete access to the store (S3: s3:GetObject and
         s3:DeleteObject on the instance prefix, s3:ListBucket on the bucket). If it fails
         after the head is gone, a retry returns False and still removes the leftovers.
@@ -643,7 +689,7 @@ class Scheduler:
             raise no_instance_store(instance_id=instance_id)
         return self._instances
 
-    async def _prepare_vm(  # noqa: PLR0912
+    async def _prepare_vm(
         self,
         spec: VmSpec,
         *,
@@ -672,16 +718,11 @@ class Scheduler:
         if self._vm_manager is None or self._settings is None:
             raise _internal(_NOT_INITIALIZED)
 
-        # Resolve port mappings (allocate ephemeral ports for those without explicit external)
+        # Resolve port mappings (allocate ephemeral ports for those without explicit external;
+        # resolve_port_mappings logs them)
         resolved_ports: list[ExposedPort] = []
         if spec.expose_ports:
             resolved_ports = resolve_port_mappings(list(spec.expose_ports))
-            logger.info(
-                "Resolved port mappings",
-                extra={
-                    "ports": [(p.internal, p.external) for p in resolved_ports],
-                },
-            )
 
         # Validate packages against allowlist
         if spec.packages and self.config.enable_package_validation:
@@ -690,9 +731,33 @@ class Scheduler:
         # Check L2 snapshot cache for disk caching (only if packages specified)
         # Only use snapshots when packages need to be installed - empty packages case
         # benefits from overlay pool pre-caching which requires using the original base image
-        snapshot_path: Path | None = None
+        # The L2 layer is leased from its lookup on: admission (below) may evict cache
+        # entries for disk space, never this one. Each VM launch takes its own share.
+        snapshot: EntryLease | None = None
         if spec.packages:
-            snapshot_path = await self._get_or_create_snapshot(spec.language, list(spec.packages), spec.memory_mb)
+            snapshot = await self._get_or_create_snapshot(spec.language, list(spec.packages), spec.memory_mb)
+        try:
+            return await self._launch_for(
+                spec, task_id=task_id, on_boot_log=on_boot_log, snapshot=snapshot, resolved_ports=resolved_ports
+            )
+        finally:
+            if snapshot is not None:
+                snapshot.release()
+
+    async def _launch_for(
+        self,
+        spec: VmSpec,
+        *,
+        task_id: str,
+        on_boot_log: Callable[[str], None] | None,
+        snapshot: EntryLease | None,
+        resolved_ports: list[ExposedPort],
+    ) -> tuple[QemuVM, list[ExposedPort], bool, int]:
+        """_prepare_vm after the L2 lookup: warm pool, L1 restore or cold boot on `snapshot`."""
+        if self._vm_manager is None:
+            raise _internal(_NOT_INITIALIZED)
+        snapshot_path = snapshot.path if snapshot is not None else None
+        if snapshot_path is not None:
             logger.info(
                 "Snapshot ready",
                 extra={"snapshot_path": str(snapshot_path)},
@@ -711,69 +776,102 @@ class Scheduler:
             is_cold_boot = True
 
             # Base image must be on disk before the L1 cache key hashes it
-            # (compute_cache_key -> get_base_image) and before cold create_vm.
+            # (compute_cache_key -> VmManager.images.base_image) and before cold create_vm.
             # Skip when snapshot_path already fetched it.
             if self.config.auto_download_assets and not snapshot_path:
-                await fetch_base_image(spec.language)
+                await ensure_base_image(spec.language, images_dir=self._vm_manager.images.images_dir)
 
-            admission_start = asyncio.get_running_loop().time()
-            async with self._vm_manager.reservation_context(
-                spec, vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}"
-            ) as reservation:
-                admission_ms = round((asyncio.get_running_loop().time() - admission_start) * 1000)
-                # L1 key, once per request (it hashes the base image, kernel and L2 layer).
-                # It includes the network device (spec.has_network_device):
-                # expose_ports also adds a virtio-net device.
-                memory = self._memory_snapshot_manager
-                l1_key = await memory.compute_cache_key(spec, l2_path=snapshot_path) if memory else None
-                # L1 memory snapshot restore (~100ms)
-                # Skip when on_boot_log requested (L1 skips boot, callback would never fire).
-                if memory and l1_key and on_boot_log is None:
-                    vm = await memory.restore(
-                        spec,
-                        key=l1_key,
-                        tenant_id=constants.SCHEDULER_TENANT_ID,
-                        task_id=task_id,
-                        snapshot_drive=snapshot_path,
-                        expose_ports=resolved_ports if resolved_ports else None,
-                        reservation=reservation,
-                    )
-                    if vm is not None:
-                        logger.info(
-                            "VM restored from L1 cache",
-                            extra={"vm_id": vm.vm_id, "language": spec.language},
-                        )
-
-                # Cold boot fallback: L1 miss (or L1 skipped for a boot log)
-                if vm is None:
-                    vm = await self._vm_manager.create_vm(
-                        spec,
-                        tenant_id=constants.SCHEDULER_TENANT_ID,
-                        task_id=task_id,
-                        expose_ports=resolved_ports if resolved_ports else None,
-                        on_boot_log=on_boot_log,
-                        snapshot_drive=snapshot_path,
-                        reservation=reservation,
-                    )
-
-                    # Schedule background L1 save for next time
-                    if memory and l1_key:
-                        try:
-                            await memory.schedule_background_save(spec, key=l1_key, snapshot_drive=snapshot_path)
-                        except BaseException:
-                            # The caller never receives the newly-created VM when
-                            # post-acquisition scheduling is interrupted. Return
-                            # ownership to VmManager before propagating the error.
-                            await self._vm_manager.destroy_vm(vm)
-                            raise
+            # L1 key, once per request (it hashes the base image, kernel and L2 layer).
+            # It includes the network device (spec.has_network_device):
+            # expose_ports also adds a virtio-net device.
+            memory = self._memory_snapshot_manager
+            l1_key = await memory.compute_cache_key(spec, l2_path=snapshot_path) if memory else None
+            # The L1 entry is leased before admission, like the L2 layer: admission may evict
+            # cache entries for disk space, never these. Skipped when on_boot_log is requested
+            # (L1 skips boot, the callback would never fire).
+            l1_entry = await memory.lease(l1_key) if memory and l1_key and on_boot_log is None else None
+            try:
+                vm, admission_ms = await self._admit_and_launch(
+                    spec,
+                    task_id=task_id,
+                    on_boot_log=on_boot_log,
+                    snapshot=snapshot,
+                    l1_key=l1_key,
+                    l1_entry=l1_entry,
+                    resolved_ports=resolved_ports,
+                )
+            finally:
+                if l1_entry is not None:  # restore() releases it; this covers a failed admission
+                    l1_entry.release()
 
         return vm, resolved_ports, is_cold_boot, admission_ms
 
-    def _create_settings(self) -> Settings:
-        """Settings for this scheduler (after ensure_assets() has set self._images_dir)."""
-        if self._images_dir is None:
-            raise RuntimeError("_create_settings called before ensure_assets")
-        return settings_from_config(self.config, images_dir=self._images_dir)
+    async def _admit_and_launch(
+        self,
+        spec: VmSpec,
+        *,
+        task_id: str,
+        on_boot_log: Callable[[str], None] | None,
+        snapshot: EntryLease | None,
+        l1_key: str | None,
+        l1_entry: EntryLease | None,
+        resolved_ports: list[ExposedPort],
+    ) -> tuple[QemuVM, int]:
+        """_launch_for after a warm pool miss: admission, then an L1 restore of `l1_entry`
+        (taken over by restore) or a cold boot on `snapshot`. Returns the VM and the
+        admission time in ms."""
+        if self._vm_manager is None:
+            raise _internal(_NOT_INITIALIZED)
+        memory = self._memory_snapshot_manager
+        snapshot_path = snapshot.path if snapshot is not None else None
+        held = frozenset(lease.path for lease in (snapshot, l1_entry) if lease is not None)
+        admission_start = asyncio.get_running_loop().time()
+        async with self._vm_manager.reservation_context(
+            spec, vm_id=f"{constants.SCHEDULER_TENANT_ID}-{task_id}", held=held
+        ) as reservation:
+            admission_ms = round((asyncio.get_running_loop().time() - admission_start) * 1000)
+            vm: QemuVM | None = None
+            # L1 memory snapshot restore (~50-60 ms)
+            if memory and l1_entry is not None:
+                vm = await memory.restore(
+                    spec,
+                    entry=l1_entry,
+                    tenant_id=constants.SCHEDULER_TENANT_ID,
+                    task_id=task_id,
+                    snapshot_drive=snapshot,
+                    expose_ports=resolved_ports if resolved_ports else None,
+                    reservation=reservation,
+                )
+                if vm is not None:
+                    logger.info(
+                        "VM restored from L1 cache",
+                        extra={"vm_id": vm.vm_id, "language": spec.language},
+                    )
+
+            # Cold boot fallback: L1 miss (or L1 skipped for a boot log)
+            if vm is None:
+                vm = await self._vm_manager.create_vm(
+                    spec,
+                    tenant_id=constants.SCHEDULER_TENANT_ID,
+                    task_id=task_id,
+                    expose_ports=resolved_ports if resolved_ports else None,
+                    on_boot_log=on_boot_log,
+                    snapshot_drive=snapshot_path,
+                    cache_leases=(snapshot,) if snapshot is not None else (),
+                    reservation=reservation,
+                )
+
+                # Schedule background L1 save for next time
+                if memory and l1_key:
+                    try:
+                        await memory.schedule_background_save(spec, key=l1_key, snapshot_drive=snapshot)
+                    except BaseException:
+                        # The caller never receives the newly-created VM when
+                        # post-acquisition scheduling is interrupted. Return
+                        # ownership to VmManager before propagating the error.
+                        await self._vm_manager.destroy_vm(vm)
+                        raise
+        return vm, admission_ms
 
     async def _validate_packages(self, packages: list[str], language: Language) -> None:
         """Validate packages against allowlist.
@@ -792,7 +890,7 @@ class Scheduler:
             self._package_validator = await PackageValidator.create()
         self._package_validator.validate(packages, language)
 
-    async def _get_or_create_snapshot(self, language: Language, packages: list[str], memory_mb: int) -> Path:
+    async def _get_or_create_snapshot(self, language: Language, packages: list[str], memory_mb: int) -> EntryLease:
         """Get cached snapshot or create new one with packages.
 
         Checks L2 (local qcow2) and L3 (S3) caches before building.
@@ -803,7 +901,7 @@ class Scheduler:
             memory_mb: VM memory in MB of the VM that builds the snapshot (not in the cache key)
 
         Returns:
-            Path to snapshot qcow2.
+            A lease on the snapshot qcow2 (lease.path): the caller releases it.
 
         Raises:
             InternalError: INTERNAL: snapshot manager not configured.
@@ -814,11 +912,13 @@ class Scheduler:
             raise _internal("Packages requested but snapshot manager is not configured")
 
         # Ensure base image is on disk before computing snapshot cache key
-        # (_compute_cache_key hashes the base image file via get_base_image() glob)
+        # (_compute_cache_key hashes the base image that VmManager.images names)
         if self.config.auto_download_assets:
-            await fetch_base_image(language)
+            if self._vm_manager is None:
+                raise _internal(_NOT_INITIALIZED)
+            await ensure_base_image(language, images_dir=self._vm_manager.images.images_dir)
 
-        snapshot_path = await self._snapshot_manager.get_or_create_snapshot(
+        snapshot = await self._snapshot_manager.get_or_create_snapshot(
             language=language,
             packages=packages,
             tenant_id=constants.SCHEDULER_TENANT_ID,
@@ -830,10 +930,10 @@ class Scheduler:
             extra={
                 "language": language,
                 "packages": packages,
-                "path": str(snapshot_path),
+                "path": str(snapshot.path),
             },
         )
-        return snapshot_path
+        return snapshot
 
 
 def _startup_timing(vm: QemuVM, *, is_cold_boot: bool, total_ms: int, admission_ms: int) -> StartupTiming:
@@ -842,7 +942,7 @@ def _startup_timing(vm: QemuVM, *, is_cold_boot: bool, total_ms: int, admission_
     def cold(value: int | None) -> int:
         return value if is_cold_boot and value is not None else 0
 
-    boot_ms = cold(vm.boot_ms)
+    boot_ms = cold(vm.timing.boot_ms)
     return StartupTiming(
         total_ms=total_ms,
         admission_ms=admission_ms,
@@ -852,12 +952,12 @@ def _startup_timing(vm: QemuVM, *, is_cold_boot: bool, total_ms: int, admission_
         warm_pool_hit=not is_cold_boot,
         l1_cache_hit=vm.l1_restored,
         # setup_ms of an L1-restored VM is its restore time
-        l1_restore_ms=vm.setup_ms if vm.l1_restored else None,
-        overlay_ms=cold(vm.overlay_ms),
-        qemu_cmd_build_ms=cold(vm.qemu_cmd_build_ms),
-        gvproxy_start_ms=cold(vm.gvproxy_start_ms),
-        qemu_fork_ms=cold(vm.qemu_fork_ms),
-        guest_wait_ms=cold(vm.guest_wait_ms),
+        l1_restore_ms=vm.timing.setup_ms if vm.l1_restored else None,
+        overlay_ms=cold(vm.timing.overlay_ms),
+        qemu_cmd_build_ms=cold(vm.timing.qemu_cmd_build_ms),
+        gvproxy_start_ms=cold(vm.timing.gvproxy_start_ms),
+        qemu_fork_ms=cold(vm.timing.qemu_fork_ms),
+        guest_wait_ms=cold(vm.timing.guest_wait_ms),
         boot_retries=cold(vm.timing.boot_retries),
         instance_load_ms=None,
     )
@@ -871,14 +971,12 @@ def settings_from_config(config: SchedulerConfig, *, images_dir: Path) -> Settin
     The config is valid already, so what Settings refuses comes from the variables:
     ConfigError SETTING_INVALID (_invalid_variables).
     """
-    # Kernels may be in images_dir directly or in a kernels subdirectory
-    kernels_subdir = images_dir / "kernels"
-    kernel_path = kernels_subdir if kernels_subdir.exists() else images_dir
     bridged = SchedulerConfig.model_fields.keys() & Settings.model_fields.keys()
     try:
         return Settings(
             base_images_dir=images_dir,
-            kernel_path=kernel_path,
+            kernel_path=kernel_dir_of(images_dir, arch=arch_of(get_current_arch())),  # kernels/ when it has the files
+            base_images_download_dir=images_download_dir(),
             **config.model_dump(include=bridged, exclude_unset=True),
         )
     except ValidationError as e:

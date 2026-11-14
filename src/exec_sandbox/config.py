@@ -1,7 +1,5 @@
-"""Scheduler configuration for exec-sandbox.
-
-SchedulerConfig provides all configuration options for the Scheduler,
-including VM pool settings, resource limits, paths, the S3 cache and saved instances.
+"""SchedulerConfig: the settings of a Scheduler (warm pool, timeouts, admission
+budgets, folders, S3, saved instances). What a VM is made of is in VmSpec.
 
 Example:
     ```python
@@ -9,8 +7,8 @@ Example:
 
     # Default configuration
     async with Scheduler() as scheduler:
-        async with await scheduler.new(VmSpec(language="python")) as vm:
-            result = await vm.exec("print('hello')")
+        async with await scheduler.new(VmSpec(language="python")) as session:
+            result = await session.exec("print('hello')")
 
     # Custom configuration (VM sizes live in VmSpec, not here)
     config = SchedulerConfig(warm_pool_size=2, s3_bucket="my-snapshots")
@@ -36,7 +34,7 @@ MAX_SESSION_IDLE_TIMEOUT_SECONDS: Final[int] = 3600
 
 
 class SchedulerConfig(BaseModel):
-    """Configuration for Scheduler.
+    """Settings of a Scheduler, for all its VMs.
 
     A field that you do not set in code takes its value from EXEC_SANDBOX_<FIELD>
     (the field name in capitals); a value set in code wins. Six fields read no such
@@ -54,7 +52,7 @@ class SchedulerConfig(BaseModel):
         images_dir: Folder of the VM images (qcow2, kernels).
             If None, exec-sandbox looks in this order:
             - EXEC_SANDBOX_IMAGES_DIR env var
-            - ./images/dist/ (local build)
+            - images/dist/ of a clone of the repository (a local build)
             - OS-specific cache folder / v<version>/ (download cache; macOS:
               ~/Library/Caches/exec-sandbox/, Linux: ~/.cache/exec-sandbox/)
         disk_snapshot_cache_dir: Folder of the L2 cache (disk snapshots).
@@ -69,8 +67,9 @@ class SchedulerConfig(BaseModel):
         s3_snapshot_prefix: Key prefix of the L3 cache. Default: "snapshots/".
         s3_instance_prefix: Key prefix of saved instances. Default: "instances/".
         max_concurrent_s3_uploads: Max concurrent background S3 uploads. Default: 128.
-        memory_overcommit_ratio, cpu_overcommit_ratio, host_memory_reserve_ratio,
-            host_cpu_reserve_cores: Admission budgets (see each field's description).
+        memory_overcommit_ratio, cpu_overcommit_ratio, disk_overcommit_ratio,
+            host_memory_reserve_ratio, host_cpu_reserve_cores: Admission budgets (see
+            each field's description).
         enable_package_validation: Check packages against the allow-list.
             Turn it off for tests only. Default: True.
         auto_download_assets: Download the VM images from GitHub Releases, into
@@ -105,9 +104,9 @@ class SchedulerConfig(BaseModel):
 
     # Defaults for Session.exec()
     default_timeout_seconds: int = Field(
-        default=30,
+        default=constants.DEFAULT_TIMEOUT_SECONDS,
         ge=1,
-        le=300,
+        le=constants.MAX_TIMEOUT_SECONDS,
         description="Default execution timeout in seconds",
     )
     session_idle_timeout_seconds: int = Field(
@@ -123,17 +122,17 @@ class SchedulerConfig(BaseModel):
         description="Folder of the VM images (None: found automatically)",
     )
     disk_snapshot_cache_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "disk-snapshots",
+        default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "disk-snapshots",
         description="Folder of the L2 cache (disk snapshots)",
     )
     memory_snapshot_cache_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") / "memory-snapshots",
+        default_factory=lambda: get_user_dir(kind=UserDir.CACHE) / "memory-snapshots",
         description="Folder of the L1 cache (memory snapshots)",
     )
     # S3: one bucket for the L3 snapshot cache and for the "s3" instance store, each under its prefix
     s3_bucket: str | None = Field(
         default=None,
-        description='S3 bucket of the L3 cache and the "s3" instance store (None disables the L3 cache)',
+        description='S3 bucket of the L3 snapshot cache and the "s3" instance store (None turns the L3 snapshot cache off)',
     )
     s3_region: str = Field(
         default="us-east-1",
@@ -171,6 +170,12 @@ class SchedulerConfig(BaseModel):
         le=20.0,
         description="CPU overcommit ratio. Effective budget = (host_cpus - reserve) * ratio",
     )
+    disk_overcommit_ratio: float = Field(
+        default=constants.DEFAULT_DISK_OVERCOMMIT_RATIO,
+        ge=1.0,
+        le=64.0,
+        description="Home disk overcommit ratio. Each VM reserves (disk_mb - written) / ratio of free disk",
+    )
     host_memory_reserve_ratio: float = Field(
         default=constants.DEFAULT_HOST_MEMORY_RESERVE_RATIO,
         ge=0.01,
@@ -199,7 +204,7 @@ class SchedulerConfig(BaseModel):
         description='Store of saved instances: "s3" (s3_bucket) or "local" (instance_store_dir); None turns them off',
     )
     instance_store_dir: Path = Field(
-        default_factory=lambda: get_user_dir(kind=UserDir.DATA, app_name="exec-sandbox") / "instances",
+        default_factory=lambda: get_user_dir(kind=UserDir.DATA) / "instances",
         description='Root folder of the "local" instance store',
     )
     instance_keyring: SecretStr | None = Field(
