@@ -25,8 +25,8 @@ from .conftest import skip_unless_hwaccel
 # =============================================================================
 # Payload size fixtures - from tiny to max stdout limit
 # =============================================================================
-# IMPORTANT: stdout is limited to 1,000,000 bytes (1MB decimal).
-# Tests for larger payloads must use streaming callbacks.
+# IMPORTANT: stdout is limited to 1,000,000 bytes (1MB decimal), also with streaming
+# callbacks: a larger output fails with InvalidInputError OUTPUT_LIMIT.
 
 PAYLOAD_SIZES = {
     "tiny": 1,  # 1 byte
@@ -39,20 +39,10 @@ PAYLOAD_SIZES = {
     "1mb": 1_000_000,  # 1 MB (exactly at guest-agent limit, not exceeding)
 }
 
-# Large sizes that exceed the guest-agent stdout limit (InvalidInputError OUTPUT_LIMIT expected)
-STREAMING_ONLY_SIZES = {
-    "2mb": 2_000_000,  # 2 MB
-    "5mb": 5_000_000,  # 5 MB
-    "10mb": 10_000_000,  # 10 MB
-    "25mb": 25_000_000,  # 25 MB
-    "50mb": 50_000_000,  # 50 MB
-    "100mb": 100_000_000,  # 100 MB
-    "200mb": 200_000_000,  # 200 MB
-    "500mb": 500_000_000,  # 500 MB
-}
+# An output 500 times the guest-agent stdout limit (InvalidInputError OUTPUT_LIMIT expected)
+OVER_THE_LIMIT_SIZE = 500_000_000  # 500 MB
 
-# Extra large sizes need longer timeout (generation + transfer time)
-# 500MB needs significant time for generation
+# The bound of the over-the-limit run: the guest would need it to generate the whole 500MB
 EXTRA_LARGE_TIMEOUT_SECONDS = 300
 
 # Throughput thresholds (MiB/s) - CI runners have variable I/O performance,
@@ -80,13 +70,6 @@ def medium_payload_size(request: pytest.FixtureRequest) -> tuple[str, int]:
     """Fixture for medium payloads (under stdout limit)."""
     name = request.param
     return name, PAYLOAD_SIZES[name]
-
-
-@pytest.fixture(params=list(STREAMING_ONLY_SIZES.keys()))
-def streaming_payload_size(request: pytest.FixtureRequest) -> tuple[str, int]:
-    """Fixture for large payloads (streaming only - exceed stdout limit)."""
-    name = request.param
-    return name, STREAMING_ONLY_SIZES[name]
 
 
 # =============================================================================
@@ -198,9 +181,7 @@ class TestPythonPayloadIntegrity:
 
         assert result.exit_code == 0, f"[{size_name}] Execution failed: {result.stderr}"
 
-        # Strip trailing newline (runtime may add one)
-        stdout = result.stdout.rstrip("\n")
-        actual_data = stdout.encode("utf-8")
+        actual_data = result.stdout.encode("utf-8")  # the code writes no newline: none comes
         actual_hash = hashlib.sha256(actual_data).hexdigest()
 
         assert len(actual_data) == size_bytes, f"[{size_name}] Size mismatch: {len(actual_data)} vs {size_bytes}"
@@ -231,8 +212,7 @@ class TestPythonStreamingIntegrity:
 
         assert result.exit_code == 0
 
-        # Verify streamed data (strip trailing newline)
-        streamed_data = "".join(streamed_chunks).rstrip("\n").encode("utf-8")
+        streamed_data = "".join(streamed_chunks).encode("utf-8")
         streamed_hash = hashlib.sha256(streamed_data).hexdigest()
 
         assert len(streamed_data) == size_bytes, f"[{size_name}] Streamed size: {len(streamed_data)} vs {size_bytes}"
@@ -242,7 +222,7 @@ class TestPythonStreamingIntegrity:
         )
 
         # Verify final result matches streamed
-        final_hash = hashlib.sha256(result.stdout.rstrip("\n").encode("utf-8")).hexdigest()
+        final_hash = hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
         assert final_hash == streamed_hash, f"[{size_name}] Final vs streamed mismatch!"
 
 
@@ -265,8 +245,7 @@ class TestJavaScriptPayloadIntegrity:
 
         assert result.exit_code == 0, f"[JS-{size_name}] Execution failed: {result.stderr}"
 
-        # Strip trailing newline (runtime may add one)
-        stdout = result.stdout.rstrip("\n")
+        stdout = result.stdout  # the code writes no newline: none comes
         actual_hash = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
 
         assert len(stdout) == size_bytes, f"[JS-{size_name}] Size: {len(stdout)} vs {size_bytes}"
@@ -315,57 +294,6 @@ sys.stdout.flush()
 
 
 # =============================================================================
-# VM-computed hash verification
-# =============================================================================
-
-
-class TestVMHashVerification:
-    """Verify VM can compute matching hashes."""
-
-    async def test_vm_hash_matches_host(self, scheduler: Scheduler, small_payload_size: tuple[str, int]) -> None:
-        """VM computes same hash as host for same data."""
-        size_name, size_bytes = small_payload_size
-
-        expected_data = generate_ascii_pattern(size_bytes)
-        expected_hash = hashlib.sha256(expected_data).hexdigest()
-
-        code = f"""
-import hashlib
-import sys
-
-chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-size = {size_bytes}
-data = "".join(chars[i % len(chars)] for i in range(size))
-
-vm_hash = hashlib.sha256(data.encode("utf-8")).hexdigest()
-print(f"VMHASH:{{vm_hash}}")
-print(f"SIZE:{{len(data)}}")
-sys.stdout.write(data)
-sys.stdout.flush()
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=TIMEOUT_SECONDS)
-
-        assert result.exit_code == 0
-
-        lines = result.stdout.split("\n", 2)
-        assert len(lines) >= 3
-
-        vm_hash = lines[0].split(":")[1]
-        # Strip trailing newline from data portion
-        received_data = lines[2].rstrip("\n")
-
-        # VM computed same hash as us?
-        assert vm_hash == expected_hash, (
-            f"[{size_name}] VM hash differs from expected!\nVM: {vm_hash}\nExpected: {expected_hash}"
-        )
-
-        # Data we received matches?
-        host_hash = hashlib.sha256(received_data.encode("utf-8")).hexdigest()
-        assert host_hash == expected_hash, f"[{size_name}] Received data corrupted in transit!"
-
-
-# =============================================================================
 # RAW/Shell payload integrity
 # =============================================================================
 
@@ -394,8 +322,7 @@ class TestRawPayloadIntegrity:
 
         assert result.exit_code == 0
 
-        # Strip trailing newline (shell may add one)
-        stdout = result.stdout.rstrip("\n")
+        stdout = result.stdout  # head -c ends the output with no newline
         actual_hash = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
 
         assert len(stdout) == count, f"[RAW-{count}] Size: {len(stdout)} vs {count}"
@@ -404,29 +331,25 @@ class TestRawPayloadIntegrity:
 
 
 # =============================================================================
-# Large Payload Streaming Tests (1MB - 500MB)
+# Output over the stdout limit
 # =============================================================================
-# NOTE: Payloads >= 1MB exceed stdout limit, so we use streaming callbacks.
 
 
-class TestLargePayloadStreaming:
-    """Large payload streaming tests (1MB - 500MB).
-
-    All sizes exceed the guest-agent's 1MB stdout limit (MAX_STDOUT_BYTES),
-    so these verify that InvalidInputError OUTPUT_LIMIT is raised correctly.
+class TestOutputOverTheLimit:
+    """An output far over the guest-agent's 1MB stdout limit (MAX_STDOUT_BYTES) fails the exec
+    with InvalidInputError OUTPUT_LIMIT. An output just over it, and its callbacks:
+    test_streaming.py::TestStreamingBoundaries::test_stdout_exceeds_max_raises_output_limit.
     """
 
-    async def test_streaming_integrity(self, scheduler: Scheduler, streaming_payload_size: tuple[str, int]) -> None:
-        """Verify InvalidInputError OUTPUT_LIMIT is raised for payloads exceeding 1MB stdout limit."""
-        _size_name, size_bytes = streaming_payload_size
-
-        code = python_code_for_ascii_pattern(size_bytes)
-
-        # Use longer timeout for extra large payloads (25MB+)
-        timeout = EXTRA_LARGE_TIMEOUT_SECONDS if size_bytes >= 25_000_000 else TIMEOUT_SECONDS
+    async def test_output_over_the_limit_is_output_limit(self, scheduler: Scheduler) -> None:
+        """A 500MB output fails the exec with InvalidInputError OUTPUT_LIMIT (the guest stops it
+        at the limit: the size of the output does not matter)."""
+        code = python_code_for_ascii_pattern(OVER_THE_LIMIT_SIZE)
 
         with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT):
-            await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=timeout)
+            await run_once(
+                scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=EXTRA_LARGE_TIMEOUT_SECONDS
+            )
 
 
 # =============================================================================
@@ -533,13 +456,14 @@ class TestStreamingStress:
 
             assert result.exit_code == 0, f"Iteration {i} failed: {result.stderr}"
 
-            streamed_data = "".join(chunks).rstrip("\n").encode("utf-8")
+            streamed_data = "".join(chunks).encode("utf-8")
             actual_hash = hashlib.sha256(streamed_data).hexdigest()
 
             assert actual_hash == expected_hash, f"Iteration {i} corrupted!"
 
     async def test_interleaved_stdout_stderr(self, scheduler: Scheduler) -> None:
-        """Test rapid interleaving of stdout and stderr streams."""
+        """Rapid interleaving of stdout and stderr: the callbacks and the result get each line
+        of each stream once, in order."""
         # Generate alternating stdout/stderr output
         code = """
 import sys
@@ -565,12 +489,9 @@ for i in range(1000):
 
         assert result.exit_code == 0, f"Interleave test failed: {result.stderr}"
 
-        # Verify all lines present (order may vary due to buffering)
+        # Each stream keeps all its lines, in order (the two streams interleave in any order)
         stdout_full = "".join(stdout_chunks)
         stderr_full = "".join(stderr_chunks)
-
-        stdout_lines = [line for line in stdout_full.strip().split("\n") if line]
-        stderr_lines = [line for line in stderr_full.strip().split("\n") if line]
-
-        assert len(stdout_lines) == 1000, f"Missing stdout lines: {len(stdout_lines)}"
-        assert len(stderr_lines) == 1000, f"Missing stderr lines: {len(stderr_lines)}"
+        assert stdout_full == "".join(f"OUT{i:04d}\n" for i in range(1000))
+        assert stderr_full == "".join(f"ERR{i:04d}\n" for i in range(1000))
+        assert (result.stdout, result.stderr) == (stdout_full, stderr_full)

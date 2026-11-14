@@ -52,14 +52,6 @@ class TestPathEdgeCases:
             await session.read_file("日本語.txt", destination=dest)
             assert dest.read_bytes() == b"konnichiwa"
 
-    async def test_deeply_nested_mkdir_p(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Deeply nested path creates intermediate directories."""
-        dest = tmp_path / "deep.txt"
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("a/b/c/d/deep.txt", b"deep")
-            await session.read_file("a/b/c/d/deep.txt", destination=dest)
-            assert dest.read_bytes() == b"deep"
-
     async def test_guest_code_can_add_files_to_folders_a_write_made(self, scheduler: Scheduler) -> None:
         """write_file("out/sub/a.txt") makes out/ and out/sub/ for the sandbox user, as the file
         itself: guest code can then add files to them (they are not root's)."""
@@ -113,47 +105,11 @@ class TestPathEdgeCases:
 class TestContentEdgeCases:
     """Edge cases for file content."""
 
-    async def test_empty_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Empty file write/read roundtrip."""
-        dest = tmp_path / "empty.txt"
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("empty.txt", b"")
-            await session.read_file("empty.txt", destination=dest)
-            assert dest.read_bytes() == b""
-
-    async def test_single_byte(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Single byte write/read roundtrip."""
-        dest = tmp_path / "one.bin"
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("one.bin", b"\x42")
-            await session.read_file("one.bin", destination=dest)
-            assert dest.read_bytes() == b"\x42"
-
-    async def test_overwrite_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Second write overwrites first content."""
-        dest = tmp_path / "overwrite.txt"
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("overwrite.txt", b"first")
-            await session.write_file("overwrite.txt", b"second")
-            await session.read_file("overwrite.txt", destination=dest)
-            assert dest.read_bytes() == b"second"
-
     async def test_read_nonexistent_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Reading nonexistent file raises error."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.GUEST_IO):
                 await session.read_file("does_not_exist.txt", destination=tmp_path / "out.bin")
-
-    async def test_make_executable(self, scheduler: Scheduler) -> None:
-        """make_executable=True allows execution of the file."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            script = b"#!/bin/sh\necho 'script ran'"
-            await session.write_file("run.sh", script, make_executable=True)
-            result = await session.exec(
-                "import subprocess; print(subprocess.check_output(['/home/user/run.sh']).decode())"
-            )
-            assert result.exit_code == 0
-            assert "script ran" in result.stdout
 
     async def test_oversized_content_rejected(self, scheduler: Scheduler) -> None:
         """Content exceeding MAX_FILE_SIZE_BYTES is rejected at the Session level (ARGUMENT_INVALID)."""
@@ -235,7 +191,7 @@ class TestFileIoSessionLifecycle:
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("early.txt", b"early bird")
             result = await session.exec("print(open('early.txt').read())")
-            assert "early bird" in result.stdout
+            assert (result.exit_code, result.stdout) == (0, "early bird\n"), result.stderr
 
     async def test_file_persists_across_execs(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Files written persist across multiple exec calls."""
@@ -253,8 +209,7 @@ class TestFileIoSessionLifecycle:
             await session.write_file("data.txt", b"42")
             await session.exec("x = 100")
             result = await session.exec("print(x + int(open('data.txt').read()))")
-            assert result.exit_code == 0
-            assert "142" in result.stdout
+            assert (result.exit_code, result.stdout) == (0, "142\n"), result.stderr
 
 
 # ============================================================================
@@ -274,26 +229,6 @@ class TestListFiles:
             assert result.exit_code == 0, result.stderr
             assert [f.name for f in files] == json.loads(result.stdout)
 
-    async def test_list_after_writes(self, scheduler: Scheduler) -> None:
-        """list_files shows written files."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("a.txt", b"a")
-            await session.write_file("b.txt", b"bb")
-            files = await session.list_files()
-            names = {f.name for f in files}
-            assert "a.txt" in names
-            assert "b.txt" in names
-
-    async def test_list_subdirectory(self, scheduler: Scheduler) -> None:
-        """list_files on a subdirectory."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("subdir/x.txt", b"x")
-            await session.write_file("subdir/y.txt", b"yy")
-            files = await session.list_files("subdir")
-            names = {f.name for f in files}
-            assert "x.txt" in names
-            assert "y.txt" in names
-
     async def test_list_nonexistent_directory(self, scheduler: Scheduler) -> None:
         """list_files on nonexistent directory raises error."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -301,19 +236,15 @@ class TestListFiles:
                 await session.list_files("does_not_exist")
 
     async def test_file_info_fields(self, scheduler: Scheduler) -> None:
-        """FileInfo has correct name, is_dir, and size fields."""
+        """FileInfo has the name, is_dir and size of each entry: a written file of 5 bytes, and a
+        folder that guest code made (size 0)."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("info_test.txt", b"hello")
             await session.exec("import os; os.makedirs('/home/user/info_dir', exist_ok=True)")
             files = await session.list_files()
-            file_map = {f.name: f for f in files}
+            file_map = {f.name: (f.is_dir, f.size) for f in files}
 
-            assert "info_test.txt" in file_map
-            assert file_map["info_test.txt"].is_dir is False
-            assert file_map["info_test.txt"].size == 5
-
-            assert "info_dir" in file_map
-            assert file_map["info_dir"].is_dir is True
+            assert (file_map["info_test.txt"], file_map["info_dir"]) == ((False, 5), (True, 0))
 
 
 # ============================================================================
@@ -351,21 +282,13 @@ class TestListFilesSparseDefense:
             file_map = {f.name: f for f in files}
             assert file_map["empty.txt"].size == 0
 
-    async def test_directory_size_zero(self, scheduler: Scheduler) -> None:
-        """Directories report size 0."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.exec("import os; os.makedirs('/home/user/mydir', exist_ok=True)")
-            files = await session.list_files()
-            file_map = {f.name: f for f in files}
-            assert file_map["mydir"].size == 0
-
     # --- Edge cases: sparse files are deflated ---
 
     async def test_partially_written_sparse_file(self, scheduler: Scheduler) -> None:
         """Partially written sparse file reports actual data size, not apparent size.
 
-        Write 4KB at offset 0, then truncate to 1MB. Only the 4KB should be
-        reflected (blocks*512 >= 4096, apparent size = 1MB, min = 4096).
+        Write 4KB at offset 0, then truncate to 1MB: one 4 KiB block of the home disk (ext4),
+        so min(len, blocks * 512) = min(1 MiB, 4096) = 4096.
         """
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
@@ -380,14 +303,12 @@ print(f'BLOCKS:{s.st_blocks}')
 print(f'ACTUAL:{s.st_blocks * 512}')
 """
             r = await session.exec(code)
-            assert r.exit_code == 0
-            assert "APPARENT:1048576" in r.stdout  # 1MB apparent
+            assert (r.exit_code, r.stdout) == (0, "APPARENT:1048576\nBLOCKS:8\nACTUAL:4096\n"), r.stderr
 
             files = await session.list_files()
             file_map = {f.name: f for f in files}
-            # Should report actual data (~4KB), NOT apparent (1MB)
-            assert file_map["partial"].size <= 8192  # At most 2 pages
-            assert file_map["partial"].size >= 4096  # At least the written data
+            # The data (one 4 KiB ext4 block), not the apparent 1 MiB
+            assert file_map["partial"].size == 4096
 
     async def test_one_byte_file_reports_one(self, scheduler: Scheduler) -> None:
         """1-byte file reports size 1 (not inflated to block size).
@@ -432,7 +353,8 @@ for i in range(10):
                 assert file_map[name].size == 0, f"{name} should report 0, got {file_map[name].size}"
 
     async def test_sparse_then_fill_reports_real_size(self, scheduler: Scheduler) -> None:
-        """Create sparse file, then write real data — size should reflect real data."""
+        """A sparse file opened again with 'wb' (truncated to 0) and filled with 50,000 bytes
+        reports exactly 50,000: all of its blocks hold data."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
 import os
@@ -446,10 +368,7 @@ with open('/home/user/fill_me', 'wb') as f:
             await session.exec(code)
             files = await session.list_files()
             file_map = {f.name: f for f in files}
-            # After writing 50KB of real data, size should reflect actual usage
-            assert file_map["fill_me"].size >= 50000
-            # But not the 1MB apparent size (file was truncated down by the write)
-            assert file_map["fill_me"].size <= 100000
+            assert file_map["fill_me"].size == 50000
 
     # --- Out of bounds: extreme sparse files ---
 
@@ -470,9 +389,7 @@ print(f'APPARENT:{s.st_size}')
 print(f'BLOCKS:{s.st_blocks}')
 """
             r = await session.exec(code)
-            assert r.exit_code == 0
-            assert "APPARENT:107374182400" in r.stdout
-            assert "BLOCKS:0" in r.stdout
+            assert (r.exit_code, r.stdout) == (0, "APPARENT:107374182400\nBLOCKS:0\n"), r.stderr
 
             files = await session.list_files()
             file_map = {f.name: f for f in files}
@@ -543,7 +460,7 @@ class TestWriteAbortRecovery:
             op_id = uuid4().hex
 
             # Register op so we can receive the error response
-            op_queue = await channel.register_op(op_id)
+            op_queue = channel.register_op(op_id)
 
             try:
                 # Send header
@@ -571,12 +488,11 @@ class TestWriteAbortRecovery:
                     f"Expected error response, got {type(response).__name__}"
                 )
             finally:
-                await channel.unregister_op(op_id)
+                channel.unregister_op(op_id)
 
             # Verify no file at the final path
             result = await session.exec("import os; print(os.path.exists('/home/user/bad_chunk.bin'))")
-            assert result.exit_code == 0
-            assert "False" in result.stdout, "Partial file exists after invalid chunk — cleanup failed"
+            assert (result.exit_code, result.stdout) == (0, "False\n"), "a partial file stayed at the final path"
 
     async def test_source_read_failure_writes_nothing_and_keeps_the_session(self, scheduler: Scheduler) -> None:
         """The local source fails after the header and the first chunks: write_file closes the
@@ -600,8 +516,9 @@ class TestWriteAbortRecovery:
             assert source.tell() == 0  # set back: the same call can run again
 
             result = await session.exec("import os; print(os.path.exists('/home/user/partial.bin'))")
-            assert result.exit_code == 0
-            assert "False" in result.stdout, "the guest committed a write that never got file_end"
+            assert (result.exit_code, result.stdout) == (0, "False\n"), (
+                "the guest committed a write that never got file_end"
+            )
 
             await session.write_file("partial.bin", io.BytesIO(content))
             read_back = io.BytesIO()

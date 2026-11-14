@@ -81,73 +81,54 @@ class TestFileContentTypes:
     async def test_ascii_roundtrip(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Plain ASCII text survives roundtrip."""
         content = b"Hello, World! The quick brown fox jumps over the lazy dog. 0123456789"
-        expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("ascii.txt", content)
             await session.read_file("ascii.txt", destination=tmp_path / "ascii.txt")
 
-        result = (tmp_path / "ascii.txt").read_bytes()
-        assert result == content
-        assert hashlib.sha256(result).hexdigest() == expected_hash
+        assert (tmp_path / "ascii.txt").read_bytes() == content
 
     async def test_utf8_emoji_and_cjk(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """UTF-8 content with emoji and CJK characters survives roundtrip."""
         text = "Hello World cafe\u0301 \u00f1 \u4f60\u597d \U0001f389\U0001f680\U0001f30d \u3053\u3093\u306b\u3061\u306f \ud55c\uad6d\uc5b4"
         content = text.encode("utf-8")
-        expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("utf8.txt", content)
             await session.read_file("utf8.txt", destination=tmp_path / "utf8.txt")
 
-        result = (tmp_path / "utf8.txt").read_bytes()
-        assert result == content
-        assert hashlib.sha256(result).hexdigest() == expected_hash
+        assert (tmp_path / "utf8.txt").read_bytes() == content
 
     async def test_null_bytes_in_content(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Content containing null bytes survives roundtrip."""
         content = b"before\x00middle\x00\x00after\x00"
-        expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("nulls.bin", content)
             await session.read_file("nulls.bin", destination=tmp_path / "nulls.bin")
 
-        result = (tmp_path / "nulls.bin").read_bytes()
-        assert result == content
-        assert hashlib.sha256(result).hexdigest() == expected_hash
+        assert (tmp_path / "nulls.bin").read_bytes() == content
 
     async def test_all_256_byte_values(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """All 256 possible byte values survive roundtrip."""
         content = bytes(range(256))
-        expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("all_bytes.bin", content)
             await session.read_file("all_bytes.bin", destination=tmp_path / "all_bytes.bin")
 
-        result = (tmp_path / "all_bytes.bin").read_bytes()
-        assert result == content
-        assert len(result) == 256
-        assert hashlib.sha256(result).hexdigest() == expected_hash
+        assert (tmp_path / "all_bytes.bin").read_bytes() == content
 
     async def test_newline_variants_survive(self, scheduler: Scheduler, tmp_path: Path) -> None:
         r"""Various newline styles (\n, \r\n, \r) survive roundtrip unchanged."""
         content = b"unix\nwindows\r\nold-mac\rtrailing\n"
-        expected_hash = hashlib.sha256(content).hexdigest()
 
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("newlines.txt", content)
             await session.read_file("newlines.txt", destination=tmp_path / "newlines.txt")
 
-        result = (tmp_path / "newlines.txt").read_bytes()
-        assert result == content
-        assert hashlib.sha256(result).hexdigest() == expected_hash
-        # Verify no newline translation occurred
-        assert b"\n" in result
-        assert b"\r\n" in result
-        assert b"\rtrailing" in result
+        # Byte-equal: no newline translation
+        assert (tmp_path / "newlines.txt").read_bytes() == content
 
 
 # =============================================================================
@@ -197,7 +178,7 @@ class TestCrossOperationVerification:
             )
 
             assert result.exit_code == 0
-            assert expected_hash in result.stdout
+            assert result.stdout == expected_hash + "\n"
 
 
 # =============================================================================
@@ -207,22 +188,6 @@ class TestCrossOperationVerification:
 
 class TestFileIoBasicOperations:
     """Basic file I/O operations: list, subdirectory, overwrite, executable."""
-
-    async def test_write_and_list(self, scheduler: Scheduler) -> None:
-        """Written file appears in list_files output."""
-        content = b"listed content"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("listed.txt", content)
-            entries = await session.list_files()
-
-        names = [e.name for e in entries]
-        assert "listed.txt" in names
-
-        # Verify the entry metadata
-        entry = next(e for e in entries if e.name == "listed.txt")
-        assert entry.is_dir is False
-        assert entry.size == len(content)
 
     async def test_write_to_subdirectory(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Writing to a subdirectory path creates intermediate directories."""
@@ -242,9 +207,7 @@ class TestFileIoBasicOperations:
             await session.write_file("mydir/b.txt", b"bb")
             entries = await session.list_files("mydir")
 
-        names = sorted(e.name for e in entries)
-        assert "a.txt" in names
-        assert "b.txt" in names
+        assert sorted((e.name, e.is_dir, e.size) for e in entries) == [("a.txt", False, 3), ("b.txt", False, 2)]
 
     async def test_overwrite_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Overwriting a file replaces its content entirely."""
@@ -267,5 +230,5 @@ class TestFileIoBasicOperations:
                 "import subprocess; print(subprocess.check_output('/home/user/run.sh').decode(), end='')"
             )
 
-            assert result.exit_code == 0
-            assert "EXEC_OK" in result.stdout
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout == "EXEC_OK\n"

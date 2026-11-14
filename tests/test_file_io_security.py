@@ -28,12 +28,13 @@ FILESYSTEM_TRAVERSAL_VECTORS = [
 # Web-encoding vectors (from fuzzdb) — these use URL encoding, backslash
 # substitution, or dot-stuffing to bypass web-layer path filters. On a Unix
 # filesystem they are treated as LITERAL filenames (no server-side decode),
-# so write_file succeeds harmlessly but read_file fails (file not found).
-WEB_ENCODING_VECTORS = [
-    "....//....//etc/passwd",  # 4 dots = normal filename, not ".."
-    "..%2f..%2fetc/passwd",  # "%2f" is literal, not "/"
-    "..\\..\\etc\\passwd",  # backslash is valid filename char on Unix
-]
+# so write_file makes a file under /home/user, but read_file of a file never
+# written fails (file not found). Each maps to the real path of that file.
+WEB_ENCODING_VECTORS = {
+    "....//....//etc/passwd": "/home/user/..../..../etc/passwd",  # 4 dots = normal filename, not ".."
+    "..%2f..%2fetc/passwd": "/home/user/..%2f..%2fetc/passwd",  # "%2f" is literal, not "/"
+    "..\\..\\etc\\passwd": "/home/user/..\\..\\etc\\passwd",  # backslash is valid filename char on Unix
+}
 
 
 @pytest.mark.slow
@@ -51,12 +52,18 @@ class TestPathTraversalWrite:
             with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.write_file(path, b"pwned")
 
-    @pytest.mark.parametrize("path", WEB_ENCODING_VECTORS)
-    async def test_write_web_encoding_harmless(self, dual_scheduler: Scheduler, path: str) -> None:
-        """Web-encoding tricks create harmless literal filenames (no traversal)."""
+    @pytest.mark.parametrize(("path", "real_path"), WEB_ENCODING_VECTORS.items())
+    async def test_write_web_encoding_harmless(self, dual_scheduler: Scheduler, path: str, real_path: str) -> None:
+        """Web-encoding tricks create literal filenames under /home/user (no traversal)."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # These succeed because %2f, \\, and .... are literal on Unix
             await session.write_file(path, b"data")
+            result = await session.exec(
+                f"import os; p = os.path.realpath({'/home/user/' + path!r}); print(p, open(p).read())"
+            )
+
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == f"{real_path} data\n"
 
 
 class TestPathTraversalRead:
@@ -113,9 +120,12 @@ class TestSymlinkEscape:
     async def test_multi_hop_symlink_escape(self, dual_scheduler: Scheduler, tmp_path: Path) -> None:
         """Multi-hop symlink chain that escapes sandbox is rejected."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            # Create chain: link1 -> link2 -> /etc/passwd
-            await session.exec("import os; os.symlink('/etc', '/home/user/link_to_etc')")
-            await session.exec("import os; os.symlink('/home/user/link_to_etc/passwd', '/home/user/chain_link')")
+            # Chain: chain_link -> link_to_etc/passwd, and link_to_etc -> /etc
+            result = await session.exec(
+                "import os; os.symlink('/etc', '/home/user/link_to_etc');"
+                " os.symlink('/home/user/link_to_etc/passwd', '/home/user/chain_link')"
+            )
+            assert result.exit_code == 0, result.stderr
 
             with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.read_file("chain_link", destination=tmp_path / "chain.bin")

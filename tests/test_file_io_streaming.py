@@ -1,15 +1,14 @@
 """Integration tests for streaming file transfers under memory pressure and concurrency.
 
 Validates that the zstd-compressed chunked file transfer protocol:
-1. Handles large files (30-150 MB) in VMs without OOM
+1. Handles large files (20-150 MB) in VMs without OOM
 2. Supports concurrent parallel file transfers via asyncio.gather
 3. Keeps guest memory usage low during transfers (streaming, not buffering)
 4. Handles interleaved success/failure correctly (dispatcher multiplexing)
 5. Measures upload/download throughput (write_file/read_file MiB/s)
 
 Note: /home/user is the VM's home disk (ext4, ~973 MB usable by default), so large
-files consume host disk, not guest RAM. Some tests still use 512 MB VMs from the
-former tmpfs home; they stay valid.
+files consume host disk, not guest RAM: the memory tests use the smallest VM (128 MB).
 
 All tests require real VMs via the scheduler fixture.
 """
@@ -19,6 +18,7 @@ import hashlib
 import os
 import textwrap
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -26,15 +26,62 @@ import pytest
 from exec_sandbox.exceptions import ErrorCode, InvalidInputError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import skip_unless_hwaccel
 
 # --- Guest memory threshold (percentage of MemTotal that must remain free) ---
-# Catches catastrophic O(file_size) buffering (leaves ~5% free) while
-# tolerating OS page cache variance and arm64 TCG emulation overhead.
-# 15% gives ample margin for streaming (which typically leaves 30-40% free
-# on KVM, ~17-25% on arm64 TCG due to higher kernel/emulation overhead).
+# Catches O(file_size) buffering while it tolerates OS page cache variance and emulation
+# overhead. In a 128 MB VM, a transfer that holds the whole 40 MB file in guest memory
+# leaves 4-13% free (HVF); streaming leaves 38-48% on arm64 HVF and 37-57% on arm64 TCG
+# (lowest sample of the read and the write tests, measured), and passes on x86_64 KVM.
 _GUEST_MEM_AVAILABLE_MIN_PCT = 15
+
+_SMALL_VM_MB = 128
+"""The smallest VM (constants.MIN_MEMORY_MB): a transfer that buffers the file shows in its memory."""
+
+_MEMORY_MONITOR = textwrap.dedent("""\
+    import os, time
+    pid = os.fork()
+    if pid == 0:
+        with open('/home/user/memlog.txt', 'w') as log:
+            while True:
+                try:
+                    with open('/proc/meminfo') as f:
+                        for line in f:
+                            if line.startswith('MemAvailable:'):
+                                log.write(line.split()[1] + '\\n')
+                                log.flush()
+                                break
+                except Exception:
+                    break
+                time.sleep(0.05)
+        os._exit(0)
+    print(f'pid={pid}')
+""")
+"""Guest code: a child of the REPL writes MemAvailable (KB) to memlog.txt every 50 ms."""
+
+
+async def _min_available_pct(session: Session, transfer: Callable[[], Awaitable[None]]) -> tuple[float, int]:
+    """Run `transfer` while the guest samples MemAvailable; return (lowest sample as % of
+    MemTotal, number of samples). The samples go on until the transfer has ended."""
+    start = await session.exec(_MEMORY_MONITOR)
+    assert start.exit_code == 0, f"Monitor start failed: {start.stderr}"
+    monitor_pid = int(start.stdout.strip().split("=")[1])
+
+    await transfer()
+
+    stop = await session.exec(
+        f"import os, signal\nos.kill({monitor_pid}, signal.SIGTERM)\nos.waitpid({monitor_pid}, 0)\n"
+        "print(open('/home/user/memlog.txt').read())\n"
+        "print('total', next(line.split()[1] for line in open('/proc/meminfo') if line.startswith('MemTotal:')))"
+    )
+    assert stop.exit_code == 0, f"Monitor stop failed: {stop.stderr}"
+    *log, total = stop.stdout.strip().split("\n")
+    samples = [int(s) for s in log if s.strip().isdigit()]
+    assert len(samples) >= 2, f"Too few memory samples: {len(samples)}"
+    return min(samples) / int(total.split()[1]) * 100, len(samples)
+
 
 # =============================================================================
 # TestStreamingLargeFiles - Large file transfers in low-memory VMs
@@ -43,35 +90,14 @@ _GUEST_MEM_AVAILABLE_MIN_PCT = 15
 
 @pytest.mark.slow
 class TestStreamingLargeFiles:
-    """Prove streaming works for files that would OOM with the old buffered approach.
+    """A file larger than the guest's memory goes in and out of the VM whole.
 
     Slow under TCG: data integrity (SHA256 round-trip) correctness tests —
     work under TCG but large file transfers are too slow for the default suite.
     """
 
-    async def test_write_read_30mb_in_128mb_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write 30 MB and read it back with SHA256 verification.
-
-        Streaming only needs ~128 KB decompression buffer in the guest.
-        """
-        size = 30 * 1024 * 1024
-        content = os.urandom(size)
-        expected_hash = hashlib.sha256(content).hexdigest()
-        dest = tmp_path / "large_30mb.bin"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
-            await session.write_file("large_30mb.bin", content)
-            await session.read_file("large_30mb.bin", destination=dest)
-
-        result = dest.read_bytes()
-        assert len(result) == size, f"Size mismatch: got {len(result)}, expected {size}"
-        actual_hash = hashlib.sha256(result).hexdigest()
-        assert actual_hash == expected_hash, (
-            f"SHA256 mismatch - data corruption!\nExpected: {expected_hash}\nActual:   {actual_hash}"
-        )
-
     async def test_write_read_file_larger_than_vm_memory(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write a 150 MB file — larger than the guest's free RAM at 192 MB.
+        """Write a 150 MB file to a 128 MB VM and read it back with SHA256 verification.
 
         The home disk holds it; streaming only needs ~64 KB decompression buffer.
         """
@@ -80,7 +106,7 @@ class TestStreamingLargeFiles:
         expected_hash = hashlib.sha256(content).hexdigest()
         dest = tmp_path / "large_150mb.bin"
 
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=_SMALL_VM_MB)) as session:
             await session.write_file("large_150mb.bin", content)
             await session.read_file("large_150mb.bin", destination=dest)
 
@@ -192,63 +218,20 @@ class TestConcurrentFileTransfers:
 
 @pytest.mark.slow
 class TestStreamingMemoryEfficiency:
-    """Verify streaming doesn't spike guest memory.
+    """A transfer does not take guest memory in proportion to the file size.
 
     Slow under TCG: memory threshold (15%) documented to pass on arm64 TCG
     (~17-25%), but overall VM overhead makes it too slow for the default suite.
     """
 
-    async def test_guest_memory_stays_low_during_large_transfer(self, scheduler: Scheduler) -> None:
-        """Write 30 MB, then check guest MemAvailable didn't drop catastrophically.
-
-        With streaming, the guest only holds a ~128 KB decompression buffer.
-        The file is written directly to disk, so MemAvailable should remain
-        high (~80%+ of total) after the transfer completes.
-        Uses 128 MB VM to make the test sensitive to memory spikes.
-        """
-        size = 30 * 1024 * 1024
-        content = os.urandom(size)
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
-            await session.write_file("mem_test_30mb.bin", content)
-
-            # Read /proc/meminfo to check available memory
-            result = await session.exec(
-                "with open('/proc/meminfo') as f:\n"
-                "    for line in f:\n"
-                "        if line.startswith('MemAvailable:') or line.startswith('MemTotal:'):\n"
-                "            print(line.strip())"
-            )
-
-            assert result.exit_code == 0, f"meminfo exec failed: {result.stderr}"
-
-            # Parse MemTotal and MemAvailable from output
-            mem_total_kb = 0
-            mem_available_kb = 0
-            for line in result.stdout.strip().split("\n"):
-                if line.startswith("MemTotal:"):
-                    mem_total_kb = int(line.split()[1])
-                elif line.startswith("MemAvailable:"):
-                    mem_available_kb = int(line.split()[1])
-
-            assert mem_total_kb > 0, "Could not parse MemTotal"
-            assert mem_available_kb > 0, "Could not parse MemAvailable"
-
-            available_pct = (mem_available_kb / mem_total_kb) * 100
-            assert available_pct >= _GUEST_MEM_AVAILABLE_MIN_PCT, (
-                f"Guest memory too low after 30 MB transfer: "
-                f"{mem_available_kb} KB available / {mem_total_kb} KB total = {available_pct:.1f}%"
-            )
-
     async def test_multiple_large_files_dont_oom_small_vm(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Write 3 x 20 MB files sequentially in a 128 MB VM without OOM.
+        """Write 3 x 20 MB files one after the other in a 128 MB VM without OOM.
 
-        After each write, verify the guest is still responsive. With the old
-        buffered approach, the first 20 MB file would likely crash a 128 MB VM.
+        After each write, the guest still runs code and the file reads back whole.
         """
         size = 20 * 1024 * 1024
 
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=_SMALL_VM_MB)) as session:
             for i in range(3):
                 content = os.urandom(size)
                 expected_hash = hashlib.sha256(content).hexdigest()
@@ -258,7 +241,7 @@ class TestStreamingMemoryEfficiency:
                 # Verify guest is still responsive after each write
                 result = await session.exec("print('alive')")
                 assert result.exit_code == 0, f"Guest unresponsive after writing file {i}: {result.stderr}"
-                assert "alive" in result.stdout
+                assert result.stdout == "alive\n"
 
                 # Verify file integrity
                 dest = tmp_path / f"multi_{i}.bin"
@@ -268,195 +251,38 @@ class TestStreamingMemoryEfficiency:
                 )
 
     async def test_guest_peak_memory_during_write_transfer(self, scheduler: Scheduler) -> None:
-        """Sample guest MemAvailable DURING a 30 MB write, not just after.
+        """Sample guest MemAvailable during a 40 MB write in a 128 MB VM, and after it.
 
-        Spawns a background monitor via os.fork() that samples /proc/meminfo
-        every 50 ms to /home/user/memlog.txt.  The minimum MemAvailable sample
-        must stay >= 25% of MemTotal — lower than the post-transfer 30% threshold
-        because we capture the actual trough during active I/O.  A buffered
-        approach would show ~5%, so 25% still catches the bug.
+        A child of the REPL samples /proc/meminfo every 50 ms. The lowest sample must stay
+        at or above _GUEST_MEM_AVAILABLE_MIN_PCT of MemTotal: a write that holds the whole
+        file in guest memory leaves about 12%.
         """
-        size = 30 * 1024 * 1024
-        content = os.urandom(size)
+        content = os.urandom(40 * 1024 * 1024)
 
-        monitor_code = textwrap.dedent("""\
-            import os, time
-            pid = os.fork()
-            if pid == 0:
-                with open('/home/user/memlog.txt', 'w') as log:
-                    while True:
-                        try:
-                            with open('/proc/meminfo') as f:
-                                for line in f:
-                                    if line.startswith('MemAvailable:'):
-                                        log.write(line.split()[1] + '\\n')
-                                        log.flush()
-                                        break
-                        except Exception:
-                            break
-                        time.sleep(0.05)
-                os._exit(0)
-            print(f'pid={pid}')
-        """)
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
-            # Start background memory monitor
-            start_result = await session.exec(monitor_code)
-            assert start_result.exit_code == 0, f"Monitor start failed: {start_result.stderr}"
-            monitor_pid = int(start_result.stdout.strip().split("=")[1])
-
-            # Write the large file while monitor samples
-            await session.write_file("peak_test_30mb.bin", content)
-
-            # Stop monitor and read results
-            stop_code = textwrap.dedent(f"""\
-                import os, signal, time
-                os.kill({monitor_pid}, signal.SIGTERM)
-                time.sleep(0.1)
-                print(open('/home/user/memlog.txt').read())
-            """)
-            stop_result = await session.exec(stop_code)
-            assert stop_result.exit_code == 0, f"Monitor stop failed: {stop_result.stderr}"
-
-            # Also read MemTotal for percentage calculation
-            memtotal_result = await session.exec(
-                "with open('/proc/meminfo') as f:\n"
-                "    for line in f:\n"
-                "        if line.startswith('MemTotal:'):\n"
-                "            print(line.split()[1])\n"
-                "            break"
-            )
-            assert memtotal_result.exit_code == 0
-            mem_total_kb = int(memtotal_result.stdout.strip())
-
-            # Parse samples
-            samples = [int(s) for s in stop_result.stdout.strip().split("\n") if s.strip().isdigit()]
-            assert len(samples) >= 2, f"Too few memory samples: {len(samples)}"
-
-            min_available_kb = min(samples)
-            min_pct = (min_available_kb / mem_total_kb) * 100
-
-            assert min_pct >= _GUEST_MEM_AVAILABLE_MIN_PCT, (
-                f"Guest memory trough too low during 30 MB write: "
-                f"min {min_available_kb} KB / {mem_total_kb} KB = {min_pct:.1f}% "
-                f"(from {len(samples)} samples)"
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=_SMALL_VM_MB)) as session:
+            min_pct, count = await _min_available_pct(
+                session, lambda: session.write_file("peak_test_40mb.bin", content)
             )
 
-    async def test_guest_memory_stays_low_during_large_read(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Read 30 MB out of a 128 MB VM, check MemAvailable after transfer.
-
-        Same pattern as the write test but exercises the read path.
-        Assert MemAvailable >= 25% after the transfer completes.
-        """
-        size = 30 * 1024 * 1024
-        content = os.urandom(size)
-        dest = tmp_path / "read_mem_test_30mb.bin"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
-            await session.write_file("read_mem_test_30mb.bin", content)
-            await session.read_file("read_mem_test_30mb.bin", destination=dest)
-
-            result = await session.exec(
-                "with open('/proc/meminfo') as f:\n"
-                "    for line in f:\n"
-                "        if line.startswith('MemAvailable:') or line.startswith('MemTotal:'):\n"
-                "            print(line.strip())"
-            )
-            assert result.exit_code == 0, f"meminfo exec failed: {result.stderr}"
-
-            mem_total_kb = 0
-            mem_available_kb = 0
-            for line in result.stdout.strip().split("\n"):
-                if line.startswith("MemTotal:"):
-                    mem_total_kb = int(line.split()[1])
-                elif line.startswith("MemAvailable:"):
-                    mem_available_kb = int(line.split()[1])
-
-            assert mem_total_kb > 0, "Could not parse MemTotal"
-            assert mem_available_kb > 0, "Could not parse MemAvailable"
-
-            available_pct = (mem_available_kb / mem_total_kb) * 100
-            assert available_pct >= _GUEST_MEM_AVAILABLE_MIN_PCT, (
-                f"Guest memory too low after 30 MB read: "
-                f"{mem_available_kb} KB available / {mem_total_kb} KB total = {available_pct:.1f}%"
-            )
-
-        assert dest.read_bytes() == content
+        assert min_pct >= _GUEST_MEM_AVAILABLE_MIN_PCT, (
+            f"Guest memory trough too low during 40 MB write: {min_pct:.1f}% (from {count} samples)"
+        )
 
     async def test_guest_peak_memory_during_read_transfer(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Sample guest MemAvailable DURING a 30 MB read, not just after.
+        """Sample guest MemAvailable during a 40 MB read in a 128 MB VM, and after it; the
+        file reads back whole. Same monitor and threshold as the write test."""
+        content = os.urandom(40 * 1024 * 1024)
+        dest = tmp_path / "peak_read_40mb.bin"
 
-        Same background monitor pattern as the write peak test.
-        Assert minimum sample >= 25% of MemTotal.
-        """
-        size = 30 * 1024 * 1024
-        content = os.urandom(size)
-        dest = tmp_path / "peak_read_30mb.bin"
-
-        monitor_code = textwrap.dedent("""\
-            import os, time
-            pid = os.fork()
-            if pid == 0:
-                with open('/home/user/memlog.txt', 'w') as log:
-                    while True:
-                        try:
-                            with open('/proc/meminfo') as f:
-                                for line in f:
-                                    if line.startswith('MemAvailable:'):
-                                        log.write(line.split()[1] + '\\n')
-                                        log.flush()
-                                        break
-                        except Exception:
-                            break
-                        time.sleep(0.05)
-                os._exit(0)
-            print(f'pid={pid}')
-        """)
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=512)) as session:
-            # First write the file to read back
-            await session.write_file("peak_read_30mb.bin", content)
-
-            # Start background memory monitor
-            start_result = await session.exec(monitor_code)
-            assert start_result.exit_code == 0, f"Monitor start failed: {start_result.stderr}"
-            monitor_pid = int(start_result.stdout.strip().split("=")[1])
-
-            # Read the large file while monitor samples
-            await session.read_file("peak_read_30mb.bin", destination=dest)
-
-            # Stop monitor and read results
-            stop_code = textwrap.dedent(f"""\
-                import os, signal, time
-                os.kill({monitor_pid}, signal.SIGTERM)
-                time.sleep(0.1)
-                print(open('/home/user/memlog.txt').read())
-            """)
-            stop_result = await session.exec(stop_code)
-            assert stop_result.exit_code == 0, f"Monitor stop failed: {stop_result.stderr}"
-
-            memtotal_result = await session.exec(
-                "with open('/proc/meminfo') as f:\n"
-                "    for line in f:\n"
-                "        if line.startswith('MemTotal:'):\n"
-                "            print(line.split()[1])\n"
-                "            break"
-            )
-            assert memtotal_result.exit_code == 0
-            mem_total_kb = int(memtotal_result.stdout.strip())
-
-            samples = [int(s) for s in stop_result.stdout.strip().split("\n") if s.strip().isdigit()]
-            assert len(samples) >= 2, f"Too few memory samples: {len(samples)}"
-
-            min_available_kb = min(samples)
-            min_pct = (min_available_kb / mem_total_kb) * 100
-
-            assert min_pct >= _GUEST_MEM_AVAILABLE_MIN_PCT, (
-                f"Guest memory trough too low during 30 MB read: "
-                f"min {min_available_kb} KB / {mem_total_kb} KB = {min_pct:.1f}% "
-                f"(from {len(samples)} samples)"
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, memory_mb=_SMALL_VM_MB)) as session:
+            await session.write_file("peak_read_40mb.bin", content)
+            min_pct, count = await _min_available_pct(
+                session, lambda: session.read_file("peak_read_40mb.bin", destination=dest)
             )
 
+        assert min_pct >= _GUEST_MEM_AVAILABLE_MIN_PCT, (
+            f"Guest memory trough too low during 40 MB read: {min_pct:.1f}% (from {count} samples)"
+        )
         assert dest.read_bytes() == content
 
 
@@ -619,11 +445,11 @@ class TestInterleavedSuccessFailure:
 
             # Success: exec should still work
             result = await session.exec("print('still alive')")
-            assert result.exit_code == 0
-            assert "still alive" in result.stdout
+            assert (result.exit_code, result.stdout) == (0, "still alive\n"), result.stderr
 
     async def test_concurrent_list_with_writes(self, scheduler: Scheduler) -> None:
-        """Concurrent list_files during writes — list sees consistent state."""
+        """list_files during 2 writes: it sees the files written before, and only files that
+        exist; a list after the writes sees all of them."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Write some initial files
             for i in range(3):
@@ -641,13 +467,15 @@ class TestInterleavedSuccessFailure:
             assert results[0] is None, f"Write 3 failed: {results[0]}"
             assert results[1] is None, f"Write 4 failed: {results[1]}"
 
-            # list_files returns a list — should have at least the initial 3 files
+            # The list runs between the writes: it has the 3 files written before, maybe the new ones
             file_list = results[2]
             assert isinstance(file_list, list), f"list_files should return list, got {type(file_list)}"
-            file_names = {f.name for f in file_list}
-            # At least the 3 pre-existing files should be visible
-            for i in range(3):
-                assert f"file_{i}.txt" in file_names, f"file_{i}.txt missing from list"
+            names = {f.name for f in file_list if f.name.startswith("file_")}
+            assert {f"file_{i}.txt" for i in range(3)} <= names <= {f"file_{i}.txt" for i in range(5)}
+
+            # After the writes, a list has all 5
+            after = {f.name for f in await session.list_files() if f.name.startswith("file_")}
+            assert after == {f"file_{i}.txt" for i in range(5)}
 
 
 # =============================================================================
@@ -657,10 +485,10 @@ class TestInterleavedSuccessFailure:
 
 @skip_unless_hwaccel
 class TestFileTransferThroughput:
-    """Benchmark upload (write_file) and download (read_file) throughput.
+    """Measure upload (write_file) and download (read_file) throughput.
 
-    Requires hwaccel: explicit MiB/s threshold assertions — TCG (~5-8x
-    slower) cannot meet the minimum throughput benchmarks.
+    Prints the MiB/s (no threshold) and checks the data. Requires hwaccel: under TCG
+    (~5-8x slower) the large transfers take too long.
 
     Run with -s to see throughput output:
         uv run pytest tests/test_file_io_streaming.py::TestFileTransferThroughput -v -s -n 0
