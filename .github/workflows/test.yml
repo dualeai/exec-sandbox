@@ -45,6 +45,9 @@ jobs:
           uv run pyright .
           uv run -m vulture src/ scripts/ --min-confidence 80
 
+      - name: Package checks
+        run: make test-package
+
   static-rust-guest-agent:
     name: Static / Rust (guest-agent)
     runs-on: ubuntu-24.04-arm

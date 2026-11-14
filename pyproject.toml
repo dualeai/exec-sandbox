@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling~=1.33"]  # New 1.x minors come in on their own, a major is a manual bump; `make test-package` checks the metadata it writes
 build-backend = "hatchling.build"
 
 [project]
@@ -73,7 +73,7 @@ dev = [
     "pytest-xdist~=3.5",  # Parallel test execution (-n auto)
     "pyright~=1.1",
     "ruff~=0.7",
-    "twine~=6.1",  # Package verification before PyPI upload
+    "twine~=7.0",  # Package verification before PyPI upload (7+ reads the Metadata-Version 2.5 of hatchling 1.32+)
     "vulture~=2.14",  # Dead code detection
     "moto[s3,server]~=5.0",  # AWS mocking for S3 tests (server mode for aioboto3)
     "types-aiobotocore[s3]~=2.18.0",  # Type stubs (match the aiobotocore pinned by aioboto3) for the instance store (aiobotocore S3 client)
