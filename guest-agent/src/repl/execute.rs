@@ -67,10 +67,68 @@ fn log_repl_timeout_diagnostics(pid: Option<u32>, first_io_logged: bool) {
         read_bounded_diagnostic(&format!("/proc/{pid}/stack"), 4 * 1024).replace('\n', "; ");
     let memory_psi = read_bounded_diagnostic("/proc/pressure/memory", 2 * 1024).replace('\n', "; ");
     let zram_mm = read_bounded_diagnostic("/sys/block/zram0/mm_stat", 2 * 1024);
+    let members = group_members_diagnostic(pid);
 
     log_warn!(
-        "[repl-timeout] pid={pid} first_io={first_io_logged} status=[{status_summary}] wchan={wchan} stack=[{stack}] memory_psi=[{memory_psi}] zram_mm=[{zram_mm}]"
+        "[repl-timeout] pid={pid} first_io={first_io_logged} status=[{status_summary}] wchan={wchan} stack=[{stack}] members=[{members}] memory_psi=[{memory_psi}] zram_mm=[{zram_mm}]"
     );
+}
+
+/// Group members a `[repl-timeout]` line describes; the others are counted.
+const DIAGNOSED_MEMBERS: usize = 8;
+
+/// The other processes of the REPL's group (the REPL leads it): pid, name, state, wait
+/// channel and kernel stack of each. A REPL that runs an exec waits for its children, so
+/// the member where the exec waits tells a stalled command from a slow one.
+fn group_members_diagnostic(leader: u32) -> String {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return "unavailable".to_string();
+    };
+    let mut members = Vec::new();
+    let mut more = 0usize;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == leader {
+            continue;
+        }
+        let stat = read_bounded_diagnostic(&format!("/proc/{pid}/stat"), 1024);
+        let Some((comm, state)) = group_member(&stat, leader) else {
+            continue;
+        };
+        if members.len() == DIAGNOSED_MEMBERS {
+            more += 1;
+            continue;
+        }
+        let wchan = read_bounded_diagnostic(&format!("/proc/{pid}/wchan"), 256);
+        let stack = read_bounded_diagnostic(&format!("/proc/{pid}/stack"), 512).replace('\n', "; ");
+        members.push(format!(
+            "{pid} {comm} {state} wchan={wchan} stack=[{stack}]"
+        ));
+    }
+    if more > 0 {
+        members.push(format!("{more} more"));
+    }
+    members.join(" | ")
+}
+
+/// The name and state of the process whose /proc/<pid>/stat is `stat`, when its process
+/// group is `pgid`. The name can hold spaces and parentheses: the fields after it start
+/// after its last ')'. Its control characters become '?': the code names its processes
+/// (prctl), and a newline would start a line of its own in the log.
+fn group_member(stat: &str, pgid: u32) -> Option<(String, &str)> {
+    let (head, rest) = stat.rsplit_once(')')?;
+    let (_, comm) = head.split_once('(')?;
+    let mut fields = rest.split_whitespace(); // state ppid pgrp ...
+    let state = fields.next()?;
+    let pgrp = fields.nth(1)?.parse::<u32>().ok()?;
+    let comm = comm.replace(|c: char| c.is_control(), "?");
+    (pgrp == pgid).then_some((comm, state))
 }
 
 /// Helper to flush a buffer as a Stdout/Stderr response message.
@@ -945,6 +1003,50 @@ pub(crate) async fn execute_code_streaming(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case("42 (awk) S 7 7 7 0 -1", Some(("awk", "S")))]
+    #[case("42 (a) b) (c) D 7 7 7 0 -1", Some(("a) b) (c", "D")))]
+    #[case("42 (a\n[WARN] b) S 7 7 7 0 -1", Some(("a?[WARN] b", "S")))] // no new log line
+    #[case("42 (awk) S 7 9 9 0 -1", None)] // another group
+    #[case("42 (awk) S", None)] // cut
+    #[case("unavailable", None)]
+    fn group_member_reads_name_and_state_of_a_member(
+        #[case] stat: &str,
+        #[case] expected: Option<(&str, &str)>,
+    ) {
+        assert_eq!(
+            group_member(stat, 7),
+            expected.map(|(comm, state)| (comm.to_string(), state))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn group_members_shows_where_a_member_waits() {
+        // A leader that waits for its member, as a REPL waits for the command of an exec
+        let mut leader = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = leader.id().unwrap();
+        let mut members = String::new();
+        for _ in 0..100 {
+            members = group_members_diagnostic(pid);
+            if members.contains(" sleep ") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // SAFETY: kill(2) on the group this test started
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        let _ = leader.wait().await;
+
+        assert!(members.contains(" sleep S wchan="), "{members}");
+        assert!(!members.contains(&format!("{pid} sh ")), "{members}"); // the leader has its own fields
+    }
 
     #[tokio::test]
     async fn ready_line_returns_what_came_before_and_leaves_the_rest_in_the_pipe() {

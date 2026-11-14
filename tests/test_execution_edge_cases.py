@@ -8,6 +8,7 @@ Tests that the execution system handles unusual inputs gracefully:
 """
 
 import io
+import logging
 import re
 import time
 
@@ -364,6 +365,20 @@ time.sleep(60)
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=2)
 
         assert (result.exit_code, result.stderr) == (42, "partial")
+
+    async def test_timeout_warning_shows_where_the_exec_waits(
+        self, scheduler: Scheduler, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An exec whose child sleeps reaches its timeout: the host's timeout warning holds
+        the guest's [repl-timeout] line, with each process of the exec, its state and its
+        wait channel, so a stall on a CI runner shows the command and where it waited. The
+        child is forked (`&`): BusyBox can run a plain `sleep` inside the shell itself."""
+        with caplog.at_level(logging.WARNING, logger="exec_sandbox.qemu_vm"):
+            result = await run_once(scheduler, VmSpec(language=Language.RAW), "sleep 60 & wait", timeout_seconds=2)
+
+        assert result.exit_code == -1
+        [warning] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Execution timeout")]
+        assert re.search(r"\[repl-timeout\] pid=\d+ .* members=\[\d+ \S+ S wchan=\S+ stack=\[", warning), warning
 
     @pytest.mark.slow
     async def test_signal_kill_returns_128_plus_signal(self, scheduler: Scheduler) -> None:

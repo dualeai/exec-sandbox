@@ -576,8 +576,10 @@ class QemuVM:
                 # Timeout: code ran too long — this is a user code result, not infrastructure.
                 # Fall through to consume_stream's default handling (exit_code=-1 + stderr message).
                 if msg.error_type == constants.GuestErrorType.TIMEOUT:
+                    # With the guest's [repl-timeout] line (console): where the exec waited
+                    report = next((line for line in reversed(self.console_lines) if "[repl-timeout]" in line), "")
                     logger.warning(
-                        f"Execution timeout: [{msg.error_type}] {msg.message}",
+                        f"Execution timeout: [{msg.error_type}] {msg.message}" + (f"\n  {report}" if report else ""),
                         extra={
                             "vm_id": self.vm_id,
                             "error_message": msg.message,
