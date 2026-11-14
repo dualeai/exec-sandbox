@@ -33,11 +33,6 @@ fi
 # When stable, we can add: RUSTFLAGS="-Cpanic=immediate-abort" cargo build -Zbuild-std=std,panic_abort
 # This would reduce binary size by ~30-50%. Track: https://github.com/rust-lang/rust/issues/115022
 
-# Buildx cache configuration (for CI)
-# Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
-# Example: BUILDX_CACHE_FROM="type=gha" BUILDX_CACHE_TO="type=gha,mode=max"
-BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
-BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 
 detect_arch() {
     case "$(uname -m)" in
@@ -109,12 +104,6 @@ build_for_arch() {
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Scope includes arch and Rust version to avoid cache collisions
-    local cache_scope="tiny-init-rust${RUST_VERSION}-${arch}"
-    local cache_args=()
-    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
-    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
-
     # Build using buildx with cross-compilation (NO --platform flag to avoid QEMU)
     # The Dockerfile downloads musl.cc cross-toolchains for cross-arch builds
     DOCKER_BUILDKIT=1 docker buildx build \
@@ -122,7 +111,6 @@ build_for_arch() {
         --build-arg RUST_IMAGE="rust:${RUST_VERSION}-slim@${RUST_IMAGE_DIGEST}" \
         --build-arg RUST_TARGET="$rust_target" \
         --build-arg ARCH="$arch" \
-        ${cache_args[@]+"${cache_args[@]}"} \
         -f - "$REPO_ROOT" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
 ARG RUST_IMAGE

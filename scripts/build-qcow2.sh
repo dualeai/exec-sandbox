@@ -8,7 +8,7 @@
 #
 # All images include common tools for AI agent workflows:
 #   git, jq, bash, coreutils, grep, findutils, sed, gawk, diffutils,
-#   patch, less, make, tree, tar, gzip, unzip, file, curl
+#   patch, less, make, tree, tar, gzip, unzip, file, curl, openssl, ping
 #
 # Requires: Docker
 #
@@ -48,11 +48,6 @@ fi
 # kept for human readability.
 ALPINE_IMAGE_REF="alpine:${ALPINE_VERSION}@${ALPINE_IMAGE_DIGEST}"
 
-# Buildx cache configuration (for CI)
-# Set BUILDX_CACHE_FROM and BUILDX_CACHE_TO to enable external caching
-# Example: BUILDX_CACHE_FROM="type=gha" BUILDX_CACHE_TO="type=gha,mode=max"
-BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
-BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
 
 # Package lists for each variant
 # Common: essential tools for AI agent workflows
@@ -110,19 +105,11 @@ create_alpine_rootfs() {
     # Use docker buildx with BuildKit cache mounts for APK
     # This caches the APK index across builds (packages still re-download —
     # apk only caches packages when /etc/apk/cache exists in the image)
-    # Scope includes arch and Alpine version to avoid cache collisions
-    local platform_arch="${docker_platform#linux/}"  # Extract arch from linux/arm64 -> arm64
-    local cache_scope="alpine-${ALPINE_VERSION}-${platform_arch}"
-    local cache_args=()
-    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
-    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
-
     DOCKER_BUILDKIT=1 docker buildx build \
         --platform "$docker_platform" \
         --output "type=local,dest=$rootfs_dir" \
         --build-arg PACKAGES="$packages" \
         --build-arg ALPINE_IMAGE_REF="$ALPINE_IMAGE_REF" \
-        "${cache_args[@]+"${cache_args[@]}"}" \
         --quiet \
         -f - . <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
@@ -448,17 +435,10 @@ ensure_guestfs_image() {
     esac
     HOST_PLATFORM="linux/${host_arch}"
 
-    # Scope includes host arch to avoid cache collisions in multi-arch CI
-    local cache_scope="guestfs-${host_arch}"
-    local cache_args=()
-    [ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from "$BUILDX_CACHE_FROM,scope=$cache_scope")
-    [ -n "$BUILDX_CACHE_TO" ] && cache_args+=(--cache-to "$BUILDX_CACHE_TO,scope=$cache_scope")
-
     DOCKER_BUILDKIT=1 docker buildx build \
         --platform "$HOST_PLATFORM" \
         --load \
         --tag "$GUESTFS_IMAGE" \
-        "${cache_args[@]+"${cache_args[@]}"}" \
         --quiet \
         -f - . <<'DOCKERFILE'
 # syntax=docker/dockerfile:1.4
@@ -513,6 +493,11 @@ build_qcow2() {
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
+    # A failed or interrupted build leaves no rootfs behind (main runs each variant in its
+    # own subshell; a root-owned file left by the build container stays)
+    # shellcheck disable=SC2064 # expand now: tmp_dir is local to this function
+    trap "rm -rf '$tmp_dir' 2>/dev/null || true" EXIT
+    trap 'exit 130' INT TERM
     local rootfs_dir="$tmp_dir/rootfs"
     mkdir -p "$rootfs_dir"
 

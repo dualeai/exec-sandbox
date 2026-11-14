@@ -47,8 +47,11 @@ build_for_arch() {
     "$SCRIPT_DIR/build-tiny-init.sh" "$arch" &
     local pid_init=$!
 
-    wait $pid_agent || { echo "[$arch] Guest-agent build failed" >&2; return 1; }
-    wait $pid_init || { echo "[$arch] tiny-init build failed" >&2; return 1; }
+    # Wait for both before failing: a build left running would outlive this script
+    local failed=0
+    wait $pid_agent || { echo "[$arch] Guest-agent build failed" >&2; failed=1; }
+    wait $pid_init || { echo "[$arch] tiny-init build failed" >&2; failed=1; }
+    [ $failed -eq 0 ] || return 1
 
     # Step 2: Build kernel + initramfs + vmlinux (extract-kernel.sh orchestrates)
     # Kernel build (build-kernel.sh) runs first, then initramfs + vmlinux extraction.
