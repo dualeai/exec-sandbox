@@ -1,4 +1,4 @@
-//! Package installation (pip, bun) with validation.
+//! Package installation (uv pip for Python, bun for JavaScript) with validation.
 
 use tokio::process::Command;
 
@@ -8,7 +8,7 @@ use crate::types::{GuestResponse, Language};
 
 /// Validate a package name + version specifier.
 ///
-/// Replaces the `regex` crate dependency. Pattern:
+/// Hand-written check (no `regex` crate) for this pattern:
 ///   name: `[a-zA-Z0-9_\-\.]+`
 ///   operator: `[@=<>~]` (at least one required)
 ///   version: `[a-zA-Z0-9_\-\.@=<>~\^\*\[\], ]*` (no '/' — prevents local-path injection)
@@ -111,6 +111,11 @@ pub(crate) fn validate_package_name(pkg: &str) -> Result<(), String> {
 }
 
 /// Install packages to system paths for snapshot persistence.
+///
+/// Runs as root: `uv pip install --target PYTHON_SITE_PACKAGES` for Python,
+/// `bun add` in /usr/local/lib for JavaScript. Raw is refused. After the
+/// process exits, sends the collected stdout and stderr (each capped at
+/// MAX_PACKAGE_OUTPUT_BYTES) as one chunk each, then a Complete message.
 pub(crate) async fn install_packages(
     language: Language,
     packages: &[String],
@@ -141,7 +146,7 @@ pub(crate) async fn install_packages(
     }
 
     let start = Instant::now();
-    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::Fatal(e.into()))?;
+    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::execution(e.to_string()))?;
 
     let mut cmd = match language {
         Language::Python => {
@@ -155,30 +160,21 @@ pub(crate) async fn install_packages(
                 .arg("--python")
                 .arg(format!("{PYTHON_HOME}/bin/python3"))
                 .arg("--target")
-                .arg(PYTHON_SITE_PACKAGES);
-            for pkg in packages {
-                c.arg(pkg);
-            }
-            c.current_dir(PYTHON_SITE_PACKAGES);
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
+                .arg(PYTHON_SITE_PACKAGES)
+                .current_dir(PYTHON_SITE_PACKAGES);
             c
         }
         Language::Javascript => {
             let mut c = Command::new("bun");
-            c.arg("add");
-            for pkg in packages {
-                c.arg(pkg);
-            }
-            c.current_dir("/usr/local/lib");
-            c.process_group(0);
-            c.stdout(std::process::Stdio::piped());
-            c.stderr(std::process::Stdio::piped());
+            c.arg("add").current_dir("/usr/local/lib");
             c
         }
         Language::Raw => unreachable!(),
     };
+    cmd.args(packages)
+        .process_group(0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -190,23 +186,25 @@ pub(crate) async fn install_packages(
             )));
         }
     };
-
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+    // No await since the spawn: the PID 1 reaper cannot have collected it yet.
+    let mut child = crate::init::WaitedChild::register(child);
 
     let stdout_task = spawn_output_reader(stdout, MAX_PACKAGE_OUTPUT_BYTES);
     let stderr_task = spawn_output_reader(stderr, MAX_PACKAGE_OUTPUT_BYTES);
 
+    let timeout = effective_timeout_secs(timeout); // 0: the default deadline, as for an exec
     let wait_result = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
 
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
+            graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             return Err(CmdError::execution(format!("Process wait error: {}", e)));
         }
         Err(_) => {
-            let _ = graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
+            graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
             return Err(CmdError::timeout(format!(
                 "Package installation timeout after {}s",
                 timeout

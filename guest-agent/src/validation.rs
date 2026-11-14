@@ -79,8 +79,9 @@ pub(crate) fn validate_env_vars(env_vars: &HashMap<String, String>) -> Result<()
 }
 
 /// Check for control characters that are forbidden in env var names/values.
-/// Allows: tab (0x09), printable ASCII (0x20-0x7E), UTF-8 continuation (0x80+).
+/// Allows: tab (0x09), printable ASCII (0x20-0x7E), every char from U+0080 up.
 /// Forbids: NUL, C0 controls (except tab), DEL (0x7F).
+/// Same set as ENV_VAR_FORBIDDEN_CONTROL_CHARS in src/exec_sandbox/constants.py.
 fn is_forbidden_control_char(c: char) -> bool {
     let code = c as u32;
     code < 0x09 || (0x0A..0x20).contains(&code) || code == 0x7F
@@ -88,6 +89,7 @@ fn is_forbidden_control_char(c: char) -> bool {
 
 /// Build code prefix that sets environment variables for the given language.
 ///
+/// In RAW mode, a key that is not a valid shell name is skipped with a warning.
 /// For RAW mode with shebang lines (`#!`), the user code is written to a temp
 /// file so the kernel's `binfmt_script` handles interpreter dispatch.
 pub(crate) fn prepend_env_vars(

@@ -97,10 +97,10 @@ class TestPathTraversalList:
 
 
 class TestSymlinkEscape:
-    """Symlink escape attacks on read_file."""
+    """Symlink escape attacks on read_file, write_file and list_files."""
 
     async def test_symlink_to_etc_passwd(self, dual_scheduler: Scheduler, tmp_path: Path) -> None:
-        """read_file follows symlink but canonicalize catches escape."""
+        """A link to a file out of /home/user: read_file is refused (a path error)."""
         async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             # Create a symlink pointing outside sandbox
             result = await session.exec("import os; os.symlink('/etc/passwd', '/home/user/evil_link')")
@@ -119,6 +119,54 @@ class TestSymlinkEscape:
 
             with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
                 await session.read_file("chain_link", destination=tmp_path / "chain.bin")
+
+    async def test_folder_links_out_of_home_refuse_write_read_and_list(
+        self, dual_scheduler: Scheduler, tmp_path: Path
+    ) -> None:
+        """Guest code plants folder links out of /home/user (absolute, and relative with ".."):
+        the agent writes as root, so a write through one must not make a file outside; a
+        read and a listing through one are refused the same way (path error)."""
+        async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            result = await session.exec(
+                "import os; os.symlink('/tmp', '/home/user/out'); os.symlink('../../tmp', '/home/user/rel_out');"
+                " open('/tmp/secret', 'w').write('host must not read this')"
+            )
+            assert result.exit_code == 0, result.stderr
+
+            for link in ("out", "rel_out"):
+                with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
+                    await session.write_file(f"{link}/pwned", b"pwned")
+                with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
+                    await session.write_file(f"{link}/new_dir/pwned", b"pwned")
+                with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
+                    await session.read_file(f"{link}/secret", destination=tmp_path / f"{link}.bin")
+                with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.PATH_INVALID):
+                    await session.list_files(link)
+
+            result = await session.exec(
+                "import os; print(sorted(n for n in os.listdir('/tmp') if n.startswith(('pwned', 'new_dir'))))"
+            )
+            assert result.stdout.strip() == "[]"
+
+    async def test_a_link_that_stays_in_home_still_works(self, dual_scheduler: Scheduler, tmp_path: Path) -> None:
+        """Folder links that resolve inside /home/user, relative or absolute (`ln -s
+        "$PWD/run" latest` makes absolute ones), are followed for write, read and list: the
+        check refuses only what leaves the root."""
+        async with await dual_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            result = await session.exec(
+                "import os; os.mkdir('/home/user/real');"
+                " os.symlink('real', '/home/user/alias'); os.symlink('/home/user/real', '/home/user/abs_alias')"
+            )
+            assert result.exit_code == 0, result.stderr
+
+            for link in ("alias", "abs_alias"):
+                await session.write_file(f"{link}/{link}.txt", link.encode())
+                await session.read_file(f"{link}/{link}.txt", destination=tmp_path / f"{link}.txt")
+            listed = await session.list_files("abs_alias")
+
+        for link in ("alias", "abs_alias"):
+            assert (tmp_path / f"{link}.txt").read_bytes() == link.encode()
+        assert [(entry.name, entry.is_dir) for entry in listed] == [("abs_alias.txt", False), ("alias.txt", False)]
 
 
 class TestNullByteInjection:

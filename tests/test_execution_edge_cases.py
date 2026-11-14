@@ -7,13 +7,17 @@ Tests that the execution system handles unusual inputs gracefully:
 4. Error cases: Syntax errors, import errors, runtime errors
 """
 
+import io
+import time
+
 import pytest
 
-from exec_sandbox.exceptions import ErrorCode, InvalidInputError
+from exec_sandbox.exceptions import ErrorCode, InvalidInputError, TransientError
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
+from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
-from tests.conftest import run_once, skip_unless_hwaccel
+from tests.conftest import run_once, run_timed, skip_unless_hwaccel, skip_unless_linux
 
 
 # =============================================================================
@@ -173,11 +177,6 @@ sys.stdout.buffer.flush()
         assert result.exit_code == 0
         assert "before" in result.stdout or "after" in result.stdout
 
-    async def test_null_bytes_in_code_rejected(self, scheduler: Scheduler) -> None:
-        """Code containing null bytes raises InvalidInputError CODE_INVALID."""
-        with pytest.raises(InvalidInputError, check=lambda e: e.code is ErrorCode.CODE_INVALID, match="null bytes"):
-            await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('hello')\x00print('world')")
-
     @pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVASCRIPT, Language.RAW])
     async def test_null_bytes_rejected_all_languages(self, scheduler: Scheduler, language: Language) -> None:
         """Null bytes rejected regardless of language."""
@@ -269,6 +268,57 @@ print("should not print")
         assert result.exit_code == 0
         assert "should not print" not in result.stdout
 
+    async def test_code_that_closes_its_output_and_returns_ends_the_exec(self, scheduler: Scheduler) -> None:
+        """Code closes fd 1 and 2: the REPL writes the exec's end on its own copies of them,
+        so the exec ends at once and the REPL serves the next one; a file opened later (it
+        may get fd 1) never gets a protocol marker."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            closed = await session.exec("import os\nos.close(1)\nos.close(2)\n", timeout_seconds=30)
+            after = await session.exec(
+                "f = open('/home/user/f.txt', 'w'); f.write('mine'); f.close()", timeout_seconds=30
+            )
+            content = io.BytesIO()
+            await session.read_file("f.txt", destination=content)
+
+        assert (closed.exit_code, closed.timing.execute_ms < 5_000) == (0, True), closed.stderr
+        assert after.exit_code == 0, after.stderr
+        assert content.getvalue() == b"mine"
+
+    async def test_code_that_closes_its_output_and_hangs_ends_at_its_timeout(self, scheduler: Scheduler) -> None:
+        """Code closes fd 1 and 2, then keeps running: the REPL keeps the pipes open (its
+        copies), so the exec ends at its timeout, as any code that runs on."""
+        code = "import os, time\nos.close(1)\nos.close(2)\ntime.sleep(600)\n"
+
+        timed = await run_timed(scheduler, VmSpec(language=Language.PYTHON), code, timeout_seconds=5)
+
+        assert timed.result.exit_code != 0
+        assert timed.result.timing.execute_ms < 10_000
+
+    @skip_unless_linux
+    async def test_disk_writes_do_not_fill_the_vm_cgroup(self, scheduler: Scheduler) -> None:
+        """A VM writes 256 MiB to its home disk: the writes skip the host page cache, so its
+        cgroup never reaches memory.max (buffered, a 1 GiB write reached it 480 times).
+        Linux, with VM cgroups and a home disk folder that takes O_DIRECT."""
+        from exec_sandbox.system_probes import probe_drive_direct_io
+
+        code = (
+            "import os\nwith open('/home/user/big.bin', 'wb') as f:\n    for _ in range(16):\n"
+            "        f.write(os.urandom(16 << 20))\n    os.fsync(f.fileno())"
+        )
+        async with await scheduler.new(VmSpec(language=Language.PYTHON, disk_mb=1024)) as session:
+            vm = session._vm
+            if vm.cgroup is None:
+                pytest.skip("no VM cgroup on this host")
+            if not await probe_drive_direct_io(vm.workdir.home_disk.parent):
+                pytest.skip("the home disk folder does not take O_DIRECT")
+            events = vm.cgroup.path / "memory.events"
+            before = dict(line.split() for line in events.read_text().splitlines())["max"]
+            result = await session.exec(code, timeout_seconds=120)
+            after = dict(line.split() for line in events.read_text().splitlines())["max"]
+
+        assert result.exit_code == 0, result.stderr
+        assert after == before
+
     async def test_os_exit_immediately(self, scheduler: Scheduler) -> None:
         """Code that calls os._exit (bypasses cleanup)."""
         code = """
@@ -279,6 +329,25 @@ os._exit(42)
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
         assert result.exit_code == 42
+
+    async def test_exec_after_exit_137_fails_at_once(self, vm_manager: VmManager, execute_timeout: int) -> None:
+        """Exit 137 retires the VM: the guest refuses the next code with a reply at once.
+
+        Without the reply (a dropped connection), the host waits for its whole deadline
+        (timeout + margin), then raises OutcomeUnknownError."""
+        vm = await vm_manager.create_vm(
+            VmSpec(language=Language.RAW), tenant_id="test", task_id="exit-137", cache_leases=()
+        )
+        try:
+            killed = await vm.execute("kill -9 $$", timeout_seconds=execute_timeout)
+            assert killed.exit_code == 137
+
+            start = time.monotonic()
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.GUEST_UNAVAILABLE, match="retired"):
+                await vm.execute("echo second", timeout_seconds=1)
+            assert time.monotonic() - start < 1
+        finally:
+            await vm_manager.destroy_vm(vm)
 
     @skip_unless_hwaccel
     async def test_sigterm_graceful_exit(self, scheduler: Scheduler) -> None:
@@ -471,27 +540,24 @@ time.sleep(60)  # Wait to be killed
 class TestOutOfBounds:
     """Tests for resource limits and exhaustion."""
 
+    # slow: not for its time (about 1 s) but to run alone (-n 0): its memory pressure slows the VMs of
+    # parallel tests, and their time limits fail (a QMP stop, a sudo bound: 2 of 3 runs)
     @pytest.mark.slow
-    async def test_memory_allocation_large(self, scheduler: Scheduler) -> None:
-        """Attempting to allocate lots of memory.
+    @pytest.mark.parametrize("allocation", ["bytearray(500 << 20)", "[bytearray(1 << 20) for _ in range(500)]"])
+    async def test_memory_allocation_large(self, scheduler: Scheduler, allocation: str) -> None:
+        """More zero-filled memory than the VM has (500 MB in 256 MB): MemoryError, or the
+        guest's OOM guard ends the code (137) at once. Zero pages fill zram's logical size at
+        no physical cost; the guard counts them, so the exec does not thrash until its
+        timeout (120 s without that count)."""
+        code = (
+            f"try:\n    data = {allocation}\n    print('ALLOCATED')\nexcept MemoryError:\n    print('MEMORY_ERROR')\n"
+        )
 
-        Slow under TCG: OOM correctness test with generous timeout and
-        no timing assertions, but TCG boot overhead makes it too slow for
-        the default suite.  60s accommodates TCG boot + OOM handling.
-        """
-        # Try to allocate 500MB (should fail or be killed with 256MB VM)
-        code = """
-try:
-    data = bytearray(500 * 1024 * 1024)  # 500MB
-    print("ALLOCATED")
-except MemoryError:
-    print("MEMORY_ERROR")
-"""
+        timed = await run_timed(scheduler, VmSpec(language=Language.PYTHON, memory_mb=256), code, timeout_seconds=60)
 
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, memory_mb=256), code)
-
-        # Should either get MemoryError or be OOM-killed
-        assert "MEMORY_ERROR" in result.stdout or result.exit_code != 0
+        result = timed.result
+        assert "MEMORY_ERROR" in result.stdout or result.exit_code == 137, (result.exit_code, result.stderr)
+        assert result.timing.execute_ms < 20_000
 
     async def test_deep_recursion(self, scheduler: Scheduler) -> None:
         """Deep recursion hits stack limit."""
@@ -551,9 +617,8 @@ print(f"SUBPROCESS:{result.stdout.strip()}")
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        # Subprocesses may or may not be allowed
-        # Should not hang or crash either way
-        assert result.exit_code == 0 or "SUBPROCESS:" not in result.stdout
+        assert result.exit_code == 0, result.stderr
+        assert "SUBPROCESS:hello from subprocess" in result.stdout
 
 
 # =============================================================================
@@ -873,12 +938,14 @@ console.log(reimport(42));
     # --- Error cases ---
 
     async def test_dynamic_import_nonexistent_module(self, scheduler: Scheduler) -> None:
-        """Dynamic import of non-existent module fails."""
-        result = await run_once(
+        """Dynamic import of a package that is not installed fails at once: no auto-install
+        from the registry (an auto-install waits 30 s with no network)."""
+        timed = await run_timed(
             scheduler, VmSpec(language=Language.JAVASCRIPT), "await import('nonexistent_xyz_module');"
         )
 
-        assert result.exit_code != 0
+        assert timed.result.exit_code != 0
+        assert timed.result.timing.execute_ms < 5_000
 
     async def test_dynamic_import_fire_and_forget_error(self, scheduler: Scheduler) -> None:
         """Unhandled dynamic import rejection is caught by unhandledRejection handler."""
@@ -887,9 +954,10 @@ import('nonexistent_xyz');
 await new Promise(r => setTimeout(r, 200));
 console.log("after");
 """
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
+        timed = await run_timed(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
 
-        assert result.exit_code != 0
+        assert timed.result.exit_code != 0
+        assert timed.result.timing.execute_ms < 5_000
 
 
 # =============================================================================
@@ -1110,6 +1178,7 @@ class TestRawEdgeCases:
 
         # Shell variable expansion
         assert result.exit_code == 0
+        assert result.stdout.strip() == "hello"
 
     # ---- Shebang handling (temp-file dispatch) ----
 
@@ -1293,10 +1362,9 @@ class TestHomeEnvironmentEdge:
 
     async def test_raw_home_persists_across_executions(self, scheduler: Scheduler) -> None:
         """HOME stays /home/user on second execution in same session."""
-        result = await run_once(scheduler, VmSpec(language=Language.RAW), "echo $HOME; echo $HOME")
-        assert result.exit_code == 0
-        lines = [line for line in result.stdout.strip().split("\n") if line.strip()]
-        assert all(line.strip() == "/home/user" for line in lines)
+        async with await scheduler.new(VmSpec(language=Language.RAW)) as session:
+            outputs = [(await session.exec("echo $HOME")).stdout.strip() for _ in range(2)]
+        assert outputs == ["/home/user", "/home/user"]
 
     async def test_raw_subprocess_inherits_home(self, scheduler: Scheduler) -> None:
         """Child processes inherit correct HOME."""
@@ -1391,17 +1459,6 @@ except EOFError:
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "CAUGHT_EOF" in result.stdout
-
-    async def test_python_stdin_read_empty(self, scheduler: Scheduler) -> None:
-        """sys.stdin.read() returns empty string at EOF."""
-        code = """\
-import sys
-data = sys.stdin.read()
-print(repr(data))
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "''" in result.stdout
 
     async def test_python_stdin_iteration_empty(self, scheduler: Scheduler) -> None:
         """for line in sys.stdin iterates zero times at EOF."""

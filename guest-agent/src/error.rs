@@ -2,7 +2,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::constants::VERSION;
+use crate::constants::{KILL_WAIT, VERSION};
 use crate::types::{GuestResponse, Language};
 
 // ============================================================================
@@ -11,9 +11,9 @@ use crate::types::{GuestResponse, Language};
 
 /// Domain-specific error types sent to the host as the `error_type` wire field.
 ///
-/// Replaces the previous ad-hoc `&'static str` approach where `"validation_error"`
-/// was overloaded across env vars, code, paths, and packages. Each variant maps
-/// to a distinct wire string so the host can dispatch without parsing messages.
+/// Each variant maps to a distinct wire string, so the host can dispatch
+/// without parsing messages. The host enum is `GuestErrorType` in
+/// src/exec_sandbox/constants.py; keep the two in sync.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ErrorType {
     EnvVar,      // "env_var_error"
@@ -189,43 +189,30 @@ impl ResponseWriter {
 }
 
 // ============================================================================
-// Response helpers (pre-parse error paths where no op_id is available)
+// Response helpers (request errors before a ResponseWriter exists)
 // ============================================================================
 
-/// Serialize a GuestResponse to JSON + newline and queue it for sending.
+/// Send a `request_error` response to the host.
 ///
-/// Used only for pre-parse error paths (before `op_id` is extracted from JSON).
-/// Prefer `ResponseWriter::send()` for all other cases.
-pub(crate) async fn send_response(
+/// Used only for request errors found before the `ResponseWriter` exists
+/// (request too large, bad JSON, unknown command); `op_id` is set when the
+/// JSON parsed but the command did not.
+/// Prefer `ResponseWriter::send_error()` for all other cases.
+pub(crate) async fn send_request_error(
     write_tx: &mpsc::Sender<Vec<u8>>,
-    msg: &GuestResponse,
+    message: String,
+    op_id: Option<&str>,
 ) -> Result<(), CmdError> {
-    let mut bytes = serde_json::to_vec(msg).map_err(|e| CmdError::Fatal(e.into()))?;
+    let msg = GuestResponse::Error {
+        message,
+        error_type: ErrorType::Request.as_str().to_string(),
+        op_id: op_id.map(|s| s.to_string()),
+        version: Some(VERSION),
+    };
+    let mut bytes = serde_json::to_vec(&msg).map_err(|e| CmdError::Fatal(e.into()))?;
     bytes.push(b'\n');
     write_tx.send(bytes).await?;
     Ok(())
-}
-
-/// Send an error response to the host.
-///
-/// Used only for pre-parse error paths (before `op_id` is extracted from JSON).
-/// Prefer `ResponseWriter::send_error()` for all other cases.
-pub(crate) async fn send_streaming_error(
-    write_tx: &mpsc::Sender<Vec<u8>>,
-    message: String,
-    error_type: &str,
-    op_id: Option<&str>,
-) -> Result<(), CmdError> {
-    send_response(
-        write_tx,
-        &GuestResponse::Error {
-            message,
-            error_type: error_type.to_string(),
-            op_id: op_id.map(|s| s.to_string()),
-            version: Some(VERSION),
-        },
-    )
-    .await
 }
 
 // ============================================================================
@@ -246,9 +233,12 @@ pub(crate) fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
 }
 
 /// Parse a language string, returning CmdError::Reply on failure.
-pub(crate) fn parse_language(language_str: &str, context: &str) -> Result<Language, CmdError> {
-    Language::parse(language_str)
-        .ok_or_else(|| CmdError::code(format!("Unsupported language '{language_str}' ({context})")))
+pub(crate) fn parse_language(language_str: &str) -> Result<Language, CmdError> {
+    Language::parse(language_str).ok_or_else(|| {
+        CmdError::code(format!(
+            "Unsupported language '{language_str}' (supported: python, javascript, raw)"
+        ))
+    })
 }
 
 /// Gracefully terminate a process group: SIGTERM → wait → SIGKILL.
@@ -258,14 +248,14 @@ pub(crate) fn parse_language(language_str: &str, context: &str) -> Result<Langua
 /// 2. Wait for grace period
 /// 3. If still running, send SIGKILL
 pub(crate) async fn graceful_terminate_process_group(
-    child: &mut tokio::process::Child,
+    child: &mut crate::init::WaitedChild,
     grace_period_secs: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     use tokio::time::{Duration, timeout};
 
     let pid = match child.id() {
         Some(id) => id as i32,
-        None => return Ok(()), // Process already exited
+        None => return, // Process already exited (its PID may be another process now)
     };
 
     // Phase 1: SIGTERM to entire process group
@@ -275,13 +265,13 @@ pub(crate) async fn graceful_terminate_process_group(
         if errno.raw_os_error() != Some(libc::ESRCH) {
             log_error!("SIGTERM to process group {pid} failed: {errno}");
         }
-        let _ = child.wait().await;
-        return Ok(());
+        let _ = wait_child_bounded(child, "a failed SIGTERM", KILL_WAIT).await;
+        return;
     }
 
     // Phase 2: Wait for grace period
     match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
-        Ok(Ok(_)) => return Ok(()),
+        Ok(Ok(_)) => return,
         Ok(Err(e)) => log_error!("Wait error after SIGTERM: {e}"),
         Err(_) => log_warn!(
             "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
@@ -297,13 +287,43 @@ pub(crate) async fn graceful_terminate_process_group(
         }
     }
 
-    let _ = child.wait().await;
-    Ok(())
+    let _ = wait_child_bounded(child, "SIGKILL", KILL_WAIT).await;
+}
+
+/// Wait for `child` to exit, at most `limit` (`KILL_WAIT` in the agent).
+///
+/// For a child that got SIGKILL, or that closed both output pipes. A process
+/// in uninterruptible sleep (D state) exits only when its I/O ends, and the
+/// agent serves one command at a time: it must not wait for that. A child
+/// that is still running is reaped later (tokio's orphan queue, or the PID 1
+/// reaper).
+pub(crate) async fn wait_child_bounded(
+    child: &mut crate::init::WaitedChild,
+    after: &str,
+    limit: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let pid = child.id();
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(e)) => {
+            log_error!("Wait for process {pid:?} after {after} failed: {e}");
+            None
+        }
+        Err(_) => {
+            log_warn!("Process {pid:?} still runs {limit:?} after {after}; not waiting longer");
+            None
+        }
+    }
 }
 
 /// Spawn a task that reads lines from a child process stream, respecting a byte limit.
 ///
-/// Used by `install_packages` to capture stdout/stderr without duplication.
+/// Used by `install_packages` to collect stdout and stderr. Whole lines are
+/// kept while their total fits in `max_bytes` (a newline counts one byte); the
+/// line that crosses it is cut at a character boundary and a `[truncated: ...]`
+/// line follows. The task then reads on and drops the rest, so the child never
+/// writes into a closed pipe (EPIPE). Bytes that are not UTF-8 become U+FFFD.
+/// A line holds at most `max_bytes` in memory, however long the child makes it.
 pub(crate) fn spawn_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     stream: R,
     max_bytes: usize,
@@ -311,27 +331,69 @@ pub(crate) fn spawn_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'stat
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stream).lines();
+        let mut reader = BufReader::new(stream);
         let mut lines = Vec::new();
-        let mut total_bytes = 0usize;
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            if total_bytes + line.len() + 1 > max_bytes {
-                let remaining = max_bytes.saturating_sub(total_bytes);
-                if remaining > 0 {
-                    lines.push(line[..remaining.min(line.len())].to_string());
+        let mut kept = 0usize; // bytes of `lines`, a newline counting one
+        let mut current: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        loop {
+            let chunk = match reader.fill_buf().await {
+                Ok([]) | Err(_) => break, // end of the stream, or the child's end is gone
+                Ok(chunk) => chunk,
+            };
+            let read = chunk.len();
+            if !truncated {
+                for &byte in chunk {
+                    if byte == b'\n' {
+                        truncated = keep_line(&mut lines, &mut kept, &mut current, max_bytes);
+                        if truncated {
+                            break;
+                        }
+                    } else if current.len() <= max_bytes {
+                        current.push(byte); // past max_bytes the line is cut anyway
+                    }
                 }
-                lines.push(format!(
-                    "[truncated: output limit {}KB exceeded]",
-                    max_bytes / 1024
-                ));
-                break;
             }
-            total_bytes += line.len() + 1;
-            lines.push(line);
+            reader.consume(read);
+        }
+        if !truncated && !current.is_empty() {
+            keep_line(&mut lines, &mut kept, &mut current, max_bytes);
         }
         lines
     })
+}
+
+/// Add the line in `current` (its newline not included) to `lines`, or its
+/// part that fits in `max_bytes` and a `[truncated: ...]` line. Returns true
+/// once truncated: the caller then drops the rest of the stream.
+fn keep_line(
+    lines: &mut Vec<String>,
+    kept: &mut usize,
+    current: &mut Vec<u8>,
+    max_bytes: usize,
+) -> bool {
+    if current.last() == Some(&b'\r') {
+        current.pop();
+    }
+    let line = String::from_utf8_lossy(current).into_owned();
+    current.clear();
+    if *kept + line.len() < max_bytes {
+        *kept += line.len() + 1;
+        lines.push(line);
+        return false;
+    }
+    let mut cut = max_bytes.saturating_sub(*kept).min(line.len());
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut > 0 {
+        lines.push(line[..cut].to_string());
+    }
+    lines.push(format!(
+        "[truncated: output limit {}KB exceeded]",
+        max_bytes / 1024
+    ));
+    true
 }
 
 // ============================================================================
@@ -340,6 +402,88 @@ pub(crate) fn spawn_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'stat
 
 #[cfg(test)]
 mod tests {
+
+    // -------------------------------------------------------------------------
+    // spawn_output_reader
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_output_reader_keeps_whole_lines_then_marks_the_cut() {
+        // "abcdeé" is 7 bytes and its newline 1: it fills the 8-byte limit, so
+        // "xyz" goes and the truncation line follows
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = spawn_output_reader(rx, 8);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, "abcdeé\nxyz\n".as_bytes())
+            .await
+            .unwrap();
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "abcdeé".to_string(),
+                "[truncated: output limit 0KB exceeded]".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_output_reader_cut_inside_a_char_does_not_panic() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = spawn_output_reader(rx, 4);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, "abcé\n".as_bytes())
+            .await
+            .unwrap();
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "abc".to_string(),
+                "[truncated: output limit 0KB exceeded]".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_output_reader_drains_past_the_limit() {
+        // The child writes 64 KiB through a 1 KiB pipe after the limit: every
+        // write must succeed (a closed pipe would give the child EPIPE).
+        let (mut tx, rx) = tokio::io::duplex(1024);
+        let task = spawn_output_reader(rx, 16);
+        for _ in 0..1024 {
+            tokio::io::AsyncWriteExt::write_all(&mut tx, &[b'x'; 63])
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut tx, b"\n")
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "x".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn test_output_reader_keeps_reading_after_bytes_that_are_not_utf8() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = spawn_output_reader(rx, 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, b"a\xffb\r\nnext\nlast")
+            .await
+            .unwrap();
+        drop(tx);
+        let lines = task.await.unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "a\u{fffd}b".to_string(),
+                "next".to_string(),
+                "last".to_string()
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -501,14 +645,14 @@ mod tests {
 
     #[test]
     fn test_parse_language_valid() {
-        assert!(parse_language("python", "test").is_ok());
-        assert!(parse_language("javascript", "test").is_ok());
-        assert!(parse_language("raw", "test").is_ok());
+        assert!(parse_language("python").is_ok());
+        assert!(parse_language("javascript").is_ok());
+        assert!(parse_language("raw").is_ok());
     }
 
     #[test]
     fn test_parse_language_invalid() {
-        let err = parse_language("cobol", "test").unwrap_err();
+        let err = parse_language("cobol").unwrap_err();
         match err {
             CmdError::Reply {
                 message,
@@ -725,5 +869,47 @@ mod tests {
     async fn response_writer_empty_op_id() {
         let val = writer_send_json(Some(""), &PONG).await;
         assert_eq!(val["op_id"], "");
+    }
+
+    // -------------------------------------------------------------------------
+    // wait_child_bounded
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wait_child_bounded_gives_up_on_a_child_that_keeps_running() {
+        let mut child = crate::init::WaitedChild::register(
+            tokio::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let start = std::time::Instant::now();
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_child_bounded(&mut child, "test", std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("the wait must stop at its limit");
+
+        assert!(status.is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_child_bounded_returns_the_status_of_a_child_that_exits() {
+        let mut child = crate::init::WaitedChild::register(
+            tokio::process::Command::new("sh")
+                .args(["-c", "exit 3"])
+                .spawn()
+                .unwrap(),
+        );
+
+        let status =
+            wait_child_bounded(&mut child, "test", std::time::Duration::from_secs(2)).await;
+
+        assert_eq!(status.and_then(|s| s.code()), Some(3));
     }
 }

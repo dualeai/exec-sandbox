@@ -18,6 +18,16 @@ pub(crate) const MAX_CODE_SIZE_BYTES: usize = 1024 * 1024; // 1 MiB max code siz
 pub(crate) const MAX_PACKAGE_OUTPUT_BYTES: usize = 50_000; // 50KB max package install output
 pub(crate) const MAX_TIMEOUT_SECONDS: u64 = 300; // 5 minutes max execution timeout
 
+/// The deadline of an exec or a package install of `requested` seconds: 0
+/// means the default, MAX_TIMEOUT_SECONDS (the host accepts 0 for both).
+pub(crate) fn effective_timeout_secs(requested: u64) -> u64 {
+    if requested > 0 {
+        requested
+    } else {
+        MAX_TIMEOUT_SECONDS
+    }
+}
+
 // Sandbox user identity — all code execution runs as this non-root user.
 // Matches the "user" account created in the VM image (see build-qcow2.sh).
 pub(crate) const SANDBOX_UID: u32 = 1000;
@@ -25,15 +35,16 @@ pub(crate) const SANDBOX_GID: u32 = 1000;
 
 // Connection limits
 pub(crate) const MAX_REQUEST_SIZE_BYTES: usize = 16_000_000; // 16MB max single request JSON
-pub(crate) const RETRY_DELAY_MS: u64 = 50; // 50ms retry delay on transient errors
+// Pause before reopening the ports after a connection error.
+pub(crate) const RETRY_DELAY_MS: u64 = 50;
 // Bounded channel size for the guest→host write queue.
 pub(crate) const WRITE_QUEUE_SIZE: usize = 128;
-pub(crate) const READ_TIMEOUT_MS: u64 = 18000; // 18s > 15s health check interval
 
-// Host disconnection backoff configuration
-// INITIAL: 1ms for fast reconnect (virtio-serial port typically ready in 1-2ms).
-// MAX: 1000ms to keep orphan VM CPU low (~1% vs 5x higher at 200ms).
-// Exponential backoff reaches 1000ms after ~10 attempts (~2s).
+// Backoff between attempts to open the virtio-serial ports (boot, or after a
+// port error). A host close does not reopen them (see CommandPort).
+// INITIAL: 1ms for a fast open (virtio-serial port typically ready in 1-2ms).
+// MAX: 1000ms to keep CPU low while a port stays broken.
+// Exponential backoff reaches 1000ms after 10 attempts (~1s of waits).
 pub(crate) const INITIAL_BACKOFF_MS: u64 = 1;
 pub(crate) const MAX_BACKOFF_MS: u64 = 1000;
 
@@ -44,9 +55,13 @@ pub(crate) const MAX_ENV_VAR_VALUE_LENGTH: usize = 4096;
 
 // Package limits
 pub(crate) const MAX_PACKAGES: usize = 50;
-pub(crate) const MAX_PACKAGE_NAME_LENGTH: usize = 214; // PyPI limit
+// npm name limit, checked on the full spec (name + version).
+pub(crate) const MAX_PACKAGE_NAME_LENGTH: usize = 214;
 
-// Streaming configuration
+// Streaming configuration. Exec output is sent every FLUSH_INTERVAL_MS, and at
+// once when a buffer reaches MAX_BUFFER_SIZE_BYTES or when no output was sent
+// in the last FLUSH_INTERVAL_MS (execute.rs).
+// DRAIN_TIMEOUT_MS bounds each read of the drain after a timeout SIGTERM.
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
 pub(crate) const DRAIN_TIMEOUT_MS: u64 = 5;
 pub(crate) const MAX_BUFFER_SIZE_BYTES: usize = 64 * 1024; // 64KB
@@ -65,7 +80,7 @@ pub(crate) const SANDBOX_ROOT: &str = "/home/user";
 pub(crate) const PYTHON_SITE_PACKAGES: &str = "/usr/lib/python3/site-packages";
 pub(crate) const NODE_MODULES_SYSTEM: &str = "/usr/local/lib/node_modules";
 
-// Runtime paths — shared between spawn.rs (REPL commands).
+// Runtime paths of the REPL interpreters (spawn.rs); packages.rs also uses PYTHON_HOME.
 pub(crate) const JEMALLOC_LIB: &str = "/usr/lib/libjemalloc.so.2";
 pub(crate) const PYTHON_HOME: &str = "/opt/python";
 pub(crate) const BUN_BIN_PATH: &str = "/usr/local/bin/bun";
@@ -77,8 +92,21 @@ pub(crate) const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
 
 // Graceful termination configuration
 pub(crate) const TERM_GRACE_PERIOD_SECONDS: u64 = 5;
+// Longest wait for a process after SIGKILL (wait_child_bounded). A process in
+// uninterruptible sleep dies only when its I/O ends. Fits in the host margin
+// (EXECUTION_TIMEOUT_MARGIN_SECONDS = 10) with TERM_GRACE_PERIOD_SECONDS.
+pub(crate) const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// E4: Quiet mode — suppress non-essential log_info! on the boot critical path.
+// Longest wait for the writer task of a pipelined file write: for a free slot
+// for each chunk, at file_end for the end of the write, and for a task that
+// ended early. A writer stuck on the disk would else stop the agent, which reads
+// one command at a time. Below the host's ack wait (FILE_IO_TIMEOUT_SECONDS =
+// 120), so a write that failed gets an error reply, not a deadline. A write
+// whose rename stalls after its commit claim gets no reply: the host's deadline
+// then gives an unknown outcome, the truth.
+pub(crate) const FILE_WRITE_STALL_TIMEOUT_SECONDS: u64 = 60;
+
+/// Quiet mode — suppress non-essential log_info! on the boot critical path.
 /// Each eprintln! triggers an MMIO trap through the console device (~0.1-5ms per line
 /// depending on console type: virtio-console, PL011, ISA serial).
 /// Enabled by `init.quiet=1` on the kernel command line.
@@ -148,8 +176,8 @@ pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
 ];
 
 /// Network readiness gate: 0=pending, 1=ready (including intentionally offline),
-/// 2=failed. ExecuteCode/InstallPackages wait on this; Ping/file I/O respond
-/// immediately.
+/// 2=failed. ExecuteCode, InstallPackages and WarmRepl wait on this; Ping and
+/// file I/O respond immediately.
 pub(crate) const NETWORK_PENDING: u8 = 0;
 pub(crate) const NETWORK_READY: u8 = 1;
 pub(crate) const NETWORK_FAILED: u8 = 2;
@@ -167,10 +195,23 @@ pub(crate) const ZRAM_READY: u8 = 1;
 pub(crate) const ZRAM_FAILED: u8 = 2;
 pub(crate) static ZRAM_STATE: AtomicU8 = AtomicU8::new(ZRAM_PENDING);
 
-/// Monotonic counter for sentinel IDs. Combined with nanosecond timestamp
-/// to produce unique, unpredictable IDs without the uuid crate dependency.
+/// Monotonic counter for sentinel IDs. Combined with a nanosecond timestamp,
+/// it makes each ID unique without the uuid crate.
 pub(crate) static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Module-level REPL storage. Persists across guest agent reconnect cycles (READ_TIMEOUT_MS=18s).
+/// Module-level REPL storage. Persists across host connections.
 pub(crate) static REPL_STATES: LazyLock<TokioMutex<HashMap<Language, ReplState>>> =
     LazyLock::new(|| TokioMutex::new(HashMap::new()));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zero_timeout_is_the_default_deadline() {
+        // One rule for an install and an exec: 0 is the default deadline
+        assert_eq!(effective_timeout_secs(0), 300);
+        assert_eq!(effective_timeout_secs(1), 1);
+        assert_eq!(effective_timeout_secs(120), 120);
+    }
+}

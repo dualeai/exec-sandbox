@@ -10,12 +10,13 @@ use tokio::time::{Duration, interval};
 use crate::constants::*;
 use crate::error::{
     CmdError, ResponseWriter, exit_code_from_status, graceful_terminate_process_group,
-    parse_language,
+    parse_language, wait_child_bounded,
 };
 use crate::repl::spawn::spawn_repl;
 use crate::types::GuestResponse;
 use crate::validation::{prepend_env_vars, validate_code_params, validate_env_vars};
 
+/// Read at most `limit` bytes of a /proc or /sys file for a diagnostic log line.
 fn read_bounded_diagnostic(path: &str, limit: u64) -> String {
     use std::io::Read as _;
 
@@ -79,6 +80,14 @@ async fn flush_output_buffer(
     writer.send(&msg).await
 }
 
+/// True when nothing was sent in the last FLUSH_INTERVAL_MS: the first output
+/// after a quiet time then goes out at once, not at the next flush tick (up to
+/// FLUSH_INTERVAL_MS later). A 1 ms wait, to send a short exec's output with its
+/// end, is no faster and makes the first output 1 ms late.
+fn flush_due(last_flush: Option<Instant>) -> bool {
+    last_flush.is_none_or(|at| at.elapsed() >= Duration::from_millis(FLUSH_INTERVAL_MS))
+}
+
 /// Parse a single stderr line for a sentinel marker, returning the exit code if found.
 /// The code is kept like a process exit status (0-255, 255 if it is not a number):
 /// the host reads -1 as a timeout only.
@@ -114,8 +123,8 @@ fn process_stderr_chunk(
     stderr_line_buf.push_str(&String::from_utf8_lossy(chunk));
 
     // Single linear pass: scan complete lines in place, then drain them all at
-    // once. Per-line drain+collect was O(remaining) per line plus a heap
-    // allocation per line — quadratic on newline-dense chunks.
+    // once. A drain per line would cost O(remaining) each time — quadratic on
+    // newline-dense chunks.
     let mut sentinel_exit_code: Option<i32> = None;
     let mut consumed = 0;
     for line in stderr_line_buf.split_inclusive('\n') {
@@ -281,7 +290,7 @@ async fn drain_after_sigterm(
         let per_read = remaining.min(Duration::from_millis(DRAIN_TIMEOUT_MS));
 
         // Branch preconditions disable a stream once it is done; the
-        // `Err(_) if !other_done` arm reproduces the read asymmetry: while both
+        // `Err(_) if !other_done` arm makes reads asymmetric: while both
         // streams are active a timeout retries, but once only one remains the
         // first timeout terminates it. (At least one branch is always enabled —
         // the loop guard breaks when both are done.)
@@ -342,9 +351,41 @@ async fn submit_code_to_repl(
     stdin.flush().await
 }
 
-/// Exercise a freshly-spawned REPL with a no-op to block until the interpreter
-/// is fully loaded. `spawn_repl()` only proves fork+exec returned; the loader
-/// and interpreter may still be consuming executable/data pages.
+/// The live REPL of `language`, taken out of REPL_STATES, or a new one when none
+/// runs or it died while idle (true: new). The caller puts it back when done. The
+/// lock is held across the spawn: two callers never start two REPLs.
+pub(crate) async fn take_or_spawn_repl(
+    language: crate::types::Language,
+) -> Result<(crate::repl::spawn::ReplState, bool), Box<dyn std::error::Error>> {
+    let mut states = REPL_STATES.lock().await;
+    let alive = match states.remove(&language) {
+        Some(mut existing) => match existing.child.try_wait() {
+            Ok(None) => Some(existing),
+            Ok(Some(status)) => {
+                // An exit 137 retires the VM: spawn_repl then refuses.
+                let exit_code =
+                    crate::oom_guard::reconcile_retirement_exit(exit_code_from_status(status));
+                log_warn!(
+                    "REPL for {} died while idle with exit_code={exit_code}",
+                    language.as_str()
+                );
+                None
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+    match alive {
+        Some(existing) => Ok((existing, false)),
+        None => Ok((spawn_repl(language).await?, true)),
+    }
+}
+
+/// Exercise a REPL with a no-op. On a new REPL it blocks until the interpreter is
+/// fully loaded: `spawn_repl()` only proves fork+exec returned; the loader and
+/// interpreter may still be consuming executable/data pages. On a live REPL (an
+/// L1 restore, a warm-up before a reclaim) it maps its pages again and starts its
+/// output paths, so the first exec of a user is not the REPL's first.
 ///
 /// Pre-advertisement paths only (warm-pool pre-warm and background L1
 /// snapshot saves), hence the generous deadline: it runs before the VM is
@@ -360,10 +401,19 @@ pub(crate) async fn warm_exercise_repl(
 
     let (sentinel_id, sentinel_prefix) = generate_sentinel();
 
-    // Language-appropriate no-op code
+    // Language-appropriate no-op code. Python: load the modules that the REPL
+    // loads only when user code needs them (a cold start does not wait for them),
+    // with __import__, which binds no name: user code sees the same names on a
+    // pooled VM as on a cold one. Python and JavaScript also print a value:
+    // the first output of a REPL is slow (the stream and console paths start), and
+    // the read below drops it. Measured on a pooled VM, first exec against the
+    // second: HVF Python 4 / 1 ms, JavaScript 13 / 2 ms (TCG 55 / 3, 127 / 4) with
+    // a no-op that printed nothing.
     let code: &[u8] = match language {
-        Language::Python => b"pass",
-        Language::Javascript => b"void 0",
+        Language::Python => {
+            b"__import__('multiprocessing'), __import__('traceback'), __import__('typing'), print(0)"
+        }
+        Language::Javascript => b"console.log(0)",
         Language::Raw => b":",
     };
 
@@ -442,49 +492,20 @@ pub(crate) async fn execute_code_streaming(
     env_vars: &HashMap<String, String>,
     writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
-    let language = parse_language(language_str, "supported: python, javascript, raw")?;
+    let language = parse_language(language_str)?;
 
     validate_code_params(code, timeout)?;
     validate_env_vars(env_vars)?;
 
     let start = Instant::now();
 
-    // Get or create persistent REPL for this language
+    // Get or create persistent REPL for this language. A REPL that cannot
+    // start (a retired VM included) is a reply, never a dropped connection:
+    // the host sees no close of the port and would wait for its deadline.
     let spawn_start = Instant::now();
-    let mut was_fresh_spawn = false;
-    let mut repl = {
-        let mut states = REPL_STATES.lock().await;
-        match states.remove(&language) {
-            Some(mut existing) => match existing.child.try_wait() {
-                Ok(Some(status)) => {
-                    let exit_code = exit_code_from_status(status);
-                    if crate::oom_guard::reconcile_retirement_exit(exit_code) == 137 {
-                        return Err(CmdError::Fatal(
-                            "VM retirement required after idle REPL death".into(),
-                        ));
-                    }
-                    log_warn!("REPL for {} died, spawning fresh", language.as_str());
-                    was_fresh_spawn = true;
-                    spawn_repl(language)
-                        .await
-                        .map_err(|e| CmdError::Fatal(e.to_string().into()))?
-                }
-                Ok(None) => existing,
-                Err(_) => {
-                    was_fresh_spawn = true;
-                    spawn_repl(language)
-                        .await
-                        .map_err(|e| CmdError::Fatal(e.to_string().into()))?
-                }
-            },
-            None => {
-                was_fresh_spawn = true;
-                spawn_repl(language)
-                    .await
-                    .map_err(|e| CmdError::Fatal(e.to_string().into()))?
-            }
-        }
-    };
+    let (mut repl, was_fresh_spawn) = take_or_spawn_repl(language)
+        .await
+        .map_err(|e| CmdError::execution(format!("Failed to start REPL: {e}")))?;
     let spawn_ms = spawn_start.elapsed().as_millis() as u64;
     log_info!(
         "[timing] repl_acquired: {}ms (fresh={}, spawn={}ms)",
@@ -493,7 +514,7 @@ pub(crate) async fn execute_code_streaming(
         spawn_ms
     );
 
-    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::Fatal(e.into()))?;
+    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::execution(e.to_string()))?;
 
     // Generate unique sentinel
     let (sentinel_id, sentinel_prefix) = generate_sentinel();
@@ -506,8 +527,8 @@ pub(crate) async fn execute_code_streaming(
     let write_result = submit_code_to_repl(&mut repl.stdin, &sentinel_id, code_bytes).await;
     if let Err(e) = write_result {
         log_error!("REPL stdin write failed: {e}");
-        let _ = repl.child.kill().await;
-        let _ = repl.child.wait().await;
+        let _ = repl.child.start_kill();
+        let _ = wait_child_bounded(&mut repl.child, "SIGKILL", KILL_WAIT).await;
         return Err(CmdError::execution(format!(
             "Failed to send code to REPL: {e}"
         )));
@@ -529,6 +550,8 @@ pub(crate) async fn execute_code_streaming(
     let mut stdout_bytes = [0u8; 8192];
     let mut stderr_bytes = [0u8; 8192];
     let mut flush_timer = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+    // Time of the last output sent (flush_due); None until the first.
+    let mut last_flush: Option<Instant> = None;
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut sentinel_exit_code: Option<i32> = None;
@@ -544,17 +567,18 @@ pub(crate) async fn execute_code_streaming(
     let mut stdout_capped = false;
     let mut stderr_capped = false;
 
-    let effective_timeout = if timeout > 0 {
-        timeout
-    } else {
-        MAX_TIMEOUT_SECONDS
-    };
+    let effective_timeout = effective_timeout_secs(timeout);
     let timeout_duration = Duration::from_secs(effective_timeout);
 
     let loop_result = tokio::time::timeout(timeout_duration, async {
         loop {
             tokio::select! {
                 _ = flush_timer.tick() => {
+                    if (!stdout_capped && !stdout_buffer.is_empty())
+                        || (!stderr_capped && !stderr_buffer.is_empty())
+                    {
+                        last_flush = Some(Instant::now());
+                    }
                     if !stdout_capped {
                         let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
                     }
@@ -588,7 +612,16 @@ pub(crate) async fn execute_code_streaming(
                             } else {
                                 stdout_buffer.push_str(&String::from_utf8_lossy(&output));
                                 if stdout_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                                    last_flush = Some(Instant::now());
                                     let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                } else if !stdout_buffer.is_empty() && flush_due(last_flush) {
+                                    // Both buffers, as the tick does: stderr output that waits
+                                    // for the tick goes out with this stdout
+                                    last_flush = Some(Instant::now());
+                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                    if !stderr_capped {
+                                        let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                                    }
                                 }
                             }
                         }
@@ -628,6 +661,14 @@ pub(crate) async fn execute_code_streaming(
                                 }
                                 stderr_buffer.clear(); // discard parsed-but-over-limit data
                             } else if stderr_buffer.len() >= MAX_BUFFER_SIZE_BYTES {
+                                last_flush = Some(Instant::now());
+                                let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
+                            } else if !stderr_buffer.is_empty() && flush_due(last_flush) {
+                                // Both buffers, in the tick's order
+                                last_flush = Some(Instant::now());
+                                if !stdout_capped {
+                                    let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
+                                }
                                 let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
                             }
                         }
@@ -721,7 +762,17 @@ pub(crate) async fn execute_code_streaming(
                 .await?;
         }
         Ok(()) => {
-            let status = repl.child.wait().await;
+            // Both pipes closed without a sentinel: the REPL has most likely
+            // exited. One that still runs after KILL_WAIT (its code closed
+            // fd 1 and 2) is killed.
+            let status =
+                match wait_child_bounded(&mut repl.child, "closing its output", KILL_WAIT).await {
+                    Some(status) => Some(status),
+                    None => {
+                        graceful_terminate_process_group(&mut repl.child, 0).await;
+                        repl.child.try_wait().ok().flatten()
+                    }
+                };
             let observed_exit_code = status.map_or(255, exit_code_from_status);
             let exit_code = crate::oom_guard::reconcile_retirement_exit(observed_exit_code);
             log_warn!(
@@ -746,8 +797,7 @@ pub(crate) async fn execute_code_streaming(
                 language.as_str(),
                 effective_timeout
             );
-            let _ =
-                graceful_terminate_process_group(&mut repl.child, TERM_GRACE_PERIOD_SECONDS).await;
+            graceful_terminate_process_group(&mut repl.child, TERM_GRACE_PERIOD_SECONDS).await;
 
             // Drain stdout/stderr after SIGTERM — the process may have printed
             // output (e.g. Python SIGTERM handler) and emitted a sentinel.
@@ -773,7 +823,8 @@ pub(crate) async fn execute_code_streaming(
                 if !stderr_capped {
                     let _ = flush_output_buffer(writer, &mut stderr_buffer, "stderr").await;
                 }
-                // Timeout takes precedence over output limit — REPL is dead (SIGTERM'd)
+                // No output-limit error here: the REPL got SIGTERM and is not
+                // pooled, so the sentinel code is the result.
                 let exit_code = crate::oom_guard::reconcile_retirement_exit(exit_code);
                 writer
                     .send(&GuestResponse::Complete {
@@ -1241,6 +1292,22 @@ mod tests {
             &mut stderr_buf,
         );
         assert_eq!(result, Some(5));
+    }
+
+    // -------------------------------------------------------------------------
+    // flush_due — the first output after a quiet time goes out soon
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn flush_is_due_before_the_first_flush_and_after_a_quiet_time() {
+        let interval = Duration::from_millis(FLUSH_INTERVAL_MS);
+        assert!(flush_due(None));
+        assert!(
+            !flush_due(Some(Instant::now())),
+            "a flush just now: wait for the tick"
+        );
+        let quiet = Instant::now().checked_sub(interval).unwrap();
+        assert!(flush_due(Some(quiet)));
     }
 
     // -------------------------------------------------------------------------

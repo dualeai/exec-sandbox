@@ -2,8 +2,9 @@
 //!
 //! Lightweight async agent running inside QEMU microVMs.
 //! Communicates with host via virtio-serial for:
-//! - Package installation (pip, bun)
+//! - Package installation (uv pip for Python, bun for JavaScript)
 //! - Code execution via persistent REPL (Python, JavaScript, Shell)
+//! - File transfer (write, read, list under /home/user)
 //! - Health checks
 //!
 //! All code execution uses persistent REPL wrappers (not per-exec processes).
@@ -54,6 +55,7 @@ mod validation;
 
 use constants::*;
 
+/// CLOCK_MONOTONIC in milliseconds (time since boot), for `[timing]` log lines.
 pub(crate) fn monotonic_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -71,9 +73,9 @@ pub(crate) fn monotonic_ms() -> u64 {
 /// immediate reseed so each VM diverges before any user code calls getrandom().
 ///
 /// Called at two points for defense-in-depth:
-/// 1. `listen_virtio_serial()` — on every (re)connection (covers cold boot)
+/// 1. `listen_virtio_serial()` — each time the ports open (covers cold boot)
 /// 2. `handle_connection()` — before every command dispatch (covers L1 restore,
-///    where the VM resumes mid-loop and never re-enters the connection setup)
+///    where the VM resumes mid-loop with the ports already open)
 ///
 /// Cost: ~11μs per call, negligible vs connection/exec overhead.
 fn reseed_crng() {
@@ -100,10 +102,15 @@ fn reseed_crng() {
     }
 }
 
-/// Listen on virtio-serial ports with reconnection loop.
+/// Serve the host over the virtio-serial ports.
+///
+/// The ports stay open while they work. A host that closes its sockets (VM
+/// teardown, an L1 restore, a channel reset) ends one connection; the agent
+/// then serves the next host on the same ports. Closing a port would make the
+/// guest kernel drop the bytes that the host sends before QEMU sees the close
+/// (see connection::CommandPort). Only a port error makes the agent reopen
+/// the ports.
 async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::fs::OpenOptions;
-
     log_info!(
         "Guest agent opening virtio-serial ports: cmd={CMD_PORT_PATH}, event={EVENT_PORT_PATH}"
     );
@@ -111,64 +118,50 @@ async fn listen_virtio_serial() -> Result<(), Box<dyn std::error::Error>> {
     let mut backoff_ms = INITIAL_BACKOFF_MS;
 
     loop {
-        let cmd_file = match connection::NonBlockingFile::open_read(CMD_PORT_PATH) {
-            Ok(f) => {
-                log_info!("Guest agent connected to command port (read, non-blocking)");
-                f
-            }
-            Err(e) => {
-                log_error!("Failed to open command port: {e}, retrying in {backoff_ms}ms...");
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                continue;
-            }
-        };
-
-        match cmd_file.is_host_connected() {
-            Ok(true) => {
-                log_info!("Host is connected, proceeding with connection setup");
-                backoff_ms = INITIAL_BACKOFF_MS;
-                reseed_crng();
-            }
-            Ok(false) => {
-                log_warn!("Host not connected (POLLHUP), waiting {backoff_ms}ms before retry...");
-                drop(cmd_file);
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                continue;
-            }
+        let (mut cmd_port, event_port) = match open_ports().await {
+            Ok(ports) => ports,
             Err(e) => {
                 log_error!(
-                    "Failed to check host connection status: {e}, retrying in {backoff_ms}ms..."
+                    "Failed to open virtio-serial ports: {e}, retrying in {backoff_ms}ms..."
                 );
-                drop(cmd_file);
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                continue;
-            }
-        }
-
-        let event_file = match OpenOptions::new().write(true).open(EVENT_PORT_PATH).await {
-            Ok(f) => {
-                log_info!("Guest agent connected to event port (write)");
-                f
-            }
-            Err(e) => {
-                log_error!("Failed to open event port: {e}, retrying in {backoff_ms}ms...");
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
         };
-
+        backoff_ms = INITIAL_BACKOFF_MS;
+        reseed_crng();
         log_info!("[timing] agent_connected: {}ms (monotonic)", monotonic_ms());
 
-        let mut cmd_file = cmd_file;
-        if let Err(e) = connection::handle_connection(&mut cmd_file, event_file).await {
-            log_error!("Connection error: {e}, reopening ports...");
-            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        loop {
+            // Each connection writes through its own descriptor of the event
+            // port; `event_port` keeps the port open between connections.
+            let served = match event_port.try_clone().await {
+                Ok(event_file) => connection::handle_connection(&mut cmd_port, event_file).await,
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = served {
+                log_error!("Connection error: {e}, reopening ports...");
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                break;
+            }
         }
     }
+}
+
+/// Open the command port (read) and the event port (write).
+///
+/// No host needs to be connected: bytes that a host sends before the agent
+/// reads stay in QEMU or in the guest kernel until the agent reads them.
+async fn open_ports() -> std::io::Result<(connection::CommandPort, tokio::fs::File)> {
+    let cmd_port = connection::CommandPort::open(CMD_PORT_PATH)?;
+    log_info!("Guest agent opened command port (read, non-blocking)");
+    let event_port = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(EVENT_PORT_PATH)
+        .await?;
+    log_info!("Guest agent opened event port (write)");
+    Ok((cmd_port, event_port))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -200,9 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     phase2_handle.await?;
 
     // Start independent work only after phase 2 has prepared /dev. Zram setup
-    // is awaited so it removes its setup-only node and seals the final /dev
-    // mount before the long-lived virtio port descriptors are opened; L1
-    // snapshots rely on that stable ordering when reconnecting the ports.
+    // is awaited: it removes its setup-only node and seals /dev read-only
+    // before the agent opens the long-lived virtio port descriptors, so the
+    // ports open through the final /dev mount.
     tokio::spawn(init::reap_zombies());
     tokio::spawn(init::setup_network_background());
     init::setup_zram_and_seal_dev().await;

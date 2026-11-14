@@ -10,6 +10,9 @@ use std::collections::HashMap;
 // Inbound commands (host → guest, deserialized from JSON)
 // ============================================================================
 
+/// A host request, tagged by `action`. The host models are in
+/// src/exec_sandbox/guest_agent_protocol.py. connection.rs reads the top-level
+/// `op_id` and `host_time_ns` from the raw JSON before this parse.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action")]
 pub(crate) enum GuestCommand {
@@ -20,6 +23,7 @@ pub(crate) enum GuestCommand {
     InstallPackages {
         language: String,
         packages: Vec<String>,
+        /// Seconds for the package manager process; 0 means MAX_TIMEOUT_SECONDS.
         timeout: u64,
     },
 
@@ -27,6 +31,7 @@ pub(crate) enum GuestCommand {
     ExecuteCode {
         language: String,
         code: String,
+        /// Seconds, at most MAX_TIMEOUT_SECONDS; 0 means MAX_TIMEOUT_SECONDS.
         #[serde(default)]
         timeout: u64,
         #[serde(default)]
@@ -44,9 +49,12 @@ pub(crate) enum GuestCommand {
     #[serde(rename = "read_file")]
     ReadFile { op_id: String, path: String },
 
+    /// One chunk of a write_file stream: base64 of zstd-compressed bytes.
     #[serde(rename = "file_chunk")]
     FileChunk { op_id: String, data: String },
 
+    /// End of a write_file stream: the guest commits the file and replies
+    /// with FileWriteAck.
     #[serde(rename = "file_end")]
     FileEnd { op_id: String },
 
@@ -64,6 +72,8 @@ pub(crate) enum GuestCommand {
 // Outbound messages (guest → host, serialized to JSON)
 // ============================================================================
 
+/// A guest message, tagged by `type`. ResponseWriter adds the `op_id` of the
+/// request to each message that does not carry its own.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum GuestResponse {

@@ -1,17 +1,15 @@
 """Edge case tests for file I/O operations.
 
 Tests path edge cases, content edge cases, input type dispatch,
-and write abort/error recovery (sentinel mechanism regression tests).
+and write abort/error recovery (no partial file at the final path).
 Requires VM (integration tests).
 """
 
 import asyncio
-import base64
 import errno
 import io
 import json
 import os
-import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,12 +21,6 @@ from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
-
-# Use native zstd module (Python 3.14+) or backports.zstd
-if sys.version_info >= (3, 14):
-    from compression import zstd  # type: ignore[import-not-found]
-else:
-    from backports import zstd  # type: ignore[import-untyped,no-redef]
 
 # ============================================================================
 # Path Edge Cases
@@ -67,6 +59,18 @@ class TestPathEdgeCases:
             await session.write_file("a/b/c/d/deep.txt", b"deep")
             await session.read_file("a/b/c/d/deep.txt", destination=dest)
             assert dest.read_bytes() == b"deep"
+
+    async def test_guest_code_can_add_files_to_folders_a_write_made(self, scheduler: Scheduler) -> None:
+        """write_file("out/sub/a.txt") makes out/ and out/sub/ for the sandbox user, as the file
+        itself: guest code can then add files to them (they are not root's)."""
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
+            await session.write_file("out/sub/a.txt", b"a")
+            result = await session.exec(
+                "open('/home/user/out/b.txt', 'w').write('b'); open('/home/user/out/sub/c.txt', 'w').write('c');"
+                " print('ok')"
+            )
+
+        assert (result.exit_code, result.stdout.strip()) == (0, "ok"), result.stderr
 
     async def test_hidden_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Hidden files (dot prefix) work."""
@@ -169,14 +173,6 @@ class TestContentEdgeCases:
 class TestWriteFileInputTypes:
     """Test bytes vs Path dispatch in Session.write_file."""
 
-    async def test_write_from_bytes(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """write_file accepts bytes directly."""
-        dest = tmp_path / "from_bytes.txt"
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("from_bytes.txt", b"byte data")
-            await session.read_file("from_bytes.txt", destination=dest)
-            assert dest.read_bytes() == b"byte data"
-
     async def test_write_from_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """write_file accepts a local Path."""
         local_file = tmp_path / "local.txt"
@@ -270,10 +266,13 @@ class TestListFiles:
     """Tests for list_files operation."""
 
     async def test_list_empty_root(self, scheduler: Scheduler) -> None:
-        """list_files on fresh sandbox root returns a list (may have pre-existing files)."""
+        """list_files on a fresh sandbox root gives the entries that os.listdir gives in the
+        guest, sorted by name."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             files = await session.list_files()
-            assert isinstance(files, list)
+            result = await session.exec("import json, os; print(json.dumps(sorted(os.listdir('/home/user'))))")
+            assert result.exit_code == 0, result.stderr
+            assert [f.name for f in files] == json.loads(result.stdout)
 
     async def test_list_after_writes(self, scheduler: Scheduler) -> None:
         """list_files shows written files."""
@@ -333,15 +332,6 @@ class TestListFilesSparseDefense:
 
     # --- Normal cases: real files report correct size ---
 
-    async def test_regular_file_size_matches_content(self, scheduler: Scheduler) -> None:
-        """Regular file with known content reports exact byte count."""
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            content = b"hello world"  # 11 bytes
-            await session.write_file("regular.txt", content)
-            files = await session.list_files()
-            file_map = {f.name: f for f in files}
-            assert file_map["regular.txt"].size == len(content)
-
     async def test_binary_file_size(self, scheduler: Scheduler) -> None:
         """Binary file reports exact byte count."""
         import os
@@ -370,20 +360,6 @@ class TestListFilesSparseDefense:
             assert file_map["mydir"].size == 0
 
     # --- Edge cases: sparse files are deflated ---
-
-    async def test_sparse_file_reports_zero(self, scheduler: Scheduler) -> None:
-        """Sparse file (truncate, no data written) reports size 0 via list_files.
-
-        os.truncate() sets apparent size (metadata.len()) without allocating
-        pages on tmpfs. min(len, blocks*512) deflates this to 0.
-        """
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.exec("open('/home/user/sparse', 'w').close()")
-            await session.exec("import os; os.truncate('/home/user/sparse', 10 * 1024 * 1024)")
-            files = await session.list_files()
-            file_map = {f.name: f for f in files}
-            assert "sparse" in file_map
-            assert file_map["sparse"].size == 0
 
     async def test_partially_written_sparse_file(self, scheduler: Scheduler) -> None:
         """Partially written sparse file reports actual data size, not apparent size.
@@ -425,14 +401,14 @@ print(f'ACTUAL:{s.st_blocks * 512}')
             assert file_map["tiny.txt"].size == 1
 
     async def test_symlink_in_listing(self, scheduler: Scheduler) -> None:
-        """Symlinks appear in listing (size may be 0 on tmpfs due to inline storage)."""
+        """Symlinks appear in listing (size 0: ext4 keeps a short link target in the inode)."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             await session.write_file("target.txt", b"data")
             await session.exec("import os; os.symlink('/home/user/target.txt', '/home/user/link.txt')")
             files = await session.list_files()
             file_map = {f.name: f for f in files}
             assert "link.txt" in file_map
-            # Symlinks on tmpfs have blocks=0 (inline in inode), so min(len, 0)=0
+            # A short symlink on the ext4 home disk has blocks=0 (inline in the inode), so min(len, 0)=0
             assert file_map["link.txt"].size == 0
 
     # --- Weird cases: unusual patterns ---
@@ -481,7 +457,7 @@ with open('/home/user/fill_me', 'wb') as f:
         """100GB sparse file reports size 0 — the attack vector this defense blocks.
 
         os.truncate("huge", 100*1024**3) creates 100GB apparent size with 0
-        actual bytes on tmpfs. Without the min(len, blocks*512) fix, list_files
+        actual bytes on the home disk. Without min(len, blocks*512), list_files
         would report 107,374,182,400 bytes.
         """
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
@@ -503,11 +479,8 @@ print(f'BLOCKS:{s.st_blocks}')
             assert file_map["huge"].size == 0
 
     async def test_sparse_file_still_readable(self, scheduler: Scheduler) -> None:
-        """Sparse file reads back as zeroes despite reporting size 0 in listing.
-
-        read_file uses metadata.len() (apparent size) for transfer — correct
-        because sparse holes expand to zeroes on read. This test verifies listing
-        deflation doesn't break read_file.
+        """A sparse file that list_files reports as size 0 reads back with read_file at its
+        apparent size, as zeroes: the listing deflation does not change read_file.
         """
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             code = """\
@@ -523,14 +496,13 @@ os.truncate('/home/user/readable_sparse', 256)
             file_map = {f.name: f for f in files}
             assert file_map["readable_sparse"].size == 0
 
-            # read_file should still work (returns 256 zero bytes)
-            dest = await session.exec("print(open('/home/user/readable_sparse', 'rb').read().hex())")
-            assert dest.exit_code == 0
-            assert dest.stdout.strip() == "00" * 256
+            read_back = io.BytesIO()
+            await session.read_file("readable_sparse", destination=read_back)
+            assert read_back.getvalue() == bytes(256)
 
 
 # ============================================================================
-# Write Abort / Error Recovery (sentinel mechanism regression tests)
+# Write Abort / Error Recovery (no partial file at the final path)
 # ============================================================================
 
 
@@ -539,71 +511,27 @@ def _make_write_header(op_id: str, path: str) -> bytes:
     return json.dumps({"action": "write_file", "op_id": op_id, "path": path}).encode() + b"\n"
 
 
-def _make_file_chunk(op_id: str, data: bytes) -> bytes:
-    """Compress + base64-encode data into a raw file_chunk JSON frame."""
-    compressor = zstd.ZstdCompressor()
-    compressed = compressor.compress(data) + compressor.flush()
-    b64 = base64.b64encode(compressed).decode("ascii")
-    return json.dumps({"action": "file_chunk", "op_id": op_id, "data": b64}).encode() + b"\n"
-
-
 def _make_file_end(op_id: str) -> bytes:
     """Build a raw file_end JSON frame."""
     return json.dumps({"action": "file_end", "op_id": op_id}).encode() + b"\n"
 
 
 class TestWriteAbortRecovery:
-    """Regression tests for the sentinel mechanism that prevents partial
-    file writes on error/disconnect.
+    """A write that does not end with file_end leaves no file at its final path.
 
-    Before the fix (commit c0ae9c1), the spawn_blocking write pipeline
-    treated channel close as "all chunks received, finalize" — causing
-    partial/corrupted files to appear at their final path when a write
-    was aborted mid-transfer (disconnect, decode error, etc.).
-
-    The sentinel fix sends an empty vec as an explicit "finalize" signal.
-    Channel close without the sentinel means abort → tmp file cleanup.
+    The guest writes into a temporary file and renames it into place only at file_end
+    (an empty chunk to its writer task is the end marker). A write that stops before it
+    (a disconnect, a frame the guest cannot decode) removes the temporary file.
+    A disconnect in a write is tested through write_file (a source that fails);
+    a bad frame is not, as write_file sends only valid frames.
     """
-
-    async def test_aborted_write_no_partial_file(self, scheduler: Scheduler) -> None:
-        """Channel close mid-write must NOT leave a partial file at the final path.
-
-        Simulates a disconnect: sends write_file header + chunks but never
-        sends file_end, then closes and reconnects the channel. The guest
-        agent should clean up the temp file (no sentinel → abort path).
-        """
-        target = "aborted_partial.bin"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            vm = session._vm
-            channel = vm.channel
-
-            # Ensure channel is connected
-            await channel.connect(5)
-
-            # Send write_file header + one valid chunk, but NO file_end
-            op_id = uuid4().hex
-            await channel.enqueue_raw(_make_write_header(op_id, target))
-            await channel.enqueue_raw(_make_file_chunk(op_id, b"partial data that should not persist"))
-
-            # Close channel WITHOUT sending file_end — simulates disconnect.
-            # The guest agent's blocking write task should see channel close
-            # without the finalize sentinel and abort, cleaning up the tmp file.
-            await channel.close()
-
-            # Reconnect — guest agent goes back to waiting for commands
-            await channel.connect(5)
-
-            # Verify the partial file does NOT exist at the final path
-            result = await session.exec("import os; print(os.path.exists('/home/user/aborted_partial.bin'))")
-            assert result.exit_code == 0
-            assert "False" in result.stdout, "Partial file exists after aborted write — sentinel mechanism failed"
 
     async def test_invalid_chunk_no_partial_file(self, scheduler: Scheduler) -> None:
         """Invalid base64 chunk must NOT leave a partial file at the final path.
 
         Sends a write_file header followed by a chunk with invalid base64 data.
         The guest agent should return an error and clean up the tmp file.
+        The frames go on the VM channel: write_file never sends a bad chunk.
         """
         target = "bad_chunk.bin"
 
@@ -650,56 +578,20 @@ class TestWriteAbortRecovery:
             assert result.exit_code == 0
             assert "False" in result.stdout, "Partial file exists after invalid chunk — cleanup failed"
 
-    async def test_session_usable_after_write_abort(self, scheduler: Scheduler) -> None:
-        """Session remains fully functional after an aborted write.
-
-        After aborting a write mid-transfer (no file_end), the session
-        must still support normal write_file, read_file, and exec operations.
-        """
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            vm = session._vm
-            channel = vm.channel
-
-            # Abort a write mid-transfer
-            await channel.connect(5)
-            op_id = uuid4().hex
-            await channel.enqueue_raw(_make_write_header(op_id, "will_abort.bin"))
-            await channel.enqueue_raw(_make_file_chunk(op_id, b"this write will be aborted"))
-            await channel.close()  # disconnect without file_end
-
-            # Session should still work after reconnect
-            # (channel.connect is called internally by exec/write_file)
-
-            # 1. exec works
-            result = await session.exec("print('still alive')")
-            assert result.exit_code == 0
-            assert "still alive" in result.stdout
-
-            # 2. write_file works
-            await session.write_file("recovery.txt", b"recovered successfully")
-
-            # 3. read_file works (verifies the write above)
-            result = await session.exec("print(open('/home/user/recovery.txt').read())")
-            assert result.exit_code == 0
-            assert "recovered successfully" in result.stdout
-
-            # 4. aborted file doesn't exist
-            result = await session.exec("import os; print(os.path.exists('/home/user/will_abort.bin'))")
-            assert result.exit_code == 0
-            assert "False" in result.stdout
-
     async def test_source_read_failure_writes_nothing_and_keeps_the_session(self, scheduler: Scheduler) -> None:
-        """The local source fails after the header and a chunk: write_file closes the channel
-        (no file_end), so the guest drops the write. RETRY (LOCAL_DISK) holds: no file at the
-        target, the session stays open, and the same call with a working source succeeds."""
+        """The local source fails after the header and the first chunks: write_file closes the
+        channel (no file_end), so the guest drops the write. RETRY (LOCAL_DISK) holds: no file
+        at the target, the session stays open, and the same call with a working source
+        succeeds. Two full chunks are read before the failure: the compressor sends data to
+        the guest before the disconnect."""
 
         class FailingSource(io.BytesIO):
-            def read(self, size: int | None = -1) -> bytes:  # fails once the first chunk is read
-                if self.tell() >= FILE_TRANSFER_CHUNK_SIZE:
+            def read(self, size: int | None = -1) -> bytes:  # fails once two chunks are read
+                if self.tell() >= 2 * FILE_TRANSFER_CHUNK_SIZE:
                     raise OSError(errno.EIO, os.strerror(errno.EIO))
                 return super().read(size)
 
-        content = os.urandom(2 * FILE_TRANSFER_CHUNK_SIZE)
+        content = os.urandom(3 * FILE_TRANSFER_CHUNK_SIZE)
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             source = FailingSource(content)
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.LOCAL_DISK):
