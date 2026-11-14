@@ -42,7 +42,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 
 import numpy as np  # type: ignore[reportMissingImports]
 import psutil
@@ -181,24 +181,13 @@ class BurstResult:
 def _build_task_list(n: int) -> list[tuple[Language, str]]:
     """Build a deterministic list of (language, code) tuples from WORKLOADS.
 
-    Draws *n* tasks with a fixed seed: each workload has an equal weight, and
-    each command its proportion of that weight. Counts follow the weights
-    only approximately.
+    Draws *n* tasks with a fixed seed: each workload has an equal weight (its
+    proportions sum to 1), and each command its proportion of that weight.
+    Counts follow the weights only approximately.
     """
-    rng = random.Random(42)  # deterministic for reproducibility
-
-    # Flatten to weighted (lang, code) pairs
-    weighted: list[tuple[Language, str, float]] = []
-    for wl in WORKLOADS:
-        wl_weight = 1.0 / len(WORKLOADS)
-        for code, proportion in wl.commands.items():
-            weighted.append((wl.lang, code, wl_weight * proportion))
-
-    total_w = sum(w for _, _, w in weighted)
-    population = [(lang, code) for lang, code, _ in weighted]
-    weights = [w / total_w for _, _, w in weighted]
-
-    return rng.choices(population, weights=weights, k=n)
+    population = [(wl.lang, code) for wl in WORKLOADS for code in wl.commands]
+    weights = [proportion for wl in WORKLOADS for proportion in wl.commands.values()]
+    return random.Random(42).choices(population, weights=weights, k=n)  # deterministic for reproducibility
 
 
 # ============================================================================
@@ -207,22 +196,21 @@ def _build_task_list(n: int) -> list[tuple[Language, str]]:
 
 
 class SystemMonitor:
-    """Background sampler of the total QEMU RSS (MB) at 100 ms resolution."""
+    """Background sampler of the total QEMU RSS (MB) at 100 ms resolution, while its `with` block runs."""
 
     def __init__(self, *, interval: float) -> None:
         self.interval = interval
         self.samples: list[int] = []
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
 
-    def stop(self) -> None:
+    def __enter__(self) -> Self:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
+        self._thread.join(timeout=5)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -307,23 +295,20 @@ def _percentile(data: list[int], pct: float) -> int:
 async def _run_burst(n_vms: int, cpu_oc: float, mem_oc: float, *, images_dir: Path) -> BurstResult:
     """Execute a single burst and return summary metrics."""
     tasks_list = _build_task_list(n_vms)
-    monitor = SystemMonitor(interval=0.1)
-    monitor.start()
-    wall_start = time.monotonic()
-
-    async with Scheduler(
-        SchedulerConfig(
-            images_dir=images_dir,
-            auto_download_assets=False,
-            cpu_overcommit_ratio=cpu_oc,
-            memory_overcommit_ratio=mem_oc,
-        )
-    ) as scheduler:
-        coros = [_run_single(scheduler, lang, code) for lang, code in tasks_list]
-        results = list(await asyncio.gather(*coros))
-
-    wall_elapsed = time.monotonic() - wall_start
-    monitor.stop()
+    # The monitor runs until the Scheduler has stopped (also on an error or Ctrl-C)
+    with SystemMonitor(interval=0.1) as monitor:
+        wall_start = time.monotonic()
+        async with Scheduler(
+            SchedulerConfig(
+                images_dir=images_dir,
+                auto_download_assets=False,
+                cpu_overcommit_ratio=cpu_oc,
+                memory_overcommit_ratio=mem_oc,
+            )
+        ) as scheduler:
+            coros = [_run_single(scheduler, lang, code) for lang, code in tasks_list]
+            results = list(await asyncio.gather(*coros))
+        wall_elapsed = time.monotonic() - wall_start
 
     ok_results = [r for r in results if r.ok]
     for error, count in Counter(r.error for r in results if r.error is not None).most_common(3):
@@ -372,33 +357,20 @@ def _pareto_front(results: list[BurstResult]) -> set[tuple[float, float]]:
     never appear on the efficient frontier regardless of survivor latency.
 
     Dominance: b dominates a iff b <= a on all 3 objectives AND b < a on
-    at least one.  The Pareto front is the set of non-dominated points.
+    at least one (b != a).  The Pareto front is the set of non-dominated points.
 
     Returns set of (cpu_oc, mem_oc) tuples on the Pareto front.
     """
-    candidates = [r for r in results if r.success_pct == 100]
-    front: set[tuple[float, float]] = set()
-    for a in candidates:
-        dominated = False
-        for b in candidates:
-            if b is a:
-                continue
-            b_leq = (
-                b.admission_p95_ms <= a.admission_p95_ms
-                and b.setup_p95_ms <= a.setup_p95_ms
-                and b.exec_p95_ms <= a.exec_p95_ms
-            )
-            b_lt = (
-                b.admission_p95_ms < a.admission_p95_ms
-                or b.setup_p95_ms < a.setup_p95_ms
-                or b.exec_p95_ms < a.exec_p95_ms
-            )
-            if b_leq and b_lt:
-                dominated = True
-                break
-        if not dominated:
-            front.add((a.cpu_oc, a.mem_oc))
-    return front
+    points = {
+        (r.cpu_oc, r.mem_oc): (r.admission_p95_ms, r.setup_p95_ms, r.exec_p95_ms)
+        for r in results
+        if r.success_pct == 100
+    }
+    return {
+        combo
+        for combo, a in points.items()
+        if not any(b != a and all(x <= y for x, y in zip(b, a, strict=True)) for b in points.values())
+    }
 
 
 def _print_ranking(results: list[BurstResult]) -> None:

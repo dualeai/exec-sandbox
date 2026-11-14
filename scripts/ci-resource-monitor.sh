@@ -21,7 +21,13 @@ OS="$(uname -s)"
 # Cleanup
 # ============================================================================
 
+# The sleep between samples (see Main): it ends with the monitor
+sleep_pid=""
+
 cleanup() {
+    if [[ -n "$sleep_pid" ]]; then
+        kill "$sleep_pid" 2>/dev/null || true
+    fi
     exit 0
 }
 trap cleanup SIGTERM SIGINT
@@ -186,8 +192,13 @@ collect() {
     esac
 }
 
-# First sample immediately, then every INTERVAL seconds
+# First sample immediately, then every INTERVAL seconds. The sleep runs in the
+# background: bash runs a trap only once its foreground command ends, while `wait`
+# returns at once on a signal, so the caller's kill + wait takes no INTERVAL.
 collect
-while sleep "$INTERVAL"; do
+while true; do
+    sleep "$INTERVAL" &
+    sleep_pid=$!
+    wait "$sleep_pid"
     collect
 done
