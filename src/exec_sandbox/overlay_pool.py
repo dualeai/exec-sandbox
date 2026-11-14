@@ -5,11 +5,12 @@ pre-creating qcow2 overlay files. Acquisition is <1ms (atomic rename, or copy+un
 30-430ms (qemu-img create under contention).
 
 Architecture:
-- Separate pool per base image (python/javascript)
+- Separate pool per base image (one per language)
 - Pool directory under tempfile.gettempdir() for fast file move
-- Background replenishment maintains pool size after allocations
+- One background loop per base image fills the pool after start(), then tops it up
+  every OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS
 - Graceful fallback to on-demand creation when pool is exhausted
-- Uses qemu-storage-daemon for fast overlay creation (~4ms vs ~39ms)
+- Uses qemu-storage-daemon for fast overlay creation (~8 ms vs ~39 ms with qemu-img)
 """
 
 from __future__ import annotations
@@ -19,15 +20,18 @@ import contextlib
 import os
 import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
-from typing import Self
 from uuid import uuid4
+
+import psutil
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import settle_and_report
 from exec_sandbox.exceptions import TransientError
+from exec_sandbox.permission_utils import make_owned_dir
 from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
 
 logger = get_logger(__name__)
@@ -42,38 +46,39 @@ class OverlayPool:
     All overlay creation is centralized here - callers just request an overlay
     and the pool handles fast path (from pool) or slow path (on-demand) internally.
 
-    Base images are auto-discovered from images_path matching pattern *-base-*.qcow2.
-
     Usage:
-        async with OverlayPool(pool_size=5, images_path=base_images_dir) as pool:
-            # Always returns an overlay - fast if from pool, slow if created on-demand
-            pool_hit = await pool.acquire(base_image, target_path)
-            # pool_hit indicates if it was from pool (for metrics), but overlay is ready
+        pool = OverlayPool(pool_size=5)
+        await pool.start([base_image])  # returns once the daemon runs; the pool fills in the background
+        # Always returns an overlay - fast if from pool, slow if created on-demand
+        pool_hit = await pool.acquire(base_image, target_path)
+        # pool_hit indicates if it was from pool (for metrics), but overlay is ready
+        await pool.stop()
     """
 
     def __init__(
         self,
         pool_size: int = 0,
         *,
-        images_path: Path | None = None,
         pool_dir: Path | None = None,
     ) -> None:
         """Initialize overlay pool.
 
         Args:
             pool_size: Number of pre-created overlays per base image (0 = on-demand only)
-            images_path: Directory containing base images (for auto-discovery)
-            pool_dir: Optional pool directory (default: tempdir/exec-sandbox-overlay-pool)
+            pool_dir: Optional pool directory (default: a new folder at each start,
+                tempdir/exec-sandbox-overlay-pool-<pid>-<random>, made by mkdtemp)
         """
-        self._pool_dir = pool_dir or Path(tempfile.gettempdir()) / f"exec-sandbox-overlay-pool-{os.getpid()}"
+        # A given folder (tests) or, at each start, a new one from mkdtemp: a name another
+        # user can guess in the shared temp folder could be made first, with planted overlays.
+        self._given_pool_dir = pool_dir
+        self._pool_dir: Path | None = pool_dir
         self._pool_size = pool_size
-        self._images_path = images_path
         self._pools: dict[str, asyncio.Queue[Path]] = {}  # base_image_path -> queue
         self._replenish_tasks: set[asyncio.Task[None]] = set()
         self._shutdown_event = asyncio.Event()
         self._started = False
         # Semaphore to limit concurrent overlay creation (throttles both startup and replenishment)
-        self._creation_sem = asyncio.Semaphore(constants.OVERLAY_POOL_REPLENISH_BATCH_SIZE)
+        self._creation_sem = asyncio.Semaphore(constants.OVERLAY_POOL_CREATION_CONCURRENCY)
         # qemu-storage-daemon for fast overlay creation
         self._daemon: QemuStorageDaemon | None = None
 
@@ -94,61 +99,34 @@ class OverlayPool:
         """Whether qemu-storage-daemon is active for fast overlay creation."""
         return self._daemon is not None and self._daemon.started
 
-    def _discover_base_images(self) -> list[Path]:
-        """Discover all base images in images_path.
-
-        Uses pattern *-base-*.qcow2 to find all base images (python, javascript,
-        raw, and any future languages) without needing per-language configuration.
-
-        Returns:
-            List of discovered base image paths (sorted for determinism)
-        """
-        if not self._images_path:
-            return []
-
-        # Single pattern catches all base images: python-*-base-*.qcow2, node-*-base-*.qcow2, etc.
-        # Use absolute paths so qemu-img can find backing files from any working directory
-        matches = [p.resolve() for p in self._images_path.glob("*-base-*.qcow2")]
-        return sorted(matches)
-
     @staticmethod
     def _cleanup_stale_pool_dirs() -> int:
         """Remove stale PID-scoped pool directories from dead processes.
 
-        Directory names encode the owner PID: exec-sandbox-overlay-pool-{pid}.
-        When the owner dies (crash, OOM, kill -9), the directory becomes stale.
-        Also cleans up the legacy singleton directory (no PID suffix).
+        Directory names encode the owner PID: exec-sandbox-overlay-pool-{pid}-{mkdtemp
+        suffix}. When the owner dies (crash, OOM, kill -9), the directory becomes stale.
+        Only real folders of this user: another user's folder (or a link) in the shared
+        temp folder is left alone.
 
         Returns:
             Number of stale directories cleaned up.
         """
         tmpdir = Path(tempfile.gettempdir())
-        pattern = re.compile(r"^exec-sandbox-overlay-pool-(\d+)$")
+        pattern = re.compile(r"^exec-sandbox-overlay-pool-(\d+)-[a-z0-9_]+$")
         cleaned = 0
 
-        for pool_dir in tmpdir.glob("exec-sandbox-overlay-pool*"):
-            if not pool_dir.is_dir():
-                continue
-
+        for pool_dir in tmpdir.glob("exec-sandbox-overlay-pool-*"):
             match = pattern.match(pool_dir.name)
-            if match:
-                # PID-scoped directory: check if owner is alive
-                owner_pid = int(match.group(1))
-                try:
-                    os.kill(owner_pid, 0)
-                    # Owner alive, skip
-                    continue
-                except PermissionError:
-                    # Owner alive but not ours, skip
-                    continue
-                except ProcessLookupError:
-                    pass  # Owner dead, proceed to cleanup
-            elif pool_dir.name == "exec-sandbox-overlay-pool":
-                # Legacy singleton directory (no PID suffix): always clean up
-                pass
-            else:
-                # Non-matching directory (e.g. exec-sandbox-overlay-pool-abc), skip
+            if match is None:  # not a pool folder name (e.g. exec-sandbox-overlay-pool-abc)
                 continue
+            try:
+                st = pool_dir.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                continue
+            if psutil.pid_exists(int(match.group(1))):
+                continue  # its owner runs (ours or another user's)
 
             # Remove stale directory
             try:
@@ -163,7 +141,7 @@ class OverlayPool:
 
         return cleaned
 
-    async def start(self, base_images: list[Path] | None = None) -> None:
+    async def start(self, base_images: list[Path]) -> None:
         """Start the pool, rolling back any partially-started daemon lifecycle."""
         try:
             await self._start_impl(base_images)
@@ -176,16 +154,17 @@ class OverlayPool:
                 )
             raise
 
-    async def _start_impl(self, base_images: list[Path] | None = None) -> None:
-        """Start the overlay pool and pre-create overlays for base images.
+    async def _start_impl(self, base_images: list[Path]) -> None:
+        """Start the daemon, then fill the pool for base_images in the background.
 
-        If base_images is None, auto-discovers from images_path.
-
-        The daemon is always started (needed for on-demand overlay creation in acquire()),
-        but pre-creation and replenishment are only enabled when pool_size > 0.
+        The daemon is always started (needed for on-demand overlay creation in acquire()).
+        When pool_size > 0, one replenishment task per base image creates the overlays:
+        start() does not wait for them, as acquire() creates an overlay on demand (~8 ms; the fill
+        runs OVERLAY_POOL_CREATION_CONCURRENCY creations at once, so it does not delay it)
+        while the pool is empty.
 
         Args:
-            base_images: Optional explicit list of base image paths (for testing)
+            base_images: Base images to keep overlays for
 
         Raises:
             RuntimeError: If start() is called when pool is already started
@@ -215,18 +194,21 @@ class OverlayPool:
             logger.debug("Overlay pool pre-creation disabled (pool_size=0), daemon started for on-demand creation")
             return
 
-        # Auto-discover if not provided
-        if base_images is None:
-            base_images = self._discover_base_images()
-
         # Create pool directory (graceful degradation on permission errors)
         try:
-            self._pool_dir.mkdir(parents=True, exist_ok=True)
+            if self._given_pool_dir is not None:
+                make_owned_dir(self._given_pool_dir, setting="pool_dir")
+                self._pool_dir = self._given_pool_dir
+            else:  # 0700, a new name: not writable by qemu-vm's group (its overlays go to other VMs)
+                self._pool_dir = Path(tempfile.mkdtemp(prefix=f"exec-sandbox-overlay-pool-{os.getpid()}-"))
         except OSError as e:
             logger.warning(
                 "Failed to create overlay pool directory, pool disabled",
                 extra={"pool_dir": str(self._pool_dir), "error": str(e)},
             )
+            # Off, as with pool_size 0: acquire() makes each overlay on demand and starts
+            # no replenish loop (each would fail on the missing folder every 0.5 s)
+            self._pool_size = 0
             return
 
         # Initialize pools for each base image
@@ -234,15 +216,7 @@ class OverlayPool:
             key = str(base_image.resolve())
             self._pools[key] = asyncio.Queue(maxsize=self._pool_size)
 
-        # Pre-create overlays (concurrency is limited by _creation_sem in _create_and_enqueue)
-        tasks = [
-            self._create_and_enqueue(base_image, str(base_image.resolve()))
-            for base_image in base_images
-            for _ in range(self._pool_size)
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Start background replenishment tasks
+        # Fill in the background (concurrency is limited by _creation_sem in _create_and_enqueue)
         for base_image in base_images:
             task = asyncio.create_task(self._replenish_loop(base_image))
             self._replenish_tasks.add(task)
@@ -281,7 +255,7 @@ class OverlayPool:
             self._daemon = None
 
         # Clean up pool directory
-        if self._pool_dir.exists():
+        if self._pool_dir is not None and self._pool_dir.exists():
             try:
                 await asyncio.to_thread(shutil.rmtree, self._pool_dir)
             except OSError as e:
@@ -289,6 +263,7 @@ class OverlayPool:
                     "Failed to cleanup overlay pool directory",
                     extra={"pool_dir": str(self._pool_dir), "error": str(e)},
                 )
+        self._pool_dir = self._given_pool_dir
 
         self._pools.clear()
         self._started = False
@@ -306,7 +281,7 @@ class OverlayPool:
 
         Returns:
             True if acquired from pool (fast path, <1ms),
-            False if created on-demand (slow path, ~8ms via daemon)
+            False if created on-demand (slow path, ~8 ms via the daemon)
 
         Raises:
             FileExistsError: target_path already exists
@@ -343,7 +318,7 @@ class OverlayPool:
                 )
                 return True
             except OSError as e:
-                # Move failed (cross-filesystem or other error)
+                # Move failed (shutil.move copies across filesystems: that copy, or the rename, failed)
                 logger.warning(
                     "Failed to move pooled overlay, falling back to on-demand: %s",
                     e,
@@ -381,6 +356,8 @@ class OverlayPool:
         async with self._creation_sem:
             try:
                 # Generate unique filename
+                if self._pool_dir is None:  # stopped meanwhile
+                    return
                 overlay_path = self._pool_dir / f"overlay-{uuid4()}.qcow2"
 
                 # Create overlay via daemon
@@ -419,12 +396,15 @@ class OverlayPool:
         """
         key = str(base_image.resolve())
 
+        # Fill first, then sleep: the first pass creates every missing overlay right after start()
+        first_pass = True
         while not self._shutdown_event.is_set():
             try:
-                await asyncio.sleep(constants.OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS)
-
-                if self._shutdown_event.is_set():
-                    break
+                if not first_pass:
+                    await asyncio.sleep(constants.OVERLAY_POOL_REPLENISH_INTERVAL_SECONDS)
+                    if self._shutdown_event.is_set():
+                        break
+                first_pass = False
 
                 pool = self._pools.get(key)
                 if not pool:
@@ -437,16 +417,15 @@ class OverlayPool:
                 if needed <= 0:
                     continue
 
-                # Create overlays in batches
-                batch_size = min(needed, constants.OVERLAY_POOL_REPLENISH_BATCH_SIZE)
-                tasks = [self._create_and_enqueue(base_image, key) for _ in range(batch_size)]
+                # Create every missing overlay (_creation_sem limits how many run at once)
+                tasks = [self._create_and_enqueue(base_image, key) for _ in range(needed)]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
                 logger.debug(
                     "Overlay pool replenished",
                     extra={
                         "base_image": key,
-                        "created_count": batch_size,  # Not "created" — conflicts with LogRecord.created
+                        "created_count": needed,  # Not "created" — conflicts with LogRecord.created
                         "current_size": pool.qsize(),
                         "target_size": self._pool_size,
                     },
@@ -459,14 +438,3 @@ class OverlayPool:
                     "Replenishment error",
                     extra={"base_image": key, "error": str(e)},
                 )
-
-    async def __aenter__(self) -> Self:
-        """Enter async context manager, starting the pool."""
-        await self.start()
-        return self
-
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, stopping the pool."""
-        await self.stop()

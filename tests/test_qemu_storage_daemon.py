@@ -10,37 +10,126 @@ that creates qcow2 overlays — it does not boot VMs or use KVM/HVF.
 """
 
 import asyncio
+import contextlib
 import errno
 import json
 import os
 import secrets
+import select
+import shutil
+import signal
+import sys
 import tempfile
+import threading
+from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import psutil
 import pytest
 
-from exec_sandbox.exceptions import ConfigError, ErrorCode, SandboxError, TransientError
+from exec_sandbox import process_registry, qemu_storage_daemon
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
+from exec_sandbox.models import Language
 from exec_sandbox.overlay_pool import OverlayPool
-from exec_sandbox.process_registry import _process_groups
-from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, QmpEvent
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon, _pid_namespace
 from exec_sandbox.vm_manager import VmManager
+from tests.conftest import asyncio_with, skip_unless_linux
+from tests.test_subprocess_utils import write_foreign_elf
 
 # ============================================================================
 # Test Helpers & Fixtures
 # ============================================================================
 
+_DAEMON_ARGS_END = ["--monitor", "chardev=qmp0"]
+"""The last arguments of each daemon launch (its QMP monitor)."""
 
-def _make_event(job_id: str, status: str) -> QmpEvent:
-    """Create a QmpEvent for testing."""
-    return QmpEvent(event="JOB_STATUS_CHANGE", job_id=job_id, status=status)
+
+def _daemon_sockets() -> dict[int, Path]:
+    """The daemon processes that this process started and that run (no zombie), with the
+    QMP socket of each, read from its command line (--chardev socket,path=...)."""
+    daemons: dict[int, Path] = {}
+    for child in psutil.Process().children():
+        with contextlib.suppress(psutil.Error):
+            cmdline = child.cmdline()
+            if child.status() == psutil.STATUS_ZOMBIE or cmdline[-2:] != _DAEMON_ARGS_END:
+                continue
+            chardev = cmdline[cmdline.index("--chardev") + 1]
+            daemons[child.pid] = Path(chardev.split(",")[1].removeprefix("path="))
+    return daemons
+
+
+_NO_GREETING_DAEMON = """#!{python}
+import socket, sys, time
+chardev = sys.argv[sys.argv.index("--chardev") + 1]
+server = socket.socket(socket.AF_UNIX)
+server.bind(chardev.split(",")[1].removeprefix("path="))
+server.listen()
+connection, _ = server.accept()
+connection.sendall(b'{{"not": "a QMP greeting"}}\\n')
+time.sleep(60)
+"""
+"""A qemu-storage-daemon that serves its socket, sends a line that is no QMP greeting, then
+runs until it is ended."""
+
+
+@pytest.fixture
+def isolated_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process registry of this test only: force_kill_all() then reaches no process of
+    another test of this worker."""
+    monkeypatch.setattr("exec_sandbox.process_registry._process_groups", set())
+
+
+def _qcow2_header(size: int) -> bytes:
+    """The first 32 bytes of a qcow2 v3 image of `size` bytes (magic, version, size at 24)."""
+    return b"QFI\xfb" + (3).to_bytes(4, "big") + bytes(16) + size.to_bytes(8, "big")
+
+
+class _ScriptedQmp:
+    """A QMP peer in this process, as the reader and the writer of a daemon's connection.
+
+    It answers each command as qemu-storage-daemon does (blockdev-create starts a job that
+    ends at once and sends its JOB_STATUS_CHANGE events; query-jobs lists the jobs;
+    job-dismiss removes one), and sends the `noise` lines before each answer. `commands`
+    holds each command that the daemon sent.
+    """
+
+    def __init__(self, noise: list[dict[str, Any]]) -> None:
+        self.commands: list[dict[str, Any]] = []
+        self._noise = [json.dumps(line).encode() + b"\n" for line in noise]
+        self._jobs: list[str] = []
+        self._lines: deque[bytes] = deque()
+
+    def write(self, data: bytes) -> None:
+        command = json.loads(data)
+        self.commands.append(command)
+        arguments = command.get("arguments", {})
+        result: Any = {}
+        if command["execute"] == "blockdev-create":
+            self._jobs.append(arguments["job-id"])
+            for status in ("created", "running", "pending", "concluded"):
+                event = {"event": "JOB_STATUS_CHANGE", "data": {"id": arguments["job-id"], "status": status}}
+                self._lines.append(json.dumps(event).encode() + b"\n")
+        elif command["execute"] == "query-jobs":
+            result = [{"id": job, "type": "create", "status": "concluded"} for job in self._jobs]
+        elif command["execute"] == "job-dismiss":
+            self._jobs.remove(arguments["id"])
+        self._lines.extend(self._noise)
+        self._lines.append(json.dumps({"return": result, "id": command["id"]}).encode() + b"\n")
+
+    async def drain(self) -> None:
+        pass
+
+    async def readline(self) -> bytes:
+        return self._lines.popleft()
 
 
 @pytest.fixture
 def base_image(vm_settings) -> Path:  # type: ignore[no-untyped-def]
     """Resolve the Python base image path without starting the overlay pool."""
-    return VmManager(vm_settings).get_base_image("python")  # type: ignore[arg-type]
+    return VmManager(vm_settings).images.base_image(Language.PYTHON)  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -61,8 +150,67 @@ async def started_daemon() -> AsyncGenerator[QemuStorageDaemon, None]:
 # ============================================================================
 
 
+class TestOverlayBackingPath:
+    """The overlay keeps its base image path; the pool moves the overlay to the VM's folder."""
+
+    async def test_overlay_has_the_size_of_its_base(self, started_daemon: QemuStorageDaemon, tmp_path: Path) -> None:
+        """The size comes from the base's qcow2 header (no qemu-img process per overlay)."""
+        base = tmp_path / "base.qcow2"
+        proc = await asyncio.create_subprocess_exec("qemu-img", "create", "-q", "-f", "qcow2", str(base), "77M")
+        assert await proc.wait() == 0
+        overlay = tmp_path / "overlay.qcow2"
+
+        await started_daemon.create_overlay(base, overlay)
+
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "info", "--output=json", str(overlay), stdout=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        assert json.loads(stdout)["virtual-size"] == 77 * 1024 * 1024
+
+    async def test_a_base_image_rebuilt_in_place_gives_its_new_size(
+        self, started_daemon: QemuStorageDaemon, tmp_path: Path
+    ) -> None:
+        """The daemon reads each base image's size once, per version of the file: a rebuild at the
+        same path (make build) is read again, not served from the first read."""
+        base = tmp_path / "base.qcow2"
+        sizes = []
+        for size in ("77M", "33M"):
+            base.unlink(missing_ok=True)
+            proc = await asyncio.create_subprocess_exec("qemu-img", "create", "-q", "-f", "qcow2", str(base), size)
+            assert await proc.wait() == 0
+            overlay = tmp_path / f"overlay-{size}.qcow2"
+            await started_daemon.create_overlay(base, overlay)
+            proc = await asyncio.create_subprocess_exec(
+                "qemu-img", "info", "--output=json", str(overlay), stdout=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            sizes.append(json.loads(stdout)["virtual-size"])
+
+        assert sizes == [77 * 1024 * 1024, 33 * 1024 * 1024]
+
+    async def test_a_relative_base_image_still_opens_after_the_move(
+        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(base_image.parent)
+        overlay = tmp_path / "pool" / "overlay.qcow2"
+        overlay.parent.mkdir()
+        await started_daemon.create_overlay(Path(base_image.name), overlay)
+        moved = tmp_path / "vm" / "overlay.qcow2"
+        moved.parent.mkdir()
+        overlay.rename(moved)
+
+        monkeypatch.chdir(tmp_path)
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "info", "-U", "--backing-chain", str(moved), stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        assert proc.returncode == 0, stderr.decode()
+
+
 class TestQemuStorageDaemonUnit:
-    """Unit tests for QemuStorageDaemon - no real daemon process, no mocks."""
+    """Start, stop and QMP errors, and the faults that a real daemon does not show on demand
+    (each fake says why)."""
 
     async def test_create_overlay_when_not_started_raises_error(self) -> None:
         """create_overlay raises if daemon not started."""
@@ -71,7 +219,8 @@ class TestQemuStorageDaemonUnit:
             await daemon.create_overlay(Path("/fake/base.qcow2"), Path("/fake/out.qcow2"))
 
     async def test_cancelled_exchange_drains_identified_response_before_next_command(self) -> None:
-        """Cancellation cannot shift the shared QMP response stream."""
+        """Cancellation cannot shift the shared QMP response stream. A race window: the cancel
+        must come while the answer is on its way, so a fake stream holds that answer."""
         daemon = QemuStorageDaemon()
         first_read = asyncio.Event()
         release_first = asyncio.Event()
@@ -107,52 +256,50 @@ class TestQemuStorageDaemonUnit:
         sent = [json.loads(call.args[0]) for call in writer.write.call_args_list]
         assert [message["id"] for message in sent] == ["qsd-1", "qsd-2"]
 
-    async def test_cleanup_owner_retries_until_process_death_is_confirmed(self) -> None:
+    async def test_stop_waits_until_the_daemon_death_is_confirmed(self) -> None:
+        """A kill that is not confirmed in its timeout is tried again, 1 s later: stop() returns
+        only once the death of the daemon is confirmed. An OS fault that no real daemon shows
+        on demand: the process is a fake and cleanup_process (the kill) fails once."""
         daemon = QemuStorageDaemon()
-        daemon._process = MagicMock()
-        attempts = 0
-
-        async def cleanup(_self: QemuStorageDaemon) -> bool:
-            nonlocal attempts
-            attempts += 1
-            if attempts == 2:
-                daemon._process = None
-                return True
-            return False
-
+        daemon._process = MagicMock()  # a daemon that a failed start left
         with (
-            patch.object(QemuStorageDaemon, "_cleanup_process", side_effect=cleanup, autospec=True),
-            patch("exec_sandbox.qemu_storage_daemon.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            patch(
+                "exec_sandbox.qemu_storage_daemon.cleanup_process",
+                new_callable=AsyncMock,
+                side_effect=[False, True],
+            ) as kill,
+            patch("exec_sandbox.qemu_storage_daemon.asyncio", asyncio_with(sleep=(sleep := AsyncMock()))),
         ):
-            await daemon._ensure_cleanup_task()
+            await daemon.stop()
 
-        assert attempts == 2
+        assert kill.await_count == 2
         sleep.assert_awaited_once_with(1.0)
 
-    async def test_start_does_not_overwrite_retained_partial_process(self) -> None:
+    async def test_start_spawns_only_after_the_death_of_a_retained_daemon(self) -> None:
+        """A failed start can leave a daemon whose death is not confirmed yet (an OS fault, so
+        the process is a fake): the next start ends it first, and spawns a new daemon only
+        once that death is confirmed."""
         daemon = QemuStorageDaemon()
-        retained = MagicMock()
-        daemon._process = retained
+        daemon._process = MagicMock()  # a daemon that a failed start left
+        steps: list[str] = []
+
+        async def kill(*_args: object, **_kwargs: object) -> bool:
+            steps.append("kill")
+            return steps.count("kill") == 2  # the second kill is confirmed
+
+        async def spawn(*_args: object, **_kwargs: object) -> None:
+            steps.append("spawn")
+            raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))  # no real daemon starts
 
         with (
-            patch.object(
-                QemuStorageDaemon,
-                "stop",
-                new_callable=AsyncMock,
-                side_effect=TransientError(
-                    "cleanup pending", code=ErrorCode.OVERLAY_FAILED, context=None, hint=None, instance_id=None
-                ),
-            ) as stop,
-            patch("exec_sandbox.qemu_storage_daemon.start_managed_process", new_callable=AsyncMock) as spawn,
+            patch("exec_sandbox.qemu_storage_daemon.cleanup_process", new_callable=AsyncMock, side_effect=kill),
+            patch("exec_sandbox.qemu_storage_daemon.start_managed_process", new_callable=AsyncMock, side_effect=spawn),
+            patch("exec_sandbox.qemu_storage_daemon.asyncio", asyncio_with(sleep=AsyncMock())),
+            pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED),
         ):
-            with pytest.raises(
-                TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="cleanup pending"
-            ):
-                await daemon.start()
+            await daemon.start()
 
-        stop.assert_awaited_once_with()
-        spawn.assert_not_awaited()
-        assert daemon._process is retained
+        assert steps == ["kill", "kill", "spawn"]
 
     async def test_stop_without_start_is_safe(self) -> None:
         """Stopping un-started daemon is a no-op (idempotent)."""
@@ -160,326 +307,268 @@ class TestQemuStorageDaemonUnit:
         await daemon.stop()  # Should not raise
         assert not daemon.started
 
-    async def test_started_property_false_before_start(self) -> None:
-        """started property is False before start()."""
-        daemon = QemuStorageDaemon()
-        assert daemon.started is False
-
-    async def test_qmp_error_keeps_its_class_and_description(self) -> None:
-        """A QMP error answer raises TransientError OVERLAY_FAILED: the message is the
-        QMP description, context["error_class"] the QMP error class."""
-        daemon = QemuStorageDaemon()
-        reader = MagicMock()
-        reader.readline = AsyncMock(
-            return_value=b'{"error":{"class":"GenericError","desc":"Some error"},"id":"qsd-1"}\n'
-        )
-        writer = MagicMock()
-        writer.drain = AsyncMock()
-        daemon._reader = reader
-        daemon._writer = writer
-
+    async def test_qmp_error_keeps_its_class_and_description(self, started_daemon: QemuStorageDaemon) -> None:
+        """A QMP error answer raises TransientError OVERLAY_FAILED: the message is the QMP
+        description, context["error_class"] the QMP error class. The public calls send only
+        valid commands: an unknown command gets a real error answer from the daemon."""
         with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED) as exc_info:
-            await daemon._execute("blockdev-add")
+            await started_daemon._execute("no-such-command")
 
-        assert str(exc_info.value) == "Some error"
-        assert exc_info.value.context["error_class"] == "GenericError"
-
-    async def test_missing_binary_is_a_config_error(self) -> None:
-        """A host without qemu-storage-daemon raises ConfigError HOST_DEPENDENCY (no
-        retry fixes it), not the transient OVERLAY_FAILED."""
-        daemon = QemuStorageDaemon()
-        with (
-            patch(
-                "exec_sandbox.qemu_storage_daemon.start_managed_process",
-                new_callable=AsyncMock,
-                side_effect=FileNotFoundError(2, "No such file or directory", "qemu-storage-daemon"),
-            ),
-            pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info,
-        ):
-            await daemon.start()
-
-        assert exc_info.value.context["binary"] == "qemu-storage-daemon"
-        assert not daemon.started
+        assert str(exc_info.value) == "The command no-such-command has not been found"
+        assert exc_info.value.context == {"error_class": "CommandNotFound"}
 
     @pytest.mark.parametrize(
-        ("err", "cls", "code"),
+        ("content", "mode", "err"),
         [
-            (errno.EACCES, ConfigError, ErrorCode.HOST_DEPENDENCY),
-            (errno.ENOEXEC, ConfigError, ErrorCode.HOST_DEPENDENCY),
-            (errno.EAGAIN, TransientError, ErrorCode.OVERLAY_FAILED),
+            (None, 0, errno.ENOENT),
+            (b"#!/bin/sh\n", 0o644, errno.EACCES),
+            (b"not a program\n", 0o755, errno.ENOEXEC),
         ],
-        ids=["no-exec-bit", "other-arch", "process-limit"],
+        ids=["missing", "no-exec-bit", "not-a-program"],
     )
-    async def test_spawn_error_by_errno(self, err: int, cls: type[SandboxError], code: ErrorCode) -> None:
-        """A binary this user cannot run fails on every retry (FIX_CONFIG); a fork that hits
-        a process limit can pass later (OVERLAY_FAILED, RETRY)."""
+    async def test_binary_that_cannot_run_is_a_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes | None, mode: int, err: int
+    ) -> None:
+        """A qemu-storage-daemon that is missing, that this user cannot run, or that is not a
+        program fails on every retry: ConfigError HOST_DEPENDENCY with the errno, not the
+        transient OVERLAY_FAILED."""
+        binary = tmp_path / "qemu-storage-daemon"
+        if content is not None:
+            binary.write_bytes(content)
+            binary.chmod(mode)
+        monkeypatch.setattr("exec_sandbox.qemu_storage_daemon._BINARY", str(binary))
+        daemon = QemuStorageDaemon()
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+            await daemon.start()
+
+        assert exc_info.value.context == {"binary": str(binary), "errno": err}
+        assert not daemon.started
+
+    async def test_process_limit_at_spawn_is_transient(self) -> None:
+        """A fork that hits a process limit (EAGAIN: an OS state that a test cannot make, so
+        the spawn is a fake) can pass later: TransientError OVERLAY_FAILED with the errno."""
         daemon = QemuStorageDaemon()
         with (
             patch(
                 "exec_sandbox.qemu_storage_daemon.start_managed_process",
                 new_callable=AsyncMock,
-                side_effect=OSError(err, os.strerror(err)),
+                side_effect=OSError(errno.EAGAIN, os.strerror(errno.EAGAIN)),
             ),
-            pytest.raises(cls, check=lambda e: e.code is code) as exc_info,
+            pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED) as exc_info,
         ):
             await daemon.start()
 
-        assert exc_info.value.context["errno"] == err
+        assert exc_info.value.context == {"binary": "qemu-storage-daemon", "errno": errno.EAGAIN}
         assert not daemon.started
 
-    # --- Event buffer logic ---
-
-    async def test_event_buffer_initialized_empty(self) -> None:
-        """Fresh daemon has empty event buffer."""
+    @skip_unless_linux
+    async def test_daemon_of_another_arch_is_a_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A qemu-storage-daemon this host cannot exec: the launch shell ends with 126 (it
+        runs the exec, so Popen cannot report it): ConfigError HOST_DEPENDENCY with the
+        install hint, not the transient OVERLAY_FAILED."""
+        # A path, not the name: like Popen, a shell goes on to the next PATH entry after an exec error
+        binary = str(write_foreign_elf(tmp_path / "qemu-storage-daemon"))
+        monkeypatch.setattr("exec_sandbox.qemu_storage_daemon._BINARY", binary)
         daemon = QemuStorageDaemon()
-        assert daemon._event_buffer == []
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
+            await daemon.start()
+        assert str(exc_info.value).startswith(f"Failed to start {binary}: exit status 126 (")
+        assert exc_info.value.context == {"binary": binary, "exit_code": 126}
+        assert not daemon.started
 
-    async def test_consume_event_finds_matching_concluded(self) -> None:
-        """consume_event returns and removes matching concluded event."""
+    async def test_daemon_starts_with_no_preexec(self) -> None:
+        """The daemon asks the launch to end it with this process, with no step: where setpriv
+        works, the launch then has no Python preexec_fn, so Popen can vfork. The
+        launch is a fake: no process shows if Popen forked or vforked it. The launch itself
+        is the contract of start_managed_process; the real end: TestDaemonEndsWithItsProcess."""
         daemon = QemuStorageDaemon()
-        daemon._event_buffer = [_make_event("job-A", "concluded")]
+        launch = AsyncMock(side_effect=OSError(errno.EAGAIN, os.strerror(errno.EAGAIN)))
+        with (
+            patch("exec_sandbox.qemu_storage_daemon.start_managed_process", launch),
+            pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED),
+        ):
+            await daemon.start()
+        assert (launch.call_args.kwargs["steps"], launch.call_args.kwargs["end_with_this_process"]) == ((), True)
 
-        result = daemon._consume_event("job-A", "concluded")
+    # --- QMP lines that are not the answer ---
 
-        assert result is not None
-        assert result.job_id == "job-A"
-        assert daemon._event_buffer == []
-
-    async def test_consume_event_returns_none_when_no_match(self) -> None:
-        """consume_event returns None when job ID doesn't match."""
-        daemon = QemuStorageDaemon()
-        daemon._event_buffer = [_make_event("job-A", "concluded")]
-
-        result = daemon._consume_event("job-B", "concluded")
-
-        assert result is None
-        assert len(daemon._event_buffer) == 1  # Unchanged
-
-    async def test_consume_event_preserves_other_events(self) -> None:
-        """consume_event only removes the matched event, preserves others."""
-        daemon = QemuStorageDaemon()
-        daemon._event_buffer = [
-            _make_event("job-A", "running"),
-            _make_event("job-B", "concluded"),
-            _make_event("job-A", "concluded"),
+    async def test_overlay_skips_malformed_and_unmatched_qmp_lines(self, tmp_path: Path) -> None:
+        """Before each answer, the daemon reads events (malformed ones too: no data, data that
+        is not an object, no id) and answers of no command it sent: it skips them, and the
+        overlay completes with the same commands. A real qemu-storage-daemon sends no such
+        line, so a peer in this process sends them."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(_qcow2_header(77 * 1024 * 1024))
+        noise: list[dict[str, Any]] = [
+            {"event": "JOB_STATUS_CHANGE"},
+            {"event": "JOB_STATUS_CHANGE", "data": "not-an-object"},
+            {"event": "JOB_STATUS_CHANGE", "data": 42},
+            {"event": "JOB_STATUS_CHANGE", "data": ["a", "b"]},
+            {"event": "JOB_STATUS_CHANGE", "data": None},
+            {"event": "JOB_STATUS_CHANGE", "data": {"status": "concluded"}},
+            {"event": "BLOCK_IO_ERROR", "data": {"device": "", "operation": "write", "action": "report"}},
+            {"data": {"id": "file-0", "status": "concluded"}},
+            {"return": {}, "id": "qsd-0"},
         ]
-
-        result = daemon._consume_event("job-A", "concluded")
-
-        assert result is not None
-        assert result.job_id == "job-A"
-        assert result.status == "concluded"
-        assert len(daemon._event_buffer) == 2
-        assert daemon._event_buffer[0].job_id == "job-A"
-        assert daemon._event_buffer[0].status == "running"
-        assert daemon._event_buffer[1].job_id == "job-B"
-
-    async def test_consume_event_empty_buffer(self) -> None:
-        """consume_event returns None on empty buffer."""
+        peer = _ScriptedQmp(noise)
         daemon = QemuStorageDaemon()
-        assert daemon._consume_event("job-A", "concluded") is None
+        daemon._reader = cast("asyncio.StreamReader", peer)
+        daemon._writer = cast("asyncio.StreamWriter", peer)
+        daemon._started = True
 
-    async def test_consume_event_wrong_status(self) -> None:
-        """consume_event returns None when status doesn't match."""
+        await daemon.create_overlay(base, tmp_path / "overlay.qcow2")
+
+        assert [command["execute"] for command in peer.commands] == [
+            "blockdev-create",
+            "query-jobs",
+            "job-dismiss",
+            "blockdev-add",
+            "blockdev-create",
+            "query-jobs",
+            "job-dismiss",
+            "blockdev-del",
+        ]
+        created = [
+            command["arguments"]["job-id"] for command in peer.commands if command["execute"] == "blockdev-create"
+        ]
+        dismissed = [command["arguments"]["id"] for command in peer.commands if command["execute"] == "job-dismiss"]
+        assert dismissed == created
+
+    @staticmethod
+    def _daemon_whose_peer_ends(*, lines_before: int, end: bytes) -> tuple[QemuStorageDaemon, _ScriptedQmp]:
+        """A started daemon whose scripted peer answers `lines_before` lines, then gives `end`
+        for each read (b"": the stream ended). The peer's lines for one overlay: blockdev-create
+        0-4 (4 events, the answer), query-jobs 5, job-dismiss 6, blockdev-add 7, blockdev-create
+        8-12, query-jobs 13, job-dismiss 14, blockdev-del 15."""
+        peer = _ScriptedQmp([])
+        answered = 0
+        scripted_readline = peer.readline
+
+        async def ending_readline() -> bytes:
+            nonlocal answered
+            if answered >= lines_before:
+                return end
+            answered += 1
+            return await scripted_readline()
+
+        peer.readline = ending_readline  # type: ignore[method-assign]
         daemon = QemuStorageDaemon()
-        daemon._event_buffer = [_make_event("job-A", "running")]
+        daemon._reader = cast("asyncio.StreamReader", peer)
+        daemon._writer = cast("asyncio.StreamWriter", peer)
+        daemon._started = True
+        return daemon, peer
 
-        result = daemon._consume_event("job-A", "concluded")
+    @pytest.mark.parametrize(
+        "lines_before",
+        [0, 5, 7, 9],
+        ids=["first-blockdev-create", "job-wait-query-jobs", "blockdev-add", "second-blockdev-create"],
+    )
+    @pytest.mark.parametrize(
+        ("end", "message"),
+        [
+            (b"", "closed its socket"),
+            (b"not json\n", "not JSON"),
+            (b"[1, 2]\n", "not a JSON object"),
+            (b"null\n", "not a JSON object"),
+            (b"[" * 60_000 + b"\n", "not JSON"),
+        ],
+        ids=["end-of-stream", "torn-line", "json-array", "json-null", "nested-too-deep"],
+    )
+    async def test_a_daemon_that_dies_mid_overlay_is_overlay_failed(
+        self, tmp_path: Path, lines_before: int, end: bytes, message: str
+    ) -> None:
+        """The daemon dies (OOM) during create_overlay: its stream ends, or a torn line or a
+        line that is no QMP object comes. The error is TransientError OVERLAY_FAILED, never a
+        raw JSONDecodeError, AttributeError or TypeError. A peer in this process
+        ends on cue."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(_qcow2_header(77 * 1024 * 1024))
+        daemon, _ = self._daemon_whose_peer_ends(lines_before=lines_before, end=end)
 
-        assert result is None
-        assert len(daemon._event_buffer) == 1  # Unchanged
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match=message):
+            await daemon.create_overlay(base, tmp_path / "overlay.qcow2")
 
-    async def test_consume_event_takes_first_match(self) -> None:
-        """consume_event returns first matching event when duplicates exist."""
+    async def test_a_daemon_that_dies_in_the_cleanup_leaves_a_complete_overlay(self, tmp_path: Path) -> None:
+        """The stream ends first at the blockdev-del cleanup: the qcow2 job has concluded, so
+        the overlay is complete and create_overlay returns; the cleanup error is suppressed."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(_qcow2_header(77 * 1024 * 1024))
+        daemon, peer = self._daemon_whose_peer_ends(lines_before=15, end=b"")
+
+        await daemon.create_overlay(base, tmp_path / "overlay.qcow2")
+
+        assert peer.commands[-1]["execute"] == "blockdev-del"
+
+    async def test_a_qmp_error_that_is_not_an_object_is_overlay_failed(self, tmp_path: Path) -> None:
+        """An answer whose "error" is not an object: OVERLAY_FAILED "Unknown QMP error", not a
+        raw AttributeError."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(_qcow2_header(77 * 1024 * 1024))
+        peer = _ScriptedQmp([])
+
+        async def error_readline() -> bytes:
+            return json.dumps({"error": "not an object", "id": peer.commands[-1]["id"]}).encode() + b"\n"
+
+        peer.readline = error_readline  # type: ignore[method-assign]
         daemon = QemuStorageDaemon()
-        first = _make_event("job-A", "concluded")
-        second = _make_event("job-A", "concluded")
-        daemon._event_buffer = [first, second]
+        daemon._reader = cast("asyncio.StreamReader", peer)
+        daemon._writer = cast("asyncio.StreamWriter", peer)
+        daemon._started = True
 
-        result = daemon._consume_event("job-A", "concluded")
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Unknown QMP"):
+            await daemon.create_overlay(base, tmp_path / "overlay.qcow2")
 
-        assert result is first  # Identity check: must be the first object
-        assert daemon._event_buffer == [second]
-
-    async def test_consume_event_ignores_non_job_events(self) -> None:
-        """consume_event skips unrelated event types."""
+    async def test_a_line_over_the_reader_limit_is_overlay_failed(self, tmp_path: Path) -> None:
+        """A line longer than the stream reader's limit (64 KiB by default; 64 bytes here):
+        OVERLAY_FAILED, not the raw ValueError of StreamReader.readline."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(_qcow2_header(77 * 1024 * 1024))
+        reader = asyncio.StreamReader(limit=64)
+        reader.feed_data(b'{"return": "' + b"x" * 100 + b'"}\n')
+        reader.feed_eof()  # the blockdev-del cleanup ends at once (a live daemon answers it)
+        writer = MagicMock()
+        writer.drain = AsyncMock()
         daemon = QemuStorageDaemon()
-        # BLOCK_IO_ERROR has no matching job_id/status
-        daemon._event_buffer = [QmpEvent(event="BLOCK_IO_ERROR", job_id="", status="")]
+        daemon._reader = reader
+        daemon._writer = writer
+        daemon._started = True
 
-        result = daemon._consume_event("job-A", "concluded")
+        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="limit"):
+            await daemon.create_overlay(base, tmp_path / "overlay.qcow2")
 
-        assert result is None
-        assert len(daemon._event_buffer) == 1  # Preserved
+    async def test_a_job_still_running_after_its_concluded_event_is_waited_for(self, tmp_path: Path) -> None:
+        """The JOB_STATUS_CHANGE "concluded" event comes, but query-jobs still lists the job as
+        running: the wait polls again and dismisses the job once it concludes. It never takes
+        the job as done on the event alone. A real daemon does not disagree on demand,
+        so a peer in this process does."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(_qcow2_header(77 * 1024 * 1024))
+        peer = _ScriptedQmp([])
+        scripted_write = peer.write
+        first_query = True
 
-    async def test_consume_event_malformed_event_no_data(self) -> None:
-        """consume_event handles event with empty fields without crashing."""
+        def write(data: bytes) -> None:
+            nonlocal first_query
+            scripted_write(data)
+            if json.loads(data)["execute"] == "query-jobs" and first_query:
+                first_query = False
+                answer = json.loads(peer._lines.pop())  # the scripted "concluded" answer
+                answer["return"] = [{**job, "status": "running"} for job in answer["return"]]
+                peer._lines.append(json.dumps(answer).encode() + b"\n")
+
+        peer.write = write  # type: ignore[method-assign]
         daemon = QemuStorageDaemon()
-        # Simulates _parse_event output for {"event": "JOB_STATUS_CHANGE"} (no data)
-        daemon._event_buffer = [QmpEvent(event="JOB_STATUS_CHANGE", job_id="", status="")]
+        daemon._reader = cast("asyncio.StreamReader", peer)
+        daemon._writer = cast("asyncio.StreamWriter", peer)
+        daemon._started = True
 
-        result = daemon._consume_event("job-A", "concluded")
+        await daemon.create_overlay(base, tmp_path / "overlay.qcow2")
 
-        assert result is None
-        assert len(daemon._event_buffer) == 1  # Preserved
-
-    async def test_consume_event_malformed_event_no_id(self) -> None:
-        """consume_event handles event with status but no ID."""
-        daemon = QemuStorageDaemon()
-        # Simulates _parse_event output for {"data": {"status": "concluded"}} (no id)
-        daemon._event_buffer = [QmpEvent(event="JOB_STATUS_CHANGE", job_id="", status="concluded")]
-
-        result = daemon._consume_event("job-A", "concluded")
-
-        assert result is None
-        assert len(daemon._event_buffer) == 1  # Preserved
-
-    async def test_consume_event_with_extra_fields_via_parse(self) -> None:
-        """_parse_event extracts only relevant fields, ignoring extras."""
-        raw = {
-            "event": "JOB_STATUS_CHANGE",
-            "data": {"id": "job-A", "status": "concluded", "extra-field": "unexpected"},
-            "timestamp": {"seconds": 0, "microseconds": 0},
-        }
-        parsed = QemuStorageDaemon._parse_event(raw)
-        assert parsed.job_id == "job-A"
-        assert parsed.status == "concluded"
-        assert parsed.event == "JOB_STATUS_CHANGE"
-
-    async def test_consume_event_large_buffer(self) -> None:
-        """consume_event works correctly with 1000 events in buffer."""
-        daemon = QemuStorageDaemon()
-        # Fill buffer with 1000 events for different job IDs
-        daemon._event_buffer = [_make_event(f"job-{i}", "concluded") for i in range(1000)]
-
-        # Consume one specific event
-        result = daemon._consume_event("job-500", "concluded")
-
-        assert result is not None
-        assert result.job_id == "job-500"
-        assert len(daemon._event_buffer) == 999
-        # Verify the consumed one is gone
-        remaining_ids = [e.job_id for e in daemon._event_buffer]
-        assert "job-500" not in remaining_ids
-
-    async def test_event_buffer_cleared_on_stop(self) -> None:
-        """stop() clears the event buffer even for unstarted daemon."""
-        daemon = QemuStorageDaemon()
-        daemon._event_buffer = [_make_event("job-A", "concluded"), _make_event("job-B", "running")]
-
-        await daemon.stop()
-
-        assert daemon._event_buffer == []
-
-    async def test_parse_event_malformed_raw(self) -> None:
-        """_parse_event handles missing keys gracefully."""
-        # No data key at all
-        parsed = QemuStorageDaemon._parse_event({"event": "JOB_STATUS_CHANGE"})
-        assert parsed.job_id == ""
-        assert parsed.status == ""
-
-        # No event key
-        parsed = QemuStorageDaemon._parse_event({"data": {"id": "x", "status": "y"}})
-        assert parsed.event == ""
-        assert parsed.job_id == "x"
-        assert parsed.status == "y"
-
-        # Completely empty
-        parsed = QemuStorageDaemon._parse_event({})
-        assert parsed.event == ""
-        assert parsed.job_id == ""
-        assert parsed.status == ""
-
-    async def test_parse_event_non_dict_data(self) -> None:
-        """_parse_event handles non-dict data values gracefully."""
-        # String data
-        parsed = QemuStorageDaemon._parse_event({"event": "X", "data": "not-a-dict"})
-        assert parsed.event == "X"
-        assert parsed.job_id == ""
-        assert parsed.status == ""
-
-        # Integer data
-        parsed = QemuStorageDaemon._parse_event({"event": "Y", "data": 42})
-        assert parsed.job_id == ""
-        assert parsed.status == ""
-
-        # List data
-        parsed = QemuStorageDaemon._parse_event({"event": "Z", "data": ["a", "b"]})
-        assert parsed.job_id == ""
-        assert parsed.status == ""
-
-        # None data (explicit)
-        parsed = QemuStorageDaemon._parse_event({"event": "W", "data": None})
-        assert parsed.job_id == ""
-        assert parsed.status == ""
-
-    # --- Orphan reaper unit tests ---
-
-    async def test_reap_stale_daemons_removes_dead_parent_socket(self) -> None:
-        """Reaper removes sockets for dead parent PIDs."""
-        # PID 99999999 almost certainly doesn't exist; unique suffix avoids parallel collisions
-        suffix = secrets.token_hex(8)
-        sock = Path(tempfile.gettempdir()) / f"qsd-99999999-{suffix}.sock"
-        sock.touch()
-
-        try:
-            # Don't assert on count — a parallel worker's reaper (e.g. from
-            # OverlayPool.start()) may have already cleaned this socket via the
-            # shared tmpdir, making our call return 0.
-            QemuStorageDaemon._reap_stale_daemons()
-            assert not sock.exists()
-        finally:
-            # Cleanup if test fails
-            sock.unlink(missing_ok=True)
-
-    async def test_reap_stale_daemons_keeps_live_parent_socket(self) -> None:
-        """Reaper does not remove sockets for live parent PIDs."""
-        # Use our own PID (definitely alive); unique suffix avoids parallel collisions
-        suffix = secrets.token_hex(8)
-        sock = Path(tempfile.gettempdir()) / f"qsd-{os.getpid()}-{suffix}.sock"
-        sock.touch()
-
-        try:
-            QemuStorageDaemon._reap_stale_daemons()
-            assert sock.exists()  # Should NOT be removed
-        finally:
-            sock.unlink(missing_ok=True)
-
-    async def test_reap_stale_daemons_ignores_non_matching_filenames(self) -> None:
-        """Reaper ignores files that don't match the qsd-{pid}-{hex}.sock pattern."""
-        tmpdir = Path(tempfile.gettempdir())
-        non_matching1 = tmpdir / "qsd-notapid.sock"
-        non_matching2 = tmpdir / "other-file.sock"
-        non_matching1.touch()
-        non_matching2.touch()
-
-        try:
-            QemuStorageDaemon._reap_stale_daemons()
-            assert non_matching1.exists()  # Untouched
-            assert non_matching2.exists()  # Untouched
-        finally:
-            non_matching1.unlink(missing_ok=True)
-            non_matching2.unlink(missing_ok=True)
-
-    async def test_reap_stale_daemons_does_not_crash_when_clean(self) -> None:
-        """Reaper runs without error when no stale sockets exist."""
-        count = QemuStorageDaemon._reap_stale_daemons()
-        # Count may be >= 0 if stale sockets exist from other tests;
-        # the important thing is it doesn't crash
-        assert count >= 0
-
-    async def test_reap_stale_daemons_handles_permission_error(self) -> None:
-        """Reaper handles PID 1 (init) gracefully — PermissionError means alive."""
-        suffix = secrets.token_hex(8)
-        sock = Path(tempfile.gettempdir()) / f"qsd-1-{suffix}.sock"
-        sock.touch()
-
-        try:
-            # Should not crash — PID 1 is alive but os.kill(1, 0) raises PermissionError
-            QemuStorageDaemon._reap_stale_daemons()
-            assert sock.exists()  # Should NOT be removed (parent alive)
-        finally:
-            sock.unlink(missing_ok=True)
+        executed = [command["execute"] for command in peer.commands]
+        assert executed[:3] == ["blockdev-create", "query-jobs", "query-jobs"]  # polled again
+        assert executed.count("job-dismiss") == 2  # both jobs dismissed once concluded
 
 
 # ============================================================================
@@ -494,24 +583,38 @@ class TestQemuStorageDaemonIntegration:
     creates qcow2 overlays via QMP — it does not boot VMs or use KVM/HVF.
     """
 
+    @pytest.mark.usefixtures("isolated_registry")
     async def test_start_stop_lifecycle(self) -> None:
-        """Daemon starts and stops cleanly."""
+        """start() runs one daemon process with its QMP socket, registered for force_kill_all;
+        stop() ends the process, removes the socket and unregisters the process."""
+        before = _daemon_sockets()
         daemon = QemuStorageDaemon()
-        await daemon.start()
-        assert daemon.started is True
-        await daemon.stop()
         assert daemon.started is False
+        await daemon.start()
+        try:
+            assert daemon.started is True
+            started = {pid: path for pid, path in _daemon_sockets().items() if pid not in before}
+            assert len(started) == 1
+            (socket_path,) = started.values()
+            assert socket_path.is_socket()
+            assert process_registry.get_tracked_count() == 1
+        finally:
+            await daemon.stop()
+        assert daemon.started is False
+        assert not started.keys() & _daemon_sockets().keys()
+        assert not socket_path.exists()
+        assert process_registry.get_tracked_count() == 0
 
     async def test_double_start_is_idempotent(self) -> None:
         """Calling start() twice is safe - second call is no-op."""
+        before = _daemon_sockets().keys()
         daemon = QemuStorageDaemon()
         await daemon.start()
         try:
-            assert daemon._process is not None
-            pid_after_first = daemon._process.pid
+            started = _daemon_sockets().keys() - before
             await daemon.start()  # Should be no-op
-            assert daemon._process is not None
-            assert daemon._process.pid == pid_after_first  # Same process
+            assert _daemon_sockets().keys() - before == started  # the same one process
+            assert len(started) == 1
             assert daemon.started is True
         finally:
             await daemon.stop()
@@ -525,33 +628,6 @@ class TestQemuStorageDaemonIntegration:
         await daemon.stop()  # Should not raise
         assert daemon.started is False
 
-    async def test_socket_created_on_start(self) -> None:
-        """QMP socket is created on daemon start."""
-        daemon = QemuStorageDaemon()
-        await daemon.start()
-        try:
-            assert daemon._socket_path is not None
-            assert daemon._socket_path.exists()
-        finally:
-            await daemon.stop()
-
-    async def test_socket_removed_on_stop(self) -> None:
-        """QMP socket is removed on daemon stop."""
-        daemon = QemuStorageDaemon()
-        await daemon.start()
-        socket_path = daemon._socket_path
-        await daemon.stop()
-        assert socket_path is not None
-        assert not socket_path.exists()
-
-    async def test_create_overlay(self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path) -> None:
-        """Creates valid qcow2 overlay via QMP."""
-        overlay = tmp_path / "test-overlay.qcow2"
-        await started_daemon.create_overlay(base_image, overlay)
-
-        assert overlay.exists()
-        assert overlay.stat().st_size > 0
-
     async def test_overlay_has_correct_backing_file(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
@@ -563,15 +639,15 @@ class TestQemuStorageDaemonIntegration:
         proc = await asyncio.create_subprocess_exec(
             "qemu-img",
             "info",
+            "--output=json",
             str(overlay),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()
-        info_output = stdout.decode()
+        info = json.loads(stdout)
 
-        assert str(base_image) in info_output
-        assert "backing file:" in info_output.lower()
+        assert info["backing-filename"] == str(base_image.absolute())
+        assert info["backing-filename-format"] == "qcow2"
 
     async def test_overlay_has_qcow2_format(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
@@ -600,162 +676,429 @@ class TestQemuStorageDaemonIntegration:
         options = info["format-specific"]["data"]
         assert (options["lazy-refcounts"], options["extended-l2"]) == (True, True)
 
-    async def test_multiple_overlays_created_sequentially(
+    # --- Job flow integration ---
+
+    async def test_sequential_overlays_complete(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
-        """Multiple overlays can be created in sequence."""
-        overlays = [tmp_path / f"overlay-{i}.qcow2" for i in range(5)]
-        for overlay in overlays:
-            await started_daemon.create_overlay(base_image, overlay)
-
-        assert all(o.exists() for o in overlays)
-        assert all(o.stat().st_size > 0 for o in overlays)
-
-    async def test_multiple_overlays_created_concurrently(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """Multiple overlays can be created concurrently (QMP commands serialized by lock)."""
-        overlays = [tmp_path / f"concurrent-{i}.qcow2" for i in range(5)]
-        tasks = [started_daemon.create_overlay(base_image, o) for o in overlays]
-        await asyncio.gather(*tasks)
-
-        assert all(o.exists() for o in overlays)
-
-    async def test_restart_daemon_after_stop(self) -> None:
-        """Daemon can be restarted after stop (not the same instance, but same pattern)."""
-        daemon = QemuStorageDaemon()
-
-        # First lifecycle
-        await daemon.start()
-        assert daemon.started is True
-        await daemon.stop()
-        assert daemon.started is False
-
-        # Create new daemon (same pattern as OverlayPool restart)
-        daemon2 = QemuStorageDaemon()
-        await daemon2.start()
-        assert daemon2.started is True
-        await daemon2.stop()
-
-    # --- Event-driven flow integration ---
-
-    async def test_single_overlay_events_consumed(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """Event buffer is empty after creating one overlay (events consumed, not leaking)."""
-        overlay = tmp_path / "event-test.qcow2"
-        await started_daemon.create_overlay(base_image, overlay)
-
-        assert started_daemon._event_buffer == []
-
-    async def test_sequential_overlays_buffer_stays_clean(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """Event buffer stays empty across sequential overlay creations."""
+        """Sequential overlays all complete on one daemon."""
         for i in range(10):
             overlay = tmp_path / f"seq-{i}.qcow2"
             await started_daemon.create_overlay(base_image, overlay)
-            assert started_daemon._event_buffer == [], f"Buffer not empty after overlay {i}"
-
-    async def test_concurrent_overlays_all_succeed(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """8 concurrent overlays all succeed and buffer is empty afterward."""
-        overlays = [tmp_path / f"conc-{i}.qcow2" for i in range(8)]
-        tasks = [started_daemon.create_overlay(base_image, o) for o in overlays]
-        await asyncio.gather(*tasks)
-
-        assert all(o.exists() for o in overlays)
-        assert started_daemon._event_buffer == []
+            assert overlay.exists()
 
     async def test_concurrent_overlays_no_stale_events(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
-        """20 concurrent overlays (more than typical semaphore) leave no stale events."""
+        """20 concurrent overlays (more than the pool's creation limit; QMP commands take
+        turns) all complete."""
         overlays = [tmp_path / f"many-{i}.qcow2" for i in range(20)]
         tasks = [started_daemon.create_overlay(base_image, o) for o in overlays]
         await asyncio.gather(*tasks)
 
         assert all(o.exists() for o in overlays)
-        assert started_daemon._event_buffer == []
 
     async def test_overlay_after_failed_overlay_succeeds(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
     ) -> None:
-        """Valid overlay creation succeeds after a failed attempt on same daemon."""
-        # First: fail with nonexistent base
-        with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED):
-            await started_daemon.create_overlay(tmp_path / "nonexistent.qcow2", tmp_path / "fail.qcow2")
+        """A job that fails in the daemon (no write access to the overlay's folder) raises
+        TransientError OVERLAY_FAILED, and the same daemon then creates a valid overlay."""
+        readonly_dir = tmp_path / "readonly"
+        readonly_dir.mkdir()
+        readonly_dir.chmod(0o555)
+        try:
+            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="failed"):
+                await started_daemon.create_overlay(base_image, readonly_dir / "overlay.qcow2")
+        finally:
+            readonly_dir.chmod(0o755)  # Restore for cleanup
 
-        # Second: succeed with valid base
         overlay = tmp_path / "success.qcow2"
         await started_daemon.create_overlay(base_image, overlay)
         assert overlay.exists()
 
     # --- Process registry integration ---
 
-    async def test_process_registered_on_start(self) -> None:
-        """Daemon PID is registered in process_registry on start."""
+    @pytest.mark.usefixtures("isolated_registry")
+    async def test_force_kill_all_reaches_the_daemon(self) -> None:
+        """force_kill_all() (the second Ctrl+C) kills a started daemon; stop() then ends cleanly."""
+        before = _daemon_sockets().keys()
         daemon = QemuStorageDaemon()
         await daemon.start()
         try:
-            assert daemon._process is not None
-            assert daemon._process.pid in _process_groups
+            (pid,) = _daemon_sockets().keys() - before
+
+            assert process_registry.force_kill_all() == 1
+
+            async with asyncio.timeout(2):  # a SIGKILL ends it in ms; the timeout only bounds a failure
+                while pid in _daemon_sockets():  # noqa: ASYNC110 - the end of a process has no event here
+                    await asyncio.sleep(0.005)
         finally:
             await daemon.stop()
+        assert daemon.started is False
 
-    async def test_process_unregistered_on_stop(self) -> None:
-        """Daemon PID is unregistered from process_registry on stop."""
+    @pytest.mark.usefixtures("isolated_registry")
+    async def test_process_unregistered_on_start_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A daemon that runs but sends no QMP greeting fails the start (TransientError
+        OVERLAY_FAILED): the start ends the process and unregisters it."""
+        binary = tmp_path / "qemu-storage-daemon"
+        binary.write_text(_NO_GREETING_DAEMON.format(python=sys.executable))
+        binary.chmod(0o755)
+        monkeypatch.setattr("exec_sandbox.qemu_storage_daemon._BINARY", str(binary))
+        before = _daemon_sockets().keys()
         daemon = QemuStorageDaemon()
-        await daemon.start()
-        assert daemon._process is not None
-        pid = daemon._process.pid
-        await daemon.stop()
-        assert pid not in _process_groups
-
-    async def test_process_unregistered_on_start_failure(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-        """PID is not left in process_registry when start fails."""
-        daemon = QemuStorageDaemon()
-
-        # Poison the QMP wait+connect step so start fails after process creation
-        # Monkeypatch at class level since __slots__ prevents instance-level setattr
-        async def _bad_wait_and_connect_qmp(_self: QemuStorageDaemon) -> None:
-            raise ConnectionError("Injected failure")
-
-        monkeypatch.setattr(QemuStorageDaemon, "_wait_and_connect_qmp", _bad_wait_and_connect_qmp)
 
         with pytest.raises(
-            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to start daemon"
+            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Invalid QMP greeting"
         ):
             await daemon.start()
 
-        # Process was cleaned up, should not be in registry
-        assert daemon._process is None
+        assert _daemon_sockets().keys() - before == set()
+        assert process_registry.get_tracked_count() == 0
+        assert not daemon.started
 
     # --- Orphan reaper integration ---
 
-    async def test_reaper_runs_on_start_without_blocking(self) -> None:
-        """start() completes in reasonable time even when reaper runs."""
-        tmpdir = Path(tempfile.gettempdir())
-        # Create a few stale sockets with unique suffixes to avoid parallel collisions
-        stale_socks = []
-        for _ in range(3):
-            sock = tmpdir / f"qsd-99999999-{secrets.token_hex(8)}.sock"
-            sock.touch()
-            stale_socks.append(sock)
+    @pytest.mark.parametrize("unreadable_process", [False, True], ids=["all-readable", "one-unreadable"])
+    async def test_start_reaps_only_the_daemons_of_dead_owners(
+        self, unreadable_process: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """start() removes each qsd-<namespace>-<pid>-<hex>.sock socket of this pid namespace in
+        the temp folder whose owner pid does not run, and kills the qemu-storage-daemon that
+        serves it. These stay: the socket of a running owner (this process; pid 1, of another
+        user), one of another pid namespace (a container sharing /tmp: its pid means nothing
+        here), one whose pid no kernel gives (no OverflowError out of start), other names,
+        and a process that is not the daemon with a stale socket path in its arguments.
+
+        one-unreadable: a process that cannot be read during the scan (on macOS psutil raises
+        SystemError for a process that exits while its arguments are read) is skipped, and
+        start() still succeeds. That exit race does not come on demand, so the first
+        command line read raises it.
+
+        The sockets sit in a temp folder of this test: a start in another worker reaps only its
+        own temp folder."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="qsd-"))
+        monkeypatch.setattr(tempfile, "tempdir", str(tmpdir))
+        suffix = secrets.token_hex(8)  # parallel workers share the temp folder
+        ns = _pid_namespace()
+        dead = [tmpdir / f"qsd-{ns}-99999999-{suffix}{i}.sock" for i in range(2)]  # no pid is 99999999
+        kept = [
+            tmpdir / f"qsd-{ns}-{os.getpid()}-{suffix}.sock",
+            tmpdir / f"qsd-{ns}-1-{suffix}.sock",
+            tmpdir / f"qsd-{ns + 1}-99999999-{suffix}.sock",
+            tmpdir / f"qsd-{ns}-{2**31}-{suffix}.sock",
+            tmpdir / f"qsd-x{suffix}.sock",
+            tmpdir / f"other-{suffix}.sock",
+        ]
+        for path in (dead[1], *kept):
+            path.touch()
+        orphan = await asyncio.create_subprocess_exec(
+            "qemu-storage-daemon",
+            "--chardev",
+            f"socket,path={dead[0]},server=on,wait=off,id=qmp0",
+            "--monitor",
+            "chardev=qmp0",
+            start_new_session=True,
+        )
+        for _ in range(200):  # the orphan serves its socket within a few ms
+            if dead[0].exists():
+                break
+            await asyncio.sleep(0.01)
+        assert dead[0].exists()
+        bystander = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(60)", str(dead[1]), start_new_session=True
+        )
+        real_cmdline = psutil.Process.cmdline
+        reads = 0
+
+        def cmdline(proc: psutil.Process) -> list[str]:
+            nonlocal reads
+            reads += 1
+            if unreadable_process and reads == 1:
+                raise SystemError("<built-in function proc_cmdline> returned a result with an exception set")
+            return real_cmdline(proc)
 
         daemon = QemuStorageDaemon()
         try:
-            # start() should complete within a reasonable timeout
-            await asyncio.wait_for(daemon.start(), timeout=15.0)
+            with patch.object(psutil.Process, "cmdline", cmdline):
+                await daemon.start()
 
-            # Stale sockets should be cleaned
-            for sock in stale_socks:
-                assert not sock.exists(), f"Stale socket not cleaned: {sock}"
+            assert await asyncio.wait_for(orphan.wait(), timeout=2) == -signal.SIGKILL
+            assert bystander.returncode is None
+            assert [path.exists() for path in dead] == [False, False]
+            assert [path.exists() for path in kept] == [True] * len(kept)
         finally:
             await daemon.stop()
-            for sock in stale_socks:
-                sock.unlink(missing_ok=True)
+            for process in (orphan, bystander):
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+            shutil.rmtree(tmpdir, ignore_errors=True)  # the test's sockets, and the daemon's own
+
+
+class TestOverlayTemplates:
+    """The first overlay of a base image version goes through QMP and is kept as its template;
+    each later one is a clone of it, with the same bytes and mode as one made through QMP."""
+
+    @staticmethod
+    def _counted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """The QMP commands that the daemons send from now on (a slotted class: patched on it)."""
+        sent: list[str] = []
+        execute = QemuStorageDaemon._execute  # pyright: ignore[reportPrivateUsage]
+
+        async def counted(
+            self: QemuStorageDaemon, command: str, arguments: dict[str, Any] | None = None
+        ) -> dict[str, Any]:
+            sent.append(command)
+            return await execute(self, command, arguments)
+
+        monkeypatch.setattr(QemuStorageDaemon, "_execute", counted)
+        return sent
+
+    async def test_later_overlays_are_clones_with_no_qmp(
+        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first, later = tmp_path / "first.qcow2", [tmp_path / f"later-{i}.qcow2" for i in range(5)]
+        await started_daemon.create_overlay(base_image, first)
+        sent = self._counted(monkeypatch)
+
+        await asyncio.gather(*(started_daemon.create_overlay(base_image, overlay) for overlay in later))
+
+        assert sent == []
+        for overlay in later:
+            assert overlay.read_bytes() == first.read_bytes()
+            assert overlay.stat().st_mode == first.stat().st_mode
+
+    async def test_overlays_at_once_wait_for_the_first(
+        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Overlays asked for at once (a burst at start) wait for the first one of their base
+        image: one QMP creation, not one each."""
+        sent = self._counted(monkeypatch)
+        overlays = [tmp_path / f"burst-{i}.qcow2" for i in range(5)]
+
+        await asyncio.gather(*(started_daemon.create_overlay(base_image, overlay) for overlay in overlays))
+
+        assert sent.count("blockdev-add") == 1
+        assert len({overlay.read_bytes() for overlay in overlays}) == 1
+
+    async def test_a_template_gone_makes_the_overlay_through_qmp(
+        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template removed meanwhile (a temp folder cleaner): the overlay is made through QMP."""
+        first = tmp_path / "first.qcow2"
+        await started_daemon.create_overlay(base_image, first)
+        template_dir = started_daemon._template_dir  # pyright: ignore[reportPrivateUsage]
+        assert template_dir is not None
+        for template in template_dir.iterdir():
+            template.unlink()
+        sent = self._counted(monkeypatch)
+
+        await started_daemon.create_overlay(base_image, tmp_path / "second.qcow2")
+
+        assert "blockdev-add" in sent
+        assert (tmp_path / "second.qcow2").read_bytes() == first.read_bytes()
+
+    async def test_stop_removes_the_template_folder(self, base_image: Path, tmp_path: Path) -> None:
+        daemon = QemuStorageDaemon()
+        await daemon.start()
+        try:
+            await daemon.create_overlay(base_image, tmp_path / "overlay.qcow2")
+            template_dir = daemon._template_dir  # pyright: ignore[reportPrivateUsage]
+            assert template_dir is not None
+            assert any(template_dir.iterdir())
+        finally:
+            await daemon.stop()
+        assert not template_dir.exists()
+
+    @staticmethod
+    async def _template_clone_held(
+        daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[threading.Event, asyncio.Task[None], Path]:
+        """Start the daemon and a first overlay whose template clone waits on the returned
+        event. Returns (event, the creating task, the template folder), once the clone runs."""
+        release = threading.Event()
+        real_clone = qemu_storage_daemon._clone_overlay  # pyright: ignore[reportPrivateUsage]
+
+        def held_clone(source: Path, target: Path) -> bool:
+            if target.parent.name.endswith(".templates"):
+                release.wait(10)
+            return real_clone(source, target)
+
+        monkeypatch.setattr(qemu_storage_daemon, "_clone_overlay", held_clone)
+        await daemon.start()
+        template_dir = daemon._template_dir  # pyright: ignore[reportPrivateUsage]
+        assert template_dir is not None
+        creating = asyncio.create_task(daemon.create_overlay(base_image, tmp_path / "overlay.qcow2"))
+        for _ in range(500):  # until the template clone runs
+            if daemon._template_writes:  # pyright: ignore[reportPrivateUsage]
+                break
+            await asyncio.sleep(0.01)
+        assert daemon._template_writes, "the template clone never started"  # pyright: ignore[reportPrivateUsage]
+        return release, creating, template_dir
+
+    async def test_stop_waits_for_a_template_clone_in_flight(
+        self, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """stop() during the clone that makes a template: it waits for the clone, then removes
+        the folder, so the clone cannot fill it again after its removal."""
+        daemon = QemuStorageDaemon()
+        release, creating, template_dir = await self._template_clone_held(daemon, base_image, tmp_path, monkeypatch)
+        stopping = asyncio.create_task(daemon.stop())
+        for _ in range(500):  # until the daemon process is gone: only the clone then holds stop()
+            if daemon._process is None:  # pyright: ignore[reportPrivateUsage]
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+        assert not stopping.done()  # it waits for the clone
+        release.set()
+        await stopping
+        await creating
+        assert not template_dir.exists()
+
+    async def test_a_cancelled_stop_cancels_no_clone_and_still_removes_the_folder(
+        self, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """stop() cancelled while a template clone runs: the create_overlay that awaits the
+        clone is not cancelled (its overlay is made), and the folder still goes once the clone
+        ends."""
+        daemon = QemuStorageDaemon()
+        release, creating, template_dir = await self._template_clone_held(daemon, base_image, tmp_path, monkeypatch)
+        stopping = asyncio.create_task(daemon.stop())
+        await asyncio.sleep(0.1)
+        stopping.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stopping
+
+        release.set()
+        await creating  # not cancelled
+        assert (tmp_path / "overlay.qcow2").exists()
+        await asyncio.gather(*qemu_storage_daemon._cleanup_tasks)  # pyright: ignore[reportPrivateUsage]
+        assert not template_dir.exists()
+
+    async def test_no_template_clone_starts_once_stop_began(
+        self, base_image: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A first overlay still in its QMP step when stop() runs: once that step ends, it
+        starts no template clone into the folder that stop() removes. The QMP step is
+        a stand-in that waits on an event."""
+        qmp_entered, qmp_done = asyncio.Event(), asyncio.Event()
+
+        async def slow_qmp(_self: QemuStorageDaemon, _base: Path, overlay_path: Path, _identity: object) -> None:
+            qmp_entered.set()
+            await qmp_done.wait()
+            overlay_path.write_bytes(b"overlay")
+
+        clones: list[Path] = []
+        monkeypatch.setattr(QemuStorageDaemon, "_create_with_qmp", slow_qmp)
+        monkeypatch.setattr(qemu_storage_daemon, "_clone_overlay", lambda _source, target: clones.append(target))
+        daemon = QemuStorageDaemon()
+        await daemon.start()
+        creating = asyncio.create_task(daemon.create_overlay(base_image, tmp_path / "overlay.qcow2"))
+        await asyncio.wait_for(qmp_entered.wait(), 5)  # in its QMP step, the folder read
+
+        await daemon.stop()
+        qmp_done.set()
+        await creating
+
+        assert clones == []
+
+    async def test_a_stop_cancelled_while_a_start_runs_still_stops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """stop() waits for a start() and is cancelled meanwhile: the stop still runs once the
+        start ends (a retained task), so no daemon or folder stays."""
+        entered, release = threading.Event(), threading.Event()
+        real_reap = QemuStorageDaemon._reap_stale_daemons  # pyright: ignore[reportPrivateUsage]
+
+        def held_reap(*args: Any) -> int:
+            entered.set()
+            release.wait(10)
+            return real_reap(*args)
+
+        monkeypatch.setattr(QemuStorageDaemon, "_reap_stale_daemons", staticmethod(held_reap))
+        daemon = QemuStorageDaemon()
+        starting = asyncio.create_task(daemon.start())
+        assert await asyncio.to_thread(entered.wait, 10)
+        stopping = asyncio.create_task(daemon.stop())
+        await asyncio.sleep(0.05)
+        stopping.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stopping
+
+        release.set()
+        await starting
+        await asyncio.gather(*qemu_storage_daemon._cleanup_tasks)  # pyright: ignore[reportPrivateUsage]
+        assert (daemon.started, daemon._process, daemon._template_dir) == (False, None, None)  # pyright: ignore[reportPrivateUsage]
+
+    @pytest.mark.parametrize("held", ["reaper", "template-mkdir"])
+    async def test_a_stop_during_start_stops_what_it_made(self, monkeypatch: pytest.MonkeyPatch, held: str) -> None:
+        """stop() while start() still runs (its stale-daemon reaper, or the mkdir of its
+        template folder): stop() waits for start(), then stops what it made: no daemon runs
+        and no template folder stays. The held step waits on an event. Other daemons of this
+        worker (from earlier tests) can still hold their folders: only new ones count."""
+        entered, release = threading.Event(), threading.Event()
+        own_folders = f"qsd-*-{os.getpid()}-*.templates"
+        before = set(Path(tempfile.gettempdir()).glob(own_folders))
+
+        def hold() -> None:
+            entered.set()
+            release.wait(10)
+
+        if held == "reaper":
+            real_reap = QemuStorageDaemon._reap_stale_daemons  # pyright: ignore[reportPrivateUsage]
+
+            def held_reap(*args: Any) -> int:
+                hold()
+                return real_reap(*args)
+
+            monkeypatch.setattr(QemuStorageDaemon, "_reap_stale_daemons", staticmethod(held_reap))
+        else:
+            real_mkdir = Path.mkdir
+
+            def held_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+                if path.name.endswith(".templates"):
+                    hold()
+                real_mkdir(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "mkdir", held_mkdir)
+        daemon = QemuStorageDaemon()
+        starting = asyncio.create_task(daemon.start())
+        assert await asyncio.to_thread(entered.wait, 10)
+        stopping = asyncio.create_task(daemon.stop())
+        await asyncio.sleep(0.1)
+
+        assert not stopping.done()  # it waits for start()
+        release.set()
+        await starting
+        await stopping
+        await asyncio.gather(*qemu_storage_daemon._cleanup_tasks)  # pyright: ignore[reportPrivateUsage]
+        assert (daemon.started, daemon._process, daemon._template_dir) == (False, None, None)  # pyright: ignore[reportPrivateUsage]
+        assert not set(Path(tempfile.gettempdir()).glob(own_folders)) - before
+
+    async def test_start_removes_only_the_template_folders_of_dead_owners(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template folder of a dead owner of this pid namespace goes; those of a running
+        owner, of another namespace, and other names stay."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="qsd-"))
+        monkeypatch.setattr(tempfile, "tempdir", str(tmpdir))
+        ns = _pid_namespace()
+        dead = tmpdir / f"qsd-{ns}-99999999-abc_12.templates"  # no pid is 99999999
+        kept = [
+            tmpdir / f"qsd-{ns}-{os.getpid()}-abc_12.templates",
+            tmpdir / f"qsd-{ns + 1}-99999999-abc_12.templates",
+            tmpdir / f"qsd-{ns}-99999999-abc_12.other",
+        ]
+        for folder in (dead, *kept):
+            folder.mkdir()
+            (folder / "t.qcow2").touch()
+        daemon = QemuStorageDaemon()
+        try:
+            await daemon.start()
+            assert not dead.exists()
+            assert all(folder.exists() for folder in kept)
+        finally:
+            await daemon.stop()
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ============================================================================
@@ -778,6 +1121,12 @@ class TestOverlayPoolWithDaemon:
         try:
             assert pool.daemon_enabled is True
 
+            # The pool fills in the background after start()
+            queue = pool._pools[str(base_image.resolve())]
+            async with asyncio.timeout(5):
+                while queue.empty():  # noqa: ASYNC110 - the pool has no fill event to await
+                    await asyncio.sleep(0.005)
+
             # Acquire overlay should work
             target = tmp_path / "acquired.qcow2"
             result = await pool.acquire(base_image, target)
@@ -788,16 +1137,19 @@ class TestOverlayPoolWithDaemon:
             await pool.stop()
 
     async def test_daemon_stopped_on_pool_shutdown(self, base_image: Path, tmp_path: Path) -> None:
-        """Daemon is stopped when pool shuts down."""
+        """Daemon is stopped when pool shuts down: its process ends."""
+        before = _daemon_sockets().keys()
         pool = OverlayPool(pool_size=2, pool_dir=tmp_path / "pool")
         await pool.start([base_image])
 
         assert pool.daemon_enabled is True
+        started = _daemon_sockets().keys() - before
+        assert len(started) == 1
 
         await pool.stop()
 
         assert pool.daemon_enabled is False
-        assert pool._daemon is None
+        assert not started & _daemon_sockets().keys()
 
 
 # ============================================================================
@@ -820,20 +1172,29 @@ class TestQemuStorageDaemonErrors:
         overlay = tmp_path / "overlay.qcow2"
 
         with pytest.raises(
-            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to get image info"
+            TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="Failed to read the header"
         ):
             await started_daemon.create_overlay(nonexistent, overlay)
 
         # Overlay should not exist
         assert not overlay.exists()
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"not a qcow2 file",
+            b"",
+            b"QFI\xfb" + (1).to_bytes(4, "big") + bytes(24),  # qcow v1: same magic, QEMU refuses it
+            b"QFI\xfb" + (3).to_bytes(4, "big"),  # the magic and a version, then nothing
+        ],
+        ids=["raw", "empty", "qcow-v1", "short-header"],
+    )
     async def test_create_overlay_invalid_base_image_fails(
-        self, started_daemon: QemuStorageDaemon, tmp_path: Path
+        self, started_daemon: QemuStorageDaemon, tmp_path: Path, content: bytes
     ) -> None:
         """create_overlay with invalid qcow2 base fails fast with clear error."""
-        # Create a fake base image (not qcow2 - will be detected as "raw" format)
         fake_base = tmp_path / "fake-base.qcow2"
-        fake_base.write_text("not a qcow2 file")
+        fake_base.write_bytes(content)
 
         overlay = tmp_path / "overlay.qcow2"
 
@@ -841,23 +1202,6 @@ class TestQemuStorageDaemonErrors:
             TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED, match="not qcow2 format"
         ):
             await started_daemon.create_overlay(fake_base, overlay)
-
-    async def test_create_overlay_permission_denied(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """create_overlay fails when overlay path is not writable."""
-        # Create read-only directory
-        readonly_dir = tmp_path / "readonly"
-        readonly_dir.mkdir()
-        readonly_dir.chmod(0o444)
-
-        overlay = readonly_dir / "overlay.qcow2"
-
-        try:
-            with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.OVERLAY_FAILED):
-                await started_daemon.create_overlay(base_image, overlay)
-        finally:
-            readonly_dir.chmod(0o755)  # Restore for cleanup
 
     async def test_create_overlay_with_unicode_path(
         self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
@@ -897,60 +1241,55 @@ class TestQemuStorageDaemonErrors:
         assert overlay.stat().st_size > 0
 
 
-# ============================================================================
-# Stress and Concurrency Tests
-# ============================================================================
+_KILLED_OWNER = """
+import asyncio, sys
+from exec_sandbox.qemu_storage_daemon import QemuStorageDaemon
+
+async def main() -> None:
+    daemon = QemuStorageDaemon()
+    await daemon.start()
+    print(daemon._process.pid, flush=True)
+    await asyncio.Event().wait()  # until the test kills this process (never a read of a shared stdin)
+
+asyncio.run(main())
+"""
+"""A process with a started daemon, killed by the test (SIGKILL: no cleanup runs)."""
 
 
-class TestQemuStorageDaemonStress:
-    """Stress tests for daemon under load.
+@skip_unless_linux
+class TestDaemonEndsWithItsProcess:
+    """The daemon runs as this user and is not a VM: no VM cgroup and no watcher reach it.
+    Without PR_SET_PDEATHSIG, the daemon of a killed process runs on (its parent is then
+    init) until a start-time reaper with the same temp folder finds its socket, if ever."""
 
-    No hwaccel required: qemu-storage-daemon is a host-side tool that
-    creates qcow2 overlays via QMP — it does not boot VMs or use KVM/HVF.
-    """
-
-    async def test_many_overlays_sequential(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """Create 20 overlays sequentially to verify daemon stability."""
-        overlays = [tmp_path / f"overlay-{i}.qcow2" for i in range(20)]
-        for overlay in overlays:
-            await started_daemon.create_overlay(base_image, overlay)
-
-        assert all(o.exists() for o in overlays)
-        assert len({o.stat().st_ino for o in overlays}) == 20  # All unique files
-
-    async def test_many_overlays_concurrent(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """Create 20 overlays concurrently to verify lock handling and event-driven path."""
-        overlays = [tmp_path / f"concurrent-{i}.qcow2" for i in range(20)]
-        tasks = [started_daemon.create_overlay(base_image, o) for o in overlays]
-        await asyncio.gather(*tasks)
-
-        assert all(o.exists() for o in overlays)
-        assert started_daemon._event_buffer == []  # All events consumed
-
-    async def test_rapid_start_stop_cycles(self) -> None:
-        """Rapid start/stop cycles don't leak resources."""
-        for _ in range(5):
-            daemon = QemuStorageDaemon()
-            await daemon.start()
-            assert daemon.started
-            socket_path = daemon._socket_path
-            assert socket_path is not None, "Daemon should have a socket path after start()"
-            await daemon.stop()
-            assert not daemon.started
-            assert not socket_path.exists(), f"Socket should be removed after stop(): {socket_path}"
-
-    async def test_rapid_create_overlay_cycles(
-        self, started_daemon: QemuStorageDaemon, base_image: Path, tmp_path: Path
-    ) -> None:
-        """50 sequential overlays with no event buffer growth (leak detection)."""
-        for i in range(50):
-            overlay = tmp_path / f"rapid-{i}.qcow2"
-            await started_daemon.create_overlay(base_image, overlay)
-            assert overlay.exists()
-
-        # No events leaked
-        assert started_daemon._event_buffer == []
+    async def test_daemon_of_a_killed_process_ends_at_once(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="qsd-"))  # the daemon's socket: private to this test
+        owner = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _KILLED_OWNER,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            env={**os.environ, "TMPDIR": str(tmp)},
+        )
+        pidfd: int | None = None
+        try:
+            assert owner.stdout is not None
+            pidfd = os.pidfd_open(int(await owner.stdout.readline()))  # readable once the daemon ends
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            assert poller.poll(0) == []  # alive while its process lives
+            owner.kill()
+            assert await owner.wait() == -9
+            start = asyncio.get_running_loop().time()
+            assert await asyncio.to_thread(poller.poll, 2000)  # ends within ms; the timeout only bounds a failure
+            assert asyncio.get_running_loop().time() - start < 1.0
+        finally:
+            if owner.returncode is None:
+                owner.kill()
+                await owner.wait()
+            if pidfd is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)  # a failed test leaves no daemon
+                os.close(pidfd)
+            shutil.rmtree(tmp, ignore_errors=True)

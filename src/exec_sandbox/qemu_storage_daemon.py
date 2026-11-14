@@ -5,24 +5,32 @@ recommended by the QEMU project for storage operations outside a VM:
 - https://www.qemu.org/docs/master/tools/qemu-storage-daemon.html
 - https://lwn.net/Articles/911281/ (LWN: "Accessing QEMU storage features without a VM")
 
-This eliminates ~70ms fork/exec overhead per overlay creation, achieving
-~4-5ms per overlay via QMP commands vs ~39ms via qemu-img subprocess.
+No process starts per overlay: about 6 ms per overlay through QMP, against
+about 39 ms for a qemu-img process (its fork and exec included). The first overlay of
+each base image version is also kept as a template: each later overlay of that version
+is a clone of it (the same bytes): 0.3 ms, and 1.4 ms for 10 at once, where QMP takes
+31 ms for 10 at once.
 
 Architecture:
 - Single persistent daemon process per OverlayPool
-- QMP socket: /tmp/qsd-{pid}-{random}.sock
-- Event-driven job completion: JOB_STATUS_CHANGE events are stashed by
-  _execute() and consumed by _wait_for_job(), eliminating polling storms.
-  Fallback polling at 50ms interval as safety net.
-- Orphan reaper: On startup, scans /tmp for stale QSD sockets from dead
-  parent processes and kills the owning daemons. Handles crashes, OOM kills,
-  and kill -9 that bypass normal cleanup.
+- QMP socket: <tempfile.gettempdir()>/qsd-{pid namespace}-{pid}-{random}.sock
+- Templates: <tempfile.gettempdir()>/qsd-{pid namespace}-{pid}-{random}.templates/ (0700)
+- Job completion: _wait_for_job() polls query-jobs (the job's status and error) from
+  1 ms, doubling up to 50 ms; an exchange skips the JOB_STATUS_CHANGE events it reads.
+- Parent death: on Linux the kernel kills the daemon when the thread that
+  spawned it (the event loop's) ends, SIGKILL of this process included
+  (PR_SET_PDEATHSIG, subprocess_utils.start_managed_process end_with_this_process).
+- Orphan reaper: On startup, scans the temp folder for stale QSD sockets from dead
+  parent processes and kills the owning daemons (and removes their template folders). Handles crashes, OOM kills,
+  and kill -9 that bypass normal cleanup (the only way on macOS).
 - Process registry: Daemon PID is registered with process_registry so
   force_kill_all() (2nd Ctrl+C) reaches QSD processes.
 
 Usage:
-    async with QemuStorageDaemon() as daemon:
-        await daemon.create_overlay(base_image, overlay_path)
+    daemon = QemuStorageDaemon()
+    await daemon.start()
+    await daemon.create_overlay(base_image, overlay_path)
+    await daemon.stop()
 """
 
 from __future__ import annotations
@@ -33,29 +41,52 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
+import stat
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Self, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import psutil
 
 from exec_sandbox import constants
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
-from exec_sandbox.exceptions import ErrorCode, TransientError, spawn_error
+from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError, spawn_error
+from exec_sandbox.files.disk import clone_sparse
 from exec_sandbox.process_registry import unregister_process
 from exec_sandbox.resource_cleanup import cleanup_process
-from exec_sandbox.subprocess_utils import communicate_managed_process, start_managed_process, wait_for_socket
+from exec_sandbox.subprocess_utils import (
+    exec_failed_error,
+    start_managed_process,
+    wait_for_socket,
+)
 
 if TYPE_CHECKING:
     from exec_sandbox.platform_utils import ProcessWrapper
 
 logger = get_logger(__name__)
 
-# Cleanup must outlive a caller that abandons a partially-started daemon.
+# Cleanup must outlive a caller that abandons a partially-started daemon: the process
+# cleanups and the template folder removals (stop).
 _cleanup_tasks: set[asyncio.Task[None]] = set()
+
+_BINARY: Final = "qemu-storage-daemon"
+_PID_MAX: Final = 2**31 - 1
+"""The largest pid any kernel gives (a C int): a socket name with a larger one names no owner."""
+
+
+def _pid_namespace() -> int:
+    """This process's pid namespace: the inode of /proc/self/ns/pid (Linux), else 0 (macOS has
+    none). A pid in a socket name means something only in that namespace."""
+    try:
+        return Path("/proc/self/ns/pid").stat().st_ino
+    except OSError:
+        return 0
+
+
+_INSTALL_HINT: Final = "Install QEMU (it ships qemu-storage-daemon)."
 
 # qcow2 options of every overlay (qemu-img create -o lazy_refcounts=on,extended_l2=on,cluster_size=128k):
 # lazy refcounts for faster writes (metadata stays crash-consistent through fsync), extended L2
@@ -69,27 +100,69 @@ def _overlay_failed(message: str, *, context: dict[str, Any] | None) -> Transien
     return TransientError(message, code=ErrorCode.OVERLAY_FAILED, context=context, hint=None, instance_id=None)
 
 
-@dataclass(frozen=True, slots=True)
-class QmpJob:
-    """QMP job status from query-jobs response."""
+_QCOW2_MAGIC: Final = b"QFI\xfb"
+_QCOW2_HEADER_BYTES: Final = 32  # magic(4) version(4) backing offset(8) size(4) cluster bits(4) virtual size(8)
+_QCOW2_VERSIONS: Final = (2, 3)  # version 1 ("qcow") has the same magic; QEMU's qcow2 driver refuses it
+_SECTOR_BYTES: Final = 512
+_JOB_POLL_FIRST_SECONDS: Final = 0.001  # job poll: 1 ms, doubling up to 50 ms
+_JOB_POLL_MAX_SECONDS: Final = 0.05
 
-    job_id: str
-    status: str
-    error: str | None = None
 
+def _file_identity(image_path: Path) -> tuple[Path, int, int, int, int]:
+    """The path and the version of the file at it (device, inode, mtime, size).
 
-@dataclass(frozen=True, slots=True)
-class QmpEvent:
-    """Parsed QMP event (e.g. JOB_STATUS_CHANGE).
-
-    Only the fields relevant to job completion tracking are extracted.
-    Unknown/malformed events parse to empty strings, allowing safe
-    matching without KeyError.
+    Raises:
+        TransientError: OVERLAY_FAILED if the file cannot be read
     """
+    try:
+        st = image_path.stat()
+    except OSError as e:
+        raise _overlay_failed(f"Failed to read the header of {image_path}: {e.strerror or e}", context=None) from e
+    return image_path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size
 
-    event: str
-    job_id: str
-    status: str
+
+def _clone_overlay(src: Path, dst: Path) -> bool:
+    """Make `dst` a copy of the overlay `src` with its mode (clone_sparse gives 0600 where it
+    is no APFS clone; the daemon makes 0666 minus the umask). False when it cannot: a
+    partial `dst` is removed, one that was there is left (blocking)."""
+    try:
+        clone_sparse(src, dst)
+    except FileExistsError:
+        return False
+    except OSError:
+        with contextlib.suppress(OSError):
+            dst.unlink()
+        return False
+    try:
+        dst.chmod(stat.S_IMODE(src.stat().st_mode))
+    except OSError:
+        with contextlib.suppress(OSError):
+            dst.unlink()
+        return False
+    return True
+
+
+def _qcow2_virtual_size(image_path: Path) -> int:
+    """Virtual size of a qcow2 base image, read from its header (magic at 0, version at 4,
+    size as a big-endian u64 at 24): 32 bytes of a file, no qemu-img process. Rounded down
+    to whole 512-byte sectors, as QEMU's qcow2 driver reports it.
+
+    Raises:
+        TransientError: OVERLAY_FAILED if the file cannot be read or is not qcow2 v2/v3
+    """
+    try:
+        with image_path.open("rb") as f:
+            header = f.read(_QCOW2_HEADER_BYTES)
+    except OSError as e:
+        raise _overlay_failed(f"Failed to read the header of {image_path}: {e.strerror or e}", context=None) from e
+    if (
+        len(header) < _QCOW2_HEADER_BYTES
+        or header[:4] != _QCOW2_MAGIC
+        or int.from_bytes(header[4:8], "big") not in _QCOW2_VERSIONS
+    ):
+        raise _overlay_failed(f"Base image {image_path} is not qcow2 format (version 2 or 3)", context=None)
+    size = int.from_bytes(header[24:_QCOW2_HEADER_BYTES], "big")
+    return size - size % _SECTOR_BYTES
 
 
 class QemuStorageDaemon:
@@ -98,7 +171,7 @@ class QemuStorageDaemon:
     The daemon process handles qcow2 overlay creation via QMP blockdev-create
     commands, avoiding fork/exec overhead of spawning qemu-img processes.
 
-    Thread-safe: Uses asyncio lock for QMP command serialization.
+    Safe for concurrent coroutines of one event loop: an asyncio.Lock serializes QMP commands.
 
     Attributes:
         _socket_path: Full path to QMP socket
@@ -108,14 +181,17 @@ class QemuStorageDaemon:
 
     __slots__ = (
         "_cleanup_task",
-        "_event_buffer",
+        "_lifecycle_lock",
         "_lock",
         "_process",
         "_reader",
         "_request_seq",
         "_socket_path",
         "_started",
-        "_virtual_size_cache",
+        "_template_dir",
+        "_template_writes",
+        "_templates",
+        "_virtual_sizes",
         "_writer",
     )
 
@@ -128,9 +204,21 @@ class QemuStorageDaemon:
         self._started = False
         self._request_seq = 0
         self._lock = asyncio.Lock()  # Serialize QMP commands
-        self._virtual_size_cache: dict[str, int] = {}  # Cache base image sizes
-        self._event_buffer: list[QmpEvent] = []  # Events stashed by _execute(), consumed by _wait_for_job()
+        # start() and stop() one at a time: a stop() during a start() then stops what that
+        # start() made, instead of finding nothing to stop
+        self._lifecycle_lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task[None] | None = None
+        # Base image virtual sizes, read once per file version (a worker thread: images can be on a
+        # network disk); keyed by _file_identity, so an image rebuilt in place is read again
+        self._virtual_sizes: dict[tuple[Path, int, int, int, int], int] = {}
+        # The template of each base image version (keyed by _file_identity), made by start():
+        # None when the folder could not be made (each overlay through QMP). The future gives
+        # the template once its first overlay is made, or None (the next creation tries again).
+        self._template_dir: Path | None = None
+        self._templates: dict[tuple[Path, int, int, int, int], asyncio.Future[Path | None]] = {}
+        # Template clones still being written: stop() waits for them before it removes the
+        # folder, which they would fill again
+        self._template_writes: set[asyncio.Future[bool]] = set()
 
     @property
     def started(self) -> bool:
@@ -146,12 +234,17 @@ class QemuStorageDaemon:
             TransientError: OVERLAY_FAILED if daemon fails to start or connect
             ConfigError: HOST_DEPENDENCY if the qemu-storage-daemon binary is missing or cannot run
         """
+        async with self._lifecycle_lock:
+            await self._start()
+
+    async def _start(self) -> None:
+        """start() under the lifecycle lock."""
         if self._started:
             return
         if self._process is not None:
             # A prior failed/cancelled start still owns a daemon. Confirm its
             # death before assigning another socket/process handle.
-            await self.stop()
+            await self._stop()
 
         # Clean up orphaned daemons from previous crashes (non-critical)
         try:
@@ -161,12 +254,14 @@ class QemuStorageDaemon:
         except (OSError, psutil.Error):
             logger.debug("Orphan reaper failed (non-critical)", exc_info=True)
 
-        # Use /tmp for socket to avoid Unix socket path length limit (104-108 chars)
-        self._socket_path = Path(tempfile.gettempdir()) / f"qsd-{os.getpid()}-{secrets.token_hex(8)}.sock"
+        # The temp folder: a short path, under the Unix socket path limit (104-108 bytes)
+        self._socket_path = (
+            Path(tempfile.gettempdir()) / f"qsd-{_pid_namespace()}-{os.getpid()}-{secrets.token_hex(8)}.sock"
+        )
 
         # Start daemon process
         cmd = [
-            "qemu-storage-daemon",
+            _BINARY,
             "--chardev",
             f"socket,path={self._socket_path},server=on,wait=off,id=qmp0",
             "--monitor",
@@ -177,6 +272,9 @@ class QemuStorageDaemon:
         try:
             self._process = await start_managed_process(
                 cmd,
+                steps=(),
+                end_with_this_process=True,
+                pass_fds=(),
                 on_process_started=lambda proc: setattr(self, "_process", proc),
             )
             spawned = True
@@ -200,31 +298,66 @@ class QemuStorageDaemon:
             except asyncio.CancelledError:
                 # The globally-retained cleanup owner keeps retrying.
                 raise
-            if isinstance(e, asyncio.CancelledError):
+            if isinstance(e, asyncio.CancelledError | ConfigError):  # ConfigError: exec_failed_error
                 raise
             if isinstance(e, OSError) and not spawned:
                 raise spawn_error(
-                    e,
-                    binary=cmd[0],
-                    code=ErrorCode.OVERLAY_FAILED,
-                    context={},
-                    hint="Install QEMU (it ships qemu-storage-daemon).",
+                    e, binary=cmd[0], code=ErrorCode.OVERLAY_FAILED, context={}, hint=_INSTALL_HINT
                 ) from e
             raise _overlay_failed(f"Failed to start daemon: {e}", context=None) from e
+
+        # The templates' folder, pid-scoped as the socket (the reaper removes it after a
+        # crash). Without it, each overlay goes through QMP.
+        # Named and recorded before the mkdir: a cancel during it leaves no folder that stop()
+        # does not know
+        template_dir = (
+            Path(tempfile.gettempdir()) / f"qsd-{_pid_namespace()}-{os.getpid()}-{secrets.token_hex(8)}.templates"
+        )
+        self._template_dir = template_dir
+        # A cancel waits for the mkdir thread: else the folder could come after the removal
+        # of a stop() that runs at once
+        made = asyncio.create_task(asyncio.to_thread(template_dir.mkdir, mode=0o700))
+        try:
+            await asyncio.shield(made)
+        except asyncio.CancelledError:
+            await await_settled(made)
+            if not made.cancelled():
+                made.exception()  # retrieved: the cancel wins
+            raise
+        except OSError:
+            self._template_dir = None
+            logger.debug("No overlay template folder: each overlay is made through QMP", exc_info=True)
+            return
 
     async def stop(self) -> None:
         """Stop daemon gracefully.
 
-        Idempotent: Clears event buffer and returns if not started.
-        Cancellation-safe: _started is set False before any await.
+        Idempotent: returns at once if not started. A start() that runs: stop() waits for it,
+        then stops what it made.
+        Cancellation-safe: the stop runs in a retained task, which a cancel of this call does
+        not stop, also while it waits for a start().
         """
+        stopping = asyncio.create_task(self._stop_locked())
+        _cleanup_tasks.add(stopping)
+        stopping.add_done_callback(_cleanup_tasks.discard)
+        # Retrieved here: a cancelled caller no longer waits for it (no unretrieved error)
+        stopping.add_done_callback(lambda task: task.cancelled() or task.exception())
+        await asyncio.shield(stopping)
+
+    async def _stop_locked(self) -> None:
+        """Take the lifecycle lock, then _stop."""
+        async with self._lifecycle_lock:
+            await self._stop()
+
+    async def _stop(self) -> None:
+        """stop() itself; the caller holds the lifecycle lock."""
         if not self._started and self._process is None:
-            self._event_buffer.clear()
             return
 
         # Set early so idempotency guard works even if we're cancelled mid-cleanup
         was_started = self._started
         self._started = False
+        templates_removed = self._remove_templates()
 
         try:
             # Send quit command (ignore errors - daemon may already be dead)
@@ -236,13 +369,91 @@ class QemuStorageDaemon:
             # waiter is cancelled, the global task continues retrying.
             cleanup_task = self._ensure_cleanup_task()
             await self._cleanup_connection()
-            self._event_buffer.clear()
             await asyncio.shield(cleanup_task)
+
+        if templates_removed is not None:
+            await asyncio.shield(templates_removed)
 
         logger.info("QEMU storage daemon stopped")
 
+    def _remove_templates(self) -> asyncio.Task[None] | None:
+        """Forget the templates and remove their folder in a retained task, once the clones in
+        flight end: a clone during the removal would leave a file, so the folder would stay
+        (create_overlay starts no clone once the folder is forgotten). It cancels no clone
+        that a create_overlay awaits (asyncio.wait does not cancel what it waits for)."""
+        template_dir, self._template_dir = self._template_dir, None
+        self._templates.clear()
+        if template_dir is None:
+            return None
+        writes = set(self._template_writes)
+
+        async def remove() -> None:
+            if writes:  # each about 0.3 ms
+                await asyncio.wait(writes)
+            try:
+                await asyncio.to_thread(shutil.rmtree, template_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as e:  # a few small files; the folder of a dead owner goes at a later start
+                logger.warning(
+                    "Failed to remove the overlay template folder", extra={"folder": str(template_dir), "error": str(e)}
+                )
+
+        task = asyncio.create_task(remove())
+        _cleanup_tasks.add(task)
+        task.add_done_callback(_cleanup_tasks.discard)
+        return task
+
     async def create_overlay(self, base_image: Path, overlay_path: Path) -> None:
-        """Create qcow2 overlay with backing file via QMP.
+        """Create qcow2 overlay with backing file: the first one of each base image version
+        via QMP (_create_with_qmp), kept as its template; each later one is a clone of that
+        template (the same bytes), via QMP when the clone fails.
+
+        Raises:
+            TransientError: OVERLAY_FAILED if daemon not started or creation fails
+        """
+        if not self._started:
+            raise _overlay_failed("Daemon not started", context=None)
+        # The backing path is stored in the overlay as given and read relative to the
+        # overlay's folder: an absolute path keeps it valid after the pool moves the file
+        base_image = base_image.absolute()
+        identity = await asyncio.to_thread(_file_identity, base_image)
+        template_dir = self._template_dir
+        if template_dir is None:
+            await self._create_with_qmp(base_image, overlay_path, identity)
+            return
+
+        made = self._templates.get(identity)
+        if made is not None:
+            template = await asyncio.shield(made)  # its first overlay may still be in the making
+            if template is None or not await asyncio.to_thread(_clone_overlay, template, overlay_path):
+                await self._create_with_qmp(base_image, overlay_path, identity)
+            return
+
+        made = asyncio.get_running_loop().create_future()
+        self._templates[identity] = made
+        template = None
+        try:
+            await self._create_with_qmp(base_image, overlay_path, identity)
+            # stop() began meanwhile: its removal of the folder must not race a clone
+            if self._template_dir is not template_dir:
+                return
+            candidate = template_dir / f"{secrets.token_hex(8)}.qcow2"
+            write = asyncio.ensure_future(asyncio.to_thread(_clone_overlay, overlay_path, candidate))
+            self._template_writes.add(write)
+            write.add_done_callback(self._template_writes.discard)
+            if await asyncio.shield(write):
+                template = candidate
+        finally:  # also on a failure or a cancel: the waiters then use QMP
+            made.set_result(template)
+            if template is None and self._templates.get(identity) is made:
+                del self._templates[identity]
+
+    async def _create_with_qmp(
+        self, base_image: Path, overlay_path: Path, identity: tuple[Path, int, int, int, int]
+    ) -> None:
+        """Create qcow2 overlay with backing file via QMP (`base_image` absolute, `identity`
+        its _file_identity).
 
         Uses 3-step approach required by qemu-storage-daemon:
         1. blockdev-create with file driver (creates empty file)
@@ -258,18 +469,17 @@ class QemuStorageDaemon:
             overlay_path: Path for new overlay file (will be created)
 
         Raises:
-            TransientError: OVERLAY_FAILED if daemon not started or creation fails
+            TransientError: OVERLAY_FAILED if creation fails
         """
-        if not self._started:
-            raise _overlay_failed("Daemon not started", context=None)
-
         uid = secrets.token_hex(8)
         file_job_id = f"file-{uid}"
         node_name = f"node-{uid}"
         qcow2_job_id = f"qcow2-{uid}"
 
-        # Get base image virtual size for overlay
-        virtual_size = await self._get_image_virtual_size(base_image)
+        virtual_size = self._virtual_sizes.get(identity)
+        if virtual_size is None:
+            virtual_size = await asyncio.to_thread(_qcow2_virtual_size, base_image)
+            self._virtual_sizes[identity] = virtual_size
 
         try:
             # Step 1: Create empty file
@@ -333,8 +543,11 @@ class QemuStorageDaemon:
             raise _overlay_failed("No socket path configured", context=None)
 
         def _check_process_alive() -> None:
-            if self._process and self._process.returncode is not None:
-                raise _overlay_failed(f"Daemon process exited with code {self._process.returncode}", context=None)
+            if self._process and (returncode := self._process.returncode) is not None:
+                # 126 or 127: an exec of its launch failed (ConfigError); else it ended
+                raise exec_failed_error(
+                    returncode, binary=_BINARY, detail=None, context={}, hint=_INSTALL_HINT
+                ) or _overlay_failed(f"Daemon process exited with code {returncode}", context=None)
 
         startup_timeout = constants.QEMU_STORAGE_DAEMON_STARTUP_TIMEOUT_SECONDS
         socket_timeout = constants.QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS
@@ -358,13 +571,8 @@ class QemuStorageDaemon:
         # Send capabilities
         await self._execute("qmp_capabilities")
 
-    async def _execute(
-        self,
-        command: str,
-        arguments: dict[str, Any] | None = None,
-        timeout: float = constants.QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS,
-    ) -> dict[str, Any]:
-        """Execute QMP command and return result.
+    async def _execute(self, command: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute QMP command and return result, within QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS.
 
         Handles QMP's async event model - reads lines until we get the actual
         command response (containing "return" or "error"), skipping events.
@@ -372,7 +580,6 @@ class QemuStorageDaemon:
         Args:
             command: QMP command name
             arguments: Optional command arguments
-            timeout: Command timeout in seconds
 
         Returns:
             QMP response dict (the 'return' field contents)
@@ -388,7 +595,7 @@ class QemuStorageDaemon:
 
         async def exchange() -> dict[str, Any]:
             async with self._lock:
-                return await self._exchange(request_id, command, arguments, timeout)
+                return await self._exchange(request_id, command, arguments)
 
         # Once a command is written, consume its identified response before
         # propagating caller cancellation. This preserves stream alignment.
@@ -401,14 +608,15 @@ class QemuStorageDaemon:
                 exchange_task.exception()
             raise
 
-    async def _exchange(
-        self,
-        request_id: str,
-        command: str,
-        arguments: dict[str, Any] | None,
-        timeout: float,
-    ) -> dict[str, Any]:
-        """Write one identified QMP command and consume its matching response."""
+    async def _exchange(self, request_id: str, command: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        """Write one identified QMP command and consume its matching response.
+
+        Raises:
+            TransientError: OVERLAY_FAILED: a QMP error, no answer by the timeout, a daemon
+                that died (end of the stream, a broken socket) or sent a line that is not a
+                JSON object or is over the reader's limit (never a raw TimeoutError,
+                OSError, ValueError, AttributeError or TypeError)
+        """
         if self._writer is None or self._reader is None:
             raise _overlay_failed("Not connected to QMP", context=None)
 
@@ -416,20 +624,19 @@ class QemuStorageDaemon:
         if arguments:
             msg["arguments"] = arguments
 
-        self._writer.write(json.dumps(msg).encode() + b"\n")
-        await self._writer.drain()
+        try:
+            self._writer.write(json.dumps(msg).encode() + b"\n")
+            await self._writer.drain()
+        except OSError as e:
+            raise _overlay_failed(f"QMP {command}: the daemon's socket failed: {e}", context=None) from e
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + constants.QEMU_STORAGE_DAEMON_SOCKET_TIMEOUT_SECONDS
         while loop.time() < deadline:
             remaining = deadline - loop.time()
-            response = await asyncio.wait_for(self._reader.readline(), timeout=max(0.1, remaining))
-            result = json.loads(response)
+            result = await self._read_message(self._reader, command, timeout=max(0.1, remaining))
 
-            if "event" in result:
-                parsed = self._parse_event(result)
-                if parsed.status == "concluded":
-                    self._event_buffer.append(parsed)
+            if "event" in result:  # events (JOB_STATUS_CHANGE, ...): _wait_for_job polls query-jobs
                 continue
 
             if result.get("id") != request_id:
@@ -440,9 +647,10 @@ class QemuStorageDaemon:
                 continue
 
             if "error" in result:
+                error = cast("dict[str, Any]", result["error"]) if isinstance(result["error"], dict) else {}
                 raise _overlay_failed(
-                    result["error"].get("desc", "Unknown QMP error"),
-                    context={"error_class": result["error"].get("class")},
+                    error.get("desc", "Unknown QMP error"),
+                    context={"error_class": error.get("class")},
                 )
 
             if "return" in result:
@@ -450,117 +658,37 @@ class QemuStorageDaemon:
 
         raise _overlay_failed(f"Timeout waiting for response to {command}", context=None)
 
-    async def _get_image_virtual_size(self, image_path: Path) -> int:
-        """Get image virtual size using qemu-img info (cached).
-
-        Note: qemu-storage-daemon doesn't have query-image-info command,
-        so we use qemu-img for this metadata query. Results are cached
-        per image path since base image sizes don't change.
-
-        Args:
-            image_path: Path to qcow2 image
-
-        Returns:
-            Virtual size in bytes
+    @staticmethod
+    async def _read_message(reader: asyncio.StreamReader, command: str, *, timeout: float) -> dict[str, Any]:
+        """The next QMP message of `command`'s exchange.
 
         Raises:
-            TransientError: OVERLAY_FAILED if image doesn't exist, is invalid, or query fails
+            TransientError: OVERLAY_FAILED: none by `timeout`, a socket that failed or ended
+                (the daemon exited), a line over the reader's limit, or a line that is not a
+                JSON object
         """
-        cache_key = str(image_path)
-        if cache_key in self._virtual_size_cache:
-            return self._virtual_size_cache[cache_key]
-
-        returncode, stdout, stderr = await communicate_managed_process(
-            ["qemu-img", "info", "--output=json", str(image_path)],
-            process_name="qemu-img-info",
-            context_id=cache_key,
-        )
-
-        if returncode != 0:
-            error_msg = stderr.decode().strip() if stderr else "Unknown error"
-            raise _overlay_failed(f"Failed to get image info for {image_path}: {error_msg}", context=None)
-
         try:
-            info = json.loads(stdout)
-        except json.JSONDecodeError as e:
-            raise _overlay_failed(f"Invalid JSON from qemu-img info for {image_path}: {e}", context=None) from e
-
-        # Verify it's a qcow2 image (not raw or other format)
-        fmt = info.get("format")
-        if fmt != "qcow2":
-            raise _overlay_failed(f"Base image {image_path} is not qcow2 format (got: {fmt})", context=None)
-
-        size = info.get("virtual-size")
-        if size is None:
-            raise _overlay_failed(f"No virtual-size in qemu-img info for {image_path}", context=None)
-
-        self._virtual_size_cache[cache_key] = size
-        return size
-
-    @staticmethod
-    def _parse_job(data: dict[str, Any]) -> QmpJob:
-        """Parse raw QMP job dict into QmpJob dataclass."""
-        return QmpJob(
-            job_id=data.get("id", ""),
-            status=data.get("status", ""),
-            error=data.get("error"),
-        )
-
-    @staticmethod
-    def _parse_event(raw: dict[str, Any]) -> QmpEvent:
-        """Parse raw QMP event dict into QmpEvent dataclass.
-
-        Handles malformed events gracefully — missing keys or non-dict data
-        default to empty strings, so matching always works without errors.
-        """
-        data_raw = raw.get("data")
-        data = cast("dict[str, Any]", data_raw) if isinstance(data_raw, dict) else {}
-        return QmpEvent(
-            event=raw.get("event", ""),
-            job_id=data.get("id", ""),
-            status=data.get("status", ""),
-        )
-
-    def _consume_event(self, job_id: str, status: str) -> QmpEvent | None:
-        """Consume and remove first matching event from buffer.
-
-        Scans the event buffer for a QMP event matching the given job ID and
-        status. If found, removes it from the buffer and returns it.
-
-        Args:
-            job_id: Job ID to match in event data
-            status: Status to match (e.g. "concluded")
-
-        Returns:
-            Matching QmpEvent, or None if no match found.
-        """
-        for i, event in enumerate(self._event_buffer):
-            if event.job_id == job_id and event.status == status:
-                self._event_buffer.pop(i)
-                return event
-        return None
-
-    def _purge_job_events(self, job_id: str) -> None:
-        """Remove all buffered events for the given job ID.
-
-        Called after a job completes (by any path) to prevent stale events
-        from accumulating. In concurrent scenarios, concluded events for one
-        job can be buffered by _execute() calls from other coroutines after
-        _wait_for_job already observed completion via query-jobs.
-        """
-        self._event_buffer = [e for e in self._event_buffer if e.job_id != job_id]
+            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        except TimeoutError as e:
+            raise _overlay_failed(f"Timeout waiting for response to {command}", context=None) from e
+        except OSError as e:
+            raise _overlay_failed(f"QMP {command}: the daemon's socket failed: {e}", context=None) from e
+        except ValueError as e:  # StreamReader.readline: a line over the limit
+            raise _overlay_failed(f"QMP {command}: a line over the reader's limit: {e}", context=None) from e
+        if not line:
+            raise _overlay_failed(f"QMP {command}: the daemon closed its socket (it exited)", context=None)
+        try:
+            message = json.loads(line)
+        except (ValueError, RecursionError) as e:  # RecursionError: a line nested too deep
+            raise _overlay_failed(f"QMP {command}: a line that is not JSON: {line[:200]!r}", context=None) from e
+        if not isinstance(message, dict):
+            raise _overlay_failed(f"QMP {command}: a line that is not a JSON object: {line[:200]!r}", context=None)
+        return cast("dict[str, Any]", message)
 
     async def _wait_for_job(self, job_id: str) -> None:
-        """Wait for async job to complete using event-driven approach.
-
-        Primary path: Checks _event_buffer for a JOB_STATUS_CHANGE(concluded)
-        event that was stashed by _execute() while reading QMP responses.
-
-        Fallback path: If no event found (e.g. job concluded and auto-dismissed
-        before any event was captured), queries jobs directly.
-
-        On completion (success or failure), purges all remaining events for
-        this job_id from the buffer to prevent stale event accumulation.
+        """Wait for an async job to end: poll query-jobs (its status and error), with a pause
+        that doubles from _JOB_POLL_FIRST_SECONDS to _JOB_POLL_MAX_SECONDS. A concluded job is
+        dismissed; a job no longer listed concluded and was auto-dismissed.
 
         Args:
             job_id: Job ID to wait for (at most QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS)
@@ -569,119 +697,101 @@ class QemuStorageDaemon:
             TransientError: OVERLAY_FAILED if job times out or fails
         """
         timeout = constants.QEMU_STORAGE_DAEMON_JOB_TIMEOUT_SECONDS
-        try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            while loop.time() < deadline:
-                # Primary path: check event buffer for concluded event
-                concluded_event = self._consume_event(job_id, "concluded")
-                if concluded_event:
-                    # Event found — query jobs once to get error details and dismiss.
-                    # Events don't carry error messages, only status changes.
-                    result = await self._execute("query-jobs")
-                    raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        delay = _JOB_POLL_FIRST_SECONDS
+        while loop.time() < deadline:
+            # query-jobs tells the job's end and its error (a JOB_STATUS_CHANGE event carries
+            # no error): a job it lists as running is polled again, never taken as done
+            result = await self._execute("query-jobs")
+            raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
+            job = next((raw for raw in raw_jobs if raw.get("id") == job_id), None)
 
-                    for raw in raw_jobs:
-                        if raw.get("id") == job_id:
-                            job = self._parse_job(raw)
-                            if job.status == "concluded":
-                                if job.error:
-                                    with contextlib.suppress(TransientError):
-                                        await self._execute("job-dismiss", {"id": job_id})
-                                    raise _overlay_failed(f"Job {job_id} failed: {job.error}", context=None)
-                                # Dismiss completed job
-                                await self._execute("job-dismiss", {"id": job_id})
-                                return
-                            # Event said concluded but query-jobs disagrees; fall through
-                            break
+            if job is None:
+                return  # concluded and auto-dismissed
 
-                    # Job already auto-dismissed (not in query-jobs list)
-                    return
+            if job.get("status") == "concluded":
+                if error := job.get("error"):
+                    with contextlib.suppress(TransientError):
+                        await self._execute("job-dismiss", {"id": job_id})
+                    raise _overlay_failed(f"Job {job_id} failed: {error}", context=None)
+                await self._execute("job-dismiss", {"id": job_id})
+                return
 
-                # Fallback: query jobs directly (handles auto-dismiss race)
-                result = await self._execute("query-jobs")
-                raw_jobs = cast("list[dict[str, Any]]", result) if isinstance(result, list) else []
+            # This poll is the wait: a job takes a few ms, a fixed 50 ms sleep cost ~50 ms
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _JOB_POLL_MAX_SECONDS)
 
-                job: QmpJob | None = None
-                for raw in raw_jobs:
-                    if raw.get("id") == job_id:
-                        job = self._parse_job(raw)
-                        break
-
-                if not job:
-                    # Job completed and was auto-removed
-                    return
-
-                if job.status == "concluded":
-                    if job.error:
-                        with contextlib.suppress(TransientError):
-                            await self._execute("job-dismiss", {"id": job_id})
-                        raise _overlay_failed(f"Job {job_id} failed: {job.error}", context=None)
-                    await self._execute("job-dismiss", {"id": job_id})
-                    return
-
-                # Safety net: polling at 50ms (5x slower than before — events are primary)
-                await asyncio.sleep(0.05)
-
-            raise _overlay_failed(f"Job {job_id} timed out after {timeout}s", context=None)
-        finally:
-            # Purge any stale events for this job (e.g. concluded events that
-            # arrived after we already observed completion via query-jobs)
-            self._purge_job_events(job_id)
+        raise _overlay_failed(f"Job {job_id} timed out after {timeout}s", context=None)
 
     @staticmethod
     def _reap_stale_daemons() -> int:
         """Remove stale QSD sockets from dead parent processes and kill orphaned daemons.
 
-        Socket filenames encode the parent PID: qsd-{pid}-{random}.sock.
-        When the parent dies (crash, OOM, kill -9), the daemon becomes an orphan.
-        This method finds such orphans and cleans them up.
+        Socket filenames encode the parent's pid namespace and pid:
+        qsd-{namespace}-{pid}-{random}.sock. When the parent dies (crash, OOM, kill -9), the
+        daemon becomes an orphan. This method finds such orphans and cleans them up.
+
+        Only sockets of this pid namespace count: a pid means something only in its own
+        namespace, and the temp folder can be shared with other ones (a container's /tmp), so
+        another namespace's live daemon is never taken for an orphan. A pid out of the C int
+        range (no kernel gives one; psutil raises OverflowError) is no owner of ours.
+
+        One scan of the processes, only when a stale socket exists: a process is the orphan of a
+        socket when one of its arguments is the daemon's own `--chardev socket,path=<socket>,...`
+        value. No name or executable filter: a daemon whose binary was replaced (an upgrade) or
+        that runs through a wrapper still matches, and a process that only names the path does
+        not. A process that ends or cannot be read during the scan is skipped: psutil
+        raises psutil.Error, or on macOS SystemError for a process that exits while its
+        arguments are read.
+
+        The template folders of dead owners (qsd-{namespace}-{pid}-{random}.templates, folders
+        of this user only: the temp folder is shared) are removed too.
 
         Returns:
             Number of stale sockets cleaned up.
         """
-        tmpdir = Path(tempfile.gettempdir())
-        pattern = re.compile(r"^qsd-(\d+)-[0-9a-f]+\.sock$")
-        cleaned = 0
+        namespace = _pid_namespace()
+        pattern = re.compile(rf"^qsd-{namespace}-(\d+)-[0-9a-f]+\.sock$")
+        template_pattern = re.compile(rf"^qsd-{namespace}-(\d+)-[a-z0-9_]+\.templates$")
 
-        for sock_path in tmpdir.glob("qsd-*.sock"):
-            match = pattern.match(sock_path.name)
-            if not match:
+        def is_stale(name: str, name_pattern: re.Pattern[str]) -> bool:
+            match = name_pattern.match(name)
+            if match is None:
+                return False
+            pid = int(match.group(1))
+            return pid <= _PID_MAX and not psutil.pid_exists(pid)
+
+        for folder in Path(tempfile.gettempdir()).glob("qsd-*.templates"):
+            if not is_stale(folder.name, template_pattern):
                 continue
-
-            parent_pid = int(match.group(1))
-
-            # Check if parent PID is alive
-            try:
-                os.kill(parent_pid, 0)
-                # Parent alive, skip
-                continue
-            except PermissionError:
-                # Parent alive but not ours, skip
-                continue
-            except ProcessLookupError:
-                pass  # Parent dead, proceed to cleanup
-
-            # Find and kill the QSD process whose cmdline contains this socket path
-            sock_str = str(sock_path)
-            for proc in psutil.process_iter(["pid", "name", "cmdline"]):  # type: ignore[reportUnknownMemberType]
-                try:
-                    cmdline: list[str] = proc.info.get("cmdline") or []  # type: ignore[union-attr]
-                    if sock_str in " ".join(cmdline):
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        logger.debug(
-                            "Killed orphaned QSD process",
-                            extra={"pid": proc.pid, "socket": sock_str},
-                        )
-                except (ProcessLookupError, PermissionError, psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-
-            # Remove stale socket (regardless of whether QSD process was found)
             with contextlib.suppress(OSError):
-                sock_path.unlink()
-                cleaned += 1
-                logger.debug("Removed stale QSD socket", extra={"socket": sock_str})
+                st = folder.lstat()
+                if stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid():
+                    shutil.rmtree(folder)
+                    logger.debug("Removed stale QSD template folder", extra={"folder": str(folder)})
 
+        stale = [path for path in Path(tempfile.gettempdir()).glob("qsd-*.sock") if is_stale(path.name, pattern)]
+        if not stale:
+            return 0
+
+        chardevs = tuple(f"socket,path={path}," for path in stale)  # as start() builds it
+        for proc in psutil.process_iter():
+            try:
+                arguments = proc.cmdline()
+            except (psutil.Error, SystemError):
+                continue
+            if any(argument.startswith(chardevs) for argument in arguments):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    logger.debug("Killed orphaned QSD process", extra={"pid": proc.pid})
+
+        cleaned = 0
+        for path in stale:
+            with contextlib.suppress(OSError):
+                path.unlink()
+                cleaned += 1
+                logger.debug("Removed stale QSD socket", extra={"socket": str(path)})
         return cleaned
 
     async def _cleanup_connection(self) -> None:
@@ -705,6 +815,7 @@ class QemuStorageDaemon:
             str(self._socket_path or "qsd-startup"),
             term_timeout=2.0,
             kill_timeout=2.0,
+            kill_first=False,
         )
         if destroyed:
             unregister_process(process)
@@ -738,14 +849,3 @@ class QemuStorageDaemon:
         if self._socket_path is not None:
             with contextlib.suppress(OSError):
                 self._socket_path.unlink()
-
-    async def __aenter__(self) -> Self:
-        """Enter async context manager, starting the daemon."""
-        await self.start()
-        return self
-
-    async def __aexit__(
-        self, _exc_type: type[BaseException] | None, _exc_val: BaseException | None, _exc_tb: object
-    ) -> None:
-        """Exit async context manager, stopping the daemon."""
-        await self.stop()
