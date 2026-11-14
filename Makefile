@@ -118,6 +118,7 @@ test-static:
 	uv run -m vulture src/ scripts/ --min-confidence 80
 	shellcheck scripts/*.sh cicd/*.sh
 	$(MAKE) test-kernel-hash-sync
+	$(MAKE) test-package
 	$(MAKE) --directory guest-agent test-static
 	$(MAKE) --directory tiny-init test-static
 	$(MAKE) --directory gvproxy-wrapper test-static
@@ -131,6 +132,13 @@ test-kernel-hash-sync:
 		sed -n '/^compute_kernel_hash() {/,/^}/p' scripts/extract-kernel.sh | tail -n +2 > "$$b" && \
 		{ diff "$$a" "$$b" || { echo "ERROR: compute_hash (build-kernel.sh) and compute_kernel_hash (extract-kernel.sh) diverged"; rm -f "$$a" "$$b"; exit 1; }; } && \
 		rm -f "$$a" "$$b"
+
+# Build the sdist and wheel into a temporary folder, then run the twine check of
+# release.yml (Verify build artifacts): a build-backend or metadata-version change
+# fails here, before the merge, not at release time.
+test-package:
+	@out=$$(mktemp -d) && \
+		{ uv build --out-dir "$$out" && uv run twine check "$$out"/*; rc=$$?; rm -rf "$$out"; exit $$rc; }
 
 # CI resource monitor — wraps a command with background metrics collection.
 # Runs in a single shell: start monitor, run command, kill monitor, propagate exit code.
