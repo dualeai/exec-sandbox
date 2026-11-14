@@ -2,6 +2,7 @@
 no VM test can set up. Requires Linux, no VM."""
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -10,6 +11,11 @@ from pathlib import Path
 from tests.conftest import skip_unless_linux
 
 _REPL = Path(__file__).parent.parent / "guest-agent" / "src" / "repl" / "scripts" / "python_repl.py"
+
+
+def _sentinels(stderr: str) -> list[str]:
+    """The sentinel lines of the REPL's stderr, in order: one per exec that ended."""
+    return re.findall(r"^__SENTINEL_\w+?_-?\d+__$", stderr, re.MULTILINE)
 
 
 def _run_repl(*codes: str) -> tuple[list[str], str]:
@@ -38,7 +44,7 @@ def test_multiprocessing_imported_before_the_repl_still_forks(tmp_path: Path) ->
     )
 
     assert run.stdout.decode().splitlines()[0] == "fork", run.stderr.decode()
-    assert "__SENTINEL_s1_0__" in run.stderr.decode()
+    assert _sentinels(run.stderr.decode()) == ["__SENTINEL_s1_0__"]
 
 
 @skip_unless_linux
@@ -68,6 +74,18 @@ def test_a_failed_prctl_stops_the_repl_before_any_exec(tmp_path: Path) -> None:
     assert "prctl(PR_SET_DUMPABLE, 0) failed" in run.stderr.decode()
     assert "ran" not in run.stdout.decode()
     assert "__SENTINEL_" not in run.stderr.decode()
+    assert "__REPL_READY__" not in run.stderr.decode()  # the agent reports a REPL that did not start
+
+
+@skip_unless_linux
+def test_the_ready_line_comes_before_any_exec() -> None:
+    """The REPL writes its ready line to stderr once set up, before it reads an exec: the agent
+    writes the first exec only after it (a REPL that fails before it did not start)."""
+    stdout, stderr = _run_repl("print('ran')")
+
+    assert stderr.startswith("__REPL_READY__\n"), stderr
+    assert stderr.count("__REPL_READY__") == 1
+    assert stdout[:1] == ["ran"]
 
 
 @skip_unless_linux
@@ -82,8 +100,7 @@ def test_user_names_do_not_break_the_loop() -> None:
     )
 
     assert "ok" in stdout, stderr
-    for i in range(4):
-        assert f"__SENTINEL_s{i}_0__" in stderr, stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_0__" for i in range(4)], stderr
 
 
 @skip_unless_linux
@@ -99,7 +116,7 @@ def test_replaced_original_streams_do_not_hide_the_end_of_an_exec() -> None:
     )
 
     assert "ok" in stdout, stderr
-    assert [f"__SENTINEL_s{i}_{code}__" in stderr for i, code in enumerate((0, 0, 1, 0))] == [True] * 4, stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_{code}__" for i, code in enumerate((0, 0, 1, 0))], stderr
     assert "ZeroDivisionError" in stderr
 
 
@@ -121,7 +138,7 @@ def test_a_finder_without_find_spec_does_not_break_multiprocessing() -> None:
     stdout, stderr = _run_repl(code)
 
     assert stdout[:1] == ["fork"], stderr
-    assert "__SENTINEL_s0_0__" in stderr
+    assert _sentinels(stderr) == ["__SENTINEL_s0_0__"], stderr
 
 
 @skip_unless_linux
@@ -137,7 +154,7 @@ def test_rebinding_sys_or_changing_builtins_does_not_break_the_repl() -> None:
     )
 
     assert stdout == ["__STDOUT_END_s0__", "fork", "__STDOUT_END_s1__", "__STDOUT_END_s2__", "ok", "__STDOUT_END_s3__"]
-    assert [f"__SENTINEL_s{i}_0__" in stderr for i in range(4)] == [True] * 4, stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_0__" for i in range(4)], stderr
 
 
 @skip_unless_linux
@@ -154,7 +171,7 @@ def test_closed_or_odd_streams_do_not_hide_the_end_of_an_exec() -> None:
     )
 
     assert "ZeroDivisionError" in stderr
-    assert [f"__SENTINEL_s{i}_{code}__" in stderr for i, code in enumerate((0, 1, 0, 0))] == [True] * 4, stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_{code}__" for i, code in enumerate((0, 1, 0, 0))], stderr
     assert [line for line in stdout if line.startswith("__STDOUT_END_")] == [f"__STDOUT_END_s{i}__" for i in range(4)]
 
 
@@ -181,7 +198,7 @@ def test_an_error_shows_whatever_user_code_did_to_stderr_or_traceback() -> None:
     assert "ok" in stdout, stderr
     assert "ZeroDivisionError" in stderr
     assert "IndexError" in stderr
-    assert [f"__SENTINEL_s{i}_{code}__" in stderr for i, code in enumerate((0, 1, 0, 1, 0))] == [True] * 5, stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_{code}__" for i, code in enumerate((0, 1, 0, 1, 0))], stderr
 
 
 @skip_unless_linux
@@ -228,7 +245,7 @@ def test_files_opened_after_closerange_never_get_protocol_text(tmp_path: Path) -
     )
 
     assert [p.read_text() for p in paths] == ["mine"] * 3
-    assert [f"__SENTINEL_s{i}_0__" in stderr for i in range(3)] == [True] * 3, stderr
+    assert _sentinels(stderr) == [f"__SENTINEL_s{i}_0__" for i in range(3)], stderr
     assert [line for line in stdout if "__STDOUT_END_" in line] == [f"__STDOUT_END_s{i}__" for i in range(3)]
 
 
@@ -265,4 +282,4 @@ def test_a_fork_keeps_a_user_fd_that_took_a_copy_number(tmp_path: Path) -> None:
     _stdout, stderr = _run_repl(code)
 
     assert target.read_text() == "from the child", stderr
-    assert "__SENTINEL_s0_0__" in stderr
+    assert _sentinels(stderr) == ["__SENTINEL_s0_0__"], stderr

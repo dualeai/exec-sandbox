@@ -3,7 +3,7 @@
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -314,11 +314,7 @@ fn beneath_error(path: &str, e: &std::io::Error, what: &str) -> CmdError {
 // ============================================================================
 
 /// Handle read_file command: read from disk, stream as zstd-compressed chunks.
-pub(crate) async fn handle_read_file(
-    op_id: &str,
-    path: &str,
-    writer: &ResponseWriter,
-) -> Result<(), CmdError> {
+pub(crate) async fn handle_read_file(path: &str, writer: &ResponseWriter) -> Result<(), CmdError> {
     let resolved_path = validate_file_path(path)
         .map_err(|e| CmdError::path(format!("Invalid path '{path}': {e}")))?;
 
@@ -346,8 +342,7 @@ pub(crate) async fn handle_read_file(
             "'{path}' is a directory, not a file"
         )));
     }
-    let file_type = metadata.file_type();
-    if !metadata.is_file() || file_type.is_fifo() || file_type.is_socket() {
+    if !metadata.is_file() {
         return Err(CmdError::path(format!("'{path}' is not a regular file")));
     }
     if metadata.len() as usize > MAX_FILE_SIZE_BYTES {
@@ -374,16 +369,12 @@ pub(crate) async fn handle_read_file(
         };
         let chunk_b64 = BASE64.encode(&buf[..n]);
         writer
-            .send(&GuestResponse::FileChunk {
-                op_id: op_id.to_string(),
-                data: chunk_b64,
-            })
+            .send(&GuestResponse::FileChunk { data: chunk_b64 })
             .await?;
     }
 
     writer
         .send(&GuestResponse::FileReadComplete {
-            op_id: op_id.to_string(),
             path: path.to_string(),
             size: file_size,
         })
@@ -431,12 +422,7 @@ pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Re
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    writer
-        .send(&GuestResponse::FileList {
-            path: path.to_string(),
-            entries,
-        })
-        .await
+    writer.send(&GuestResponse::FileList { entries }).await
 }
 
 /// Set up a pipelined file write operation.
@@ -444,7 +430,7 @@ pub(crate) async fn handle_list_files(path: &str, writer: &ResponseWriter) -> Re
 /// Creates the parent folders and a temporary file `.wr.<op_id>.tmp` next to
 /// the target, then starts the writer task (`run_write`). Returns the handle
 /// of that task, or an error.
-pub(crate) async fn handle_write_file(
+pub(crate) fn handle_write_file(
     op_id: &str,
     path: &str,
     make_executable: bool,
@@ -804,11 +790,21 @@ mod tests {
     // run_write: the commit point
     // -------------------------------------------------------------------------
 
+    /// How the agent ends a write of `write_through_pipeline`.
+    enum Ending {
+        /// The end marker (file_end).
+        EndMarker,
+        /// The end marker, after the agent abandoned the write at a stall.
+        Abandoned,
+        /// No end marker: the channel closes (the host closed its connection).
+        HostGone,
+    }
+
     /// Run a whole write of `data` into a fresh temp folder.
     fn write_through_pipeline(
         name: &str,
         data: &[u8],
-        abandoned: bool,
+        ending: Ending,
     ) -> (Result<usize, String>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("guest-agent-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -831,17 +827,21 @@ mod tests {
         let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(16);
         let compressed = zstd::stream::encode_all(data, FILE_TRANSFER_ZSTD_LEVEL).unwrap();
         chunk_tx.try_send(compressed).unwrap();
-        chunk_tx.try_send(vec![]).unwrap();
         let end = WriteEnd::new();
-        if abandoned {
-            assert!(end.try_abandon());
+        match ending {
+            Ending::EndMarker => chunk_tx.try_send(vec![]).unwrap(),
+            Ending::Abandoned => {
+                chunk_tx.try_send(vec![]).unwrap();
+                assert!(end.try_abandon());
+            }
+            Ending::HostGone => drop(chunk_tx),
         }
         (run_write(state, chunk_rx, &end), dir)
     }
 
     #[test]
     fn test_run_write_commits_a_finished_write() {
-        let (result, dir) = write_through_pipeline("commit", b"hello", false);
+        let (result, dir) = write_through_pipeline("commit", b"hello", Ending::EndMarker);
         assert_eq!(result.ok().unwrap(), 5);
         assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), b"hello");
         assert!(!dir.join(".wr.op.tmp").exists());
@@ -850,8 +850,11 @@ mod tests {
 
     #[test]
     fn test_run_write_never_commits_an_abandoned_write() {
-        let (result, dir) = write_through_pipeline("abandoned", b"hello", true);
-        assert!(result.err().unwrap().contains("abandoned"));
+        let (result, dir) = write_through_pipeline("abandoned", b"hello", Ending::Abandoned);
+        assert_eq!(
+            result.unwrap_err(),
+            "I/O error for 'file.bin': abandoned after a stall"
+        );
         assert!(
             !dir.join("file.bin").exists(),
             "an abandoned write must not land"
@@ -860,6 +863,20 @@ mod tests {
             !dir.join(".wr.op.tmp").exists(),
             "its temporary file is removed"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_run_write_drops_a_write_whose_host_is_gone() {
+        // The host closed its connection before file_end: the agent drops the
+        // write's channel. No file lands, and the temporary file is removed.
+        let (result, dir) = write_through_pipeline("host-gone", b"hello", Ending::HostGone);
+        assert_eq!(
+            result.unwrap_err(),
+            "I/O error for 'file.bin': channel closed without finalize"
+        );
+        assert!(!dir.join("file.bin").exists());
+        assert!(!dir.join(".wr.op.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

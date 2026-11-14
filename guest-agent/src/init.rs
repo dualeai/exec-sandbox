@@ -1,13 +1,25 @@
 //! Init-time setup: PID 1 environment, mounts, network, zombie reaping.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::constants::{
-    NETWORK_FAILED, NETWORK_NOTIFY, NETWORK_PENDING, NETWORK_READY, NETWORK_SETUP_TIMEOUT_SECONDS,
-    NETWORK_STATE, ZRAM_FAILED, ZRAM_READY, ZRAM_STATE,
-};
+use tokio::sync::SetOnce;
+
+use crate::constants::NETWORK_SETUP_TIMEOUT_SECONDS;
+
+/// Network readiness gate: the outcome of network setup, set once within
+/// NETWORK_SETUP_TIMEOUT_SECONDS of boot (Ok also for an intentionally offline
+/// VM). ExecuteCode, InstallPackages and WarmRepl wait on it; Ping and file I/O
+/// respond immediately.
+static NETWORK_STATE: SetOnce<Result<(), &'static str>> = SetOnce::const_new();
+
+/// Capped-zram safety gate: true once zram swap is active with its pressure
+/// guard and /dev is sealed. Untrusted process spawning is blocked until then.
+/// Production has no intentional no-swap mode: every setup failure makes the VM
+/// unavailable. main.rs awaits zram setup before the virtio listener starts, so
+/// the gate is final when a command reads it.
+static ZRAM_READY: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Zombie reaping
@@ -248,12 +260,7 @@ pub(crate) async fn setup_zram_and_seal_dev() {
     if !dev_read_only {
         log_warn!("[zram] failed to seal /dev read-only; marking VM unavailable");
     }
-    let state = if zram_active && dev_read_only {
-        ZRAM_READY
-    } else {
-        ZRAM_FAILED
-    };
-    ZRAM_STATE.store(state, Ordering::Release);
+    ZRAM_READY.store(zram_active && dev_read_only, Ordering::Release);
 }
 
 /// Background network setup: interface config + gvproxy verification.
@@ -268,26 +275,27 @@ pub(crate) async fn setup_network_background() {
     )
     .await
     {
-        Ok(Ok(Ok(()))) => NETWORK_READY,
+        Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(error))) => {
             log_warn!("network setup failed: {error}");
-            NETWORK_FAILED
+            Err("network setup failed")
         }
         Ok(Err(error)) => {
             log_warn!("network setup worker failed: {error}");
-            NETWORK_FAILED
+            Err("network setup failed")
         }
         Err(_) => {
             log_warn!(
                 "network setup exceeded {}s; marking VM unavailable",
                 NETWORK_SETUP_TIMEOUT_SECONDS
             );
-            NETWORK_FAILED
+            Err("network setup failed")
         }
     };
-    publish_network_state(state);
+    // The only setter: it runs once, at boot.
+    let _ = NETWORK_STATE.set(state);
     let t_done = crate::monotonic_ms();
-    if state == NETWORK_READY {
+    if state.is_ok() {
         log_info!(
             "[timing] network_ready: {}ms ({}ms elapsed)",
             t_done,
@@ -302,73 +310,26 @@ pub(crate) async fn setup_network_background() {
     }
 }
 
-fn publish_network_state(state: u8) {
-    NETWORK_STATE.store(state, Ordering::Release);
-    NETWORK_NOTIFY.notify_waiters();
-}
-
-fn current_network_state() -> Result<bool, &'static str> {
-    decode_network_state(NETWORK_STATE.load(Ordering::Acquire))
-}
-
-fn decode_network_state(state: u8) -> Result<bool, &'static str> {
-    match state {
-        NETWORK_READY => Ok(true),
-        NETWORK_FAILED => Err("network setup failed"),
-        NETWORK_PENDING => Ok(false),
-        _ => Err("network setup entered an invalid state"),
-    }
-}
-
-/// Wait until network setup reaches a terminal state. Intentionally offline VMs
-/// are ready after loopback setup; a failed/stuck worker is an infrastructure
-/// error so the host can destroy and replace the VM.
-pub(crate) async fn wait_for_network() -> Result<(), &'static str> {
-    if current_network_state()? {
-        return Ok(());
-    }
-
-    // Re-check after registering the notified future to avoid TOCTOU race
-    let notified = NETWORK_NOTIFY.notified();
-    if current_network_state()? {
-        return Ok(());
-    }
-
-    tokio::time::timeout(
-        Duration::from_secs(NETWORK_SETUP_TIMEOUT_SECONDS + 1),
-        notified,
-    )
-    .await
-    .map_err(|_| "network setup readiness timed out")?;
-
-    if current_network_state()? {
+/// Capped-zram setup ends before the virtio listener starts (main.rs awaits
+/// it), so commands check it synchronously and fail closed on anything but
+/// active swap. In particular, `swapon` cannot overlap untrusted process
+/// execution before monitor startup.
+fn require_memory_safety() -> Result<(), &'static str> {
+    if ZRAM_READY.load(Ordering::Acquire) {
         Ok(())
     } else {
-        Err("network setup notification arrived without a terminal state")
+        Err("zram safety setup failed")
     }
-}
-
-fn decode_zram_state(state: u8) -> Result<(), &'static str> {
-    match state {
-        ZRAM_READY => Ok(()),
-        ZRAM_FAILED => Err("zram safety setup failed"),
-        _ => Err("zram safety state is not terminal"),
-    }
-}
-
-/// Capped-zram setup publishes a terminal state before the virtio listener
-/// starts (main.rs awaits it), so commands check it synchronously and fail
-/// closed on anything but active swap. In particular, `swapon` cannot overlap
-/// untrusted process execution before monitor startup.
-pub(crate) fn require_memory_safety() -> Result<(), &'static str> {
-    decode_zram_state(ZRAM_STATE.load(Ordering::Acquire))
 }
 
 /// Process-spawning commands require both boot workers' outcomes. Zram is
-/// terminal before the listener starts; only network setup is still concurrent.
+/// final before the listener starts; only network setup is still concurrent
+/// (setup_network_background sets its outcome within its deadline).
+/// Intentionally offline VMs are ready after loopback setup; a failed or stuck
+/// worker is an infrastructure error so the host can destroy and replace the VM.
 pub(crate) async fn wait_for_untrusted_readiness() -> Result<(), &'static str> {
     require_memory_safety()?;
-    wait_for_network().await
+    *NETWORK_STATE.wait().await
 }
 
 /// Read-only bind remounts for CIS hardening.
@@ -755,16 +716,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
     use std::thread;
     use std::time::Duration;
 
-    // Syscall numbers for swapon(2)
-    #[cfg(target_arch = "x86_64")]
-    const SYS_SWAPON: libc::c_long = 167;
-    #[cfg(target_arch = "aarch64")]
-    const SYS_SWAPON: libc::c_long = 224;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_SWAPOFF: libc::c_long = 168;
-    #[cfg(target_arch = "aarch64")]
-    const SYS_SWAPOFF: libc::c_long = 225;
-    const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
+    const SWAP_FLAG_PREFER: libc::c_int = 0x8000; // <sys/swap.h>
 
     fn reset_zram() {
         let _ = std::fs::write("/sys/block/zram0/reset", "1");
@@ -835,7 +787,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
 
             // swapon with high priority. Returning 0 attests activation; no
             // /proc/swaps readback needed.
-            if unsafe { libc::syscall(SYS_SWAPON, dev.as_ptr(), SWAP_FLAG_PREFER | 100) } < 0 {
+            if unsafe { libc::swapon(dev.as_ptr(), SWAP_FLAG_PREFER | 100) } < 0 {
                 return Err(format!("swapon: {}", std::io::Error::last_os_error()));
             }
             Ok((oom_guard, geometry))
@@ -854,7 +806,7 @@ fn setup_zram_swap() -> ZramSetupOutcome {
     // capped geometry active without its pressure guard.
     if let Err(e) = oom_guard.spawn() {
         log_warn!("[zram] setup failed: could not start OOM guard: {e}");
-        let swapoff_rc = unsafe { libc::syscall(SYS_SWAPOFF, dev.as_ptr()) };
+        let swapoff_rc = unsafe { libc::swapoff(dev.as_ptr()) };
         let reset_result = std::fs::write("/sys/block/zram0/reset", "1");
         if swapoff_rc != 0 || reset_result.is_err() {
             log_warn!("[zram] cleanup after guard failure failed, powering off guest");
@@ -1158,7 +1110,6 @@ fn mount_readonly(path: &std::ffi::CStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::ZRAM_PENDING;
     use crate::error::{
         exit_code_from_status, graceful_terminate_process_group, wait_child_bounded,
     };
@@ -1393,21 +1344,6 @@ mod tests {
     }
 
     #[test]
-    fn network_state_decoder_distinguishes_all_terminal_states() {
-        assert_eq!(decode_network_state(NETWORK_PENDING), Ok(false));
-        assert_eq!(decode_network_state(NETWORK_READY), Ok(true));
-        assert_eq!(
-            decode_network_state(NETWORK_FAILED),
-            Err("network setup failed")
-        );
-    }
-
-    #[test]
-    fn network_state_decoder_rejects_unknown_values() {
-        assert!(decode_network_state(200).is_err());
-    }
-
-    #[test]
     fn zram_geometry_is_40_percent_disk_20_percent_mem() {
         // 1000 KiB => 1_024_000 bytes; independent literals, not the formula.
         assert_eq!(zram_geometry(1000), (409_600, 204_800));
@@ -1430,24 +1366,14 @@ mod tests {
 
     #[tokio::test]
     async fn untrusted_readiness_fails_closed_on_zram_before_network() {
-        // NETWORK_STATE stays PENDING: if the zram check did not run first,
-        // this call would block on the network waiter instead of erroring.
-        ZRAM_STATE.store(ZRAM_FAILED, Ordering::Release);
-        let result = wait_for_untrusted_readiness().await;
+        // ZRAM_READY and NETWORK_STATE stay unset in tests: if the zram check
+        // did not run first, this call would wait for the network instead.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_untrusted_readiness(),
+        )
+        .await
+        .expect("the zram check must not wait for the network");
         assert_eq!(result, Err("zram safety setup failed"));
-        ZRAM_STATE.store(ZRAM_PENDING, Ordering::Release);
-    }
-
-    #[test]
-    fn zram_state_decoder_fails_closed_on_anything_but_active() {
-        assert_eq!(decode_zram_state(ZRAM_READY), Ok(()));
-        assert_eq!(
-            decode_zram_state(ZRAM_FAILED),
-            Err("zram safety setup failed")
-        );
-        assert_eq!(
-            decode_zram_state(ZRAM_PENDING),
-            Err("zram safety state is not terminal")
-        );
     }
 }

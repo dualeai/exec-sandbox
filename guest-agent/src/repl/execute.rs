@@ -1,20 +1,30 @@
 //! Code execution via persistent REPL with streaming output.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{Duration, interval};
 
 use crate::constants::*;
 use crate::error::{
     CmdError, ResponseWriter, exit_code_from_status, graceful_terminate_process_group,
-    parse_language, wait_child_bounded,
+    wait_child_bounded,
 };
-use crate::repl::spawn::spawn_repl;
-use crate::types::GuestResponse;
+use crate::repl::spawn::{ReplState, spawn_repl};
+use crate::types::{GuestResponse, Language};
 use crate::validation::{prepend_env_vars, validate_code_params, validate_env_vars};
+
+/// The idle REPL of each language, between execs. Persists across host connections.
+static REPL_STATES: LazyLock<TokioMutex<HashMap<Language, ReplState>>> =
+    LazyLock::new(|| TokioMutex::new(HashMap::new()));
+
+/// Monotonic counter for sentinel IDs. Combined with a nanosecond timestamp,
+/// it makes each ID unique without the uuid crate.
+static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Read at most `limit` bytes of a /proc or /sys file for a diagnostic log line.
 fn read_bounded_diagnostic(path: &str, limit: u64) -> String {
@@ -352,11 +362,14 @@ async fn submit_code_to_repl(
 }
 
 /// The live REPL of `language`, taken out of REPL_STATES, or a new one when none
-/// runs or it died while idle (true: new). The caller puts it back when done. The
-/// lock is held across the spawn: two callers never start two REPLs.
-pub(crate) async fn take_or_spawn_repl(
-    language: crate::types::Language,
-) -> Result<(crate::repl::spawn::ReplState, bool), Box<dyn std::error::Error>> {
+/// runs or it died while idle (true: new). A new REPL is returned once it has written its
+/// ready line, within `ready_timeout`; one that exits or stalls before is killed, and the
+/// error says the REPL did not start (the caller's code never ran). The caller puts it
+/// back when done. The lock is held across the spawn: two callers never start two REPLs.
+async fn take_or_spawn_repl(
+    language: Language,
+    ready_timeout: Duration,
+) -> Result<(ReplState, bool), Box<dyn std::error::Error>> {
     let mut states = REPL_STATES.lock().await;
     let alive = match states.remove(&language) {
         Some(mut existing) => match existing.child.try_wait() {
@@ -375,29 +388,118 @@ pub(crate) async fn take_or_spawn_repl(
         },
         None => None,
     };
-    match alive {
-        Some(existing) => Ok((existing, false)),
-        None => Ok((spawn_repl(language).await?, true)),
+    if let Some(existing) = alive {
+        return Ok((existing, false));
+    }
+    let mut repl = spawn_repl(language)?;
+    let failure = match tokio::time::timeout(ready_timeout, read_ready_line(&mut repl.stderr)).await
+    {
+        Ok(Ok(before)) => {
+            if !before.is_empty() {
+                log_warn!(
+                    "REPL for {} wrote before its ready line: {}",
+                    language.as_str(),
+                    before.trim_end()
+                );
+            }
+            return Ok((repl, true));
+        }
+        Ok(Err(stderr)) => format!("REPL exited at start: {}", stderr.trim_end()),
+        Err(_) => format!("REPL did not start within {}ms", ready_timeout.as_millis()),
+    };
+    kill_repl(&mut repl).await;
+    Err(failure.into())
+}
+
+/// End a REPL that is not put back in REPL_STATES: SIGKILL, then a bounded wait.
+async fn kill_repl(repl: &mut ReplState) {
+    let _ = repl.child.start_kill();
+    let _ = wait_child_bounded(&mut repl.child, "SIGKILL", KILL_WAIT).await;
+}
+
+/// Warm up the REPL of `language`: the live one when one runs (an L1 restore, a
+/// warm-up before), else a new one; run a no-op in it, and keep it for the next
+/// exec. Err holds the message of the warm-up ack; a REPL that fails the no-op
+/// is killed.
+pub(crate) async fn warm_repl(language: Language) -> Result<(), String> {
+    let (mut repl, _) = take_or_spawn_repl(language, WARM_UP_TIMEOUT)
+        .await
+        .map_err(|e| {
+            log_warn!("Eager REPL spawn failed: {e}");
+            e.to_string()
+        })?;
+    // A new REPL has written its ready line. The no-op loads the modules that the
+    // REPL loads only on demand and starts its output paths (on a live REPL it also
+    // maps its pages again), so the first exec of a user is not the REPL's first one.
+    let warm_start = Instant::now();
+    match warm_exercise_repl(&mut repl, language).await {
+        Ok(()) => {
+            let warm_ms = warm_start.elapsed().as_millis();
+            REPL_STATES.lock().await.insert(language, repl);
+            log_info!("REPL pre-warmed for {} ({warm_ms}ms)", language.as_str());
+            Ok(())
+        }
+        Err(e) => {
+            log_warn!("REPL warm-up failed for {}: {e}", language.as_str());
+            kill_repl(&mut repl).await;
+            Err(format!("warm-up failed: {e}"))
+        }
     }
 }
 
-/// Exercise a REPL with a no-op. On a new REPL it blocks until the interpreter is
-/// fully loaded: `spawn_repl()` only proves fork+exec returned; the loader and
-/// interpreter may still be consuming executable/data pages. On a live REPL (an
-/// L1 restore, a warm-up before a reclaim) it maps its pages again and starts its
-/// output paths, so the first exec of a user is not the REPL's first.
+/// The line each REPL writes to its stderr right before it reads its first exec.
+const READY_LINE: &[u8] = b"__REPL_READY__\n";
+
+/// The time a warm-up gives a REPL to start, and then again to run its no-op (before
+/// the VM is advertised: generous, for TCG under load).
+const WARM_UP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Read a new REPL's stderr up to its ready line, one byte at a time: nothing after the
+/// line is taken from the pipe. Ok(what came before it: interpreter warnings), or Err(the
+/// stderr) when the pipe closed first (the REPL failed at start). Both keep whole lines
+/// until they pass MAX_STDERR_BYTES; Err adds the last line, ended or not. A line with no
+/// end is cut every MAX_STDERR_BYTES (the memory stays bounded), and its rest is never
+/// taken for the ready line.
+async fn read_ready_line<R: AsyncRead + Unpin>(stderr: &mut R) -> Result<String, String> {
+    let mut before: Vec<u8> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+    let mut cut = false; // `line` is the rest of a line that was cut
+    loop {
+        let byte = match stderr.read_u8().await {
+            Ok(byte) => byte,
+            Err(_) => {
+                before.extend_from_slice(&line);
+                return Err(String::from_utf8_lossy(&before).into_owned());
+            }
+        };
+        line.push(byte);
+        if byte != b'\n' && line.len() <= MAX_STDERR_BYTES {
+            continue;
+        }
+        if !cut && line == READY_LINE {
+            return Ok(String::from_utf8_lossy(&before).into_owned());
+        }
+        if before.len() < MAX_STDERR_BYTES {
+            before.extend_from_slice(&line);
+        }
+        cut = byte != b'\n';
+        line.clear();
+    }
+}
+
+/// Exercise a REPL with a no-op, so the first exec of a user is not the REPL's first.
+/// A new REPL has written its ready line (`take_or_spawn_repl`); the no-op loads the
+/// modules that the REPL loads only on demand and starts its output paths. On a live
+/// REPL (an L1 restore, a warm-up before a reclaim) it also maps its pages again.
 ///
 /// Pre-advertisement paths only (warm-pool pre-warm and background L1
 /// snapshot saves), hence the generous deadline: it runs before the VM is
 /// available to callers.
-pub(crate) async fn warm_exercise_repl(
-    repl: &mut crate::repl::spawn::ReplState,
-    language: crate::types::Language,
+async fn warm_exercise_repl(
+    repl: &mut ReplState,
+    language: Language,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::types::Language;
-
     const PHASE: &str = "warm_pool";
-    let timeout = Duration::from_secs(120);
 
     let (sentinel_id, sentinel_prefix) = generate_sentinel();
 
@@ -422,25 +524,27 @@ pub(crate) async fn warm_exercise_repl(
     log_info!(
         "[repl-readiness] phase={PHASE} language={} action=waiting timeout_ms={}",
         language.as_str(),
-        timeout.as_millis(),
+        WARM_UP_TIMEOUT.as_millis(),
     );
 
     // Wait for sentinel on stderr (this is where the interpreter startup time is spent)
     let mut stderr_line_buf = String::new();
     let mut stderr_discard = String::new();
     let mut buf = [0u8; 4096];
-    let result = tokio::time::timeout(timeout, async {
+    let result = tokio::time::timeout(WARM_UP_TIMEOUT, async {
         loop {
             let n = repl.stderr.read(&mut buf).await?;
             if n == 0 {
                 return Err("REPL stderr closed before sentinel".into());
             }
-            if let Some(_exit_code) = process_stderr_chunk(
+            if process_stderr_chunk(
                 &buf[..n],
                 &mut stderr_line_buf,
                 &sentinel_prefix,
                 &mut stderr_discard,
-            ) {
+            )
+            .is_some()
+            {
                 return Ok(());
             }
         }
@@ -477,7 +581,7 @@ pub(crate) async fn warm_exercise_repl(
             log_repl_timeout_diagnostics(repl.child.id(), false);
             Err(format!(
                 "REPL {PHASE} readiness timed out after {}ms",
-                timeout.as_millis()
+                WARM_UP_TIMEOUT.as_millis()
             )
             .into())
         }
@@ -486,24 +590,27 @@ pub(crate) async fn warm_exercise_repl(
 
 /// Execute code via persistent REPL with streaming output.
 pub(crate) async fn execute_code_streaming(
-    language_str: &str,
+    language: Language,
     code: &str,
     timeout: u64,
     env_vars: &HashMap<String, String>,
     writer: &ResponseWriter,
 ) -> Result<(), CmdError> {
-    let language = parse_language(language_str)?;
-
     validate_code_params(code, timeout)?;
     validate_env_vars(env_vars)?;
 
     let start = Instant::now();
+    let effective_timeout = effective_timeout_secs(timeout);
+    let timeout_duration = Duration::from_secs(effective_timeout);
+    // One time budget for a new REPL's start and the run, as when the code
+    // waited in the pipe while the REPL started: the host's deadline holds
+    let deadline = tokio::time::Instant::now() + timeout_duration;
 
     // Get or create persistent REPL for this language. A REPL that cannot
     // start (a retired VM included) is a reply, never a dropped connection:
     // the host sees no close of the port and would wait for its deadline.
     let spawn_start = Instant::now();
-    let (mut repl, was_fresh_spawn) = take_or_spawn_repl(language)
+    let (mut repl, was_fresh_spawn) = take_or_spawn_repl(language, timeout_duration)
         .await
         .map_err(|e| CmdError::execution(format!("Failed to start REPL: {e}")))?;
     let spawn_ms = spawn_start.elapsed().as_millis() as u64;
@@ -514,7 +621,10 @@ pub(crate) async fn execute_code_streaming(
         spawn_ms
     );
 
-    crate::oom_guard::ensure_vm_usable().map_err(|e| CmdError::execution(e.to_string()))?;
+    if let Err(e) = crate::oom_guard::ensure_vm_usable() {
+        kill_repl(&mut repl).await;
+        return Err(CmdError::execution(e.to_string()));
+    }
 
     // Generate unique sentinel
     let (sentinel_id, sentinel_prefix) = generate_sentinel();
@@ -527,8 +637,7 @@ pub(crate) async fn execute_code_streaming(
     let write_result = submit_code_to_repl(&mut repl.stdin, &sentinel_id, code_bytes).await;
     if let Err(e) = write_result {
         log_error!("REPL stdin write failed: {e}");
-        let _ = repl.child.start_kill();
-        let _ = wait_child_bounded(&mut repl.child, "SIGKILL", KILL_WAIT).await;
+        kill_repl(&mut repl).await;
         return Err(CmdError::execution(format!(
             "Failed to send code to REPL: {e}"
         )));
@@ -560,17 +669,15 @@ pub(crate) async fn execute_code_streaming(
     // Output size cap counters (guest-enforced limits).
     // These count bytes, not UTF-8 decoded string length: stdout counts the
     // output left after the end marker is removed, stderr the raw pipe bytes.
-    // When a read crosses the limit boundary, the entire chunk is discarded
-    // (the host may get up to about 8 KiB less than the limit).
+    // When a stdout read crosses the limit, its whole chunk is dropped (the host
+    // may get up to about 8 KiB less than the limit). The complete lines of the
+    // stderr read that crosses it are still sent (up to about 8 KiB more).
     let mut stdout_total: usize = 0;
     let mut stderr_total: usize = 0;
     let mut stdout_capped = false;
     let mut stderr_capped = false;
 
-    let effective_timeout = effective_timeout_secs(timeout);
-    let timeout_duration = Duration::from_secs(effective_timeout);
-
-    let loop_result = tokio::time::timeout(timeout_duration, async {
+    let loop_result = tokio::time::timeout_at(deadline, async {
         loop {
             tokio::select! {
                 _ = flush_timer.tick() => {
@@ -644,7 +751,8 @@ pub(crate) async fn execute_code_streaming(
                             }
                             // Asymmetry with stdout: stderr must be parsed for the sentinel
                             // BEFORE the cap check, so process_stderr_chunk runs unconditionally.
-                            // This writes into stderr_buffer even when over-limit; we clear it below.
+                            // It writes into stderr_buffer even past the limit: the read that
+                            // crosses it is flushed, the later ones are cleared below.
                             if let Some(code) = process_stderr_chunk(
                                 &stderr_bytes[..n],
                                 &mut stderr_line_buf,
@@ -701,8 +809,10 @@ pub(crate) async fn execute_code_streaming(
     if !stdout_capped {
         stdout_buffer.push_str(&String::from_utf8_lossy(&stdout_end.finish()));
     }
-    if !stderr_line_buf.is_empty() && !stderr_capped {
-        stderr_buffer.push_str(&stderr_line_buf);
+    // Taken, not copied: after a timeout, the drain below adds to the line
+    // buffer, and the partial line sent here must not go out a second time.
+    if !stderr_capped {
+        stderr_buffer.push_str(&std::mem::take(&mut stderr_line_buf));
     }
     if !stdout_capped {
         let _ = flush_output_buffer(writer, &mut stdout_buffer, "stdout").await;
@@ -713,6 +823,12 @@ pub(crate) async fn execute_code_streaming(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let process_ms = Some(process_start.elapsed().as_millis() as u64);
+    let complete = |exit_code| GuestResponse::Complete {
+        exit_code,
+        execution_time_ms: duration_ms,
+        spawn_ms: Some(spawn_ms),
+        process_ms,
+    };
 
     match loop_result {
         Ok(()) if sentinel_exit_code.is_some() => {
@@ -722,14 +838,8 @@ pub(crate) async fn execute_code_streaming(
             // delivery. Do not pool the REPL or report a non-terminal result
             // once that decision is visible (see reconcile_retirement_exit).
             if crate::oom_guard::reconcile_retirement_exit(exit_code) == 137 {
-                writer
-                    .send(&GuestResponse::Complete {
-                        exit_code: 137,
-                        execution_time_ms: duration_ms,
-                        spawn_ms: Some(spawn_ms),
-                        process_ms,
-                    })
-                    .await?;
+                kill_repl(&mut repl).await;
+                writer.send(&complete(137)).await?;
                 return Ok(());
             }
 
@@ -752,14 +862,7 @@ pub(crate) async fn execute_code_streaming(
                 return Err(CmdError::output_limit(parts.join(", ")));
             }
 
-            writer
-                .send(&GuestResponse::Complete {
-                    exit_code,
-                    execution_time_ms: duration_ms,
-                    spawn_ms: Some(spawn_ms),
-                    process_ms,
-                })
-                .await?;
+            writer.send(&complete(exit_code)).await?;
         }
         Ok(()) => {
             // Both pipes closed without a sentinel: the REPL has most likely
@@ -781,14 +884,7 @@ pub(crate) async fn execute_code_streaming(
                 exit_code
             );
 
-            writer
-                .send(&GuestResponse::Complete {
-                    exit_code,
-                    execution_time_ms: duration_ms,
-                    spawn_ms: Some(spawn_ms),
-                    process_ms,
-                })
-                .await?;
+            writer.send(&complete(exit_code)).await?;
         }
         Err(_) => {
             log_repl_timeout_diagnostics(repl.child.id(), first_io_logged);
@@ -826,26 +922,12 @@ pub(crate) async fn execute_code_streaming(
                 // No output-limit error here: the REPL got SIGTERM and is not
                 // pooled, so the sentinel code is the result.
                 let exit_code = crate::oom_guard::reconcile_retirement_exit(exit_code);
-                writer
-                    .send(&GuestResponse::Complete {
-                        exit_code,
-                        execution_time_ms: duration_ms,
-                        spawn_ms: Some(spawn_ms),
-                        process_ms,
-                    })
-                    .await?;
+                writer.send(&complete(exit_code)).await?;
                 return Ok(());
             }
 
             if crate::oom_guard::retirement_required() {
-                writer
-                    .send(&GuestResponse::Complete {
-                        exit_code: 137,
-                        execution_time_ms: duration_ms,
-                        spawn_ms: Some(spawn_ms),
-                        process_ms,
-                    })
-                    .await?;
+                writer.send(&complete(137)).await?;
                 return Ok(());
             }
 
@@ -863,6 +945,52 @@ pub(crate) async fn execute_code_streaming(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[tokio::test]
+    async fn ready_line_returns_what_came_before_and_leaves_the_rest_in_the_pipe() {
+        let mut stderr: &[u8] = b"a warning\n__REPL_READY__\nnext exec";
+        assert_eq!(
+            read_ready_line(&mut stderr).await,
+            Ok("a warning\n".to_string())
+        );
+        assert_eq!(stderr, b"next exec");
+    }
+
+    #[tokio::test]
+    async fn ready_line_alone_returns_nothing_before() {
+        let mut stderr: &[u8] = b"__REPL_READY__\n";
+        assert_eq!(read_ready_line(&mut stderr).await, Ok(String::new()));
+    }
+
+    #[tokio::test]
+    async fn stderr_closed_before_the_ready_line_is_a_failed_start() {
+        let mut stderr: &[u8] = b"Error: prctl(PR_SET_DUMPABLE, 0) failed\n    at js_repl.mjs:21";
+        assert_eq!(
+            read_ready_line(&mut stderr).await,
+            Err("Error: prctl(PR_SET_DUMPABLE, 0) failed\n    at js_repl.mjs:21".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_with_no_end_is_cut_and_its_rest_is_not_the_ready_line() {
+        let mut input = vec![b'x'; MAX_STDERR_BYTES];
+        input.extend_from_slice(b"y__REPL_READY__\n__REPL_READY__\n");
+        let mut stderr: &[u8] = &input;
+        let before = read_ready_line(&mut stderr)
+            .await
+            .expect("the ready line on its own");
+        assert_eq!(before.len(), MAX_STDERR_BYTES + 1); // the cut start; then full: the rest is dropped
+        assert!(stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_ready_text_inside_a_line_is_not_the_ready_line() {
+        let mut stderr: &[u8] = b"x__REPL_READY__\n";
+        assert_eq!(
+            read_ready_line(&mut stderr).await,
+            Err("x__REPL_READY__\n".to_string())
+        );
+    }
 
     // -------------------------------------------------------------------------
     // parse_stderr_line_for_sentinel — normal cases

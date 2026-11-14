@@ -1,13 +1,6 @@
 //! Constants and statics for the guest agent.
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU8, AtomicU64};
-
-use tokio::sync::{Mutex as TokioMutex, Notify};
-
-use crate::repl::ReplState;
-use crate::types::Language;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const CMD_PORT_PATH: &str = "/dev/virtio-ports/org.dualeai.cmd";
@@ -92,6 +85,12 @@ pub(crate) const FILE_TRANSFER_ZSTD_LEVEL: i32 = 3;
 
 // Graceful termination configuration
 pub(crate) const TERM_GRACE_PERIOD_SECONDS: u64 = 5;
+
+// After an installer (uv, bun) ends and its group is killed, its output pipes close at
+// once; a process that left its group can hold them. The readers wait at least this long
+// after the end, also when the install deadline is closer.
+pub(crate) const INSTALLER_OUTPUT_GRACE_MS: u64 = 1000;
+
 // Longest wait for a process after SIGKILL (wait_child_bounded). A process in
 // uninterruptible sleep dies only when its I/O ends. Fits in the host margin
 // (EXECUTION_TIMEOUT_MARGIN_SECONDS = 10) with TERM_GRACE_PERIOD_SECONDS.
@@ -175,33 +174,8 @@ pub(crate) static BLOCKED_ENV_VARS: &[&str] = &[
     "MALLOC_PERTURB_",
 ];
 
-/// Network readiness gate: 0=pending, 1=ready (including intentionally offline),
-/// 2=failed. ExecuteCode, InstallPackages and WarmRepl wait on this; Ping and
-/// file I/O respond immediately.
-pub(crate) const NETWORK_PENDING: u8 = 0;
-pub(crate) const NETWORK_READY: u8 = 1;
-pub(crate) const NETWORK_FAILED: u8 = 2;
+/// Longest network setup at boot (init::NETWORK_STATE is set within it).
 pub(crate) const NETWORK_SETUP_TIMEOUT_SECONDS: u64 = 7;
-pub(crate) static NETWORK_STATE: AtomicU8 = AtomicU8::new(NETWORK_PENDING);
-pub(crate) static NETWORK_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
-
-/// Capped-zram safety gate. Untrusted process spawning is blocked until the
-/// configured active-swap policy has fully started. Production has no
-/// intentional no-swap mode: every setup failure makes the VM unavailable.
-/// The state is terminal before the virtio listener starts (main.rs awaits
-/// zram setup), so readers check it synchronously — no waiter machinery.
-pub(crate) const ZRAM_PENDING: u8 = 0;
-pub(crate) const ZRAM_READY: u8 = 1;
-pub(crate) const ZRAM_FAILED: u8 = 2;
-pub(crate) static ZRAM_STATE: AtomicU8 = AtomicU8::new(ZRAM_PENDING);
-
-/// Monotonic counter for sentinel IDs. Combined with a nanosecond timestamp,
-/// it makes each ID unique without the uuid crate.
-pub(crate) static SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Module-level REPL storage. Persists across host connections.
-pub(crate) static REPL_STATES: LazyLock<TokioMutex<HashMap<Language, ReplState>>> =
-    LazyLock::new(|| TokioMutex::new(HashMap::new()));
 
 #[cfg(test)]
 mod tests {

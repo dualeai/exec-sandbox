@@ -17,7 +17,9 @@ const libc = dlopen('libc.so.6', {
     read:  { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
     fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 });
-libc.symbols.prctl(4, 0, 0, 0, 0);  // PR_SET_DUMPABLE=0
+if (libc.symbols.prctl(4, 0, 0, 0, 0) !== 0) {  // PR_SET_DUMPABLE=0: fail closed, as the Python REPL
+    throw new Error('prctl(PR_SET_DUMPABLE, 0) failed');
+}
 // Ensure stdin is blocking — Bun's runtime may set O_NONBLOCK on fd 0.
 const _flags = libc.symbols.fcntl(0, 3/*F_GETFL*/, 0);
 if (_flags >= 0) libc.symbols.fcntl(0, 4/*F_SETFL*/, _flags & ~2048/*O_NONBLOCK*/);
@@ -190,8 +192,8 @@ function writeError(e) {
 }
 // --- Blocking stdin reader via libc.read() ---
 // Thread sleeps in kernel until data arrives, achieving 0% idle CPU.
-// The original Bun.stdin.stream().getReader() polls at ~20-25% due to
-// O_NONBLOCK + event loop scheduling overhead.
+// Bun.stdin.stream().getReader() polls at ~20-25% due to O_NONBLOCK +
+// event loop scheduling overhead.
 let buf = new Uint8Array(0);
 const dec = new TextDecoder();
 function cat(a, b) {
@@ -225,6 +227,9 @@ function readN(n) {
     buf = buf.slice(n);
     return dec.decode(data);
 }
+// Ready: the agent writes the first exec only after it reads this line (a REPL that
+// fails before it did not start, and no user code ran)
+await protocolWrite(_stderr, _origStderrWrite, 2, '__REPL_READY__\n');
 while (true) {
     const header = readLine();
     if (header === null) break;

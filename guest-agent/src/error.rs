@@ -2,8 +2,8 @@
 
 use tokio::sync::mpsc;
 
-use crate::constants::{KILL_WAIT, VERSION};
-use crate::types::{GuestResponse, Language};
+use crate::constants::KILL_WAIT;
+use crate::types::GuestResponse;
 
 // ============================================================================
 // ErrorType — domain-specific error classification
@@ -140,9 +140,8 @@ impl From<mpsc::error::SendError<Vec<u8>>> for CmdError {
 // ResponseWriter — op_id-aware response sender
 // ============================================================================
 
-/// Wraps a write channel and an optional `op_id`.  Every message sent through
-/// this writer gets `op_id` injected into its JSON (unless the message already
-/// carries one, e.g. file-transfer responses with their own `op_id`).
+/// Wraps a write channel and the optional `op_id` of a request. Every message
+/// sent through this writer gets that `op_id` in its JSON.
 pub(crate) struct ResponseWriter {
     write_tx: mpsc::Sender<Vec<u8>>,
     op_id: Option<String>,
@@ -153,17 +152,14 @@ impl ResponseWriter {
         Self { write_tx, op_id }
     }
 
-    /// Serialize `msg` to JSON, inject `op_id` (preserving any existing one),
-    /// append newline, and queue for sending.
+    /// Serialize `msg` to JSON, inject `op_id`, append newline, and queue for sending.
     pub(crate) async fn send(&self, msg: &GuestResponse) -> Result<(), CmdError> {
         let mut value = serde_json::to_value(msg).map_err(|e| CmdError::Fatal(e.into()))?;
 
-        // Inject op_id only if the message doesn't already have one
         if let Some(ref id) = self.op_id
             && let Some(obj) = value.as_object_mut()
         {
-            obj.entry("op_id")
-                .or_insert_with(|| serde_json::Value::String(id.clone()));
+            obj.insert("op_id".to_string(), serde_json::Value::String(id.clone()));
         }
 
         let mut bytes = serde_json::to_vec(&value).map_err(|e| CmdError::Fatal(e.into()))?;
@@ -181,38 +177,9 @@ impl ResponseWriter {
         self.send(&GuestResponse::Error {
             message,
             error_type: error_type.to_string(),
-            op_id: self.op_id.clone(),
-            version: Some(VERSION),
         })
         .await
     }
-}
-
-// ============================================================================
-// Response helpers (request errors before a ResponseWriter exists)
-// ============================================================================
-
-/// Send a `request_error` response to the host.
-///
-/// Used only for request errors found before the `ResponseWriter` exists
-/// (request too large, bad JSON, unknown command); `op_id` is set when the
-/// JSON parsed but the command did not.
-/// Prefer `ResponseWriter::send_error()` for all other cases.
-pub(crate) async fn send_request_error(
-    write_tx: &mpsc::Sender<Vec<u8>>,
-    message: String,
-    op_id: Option<&str>,
-) -> Result<(), CmdError> {
-    let msg = GuestResponse::Error {
-        message,
-        error_type: ErrorType::Request.as_str().to_string(),
-        op_id: op_id.map(|s| s.to_string()),
-        version: Some(VERSION),
-    };
-    let mut bytes = serde_json::to_vec(&msg).map_err(|e| CmdError::Fatal(e.into()))?;
-    bytes.push(b'\n');
-    write_tx.send(bytes).await?;
-    Ok(())
 }
 
 // ============================================================================
@@ -232,21 +199,13 @@ pub(crate) fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(255)
 }
 
-/// Parse a language string, returning CmdError::Reply on failure.
-pub(crate) fn parse_language(language_str: &str) -> Result<Language, CmdError> {
-    Language::parse(language_str).ok_or_else(|| {
-        CmdError::code(format!(
-            "Unsupported language '{language_str}' (supported: python, javascript, raw)"
-        ))
-    })
-}
-
 /// Gracefully terminate a process group: SIGTERM → wait → SIGKILL.
 ///
 /// Implements Kubernetes-style graceful shutdown:
 /// 1. Send SIGTERM to entire process group (allows cleanup)
-/// 2. Wait for grace period
-/// 3. If still running, send SIGKILL
+/// 2. Wait for the leader, at most the grace period
+/// 3. Send SIGKILL to the group: as when the init of a container ends, the
+///    members that outlive the leader (one that ignores SIGTERM) end with it
 pub(crate) async fn graceful_terminate_process_group(
     child: &mut crate::init::WaitedChild,
     grace_period_secs: u64,
@@ -269,16 +228,24 @@ pub(crate) async fn graceful_terminate_process_group(
         return;
     }
 
-    // Phase 2: Wait for grace period
-    match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
-        Ok(Ok(_)) => return,
-        Ok(Err(e)) => log_error!("Wait error after SIGTERM: {e}"),
-        Err(_) => log_warn!(
-            "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
-        ),
-    }
+    // Phase 2: Wait for the leader, at most the grace period
+    let leader_ended = match timeout(Duration::from_secs(grace_period_secs), child.wait()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            log_error!("Wait error after SIGTERM: {e}");
+            false
+        }
+        Err(_) => {
+            log_warn!(
+                "Process {pid} didn't respond to SIGTERM within {grace_period_secs}s, sending SIGKILL"
+            );
+            false
+        }
+    };
 
-    // Phase 3: SIGKILL
+    // Phase 3: SIGKILL to the group, also after the leader ended. The group ID
+    // stays reserved while a member lives, so the signal reaches only the
+    // group (ESRCH when no member is left).
     let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
     if kill_result == -1 {
         let errno = std::io::Error::last_os_error();
@@ -287,7 +254,9 @@ pub(crate) async fn graceful_terminate_process_group(
         }
     }
 
-    let _ = wait_child_bounded(child, "SIGKILL", KILL_WAIT).await;
+    if !leader_ended {
+        let _ = wait_child_bounded(child, "SIGKILL", KILL_WAIT).await;
+    }
 }
 
 /// Wait for `child` to exit, at most `limit` (`KILL_WAIT` in the agent).
@@ -643,28 +612,6 @@ mod tests {
         assert_eq!(format!("{err}"), "fatal: connection lost");
     }
 
-    #[test]
-    fn test_parse_language_valid() {
-        assert!(parse_language("python").is_ok());
-        assert!(parse_language("javascript").is_ok());
-        assert!(parse_language("raw").is_ok());
-    }
-
-    #[test]
-    fn test_parse_language_invalid() {
-        let err = parse_language("cobol").unwrap_err();
-        match err {
-            CmdError::Reply {
-                message,
-                error_type,
-            } => {
-                assert!(message.contains("cobol"));
-                assert_eq!(error_type, "code_error");
-            }
-            CmdError::Fatal(_) => panic!("expected Reply"),
-        }
-    }
-
     // -------------------------------------------------------------------------
     // ResponseWriter
     // -------------------------------------------------------------------------
@@ -730,14 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_writer_inject_op_id_into_file_list() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileList {
-                path: "".into(),
-                entries: vec![],
-            },
-        )
-        .await;
+        let val = writer_send_json(Some("abc"), &GuestResponse::FileList { entries: vec![] }).await;
         assert_eq!(val["op_id"], "abc");
     }
 
@@ -746,7 +686,7 @@ mod tests {
         let val = writer_send_json(
             Some("abc"),
             &GuestResponse::WarmReplAck {
-                language: "python".into(),
+                language: crate::types::Language::Python,
                 status: "ok".into(),
                 message: None,
             },
@@ -756,75 +696,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_writer_preserve_existing_file_write_ack_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileWriteAck {
-                op_id: "orig".into(),
+    async fn response_writer_inject_op_id_into_file_transfer_messages() {
+        // The host matches each chunk and the end of a transfer by this op_id
+        for msg in [
+            GuestResponse::FileWriteAck {
                 path: "f.txt".into(),
                 bytes_written: 42,
             },
-        )
-        .await;
-        // Existing op_id preserved, not overwritten
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_preserve_existing_file_chunk_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileChunk {
-                op_id: "orig".into(),
+            GuestResponse::FileChunk {
                 data: "SGVsbG8=".into(),
             },
-        )
-        .await;
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_preserve_existing_file_read_complete_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::FileReadComplete {
-                op_id: "orig".into(),
+            GuestResponse::FileReadComplete {
                 path: "f.txt".into(),
                 size: 100,
             },
-        )
-        .await;
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_preserve_existing_error_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Error {
-                message: "fail".into(),
-                error_type: "io_error".into(),
-                op_id: Some("orig".into()),
-                version: Some(VERSION),
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "orig");
-    }
-
-    #[tokio::test]
-    async fn response_writer_inject_into_error_without_op_id() {
-        let val = writer_send_json(
-            Some("abc"),
-            &GuestResponse::Error {
-                message: "fail".into(),
-                error_type: "io_error".into(),
-                op_id: None,
-                version: Some(VERSION),
-            },
-        )
-        .await;
-        assert_eq!(val["op_id"], "abc");
+        ] {
+            let val = writer_send_json(Some("abc"), &msg).await;
+            assert_eq!(val["op_id"], "abc", "{msg:?}");
+        }
     }
 
     #[tokio::test]
@@ -844,6 +733,22 @@ mod tests {
         assert_eq!(val["message"], "boom");
         assert_eq!(val["error_type"], "io_error");
         assert_eq!(val["op_id"], "abc");
+    }
+
+    #[tokio::test]
+    async fn response_writer_error_of_a_request_with_no_op_id_has_none() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let writer = ResponseWriter::new(tx, None);
+        writer
+            .send_error("bad".into(), "request_error")
+            .await
+            .unwrap();
+        let bytes = rx.recv().await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({"type": "error", "message": "bad", "error_type": "request_error"})
+        );
     }
 
     #[tokio::test]
@@ -896,6 +801,38 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         child.start_kill().unwrap();
         child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_terminate_ends_a_member_that_outlives_the_leader() {
+        // The leader (sh) ends at SIGTERM; its child ignores SIGTERM and holds the
+        // stdout pipe, so the pipe ends only when the group SIGKILL reaches it.
+        let mut spawned = tokio::process::Command::new("sh")
+            .args(["-c", "(trap '' TERM; echo ready; exec sleep 30) & wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut stdout = spawned.stdout.take().unwrap();
+        let mut child = crate::init::WaitedChild::register(spawned);
+        let mut ready = [0u8; 6];
+        tokio::io::AsyncReadExt::read_exact(&mut stdout, &mut ready)
+            .await
+            .unwrap();
+        assert_eq!(&ready, b"ready\n"); // the member ignores SIGTERM from here
+
+        graceful_terminate_process_group(&mut child, 5).await;
+
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut rest),
+        )
+        .await;
+        assert!(
+            matches!(ended, Ok(Ok(0))),
+            "a member of the group still holds the pipe: {ended:?}"
+        );
     }
 
     #[tokio::test]

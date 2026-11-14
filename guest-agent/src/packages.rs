@@ -110,6 +110,36 @@ pub(crate) fn validate_package_name(pkg: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The output of an installer that ended. Its process group is killed first: a daemon that a
+/// postinstall script starts would keep the output pipes open, and the snapshot taken after the
+/// install must hold no process. Then both readers are awaited until `deadline`, or
+/// INSTALLER_OUTPUT_GRACE_MS from now when that is later (an installer that ended just before
+/// its deadline). None: a process outside the group still holds a pipe then (both readers
+/// are aborted).
+async fn finish_installer_output(
+    group: Option<i32>,
+    stdout: tokio::task::JoinHandle<Vec<String>>,
+    stderr: tokio::task::JoinHandle<Vec<String>>,
+    deadline: tokio::time::Instant,
+) -> Option<(Vec<String>, Vec<String>)> {
+    if let Some(group) = group {
+        // ESRCH: no member left. The group ID stays reserved while a member lives.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let (stdout_abort, stderr_abort) = (stdout.abort_handle(), stderr.abort_handle());
+    let grace =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(INSTALLER_OUTPUT_GRACE_MS);
+    match tokio::time::timeout_at(deadline.max(grace), async { (stdout.await, stderr.await) }).await
+    {
+        Ok((out, err)) => Some((out.unwrap_or_default(), err.unwrap_or_default())),
+        Err(_) => {
+            stdout_abort.abort();
+            stderr_abort.abort();
+            None
+        }
+    }
+}
+
 /// Install packages to system paths for snapshot persistence.
 ///
 /// Runs as root: `uv pip install --target PYTHON_SITE_PACKAGES` for Python,
@@ -188,6 +218,8 @@ pub(crate) async fn install_packages(
     };
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+    // The group of the installer: child.id() is None once the child is reaped
+    let group = child.id().map(|id| id as i32);
     // No await since the spawn: the PID 1 reaper cannot have collected it yet.
     let mut child = crate::init::WaitedChild::register(child);
 
@@ -195,16 +227,21 @@ pub(crate) async fn install_packages(
     let stderr_task = spawn_output_reader(stderr, MAX_PACKAGE_OUTPUT_BYTES);
 
     let timeout = effective_timeout_secs(timeout); // 0: the default deadline, as for an exec
-    let wait_result = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+    let wait_result = tokio::time::timeout_at(deadline, child.wait()).await;
 
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(CmdError::execution(format!("Process wait error: {}", e)));
         }
         Err(_) => {
             graceful_terminate_process_group(&mut child, TERM_GRACE_PERIOD_SECONDS).await;
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(CmdError::timeout(format!(
                 "Package installation timeout after {}s",
                 timeout
@@ -213,8 +250,14 @@ pub(crate) async fn install_packages(
     };
     let observed_exit_code = exit_code_from_status(status);
     let exit_code = crate::oom_guard::reconcile_retirement_exit(observed_exit_code);
-    let stdout_lines = stdout_task.await.unwrap_or_default();
-    let stderr_lines = stderr_task.await.unwrap_or_default();
+    let Some((stdout_lines, stderr_lines)) =
+        finish_installer_output(group, stdout_task, stderr_task, deadline).await
+    else {
+        return Err(CmdError::timeout(format!(
+            "Package installation timeout after {}s: a process the installer started outside its group kept its output open",
+            timeout
+        )));
+    };
 
     let duration_ms = start.elapsed().as_millis() as u64;
     // Sync filesystem for snapshot safety
@@ -258,6 +301,72 @@ pub(crate) async fn install_packages(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    /// An installer (`script` in sh, its own group) that has ended.
+    async fn ended_installer(
+        script: &str,
+    ) -> (
+        Option<i32>,
+        tokio::task::JoinHandle<Vec<String>>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        let mut spawned = Command::new("sh")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = spawned.id().map(|id| id as i32);
+        let stdout = spawn_output_reader(spawned.stdout.take().unwrap(), 1024);
+        let stderr = spawn_output_reader(spawned.stderr.take().unwrap(), 1024);
+        let mut child = crate::init::WaitedChild::register(spawned);
+        assert!(child.wait().await.unwrap().success());
+        (group, stdout, stderr)
+    }
+
+    #[tokio::test]
+    async fn installer_output_ends_with_a_daemon_left_in_its_group() {
+        // The daemon holds both pipes: only the group SIGKILL ends them before the deadline
+        let (group, stdout, stderr) = ended_installer("sleep 30 & echo installed").await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let started = std::time::Instant::now();
+        let output = finish_installer_output(group, stdout, stderr, deadline).await;
+
+        assert_eq!(output, Some((vec!["installed".to_string()], vec![])));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn installer_output_at_its_deadline_still_waits_for_the_pipes_to_close() {
+        // The installer ended just before its deadline (passed here); a process outside its
+        // group holds the pipes for 0.3 s more: the output comes, not the "kept open" error
+        let (group, stdout, stderr) = ended_installer(
+            r#"f=$(mktemp -u); mkfifo "$f"; setsid sh -c 'echo > "$1"; exec sleep 0.3' sh "$f" & read -r _ < "$f"; rm -f "$f"; echo installed"#,
+        )
+        .await;
+        let deadline = tokio::time::Instant::now();
+
+        let output = finish_installer_output(group, stdout, stderr, deadline).await;
+
+        assert_eq!(output, Some((vec!["installed".to_string()], vec![])));
+    }
+
+    #[tokio::test]
+    async fn installer_output_stops_at_the_deadline_with_a_daemon_outside_its_group() {
+        // setsid: the daemon leaves the group, so the SIGKILL misses it and it keeps the pipes.
+        // The installer ends only once the daemon is in its own session (the FIFO).
+        let (group, stdout, stderr) = ended_installer(
+            r#"f=$(mktemp -u); mkfifo "$f"; setsid sh -c 'echo > "$1"; exec sleep 30' sh "$f" & read -r _ < "$f"; rm -f "$f"; echo installed"#,
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+
+        let output = finish_installer_output(group, stdout, stderr, deadline).await;
+
+        assert_eq!(output, None);
+    }
 
     #[rstest]
     #[case("pandas==2.0.0", true)]

@@ -1,5 +1,4 @@
 //! REPL process lifecycle: spawn wrapper scripts.
-//! Wrapper scripts are lazily written on first spawn via init::ensure_repl_wrappers().
 
 use tokio::process::Command;
 
@@ -17,13 +16,9 @@ pub(crate) struct ReplState {
 /// Spawn a fresh REPL process for the given language.
 ///
 /// Scripts run from SANDBOX_ROOT so package resolution works naturally.
-/// Wrapper scripts are lazily written on first call (deferred from init for boot speed).
-pub(crate) async fn spawn_repl(
-    language: Language,
-) -> Result<ReplState, Box<dyn std::error::Error>> {
+/// Wrapper scripts are written on the first call (deferred from init for boot speed).
+pub(crate) fn spawn_repl(language: Language) -> Result<ReplState, Box<dyn std::error::Error>> {
     crate::oom_guard::ensure_vm_usable()?;
-
-    // Lazily write REPL wrapper scripts on first spawn
     crate::init::ensure_repl_wrappers();
 
     let mut cmd = match language {
@@ -114,6 +109,9 @@ pub(crate) async fn spawn_repl(
             //
             // See: https://github.com/oven-sh/bun/issues/23735
             //      https://github.com/oven-sh/bun/pull/24350
+            //
+            // No FTL, the most costly JIT tier: it starts after 100k+ iterations,
+            // which short execs do not reach. This saves JIT code memory.
             c.env("BUN_JSC_useFTLJIT", "0");
             // Minimize background thread CPU when idle. Without these, JSC's
             // concurrent GC/JIT threads and Bun's GC timer cause ~20-25% CPU

@@ -1,6 +1,7 @@
 //! Connection handling: non-blocking virtio-serial I/O and command dispatch.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use crate::file_io::{
     ActiveWriteHandle, WriteEnd, handle_list_files, handle_read_file, handle_write_file,
 };
 use crate::packages::install_packages;
-use crate::repl::execute::{execute_code_streaming, take_or_spawn_repl};
-use crate::types::{GuestCommand, GuestResponse, Language};
+use crate::repl::execute::{execute_code_streaming, warm_repl};
+use crate::types::{GuestCommand, GuestResponse};
 
 /// Extract `op_id` from raw JSON before serde deserialization.
 ///
@@ -188,10 +189,8 @@ impl CommandPort {
 // Connection handler
 // ============================================================================
 
-/// Bound on each wait for a pipelined file write (FILE_WRITE_STALL_TIMEOUT_SECONDS).
-fn write_stall_timeout() -> Duration {
-    Duration::from_secs(FILE_WRITE_STALL_TIMEOUT_SECONDS)
-}
+/// Bound on each wait for a pipelined file write.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(FILE_WRITE_STALL_TIMEOUT_SECONDS);
 
 /// How a pipelined write ended, as `finish_write` saw it.
 enum WriteFinish {
@@ -248,7 +247,6 @@ async fn report(
         Err(CmdError::Reply {
             message,
             error_type,
-            ..
         }) => writer
             .send_error(message, error_type)
             .await
@@ -311,15 +309,15 @@ pub(crate) async fn handle_connection(
         };
 
         if bytes_read > MAX_REQUEST_SIZE_BYTES {
-            let _ = send_request_error(
-                &write_tx,
-                format!(
-                    "Request too large: {} bytes (max {} bytes)",
-                    bytes_read, MAX_REQUEST_SIZE_BYTES
-                ),
-                None,
-            )
-            .await;
+            let _ = ResponseWriter::new(write_tx.clone(), None)
+                .send_error(
+                    format!(
+                        "Request too large: {} bytes (max {} bytes)",
+                        bytes_read, MAX_REQUEST_SIZE_BYTES
+                    ),
+                    ErrorType::Request.as_str(),
+                )
+                .await;
             continue;
         }
 
@@ -332,7 +330,9 @@ pub(crate) async fn handle_connection(
             Ok(v) => v,
             Err(e) => {
                 log_error!("JSON parse error: {e}");
-                let _ = send_request_error(&write_tx, format!("Invalid JSON: {e}"), None).await;
+                let _ = ResponseWriter::new(write_tx.clone(), None)
+                    .send_error(format!("Invalid JSON: {e}"), ErrorType::Request.as_str())
+                    .await;
                 continue;
             }
         };
@@ -342,12 +342,9 @@ pub(crate) async fn handle_connection(
             Ok(cmd) => cmd,
             Err(e) => {
                 log_error!("Command parse error: {e}");
-                let _ = send_request_error(
-                    &write_tx,
-                    format!("Invalid command: {e}"),
-                    op_id.as_deref(),
-                )
-                .await;
+                let _ = ResponseWriter::new(write_tx.clone(), op_id)
+                    .send_error(format!("Invalid command: {e}"), ErrorType::Request.as_str())
+                    .await;
                 continue;
             }
         };
@@ -374,102 +371,28 @@ pub(crate) async fn handle_connection(
                 }
             }
             GuestCommand::WarmRepl { language } => {
-                log_info!("Processing: warm_repl (language={language})");
-                if let Err(error) = crate::init::wait_for_untrusted_readiness().await {
-                    log_warn!("REPL warm-up readiness failed: {error}");
-                    if writer
-                        .send(&GuestResponse::WarmReplAck {
-                            language,
-                            status: "error".to_string(),
-                            message: Some(format!("guest readiness failed: {error}")),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break Err("write queue closed".into());
-                    }
-                    continue;
-                }
-                let lang = match Language::parse(&language) {
-                    Some(l) => l,
-                    None => {
-                        if writer
-                            .send(&GuestResponse::WarmReplAck {
-                                language,
-                                status: "error".to_string(),
-                                message: Some(
-                                    "Unsupported language (supported: python, javascript, raw)"
-                                        .to_string(),
-                                ),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
-                        }
-                        continue;
+                log_info!("Processing: warm_repl (language={})", language.as_str());
+                let warmed = match crate::init::wait_for_untrusted_readiness().await {
+                    Ok(()) => warm_repl(language).await,
+                    Err(error) => {
+                        log_warn!("REPL warm-up readiness failed: {error}");
+                        Err(format!("guest readiness failed: {error}"))
                     }
                 };
-                // The live REPL when one runs (an L1 restore, a warm-up before), else a new one
-                match take_or_spawn_repl(lang).await {
-                    Ok((mut repl, _)) => {
-                        // Exercise the REPL with a no-op to block until the interpreter
-                        // is fully loaded. Without this, spawn_repl returns after fork+exec
-                        // (~4ms) but Python/Bun take 0.1-1 s more to load (3-5 s under TCG).
-                        // The pool would advertise the VM as ready prematurely. On a live
-                        // REPL the no-op maps its pages again and starts its output paths,
-                        // so the first exec of a user is not the REPL's first one.
-                        let warm_start = std::time::Instant::now();
-                        match crate::repl::execute::warm_exercise_repl(&mut repl, lang).await {
-                            Ok(()) => {
-                                let warm_ms = warm_start.elapsed().as_millis();
-                                REPL_STATES.lock().await.insert(lang, repl);
-                                log_info!("REPL pre-warmed for {language} ({warm_ms}ms)");
-                                if writer
-                                    .send(&GuestResponse::WarmReplAck {
-                                        language,
-                                        status: "ok".to_string(),
-                                        message: None,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break Err("write queue closed".into());
-                                }
-                            }
-                            Err(e) => {
-                                log_warn!("REPL warm-up failed for {language}: {e}");
-                                let _ = repl.child.start_kill();
-                                let _ =
-                                    wait_child_bounded(&mut repl.child, "SIGKILL", KILL_WAIT).await;
-                                if writer
-                                    .send(&GuestResponse::WarmReplAck {
-                                        language,
-                                        status: "error".to_string(),
-                                        message: Some(format!("warm-up failed: {e}")),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break Err("write queue closed".into());
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_warn!("Eager REPL spawn failed: {e}");
-                        if writer
-                            .send(&GuestResponse::WarmReplAck {
-                                language,
-                                status: "error".to_string(),
-                                message: Some(e.to_string()),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
-                        }
-                    }
+                let (status, message) = match warmed {
+                    Ok(()) => ("ok", None),
+                    Err(message) => ("error", Some(message)),
+                };
+                if writer
+                    .send(&GuestResponse::WarmReplAck {
+                        language,
+                        status: status.to_string(),
+                        message,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break Err("write queue closed".into());
                 }
             }
             GuestCommand::InstallPackages {
@@ -492,31 +415,13 @@ pub(crate) async fn handle_connection(
                     continue;
                 }
                 log_info!(
-                    "Processing: install_packages (language={language}, count={}, timeout={timeout}s)",
+                    "Processing: install_packages (language={}, count={}, timeout={timeout}s)",
+                    language.as_str(),
                     packages.len()
                 );
-                let lang = match Language::parse(&language) {
-                    Some(l) => l,
-                    None => {
-                        if writer
-                            .send_error(
-                                format!(
-                                    "Unsupported language '{}' for package installation (supported: python, javascript)",
-                                    language
-                                ),
-                                ErrorType::Package.as_str(),
-                            )
-                            .await
-                            .is_err()
-                        {
-                            break Err("write queue closed".into());
-                        }
-                        continue;
-                    }
-                };
                 if let Err(e) = report(
                     &writer,
-                    install_packages(lang, &packages, timeout, &writer).await,
+                    install_packages(language, &packages, timeout, &writer).await,
                 )
                 .await
                 {
@@ -551,12 +456,13 @@ pub(crate) async fn handle_connection(
                     t_net_done
                 );
                 log_info!(
-                    "Processing: execute_code (language={language}, code_size={}, timeout={timeout}s, env_vars={})",
+                    "Processing: execute_code (language={}, code_size={}, timeout={timeout}s, env_vars={})",
+                    language.as_str(),
                     code.len(),
                     env_vars.len()
                 );
                 let outcome =
-                    execute_code_streaming(&language, &code, timeout, &env_vars, &writer).await;
+                    execute_code_streaming(language, &code, timeout, &env_vars, &writer).await;
                 if let Err(e) = report(&writer, outcome).await {
                     break Err(e);
                 }
@@ -569,28 +475,27 @@ pub(crate) async fn handle_connection(
                 log_info!(
                     "Processing: write_file (op_id={op_id}, path={path}, executable={make_executable})"
                 );
-                #[allow(clippy::map_entry)] // Entry API incompatible with async error path
-                if active_writes.contains_key(&op_id) {
-                    let _ = writer
-                        .send_error(
-                            format!("Duplicate op_id '{op_id}' for write_file"),
-                            ErrorType::Protocol.as_str(),
-                        )
-                        .await;
-                } else {
-                    match handle_write_file(&op_id, &path, make_executable).await {
-                        Ok(handle) => {
-                            active_writes.insert(op_id, handle);
-                        }
-                        Err(CmdError::Reply {
-                            message,
-                            error_type,
-                            ..
-                        }) => {
-                            let _ = writer.send_error(message, error_type).await;
-                        }
-                        Err(CmdError::Fatal(e)) => {
-                            break Err(e.to_string().into());
+                match active_writes.entry(op_id) {
+                    Entry::Occupied(entry) => {
+                        let _ = writer
+                            .send_error(
+                                format!("Duplicate op_id '{}' for write_file", entry.key()),
+                                ErrorType::Protocol.as_str(),
+                            )
+                            .await;
+                    }
+                    Entry::Vacant(slot) => {
+                        match handle_write_file(slot.key(), &path, make_executable) {
+                            Ok(handle) => {
+                                slot.insert(handle);
+                            }
+                            Err(CmdError::Reply {
+                                message,
+                                error_type,
+                            }) => {
+                                let _ = writer.send_error(message, error_type).await;
+                            }
+                            Err(CmdError::Fatal(e)) => break Err(e.to_string().into()),
                         }
                     }
                 }
@@ -631,7 +536,7 @@ pub(crate) async fn handle_connection(
                 // which reads one command at a time.
                 let sent = {
                     let handle = active_writes.get(&op_id).unwrap();
-                    tokio::time::timeout(write_stall_timeout(), handle.chunk_tx.send(decoded)).await
+                    tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.chunk_tx.send(decoded)).await
                 };
                 if sent.is_err() {
                     let handle = active_writes.remove(&op_id).unwrap();
@@ -659,7 +564,7 @@ pub(crate) async fn handle_connection(
                     drop(handle.chunk_tx);
                     // Bounded: its end removes the temporary file, which a stalled disk
                     // can hold; the write failed either way (no end marker)
-                    let Ok(ended) = tokio::time::timeout(write_stall_timeout(), handle.task).await
+                    let Ok(ended) = tokio::time::timeout(WRITE_STALL_TIMEOUT, handle.task).await
                     else {
                         log_error!(
                             "Write of '{}' (op_id={op_id}) failed, and its cleanup did not end in {FILE_WRITE_STALL_TIMEOUT_SECONDS}s",
@@ -729,8 +634,8 @@ pub(crate) async fn handle_connection(
                     chunk_tx,
                     task,
                     &end,
-                    write_stall_timeout(),
-                    write_stall_timeout(),
+                    WRITE_STALL_TIMEOUT,
+                    WRITE_STALL_TIMEOUT,
                 )
                 .await
                 {
@@ -763,7 +668,6 @@ pub(crate) async fn handle_connection(
                     Ok(Ok(bytes_written)) => {
                         if writer
                             .send(&GuestResponse::FileWriteAck {
-                                op_id,
                                 path: path_display,
                                 bytes_written,
                             })
@@ -791,9 +695,7 @@ pub(crate) async fn handle_connection(
             }
             GuestCommand::ReadFile { op_id, path } => {
                 log_info!("Processing: read_file (op_id={op_id}, path={path})");
-                if let Err(e) =
-                    report(&writer, handle_read_file(&op_id, &path, &writer).await).await
-                {
+                if let Err(e) = report(&writer, handle_read_file(&path, &writer).await).await {
                     break Err(e);
                 }
             }
@@ -830,6 +732,9 @@ mod tests {
 
     use std::io::Write as _;
 
+    /// Number of the next FIFO folder of this test process.
+    static NEXT_FIFO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     /// A FIFO in a fresh temp folder, removed on drop.
     struct Fifo {
         dir: std::path::PathBuf,
@@ -841,7 +746,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!(
                 "guest-agent-{name}-{}-{}",
                 std::process::id(),
-                SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed)
+                NEXT_FIFO.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("port");

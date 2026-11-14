@@ -327,6 +327,9 @@ def _serve() -> None:  # noqa: PLR0915
     # `from __future__` statements of an exec hold for the later ones, as in the Python REPL
     # (codeop); this script's own (annotations) does not (dont_inherit)
     future = 0
+    # Ready: the agent writes the first exec only after it reads this line (a REPL that
+    # fails before it did not start, and no user code ran)
+    protocol_write((_stderr_fd, 2), _stderr_pipe, "__REPL_READY__\n")
     while True:
         header = _stdin_buf.readline()
         if not header:

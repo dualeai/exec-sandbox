@@ -101,25 +101,23 @@ pub(crate) fn prepend_env_vars(
     let code = code.strip_prefix('\u{FEFF}').unwrap_or(code);
 
     let mut full_code = String::new();
+    // The body of a single-quoted Python or JavaScript string literal
+    let quoted = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
 
     if !env_vars.is_empty() {
         match language {
             Language::Python => {
                 full_code.push_str("import os as __os__\n");
                 for (key, value) in env_vars {
-                    let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
-                    let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
-                    full_code.push_str(&format!(
-                        "__os__.environ['{escaped_key}']='{escaped_val}'\n"
-                    ));
+                    let (key, value) = (quoted(key), quoted(value));
+                    full_code.push_str(&format!("__os__.environ['{key}']='{value}'\n"));
                 }
                 full_code.push_str("del __os__\n");
             }
             Language::Javascript => {
                 for (key, value) in env_vars {
-                    let escaped_key = key.replace('\\', "\\\\").replace('\'', "\\'");
-                    let escaped_val = value.replace('\\', "\\\\").replace('\'', "\\'");
-                    full_code.push_str(&format!("process.env['{escaped_key}']='{escaped_val}';\n"));
+                    let (key, value) = (quoted(key), quoted(value));
+                    full_code.push_str(&format!("process.env['{key}']='{value}';\n"));
                 }
             }
             Language::Raw => {
@@ -171,6 +169,7 @@ pub(crate) fn prepend_env_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // -------------------------------------------------------------------------
     // validate_code_params
@@ -297,80 +296,68 @@ mod tests {
         assert!(validate_env_vars(&env).is_ok());
     }
 
-    #[test]
-    fn test_blocked_env_ld_preload() {
-        let env = HashMap::from([("LD_PRELOAD".into(), "/evil.so".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_blocked_env_ld_preload_lowercase() {
-        let env = HashMap::from([("ld_preload".into(), "/evil.so".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_blocked_env_path() {
-        let env = HashMap::from([("PATH".into(), "/evil".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_blocked_env_bash_env() {
-        let env = HashMap::from([("BASH_ENV".into(), "/evil".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_blocked_env_node_options() {
-        let env = HashMap::from([("NODE_OPTIONS".into(), "--require=evil".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_blocked_env_pythonpath() {
-        let env = HashMap::from([("PYTHONPATH".into(), "/tmp/evil".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_blocked_env_ifs() {
-        let env = HashMap::from([("IFS".into(), " ".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_null_byte_in_env_name() {
-        let env = HashMap::from([("FOO\0BAR".into(), "val".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_control_char_in_env_name() {
-        let env = HashMap::from([("FOO\x01".into(), "val".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_esc_in_env_value() {
-        let env = HashMap::from([("FOO".into(), "val\x1B".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_del_in_env_name() {
-        let env = HashMap::from([("FOO\x7F".into(), "val".into())]);
-        assert!(validate_env_vars(&env).is_err());
-    }
-
-    #[test]
-    fn test_env_var_error_type() {
-        let env = HashMap::from([("LD_PRELOAD".into(), "/evil.so".into())]);
-        let err = validate_env_vars(&env).unwrap_err();
-        match err {
-            CmdError::Reply { error_type, .. } => assert_eq!(error_type, "env_var_error"),
-            CmdError::Fatal(_) => panic!("expected Reply"),
+    /// The reply of a refused `name=value`: (message, error type).
+    fn refusal(name: &str, value: &str) -> (String, &'static str) {
+        let env = HashMap::from([(name.to_string(), value.to_string())]);
+        match validate_env_vars(&env) {
+            Err(CmdError::Reply {
+                message,
+                error_type,
+            }) => (message, error_type),
+            other => panic!("expected a reply error, got {other:?}"),
         }
+    }
+
+    #[rstest]
+    #[case("LD_PRELOAD")]
+    #[case("ld_preload")] // the check ignores case
+    #[case("LD_LIBRARY_PATH")]
+    #[case("GLIBC_TUNABLES")]
+    #[case("NODE_OPTIONS")]
+    #[case("PYTHONPATH")]
+    #[case("PYTHONSTARTUP")]
+    #[case("BASH_ENV")]
+    #[case("IFS")]
+    #[case("PATH")]
+    fn test_blocked_env_var_is_refused(#[case] name: &str) {
+        assert_eq!(
+            refusal(name, "/tmp/evil"),
+            (
+                format!("Blocked environment variable: '{name}' (security risk)"),
+                "env_var_error"
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::nul("val\0ue")]
+    #[case::escape("\x1b[31mred\x1b[0m")]
+    #[case::newline("line1\nline2")]
+    #[case::carriage_return("start\roverwrite")]
+    #[case::bell("ding\x07")]
+    #[case::del("delete\x7f")]
+    fn test_control_character_in_value_is_refused(#[case] value: &str) {
+        assert_eq!(
+            refusal("FOO", value),
+            (
+                "Environment variable 'FOO' value contains forbidden control character".to_string(),
+                "env_var_error"
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::nul("FOO\0BAR")]
+    #[case::start_of_heading("F\x01OO")]
+    #[case::del("FOO\x7F")]
+    fn test_control_character_in_name_is_refused(#[case] name: &str) {
+        assert_eq!(
+            refusal(name, "value"),
+            (
+                format!("Environment variable name '{name}' contains forbidden control character"),
+                "env_var_error"
+            )
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -381,6 +368,16 @@ mod tests {
     fn test_prepend_strips_bom_python() {
         let result = prepend_env_vars(Language::Python, "\u{FEFF}print('hello')", &HashMap::new());
         assert_eq!(result, "print('hello')");
+    }
+
+    #[test]
+    fn test_prepend_strips_bom_javascript() {
+        let result = prepend_env_vars(
+            Language::Javascript,
+            "\u{FEFF}console.log('hello')",
+            &HashMap::new(),
+        );
+        assert_eq!(result, "console.log('hello')");
     }
 
     #[test]
