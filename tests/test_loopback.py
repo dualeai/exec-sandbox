@@ -1,6 +1,6 @@
 """Tests for loopback interface (lo) in the guest VM.
 
-The guest-agent brings up `lo` via `ip link set lo up` in setup_init_environment().
+The guest-agent brings up `lo` over rtnetlink in setup_network() (guest-agent/src/init.rs).
 Without this, all localhost/127.0.0.1 connections fail inside the microvm — breaking
 http.createServer + fetch('http://localhost:...') in Bun, Python socket servers, etc.
 
@@ -10,6 +10,8 @@ Test categories:
 - Weird: unusual but valid patterns (UDP, multiple servers, Bun-native API)
 - Out of bounds: privileged ports rejected, ephemeral port allocation
 """
+
+import re
 
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
@@ -68,39 +70,21 @@ class TestLoopbackInterfaceUp:
     """Loopback interface is configured and operational."""
 
     async def test_loopback_up_shell(self, scheduler: Scheduler) -> None:
-        """ip addr show lo reports state UP and 127.0.0.1."""
+        """ip addr show lo reports the UP and LOWER_UP flags and the addresses 127.0.0.1/8 and ::1.
+
+        A bind to 127.0.0.1 from Python and JavaScript: test_python_ephemeral_port_bind and
+        test_javascript_http_server_fetch.
+        """
         result = await run_once(scheduler, VmSpec(language=Language.RAW), "ip addr show lo")
         assert result.exit_code == 0
-        assert "UP" in result.stdout
-        assert "127.0.0.1" in result.stdout
-
-    async def test_loopback_up_python(self, scheduler: Scheduler) -> None:
-        """Python can bind a socket to 127.0.0.1."""
-        code = """\
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.bind(('127.0.0.1', 0))
-addr = s.getsockname()
-s.close()
-print(f"bound:{addr[0]}:{addr[1]}")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "bound:127.0.0.1:" in result.stdout
-
-    async def test_loopback_up_javascript(self, scheduler: Scheduler) -> None:
-        """node:http server binds to 127.0.0.1 successfully."""
-        code = """\
-const http = require('http');
-const server = http.createServer((req, res) => { res.end('ok'); });
-await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-const addr = server.address();
-console.log('bound:' + addr.address + ':' + addr.port);
-server.close();
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
-        assert result.exit_code == 0
-        assert "bound:127.0.0.1:" in result.stdout
+        assert result.stdout == (
+            "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN qlen 1000\n"
+            "    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n"
+            "    inet 127.0.0.1/8 scope host lo\n"
+            "       valid_lft forever preferred_lft forever\n"
+            "    inet6 ::1/128 scope host \n"
+            "       valid_lft forever preferred_lft forever\n"
+        )
 
 
 # =============================================================================
@@ -140,10 +124,10 @@ asyncio.run(main())
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "sent:PING recv:PONG" in result.stdout
+        assert result.stdout == "sent:PING recv:PONG\n"
 
     async def test_javascript_http_server_fetch(self, scheduler: Scheduler) -> None:
-        """node:http createServer + fetch on 127.0.0.1 — the original bug scenario."""
+        """node:http createServer + fetch on 127.0.0.1: the case that fails when lo is down."""
         code = """\
 const http = require('http');
 const server = http.createServer((req, res) => {
@@ -159,8 +143,7 @@ console.log('status:' + res.status + ' body:' + body);
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
-        assert "status:200" in result.stdout
-        assert "body:HELLO_FROM_SERVER" in result.stdout
+        assert result.stdout == "status:200 body:HELLO_FROM_SERVER\n"
 
     async def test_shell_tcp_loopback(self, scheduler: Scheduler) -> None:
         """Shell nc listener + sender exchange data on loopback."""
@@ -178,7 +161,7 @@ cat /tmp/nc_out
 """
         result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
         assert result.exit_code == 0
-        assert "SHELL_PING" in result.stdout
+        assert result.stdout == "SHELL_PING\n"
 
 
 # =============================================================================
@@ -193,10 +176,10 @@ class TestLoopbackEdgeCases:
             scheduler, VmSpec(language=Language.PYTHON), _py_tcp_server_code("WILDCARD_OK", bind="0.0.0.0")
         )
         assert result.exit_code == 0
-        assert "WILDCARD_OK" in result.stdout
+        assert result.stdout == "WILDCARD_OK\n"
 
     async def test_python_localhost_dns_resolves(self, scheduler: Scheduler) -> None:
-        """socket.getaddrinfo('localhost', ...) resolves to 127.0.0.1."""
+        """socket.getaddrinfo('localhost', ...) resolves to 127.0.0.1 only (AF_INET)."""
         code = """\
 import socket
 results = socket.getaddrinfo('localhost', 80, socket.AF_INET, socket.SOCK_STREAM)
@@ -205,7 +188,7 @@ print('resolved:' + ','.join(addrs))
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "127.0.0.1" in result.stdout
+        assert result.stdout == "resolved:127.0.0.1\n"
 
     async def test_javascript_localhost_string_resolves(self, scheduler: Scheduler) -> None:
         """fetch('http://localhost:...') works — validates /etc/hosts config."""
@@ -215,7 +198,7 @@ print('resolved:' + ','.join(addrs))
             _js_http_fetch_code("LOCALHOST_STR", fetch_host="localhost"),
         )
         assert result.exit_code == 0
-        assert "LOCALHOST_STR" in result.stdout
+        assert result.stdout == "LOCALHOST_STR\n"
 
     async def test_python_sequential_bind_reuse(self, scheduler: Scheduler) -> None:
         """Bind, close, re-bind same port with SO_REUSEADDR — port reuse on loopback."""
@@ -232,11 +215,11 @@ s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s2.bind(('127.0.0.1', port))
 s2.close()
-print(f"reuse_ok:{port}")
+print("reuse_ok")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "reuse_ok:" in result.stdout
+        assert result.stdout == "reuse_ok\n"
 
 
 # =============================================================================
@@ -265,8 +248,7 @@ print(f"udp:{data.decode()} from:{addr[0]}")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "udp:UDP_PING" in result.stdout
-        assert "from:127.0.0.1" in result.stdout
+        assert result.stdout == "udp:UDP_PING from:127.0.0.1\n"
 
     async def test_python_multiple_servers_different_ports(self, scheduler: Scheduler) -> None:
         """Two servers on loopback, different ports, both reachable."""
@@ -311,8 +293,7 @@ asyncio.run(main())
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "SERVER_A" in result.stdout
-        assert "SERVER_B" in result.stdout
+        assert result.stdout == "SERVER_A,SERVER_B\n"
 
     async def test_javascript_bun_tcp_loopback(self, scheduler: Scheduler) -> None:
         """Bun.listen + Bun.connect TCP round-trip on 127.0.0.1 (Bun-native API)."""
@@ -351,7 +332,7 @@ console.log('bun_tcp:' + resp);
 """
         result = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), code)
         assert result.exit_code == 0
-        assert "bun_tcp:BUN_TCP_PONG" in result.stdout
+        assert result.stdout == "bun_tcp:BUN_TCP_PONG\n"
 
 
 # =============================================================================
@@ -377,10 +358,10 @@ except OSError as e:
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "blocked" in result.stdout
+        assert result.stdout == "blocked\n"
 
     async def test_python_ephemeral_port_bind(self, scheduler: Scheduler) -> None:
-        """Bind to port 0 (OS-assigned) works on loopback."""
+        """Python binds 127.0.0.1 port 0 and gets an OS-assigned unprivileged port."""
         code = """\
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -391,7 +372,6 @@ print(f"ephemeral:{port}")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        assert "ephemeral:" in result.stdout
-        # Ephemeral ports are OS-assigned from the unprivileged range (> 1024)
-        port_str = result.stdout.strip().split("ephemeral:")[1].split()[0]
-        assert int(port_str) > 1024
+        port = re.fullmatch(r"ephemeral:(\d+)\n", result.stdout)
+        assert port, result.stdout
+        assert int(port[1]) > 1024  # OS-assigned, from the unprivileged range

@@ -25,10 +25,10 @@ class TestNetworkLayerDNSBlocking:
     """Prove gvproxy intercepts DNS at the network layer, independent of resolv.conf."""
 
     async def test_direct_tcp_to_external_dns_blocked(self, scheduler: Scheduler) -> None:
-        """Raw TCP to 8.8.8.8:53 is blocked by gvproxy when outbound filtering is active.
+        """Raw TCP to 8.8.8.8:53 is refused by gvproxy when outbound filtering is active.
 
         Even if resolv.conf pointed at 8.8.8.8, the TCP connection cannot
-        reach it — gvproxy does not forward non-TLS traffic to arbitrary IPs.
+        reach it: gvproxy refuses non-TLS traffic to arbitrary IPs (ECONNREFUSED, not a time-out).
         """
         code = """\
 import socket
@@ -45,16 +45,15 @@ except Exception as e:
         result = await run_once(
             scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
         )
-        assert "BLOCKED:" in result.stdout, (
-            f"Expected raw TCP to 8.8.8.8:53 to be blocked by gvproxy.\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.stdout == "BLOCKED:ConnectionRefusedError\n", (
+            f"Expected gvproxy to refuse raw TCP to 8.8.8.8:53.\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
     async def test_udp_dns_to_external_resolver_blocked(self, scheduler: Scheduler) -> None:
-        """Raw UDP DNS query to 8.8.8.8:53 for non-allowed domain times out.
+        """Raw UDP DNS query to 8.8.8.8:53 for a non-allowed domain gets no reply (the 3 s socket time-out).
 
         Constructs a minimal DNS query for example.com and sends it via UDP
-        directly to Google's public DNS. gvproxy should not forward this.
+        directly to Google's public DNS. gvproxy does not forward it.
         """
         code = """\
 import socket
@@ -81,29 +80,24 @@ finally:
         result = await run_once(
             scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=["cp.cloudflare.com"]), code
         )
-        assert "BLOCKED:" in result.stdout, (
-            f"Expected UDP DNS to 8.8.8.8:53 to be blocked/timeout.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.stdout == "BLOCKED:TimeoutError\n", (
+            f"Expected UDP DNS to 8.8.8.8:53 to get no reply.\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
     async def test_only_route_is_through_gvproxy_gateway(self, scheduler: Scheduler) -> None:
-        """ip route shows sole default route via 192.168.127.1 (gvproxy gateway).
-
-        No alternative route exists that could bypass gvproxy filtering.
+        """The routes are the default one via 192.168.127.1 (the gvproxy gateway) and the link
+        route of eth0: no alternative route could bypass gvproxy filtering. (BusyBox ip prints
+        every route for `show default`.)
         """
         result = await run_once(
             scheduler,
             VmSpec(language=Language.RAW, allow_network=True, allowed_domains=["cp.cloudflare.com"]),
             "ip route show default",
         )
-        assert "192.168.127.1" in result.stdout, (
-            f"Expected default route via gvproxy gateway 192.168.127.1.\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
-        )
-        # Should be the only default route (no bypass paths)
-        default_lines = [line for line in result.stdout.strip().splitlines() if line.startswith("default")]
-        assert len(default_lines) == 1, (
-            f"Expected exactly one default route, found {len(default_lines)}.\nroutes: {default_lines}"
-        )
+        assert (result.exit_code, result.stdout) == (
+            0,
+            "default via 192.168.127.1 dev eth0 \n192.168.127.0/24 dev eth0 scope link  src 192.168.127.2 \n",
+        ), result.stderr
 
 
 # =============================================================================
@@ -115,42 +109,14 @@ class TestResolvConfReadOnlyMount:
     """Verify /etc/resolv.conf is protected by read-only bind mount (EROFS)."""
 
     async def test_resolv_conf_is_readonly_mount(self, scheduler: Scheduler) -> None:
-        """Write to /etc/resolv.conf returns EROFS (Read-only file system).
+        """/etc/resolv.conf is on a read-only mount: os.statvfs() gives the ST_RDONLY flag.
 
-        Uses os.statvfs() to check the ST_RDONLY flag on the mount point,
-        confirming the bind-mount is active — distinct from EACCES (Unix perms).
-        Also verifies via ctypes open(2) that the kernel returns EROFS (errno 30).
+        The open(2) for write that this mount refuses (EROFS, before the Unix permissions):
+        test_etc_hardening.py::TestEtcWeirdCases::test_ctypes_open_wronly.
         """
         code = """\
-import os, ctypes, errno
-
-# Check 1: statvfs ST_RDONLY flag
-st = os.statvfs('/etc/resolv.conf')
-is_rdonly = bool(st.f_flag & os.ST_RDONLY)
-print(f"statvfs_rdonly={is_rdonly}")
-
-# Check 2: open(2) returns EROFS (errno 30) for root-level write attempt
-# Note: UID 1000 may get EACCES first (DAC check), but the mount flag
-# is still detectable via statvfs above.
-libc = ctypes.CDLL("libc.so.6", use_errno=True)
-fd = libc.open(b"/etc/resolv.conf", os.O_WRONLY)
-err = ctypes.get_errno()
-if fd == -1:
-    if err == errno.EROFS:
-        print("open_blocked=erofs")
-    elif err == errno.EACCES:
-        print("open_blocked=eacces")
-    else:
-        print(f"open_blocked=errno_{err}")
-else:
-    os.close(fd)
-    print("open_blocked=none")
+import os
+print(f"statvfs_rdonly={bool(os.statvfs('/etc/resolv.conf').f_flag & os.ST_RDONLY)}")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert "statvfs_rdonly=True" in result.stdout, (
-            f"Expected /etc/resolv.conf to be on a read-only mount.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
-        assert "open_blocked=" in result.stdout
-        assert "open_blocked=none" not in result.stdout, (
-            f"Expected open(2) to fail on /etc/resolv.conf.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        assert (result.exit_code, result.stdout) == (0, "statvfs_rdonly=True\n"), result.stderr

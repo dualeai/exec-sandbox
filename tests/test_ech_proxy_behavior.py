@@ -9,11 +9,9 @@ domains using multiple TLS backends and protocol versions:
 - curl (OpenSSL 3.x on Alpine) -- TLS 1.2 / 1.3, ciphers, curves, false-start
 
 These tests complement the byte-level Go unit tests for ECH GREASE
-parsing (committed in gvisor-tap-vsock). They verify that connections
+parsing (in gvisor-tap-vsock). They verify that connections
 to ECH-supporting servers (Cloudflare) work end-to-end through the
 proxy across different TLS versions and handshake configurations.
-
-See commit 31d11c10 for the proxy fix that stopped rejecting ECH/GREASE.
 """
 
 import pytest
@@ -89,7 +87,8 @@ for attempt in range({NET_RETRY_COUNT + 1}):
 
 
 def _js_tls_code(domain: str, *, retries: bool) -> str:
-    """Bun/BoringSSL fetch test with top-level await.
+    """Bun/BoringSSL fetch test with top-level await: CONNECTED once a response came (any HTTP
+    status: the TLS connection worked).
 
     Bun's fetch does not expose TLS version control: the TLS version of the
     case does not apply.
@@ -105,8 +104,8 @@ def _js_tls_code(domain: str, *, retries: bool) -> str:
             JS_SAFETY
             + f"""for (let attempt = 0; attempt < {NET_RETRY_COUNT + 1}; attempt++) {{
     try {{
-        const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
-        console.log("CONNECTED:" + res.status);
+        await fetch("https://{domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
+        console.log("CONNECTED");
         break;
     }} catch (e) {{
         if (attempt < {NET_RETRY_COUNT}) {{ await new Promise(r => setTimeout(r, {NET_RETRY_BACKOFF_S * 1000} * (attempt + 1))); continue; }}
@@ -118,8 +117,8 @@ def _js_tls_code(domain: str, *, retries: bool) -> str:
         JS_SAFETY
         + f"""
 try {{
-    const res = await fetch("https://{domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
-    console.log("CONNECTED:" + res.status);
+    await fetch("https://{domain}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
+    console.log("CONNECTED");
 }} catch (e) {{
     console.log("BLOCKED:" + e.name + ":" + e.message);
 }}
@@ -145,8 +144,9 @@ def _curl_tls_code(
     DNS is stuck.  Under ARM64 TCG with parallel test load the entire
     operation can be inflated 10-25x by CPU starvation, easily exceeding
     the 120 s guest-agent timeout.  ``timeout {NET_SAFETY_TIMEOUT_S}``
-    guarantees the command terminates and the ``|| echo "BLOCKED"``
-    fallback always runs.
+    guarantees the command terminates and the ``|| echo "BLOCKED:$?"``
+    fallback always runs (``$?`` is the curl exit code, 6 when the name does not resolve,
+    or 124 when ``timeout`` stopped it).
 
     See guest-agent ``spawn.rs`` Raw language comment for full TLS analysis.
 
@@ -169,7 +169,7 @@ def _curl_tls_code(
         f"timeout {NET_SAFETY_TIMEOUT_S} curl -sf {flags_str}"
         f"--connect-timeout {NET_CONNECT_TIMEOUT_S} --max-time {NET_OP_TIMEOUT_S}"
         f"{retry_str} "
-        f'https://{domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED"'
+        f'https://{domain}/ -o /dev/null && echo "CONNECTED" || echo "BLOCKED:$?"'
     )
 
 
@@ -192,22 +192,7 @@ def _get_connection_code(
 # Test matrix — allowed connections (runtime x domain x TLS version)
 # =============================================================================
 ECH_ALLOWED_CASES = [
-    # -- Python x TLS versions x ECH domains --
-    # NOTE: Python x cloudflare.com covered by test_tls_version_diagnostic (stricter assertions)
-    pytest.param(
-        Language.PYTHON,
-        ECH_DOMAIN_ONE,
-        TLS_13,
-        [ECH_DOMAIN_ONE],
-        id="python-tls13-one",
-    ),
-    pytest.param(
-        Language.PYTHON,
-        ECH_DOMAIN_ONE,
-        TLS_12,
-        [ECH_DOMAIN_ONE],
-        id="python-tls12-one",
-    ),
+    # NOTE: Python x TLS versions x ECH domains: test_tls_version_diagnostic (it also checks the negotiated version)
     # -- JavaScript (default TLS) x domains --
     pytest.param(
         Language.JAVASCRIPT,
@@ -247,7 +232,7 @@ async def test_ech_allowed(
     result = await run_once(
         scheduler, VmSpec(language=language, allow_network=True, allowed_domains=allowed_domains), code
     )
-    assert "CONNECTED" in result.stdout, (
+    assert result.stdout == "CONNECTED\n", (
         f"{language.value} TLS {tls_version} to {domain} should succeed.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -256,45 +241,47 @@ async def test_ech_allowed(
 # =============================================================================
 # Test matrix — blocked connections (allowlist enforcement)
 # =============================================================================
+# Only example.com is allowed. The filter blocks a non-allowed name at DNS: each runtime reports a name that
+# does not resolve.
 ECH_BLOCKED_CASES = [
     pytest.param(
         Language.JAVASCRIPT,
         ECH_DOMAIN_CLOUDFLARE,
         TLS_DEFAULT,
-        ["example.com"],
+        "BLOCKED:TypeError:getaddrinfo ENOTFOUND cloudflare.com\n",
         id="js-cloudflare-blocked",
     ),
     pytest.param(
         Language.PYTHON,
         ECH_DOMAIN_CLOUDFLARE,
         TLS_13,
-        ["example.com"],
+        "BLOCKED:gaierror\n",
         id="python-tls13-cloudflare-blocked",
     ),
     pytest.param(
         Language.RAW,
         ECH_DOMAIN_CLOUDFLARE,
         TLS_13,
-        ["example.com"],
+        "BLOCKED:6\n",  # curl exit code 6: could not resolve host
         id="curl-tls13-cloudflare-blocked",
     ),
 ]
 
 
-@pytest.mark.parametrize("language,domain,tls_version,allowed_domains", ECH_BLOCKED_CASES)
+@pytest.mark.parametrize("language,domain,tls_version,expected", ECH_BLOCKED_CASES)
 async def test_ech_blocked(
     scheduler: Scheduler,
     language: Language,
     domain: str,
     tls_version: str,
-    allowed_domains: list[str],
+    expected: str,
 ) -> None:
-    """TLS connection to non-allowed domain is blocked."""
+    """TLS connection to a non-allowed domain fails at DNS."""
     code = _get_connection_code(language, domain, tls_version, retries=False)
     result = await run_once(
-        scheduler, VmSpec(language=language, allow_network=True, allowed_domains=allowed_domains), code
+        scheduler, VmSpec(language=language, allow_network=True, allowed_domains=["example.com"]), code
     )
-    assert "BLOCKED" in result.stdout, (
+    assert result.stdout == expected, (
         f"{language.value} TLS {tls_version} to {domain} should be blocked.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -347,7 +334,7 @@ async def test_curl_advanced_tls(
     result = await run_once(
         scheduler, VmSpec(language=Language.RAW, allow_network=True, allowed_domains=[domain]), code
     )
-    assert "CONNECTED" in result.stdout, (
+    assert result.stdout == "CONNECTED\n", (
         f"curl ({extra_flags}) to {domain} should succeed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
@@ -358,6 +345,8 @@ async def test_curl_advanced_tls(
 VERSION_DIAGNOSTIC_CASES = [
     pytest.param(ECH_DOMAIN_CLOUDFLARE, TLS_13, "TLSv1.3", id="tls13-cloudflare"),
     pytest.param(ECH_DOMAIN_CLOUDFLARE, TLS_12, "TLSv1.2", id="tls12-cloudflare"),
+    pytest.param(ECH_DOMAIN_ONE, TLS_13, "TLSv1.3", id="tls13-one"),
+    pytest.param(ECH_DOMAIN_ONE, TLS_12, "TLSv1.2", id="tls12-one"),
 ]
 
 
@@ -368,12 +357,12 @@ async def test_tls_version_diagnostic(
     tls_version: str,
     expected_proto: str,
 ) -> None:
-    """Python ssl reports the expected TLS version was negotiated."""
+    """Python ssl connects to an allowed domain through the proxy and negotiates the forced TLS version."""
     code = _python_tls_code(domain, tls_version)
     result = await run_once(
         scheduler, VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=[domain]), code
     )
-    assert f"CONNECTED:{expected_proto}" in result.stdout, (
+    assert result.stdout == f"CONNECTED:{expected_proto}\n", (
         f"Expected {expected_proto} with {domain} (forced {tls_version}).\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
@@ -413,7 +402,7 @@ async def test_curl_verbose_tls_negotiation(
     ``timeout {NET_SAFETY_TIMEOUT_S}`` wraps the entire pipeline so that
     even if curl hangs in musl's blocking ``getaddrinfo()`` (see
     ``_curl_tls_code`` docstring), grep still receives EOF and the
-    ``|| echo "BLOCKED"`` fallback fires instead of the pipeline hanging
+    ``|| echo "BLOCKED"`` fallback runs instead of the pipeline hanging
     until the guest-agent timeout.
     """
     curl_flags = _CURL_VERSION_FLAGS[tls_version]
@@ -426,11 +415,15 @@ async def test_curl_verbose_tls_negotiation(
     result = await run_once(
         scheduler, VmSpec(language=Language.RAW, allow_network=True, allowed_domains=[domain]), code
     )
-    assert "CONNECTED" in result.stdout, (
+    # The handshake line, then CONNECTED. The rest of the line (key exchange group, signature, the
+    # TLS 1.2 cipher) is the server's choice: only the version and the asked cipher are checked.
+    *handshake, connected = result.stdout.splitlines()
+    assert connected == "CONNECTED", (
         f"curl TLS {tls_version} should connect to {domain}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert expected_version in result.stdout, f"Expected {expected_version} in verbose output.\nstdout: {result.stdout}"
-    assert expected_cipher in result.stdout, f"Expected '{expected_cipher}' in verbose output.\nstdout: {result.stdout}"
+    (line,) = handshake
+    assert line.startswith(f"* SSL connection using {expected_version} / "), line
+    assert expected_cipher in line, line
 
 
 # =============================================================================
@@ -445,14 +438,14 @@ async def test_ech_javascript_multiple_ech_domains(
     code = (
         JS_SAFETY
         + f"""try {{
-    const r1 = await fetch("https://{ECH_DOMAIN_CLOUDFLARE}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
-    console.log("CONNECTED:cloudflare:" + r1.status);
+    await fetch("https://{ECH_DOMAIN_CLOUDFLARE}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
+    console.log("CONNECTED:cloudflare");
 }} catch (e) {{
     console.log("BLOCKED:cloudflare:" + e.name);
 }}
 try {{
-    const r2 = await fetch("https://{ECH_DOMAIN_ONE}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
-    console.log("CONNECTED:one:" + r2.status);
+    await fetch("https://{ECH_DOMAIN_ONE}/", {{ signal: AbortSignal.timeout({NET_OP_TIMEOUT_S * 1000}) }});
+    console.log("CONNECTED:one");
 }} catch (e) {{
     console.log("BLOCKED:one:" + e.name);
 }}"""
@@ -464,9 +457,7 @@ try {{
         ),
         code,
     )
-    assert "CONNECTED:cloudflare:" in result.stdout, (
-        f"Bun should connect to {ECH_DOMAIN_CLOUDFLARE}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-    assert "CONNECTED:one:" in result.stdout, (
-        f"Bun should connect to {ECH_DOMAIN_ONE}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.stdout == "CONNECTED:cloudflare\nCONNECTED:one\n", (
+        f"Bun should connect to {ECH_DOMAIN_CLOUDFLARE} and {ECH_DOMAIN_ONE}.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
