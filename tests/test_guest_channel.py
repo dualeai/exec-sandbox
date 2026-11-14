@@ -9,7 +9,7 @@ closes its end, then the channel writes (EPIPE).
 import asyncio
 import os
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -21,13 +21,20 @@ from tests.instance_support import await_until
 
 @dataclass
 class _Guest:
-    """The guest side of a channel's socket: each connection it accepted, in order."""
+    """The guest side of a channel's socket: each connection it accepted, in order.
+
+    It keeps each writer it hands out until the test ends: since Python 3.13 a StreamWriter
+    that is garbage-collected closes its socket, which would end the connection of a guest
+    that reads nothing in the middle of the test."""
 
     path: Path
     accepted: asyncio.Queue[tuple[asyncio.StreamReader, asyncio.StreamWriter]]
+    handed_out: list[asyncio.StreamWriter] = field(default_factory=list[asyncio.StreamWriter])
 
     async def next_connection(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.wait_for(self.accepted.get(), timeout=1)
+        reader, writer = await asyncio.wait_for(self.accepted.get(), timeout=1)
+        self.handed_out.append(writer)
+        return reader, writer
 
 
 @pytest.fixture
@@ -39,11 +46,14 @@ async def guest(short_tmp_dir: Path) -> AsyncIterator[_Guest]:
 
     path = short_tmp_dir / "cmd.sock"
     server = await asyncio.start_unix_server(on_connect, path=str(path))
+    guest = _Guest(path, accepted)
     try:
-        yield _Guest(path, accepted)
+        yield guest
     finally:
         while not accepted.empty():
             accepted.get_nowait()[1].close()
+        for writer in guest.handed_out:
+            writer.close()
         server.close()
 
 

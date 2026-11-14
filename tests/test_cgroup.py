@@ -1062,11 +1062,13 @@ class TestCgroupIntegration:
         # Create cgroup
         cgroup_path = (await self._create(unique_vm_id, memory_mb=256)).path
 
-        # Start a process that does some work
+        # A process that writes 16 MiB only once it is in the cgroup (it waits for a line on
+        # stdin): cgroup v2 does not move what a process charged before its move
         proc = await asyncio.create_subprocess_exec(
             "python3",
             "-c",
-            "x = [0] * 1000000; import time; time.sleep(0.5)",
+            "import sys; sys.stdin.readline(); x = b'x' * (16 * 1024 * 1024); import time; time.sleep(0.5)",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -1074,19 +1076,17 @@ class TestCgroupIntegration:
         try:
             assert proc.pid is not None
             assert await Cgroup(cgroup_path).attach(proc.pid)
-
-            # Wait for process to do some work
-            await proc.wait()
+            await proc.communicate(b"go\n")  # the work starts now, in the cgroup
 
             # Read stats
             stats = Cgroup(cgroup_path).stats()
             cpu_ms, mem_mb, nr_throttled = stats.cpu_time_ms, stats.peak_memory_mb, stats.nr_throttled
 
-            # The process did work: a Python start takes CPU time, and the list alone is 8 MB
+            # The process did work: a Python start takes CPU time, and its bytes alone are 16 MiB
             assert cpu_ms is not None, "CPU stats not available"
             assert cpu_ms > 0, f"CPU time of the process not counted: {cpu_ms}"
             if mem_mb is not None:  # memory.peak: Linux 5.19+
-                assert mem_mb >= 8, f"Peak memory below the 8 MB list: {mem_mb}"
+                assert mem_mb >= 16, f"Peak memory below the 16 MiB written: {mem_mb}"
             assert nr_throttled is not None, "cpu.stat has nr_throttled with the cpu controller on"
 
         finally:
