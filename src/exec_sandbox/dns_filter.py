@@ -13,7 +13,7 @@ from exec_sandbox.constants import NPM_PACKAGE_DOMAINS, PYTHON_PACKAGE_DOMAINS
 # Security: Domain validation pattern (RFC 1035 compliant)
 # Prevents ReDoS attacks and regex injection via malicious domain input
 # Labels: alphanumeric, can contain hyphens (not at start/end), 1-63 chars each
-# TLD: must be alphabetic only (no numbers), 2+ chars
+# TLD: letters only (no digits)
 # Total length: max 253 characters
 _DOMAIN_LABEL_PATTERN = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 _DOMAIN_MAX_LENGTH = 253
@@ -40,11 +40,14 @@ def validate_domain(domain: str) -> None:
     """
     if not domain:
         raise ValueError("Domain cannot be empty")
-    if len(domain) > _DOMAIN_MAX_LENGTH:
-        raise ValueError(f"Domain too long: {len(domain)} > {_DOMAIN_MAX_LENGTH}")
+    # One final dot is the FQDN form: not part of the 253-character name; a second is
+    # an empty label
+    name = domain.removesuffix(".")
+    if len(name) > _DOMAIN_MAX_LENGTH:
+        raise ValueError(f"Domain too long: {len(name)} > {_DOMAIN_MAX_LENGTH}")
 
     # Split and validate each label
-    labels = domain.rstrip(".").split(".")
+    labels = name.split(".")
     if len(labels) < 2:  # noqa: PLR2004
         raise ValueError(f"Domain must have at least 2 labels (got {len(labels)}): {domain!r}")
 
@@ -53,13 +56,25 @@ def validate_domain(domain: str) -> None:
             raise ValueError(f"Domain contains empty label: {domain!r}")
         if len(label) > 63:  # noqa: PLR2004
             raise ValueError(f"Domain label too long ({len(label)} > 63): {label!r}")
-        if not _DOMAIN_LABEL_PATTERN.match(label):
+        if not _DOMAIN_LABEL_PATTERN.fullmatch(label):  # match with `$` would let a final newline in
             raise ValueError(f"Invalid domain label format: {label!r} in {domain!r}")
 
     # TLD must be alphabetic only (no numbers allowed)
     tld = labels[-1]
     if not tld.isalpha():
         raise ValueError(f"TLD must be alphabetic only: {tld!r} in {domain!r}")
+
+
+def normalize_domain(domain: str) -> str:
+    """`domain` as the network filter compares names: checked (validate_domain), with no final
+    dot (the FQDN form) and lowercase. gvproxy lowercases DNS names and TLS SNI before its
+    regex match, and drops the final dot of a DNS name; SNI never has one.
+
+    Raises:
+        ValueError: the domain is not valid (validate_domain)
+    """
+    validate_domain(domain)
+    return domain.removesuffix(".").lower()
 
 
 def create_outbound_patterns(domains: Sequence[str]) -> list[str]:
@@ -87,12 +102,12 @@ def create_outbound_patterns(domains: Sequence[str]) -> list[str]:
     for domain in domains:
         # Security: Validate domain format before constructing regex
         # Prevents ReDoS attacks and regex injection
-        validate_domain(domain)
+        name = normalize_domain(domain)
         patterns.append(
             # Match domain AND all subdomains: (.*\.)? makes prefix optional
             # Matches both "pypi.org" and "www.pypi.org"
             # Trailing \.? handles FQDN format (e.g., "google.com.")
-            f"^(.*\\.)?{domain.replace('.', '\\.')}\\.?$"
+            f"^(.*\\.)?{name.replace('.', '\\.')}\\.?$"
         )
     return patterns
 
@@ -119,22 +134,11 @@ def generate_outbound_allow_json(
         >>> json_str
         '[]'
     """
-    # Auto-expand package domains if not specified (None = use defaults)
+    # None: the language's package registries (raw has none: no filter)
     if allowed_domains is None:
-        if language == "python":
-            allowed_domains = PYTHON_PACKAGE_DOMAINS.copy()
-        elif language == "javascript":
-            allowed_domains = NPM_PACKAGE_DOMAINS.copy()
-        else:
-            # No language-specific defaults, no filtering
-            return "[]"
+        allowed_domains = {"python": PYTHON_PACKAGE_DOMAINS, "javascript": NPM_PACKAGE_DOMAINS}.get(language, [])
 
-    # Empty list = no domain filter: with allow_network, all outbound is allowed
+    # No domain ("[]") = no domain filter: with allow_network, all outbound is allowed
     # (by design). Blocking all outbound is the -block-outbound flag, set only
     # when ports are exposed without allow_network.
-    if len(allowed_domains) == 0:
-        return "[]"
-
-    # Create outbound allow patterns
-    patterns = create_outbound_patterns(allowed_domains)
-    return json.dumps(patterns, separators=(",", ":"))
+    return json.dumps(create_outbound_patterns(allowed_domains), separators=(",", ":"))

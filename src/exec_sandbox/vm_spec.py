@@ -1,10 +1,9 @@
 """VmSpec: what a VM is made of.
 
-Everything that shapes the guest lives in one frozen object: the L1 template a
-VM can come from is keyed on it, and a saved instance stores it so a load
-rebuilds the same VM. Values of one launch only (vm id, tenant and task ids,
-work paths, host ports allocated at launch, timeouts, file descriptors) are not
-part of it.
+One frozen object holds everything that shapes the guest: the L1 memory
+snapshot cache is keyed on it, and a saved instance stores it, so a load makes
+the same VM again. Values of one launch only (vm id, work paths, host ports
+picked at launch, timeouts) are not part of it.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from exec_sandbox import constants
-from exec_sandbox.dns_filter import validate_domain
+from exec_sandbox.dns_filter import normalize_domain
 from exec_sandbox.models import Language, PortMapping
 
 if TYPE_CHECKING:
@@ -57,7 +56,8 @@ class VmSpec(BaseModel):
         description="With allow_network: the only domains the guest may reach, and their subdomains. "
         "None: the language's package registries only (PyPI for python, npm for javascript; no limit for raw). "
         "Empty: no limit. "
-        "Each is a domain name (RFC 1035, alphabetic TLD), checked when the spec is built.",
+        "Each entry must be a domain name (RFC 1035, alphabetic TLD), checked when the spec is built; "
+        "the spec keeps each name once, lowercase, with no final dot, in sorted order.",
     )
     expose_ports: tuple[PortMapping, ...] = Field(
         default=(),
@@ -75,9 +75,9 @@ class VmSpec(BaseModel):
     def _check_domains(cls, domains: tuple[str, ...] | None) -> tuple[str, ...] | None:
         # Checked here, not when gvproxy starts: a bad entry fails when the spec is
         # built (pydantic ValidationError), before any VM or reservation.
-        for domain in domains or ():
-            validate_domain(domain)
-        return domains
+        # As the network filter compares names: no final dot, lowercase; each
+        # name once and sorted, as packages are, so the same set is the same spec
+        return None if domains is None else tuple(sorted({normalize_domain(domain) for domain in domains}))
 
     @field_validator("expose_ports", mode="before")
     @classmethod

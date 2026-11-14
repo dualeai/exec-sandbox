@@ -3,19 +3,15 @@
 import pytest
 from pydantic import ValidationError
 
-from exec_sandbox import constants
 from exec_sandbox.models import Language, PortMapping
 from exec_sandbox.vm_spec import VmSpec
 
 
 class TestVmSpec:
     def test_defaults(self) -> None:
+        """192 MB of RAM, 1 vCPU, a 1024 MB home disk, no package, no network."""
         spec = VmSpec(language=Language.PYTHON)
-        assert (spec.memory_mb, spec.cpu_cores, spec.disk_mb) == (
-            constants.DEFAULT_MEMORY_MB,
-            constants.DEFAULT_VM_CPU_CORES,
-            constants.DEFAULT_DISK_MB,
-        )
+        assert (spec.memory_mb, spec.cpu_cores, spec.disk_mb) == (192, 1, 1024)
         assert (spec.packages, spec.allow_network, spec.allowed_domains, spec.expose_ports) == ((), False, None, ())
 
     def test_packages_are_canonical(self) -> None:
@@ -49,6 +45,16 @@ class TestVmSpec:
         with pytest.raises(ValidationError):
             spec.memory_mb = 1024  # type: ignore[misc]
 
+    def test_domains_are_kept_as_the_network_filter_compares_them(self) -> None:
+        """Lowercase and with no final dot: gvproxy matches lowercase names with no final dot,
+        so "GitHub.com." must allow github.com. Each name once and sorted: the
+        same set of names, in any order or form, is the same spec."""
+        spec = VmSpec(
+            language=Language.PYTHON, allow_network=True, allowed_domains=("PyPI.org", "GitHub.com.", "github.com")
+        )
+        assert spec.allowed_domains == ("github.com", "pypi.org")
+        assert spec == VmSpec(language=Language.PYTHON, allow_network=True, allowed_domains=("pypi.org", "github.com"))
+
     def test_json_round_trip(self) -> None:
         """A saved instance stores the spec as JSON and rebuilds the same VM from it."""
         spec = VmSpec(
@@ -59,10 +65,10 @@ class TestVmSpec:
     @pytest.mark.parametrize(
         "fields",
         [
-            pytest.param({"memory_mb": constants.MIN_MEMORY_MB - 1}, id="memory-below-min"),
-            pytest.param({"disk_mb": constants.MIN_DISK_MB - 1}, id="disk-below-min"),
+            pytest.param({"memory_mb": 127}, id="memory-below-min"),
+            pytest.param({"disk_mb": 127}, id="disk-below-min"),
             pytest.param({"cpu_cores": 0}, id="no-cpu"),
-            pytest.param({"expose_ports": list(range(1, constants.MAX_EXPOSED_PORTS + 2))}, id="too-many-ports"),
+            pytest.param({"expose_ports": list(range(1, 12))}, id="too-many-ports"),
             pytest.param({"expose_ports": None}, id="ports-not-a-sequence"),
             pytest.param({"language": "cobol"}, id="unknown-language"),
             pytest.param({"memroy_mb": 256}, id="typo-field"),
@@ -75,7 +81,12 @@ class TestVmSpec:
         with pytest.raises(ValidationError):
             VmSpec.model_validate({"language": "python", **fields})
 
-    @pytest.mark.parametrize("memory_mb", [constants.MIN_MEMORY_MB, 65536])
+    @pytest.mark.parametrize("memory_mb", [128, 65536])
     def test_memory_bounds_accept(self, memory_mb: int) -> None:
-        """MIN_MEMORY_MB is the floor; there is no ceiling (the host admission decides)."""
+        """128 MB is the floor; there is no ceiling (the host admission decides)."""
         assert VmSpec(language=Language.PYTHON, memory_mb=memory_mb).memory_mb == memory_mb
+
+    def test_smallest_disk_and_most_ports_accept(self) -> None:
+        """128 MB is the smallest home disk; 10 is the most exposed ports."""
+        spec = VmSpec(language=Language.PYTHON, disk_mb=128, expose_ports=list(range(1, 11)))
+        assert (spec.disk_mb, len(spec.expose_ports)) == (128, 10)
