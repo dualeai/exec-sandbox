@@ -91,18 +91,6 @@ class TestFileContentTypes:
         assert result == content
         assert hashlib.sha256(result).hexdigest() == expected_hash
 
-    async def test_binary_roundtrip(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """Random binary data survives roundtrip."""
-        content = os.urandom(4096)
-        expected_hash = hashlib.sha256(content).hexdigest()
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("binary.bin", content)
-            await session.read_file("binary.bin", destination=tmp_path / "binary.bin")
-
-        result = (tmp_path / "binary.bin").read_bytes()
-        assert hashlib.sha256(result).hexdigest() == expected_hash
-
     async def test_utf8_emoji_and_cjk(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """UTF-8 content with emoji and CJK characters survives roundtrip."""
         text = "Hello World cafe\u0301 \u00f1 \u4f60\u597d \U0001f389\U0001f680\U0001f30d \u3053\u3093\u306b\u3061\u306f \ud55c\uad6d\uc5b4"
@@ -169,33 +157,6 @@ class TestFileContentTypes:
 
 class TestCrossOperationVerification:
     """Verify files written by file I/O APIs are accessible to exec and vice versa."""
-
-    async def test_write_file_then_exec_reads(self, scheduler: Scheduler) -> None:
-        """File written via write_file is readable by session.exec."""
-        content = b"Hello from write_file API"
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("message.txt", content)
-
-            result = await session.exec(
-                'with open("/home/user/message.txt", "rb") as f:\n    data = f.read()\nprint(data)'
-            )
-
-            assert result.exit_code == 0
-            assert "Hello from write_file API" in result.stdout
-
-    async def test_exec_writes_then_read_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
-        """File written by session.exec is readable via read_file."""
-        dest = tmp_path / "from_exec.txt"
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            result = await session.exec(
-                'with open("/home/user/from_exec.txt", "wb") as f:\n    f.write(b"Hello from exec")'
-            )
-            assert result.exit_code == 0
-
-            await session.read_file("from_exec.txt", destination=dest)
-
-        assert dest.read_bytes() == b"Hello from exec"
 
     async def test_write_file_exec_modifies_read_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Write via API, modify via exec, read back via API."""

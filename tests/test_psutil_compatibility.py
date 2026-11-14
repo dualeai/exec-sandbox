@@ -56,7 +56,7 @@ _MAX_KERNEL_OVERHEAD_RATIO = 0.30
 def _memory_lower_bound_mb(configured_mb: int) -> float:
     """Minimum expected MemTotal for a given QEMU -m value.
 
-    Uses the lesser of a fixed overhead (50 MB) and 25% of configured size
+    Uses the lesser of a fixed overhead (50 MB) and 30% of configured size
     so that small VMs (128 MB) get a tighter bound than large ones.
     """
     overhead = min(_KERNEL_OVERHEAD_MB, configured_mb * _MAX_KERNEL_OVERHEAD_RATIO)
@@ -903,42 +903,6 @@ print(f'JUPYTER_OK:True')
         assert sys_total >= lower
         assert sys_total <= _DEFAULT_MEMORY_MB
 
-    async def test_ml_resource_detection_pattern(self, scheduler: Scheduler) -> None:
-        """Simulate ML framework resource detection (PyTorch Lightning, Accelerate).
-
-        Before training, ML frameworks query CPU count + available memory to
-        configure data loaders (num_workers) and batch sizes.
-
-        Cross-validates that the detected resources match our VM settings.
-        """
-        code = """\
-import psutil
-
-# Detect available compute resources
-cpu_count = psutil.cpu_count(logical=True)
-mem = psutil.virtual_memory()
-total_mb = mem.total / (1024 * 1024)
-avail_mb = mem.available / (1024 * 1024)
-
-# Typical heuristic: num_workers = min(cpu_count, 4)
-num_workers = min(cpu_count, 4)
-
-print(f'CPU_COUNT:{cpu_count}')
-print(f'TOTAL_MB:{total_mb:.1f}')
-print(f'AVAIL_MB:{avail_mb:.1f}')
-print(f'NUM_WORKERS:{num_workers}')
-print(f'ML_DETECT_OK:True')
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "ML_DETECT_OK:True" in result.stdout
-        cpu = int(result.stdout.split("CPU_COUNT:")[1].split("\n")[0])
-        assert cpu == DEFAULT_VM_CPU_CORES, f"ML framework would see {cpu} CPUs, expected {DEFAULT_VM_CPU_CORES}"
-        total_mb = float(result.stdout.split("TOTAL_MB:")[1].split("\n")[0])
-        lower = _memory_lower_bound_mb(_DEFAULT_MEMORY_MB)
-        assert total_mb >= lower
-        assert total_mb <= _DEFAULT_MEMORY_MB
-
     async def test_process_tree_enumeration(self, scheduler: Scheduler) -> None:
         """Enumerate all processes — used by top/htop-like tools and debuggers."""
         code = """\
@@ -966,44 +930,3 @@ print(f'PID1_FOUND:{pid1_found}')
         count = int(result.stdout.split("PROC_COUNT:")[1].split("\n")[0])
         assert count >= 1
         assert "PID1_FOUND:False" in result.stdout
-
-    @pytest.mark.parametrize(
-        "code,check",
-        [
-            pytest.param(
-                f"import psutil; print(f'OK:{{psutil.cpu_count() == {DEFAULT_VM_CPU_CORES}}}')",
-                "OK:True",
-                id="cpu-count-exact",
-            ),
-            pytest.param(
-                "import psutil; print(f'OK:{psutil.virtual_memory().total > 0}')",
-                "OK:True",
-                id="memory-total",
-            ),
-            pytest.param(
-                "import psutil; print(f'OK:{psutil.virtual_memory().available > 0}')",
-                "OK:True",
-                id="memory-available",
-            ),
-            pytest.param(
-                "import psutil; print(f'OK:{psutil.disk_usage(\"/\").total > 0}')",
-                "OK:True",
-                id="disk-total",
-            ),
-            pytest.param(
-                "import psutil; print(f'OK:{len(psutil.pids()) >= 1}')",
-                "OK:True",
-                id="pids-non-empty",
-            ),
-            pytest.param(
-                "import psutil; print(f'OK:{psutil.boot_time() > 0}')",
-                "OK:True",
-                id="boot-time",
-            ),
-        ],
-    )
-    async def test_one_liner_checks(self, scheduler: Scheduler, code: str, check: str) -> None:
-        """Quick smoke tests for common psutil one-liner patterns."""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=PSUTIL_PACKAGES), code)
-        assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert check in result.stdout

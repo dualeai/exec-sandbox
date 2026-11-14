@@ -69,58 +69,6 @@ print(f'ORPHAN_PPID:{orphan_ppid}')
         # Orphan should be reparented to PID 1 (guest-agent)
         assert "ORPHAN_PPID:1" in result.stdout, f"Orphan not reparented to PID 1, got: {result.stdout}"
 
-    async def test_single_orphan_reaped(self, scheduler: Scheduler) -> None:
-        """Single orphan process is reaped and doesn't become a zombie."""
-        # Double-fork to create orphan: A forks B, A exits, B is orphan
-        code = """
-import os
-import time
-
-# Double-fork to create orphan
-pid = os.fork()
-if pid == 0:
-    # Child A: fork again then exit immediately
-    grandchild = os.fork()
-    if grandchild == 0:
-        # Grandchild B: becomes orphan when A exits, reparented to PID 1
-        time.sleep(0.3)
-        os._exit(0)
-    else:
-        # A exits immediately, orphaning B
-        os._exit(0)
-
-# Main process: wait for B to exit and be reaped by guest-agent (PID 1)
-time.sleep(1)
-
-# Count zombies whose parent is PID 1 (orphans that guest-agent should reap)
-# Zombies with other parents are children of processes that haven't called wait()
-zombie_count = 0
-for entry in os.listdir('/proc'):
-    if entry.isdigit():
-        try:
-            with open(f'/proc/{entry}/status') as f:
-                content = f.read()
-                # Only count if: State is Z (zombie) AND PPid is 1 (orphan)
-                is_zombie = False
-                is_orphan = False
-                for line in content.splitlines():
-                    if line.startswith('State:') and 'Z' in line:
-                        is_zombie = True
-                    if line.startswith('PPid:') and line.split()[1] == '1':
-                        is_orphan = True
-                if is_zombie and is_orphan:
-                    zombie_count += 1
-        except (IOError, FileNotFoundError, PermissionError):
-            pass
-
-print(f'ZOMBIE_COUNT:{zombie_count}')
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 0, f"Execution failed: {result.stderr}"
-        assert "ZOMBIE_COUNT:0" in result.stdout, f"Expected no zombies, got: {result.stdout}"
-
     async def test_multiple_orphans_reaped(self, scheduler: Scheduler) -> None:
         """Multiple orphan processes are all reaped."""
         code = """

@@ -32,7 +32,7 @@ class TestForkStdoutCapture:
     """Normal: fork + stdout capture works with the PID guard."""
 
     async def test_fork_child_sys_exit_parent_prints(self, scheduler: Scheduler) -> None:
-        """THE reported bug: child sys.exit() no longer writes premature sentinel.
+        """A child's sys.exit() writes no premature sentinel.
 
         Without PID guard, child's sys.exit() raises SystemExit caught by the
         REPL wrapper, which writes a sentinel before the parent finishes.
@@ -84,9 +84,9 @@ else:
         assert "PARENT_OK" in result.stdout, f"Parent output missing: {result.stdout}"
 
     async def test_fork_child_os_exit_with_explicit_flush(self, scheduler: Scheduler) -> None:
-        """Baseline: child with flush=True + os._exit(0) already works.
+        """Baseline: child with flush=True + os._exit(0).
 
-        This pattern works without the PID guard. Proves the fix doesn't regress it.
+        This pattern works without the PID guard; the guard must not break it.
         """
         code = """
 import os
@@ -139,11 +139,12 @@ print("PARENT_PRESENT")
         assert "PARENT_PRESENT" in result.stdout, f"Parent output missing: {result.stdout}"
 
     async def test_fork_child_nonzero_exit_code_preserved(self, scheduler: Scheduler) -> None:
-        """Child sys.exit(42) propagates exit code through PID guard.
+        """Child sys.exit(42) propagates exit code through PID guard; the result is the parent's.
 
         The REPL wrapper's except SystemExit handler sets exit_code = e.code.
         The PID guard then calls os._exit(exit_code), preserving the code.
-        Parent uses waitpid to verify the child's exit status.
+        Parent uses waitpid to verify the child's exit status. Only the parent
+        writes the sentinel: result.exit_code is 0, not the child's 42.
         """
         code = """
 import os
@@ -161,7 +162,8 @@ print("PARENT_OK")
 
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
 
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
+        # Without the PID guard, the child's premature sentinel gives its own exit code (42)
+        assert result.exit_code == 0, f"Parent exit_code 0 expected, got {result.exit_code}: {result.stderr}"
         assert "CHILD_EXIT:42" in result.stdout, f"Child exit code not preserved: {result.stdout}"
         assert "PARENT_OK" in result.stdout, f"Parent output missing: {result.stdout}"
 
@@ -355,39 +357,12 @@ print("PARENT_STDOUT")
 class TestForkStdoutOutOfBounds:
     """Out of bounds: failure modes and limits."""
 
-    async def test_fork_result_exit_code_is_parent_not_child(self, scheduler: Scheduler) -> None:
-        """Child sys.exit(99), parent completes normally. result.exit_code must be 0.
-
-        This is the most direct test of the fix's correctness: without the PID
-        guard, the child's premature sentinel reports exit_code=99. With the
-        fix, only the parent writes the sentinel (exit_code=0).
-        """
-        code = """
-import os
-
-pid = os.fork()
-if pid == 0:
-    import sys
-    sys.exit(99)
-
-os.waitpid(pid, 0)
-print("PARENT_DONE")
-"""
-
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 0, (
-            f"Expected parent exit_code 0, got {result.exit_code} "
-            f"(child's code leaked via premature sentinel?): {result.stderr}"
-        )
-        assert "PARENT_DONE" in result.stdout, f"Parent output missing: {result.stdout}"
-
     async def test_fork_repl_state_survives_child_death(self, scheduler: Scheduler) -> None:
-        """REPL namespace is not corrupted by the fork+PID guard cycle.
+        """The REPL and its namespace survive the fork + PID guard cycle.
 
-        Sets x = 42 before fork. Child sys.exit()'s. Parent prints x after
-        waitpid. The child's copy of ns is destroyed with the child; the
-        parent's ns is unchanged.
+        The first exec sets x = 42, forks, and the child calls sys.exit(). The next
+        exec of the same session reads x: the parent REPL still runs, with its
+        namespace. The child's copy of the namespace goes with the child.
         """
         code = """
 import os
@@ -399,10 +374,10 @@ if pid == 0:
     sys.exit(0)
 
 os.waitpid(pid, 0)
-print(f"x:{x}")
 """
+        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as vm:
+            forked = await vm.exec(code)
+            after = await vm.exec('print(f"x:{x}")')
 
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-
-        assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.stderr}"
-        assert "x:42" in result.stdout, f"REPL state corrupted: {result.stdout}"
+        assert forked.exit_code == 0, f"Expected exit_code 0, got {forked.exit_code}: {forked.stderr}"
+        assert (after.exit_code, after.stdout.strip()) == (0, "x:42"), f"REPL state lost: {after}"

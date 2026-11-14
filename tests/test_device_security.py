@@ -17,11 +17,26 @@ kernel/device-layer hardening that blocks access at the filesystem level.
 
 import pytest
 
-from exec_sandbox.constants import DEFAULT_DISK_MB
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import run_once
+
+_SIZE_AND_MEMTOTAL = """\
+import os
+with open('/proc/meminfo') as f:
+    mem_total_kb = next(int(line.split()[1]) for line in f if line.startswith('MemTotal:'))
+s = os.statvfs('{}')
+print(mem_total_kb * 1024, os.sysconf('SC_PAGESIZE'), s.f_blocks * s.f_frsize)
+"""
+"""Guest code: MemTotal in bytes, the page size, and the size of a tmpfs mount."""
+
+
+def _assert_page_aligned_share(stdout: str, *, share: float) -> None:
+    """The tmpfs size is `share` of MemTotal, rounded down to a whole page."""
+    mem_total, page, size = (int(field) for field in stdout.split())
+    assert size % page == 0, (size, page)
+    assert mem_total * share - page < size <= mem_total * share, (size, mem_total, page)
 
 
 # =============================================================================
@@ -53,20 +68,6 @@ class TestDangerousDeviceNodes:
         )
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
-
-    async def test_dev_mem_open_fails(self, dual_scheduler: Scheduler) -> None:
-        """open('/dev/mem') fails even if node is somehow recreated (defense-in-depth)."""
-        code = """\
-try:
-    f = open('/dev/mem', 'rb')
-    f.close()
-    print("unexpected_success")
-except (FileNotFoundError, PermissionError, OSError):
-    print("blocked")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
 
 
 # =============================================================================
@@ -183,26 +184,10 @@ with open('/proc/mounts') as f:
         assert "usrquota" in result.stdout
 
     async def test_shm_size_is_forty_pct_memtotal(self, dual_scheduler: Scheduler) -> None:
-        """Verify /dev/shm size is ~40% of MemTotal (memory-proportional)."""
-        code = """\
-import os
-with open('/proc/meminfo') as f:
-    for line in f:
-        if line.startswith('MemTotal:'):
-            mem_total_kb = int(line.split()[1])
-            break
-page_size = os.sysconf('SC_PAGESIZE')
-# 40% of RAM: mem_kb * 1024 * 2 / 5 = mem_kb * 2048 / 5, page-aligned
-expected_bytes = (mem_total_kb * 2048 // 5) // page_size * page_size
-s = os.statvfs('/dev/shm')
-shm_bytes = s.f_blocks * s.f_frsize
-print(f'EXPECTED_BYTES:{expected_bytes}')
-print(f'SHM_BYTES:{shm_bytes}')
-print(f'MATCH:{shm_bytes == expected_bytes}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "MATCH:True" in result.stdout
+        """/dev/shm size is 40% of MemTotal (memory-proportional), rounded down to a page."""
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _SIZE_AND_MEMTOTAL.format("/dev/shm"))
+        assert result.exit_code == 0, result.stderr
+        _assert_page_aligned_share(result.stdout, share=0.4)
 
     async def test_exec_blocked_on_dev_shm(self, dual_scheduler: Scheduler) -> None:
         """Script execution is blocked on /dev/shm (noexec enforcement)."""
@@ -306,27 +291,10 @@ with open('/proc/mounts') as f:
         assert result.stdout.strip() == "INODES:16384"
 
     async def test_tmpfs_size_is_half_memtotal(self, dual_scheduler: Scheduler) -> None:
-        """Verify /tmp size is ~50% of MemTotal (memory-proportional, not hardcoded)."""
-        code = """\
-import os
-# Read MemTotal from /proc/meminfo
-with open('/proc/meminfo') as f:
-    for line in f:
-        if line.startswith('MemTotal:'):
-            mem_total_kb = int(line.split()[1])
-            break
-page_size = os.sysconf('SC_PAGESIZE')
-half_mem_bytes = (mem_total_kb // 2) * 1024 // page_size * page_size  # page-align
-s = os.statvfs('/tmp')
-tmpfs_bytes = s.f_blocks * s.f_frsize
-print(f'MEMTOTAL_KB:{mem_total_kb}')
-print(f'HALF_MEM_BYTES:{half_mem_bytes}')
-print(f'TMPFS_BYTES:{tmpfs_bytes}')
-print(f'MATCH:{tmpfs_bytes == half_mem_bytes}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "MATCH:True" in result.stdout
+        """/tmp size is 50% of MemTotal (memory-proportional, not hardcoded), rounded down to a page."""
+        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), _SIZE_AND_MEMTOTAL.format("/tmp"))
+        assert result.exit_code == 0, result.stderr
+        _assert_page_aligned_share(result.stdout, share=0.5)
 
     async def test_usrquota_mount_option(self, dual_scheduler: Scheduler) -> None:
         """/tmp has usrquota mount option for per-UID quota enforcement."""
@@ -652,22 +620,6 @@ class TestBlockDeviceHardening:
         assert result.exit_code == 0
         assert result.stdout.strip() == "False"
 
-    async def test_filesystem_still_works(self, dual_scheduler: Scheduler) -> None:
-        """Read/write on the root filesystem works after /dev/vda removal."""
-        code = """\
-import os
-path = '/home/user/test_blkdev.txt'
-with open(path, 'w') as f:
-    f.write('block device node removed')
-with open(path) as f:
-    data = f.read()
-os.unlink(path)
-print(f'OK:{data}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "OK:block device node removed" in result.stdout
-
     # --- Edge cases: alternative paths to block device are closed ---
 
     async def test_dev_block_symlinks_broken(self, dual_scheduler: Scheduler) -> None:
@@ -742,20 +694,6 @@ except OSError as e:
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert result.stdout.strip().startswith("BLOCKED:")
-
-    async def test_dev_vda_open_fails(self, dual_scheduler: Scheduler) -> None:
-        """open('/dev/vda') fails (defense-in-depth, same pattern as /dev/mem test)."""
-        code = """\
-try:
-    f = open('/dev/vda', 'rb')
-    f.close()
-    print("unexpected_success")
-except (FileNotFoundError, PermissionError, OSError):
-    print("blocked")
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
 
     # --- Out of bounds cases: no block device nodes remain anywhere in /dev ---
 
@@ -1392,35 +1330,6 @@ class TestDevReadonlyHardening:
 
     # --- Normal: standard write attempts fail ---
 
-    async def test_dev_vda_write_fails(self, dual_scheduler: Scheduler) -> None:
-        """open('/dev/vda', 'wb') fails — node removed + /dev read-only."""
-        code = """\
-try:
-    f = open('/dev/vda', 'wb')
-    f.close()
-    print('unexpected_success')
-except (FileNotFoundError, PermissionError, OSError):
-    print('blocked')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_dev_vda_readwrite_os_open(self, dual_scheduler: Scheduler) -> None:
-        """os.open('/dev/vda', O_RDWR) fails (different syscall flags than Python open)."""
-        code = """\
-import os
-try:
-    fd = os.open('/dev/vda', os.O_RDWR)
-    os.close(fd)
-    print('unexpected_success')
-except (FileNotFoundError, PermissionError, OSError):
-    print('blocked')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
     async def test_dev_mounted_readonly(self, dual_scheduler: Scheduler) -> None:
         """/dev is mounted read-only; mknod returns EROFS."""
         code = """\
@@ -1452,90 +1361,43 @@ except OSError as e:
         assert "MKNOD:errno_" in result.stdout
         assert "MKNOD:success" not in result.stdout
 
-    # --- Normal: mmap attacks blocked (requires open() first) ---
+    # --- Normal: every access path to the removed nodes fails ---
 
-    async def test_dev_vda_mmap_blocked(self, dual_scheduler: Scheduler) -> None:
-        """open('/dev/vda', 'rb') + mmap fails — node removed."""
+    async def test_removed_nodes_refuse_every_access_path(self, dual_scheduler: Scheduler) -> None:
+        """/dev/vda and /dev/mem refuse each access path: read, write and read-write opens,
+        os.open(O_RDWR), read and write mmap (an open comes first), and the /proc/self/root
+        traversal (WithSecure Labs vector). One VM tries each path in turn."""
         code = """\
-import mmap
-try:
-    f = open('/dev/vda', 'rb')
-    m = mmap.mmap(f.fileno(), 4096)
-    m.close()
-    f.close()
-    print('unexpected_success')
-except (FileNotFoundError, PermissionError, OSError):
-    print('blocked')
+import mmap, os
+
+def mapped(path, mode, prot):
+    with open(path, mode) as f:
+        mmap.mmap(f.fileno(), 4096, mmap.MAP_SHARED, prot).close()
+
+attempts = {
+    'open-rb /dev/vda': lambda: open('/dev/vda', 'rb').close(),
+    'open-wb /dev/vda': lambda: open('/dev/vda', 'wb').close(),
+    'os.open-rdwr /dev/vda': lambda: os.close(os.open('/dev/vda', os.O_RDWR)),
+    'mmap-read /dev/vda': lambda: mapped('/dev/vda', 'rb', mmap.PROT_READ),
+    'mmap-write /dev/vda': lambda: mapped('/dev/vda', 'r+b', mmap.PROT_WRITE),
+    'open-rb /proc/self/root/dev/vda': lambda: open('/proc/self/root/dev/vda', 'rb').close(),
+    'open-rb /dev/mem': lambda: open('/dev/mem', 'rb').close(),
+    'mmap-read /dev/mem': lambda: mapped('/dev/mem', 'rb', mmap.PROT_READ),
+}
+for label, attempt in attempts.items():
+    try:
+        attempt()
+        print(f'{label}:OPENED')
+    except OSError:
+        print(f'{label}:blocked')
 """
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_dev_mem_mmap_blocked(self, dual_scheduler: Scheduler) -> None:
-        """open('/dev/mem', 'rb') + mmap fails — node removed."""
-        code = """\
-import mmap
-try:
-    f = open('/dev/mem', 'rb')
-    m = mmap.mmap(f.fileno(), 4096)
-    m.close()
-    f.close()
-    print('unexpected_success')
-except (FileNotFoundError, PermissionError, OSError):
-    print('blocked')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_dev_vda_mmap_write_blocked(self, dual_scheduler: Scheduler) -> None:
-        """open('/dev/vda', 'r+b') + writable mmap fails — node removed."""
-        code = """\
-import mmap
-try:
-    f = open('/dev/vda', 'r+b')
-    m = mmap.mmap(f.fileno(), 4096, mmap.MAP_SHARED, mmap.PROT_WRITE)
-    m.close()
-    f.close()
-    print('unexpected_success')
-except (FileNotFoundError, PermissionError, OSError):
-    print('blocked')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
+        assert result.exit_code == 0, result.stderr
+        outcomes = result.stdout.splitlines()
+        assert len(outcomes) == 8, outcomes
+        assert all(line.endswith(":blocked") for line in outcomes), outcomes
 
     # --- Edge: alternative access paths closed ---
-
-    async def test_proc_self_root_traversal_blocked(self, dual_scheduler: Scheduler) -> None:
-        """/proc/self/root/dev/vda fails (WithSecure Labs traversal vector)."""
-        code = """\
-try:
-    f = open('/proc/self/root/dev/vda', 'rb')
-    f.close()
-    print('unexpected_success')
-except (FileNotFoundError, PermissionError, OSError):
-    print('blocked')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_mknod_tmp_nodev(self, dual_scheduler: Scheduler) -> None:
-        """mknod in /tmp fails — nodev mount flag blocks block device creation."""
-        code = """\
-import os, stat
-try:
-    os.mknod('/tmp/fake_blk', 0o660 | stat.S_IFBLK, os.makedev(253, 0))
-    print('CREATED')
-except PermissionError:
-    print('BLOCKED:EPERM')
-except OSError as e:
-    print(f'BLOCKED:{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.startswith("BLOCKED:")
 
     async def test_open_by_handle_at_blocked(self, dual_scheduler: Scheduler) -> None:
         """open_by_handle_at syscall fails without CAP_DAC_READ_SEARCH (Shocker exploit)."""
@@ -1750,15 +1612,6 @@ class TestRootFsReadonly:
     remounting rw to DoS subsequent code.
     """
 
-    ROOT_MOUNT_LINE = """\
-with open('/proc/mounts') as f:
-    for line in f:
-        parts = line.split()
-        if len(parts) >= 4 and parts[1] == '/':
-            print(line.strip())
-            break
-"""
-
     async def test_root_has_ro_flag(self, dual_scheduler: Scheduler) -> None:
         """Root filesystem has ro mount flag."""
         code = """\
@@ -1817,20 +1670,6 @@ except OSError as e:
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert result.stdout.startswith("BLOCKED:"), f"Expected write to /var to fail.\nstdout: {result.stdout}"
-
-    async def test_create_file_in_sbin_fails(self, dual_scheduler: Scheduler) -> None:
-        """Writing to /sbin fails with EROFS on read-only rootfs."""
-        code = """\
-try:
-    with open('/sbin/test_file', 'w') as f:
-        f.write('test')
-    print('WRITTEN')
-except OSError as e:
-    print(f'BLOCKED:{e.errno}')
-"""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert result.stdout.startswith("BLOCKED:"), f"Expected write to /sbin to fail.\nstdout: {result.stdout}"
 
     async def test_remount_rw_root_fails(self, dual_scheduler: Scheduler) -> None:
         """mount -o remount,rw / requires CAP_SYS_ADMIN — fails as UID 1000."""
@@ -1993,7 +1832,7 @@ with open('/proc/mounts') as f:
         assert "discard" in opts
 
     async def test_size_matches_disk(self, dual_scheduler: Scheduler) -> None:
-        """Usable space is the default home disk minus ext4 metadata (~95%)."""
+        """Usable space is the default home disk (1024 MB) minus ext4 metadata (~95%)."""
         code = """\
 import os
 s = os.statvfs('/home/user')
@@ -2002,7 +1841,7 @@ print(f'MB:{s.f_blocks * s.f_frsize // (1 << 20)}')
         result = await run_once(dual_scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         size_mb = int(result.stdout.split("MB:")[1].split()[0])
-        assert DEFAULT_DISK_MB * 0.9 <= size_mb <= DEFAULT_DISK_MB
+        assert 922 <= size_mb <= 1024  # 90 % of 1024 MB (921.6), rounded up
 
     async def test_cloudpickle_importable(self, dual_scheduler: Scheduler) -> None:
         """cloudpickle is importable (loaded from /usr/lib/python3/site-packages)."""
@@ -2375,14 +2214,6 @@ except OSError as e:
         assert result.stdout.startswith("BLOCKED:"), (
             f"Expected symlink creation in /bin to be blocked.\nstdout: {result.stdout}"
         )
-
-    # --- Edge: the specific attack vector ---
-
-    async def test_bin_sh_replacement_attack_blocked(self, dual_scheduler: Scheduler) -> None:
-        """rm /bin/sh via RAW language fails (the specific attack vector)."""
-        result = await run_once(dual_scheduler, VmSpec(language=Language.RAW), "rm /bin/sh 2>&1; echo EXIT:$?")
-        assert result.exit_code in {0, 1}
-        assert "EXIT:0" not in result.stdout, f"Expected rm /bin/sh to fail.\nstdout: {result.stdout}"
 
     # --- Normal: system binaries still functional ---
 

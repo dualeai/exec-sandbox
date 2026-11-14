@@ -130,62 +130,6 @@ except PermissionError:
 class TestSignalPid1Blocked:
     """All signals to PID 1 (root-owned guest-agent) are blocked by EPERM."""
 
-    async def test_sigkill_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """SIGKILL to PID 1 raises PermissionError (primary gap coverage)."""
-        code = """\
-import os, signal
-try:
-    os.kill(1, signal.SIGKILL)
-    print("unexpected_success")
-except PermissionError:
-    print("blocked")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_sigstop_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """SIGSTOP (uncatchable) to PID 1 raises PermissionError."""
-        code = """\
-import os, signal
-try:
-    os.kill(1, signal.SIGSTOP)
-    print("unexpected_success")
-except PermissionError:
-    print("blocked")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_sigint_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """SIGINT to PID 1 raises PermissionError."""
-        code = """\
-import os, signal
-try:
-    os.kill(1, signal.SIGINT)
-    print("unexpected_success")
-except PermissionError:
-    print("blocked")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
-    async def test_sigusr1_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """SIGUSR1 to PID 1 raises PermissionError."""
-        code = """\
-import os, signal
-try:
-    os.kill(1, signal.SIGUSR1)
-    print("unexpected_success")
-except PermissionError:
-    print("blocked")
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
-
     async def test_signal_0_pid1_blocked(self, scheduler: Scheduler) -> None:
         """Signal 0 (existence check) to PID 1 raises PermissionError."""
         code = """\
@@ -201,7 +145,8 @@ except PermissionError:
         assert "blocked" in result.stdout
 
     async def test_all_standard_signals_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """All standard signals (1-31) to PID 1 raise PermissionError.
+        """All standard signals (1-31) to PID 1 raise PermissionError (SIGKILL, SIGSTOP,
+        SIGINT, SIGTERM and SIGUSR1 among them), never another error.
 
         Exception: SIGCONT (18) is allowed across UID boundaries within the same
         session by the Linux kernel (it's the only signal with this property).
@@ -211,6 +156,7 @@ except PermissionError:
 import os, signal
 blocked = 0
 allowed = []
+other = []
 # SIGCONT (18) is allowed cross-UID within the same session -- kernel design
 EXPECTED_ALLOWED = {signal.SIGCONT}
 for sig in range(1, 32):
@@ -219,19 +165,20 @@ for sig in range(1, 32):
         allowed.append(sig)
     except PermissionError:
         blocked += 1
-    except OSError:
-        # EINVAL for invalid signal numbers on this arch -- still not a success
-        blocked += 1
+    except OSError as e:
+        other.append((sig, e.errno))
 unexpected = [s for s in allowed if s not in EXPECTED_ALLOWED]
 print(f"BLOCKED:{blocked}")
 print(f"ALLOWED:{sorted(allowed)}")
+print(f"OTHER:{other}")
 if unexpected:
     print(f"UNEXPECTED:{unexpected}")
 """
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
-        # 30 blocked (all except SIGCONT)
+        # 30 blocked (all except SIGCONT), each with EPERM
         assert "BLOCKED:30" in result.stdout
+        assert "OTHER:[]" in result.stdout
         assert "UNEXPECTED:" not in result.stdout
 
     async def test_realtime_signals_pid1_blocked(self, scheduler: Scheduler) -> None:

@@ -107,7 +107,8 @@ server.close();
 # Normal: TCP round-trip on loopback (bind + connect + send/recv)
 # =============================================================================
 class TestLoopbackTcpRoundtrip:
-    """Bind, connect, and exchange data over loopback."""
+    """Bind, connect, and exchange data over loopback. The default VmSpec has no network
+    access (allow_network=False: no gvproxy, no eth0): loopback works without it."""
 
     async def test_python_tcp_loopback(self, scheduler: Scheduler) -> None:
         """Python TCP server + client on 127.0.0.1 exchange PING/PONG."""
@@ -178,29 +179,6 @@ cat /tmp/nc_out
         result = await run_once(scheduler, VmSpec(language=Language.RAW), code)
         assert result.exit_code == 0
         assert "SHELL_PING" in result.stdout
-
-
-# =============================================================================
-# Edge: Loopback works even with allow_network=False
-# =============================================================================
-class TestLoopbackWithoutNetwork:
-    """Loopback operates independently of external networking."""
-
-    async def test_python_loopback_no_network(self, scheduler: Scheduler) -> None:
-        """TCP loopback works with allow_network=False (no gvproxy, no eth0)."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON, allow_network=False), _py_tcp_server_code("NO_NET_OK")
-        )
-        assert result.exit_code == 0
-        assert "NO_NET_OK" in result.stdout
-
-    async def test_javascript_loopback_no_network(self, scheduler: Scheduler) -> None:
-        """fetch('http://127.0.0.1:...') works with allow_network=False."""
-        result = await run_once(
-            scheduler, VmSpec(language=Language.JAVASCRIPT, allow_network=False), _js_http_fetch_code("NO_NET_JS")
-        )
-        assert result.exit_code == 0
-        assert "NO_NET_JS" in result.stdout
 
 
 # =============================================================================

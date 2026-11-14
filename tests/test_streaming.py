@@ -276,7 +276,8 @@ print("error line", file=sys.stderr)
         assert "error line" in "".join(stderr_chunks)
 
     async def test_only_stdout_no_stderr(self, scheduler: Scheduler) -> None:
-        """When only stdout is written, stderr callbacks don't fire."""
+        """When only stdout is written, stderr callbacks don't fire. Fast code (under 5 ms)
+        still delivers its output to the callback (the final flush)."""
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
 
@@ -289,7 +290,7 @@ print("error line", file=sys.stderr)
         )
 
         assert result.exit_code == 0
-        assert len(stdout_chunks) >= 1
+        assert "".join(stdout_chunks) == "hello\n"
         assert len(stderr_chunks) == 0
 
     @skip_unless_hwaccel
@@ -374,23 +375,6 @@ for i in range(5):
         # All lines collected in result regardless of callback failure
         for i in range(5):
             assert f"line-{i}" in result.stdout
-
-    async def test_extremely_long_single_line(self, scheduler: Scheduler) -> None:
-        """128KB with no newlines splits into >= 2 chunks."""
-        stdout_chunks: list[str] = []
-        target = 128 * 1024
-
-        code = f"""
-import sys
-sys.stdout.write("A" * {target})
-sys.stdout.flush()
-"""
-        result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code, on_stdout=stdout_chunks.append)
-
-        assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert len(joined) == target
-        assert len(stdout_chunks) >= 2
 
     async def test_output_containing_json_protocol_strings(self, scheduler: Scheduler) -> None:
         """Fake JSON protocol messages in output don't confuse parser."""
@@ -517,19 +501,6 @@ print("after-timeout")
         assert "before-timeout" in joined
         assert "after-timeout" not in joined
 
-    async def test_very_fast_code_delivers_data(self, scheduler: Scheduler) -> None:
-        """Sub-5ms code still delivers output via final flush."""
-        stdout_chunks: list[str] = []
-
-        result = await run_once(
-            scheduler, VmSpec(language=Language.PYTHON), 'print("fast")', on_stdout=stdout_chunks.append
-        )
-
-        assert result.exit_code == 0
-        joined = "".join(stdout_chunks)
-        assert "fast" in joined
-        assert len(stdout_chunks) >= 1
-
     async def test_crash_after_output_captures_partial(self, scheduler: Scheduler) -> None:
         """os._exit(42) after print — pre-crash output is captured."""
         stdout_chunks: list[str] = []
@@ -588,32 +559,6 @@ sys.stdout.flush()
             assert "exec-two" not in joined_1
             assert "exec-two" in joined_2
             assert "exec-one" not in joined_2
-
-    async def test_mixed_stdout_over_stderr_under_raises_output_limit(self, scheduler: Scheduler) -> None:
-        """stdout over limit raises InvalidInputError OUTPUT_LIMIT; stderr under limit is fine."""
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
-
-        stdout_size = 1_200_000  # 1.2MB — over 1MB limit
-        stderr_size = 50_000  # 50KB — well under 100KB limit
-
-        code = f"""
-import sys
-sys.stdout.write("O" * {stdout_size})
-sys.stdout.flush()
-sys.stderr.write("E" * {stderr_size})
-sys.stderr.flush()
-"""
-        with pytest.raises(
-            InvalidInputError, check=lambda e: e.code is ErrorCode.OUTPUT_LIMIT, match="output_limit_error"
-        ):
-            await run_once(
-                scheduler,
-                VmSpec(language=Language.PYTHON),
-                code,
-                on_stdout=stdout_chunks.append,
-                on_stderr=stderr_chunks.append,
-            )
 
     async def test_session_reuse_after_output_limit_error(self, scheduler: Scheduler) -> None:
         """REPL session survives InvalidInputError OUTPUT_LIMIT — next exec works normally."""

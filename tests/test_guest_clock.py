@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 
 from exec_sandbox.config import SchedulerConfig
-from exec_sandbox.migration_client import MigrationClient
 from exec_sandbox.models import Language
 from exec_sandbox.permission_utils import get_expected_socket_uid
+from exec_sandbox.qmp_client import QmpClient
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
 from tests.conftest import run_once, run_timed, skip_unless_hwaccel, wait_l1_saves
@@ -62,13 +62,20 @@ class TestGuestClock:
         _assert_in_window(int(result.stdout.strip()), before, after)
 
     async def test_pause_and_resume(self, l1_scheduler: Scheduler) -> None:
+        """A VM that the host paused for 3 s gets the host's time back at the next request."""
         async with await l1_scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            vm = session._vm
+            vm = session._vm  # the host pauses the VM on its QMP socket: no public accessor
             assert (await session.exec("x = 1")).exit_code == 0
-            async with MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as qmp:
-                await qmp._execute("stop", arguments=None, timeout=5.0)
+            async with QmpClient.connect(
+                vm.qmp_socket,
+                expected_uid=get_expected_socket_uid(vm.use_qemu_vm_user),
+                timeout=5.0,
+                error_factory=ConnectionResetError,
+                id_prefix="clock",
+            ) as qmp:
+                assert "return" in await qmp.execute("stop", arguments=None, timeout=5.0, on_event=None)
                 await asyncio.sleep(3)
-                await qmp._execute("cont", arguments=None, timeout=5.0)
+                assert "return" in await qmp.execute("cont", arguments=None, timeout=5.0, on_event=None)
 
             before = time.time_ns()
             result = await session.exec(_READ_TIME)

@@ -6,18 +6,13 @@ dispatch), all VMs restored from the same vmstate would produce identical
 os.urandom() output — a critical security vulnerability.
 
 This test forces L1 restore for multiple VMs and asserts their random output
-diverges, validating that the reseed_crng() fix in guest-agent/src/connection.rs
-works correctly.
+diverges: the guest agent reseeds the CRNG (reseed_crng, called in
+guest-agent/src/connection.rs) before each command.
 """
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
-from pathlib import Path
 
-import pytest
-
-from exec_sandbox.config import SchedulerConfig
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
@@ -31,23 +26,6 @@ import os, hashlib
 data = os.urandom(1024)
 print(hashlib.sha256(data).hexdigest())
 """
-
-
-@pytest.fixture
-async def l1_scheduler(images_dir: Path) -> AsyncGenerator[Scheduler, None]:
-    """Scheduler with L1 memory snapshots enabled, warm pool disabled.
-
-    Disabling the warm pool forces the scheduler to use cold boot → L1 cache path,
-    making it deterministic which VMs come from L1 restore.
-    """
-    config = SchedulerConfig(
-        images_dir=images_dir,
-        auto_download_assets=False,
-        warm_pool_size=0,  # Disable warm pool — force cold boot / L1 path
-        default_timeout_seconds=120,
-    )
-    async with Scheduler(config) as sched:
-        yield sched
 
 
 @skip_unless_hwaccel
@@ -65,21 +43,21 @@ class TestL1SnapshotRNG:
     VMs, indicating a broken or missing reseed.
     """
 
-    async def test_l1_restored_vms_different_random(self, l1_scheduler: Scheduler) -> None:
+    async def test_l1_restored_vms_different_random(self, scheduler: Scheduler) -> None:
         """Two VMs restored from the same L1 snapshot must produce different random."""
         # Step 1: Prime the L1 cache with a cold boot
-        prime_result = await run_once(l1_scheduler, VmSpec(language=Language.PYTHON), "print('prime')")
+        prime_result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('prime')")
         assert prime_result.exit_code == 0
 
         # Step 2: Wait for background L1 save to complete
         # The scheduler schedules a background save after first cold boot.
         # We need it to finish before the next calls can hit L1 cache.
-        await wait_l1_saves(l1_scheduler)
+        await wait_l1_saves(scheduler)
 
         # Step 3: Run two VMs concurrently — both should restore from L1
         runs = await asyncio.gather(
-            run_timed(l1_scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM),
-            run_timed(l1_scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM),
+            run_timed(scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM),
+            run_timed(scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM),
         )
         results = [run.result for run in runs]
 
@@ -98,19 +76,19 @@ class TestL1SnapshotRNG:
             f"Kernel CRNG state was cloned — no post-restore entropy re-seeding."
         )
 
-    async def test_l1_restored_vms_sequential_different_random(self, l1_scheduler: Scheduler) -> None:
+    async def test_l1_restored_vms_sequential_different_random(self, scheduler: Scheduler) -> None:
         """Even sequential L1 restores must produce different random — no state replay."""
         # Step 1: Prime L1 cache
-        prime_result = await run_once(l1_scheduler, VmSpec(language=Language.PYTHON), "print('prime')")
+        prime_result = await run_once(scheduler, VmSpec(language=Language.PYTHON), "print('prime')")
         assert prime_result.exit_code == 0
 
         # Step 2: Wait for L1 save
-        await wait_l1_saves(l1_scheduler)
+        await wait_l1_saves(scheduler)
 
         # Step 3: Run 3 VMs sequentially from L1
         hashes: list[str] = []
         for i in range(3):
-            result, startup, _ports = await run_timed(l1_scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM)
+            result, startup, _ports = await run_timed(scheduler, VmSpec(language=Language.PYTHON), IMMEDIATE_URANDOM)
             assert result.exit_code == 0, f"VM {i} failed: {result.stderr}"
             assert startup.l1_cache_hit, f"VM {i} did NOT come from L1 restore"
             hashes.append(result.stdout.strip())
@@ -137,12 +115,12 @@ console.log(JSON.stringify({ math: [Math.random(), Math.random()], outer, crypto
 
 @skip_unless_hwaccel
 class TestL1SnapshotJsRNG:
-    async def test_l1_restored_js_vms_different_random(self, l1_scheduler: Scheduler) -> None:
-        prime = await run_once(l1_scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log('prime')")
+    async def test_l1_restored_js_vms_different_random(self, scheduler: Scheduler) -> None:
+        prime = await run_once(scheduler, VmSpec(language=Language.JAVASCRIPT), "console.log('prime')")
         assert prime.exit_code == 0, prime.stderr
-        await wait_l1_saves(l1_scheduler)
+        await wait_l1_saves(scheduler)
 
-        runs = [await run_timed(l1_scheduler, VmSpec(language=Language.JAVASCRIPT), JS_RANDOM) for _ in range(2)]
+        runs = [await run_timed(scheduler, VmSpec(language=Language.JAVASCRIPT), JS_RANDOM) for _ in range(2)]
 
         for i, run in enumerate(runs):
             assert run.result.exit_code == 0, f"VM {i} failed: {run.result.stderr}"

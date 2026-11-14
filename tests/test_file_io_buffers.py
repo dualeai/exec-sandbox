@@ -47,7 +47,8 @@ class TestBufferRoundtrip:
         assert actual_hash == expected_hash
 
     async def test_write_bytes_read_bytesio(self, scheduler: Scheduler) -> None:
-        """Write from bytes, read to BytesIO — verify buf.getvalue()."""
+        """Write from bytes, read to BytesIO — verify buf.getvalue(). The caller's buffer
+        stays open after read_file (getvalue() raises on a closed BytesIO)."""
         content = os.urandom(4096)
         buf = io.BytesIO()
 
@@ -56,19 +57,6 @@ class TestBufferRoundtrip:
             await session.read_file("test.bin", destination=buf)
 
         assert buf.getvalue() == content
-
-    async def test_bytesio_full_roundtrip(self, scheduler: Scheduler) -> None:
-        """Write from BytesIO, read to BytesIO — full buffer roundtrip, SHA256."""
-        content = os.urandom(4096)
-        expected_hash = hashlib.sha256(content).hexdigest()
-        read_buf = io.BytesIO()
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("test.bin", io.BytesIO(content))
-            await session.read_file("test.bin", destination=read_buf)
-
-        actual_hash = hashlib.sha256(read_buf.getvalue()).hexdigest()
-        assert actual_hash == expected_hash
 
     @pytest.mark.parametrize(
         ("size", "label"),
@@ -149,26 +137,6 @@ class TestBufferEdgeCases:
                 "import subprocess; print(subprocess.check_output('./run.sh').decode().strip())"
             )
             assert "hello_from_bytesio" in result.stdout
-
-    async def test_concurrent_buffers(self, scheduler: Scheduler) -> None:
-        """asyncio.gather with multiple BytesIO writes/reads — no cross-contamination."""
-        contents = {f"file_{i}.bin": os.urandom(1024) for i in range(4)}
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            # Write all files
-            for name, data in contents.items():
-                await session.write_file(name, io.BytesIO(data))
-
-            # Read all files concurrently
-            bufs: dict[str, io.BytesIO] = {name: io.BytesIO() for name in contents}
-
-            async def read_one(name: str) -> None:
-                await session.read_file(name, destination=bufs[name])
-
-            await asyncio.gather(*(read_one(name) for name in contents))
-
-        for name, expected in contents.items():
-            assert bufs[name].getvalue() == expected, f"Cross-contamination in {name}"
 
     async def test_concurrent_mixed_buffer_and_path(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Concurrent writes (BytesIO + bytes) and reads (BytesIO + Path) — no cross-contamination."""
@@ -293,15 +261,3 @@ class TestBufferOwnership:
         # Buffer should still be open and readable
         buf.seek(0)
         assert buf.read() == b"hello"
-
-    async def test_read_does_not_close_caller_buffer(self, scheduler: Scheduler) -> None:
-        """After read_file, caller's BytesIO is still usable."""
-        dest = io.BytesIO()
-
-        async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
-            await session.write_file("test.bin", b"hello")
-            await session.read_file("test.bin", destination=dest)
-
-        # Buffer should still be open and readable
-        dest.seek(0)
-        assert dest.read() == b"hello"

@@ -193,8 +193,10 @@ print(os.environ.get('VAR3'))
 class TestGuestAgentControlCharValidation:
     """Tests that Rust guest-agent rejects control characters (bypassing Pydantic).
 
-    These tests use model_construct() to bypass Pydantic validation and send
-    control characters directly to the VM, verifying the Rust defense-in-depth.
+    The host refuses these values first (Pydantic), so the guest check can only be reached on
+    the wire: model_construct() builds a request with no validation, and the test reads the
+    messages the guest sends back. Tab is allowed on both sides: test_tab_allowed_by_guest
+    reaches the guest through the public API.
     """
 
     @pytest.fixture
@@ -206,132 +208,41 @@ class TestGuestAgentControlCharValidation:
             VmSpec(language=Language.PYTHON, memory_mb=256, allow_network=False, allowed_domains=None),
             tenant_id="test",
             task_id="test-control-char",
+            cache_leases=(),
         )
         try:
             yield vm
         finally:
             await vm_manager.destroy_vm(vm)
 
-    async def _execute_with_bypass(
-        self,
-        vm: "QemuVM",
-        env_vars: dict[str, str],
-    ) -> tuple[int, str, str]:
-        """Execute code bypassing Pydantic validation to test Rust validation.
-
-        Uses model_construct() to create request without running validators.
-        """
+    async def test_control_characters_rejected_by_rust(self, running_vm: "QemuVM") -> None:
+        """NUL, ESC, LF, CR, BEL and DEL in a value, and a control character in a name: the guest
+        replies with one env_var_error and runs nothing. One VM serves each request in turn
+        (an error reply leaves the connection open)."""
         from exec_sandbox import constants
-        from exec_sandbox.guest_agent_protocol import (
-            ExecutionCompleteMessage,
-            OutputChunkMessage,
-            StreamingErrorMessage,
-        )
+        from exec_sandbox.guest_agent_protocol import StreamingErrorMessage
 
-        # Bypass Pydantic validation using model_construct
-        request = ExecuteCodeRequest.model_construct(
-            action="exec",
-            language=Language.PYTHON,
-            code="print('should not run')",
-            timeout=30,
-            env_vars=env_vars,
-        )
-
-        # Connect and send directly to guest
-        await vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-
-        stdout_chunks: list[str] = []
-        stderr_chunks: list[str] = []
-        exit_code = -1
-
-        async for msg in vm.channel.stream_messages(request, timeout=30):
-            if isinstance(msg, OutputChunkMessage):
-                if msg.type == "stdout":
-                    stdout_chunks.append(msg.chunk)
-                else:
-                    stderr_chunks.append(msg.chunk)
-            elif isinstance(msg, ExecutionCompleteMessage):
-                exit_code = msg.exit_code
-            elif isinstance(msg, StreamingErrorMessage):
-                stderr_chunks.append(msg.message)
-                break
-
-        return exit_code, "".join(stdout_chunks), "".join(stderr_chunks)
-
-    async def test_null_byte_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Null byte in env var value is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "val\x00ue"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_escape_sequence_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """ANSI escape sequence is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "\x1b[31mred\x1b[0m"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_newline_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Newline in env var value is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "line1\nline2"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_carriage_return_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Carriage return is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "start\roverwrite"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_bell_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """Bell character (0x07) is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "ding\x07"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_del_rejected_by_rust(self, running_vm: "QemuVM") -> None:
-        """DEL character (0x7F) is rejected by Rust guest-agent."""
-        exit_code, _stdout, stderr = await self._execute_with_bypass(
-            running_vm,
-            env_vars={"FOO": "delete\x7f"},
-        )
-        assert exit_code != 0 or "control character" in stderr.lower()
-
-    async def test_tab_allowed_by_rust(self, running_vm: "QemuVM", execute_timeout: int) -> None:
-        """Tab character is allowed by Rust guest-agent."""
-        # Use model_construct to bypass Pydantic, proving Rust allows tabs
-        request = ExecuteCodeRequest.model_construct(
-            action="exec",
-            language=Language.PYTHON,
-            code="import os; print(repr(os.environ.get('FOO')))",
-            timeout=execute_timeout,
-            env_vars={"FOO": "col1\tcol2"},
-        )
-
-        from exec_sandbox import constants
-        from exec_sandbox.guest_agent_protocol import (
-            ExecutionCompleteMessage,
-            OutputChunkMessage,
-        )
-
+        cases = {
+            "null byte": {"FOO": "val\x00ue"},
+            "escape sequence": {"FOO": "\x1b[31mred\x1b[0m"},
+            "newline": {"FOO": "line1\nline2"},
+            "carriage return": {"FOO": "start\roverwrite"},
+            "bell (0x07)": {"FOO": "ding\x07"},
+            "DEL (0x7F)": {"FOO": "delete\x7f"},
+            "control character in the name": {"F\x01OO": "value"},
+        }
         await running_vm.channel.connect(constants.GUEST_CONNECT_TIMEOUT_SECONDS)
-
-        stdout = ""
-        exit_code = -1
-        async for msg in running_vm.channel.stream_messages(request, timeout=execute_timeout):
-            if isinstance(msg, OutputChunkMessage) and msg.type == "stdout":
-                stdout += msg.chunk
-            elif isinstance(msg, ExecutionCompleteMessage):
-                exit_code = msg.exit_code
-
-        assert exit_code == 0
-        assert "col1\\tcol2" in stdout
+        for case, env_vars in cases.items():
+            request = ExecuteCodeRequest.model_construct(
+                action="exec",
+                language=Language.PYTHON,
+                code="print('should not run')",
+                timeout=30,
+                env_vars=env_vars,
+            )
+            messages = [msg async for msg in running_vm.channel.stream_messages(request, timeout=30)]
+            assert len(messages) == 1, (case, messages)
+            (reply,) = messages
+            assert isinstance(reply, StreamingErrorMessage), (case, reply)
+            assert reply.error_type == "env_var_error", (case, reply)
+            assert "contains forbidden control character" in reply.message, (case, reply)

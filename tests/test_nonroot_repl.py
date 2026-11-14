@@ -11,6 +11,8 @@ Test categories:
 - Out of bounds: kernel-level operations blocked by missing capabilities
 """
 
+from pathlib import Path
+
 import pytest
 
 from exec_sandbox.models import Language
@@ -108,19 +110,15 @@ class TestNonRootFileIO:
             assert result.exit_code == 0
             assert "hello from root" in result.stdout
 
-    async def test_repl_creates_file_then_read_file(self, scheduler: Scheduler) -> None:
+    async def test_repl_creates_file_then_read_file(self, scheduler: Scheduler, tmp_path: Path) -> None:
         """Files created by REPL (UID 1000) are readable by guest-agent (root)."""
         async with await scheduler.new(VmSpec(language=Language.PYTHON)) as session:
             result = await session.exec('open("created_by_repl.txt", "w").write("hello from repl")')
             assert result.exit_code == 0
 
-            import tempfile
-            from pathlib import Path
-
-            with tempfile.TemporaryDirectory() as tmp:
-                dest = Path(tmp) / "created_by_repl.txt"
-                await session.read_file("created_by_repl.txt", destination=dest)
-                assert dest.read_text() == "hello from repl"
+            dest = tmp_path / "created_by_repl.txt"
+            await session.read_file("created_by_repl.txt", destination=dest)
+            assert dest.read_text() == "hello from repl"
 
     async def test_repl_file_owned_by_uid_1000(self, scheduler: Scheduler) -> None:
         """Files created by REPL are owned by UID 1000."""
@@ -218,16 +216,6 @@ with open("/proc/self/status") as f:
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON), code)
         assert result.exit_code == 0
         assert "NoNewPrivs:\t1" in result.stdout
-
-    async def test_kill_pid1_blocked(self, scheduler: Scheduler) -> None:
-        """Non-root cannot signal PID 1 (guest-agent)."""
-        result = await run_once(
-            scheduler,
-            VmSpec(language=Language.PYTHON),
-            "import os, signal, errno\ntry:\n    os.kill(1, signal.SIGTERM)\n    print('unexpected_success')\nexcept PermissionError:\n    print('blocked')",
-        )
-        assert result.exit_code == 0
-        assert "blocked" in result.stdout
 
 
 # =============================================================================

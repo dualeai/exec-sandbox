@@ -28,8 +28,6 @@ from .conftest import skip_unless_hwaccel
 # IMPORTANT: stdout is limited to 1,000,000 bytes (1MB decimal).
 # Tests for larger payloads must use streaming callbacks.
 
-MAX_STDOUT_BYTES = 1_000_000  # System limit from constants.py
-
 PAYLOAD_SIZES = {
     "tiny": 1,  # 1 byte
     "small": 100,  # 100 bytes

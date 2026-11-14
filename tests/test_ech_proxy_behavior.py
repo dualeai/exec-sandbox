@@ -88,11 +88,11 @@ for attempt in range({NET_RETRY_COUNT + 1}):
     )
 
 
-def _js_tls_code(domain: str, _tls_version: str = TLS_DEFAULT, *, retries: bool = True) -> str:
+def _js_tls_code(domain: str, *, retries: bool) -> str:
     """Bun/BoringSSL fetch test with top-level await.
 
-    Bun's fetch does not expose TLS version control; _tls_version is
-    accepted for signature compatibility but ignored.
+    Bun's fetch does not expose TLS version control: the TLS version of the
+    case does not apply.
 
     When *retries* is True (default for allowed-domain tests), retries up
     to ``NET_RETRY_COUNT + 1`` times with linear backoff to absorb
@@ -184,7 +184,7 @@ def _get_connection_code(
     if language == Language.PYTHON:
         return _python_tls_code(domain, tls_version)
     if language == Language.JAVASCRIPT:
-        return _js_tls_code(domain, tls_version, retries=retries)
+        return _js_tls_code(domain, retries=retries)
     return _curl_tls_code(domain, tls_version, retries=retries)
 
 

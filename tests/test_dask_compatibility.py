@@ -27,7 +27,6 @@ See:
 - https://docs.dask.org/en/stable/scheduling.html
 """
 
-from exec_sandbox.constants import DEFAULT_VM_CPU_CORES
 from exec_sandbox.models import Language
 from exec_sandbox.scheduler import Scheduler
 from exec_sandbox.vm_spec import VmSpec
@@ -52,7 +51,7 @@ class TestDaskSystemContext:
     """
 
     async def test_cpu_count(self, scheduler: Scheduler) -> None:
-        """dask.system.cpu_count() matches QEMU -smp (reads affinity + cgroups).
+        """dask.system.cpu_count() matches QEMU -smp: 1 for a default VmSpec (reads affinity + cgroups).
 
         Internally calls os.sched_getaffinity(), reads /proc/self/cgroup and
         /sys/fs/cgroup/.../cpu.max, and takes the minimum.
@@ -65,9 +64,7 @@ print(f'DASK_CPU:{count}')
         result = await run_once(scheduler, VmSpec(language=Language.PYTHON, packages=DASK_PACKAGES), code)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         count = int(result.stdout.split("DASK_CPU:")[1].strip())
-        assert count == DEFAULT_VM_CPU_CORES, (
-            f"dask.system.cpu_count() returned {count}, expected {DEFAULT_VM_CPU_CORES}"
-        )
+        assert count == 1, f"dask.system.cpu_count() returned {count}, expected the 1 vCPU of a default VmSpec"
 
     async def test_cpu_count_constant(self, scheduler: Scheduler) -> None:
         """dask.system.CPU_COUNT module constant matches runtime cpu_count()."""
