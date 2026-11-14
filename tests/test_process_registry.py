@@ -48,7 +48,7 @@ class TestProcessRegistry:
         assert get_tracked_count() == 2
 
     def test_register_process_none_pid_safe(self):
-        """Test that register_process handles None PID safely."""
+        """A process without a pid is not tracked."""
         proc = MockProcessWrapper(None)
         register_process(proc)  # type: ignore[arg-type]
         assert get_tracked_count() == 0
@@ -68,16 +68,12 @@ class TestProcessRegistry:
             proc.kill()
             proc.wait(timeout=5)
 
-    def test_unregister_process_none_safe(self):
-        """Test that unregister_process handles None safely."""
-        unregister_process(None)
-        assert get_tracked_count() == 0
-
-    def test_unregister_process_not_registered(self):
-        """Test that unregister_process handles unregistered PID safely."""
-        proc = MockProcessWrapper(99999)
-        unregister_process(proc)  # type: ignore[arg-type]
-        assert get_tracked_count() == 0
+    @pytest.mark.parametrize("pid", [None, 99999], ids=["no-process", "pid-not-registered"])
+    def test_unregister_of_an_untracked_process_changes_nothing(self, pid: int | None):
+        """None, or a process that was never registered: no error, and the tracked one stays."""
+        register_process(MockProcessWrapper(12345))  # type: ignore[arg-type]
+        unregister_process(None if pid is None else MockProcessWrapper(pid))  # type: ignore[arg-type]
+        assert get_tracked_count() == 1
 
     def test_force_kill_all_counts_live_groups_and_clears_registry(self):
         """A group that ended already is not counted; a live one is. The registry is empty after."""

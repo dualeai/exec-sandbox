@@ -34,9 +34,9 @@ async def cleanup_process(
     proc: ProcessWrapper | None,
     name: str,
     context_id: str,
-    term_timeout: float = 3.0,
-    kill_timeout: float = 2.0,
     *,
+    term_timeout: float,
+    kill_timeout: float,
     kill_first: bool,
 ) -> bool:
     """Force cleanup of subprocess (SIGTERM → SIGKILL).

@@ -414,8 +414,14 @@ class TestBinfmtMisc:
 class TestExecFailedError:
     """A launch that ends with 126 or 127: an exec in it failed."""
 
-    @pytest.mark.parametrize("returncode", [126, 127])
-    def test_126_and_127_are_host_dependency(self, returncode: int) -> None:
+    @pytest.mark.parametrize(
+        ("returncode", "reason"),
+        [
+            (126, "a program of the launch cannot run: no exec bit or another CPU architecture"),
+            (127, "a program of the launch was not found, or its ELF interpreter is missing"),
+        ],
+    )
+    def test_126_and_127_are_host_dependency(self, returncode: int, reason: str) -> None:
         """As spawn_error gives for an exec that Popen runs: no retry fixes it."""
         error = exec_failed_error(
             returncode,
@@ -426,8 +432,9 @@ class TestExecFailedError:
         )
         assert error is not None
         assert error.code is ErrorCode.HOST_DEPENDENCY
-        assert str(error).startswith(f"Failed to start /opt/gvproxy: exit status {returncode} (")
-        assert str(error).endswith("): exec: /opt/gvproxy: not found")
+        assert str(error) == (
+            f"Failed to start /opt/gvproxy: exit status {returncode} ({reason}): exec: /opt/gvproxy: not found"
+        )
         assert error.context == {"vm_id": "v", "binary": "/opt/gvproxy", "exit_code": returncode}
 
     @pytest.mark.parametrize("returncode", [None, 0, 1, 2, 125, 128, -9])
@@ -509,7 +516,10 @@ class TestEndWithThisProcess:
     async def test_a_child_not_ending_with_this_process_runs_its_steps_only(self) -> None:
         """Without end_with_this_process (a setuid launcher, a transient run): the steps, no
         setpriv, no preexec_fn, whatever the host."""
-        assert await _launch_command(["true"], steps=(), end_with_this_process=False) == (["true"], None)
+        assert await _launch_command(["true"], steps=[(":", "x")], end_with_this_process=False) == (
+            ["/bin/sh", "-c", ':; shift; exec "$@"', "sh", "x", "true"],
+            None,
+        )
 
     @skip_unless_linux
     async def test_child_of_a_killed_process_ends_at_once(self) -> None:
@@ -563,8 +573,26 @@ class TestCommunicateManagedProcess:
         results: list[bool] = []
         real_cleanup = subprocess_utils.cleanup_process
 
-        async def cleanup(proc: ProcessWrapper, name: str, context_id: str, *, kill_first: bool) -> bool:
-            results.append(bool(results) and await real_cleanup(proc, name, context_id, kill_first=kill_first))
+        async def cleanup(
+            proc: ProcessWrapper,
+            name: str,
+            context_id: str,
+            *,
+            term_timeout: float,
+            kill_timeout: float,
+            kill_first: bool,
+        ) -> bool:
+            results.append(
+                bool(results)
+                and await real_cleanup(
+                    proc,
+                    name,
+                    context_id,
+                    term_timeout=term_timeout,
+                    kill_timeout=kill_timeout,
+                    kill_first=kill_first,
+                )
+            )
             return results[-1]
 
         monkeypatch.setattr(subprocess_utils, "cleanup_process", cleanup)
@@ -673,53 +701,40 @@ class TestDrainSubprocessOutput:
 
         assert captured == ["line1", "line2", "line3"]
 
-    async def test_drain_interleaved_output(self) -> None:
-        """Drain interleaved stdout/stderr without deadlock."""
+    async def test_drain_reads_both_pipes_at_once(self) -> None:
+        """A child that writes 2 MB to stderr before it writes stdout: a drain that read stdout
+        to its end first would wait for ever. asyncio buffers 128 KiB of a pipe that nobody
+        reads, the pipe holds 64 KiB more, then the child blocks on its write."""
         captured_stdout: list[str] = []
         captured_stderr: list[str] = []
+        script = "import sys; sys.stderr.write(''.join(f'err {i}\\n' for i in range(200_000))); print('out')"
+        proc = await create_process([sys.executable, "-c", script])
 
-        # Interleaved output - this could deadlock without concurrent draining
-        proc = await create_process(
-            [
-                "bash",
-                "-c",
-                """
-            for i in 1 2 3; do
-                echo "out $i"
-                echo "err $i" >&2
-            done
-            """,
-            ]
-        )
+        async with asyncio.timeout(10):
+            await drain_subprocess_output(
+                proc,
+                stdout_handler=captured_stdout.append,
+                stderr_handler=captured_stderr.append,
+            )
+            assert await proc.wait() == 0
 
-        await drain_subprocess_output(
-            proc,
-            stdout_handler=captured_stdout.append,
-            stderr_handler=captured_stderr.append,
-        )
-
-        await proc.wait()
-
-        # All output captured without deadlock
-        assert len(captured_stdout) == 3
-        assert len(captured_stderr) == 3
+        assert captured_stdout == ["out"]
+        assert captured_stderr == [f"err {i}" for i in range(200_000)]
 
     async def test_drain_large_output(self) -> None:
-        """Drain large output without pipe buffer exhaustion."""
+        """Output larger than a pipe (64 KiB): every line reaches the handler, in order."""
         captured: list[str] = []
 
-        # Generate 1000 lines (more than typical 64KB pipe buffer)
+        # 3000 lines of about 32 bytes: 95 KB
         proc = await create_process(
-            ["bash", "-c", 'for i in $(seq 1 1000); do echo "line $i with some padding text"; done']
+            ["bash", "-c", 'for i in $(seq 1 3000); do echo "line $i with some padding text"; done']
         )
 
         await drain_subprocess_output(proc, stdout_handler=captured.append, stderr_handler=[].append)
 
         await proc.wait()
 
-        assert len(captured) == 1000
-        assert "line 1 with some padding text" in captured
-        assert "line 1000 with some padding text" in captured
+        assert captured == [f"line {i} with some padding text" for i in range(1, 3001)]
 
     @pytest.mark.parametrize(
         ("output", "lines"),
@@ -802,8 +817,7 @@ class TestStartDrain:
                 proc, process_name="echo", context_id="drain-2", stdout_handler=fail, stderr_handler=[].append
             )
             with pytest.raises(ExceptionGroup):
-                await task
-            await asyncio.sleep(0)  # the done callback runs in the next loop pass
+                await task  # the log callback was added first: it ran before this await returns
         await proc.wait()
 
         assert [(r.getMessage(), getattr(r, "task_name", None)) for r in caplog.records] == [
@@ -825,41 +839,49 @@ class TestWaitForSocket:
 
         server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
         try:
-            result = await wait_for_socket(sock_path, timeout=2.0, abort_check=None, keep_connection=False)
+            result = await wait_for_socket(sock_path, timeout=2.0, abort_check=lambda: None, keep_connection=False)
             assert result is None
         finally:
             server.close()
             await server.wait_closed()
 
-    async def test_socket_appears_after_delay(self, short_tmp_dir: Path) -> None:
-        """Socket created by a background task after a short delay."""
+    async def test_socket_appears_after_the_wait_starts(self, short_tmp_dir: Path) -> None:
+        """The socket appears while the wait polls for its file (abort_check marks a poll): the
+        wait goes on, then connects once the socket listens."""
         sock_path = short_tmp_dir / "s.sock"
+        polled = asyncio.Event()
+        wait = asyncio.create_task(
+            wait_for_socket(sock_path, timeout=2.0, abort_check=polled.set, keep_connection=False)
+        )
+        await polled.wait()
+        assert not wait.done()  # no file yet: it polls
 
-        async def _create_server_later() -> asyncio.Server:
-            await asyncio.sleep(0.1)
-            return await asyncio.start_unix_server(_close_writer, path=str(sock_path))
-
-        task = asyncio.create_task(_create_server_later())
+        server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
         try:
-            result = await wait_for_socket(sock_path, timeout=2.0, abort_check=None, keep_connection=False)
-            assert result is None
+            assert await wait is None
         finally:
-            server = await task
             server.close()
             await server.wait_closed()
 
     async def test_keep_connection_true_returns_streams(self, short_tmp_dir: Path) -> None:
-        """keep_connection=True returns (reader, writer) streams."""
+        """keep_connection=True returns the (reader, writer) of its connection: the server's
+        reply to "ping" comes on that reader."""
         sock_path = short_tmp_dir / "s.sock"
 
-        server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
+        async def pong(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writer.write(b"pong to " + await reader.readline())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_unix_server(pong, path=str(sock_path))
         try:
-            result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=True, abort_check=None)
+            result = await wait_for_socket(sock_path, timeout=2.0, keep_connection=True, abort_check=lambda: None)
             assert result is not None
             r, w = result
-            assert isinstance(r, asyncio.StreamReader)
-            assert isinstance(w, asyncio.StreamWriter)
-            w.write(b"ping")
+            w.write(b"ping\n")
+            await w.drain()
+            assert await r.read() == b"pong to ping\n"
             w.close()
             await w.wait_closed()
         finally:
@@ -870,7 +892,7 @@ class TestWaitForSocket:
         """TimeoutError when socket file never appears."""
         sock_path = short_tmp_dir / "s.sock"
         with pytest.raises(TimeoutError):
-            await wait_for_socket(sock_path, timeout=0.1, abort_check=None, keep_connection=False)
+            await wait_for_socket(sock_path, timeout=0.1, abort_check=lambda: None, keep_connection=False)
 
     async def test_socket_file_exists_but_not_listening(self, short_tmp_dir: Path) -> None:
         """Fails when path exists as regular file, not a socket.
@@ -880,8 +902,13 @@ class TestWaitForSocket:
         """
         sock_path = short_tmp_dir / "s.sock"
         sock_path.write_text("not a socket")
-        with pytest.raises((TimeoutError, OSError)):
-            await wait_for_socket(sock_path, timeout=0.2, abort_check=None, keep_connection=False)
+        expected = (
+            pytest.raises(OSError, check=lambda e: e.errno == errno.ENOTSOCK)
+            if sys.platform == "darwin"
+            else pytest.raises(TimeoutError)
+        )
+        with expected:
+            await wait_for_socket(sock_path, timeout=0.2, abort_check=lambda: None, keep_connection=False)
 
     async def test_abort_check_raises(self, short_tmp_dir: Path) -> None:
         """abort_check exception propagates instead of TimeoutError."""
@@ -896,12 +923,13 @@ class TestWaitForSocket:
 
         with pytest.raises(RuntimeError, match="process died"):
             await wait_for_socket(sock_path, timeout=5.0, abort_check=_abort, keep_connection=False)
+        assert call_count == 2  # the wait ended at the first raise
 
     async def test_zero_timeout(self, short_tmp_dir: Path) -> None:
         """Zero timeout raises TimeoutError immediately."""
         sock_path = short_tmp_dir / "s.sock"
         with pytest.raises(TimeoutError):
-            await wait_for_socket(sock_path, timeout=0.0, abort_check=None, keep_connection=False)
+            await wait_for_socket(sock_path, timeout=0.0, abort_check=lambda: None, keep_connection=False)
 
     async def test_concurrent_wait_for_socket(self, short_tmp_dir: Path) -> None:
         """Multiple concurrent waits all succeed against the same server."""
@@ -910,9 +938,9 @@ class TestWaitForSocket:
         server = await asyncio.start_unix_server(_close_writer, path=str(sock_path))
         try:
             results = await asyncio.gather(
-                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=None),
-                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=None),
-                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=None),
+                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=lambda: None),
+                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=lambda: None),
+                wait_for_socket(sock_path, timeout=2.0, keep_connection=False, abort_check=lambda: None),
             )
             assert all(r is None for r in results)
         finally:
@@ -929,7 +957,7 @@ class TestWaitForSocket:
         sock_path.chmod(0o000)
         try:
             with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.HOST_DEPENDENCY) as exc_info:
-                await wait_for_socket(sock_path, timeout=5.0, abort_check=None, keep_connection=False)
+                await wait_for_socket(sock_path, timeout=5.0, abort_check=lambda: None, keep_connection=False)
         finally:
             server.close()
             await server.wait_closed()

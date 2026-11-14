@@ -364,7 +364,14 @@ async def communicate_managed_process(
                 delay = 1.0
                 while True:
                     try:
-                        if await cleanup_process(owned_process, process_name, context_id, kill_first=False):
+                        if await cleanup_process(
+                            owned_process,
+                            process_name,
+                            context_id,
+                            term_timeout=3.0,
+                            kill_timeout=2.0,
+                            kill_first=False,
+                        ):
                             unregister_process(owned_process)
                             break
                     except asyncio.CancelledError:
@@ -521,7 +528,7 @@ async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
-    abort_check: Callable[[], None] | None,
+    abort_check: Callable[[], None],
     keep_connection: Literal[True],
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]: ...
 
@@ -531,7 +538,7 @@ async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
-    abort_check: Callable[[], None] | None,
+    abort_check: Callable[[], None],
     keep_connection: Literal[False],
 ) -> None: ...
 
@@ -540,7 +547,7 @@ async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
-    abort_check: Callable[[], None] | None,
+    abort_check: Callable[[], None],
     keep_connection: bool,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
     """Wait for a Unix socket to appear and accept connections.
@@ -550,14 +557,14 @@ async def wait_for_socket(
     to await (the file is created by an external process).
 
     Two-phase wait: first the socket file must exist, then a probe-connect
-    must succeed. This closes the TOCTOU gap between file creation and
-    listen() completion that caused spurious ConnectionRefusedError under load.
+    must succeed. A connect between the file's creation and the end of listen()
+    gets ConnectionRefusedError (seen under load): the probe retries it.
 
     Args:
         path: Path to the socket file.
         timeout: Maximum seconds to wait before raising TimeoutError.
-        abort_check: Optional callable invoked each poll iteration. Should raise
-            to abort the wait early (e.g. when the spawning process has died).
+        abort_check: Called at each poll iteration. Should raise to abort the wait
+            early (e.g. when the spawning process has died).
         keep_connection: If True, return the connected (reader, writer) streams
             instead of closing the probe connection. Eliminates the TOCTOU gap
             between probe-close and the caller's real connect for single-client
@@ -574,14 +581,12 @@ async def wait_for_socket(
     async with asyncio.timeout(timeout):
         # Phase 1: wait for socket file to exist
         while not path.exists():
-            if abort_check is not None:
-                abort_check()
+            abort_check()
             await asyncio.sleep(_SOCKET_POLL_SECONDS)
 
         # Phase 2: verify socket accepts connections
         while True:
-            if abort_check is not None:
-                abort_check()
+            abort_check()
             try:
                 r, w = await asyncio.open_unix_connection(str(path))
                 if keep_connection:

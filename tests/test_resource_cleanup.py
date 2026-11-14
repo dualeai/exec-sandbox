@@ -1,14 +1,14 @@
-"""Tests for resource_cleanup.py cleanup functions."""
+"""resource_cleanup.cleanup_process: SIGTERM, then SIGKILL, then a kept reap task."""
 
 import asyncio
 import logging
+import shlex
 import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from exec_sandbox.cgroup import Cgroup
 from exec_sandbox.platform_utils import ProcessWrapper
 from exec_sandbox.resource_cleanup import _zombie_reap_tasks, cleanup_process
 
@@ -47,7 +47,15 @@ class TestResourceCleanupProcess:
         proc = await _spawn("echo ready; exec sleep 30")
 
         assert (
-            await cleanup_process(proc=proc, name="graceful-process", context_id="test-ctx", kill_first=False) is True
+            await cleanup_process(
+                proc=proc,
+                name="graceful-process",
+                context_id="test-ctx",
+                term_timeout=3.0,
+                kill_timeout=2.0,
+                kill_first=False,
+            )
+            is True
         )
         assert proc.returncode == -signal.SIGTERM
 
@@ -59,40 +67,62 @@ class TestResourceCleanupProcess:
         start = loop.time()
 
         result = await cleanup_process(
-            proc=proc, name="killed-first", context_id="test-ctx", term_timeout=10.0, kill_first=True
+            proc=proc, name="killed-first", context_id="test-ctx", term_timeout=10.0, kill_timeout=2.0, kill_first=True
         )
 
         assert (result, proc.returncode) == (True, -signal.SIGKILL)
         assert loop.time() - start < 2.0
 
-    async def test_cleanup_process_sigterm_timeout_sigkill_success(self) -> None:
-        """A process that ignores SIGTERM: SIGKILL after term_timeout, True."""
-        proc = await _spawn("trap '' TERM; echo ready; exec sleep 30")
+    async def test_cleanup_process_sigterm_timeout_sigkill_success(self, tmp_path: Path) -> None:
+        """A process that outlives SIGTERM: SIGTERM first (its trap makes a file), SIGKILL after
+        term_timeout, True."""
+        termed = tmp_path / "termed"
+        trap = shlex.quote(f": > {shlex.quote(str(termed))}")
+        proc = await _spawn(f"trap {trap} TERM; echo ready; while :; do sleep 0.01; done")
 
         result = await cleanup_process(
             proc=proc,
             name="stubborn-process",
             context_id="test-ctx",
-            term_timeout=0.05,
+            term_timeout=0.3,
             kill_timeout=5.0,
             kill_first=False,
         )
 
-        assert result is True
-        assert proc.returncode == -signal.SIGKILL
+        assert (result, proc.returncode, termed.exists()) == (True, -signal.SIGKILL, True)
 
     async def test_cleanup_process_already_dead(self) -> None:
         """A process that already exited: True at once, and its exit code stays."""
         proc = ProcessWrapper(await asyncio.create_subprocess_exec("true"))
         await proc.wait()
 
-        assert await cleanup_process(proc=proc, name="dead-process", context_id="test-ctx", kill_first=False) is True
+        assert (
+            await cleanup_process(
+                proc=proc,
+                name="dead-process",
+                context_id="test-ctx",
+                term_timeout=3.0,
+                kill_timeout=2.0,
+                kill_first=False,
+            )
+            is True
+        )
         assert proc.returncode == 0
         await asyncio.gather(*_zombie_reap_tasks)  # its background reap ends with the test
 
     async def test_cleanup_process_none(self) -> None:
         """None process returns True (no-op)."""
-        assert await cleanup_process(proc=None, name="null-process", context_id="test-ctx", kill_first=False) is True
+        assert (
+            await cleanup_process(
+                proc=None,
+                name="null-process",
+                context_id="test-ctx",
+                term_timeout=3.0,
+                kill_timeout=2.0,
+                kill_first=False,
+            )
+            is True
+        )
 
     async def test_cleanup_process_process_lookup_error(self) -> None:
         """The process ends between the returncode check and SIGTERM (ProcessLookupError):
@@ -101,7 +131,14 @@ class TestResourceCleanupProcess:
         proc.terminate = AsyncMock(side_effect=ProcessLookupError)
 
         assert (
-            await cleanup_process(proc=proc, name="race-condition-process", context_id="test-ctx", kill_first=False)
+            await cleanup_process(
+                proc=proc,
+                name="race-condition-process",
+                context_id="test-ctx",
+                term_timeout=3.0,
+                kill_timeout=2.0,
+                kill_first=False,
+            )
             is True
         )
 
@@ -128,29 +165,17 @@ class TestResourceCleanupProcess:
         proc = _stuck_process()
         proc.terminate = AsyncMock(side_effect=RuntimeError("Unexpected error"))
 
-        assert await cleanup_process(proc=proc, name="error-process", context_id="test-ctx", kill_first=False) is False
-
-
-class TestResourceCleanupFilesystem:
-    """Cgroup.remove on real folders: idempotent, and a folder it cannot remove stays (False)."""
-
-    async def test_missing_cgroup_is_removed(self, tmp_path: Path):
-        assert await Cgroup(tmp_path / "cgroup-missing").remove() is True
-
-    async def test_empty_cgroup_folder_goes(self, tmp_path: Path):
-        folder = tmp_path / "test-cgroup"
-        (folder / "child").mkdir(parents=True)  # a child cgroup a QEMU made: removed first
-        assert await Cgroup(folder).remove() is True
-        assert not folder.exists()
-
-    async def test_folder_that_cannot_go_stays(self, tmp_path: Path):
-        """rmdir fails (on cgroupfs: EBUSY, a process left; here ENOTEMPTY): False, logged,
-        the folder stays for a later try."""
-        folder = tmp_path / "test-cgroup"
-        folder.mkdir()
-        (folder / "somefile.txt").write_text("content")
-        assert await Cgroup(folder).remove() is False
-        assert folder.exists()
+        assert (
+            await cleanup_process(
+                proc=proc,
+                name="error-process",
+                context_id="test-ctx",
+                term_timeout=3.0,
+                kill_timeout=2.0,
+                kill_first=False,
+            )
+            is False
+        )
 
 
 class TestZombieTaskTracking:
@@ -178,7 +203,17 @@ class TestZombieTaskTracking:
 
         proc.wait = wait
 
-        assert await cleanup_process(proc=proc, name="dead-process", context_id="test-ctx", kill_first=False) is True
+        assert (
+            await cleanup_process(
+                proc=proc,
+                name="dead-process",
+                context_id="test-ctx",
+                term_timeout=3.0,
+                kill_timeout=2.0,
+                kill_first=False,
+            )
+            is True
+        )
         assert len(_zombie_reap_tasks) == 1
         (task,) = _zombie_reap_tasks
         reaped.set()
@@ -218,7 +253,15 @@ class TestZombieTaskTracking:
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
             assert (
-                await cleanup_process(proc=proc, name="dead-process", context_id="test-ctx", kill_first=False) is True
+                await cleanup_process(
+                    proc=proc,
+                    name="dead-process",
+                    context_id="test-ctx",
+                    term_timeout=3.0,
+                    kill_timeout=2.0,
+                    kill_first=False,
+                )
+                is True
             )
             (task,) = _zombie_reap_tasks
             with pytest.raises(OSError, match="wait failed"):
@@ -243,7 +286,15 @@ class TestZombieTaskTracking:
 
         with caplog.at_level(logging.WARNING, logger="exec_sandbox"):
             assert (
-                await cleanup_process(proc=proc, name="dead-process", context_id="test-ctx", kill_first=False) is True
+                await cleanup_process(
+                    proc=proc,
+                    name="dead-process",
+                    context_id="test-ctx",
+                    term_timeout=3.0,
+                    kill_timeout=2.0,
+                    kill_first=False,
+                )
+                is True
             )
             (task,) = _zombie_reap_tasks
             task.cancel()

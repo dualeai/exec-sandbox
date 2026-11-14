@@ -1,16 +1,40 @@
-"""Cancellation-safe task ownership primitives.
+"""Cancellation-safe task ownership primitives, and the retry loop.
 
 Many owners in this codebase must bring an operation to a settled state even
 while the caller is being cancelled — abandoning it would orphan a child
-process, a temp directory, or a shared transport. The canonical shape is
+process, a temp directory, or a shared transport. The common shape is
 "await the task through repeated CancelledError, then decide"; these helpers
-replace the hand-rolled copies of that loop.
+hold that loop, so no caller writes it again.
 """
 
 import asyncio
 import contextlib
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+
+import tenacity
+
+
+class AsyncRetrying(tenacity.AsyncRetrying):
+    """tenacity.AsyncRetrying, except that an attempt that raises StopAsyncIteration fails.
+
+    tenacity raises an attempt's exception from ``__anext__``, where a StopAsyncIteration
+    ends the ``async for`` as if the attempt had succeeded: the code after the loop then
+    runs on a call that did not finish (a guest "ready" with no pong). Python turns it
+    into a RuntimeError in an async generator (PEP 525); this loop does the same.
+    """
+
+    _attempt: tenacity.AttemptManager | None = None
+
+    async def __anext__(self) -> tenacity.AttemptManager:
+        try:
+            self._attempt = await super().__anext__()
+        except StopAsyncIteration:
+            outcome = None if self._attempt is None else self._attempt.retry_state.outcome
+            if outcome is not None and isinstance(outcome.exception(), StopAsyncIteration):
+                raise RuntimeError("A retried call raised StopAsyncIteration") from outcome.exception()
+            raise
+        return self._attempt
 
 
 async def await_settled[T](task: asyncio.Task[T]) -> asyncio.CancelledError | None:
@@ -64,6 +88,24 @@ async def await_cancellation_safe[T](awaitable: Awaitable[T]) -> T:
             raise cancellation from error
         raise cancellation
     return task.result()
+
+
+async def gather_or_cancel[T](awaitables: Iterable[Awaitable[T]]) -> list[T]:
+    """Run ``awaitables`` at the same time; return their results in order.
+
+    On the first failure (a cancel of the caller too), cancel the others, wait until each
+    one ends, then raise that failure as it was raised. Unlike asyncio.gather, nothing runs
+    on after the call; unlike asyncio.TaskGroup, the error is not wrapped in an
+    ExceptionGroup.
+    """
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def run_to_end[T](call: Callable[[], T]) -> T:
