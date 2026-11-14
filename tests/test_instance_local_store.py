@@ -468,13 +468,24 @@ class TestDiskFailures:
 
 
 class TestOpen:
+    async def test_missing_parents_under_a_group_write_umask(self, tmp_path: Path) -> None:
+        """umask 002 (Ubuntu's default for users): the folders made above a new store are 0700
+        too, so the store's own check of the folders above it accepts them."""
+        old_umask = os.umask(0o002)
+        try:
+            async with LocalInstanceStore.open(root=tmp_path / "home" / ".local" / "share" / "store"):
+                pass
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE((tmp_path / "home" / ".local").stat().st_mode) & 0o777 == 0o700
+
     async def test_missing_root_is_made_private(self, tmp_path: Path) -> None:
         root = tmp_path / "a" / "b" / "store"
         async with LocalInstanceStore.open(root=root):
             pass
-        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(root.stat().st_mode) & 0o777 == 0o700
         assert stat.S_IMODE((root / ".lock").stat().st_mode) == 0o600
-        assert stat.S_IMODE((root / ".tmp").stat().st_mode) == 0o700
+        assert stat.S_IMODE((root / ".tmp").stat().st_mode) & 0o777 == 0o700
 
     async def test_symlink_root_is_refused(self, tmp_path: Path) -> None:
         real = tmp_path / "real"
@@ -566,9 +577,13 @@ class TestOpen:
         assert sorted(p.name for p in root.iterdir()) == []  # refused before .lock and .tmp
 
     @pytest.mark.parametrize("mode", [0o777, 0o770, 0o707], ids=oct)
-    async def test_parent_that_others_can_change_is_refused(self, tmp_path: Path, mode: int) -> None:
+    async def test_parent_that_others_can_change_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+    ) -> None:
         """Another user who can write a parent folder can put another folder in place of the root
-        (OpenSSH StrictModes): every folder above the root must be writable only by root or this user."""
+        (OpenSSH StrictModes): every folder above the root must be writable only by root or this
+        user. Its group is not this user's private group here (that one passes)."""
+        monkeypatch.setattr("exec_sandbox.permission_utils._group_is_this_users", lambda _gid: False)
         shared = tmp_path / "shared"
         shared.mkdir()
         shared.chmod(mode)
@@ -579,6 +594,7 @@ class TestOpen:
             async with LocalInstanceStore.open(root=root):
                 pass
         assert f"chmod go-w {shared.resolve()}" in str(exc.value.hint)
+        assert f"chmod +t {shared.resolve()}" in str(exc.value.hint)  # a shared volume: the sticky bit passes
         assert sorted(p.name for p in root.iterdir()) == []
 
     async def test_sticky_parent_is_accepted(self, tmp_path: Path) -> None:
@@ -721,7 +737,7 @@ class TestKeys:
         await store.put_if_absent(_HEAD, data=b"head")
         await store.upload("s/i/b/c.p", src=src)
         for folder in (root, root / "s", root / "s" / "i", root / "s" / "i" / "b"):
-            assert stat.S_IMODE(folder.stat().st_mode) == 0o700, folder
+            assert stat.S_IMODE(folder.stat().st_mode) & 0o777 == 0o700, folder
         for file in (root / "s" / "i" / "head", root / "s" / "i" / "b" / "c.p"):
             assert stat.S_IMODE(file.stat().st_mode) == 0o600, file
 
@@ -745,7 +761,7 @@ class TestSymlinks:
         open (here this user plays them). Each call starts from the folder that open()
         holds, never from the path: no file outside the store is read, written or deleted."""
         parent = tmp_path / "parent"
-        parent.mkdir()
+        parent.mkdir(mode=0o700)  # writable by this user only, whatever the umask: open() checks it
         root = parent / "store"
         victim = tmp_path / "victim"
         (victim / "b").mkdir(parents=True)

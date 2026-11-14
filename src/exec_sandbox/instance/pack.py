@@ -38,9 +38,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import NonNegativeInt, PositiveInt, TypeAdapter, ValidationError
 
 from exec_sandbox.exceptions import damaged_instance_data
+from exec_sandbox.files.disk import data_ranges, pwrite_all
 from exec_sandbox.instance import codec
 from exec_sandbox.instance.codec import BLOCK_BYTES, NONCE_BYTES, TAG_BYTES
-from exec_sandbox.sparse_file import data_ranges, pwrite_all
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping
@@ -285,8 +285,9 @@ def _in_order[T, R](fn: Callable[[T], R], items: Iterable[T]) -> Generator[R]:
 
 
 def _data_blocks(fd: int) -> set[int]:
-    """Numbers of the blocks that hold data (sparse_file.data_ranges). Without SEEK_DATA
-    (EINVAL), every block after the ranges found so far counts as data: none is lost."""
+    """Numbers of the blocks that hold data (files.disk.data_ranges). When the search
+    fails (an OSError: EINVAL without SEEK_DATA), every block after the ranges found so
+    far counts as data: none is lost."""
     size = os.fstat(fd).st_size
     blocks: set[int] = set()
     offset = 0

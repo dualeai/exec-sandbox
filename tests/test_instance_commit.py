@@ -18,8 +18,10 @@ from exec_sandbox.instance.commit import Base, Commit, commit_head
 from exec_sandbox.instance.models import RECENT_COMMITS, RecentCommit
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import InstanceStore, head_key
-from tests.instance_support import head_header
+from tests.instance_support import NO_VM_TIMEOUT, head_header
 from tests.s3_faults import After, Before, DropAfter, DropBefore, Edit, Fail, Request, Response, S3Proxy
+
+pytestmark = NO_VM_TIMEOUT
 
 _RING = keyring.Keyring.parse(",".join(base64.b64encode(secrets.token_bytes(32)).decode() for _ in range(2)))
 """This worker's keyring: the newest key and an older one."""

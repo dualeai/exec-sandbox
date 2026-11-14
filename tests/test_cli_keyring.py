@@ -11,7 +11,6 @@ import fcntl
 import multiprocessing
 import os
 import re
-import secrets
 import stat
 import time
 from pathlib import Path
@@ -27,7 +26,7 @@ from keyring.errors import KeyringError, KeyringLocked, PasswordSetError
 
 from exec_sandbox.cli_keyring import open_local_keyring
 from exec_sandbox.exceptions import ConfigError, ErrorAction, ErrorCode
-from exec_sandbox.instance.keyring import Keyring
+from tests.instance_support import new_keyring
 from tests.keyring_support import KEYRING_ENTRY, MemoryBackend, as_os_backend
 
 _SPAWN = multiprocessing.get_context("spawn")
@@ -35,8 +34,9 @@ _CHILD_TIMEOUT = 60
 _LOCK_FILE = "instance-keyring.lock"
 
 
-def _key() -> str:
-    return base64.b64encode(secrets.token_bytes(32)).decode()
+def _key_bytes(text: str) -> bytes:
+    """The bytes of one key in base64 (an independent read: not the parser of the code)."""
+    return base64.b64decode(text, validate=True)
 
 
 def _mode(path: Path) -> int:
@@ -187,7 +187,7 @@ class TestLocalKeyring:
         first = open_local_keyring(data_dir=data_dir)
         assert first.created is True
         assert backend.entries == {KEYRING_ENTRY: first.text}
-        assert len(Keyring.parse(first.text).keys) == 1
+        assert len(_key_bytes(first.text)) == 32  # one key: 32 random bytes, base64
         assert _mode(data_dir) == 0o700
         assert _mode(data_dir / _LOCK_FILE) == 0o600
         second = open_local_keyring(data_dir=data_dir)
@@ -196,7 +196,7 @@ class TestLocalKeyring:
         assert sorted(p.name for p in data_dir.iterdir()) == [_LOCK_FILE]  # the key is not in a file
 
     def test_keeps_an_entry_with_several_keys(self, tmp_path: Path, backend: MemoryBackend) -> None:
-        text = f"{_key()},{_key()}"
+        text = f"{new_keyring()},{new_keyring()}"
         backend.entries[KEYRING_ENTRY] = text
         opened = open_local_keyring(data_dir=tmp_path)
         assert (opened.text, opened.created) == (text, False)
@@ -233,7 +233,7 @@ class TestLocalKeyring:
         assert [created for _, created in outcomes].count(True) == 1, outcomes
         texts = {text for text, _ in outcomes}
         assert texts == {_FileBackend(folder).get_password(*KEYRING_ENTRY)}
-        Keyring.parse(texts.pop())
+        assert len(_key_bytes(texts.pop())) == 32
 
 
 def _open_in_child(data_dir: str, folder: str, start: Any, results: Any) -> None:
@@ -307,7 +307,7 @@ class TestRefused:
 
     @pytest.mark.parametrize("content", ["", "not base64!", "c2hvcnQ=", "{k},{k}", "{k}, "])
     def test_invalid_entry_named_and_kept(self, tmp_path: Path, backend: MemoryBackend, content: str) -> None:
-        key = _key()
+        key = new_keyring()
         stored = content.format(k=key)
         backend.entries[KEYRING_ENTRY] = stored
         with pytest.raises(
@@ -389,7 +389,7 @@ class TestBackendCheck:
         """keyring chains the installed backends when there are more than one (Secret
         Service and KWallet on one host): it reads from each and writes to the first."""
         first, second = MemoryBackend(), MemoryBackend()
-        second.entries[KEYRING_ENTRY] = text = _key()
+        second.entries[KEYRING_ENTRY] = text = new_keyring()
         chained = [
             as_os_backend(SecretService.Keyring, first),
             as_os_backend(kwallet.DBusKeyring, second),

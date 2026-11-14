@@ -26,12 +26,12 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard, cast, final
 import aiohttp
 from aiobotocore.config import AioConfig
 from aiobotocore.httpsession import AIOHTTPSession
-from aiobotocore.session import get_session
 from botocore.exceptions import BotoCoreError, ClientError
 
+from exec_sandbox._imports import aws_session
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
+from exec_sandbox.files.disk import pwrite_all
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, wrong_size
-from exec_sandbox.sparse_file import pwrite_all
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine, Sequence
@@ -110,8 +110,10 @@ class S3InstanceStore(InstanceStore):
         conditional head writes. A head write goes out once (no SDK retry, no
         aiohttp re-send): a re-send that meets the write's own effect reads as
         refused. The commit protocol reads the head back instead. No request is
-        sent until the first call."""
-        session = get_session()
+        sent until the first call. Each open has its own session (credentials and
+        settings are read again) on the API models of the process: an open costs a
+        few ms."""
+        session = aws_session()
         async with (
             _s3_client(session, endpoint_url=endpoint_url, region=region, config=None) as client,
             _s3_client(

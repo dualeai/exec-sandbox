@@ -6,9 +6,7 @@ comes from EXEC_SANDBOX_INSTANCE_KEYRING: the OS keyring is never used (that
 the variable wins is tests/test_cli.py's fact).
 """
 
-import base64
 import json
-import secrets
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -16,8 +14,9 @@ import pytest
 from click.testing import CliRunner, Result
 
 from exec_sandbox import InstanceInfo, InstanceRef, Language, VmSpec
-from exec_sandbox.cli import EXIT_CLI_ERROR, EXIT_SANDBOX_ERROR, OneShotRun, cli
+from exec_sandbox.cli import OneShotRun, cli
 from tests.conftest import skip_unless_hwaccel
+from tests.instance_support import new_keyring
 from tests.keyring_support import isolate_account
 
 pytestmark = skip_unless_hwaccel
@@ -34,7 +33,7 @@ def store_dir(tmp_path: Path, images_dir: Path, monkeypatch: pytest.MonkeyPatch)
     root = tmp_path / "instances"
     monkeypatch.delenv("EXEC_SANDBOX_INSTANCE_STORE", raising=False)
     monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_STORE_DIR", str(root))
-    monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", base64.b64encode(secrets.token_bytes(32)).decode())
+    monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", new_keyring())
     monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_ASSET_DIR", str(tmp_path / "assets"))
     monkeypatch.setenv("EXEC_SANDBOX_IMAGES_DIR", str(images_dir))
     account = isolate_account(monkeypatch, home=tmp_path / "account", key=None)
@@ -93,7 +92,7 @@ def test_list_describe_rm(store_dir: Path) -> None:
     assert f"No instance {_ID}" in again.stderr
 
     gone = _sbx("instance", "describe", _ID)
-    assert gone.exit_code == EXIT_SANDBOX_ERROR
+    assert gone.exit_code == 125  # a sandbox error
     assert "INSTANCE_NOT_FOUND (RECREATE)" in gone.stderr
 
 
@@ -103,7 +102,7 @@ def test_other_vm_settings_exit_2_and_save_nothing(store_dir: Path) -> None:
     assert made.exit_code == 0, made.output
 
     conflict = _sbx("run", "--instance", _ID, "-m", "512", "-c", "print(z)")
-    assert conflict.exit_code == EXIT_CLI_ERROR
+    assert conflict.exit_code == 2  # a usage error
     assert f"Instance {_ID} has other VM settings: --memory 512 (saved: 256)" in conflict.output
     assert _describe().generation == 1
 

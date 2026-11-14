@@ -58,7 +58,12 @@ class Keyring:
 
     @classmethod
     def parse(cls, text: str) -> Keyring:
-        """Parse and validate the text format. Messages never contain key material."""
+        """Parse and validate the text format. Messages never contain key material.
+
+        Raises:
+            ConfigError: INSTANCE_CONFIG: an entry is empty, not base64, not 32 bytes,
+                not random, or the same key as another entry
+        """
         keys: list[Key] = []
         for n, raw in enumerate(text.split(","), start=1):
             entry = raw.strip()

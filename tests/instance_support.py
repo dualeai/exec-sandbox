@@ -31,8 +31,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
+import pytest
+
 import exec_sandbox.instance.manager as instance_manager
 from exec_sandbox import constants
+from exec_sandbox.images import image_digest
 from exec_sandbox.instance.codec import BLOCK_BYTES
 from exec_sandbox.instance.head import seal_head
 from exec_sandbox.instance.ids import new_id
@@ -44,13 +47,11 @@ from exec_sandbox.instance.store import Applied
 from exec_sandbox.models import ExecutionResult, Language, StartupTiming, TimingBreakdown
 from exec_sandbox.session import Session
 from exec_sandbox.vm_spec import VmSpec
-from exec_sandbox.vm_types import VmState
+from exec_sandbox.vm_types import AccelType, VmState
 
 if TYPE_CHECKING:
     import random
     from collections.abc import AsyncGenerator, Awaitable, Callable
-
-    import pytest
 
     from exec_sandbox.instance.manager import InstanceState
     from exec_sandbox.instance.store import InstanceStore
@@ -60,23 +61,28 @@ BLOCK = BLOCK_BYTES
 """Block size of instance streams (64 KiB): the unit a pack stores."""
 PYTHON = VmSpec(language=Language.PYTHON)
 """The spec of a fake VM when the test does not care which."""
+NO_VM_TIMEOUT = pytest.mark.timeout(10)
+"""Time budget of each saved-instance test that runs no VM (setup, call and teardown). Such a
+test takes tens of ms. A host stall (a lookup or connect that waits for its timeout: 35 s on
+macOS CI) then fails the test that meets it, by name, instead of slowing the job until the
+step timeout."""
 
 
 # ----------------------------------------------------------------------------- polling
 
 
-async def await_until(predicate: Callable[[], bool], *, timeout: float = 10.0, interval: float = 0.05) -> None:
-    """Poll `predicate` until it is true; AssertionError after `timeout` seconds.
+async def await_until(predicate: Callable[[], bool]) -> None:
+    """Poll `predicate` every 50 ms until it is true; AssertionError after 10 s.
 
     Only for effects that finish in the background (a cleanup delete, a task
     the code does not expose): ordering between steps uses gates and events.
     """
     try:
-        async with asyncio.timeout(timeout):
+        async with asyncio.timeout(10):
             while not predicate():  # noqa: ASYNC110 - no event signals these effects
-                await asyncio.sleep(interval)
+                await asyncio.sleep(0.05)
     except TimeoutError:
-        raise AssertionError(f"condition still false after {timeout} s") from None
+        raise AssertionError("condition still false after 10 s") from None
 
 
 def descriptors_of(path: Path) -> list[tuple[int, int]]:
@@ -287,7 +293,11 @@ class FakeVm:
         self.spec = spec
         self.base_image = base_image
         self.packages_image: Path | None = None
+        # The digests VmManager records when QEMU opens the images (InstanceManager._host_facts)
+        self.base_image_digest: str | None = image_digest(base_image)
+        self.packages_image_digest: str | None = None
         self.use_qemu_vm_user = False
+        self.cgroup = None  # no memory cgroup (QemuVM.cgroup)
         self.workdir = SimpleNamespace(home_disk=root / "home.img")
         self.qmp_socket = root / "qmp.sock"
         self.state = VmState.READY
@@ -344,8 +354,9 @@ class FakeVmManager:
         self.settings = SimpleNamespace(force_emulation=False)
         self.base_image = base_image
         """The worker's own base image; None: this worker lacks it (a load fetches it by digest)."""
+        self.images = SimpleNamespace(base_image=self._base_image)  # VmManager.images (GuestImages)
 
-    def get_base_image(self, language: object) -> Path:
+    def _base_image(self, language: object) -> Path:
         if self.base_image is None:
             raise FileNotFoundError(f"no base image for {language} on this worker")
         return self.base_image
@@ -399,15 +410,19 @@ async def no_packages(_spec: VmSpec) -> Path | None:
     return None
 
 
-async def stop_all(vms: list[FakeVm]) -> None:
-    for vm in vms:
-        with contextlib.suppress(Exception):
-            await vm.qmp.stop()
-
-
 async def qemu_floor() -> tuple[int, int, int]:
     """Stand-in for the QEMU version probe: the fake VM needs no QEMU binary."""
     return constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION
+
+
+def accelerator_probe(host: AccelType) -> Callable[..., Awaitable[AccelType]]:
+    """Stand-in for the accelerator probe of InstanceManager: `host` (the worker probed it
+    once), or TCG when emulation is forced, as the real probe answers."""
+
+    async def detect_accel_type(*, force_emulation: bool) -> AccelType:
+        return AccelType.TCG if force_emulation else host
+
+    return detect_accel_type
 
 
 def new_keyring() -> str:
@@ -465,7 +480,7 @@ def disk_full_once(monkeypatch: pytest.MonkeyPatch, *, step: Literal["clone", "s
 
     The one private seam of the save path (no public hook makes a local write fail):
     the manager module's name for a dependency is replaced, never the manager's own
-    code. "clone": sparse_file.clone_sparse (the home disk copy, while the VM is
+    code. "clone": files.disk.clone_sparse (the home disk copy, while the VM is
     stopped); "seal": pack.write_object (the body object).
     """
     name = _DISK_FULL_SEAMS[step]
@@ -539,7 +554,9 @@ class InstanceEnv:
                 yield env
             finally:
                 proxy.clear()
-                await stop_all(env.vms)
+                for vm in env.vms:
+                    with contextlib.suppress(Exception):
+                        await vm.qmp.stop()
 
     def manager_for(self, keyring: str) -> InstanceManager:
         """Another worker on the same store and folders, with this keyring."""

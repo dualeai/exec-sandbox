@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -28,6 +27,7 @@ from exec_sandbox.exceptions import (
     SandboxError,
     TransientError,
 )
+from exec_sandbox.images import image_digest
 from exec_sandbox.instance import ids, s3_store
 from exec_sandbox.instance.head import MAX_HEAD_BYTES, open_head, seal_head
 from exec_sandbox.instance.keyring import Keyring
@@ -38,6 +38,7 @@ from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied, body_key, head_key
 from tests.instance_support import (
     BLOCK,
+    NO_VM_TIMEOUT,
     PYTHON,
     FakeVm,
     InstanceEnv,
@@ -78,6 +79,8 @@ if TYPE_CHECKING:
 
     from exec_sandbox.instance.manager import InstanceManager, InstanceState
     from exec_sandbox.session import Session
+
+pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
 _REGION = "us-east-1"
@@ -707,13 +710,13 @@ class TestDamageAtLoad:
         digest cache is keyed by that stamp): the first save to a store must not put those
         bytes under that digest. The save fails and the store holds nothing."""
         digest = hashlib.sha256(env.base_image.read_bytes()).hexdigest()  # the oracle: the good bytes
-        assert BaseCacheManager.image_hash(env.base_image) == digest
+        assert image_digest(env.base_image) == digest
         before = env.base_image.stat()
         damaged = bytearray(env.base_image.read_bytes())
         damaged[100] ^= 0x01
         env.base_image.write_bytes(bytes(damaged))
         os.utime(env.base_image, ns=(before.st_atime_ns, before.st_mtime_ns))
-        assert BaseCacheManager.image_hash(env.base_image) == digest  # the stamp still says "good"
+        assert image_digest(env.base_image) == digest  # the stamp still says "good"
         ram, home = _layout(14)
         saver = Saver(env, await env.new_vm(ram, home, spec=PYTHON), manager=env.manager, state=None)
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.IMAGE_DAMAGED) as exc:

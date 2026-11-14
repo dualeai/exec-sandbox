@@ -10,15 +10,18 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
+from botocore.loaders import Loader
+from botocore.retries.standard import ExponentialBackoff
 
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, SandboxError, TransientError
 from exec_sandbox.instance import s3_store
 from exec_sandbox.instance.s3_store import S3InstanceStore
-from exec_sandbox.instance.store import InstanceStore, NotApplied, probe
-from tests.instance_support import await_until, descriptors_of
-from tests.s3_faults import After, DropAfter, DropBefore, Edit, Fail, Hold, Request, Response, S3Proxy
+from exec_sandbox.instance.store import Applied, InstanceStore, NotApplied, probe
+from tests.instance_support import NO_VM_TIMEOUT, await_until, descriptors_of
+from tests.s3_faults import BUCKET, After, Before, DropAfter, DropBefore, Edit, Fail, Hold, Request, Response, S3Proxy
 
-_BUCKET = "test-snapshots"
+pytestmark = NO_VM_TIMEOUT
+
 _MAX = 1024 * 1024
 _PART = s3_store._PART_BYTES  # pyright: ignore[reportPrivateUsage]
 """Multipart part and ranged-GET size of the S3 store (a tuning value, from the code): a larger
@@ -34,7 +37,7 @@ def prefix() -> str:
 @pytest.fixture
 async def store(moto_s3_server, prefix: str) -> AsyncGenerator[InstanceStore]:
     endpoint_url, _ = moto_s3_server
-    async with S3InstanceStore.open(bucket=_BUCKET, prefix=prefix, endpoint_url=endpoint_url, region="us-east-1") as s:
+    async with S3InstanceStore.open(bucket=BUCKET, prefix=prefix, endpoint_url=endpoint_url, region="us-east-1") as s:
         yield s
 
 
@@ -42,9 +45,45 @@ async def store(moto_s3_server, prefix: str) -> AsyncGenerator[InstanceStore]:
 async def proxied(s3_proxy: S3Proxy) -> AsyncGenerator[tuple[InstanceStore, S3Proxy]]:
     """A store behind the fault proxy (tests/s3_faults.py): faults come from the wire, not from patches."""
     async with S3InstanceStore.open(
-        bucket=_BUCKET, prefix=s3_proxy.prefix, endpoint_url=s3_proxy.endpoint_url, region="us-east-1"
+        bucket=BUCKET, prefix=s3_proxy.prefix, endpoint_url=s3_proxy.endpoint_url, region="us-east-1"
     ) as s:
         yield s, s3_proxy
+
+
+class TestOpen:
+    async def test_opens_share_api_models_not_credentials(
+        self, s3_proxy: S3Proxy, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An open makes no botocore loader of its own: a new loader lists every service folder
+        and parses the S3 model again (40 to 300 ms for each open). Each open still reads the
+        credentials again: a key set after the first open signs the requests of the next one."""
+        signed_by: list[str] = []
+
+        async def record_key(req: Request) -> None:
+            found = re.search(r"Credential=([^/]+)/", req.headers["Authorization"])
+            signed_by.append(found.group(1) if found else "")
+
+        s3_proxy.add("PUT_IF", "", Before(record_key), times=None)
+        loaders = 0
+        new_loader = Loader.__init__
+
+        def counted(self: Loader, *args: object, **kwargs: object) -> None:
+            nonlocal loaders
+            loaders += 1
+            new_loader(self, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        async def put_signed_by(access_key: str) -> None:
+            monkeypatch.setenv("AWS_ACCESS_KEY_ID", access_key)
+            async with S3InstanceStore.open(
+                bucket=BUCKET, prefix=s3_proxy.prefix, endpoint_url=s3_proxy.endpoint_url, region="us-east-1"
+            ) as store:
+                assert isinstance(await store.put_if_absent(access_key, data=b"x"), Applied)
+
+        await put_signed_by("first-key")  # makes the loader of the process, if no earlier test did
+        monkeypatch.setattr(Loader, "__init__", counted)
+        await put_signed_by("second-key")
+        assert signed_by == ["first-key", "second-key"]
+        assert loaders == 0
 
 
 class TestSmallObjects:
@@ -53,8 +92,8 @@ class TestSmallObjects:
     async def test_keys_live_under_the_store_prefix(self, store: InstanceStore, moto_s3_server, prefix: str) -> None:
         _, s3 = moto_s3_server
         await store.put_if_absent("s/a/head", data=b"body")
-        assert s3.get_object(Bucket=_BUCKET, Key=f"{prefix}s/a/head")["Body"].read() == b"body"
-        assert s3.list_objects_v2(Bucket=_BUCKET, Prefix=prefix)["KeyCount"] == 1
+        assert s3.get_object(Bucket=BUCKET, Key=f"{prefix}s/a/head")["Body"].read() == b"body"
+        assert s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)["KeyCount"] == 1
 
     @pytest.mark.parametrize(
         ("status", "code", "maybe_applied"),
@@ -387,10 +426,11 @@ class TestListing:
 
 
 class TestFailures:
+    @pytest.mark.usefixtures("fake_aws_env")
     async def test_unreachable_store(self) -> None:
         """No answer: conditional writes may have applied (unknown); other calls raise RETRY."""
         async with S3InstanceStore.open(
-            bucket=_BUCKET, prefix="", endpoint_url="http://127.0.0.1:9", region="us-east-1"
+            bucket=BUCKET, prefix="", endpoint_url="http://127.0.0.1:9", region="us-east-1"
         ) as unreachable:
             assert await unreachable.put_if_absent("k", data=b"x") == NotApplied(maybe_applied=True)
             with pytest.raises(TransientError, check=lambda e: e.code is ErrorCode.INSTANCE_STORE_UNAVAILABLE) as exc:
@@ -551,17 +591,21 @@ class TestStoreAnswers:
 
 class TestHeadWriteIsSentOnce:
     """S3InstanceStore.open: no SDK retry and no aiohttp re-send for conditional head writes (a
-    re-send that meets the write's own effect reads as refused). SDK retries are at their default
-    here (the s3_proxy fixture turns them off for every client): each test counts the PUTs that
+    re-send that meets the write's own effect reads as refused). SDK retries are on here (the
+    fake_aws_env fixture turns them off for every other client): each test counts the PUTs that
     reach the proxy for one call."""
 
     @pytest.fixture
     async def retrying(
         self, s3_proxy: S3Proxy, monkeypatch: pytest.MonkeyPatch
     ) -> AsyncGenerator[tuple[InstanceStore, S3Proxy]]:
-        monkeypatch.delenv("AWS_MAX_ATTEMPTS")
+        """A store whose clients may retry once (standard mode), without the backoff wait
+        before the retry (a random 0 to 1 s)."""
+        monkeypatch.setenv("AWS_MAX_ATTEMPTS", "2")
+        monkeypatch.setenv("AWS_RETRY_MODE", "standard")
+        monkeypatch.setattr(ExponentialBackoff, "delay_amount", lambda _self, _context: 0.0)
         async with S3InstanceStore.open(
-            bucket=_BUCKET, prefix=s3_proxy.prefix, endpoint_url=s3_proxy.endpoint_url, region="us-east-1"
+            bucket=BUCKET, prefix=s3_proxy.prefix, endpoint_url=s3_proxy.endpoint_url, region="us-east-1"
         ) as s:
             yield s, s3_proxy
 

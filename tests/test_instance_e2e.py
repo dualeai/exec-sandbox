@@ -4,9 +4,6 @@ new -> exec -> save -> close -> reuse: the Python state and /home/user come back
 """
 
 import asyncio
-import base64
-import os
-import secrets
 import shutil
 import tempfile
 import uuid
@@ -16,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from exec_sandbox import InstanceNotSavedWarning, Scheduler, SchedulerConfig, SessionClosedError, VmSpec
+from exec_sandbox import InstanceNotSavedWarning, Scheduler, SchedulerConfig, VmSpec
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -29,18 +26,14 @@ from exec_sandbox.exceptions import (
 from exec_sandbox.instance.keyring import Keyring
 from exec_sandbox.models import Language
 from tests.conftest import skip_unless_hwaccel
-from tests.instance_support import await_until, disk_full_once
-from tests.s3_faults import After, Bucket, DropAfter, Edit, Fail, Hold, Request, Response, S3Proxy
+from tests.instance_support import await_until, disk_full_once, new_keyring
+from tests.s3_faults import BUCKET, After, Bucket, DropAfter, Edit, Fail, Hold, Request, Response, S3Proxy
 
 pytestmark = skip_unless_hwaccel
 
 _PY = VmSpec(language=Language.PYTHON)
 _HEAD = r"^s/[0-9a-f]{32}/head$"
 _BODY = r"^s/[0-9a-f]{32}/b/"
-
-
-def _key() -> str:
-    return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
 def _config(base: SchedulerConfig, endpoint_url: str, prefix: str, keyring: str) -> SchedulerConfig:
@@ -50,7 +43,7 @@ def _config(base: SchedulerConfig, endpoint_url: str, prefix: str, keyring: str)
         {
             **base.model_dump(exclude_unset=True),
             "instance_store": "s3",
-            "s3_bucket": "test-snapshots",
+            "s3_bucket": BUCKET,
             "s3_endpoint_url": endpoint_url,
             "s3_instance_prefix": prefix,
             "instance_keyring": keyring,
@@ -61,7 +54,7 @@ def _config(base: SchedulerConfig, endpoint_url: str, prefix: str, keyring: str)
 @pytest.fixture
 def home_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """EXEC_SANDBOX_HOME_DISK_DIR of this test: each VmManager's folder, with its instances/ work folder, is under it."""
-    root = Path(tempfile.mkdtemp(prefix="hd-"))  # short and 0700 (HomeDiskDir checks the root)
+    root = Path(tempfile.mkdtemp(prefix="hd-"))  # short and 0700 (PrivateRunDir checks the root)
     monkeypatch.setenv("EXEC_SANDBOX_HOME_DISK_DIR", str(root))
     try:
         yield root
@@ -85,7 +78,7 @@ async def store(
     (scheduler, prefix, s3 client). A test that injects store faults also takes `s3_proxy` (the same
     proxy); one that checks local files takes `home_root` or `asset_dir`."""
     prefix = s3_proxy.prefix
-    async with Scheduler(_config(scheduler_config, s3_proxy.endpoint_url, prefix, _key())) as scheduler:
+    async with Scheduler(_config(scheduler_config, s3_proxy.endpoint_url, prefix, new_keyring())) as scheduler:
         yield scheduler, prefix, s3_proxy.bucket.s3
 
 
@@ -116,7 +109,7 @@ def _instance_folders(home_root: Path, instance_id: str) -> list[Path]:
 
 
 def _objects(s3: object, prefix: str, instance_id: str) -> list[str]:
-    listing = s3.list_objects_v2(Bucket="test-snapshots", Prefix=f"{prefix}s/{instance_id}/b/")  # type: ignore[attr-defined]
+    listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"{prefix}s/{instance_id}/b/")  # type: ignore[attr-defined]
     return sorted(o["Key"].rsplit("/", 1)[1] for o in listing.get("Contents", []))
 
 
@@ -147,31 +140,6 @@ class TestSaveAndReuse:
             result = await vm.exec("print(x)")
             assert result.stdout.strip() == "42"
             assert vm.instance == second
-
-    async def test_second_writer_conflicts_and_is_closed(self, store: tuple[Scheduler, str, object]) -> None:
-        scheduler, prefix, s3 = store
-        async with await scheduler.new(_PY) as vm:
-            await vm.exec("x = 0")
-            ref = await vm.save()
-        a = await scheduler.reuse(ref.instance_id)
-        b = await scheduler.reuse(ref.instance_id)
-        try:
-            await a.exec("x = 'a'")
-            await b.exec("x = 'b'")
-            assert (await a.save()).generation == 2
-            with pytest.raises(OutcomeUnknownError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFLICT) as exc:
-                await b.save()
-            assert exc.value.action == "VERIFY"
-            assert b.closed
-            with pytest.raises(SessionClosedError):
-                await b.exec("print(x)")
-        finally:
-            await a.close()
-            await b.close()
-        kinds = sorted(name.rsplit(".", 1)[1] for name in _objects(s3, prefix, ref.instance_id))
-        assert kinds == ["f", "p"], kinds  # the loser removed its own pack
-        async with await scheduler.reuse(ref.instance_id) as vm:
-            assert (await vm.exec("print(x)")).stdout.strip() == "a"
 
 
 class TestErrors:
@@ -277,7 +245,7 @@ class TestSaveFailures:
         """The store records, when it applies the head write, whether the exit had already ended."""
         _, prefix, _ = store
         endpoint_url = s3_proxy.endpoint_url
-        keyring = _key()
+        keyring = new_keyring()
         scheduler = Scheduler(_config(scheduler_config, endpoint_url, prefix, keyring))
         await scheduler.__aenter__()
         vm = await scheduler.new(_PY)
@@ -350,19 +318,6 @@ class TestSaveFailures:
 
 
 class TestLoadFailures:
-    async def test_changed_body_object_is_damaged(self, store: tuple[Scheduler, str, object]) -> None:
-        scheduler, prefix, s3 = store
-        async with await scheduler.new(_PY) as vm:
-            ref = await vm.save()
-        (full,) = _objects(s3, prefix, ref.instance_id)
-        key = f"{prefix}s/{ref.instance_id}/b/{full}"
-        data = bytearray(s3.get_object(Bucket="test-snapshots", Key=key)["Body"].read())  # type: ignore[attr-defined]
-        data[len(data) // 2] ^= 0x01  # same size: only authentication can tell
-        s3.put_object(Bucket="test-snapshots", Key=key, Body=bytes(data))  # type: ignore[attr-defined]
-        with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY) as exc:
-            await scheduler.reuse(ref.instance_id)
-        assert exc.value.action == "RECREATE"
-
     async def test_worker_without_the_key_is_fix_config(
         self, store: tuple[Scheduler, str, object], scheduler_config: SchedulerConfig, moto_s3_server
     ) -> None:
@@ -370,7 +325,7 @@ class TestLoadFailures:
         async with await scheduler.new(_PY) as vm:
             ref = await vm.save()
         endpoint_url, _ = moto_s3_server
-        async with Scheduler(_config(scheduler_config, endpoint_url, prefix, _key())) as stranger:
+        async with Scheduler(_config(scheduler_config, endpoint_url, prefix, new_keyring())) as stranger:
             with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_KEY_MISSING) as exc:
                 await stranger.reuse(ref.instance_id)
         assert exc.value.action == "FIX_CONFIG"
@@ -394,7 +349,7 @@ class TestLoadFailures:
         async with await scheduler.new(_PY) as vm:
             ref = await vm.save()
         (full,) = _objects(s3, prefix, ref.instance_id)
-        s3.delete_object(Bucket="test-snapshots", Key=f"{prefix}s/{ref.instance_id}/b/{full}")  # type: ignore[attr-defined]
+        s3.delete_object(Bucket=BUCKET, Key=f"{prefix}s/{ref.instance_id}/b/{full}")  # type: ignore[attr-defined]
         with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_EXPIRED) as exc:
             await scheduler.reuse(ref.instance_id)
         assert exc.value.action == "RECREATE"
@@ -418,30 +373,34 @@ class TestLoadFailures:
 
 
 class TestChain:
-    @pytest.mark.parametrize("fault", ["middle-pack-deleted", "pack-replaced"])
+    @pytest.mark.parametrize("fault", ["deleted", "one-bit-changed"])
     async def test_broken_lineage_at_save_writes_a_full_copy(
         self, store: tuple[Scheduler, str, object], fault: str
     ) -> None:
-        """One LIST before each pack: a missing or replaced chain object makes the
-        next save a full copy, so the chain the head names always loads."""
+        """One LIST before each pack: the middle pack of a full copy and three packs, deleted or
+        with one bit changed (same size, another ETag), makes the next save a new full copy, so
+        the chain the head names always loads, with that save's state."""
         scheduler, prefix, s3 = store
+        bucket = Bucket(s3, prefix)
+        order: list[str] = []  # body keys, oldest first
         async with await scheduler.new(_PY) as vm:
-            for n in range(3):
+            for n in range(4):
                 await vm.exec(f"x = {n}")
                 ref = await vm.save()
-            objects = _objects(s3, prefix, ref.instance_id)
-            assert sorted(o.rsplit(".", 1)[1] for o in objects) == ["f", "p", "p"], objects
-            pack = sorted(o for o in objects if o.endswith(".p"))[0]
-            key = f"{prefix}s/{ref.instance_id}/b/{pack}"
-            if fault == "middle-pack-deleted":
-                s3.delete_object(Bucket="test-snapshots", Key=key)  # type: ignore[attr-defined]
+                (new,) = set(bucket.body_keys(ref.instance_id)) - set(order)
+                order.append(new)
+            assert [k.rsplit(".", 1)[1] for k in order] == ["f", "p", "p", "p"]
+            if fault == "deleted":
+                bucket.delete(order[2])
             else:
-                size = s3.head_object(Bucket="test-snapshots", Key=key)["ContentLength"]  # type: ignore[attr-defined]
-                s3.put_object(Bucket="test-snapshots", Key=key, Body=os.urandom(size))  # type: ignore[attr-defined]
+                bucket.flip(order[2], bucket.size(order[2]) // 2)
             await vm.exec("x = 'after the repair'")
-            await vm.save()
-        assert [o.rsplit(".", 1)[1] for o in _objects(s3, prefix, ref.instance_id)] == ["f"]
+            state = await vm.save()
+        (full,) = bucket.body_keys(ref.instance_id)
+        assert full.endswith(".f")
+        assert full not in order
         async with await scheduler.reuse(ref.instance_id) as vm:
+            assert vm.instance == state
             assert (await vm.exec("print(x)")).stdout.strip() == "after the repair"
 
     async def test_full_copy_gone_at_save_writes_a_new_one(self, store: tuple[Scheduler, str, object]) -> None:
@@ -452,7 +411,7 @@ class TestChain:
             await vm.exec("x = 'kept'")
             ref = await vm.save()
             (full,) = _objects(s3, prefix, ref.instance_id)
-            s3.delete_object(Bucket="test-snapshots", Key=f"{prefix}s/{ref.instance_id}/b/{full}")  # type: ignore[attr-defined]
+            s3.delete_object(Bucket=BUCKET, Key=f"{prefix}s/{ref.instance_id}/b/{full}")  # type: ignore[attr-defined]
             await vm.save()
         objects = _objects(s3, prefix, ref.instance_id)
         assert [n.rsplit(".", 1)[1] for n in objects] == ["f"], objects
@@ -473,7 +432,7 @@ class TestChain:
         old_objects = _objects(s3, prefix, ref.instance_id)
 
         endpoint_url, _ = moto_s3_server
-        new_key = _key()
+        new_key = new_keyring()
         rotated = _config(scheduler_config, endpoint_url, prefix, f"{new_key},{old_key.get_secret_value()}")
         async with Scheduler(rotated) as worker, await worker.reuse(ref.instance_id) as vm:
             await vm.save()
@@ -487,32 +446,10 @@ class TestChain:
             async with await worker.reuse(ref.instance_id) as vm:
                 assert (await vm.exec("print(x)")).stdout.strip() == "kept across the rotation"
 
-    async def test_repair_after_middle_pack_damage_real_vm(self, store: tuple[Scheduler, str, object]) -> None:
-        """One changed bit in the middle pack of a full + 3 packs chain: the next save sees it (LIST
-        ETag) and writes a full copy, and the instance loads with that save's state."""
-        scheduler, prefix, s3 = store
-        bucket = Bucket(s3, prefix)
-        order: list[str] = []  # body keys, oldest first
-        async with await scheduler.new(_PY) as vm:
-            for n in range(4):
-                await vm.exec(f"x = {n}")
-                ref = await vm.save()
-                (new,) = set(bucket.body_keys(ref.instance_id)) - set(order)
-                order.append(new)
-            assert [k.rsplit(".", 1)[1] for k in order] == ["f", "p", "p", "p"]
-            bucket.flip(order[2], bucket.size(order[2]) // 2)
-            await vm.exec("x = 'after the repair'")
-            state = await vm.save()
-        (full,) = bucket.body_keys(ref.instance_id)
-        assert full.endswith(".f")
-        assert full not in order
-        async with await scheduler.reuse(ref.instance_id) as vm:
-            assert vm.instance == state
-            assert (await vm.exec("print(x)")).stdout.strip() == "after the repair"
-
     async def test_load_fails_closed_real_vm(self, store: tuple[Scheduler, str, object], home_root: Path) -> None:
-        """A changed pack: reuse() fails with InstanceGoneError INSTANCE_INTEGRITY (RECREATE) before a VM starts,
-        and leaves no instance files on the worker."""
+        """One changed bit in a pack (same size: only authentication finds it): reuse() fails with
+        InstanceGoneError INSTANCE_INTEGRITY (RECREATE) before a VM starts, and leaves no instance
+        files on the worker."""
         scheduler, prefix, s3 = store
         bucket = Bucket(s3, prefix)
         async with await scheduler.new(_PY) as vm:
@@ -555,7 +492,7 @@ class TestAdmin:
         async with await scheduler.new(_PY) as vm:
             ref = await vm.save()
         endpoint_url, _ = moto_s3_server
-        async with Scheduler(_config(scheduler_config, endpoint_url, prefix, _key())) as stranger:
+        async with Scheduler(_config(scheduler_config, endpoint_url, prefix, new_keyring())) as stranger:
             info = await stranger.describe_instance(ref.instance_id)
         assert (info.generation, info.verified, info.spec, info.host) == (1, False, None, None)
 
@@ -596,7 +533,7 @@ class TestAssets:
         saved = await scheduler.describe_instance(ref.instance_id)
         assert saved.host is not None
         key = f"{prefix}assets/sha256/{saved.host.base_image}"
-        assert s3.head_object(Bucket="test-snapshots", Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
+        assert s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
         downloaded = asset_dir / f"{saved.host.base_image}.img"
         assert not downloaded.exists()
 
@@ -619,9 +556,9 @@ class TestAssets:
             info = await scheduler.describe_instance(ref.instance_id)
             assert info.host is not None
             key = f"{prefix}assets/sha256/{info.host.base_image}"
-            s3.delete_object(Bucket="test-snapshots", Key=key)  # type: ignore[attr-defined]
+            s3.delete_object(Bucket=BUCKET, Key=key)  # type: ignore[attr-defined]
             await vm.save()
-        assert s3.head_object(Bucket="test-snapshots", Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
+        assert s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"] > 0  # type: ignore[attr-defined]
 
     async def test_damaged_store_copy_routes(
         self,
@@ -635,7 +572,7 @@ class TestAssets:
             ref = await vm.save()
         info = await scheduler.describe_instance(ref.instance_id)
         assert info.host is not None
-        s3.put_object(Bucket="test-snapshots", Key=f"{prefix}assets/sha256/{info.host.base_image}", Body=b"x")  # type: ignore[attr-defined]
+        s3.put_object(Bucket=BUCKET, Key=f"{prefix}assets/sha256/{info.host.base_image}", Body=b"x")  # type: ignore[attr-defined]
         other = _worker_config(scheduler, scheduler_config, s3_proxy, images_dir=images_without_python_base)
         async with Scheduler(other) as worker:
             with pytest.raises(

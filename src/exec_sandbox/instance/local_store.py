@@ -1,9 +1,9 @@
 """Local instance store: a folder on this host, with the conditional writes of a bucket.
 
 For one host only: the rules of store.py hold across the threads and processes
-of this host, never across hosts (a fleet uses the S3 store). Put the folder on
-a local disk: a network filesystem can make flock shared (open() refuses that)
-or show old files to its clients.
+of this host, never across hosts (a fleet uses the S3 store). open() checks that
+flock excludes a second open of a file in this process (Linux NFS makes flock a
+POSIX lock, which one process gets twice) and refuses the folder if it does not.
 
 Layout (keys are the bucket's keys, store.py):
     <root>/                    0700, owned by this user, not a symlink, no ACL entry,
@@ -51,19 +51,20 @@ import hashlib
 import os
 import re
 import stat
-import threading
 import time
 import weakref
 from typing import TYPE_CHECKING, final
 
+from exec_sandbox.aio_utils import run_stoppable
 from exec_sandbox.exceptions import ConfigError, ErrorCode, TransientError
+from exec_sandbox.files.disk import clone_sparse_fd, flush_to_disk, make_private_dir, pwrite_all, read_all
 from exec_sandbox.instance.ids import new_id
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, wrong_size
 from exec_sandbox.permission_utils import private_dir_problem, private_tree_problem
-from exec_sandbox.sparse_file import clone_sparse_fd, flush_to_disk, pwrite_all
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Generator, Sequence
+    import threading
+    from collections.abc import AsyncGenerator, Generator, Sequence
     from pathlib import Path
 
     from exec_sandbox.instance.store import CondResult
@@ -131,14 +132,14 @@ class LocalInstanceStore(InstanceStore):
     async def upload(self, key: str, /, *, src: Path) -> str:
         """Clone `src` to a staging file (copy-on-write when the disk can), flush it,
         then rename it onto the key. The ETag is the stat stamp of the file after the rename."""
-        return await _run_to_end(functools.partial(self._upload, key=key, parts=_parts(key), src=src), undo=None)
+        return await run_stoppable(functools.partial(self._upload, key=key, parts=_parts(key), src=src), undo=None)
 
     async def download(self, key: str, /, *, dest: Path, max_bytes: int, expected_size: int | None) -> bool:
         """Clone the object to `dest` (copy-on-write when the disk can). The stat of
         the file is the truth: another size than `expected_size` is
         InstanceGoneError (INSTANCE_INTEGRITY) at once. The copy is of the file open at the start:
         a rename onto the key meanwhile does not change it."""
-        return await _run_to_end(
+        return await run_stoppable(
             functools.partial(
                 self._download,
                 key=key,
@@ -151,13 +152,13 @@ class LocalInstanceStore(InstanceStore):
         )
 
     async def put_if_absent(self, key: str, /, *, data: bytes) -> CondResult:
-        return await _run_to_end(
+        return await run_stoppable(
             functools.partial(self._put, key=key, parts=_parts(key), data=data, etag=None), undo=None
         )
 
     async def put_if_match(self, key: str, /, *, data: bytes, etag: str) -> CondResult:
         """`etag` is the SHA-256 hex that `get` or Applied gave."""
-        return await _run_to_end(
+        return await run_stoppable(
             functools.partial(self._put, key=key, parts=_parts(key), data=data, etag=etag), undo=None
         )
 
@@ -178,7 +179,7 @@ class LocalInstanceStore(InstanceStore):
         each probe and deleted instance leaves folders)."""
         items = [(key, _parts(key)) for key in keys]
         if items:
-            await _run_to_end(functools.partial(self._delete, items=items), undo=None)
+            await run_stoppable(functools.partial(self._delete, items=items), undo=None)
 
     # ------------------------------------------------------------------ jobs (worker threads)
 
@@ -240,7 +241,7 @@ class LocalInstanceStore(InstanceStore):
                 size = os.fstat(fd).st_size
                 if size > max_bytes:
                     raise wrong_size(key, size, expected=f"at most {max_bytes}")
-                data = _read_all(fd, size)
+                data = read_all(fd, size)
             finally:
                 os.close(fd)
         except OSError as e:
@@ -319,8 +320,8 @@ class LocalInstanceStore(InstanceStore):
 
     def _put(self, stop: threading.Event, *, key: str, parts: _Parts, data: bytes, etag: str | None) -> CondResult:
         """Stage, then under the flock: compare, rename, flush the folder. It raises
-        only before the rename (nothing applied); a failed flush after the rename
-        may hide a write that applied."""
+        only before the rename (nothing applied). A failed folder flush after the
+        rename gives NotApplied(maybe_applied=True): a crash may undo the rename."""
         try:
             with self._staging_file() as (staging, staged):
                 _write_new(staging, staged, data)
@@ -536,32 +537,13 @@ class LocalInstanceStore(InstanceStore):
         )
 
 
-async def _run_to_end[T](job: Callable[[threading.Event], T], *, undo: Callable[[T], None] | None) -> T:
-    """Run `job(stop)` in a worker thread. A cancel sets `stop` (the job stops at
-    its next safe point and removes its own files), waits until the job ends,
-    then raises: no job runs on after its call, or holds the flock. `undo` gets
-    the result of a job that ended after its call was cancelled."""
-    stop = threading.Event()
-    future = asyncio.get_running_loop().run_in_executor(None, job, stop)
-    try:
-        return await asyncio.shield(future)  # shield marks a later job error as read
-    except asyncio.CancelledError:
-        stop.set()
-        while not future.done():
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait([future])
-        if undo is not None and not future.cancelled() and future.exception() is None:
-            undo(future.result())
-        raise
-
-
 # ---------------------------------------------------------------------- root
 
 
 def _open_root(root: Path) -> int:
     """Make `root` (0700) when it is missing, and open it. A symlink is refused, never followed."""
     try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        make_private_dir(root)
     except OSError as e:
         raise _cannot_open(root, e) from e
     try:
@@ -721,14 +703,6 @@ def _write_new(folder: int, name: str, data: bytes) -> None:
         flush_to_disk(fd)
     finally:
         os.close(fd)
-
-
-def _read_all(fd: int, size: int) -> bytes:
-    chunks: list[bytes] = []
-    while size > 0 and (chunk := os.read(fd, size)):
-        chunks.append(chunk)
-        size -= len(chunk)
-    return b"".join(chunks)
 
 
 def _stamp(st: os.stat_result) -> str:

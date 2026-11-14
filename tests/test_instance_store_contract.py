@@ -19,6 +19,10 @@ from exec_sandbox.instance import s3_store
 from exec_sandbox.instance.local_store import LocalInstanceStore
 from exec_sandbox.instance.s3_store import S3InstanceStore
 from exec_sandbox.instance.store import Applied, InstanceStore, ListedObject, NotApplied, probe
+from tests.instance_support import NO_VM_TIMEOUT
+from tests.s3_faults import BUCKET
+
+pytestmark = NO_VM_TIMEOUT
 
 _MAX = 1024 * 1024
 _TWO_PARTS_AND_ONE = 2 * s3_store._PART_BYTES + 1  # pyright: ignore[reportPrivateUsage]
@@ -29,7 +33,7 @@ async def store(request: pytest.FixtureRequest, tmp_path: Path) -> AsyncGenerato
     if request.param == "s3":
         endpoint_url, _ = request.getfixturevalue("moto_s3_server")
         async with S3InstanceStore.open(
-            bucket="test-snapshots",
+            bucket=BUCKET,
             prefix=f"contract-{uuid.uuid4().hex}/",
             endpoint_url=endpoint_url,
             region="us-east-1",

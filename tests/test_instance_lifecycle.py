@@ -41,9 +41,11 @@ from exec_sandbox.exceptions import (
     TransientError,
 )
 from exec_sandbox.instance.store import head_key
-from exec_sandbox.models import InstanceRef
+from exec_sandbox.models import InstanceRef, StartupTiming
+from exec_sandbox.session import Session
 from tests.instance_support import (
     BLOCK,
+    NO_VM_TIMEOUT,
     PYTHON,
     FakeVm,
     InstanceEnv,
@@ -65,7 +67,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from exec_sandbox.instance.manager import InstanceState
-    from exec_sandbox.session import Session
+
+pytestmark = NO_VM_TIMEOUT
 
 type Streams = tuple[bytes, bytes]
 """(vmstate, home) bytes."""
@@ -74,6 +77,8 @@ _BLOCKS = 8
 """Blocks per stream at the start (RAM and home disk)."""
 _WAIT = 10.0
 """Bound for a gate to be reached: correct code reaches it in milliseconds."""
+_TIMING = StartupTiming.model_validate(dict.fromkeys(StartupTiming.model_fields, 0))
+"""How a session started, all zeros: the idle timeout test reads none of it."""
 _HYPOTHESIS = settings(
     max_examples=25,
     deadline=None,
@@ -280,6 +285,7 @@ async def _close_quietly(forks: list[Fork]) -> None:
 
 
 class TestGenerations:
+    @pytest.mark.timeout(60)  # 3 examples of 100 generations: about 300 saves, loads and reads of the head
     @settings(_HYPOTHESIS, max_examples=3)
     @given(seed=st.integers(min_value=0, max_value=2**32 - 1))
     async def test_generations_fake(self, lab: Lab, seed: int) -> None:
@@ -546,7 +552,6 @@ class TestCloseDuringSave:
 
 
 class TestWorkFileRemoval:
-    @pytest.mark.timeout(30)
     async def test_drain_returns_when_only_ended_jobs_remain(self, lab: Lab) -> None:
         """A job that ended but whose discard callback has not run yet (a window a loaded
         host hits): drain() must return, not spin. White-box: no public call can hold
@@ -749,24 +754,37 @@ class TestIdleTimeout:
         self, lab: Lab, caplog: pytest.LogCaptureFixture, changed: bool
     ) -> None:
         """The idle timeout closes a reused session; a warning names the instance and its last
-        saved generation only when code ran since that save."""
+        saved generation only when code ran since that save. The session is made as reuse()
+        makes it, with an idle timeout of 0 s (the public minimum, 10 s, is too long for a test):
+        the timer fires at the first loop turn after the last call."""
+        env = lab.env
         instance_id = await lab.base(seed=12)
-        fork = await lab.reuse(instance_id)
-        if changed:
-            await fork.session.exec(_op("put", "ram", block=1, value=12, tag=1))
+        state = await env.load(instance_id, manager=env.manager)
+        vm = await env.vm_from(state)
         with caplog.at_level(logging.WARNING, logger="exec_sandbox.session"):
-            # The idle-timer seam (kept in T20-B): the public minimum timeout is 10 s.
-            fork.session._idle_timeout_seconds = 0  # pyright: ignore[reportPrivateUsage]  # fire at the next loop turn
-            fork.session._reset_idle_timer()  # pyright: ignore[reportPrivateUsage]
-            await await_until(lambda: fork.session.closed)
-            await fork.session.close()  # the idle close is done (it never warns: no InstanceNotSavedWarning)
+            session = Session(
+                vm=vm,  # type: ignore[arg-type]
+                vm_manager=env.vm_manager,  # type: ignore[arg-type]
+                spec=vm.spec,
+                startup_timing=_TIMING,
+                instances=env.manager,
+                instance=state,
+                new_instance_id=None,
+                idle_timeout_seconds=0,
+                default_timeout_seconds=60,
+            )
+            if changed:  # no await before the exec: it stops the timer before the timer can fire
+                await session.exec(_op("put", "ram", block=1, value=12, tag=1))
+            await await_until(lambda: session.closed)
+            await session.close()  # the idle close is done (it never warns: no InstanceNotSavedWarning)
         warned = [
             (record.instance_id, record.generation)  # type: ignore[attr-defined]
             for record in caplog.records
             if record.getMessage() == "Idle timeout closes a session with changes since the last save"
         ]
         assert warned == ([(instance_id, 1)] if changed else [])
-        assert lab.env.work_files() == set()
+        assert session.exec_count == (1 if changed else 0)
+        assert env.work_files() == set()
 
 
 # ----------------------------------------------------------------------------- work files that will not go
@@ -931,6 +949,7 @@ class TestForks:
         assert env.bucket.body_keys(instance_id) == sorted(chain_keys(head))
         assert env.work_files() == set()
 
+    @pytest.mark.timeout(30)  # 25 examples, each of up to 3 forks and 15 steps (exec or save)
     @_HYPOTHESIS
     @given(
         scripts=st.lists(st.lists(st.sampled_from(["exec", "save"]), min_size=1, max_size=5), min_size=2, max_size=3)

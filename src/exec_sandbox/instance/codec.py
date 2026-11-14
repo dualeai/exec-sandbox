@@ -68,7 +68,8 @@ def seal_block_with_nonce(cipher: AESGCM, nonce: bytes, block: bytes, aad: bytes
 
 def open_block(cipher: AESGCM, record: bytes, aad: bytes, *, instance_id: str) -> bytes:
     """Authenticate and decompress one record (`cipher` as in seal_block); any change
-    raises InstanceGoneError (INSTANCE_INTEGRITY)."""
+    raises InstanceGoneError (INSTANCE_INTEGRITY). An authenticated record that does not
+    decompress to one block raises RouteError (INSTANCE_HOST_MISMATCH: other_release)."""
     failed = f"Instance {instance_id}: a stored block failed authentication."
     if len(record) < NONCE_BYTES + TAG_BYTES:
         raise damaged_instance_data(failed, instance_id=instance_id)

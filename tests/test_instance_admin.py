@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import random
 import secrets
 import sys
@@ -27,24 +28,35 @@ from exec_sandbox._imports import require_instance_admin
 from exec_sandbox.cli import cli
 from exec_sandbox.cli_keyring import open_local_keyring
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, InvalidInputError
-from exec_sandbox.instance.keyring import KEY_BYTES
+from exec_sandbox.instance.keyring import KEY_BYTES, Keyring
 from exec_sandbox.instance.manager import InstanceManager, open_instance_admin
-from exec_sandbox.instance.models import HostFacts, InstanceInfo
+from exec_sandbox.instance.models import HostFacts, InstanceInfo, RecentCommit
 from exec_sandbox.models import Language
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_manager import VmManager
 from exec_sandbox.vm_spec import VmSpec
-from tests.instance_support import BLOCK, PYTHON, InstanceEnv, Saver, SparseImage, random_block, seed_instance
+from tests.instance_support import (
+    BLOCK,
+    NO_VM_TIMEOUT,
+    PYTHON,
+    InstanceEnv,
+    Saver,
+    SparseImage,
+    random_block,
+    seed_instance,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+pytestmark = NO_VM_TIMEOUT
 
 _SPEC = VmSpec(language=Language.JAVASCRIPT, memory_mb=512)
 _HOST = HostFacts(
     arch="aarch64",
     accelerator="hvf",
     cpu_vendor=None,
+    cpu_model="host",
     qemu_version="10.1.0",
     base_image="0" * 64,
     packages_image=None,
@@ -159,14 +171,17 @@ async def test_ids_that_are_not_instance_ids_are_refused(settings: Settings, tmp
 
 
 async def test_admin_reads_what_the_manager_saved(instance_env: InstanceEnv, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A real save (InstanceManager, fake VM): the admin's describe equals the manager's; its delete removes it."""
+    """A real save (InstanceManager, fake VM): the admin's describe gives the facts of that save
+    (its commit, the newest key, the SHA-256 of the base image); its delete removes it."""
     ram, home = SparseImage(size=4 * BLOCK), SparseImage(size=4 * BLOCK)
     ram.put(0, random_block(random.Random(1)))
     home.put(2, random_block(random.Random(2)))
     saver = Saver(
         instance_env, await instance_env.new_vm(ram, home, spec=PYTHON), manager=instance_env.manager, state=None
     )
-    instance_id = (await saver.save()).instance_id
+    saved = await saver.save()
+    instance_id = saved.instance_id
+    base_digest = hashlib.sha256(instance_env.base_image.read_bytes()).hexdigest()
     proxy = instance_env.proxy
     settings = Settings(
         instance_store="s3",
@@ -180,8 +195,16 @@ async def test_admin_reads_what_the_manager_saved(instance_env: InstanceEnv, mon
     async with open_instance_admin(settings) as admin:
         assert [iid async for iid in admin.list_ids()] == [instance_id]
         info = await admin.describe(instance_id)
-        assert info == await instance_env.manager.describe(instance_id)
-        assert (info.verified, info.spec) == (True, VmSpec(language=Language.PYTHON))
+        assert (info.instance_id, info.generation, info.verified, info.spec) == (
+            instance_id,
+            1,
+            True,
+            VmSpec(language=Language.PYTHON),
+        )
+        assert info.recent_commits == (RecentCommit(generation=1, commit_id=saved.header.commit_id),)
+        assert info.key_id == Keyring.parse(instance_env.keyring).latest.id
+        assert info.host is not None
+        assert (info.host.base_image, info.host.packages_image, info.host.release) == (base_digest, None, __version__)
         assert await admin.delete(instance_id) is True
         assert await admin.store.list_objects(f"s/{instance_id}/") == []
     with pytest.raises(InstanceGoneError, check=lambda e: e.code is ErrorCode.INSTANCE_NOT_FOUND):

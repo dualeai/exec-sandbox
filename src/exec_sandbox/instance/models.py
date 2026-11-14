@@ -67,9 +67,9 @@ class HeadHeader(BaseModel):
 
 class HostFacts(BaseModel):
     """The host that saved the instance. A load on a host with another arch, accelerator,
-    CPU vendor or exec-sandbox release is refused before any download (ROUTE). Images
-    are matched by digest (a worker without them downloads them from the store).
-    qemu_version is for diagnostics: the load lets QEMU decide."""
+    CPU vendor, guest CPU model or exec-sandbox release is refused before any download
+    (ROUTE). Images are matched by digest (a worker without them downloads them from the
+    store). qemu_version is for diagnostics: the load lets QEMU decide."""
 
     model_config = _STRICT
 
@@ -79,6 +79,10 @@ class HostFacts(BaseModel):
     """kvm, hvf or tcg: a worker that falls back to tcg cannot load an instance saved with kvm."""
     cpu_vendor: str | None
     """x86 vendor the CPU model pins; None on ARM."""
+    cpu_model: str = Field(min_length=1)
+    """-cpu value of the saved VM's QEMU (qemu_cmd.guest_cpu_model): a restore needs the same
+    CPU features. On x86 it holds +tsc-deadline when the host has that feature (the VM then
+    runs with pit/pic/rtc off)."""
     qemu_version: str
     base_image: str = Field(pattern=_DIGEST_PATTERN)
     """SHA-256 of the base image: the guest's page cache refers to its bytes."""
@@ -143,6 +147,6 @@ class InstanceInfo(InstanceRef):
     )
     spec: VmSpec | None = Field(description="What the VM is made of (None unless verified)")
     host: HostFacts | None = Field(
-        description="Host it was saved on: arch, accelerator, CPU vendor, image digests, exec-sandbox release "
-        "(None unless verified)"
+        description="Host it was saved on: arch, accelerator, CPU vendor, guest CPU model, image digests, "
+        "exec-sandbox release (None unless verified)"
     )

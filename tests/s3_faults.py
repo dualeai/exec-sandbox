@@ -1,9 +1,13 @@
 """S3 fault injection for the instance store tests.
 
-`S3Proxy` is an aiohttp server in the test's own event loop, in front of the
-moto server. Point the store at `proxy.endpoint_url`: each request is
-classified (operation, key relative to the test prefix), logged with what the
-client got, and rules can fail, drop, hold, edit or hook it.
+`S3Proxy` is an aiohttp server in the test's own event loop, in front of
+moto. Point the store at `proxy.endpoint_url`: each request is classified
+(operation, key relative to the test prefix), logged with what the client got,
+and rules can fail, drop, hold, edit or hook it.
+
+The proxy gives each request to moto's WSGI app in this process (in a worker
+thread), as moto's HTTP server would: that server opens a new connection and a
+new thread for each request, because it closes every connection after its answer.
 
 Conditional PUTs (If-Match / If-None-Match) on one key are forwarded one at a
 time. moto checks the condition, then writes, with no lock between the two:
@@ -19,18 +23,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import io
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import quote, urlencode
 
-import aiohttp
 from aiohttp import web
 from multidict import CIMultiDict, MultiDict
-from yarl import URL
+from werkzeug.test import EnvironBuilder, run_wsgi_app
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+    from wsgiref.types import WSGIApplication, WSGIEnvironment
+
+    from werkzeug.datastructures import Headers
 
 BUCKET = "test-snapshots"
 
@@ -204,22 +213,24 @@ class Rule:
 class S3Proxy:
     """Fault-injecting proxy in front of moto. Start with `S3Proxy.start` (the `s3_proxy` fixture does)."""
 
-    def __init__(self, *, upstream: str, bucket: Bucket, session: aiohttp.ClientSession) -> None:
-        self.upstream = upstream.rstrip("/")
+    def __init__(self, *, moto: WSGIApplication, moto_url: str, bucket: Bucket, pool: ThreadPoolExecutor) -> None:
         self.bucket = bucket
         self.prefix = bucket.prefix
         self.endpoint_url = ""
         self.log: list[LogEntry] = []
         self.rules: list[Rule] = []
-        self._session = session
+        self._moto = moto
+        self._moto_url = moto_url
+        self._pool = pool
         self._key_locks: dict[str, asyncio.Lock] = {}
 
     @classmethod
     @contextlib.asynccontextmanager
-    async def start(cls, *, upstream: str, bucket: Bucket) -> AsyncGenerator[S3Proxy]:
-        """Listen on 127.0.0.1 (random port) in the running loop until the block ends."""
-        async with aiohttp.ClientSession(auto_decompress=False) as session:
-            proxy = cls(upstream=upstream, bucket=bucket, session=session)
+    async def start(cls, *, moto: WSGIApplication, moto_url: str, bucket: Bucket) -> AsyncGenerator[S3Proxy]:
+        """Listen on 127.0.0.1 (random port) in the running loop until the block ends. Requests go
+        to `moto` (moto's WSGI app) as if they reached moto's server at `moto_url`."""
+        with ThreadPoolExecutor(thread_name_prefix="moto") as pool:
+            proxy = cls(moto=moto, moto_url=moto_url, bucket=bucket, pool=pool)
             app = web.Application(client_max_size=_MAX_BODY)
             app.router.add_route("*", "/{tail:.*}", proxy._handle)
             runner = web.AppRunner(app, access_log=None, handle_signals=False)
@@ -347,20 +358,27 @@ class S3Proxy:
         return full_key.removeprefix(self.prefix)
 
     async def _forward(self, http: web.Request, req: Request, *, query_changed: bool) -> Response:
+        """moto's answer: the request as moto's server would hand it to its WSGI app (the path as
+        sent, still encoded; the query as sent unless a rule changed it)."""
+        path, _, query = http.raw_path.partition("?")
         if query_changed:
-            url = URL(self.upstream).with_path(req.path).with_query(req.query)
-        else:
-            url = URL(self.upstream + http.raw_path, encoded=True)
-        headers = [(k, v) for k, v in req.headers.items() if k.lower() not in _HOP_HEADERS]
-        async with self._session.request(
-            req.method,
-            url,
-            headers=headers,
-            data=req.body if req.method in ("PUT", "POST") else None,
-            allow_redirects=False,
-            skip_auto_headers=("Accept-Encoding", "Content-Type", "User-Agent"),
-        ) as upstream:
-            return Response(status=upstream.status, headers=CIMultiDict(upstream.headers), body=await upstream.read())
+            query = urlencode(list(req.query.items()), quote_via=quote)
+        environ = EnvironBuilder(
+            path=path,
+            base_url=self._moto_url,
+            query_string=query,
+            method=req.method,
+            headers=[(k, v) for k, v in req.headers.items() if k.lower() not in _HOP_HEADERS],
+            input_stream=io.BytesIO(req.body) if req.method in ("PUT", "POST") else None,
+        ).get_environ()
+        loop = asyncio.get_running_loop()
+        status, headers, body = await loop.run_in_executor(self._pool, _wsgi_answer, self._moto, environ)
+        return Response(status=status, headers=CIMultiDict(headers.items()), body=body)
+
+
+def _wsgi_answer(app: WSGIApplication, environ: WSGIEnvironment) -> tuple[int, Headers, bytes]:
+    chunks, status, headers = run_wsgi_app(app, environ, buffered=True)
+    return int(status.split(" ", 1)[0]), headers, b"".join(chunks)
 
 
 async def _before(fired: list[Rule], req: Request) -> None:

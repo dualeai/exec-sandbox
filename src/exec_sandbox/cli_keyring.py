@@ -31,6 +31,7 @@ from keyring.backends import SecretService, chainer, kwallet, libsecret, macOS
 from keyring.errors import KeyringError
 
 from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.files.disk import make_private_dir
 from exec_sandbox.instance.keyring import KEY_BYTES, Keyring
 
 if TYPE_CHECKING:
@@ -160,7 +161,7 @@ def _creation_lock(*, data_dir: Path) -> Generator[None]:
     path = data_dir / LOCK_FILE
     fd = -1
     try:
-        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        make_private_dir(data_dir)
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
     except OSError as exc:

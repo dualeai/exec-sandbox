@@ -43,7 +43,6 @@ from typing import TYPE_CHECKING, Literal
 from exec_sandbox import __version__, constants
 from exec_sandbox._imports import require_s3_instance_store
 from exec_sandbox._logging import get_logger
-from exec_sandbox.base_cache_manager import BaseCacheManager
 from exec_sandbox.exceptions import (
     ConfigError,
     ErrorCode,
@@ -54,7 +53,9 @@ from exec_sandbox.exceptions import (
     host_mismatch,
     no_instance_store,
 )
+from exec_sandbox.files.disk import clone_sparse, make_private_dir, memory_filesystem
 from exec_sandbox.hash_utils import file_hash
+from exec_sandbox.images import image_digest
 from exec_sandbox.instance import ids
 from exec_sandbox.instance.commit import Base, Commit, commit_head, save_context
 from exec_sandbox.instance.head import MAX_HEAD_BYTES, open_head, read_header, seal_head
@@ -83,9 +84,13 @@ from exec_sandbox.instance.store import (
     probe,
 )
 from exec_sandbox.migration_client import MigrationClient, migration_timeout
-from exec_sandbox.permission_utils import get_expected_socket_uid, grant_qemu_vm_private_file_access, probe_qemu_vm_user
+from exec_sandbox.permission_utils import (
+    get_expected_socket_uid,
+    grant_qemu_vm_private_file_access,
+    probe_qemu_vm_user,
+)
 from exec_sandbox.platform_utils import HostArch, detect_host_arch, detect_host_x86_vendor
-from exec_sandbox.sparse_file import clone_sparse
+from exec_sandbox.qemu_cmd import guest_cpu_model
 from exec_sandbox.system_probes import detect_accel_type, probe_qemu_version
 
 if TYPE_CHECKING:
@@ -102,11 +107,12 @@ logger = get_logger(__name__)
 _LOAD_ATTEMPTS = 3
 """Head reads per load while body objects vanish because newer saves replaced them."""
 _OBJECT_KIND = {"full": "f", "pack": "p"}
-_CHECKED_FACTS = ("arch", "accelerator", "cpu_vendor", "release")
-"""Host facts a load must match. Images are fetched by digest. qemu_version is not checked:
-QEMU accepts or refuses the saved state at restore (then ROUTE). release: the saved guest
-agent runs on in RAM and speaks its own release's protocol, so a load on another
-exec-sandbox release is refused (ROUTE), never migrated."""
+_CHECKED_FACTS = ("arch", "accelerator", "cpu_vendor", "cpu_model", "release")
+"""Host facts a load must match. cpu_model: QEMU refuses a state saved with other CPU
+features, but only at restore, after the download. Images are fetched by digest.
+qemu_version is not checked: QEMU accepts or refuses the saved state at restore (then
+ROUTE). release: the saved guest agent runs on in RAM and speaks its own release's
+protocol, so a load on another exec-sandbox release is refused (ROUTE), never migrated."""
 MAX_CHAIN_PACKS = 64
 """Packs after a full copy before the next full copy: bounds the head (one entry
 per pack) and the load (one download per object)."""
@@ -309,11 +315,11 @@ class InstanceManager(InstanceAdmin):
         cls, settings: Settings, *, work_dir: Path, vm_manager: VmManager
     ) -> AsyncGenerator[InstanceManager]:
         """Saved instances live in the store `instance_store` names. Fail fast, in
-        this order: keyring, store settings, QEMU floor, store probe. Each raises
-        ConfigError INSTANCE_CONFIG (FIX_CONFIG; MIGRATION_UNSUPPORTED for a QEMU
-        below the floor), or TransientError INSTANCE_STORE_UNAVAILABLE when the
-        store does not answer. A store whose extra is not installed raises
-        ConfigError EXTRA_MISSING."""
+        this order: keyring, store settings, QEMU floor, work folder (not on a
+        memory filesystem), store probe. Each raises ConfigError INSTANCE_CONFIG
+        (FIX_CONFIG; MIGRATION_UNSUPPORTED for a QEMU below the floor), or
+        TransientError INSTANCE_STORE_UNAVAILABLE when the store does not answer. A
+        store whose extra is not installed raises ConfigError EXTRA_MISSING."""
         async with _open_store(settings) as (store, keyring):
             qemu = await probe_qemu_version()
             if qemu is None or qemu < constants.MEMORY_SNAPSHOT_MIN_QEMU_VERSION:
@@ -326,8 +332,17 @@ class InstanceManager(InstanceAdmin):
                     hint="Upgrade QEMU on this worker, or unset instance_store.",
                     context=None,
                 )
+            if (filesystem := await asyncio.to_thread(memory_filesystem, work_dir.parent)) is not None:
+                raise ConfigError(
+                    f"The work folder of saved instances, {work_dir}, is on {filesystem}: a save writes the "
+                    "VM's memory there, into memory charged to the VM, which then runs out of it.",
+                    code=ErrorCode.INSTANCE_CONFIG,
+                    instance_id=None,
+                    hint="Set EXEC_SANDBOX_HOME_DISK_DIR (it holds this work folder) to a folder on disk.",
+                    context={"work_dir": str(work_dir), "filesystem": filesystem},
+                )
             work_dir.mkdir(mode=0o700, exist_ok=True)
-            settings.instance_asset_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            make_private_dir(settings.instance_asset_dir)
             await probe(store, scratch=work_dir)
             logger.info(
                 "Instance store ready",
@@ -573,14 +588,22 @@ class InstanceManager(InstanceAdmin):
             await asyncio.to_thread(clone_sparse, vm.workdir.home_disk, home)
 
         async with MigrationClient(vm.qmp_socket, get_expected_socket_uid(vm.use_qemu_vm_user)) as client:
-            await client.save_snapshot(
-                vmstate,
-                qemu_version=qemu_version,
-                timeout=migration_timeout(vm.spec.memory_mb),
-                use_template=False,
-                keep_running=True,
-                while_paused=copy_home,
-            )
+            try:
+                await client.save_snapshot(
+                    vmstate,
+                    qemu_version=qemu_version,
+                    timeout=migration_timeout(vm.spec.memory_mb),
+                    use_template=False,
+                    keep_running=True,
+                    while_paused=copy_home,
+                    memory_limited=vm.cgroup is not None,
+                )
+            except TransientError as e:
+                # A QMP deadline (QEMU sent no answer in time): the run state, CPU time and
+                # threads of QEMU and the console tell a blocked main loop from a slow one
+                if isinstance(e.__cause__, TimeoutError):
+                    e.context.update(await vm.deadline_diagnostics(operation="save"))
+                raise
 
     async def _chain_intact(self, instance_id: str, chain: tuple[ChainEntry, ...]) -> bool:
         """One listing: every object of the chain is in the store with the size and
@@ -659,9 +682,9 @@ class InstanceManager(InstanceAdmin):
         this keyring lacks its key, InstanceGoneError INSTANCE_INTEGRITY or RouteError
         INSTANCE_HOST_MISMATCH (another release) when it does not open, and the store's
         errors; RouteError INSTANCE_HOST_MISMATCH when the host facts differ (arch,
-        accelerator, CPU vendor, or the exec-sandbox release that saved it) or a guest
-        image is neither on this worker nor in the store (or the store's copy does not
-        match its digest); InstanceGoneError INSTANCE_EXPIRED when a body object stays
+        accelerator, CPU vendor, guest CPU model, or the exec-sandbox release that saved
+        it) or a guest image is neither on this worker nor in the store (or the store's
+        copy does not match its digest); InstanceGoneError INSTANCE_EXPIRED when a body object stays
         gone; TransientError INSTANCE_STORE_UNAVAILABLE when the head keeps changing;
         TransientError LOCAL_DISK for a local file error (nothing was loaded).
         """
@@ -812,10 +835,11 @@ class InstanceManager(InstanceAdmin):
         Checked at every save (one HEAD): an image deleted or cut in the store comes
         back. A same-size change is not seen here; a load checks the digest (ROUTE).
 
-        Before an upload, the image is hashed again: its digest comes from a sidecar
-        keyed by the file's inode, mtime and size, so a damaged image with the same
-        stamp keeps its old digest. ConfigError IMAGE_DAMAGED then: nothing is stored
-        under a digest the bytes do not have."""
+        Before an upload, the image is hashed again: its recorded digest comes from
+        image_digest at the VM's start, which trusts a sidecar keyed by the file's
+        inode, mtime and size, so a damaged image with the same stamp keeps its old
+        digest. ConfigError IMAGE_DAMAGED then: nothing is stored under a digest the
+        bytes do not have."""
         key = asset_key(digest)
         if await self.store.size(key) != path.stat().st_size:  # missing or cut: (re)upload
             if await file_hash(path) != digest:
@@ -846,8 +870,16 @@ class InstanceManager(InstanceAdmin):
     async def _resolve_image(self, instance_id: str, *, role: str, digest: str, local: Path | None) -> Path:
         """A local image with `digest`: the worker's own, a cached download, or a new
         download from the store (checked against the digest). ROUTE when none."""
-        if local is not None and await asyncio.to_thread(BaseCacheManager.image_hash, local) == digest:
-            return local
+        if local is not None:
+            try:
+                same = await asyncio.to_thread(image_digest, local) == digest
+            except OSError as e:  # unreadable here (no access, an I/O error): no usable local copy
+                logger.warning(
+                    "Local guest image unreadable", extra={"image": str(local), "role": role, "error": str(e)}
+                )
+                same = False
+            if same:
+                return local
         cached = self.asset_dir / f"{digest}.img"
         if cached.exists():  # only ever renamed into place after its digest was checked
             return cached
@@ -870,7 +902,7 @@ class InstanceManager(InstanceAdmin):
 
     def _local_base_image(self, spec: VmSpec) -> Path | None:
         try:
-            return self._vm_manager.get_base_image(spec.language)
+            return self._vm_manager.images.base_image(spec.language)
         except (ConfigError, FileNotFoundError):
             return None
 
@@ -884,7 +916,8 @@ class InstanceManager(InstanceAdmin):
         return Path(tempfile.mkdtemp(prefix=f"{instance_id}-", dir=self.work_dir))
 
     async def _machine_facts(self) -> dict[str, str | None]:
-        """This host: arch, accelerator, CPU vendor (x86 only), QEMU version and exec-sandbox release."""
+        """This host: arch, accelerator, CPU vendor (x86 only), guest CPU model, QEMU version and
+        exec-sandbox release."""
         arch = detect_host_arch()
         accel = await detect_accel_type(force_emulation=self._vm_manager.settings.force_emulation)
         qemu = await probe_qemu_version()
@@ -892,17 +925,31 @@ class InstanceManager(InstanceAdmin):
             "arch": arch.name.lower(),
             "accelerator": str(accel.value),
             "cpu_vendor": detect_host_x86_vendor() if arch == HostArch.X86_64 else None,
+            "cpu_model": await guest_cpu_model(arch, accel),
             "qemu_version": ".".join(map(str, qemu)) if qemu else "unknown",
             "release": __version__,
         }
 
     async def _host_facts(self, vm: QemuVM) -> HostFacts:
-        """The saved VM's facts: this host, and the digests of the images the VM
-        runs on (after reuse() these may differ from this worker's own images)."""
-        base_digest = await asyncio.to_thread(BaseCacheManager.image_hash, vm.base_image)
-        packages_digest = (
-            await asyncio.to_thread(BaseCacheManager.image_hash, vm.packages_image) if vm.packages_image else None
-        )
+        """The saved VM's facts: this host, and the digests of the images the VM runs on,
+        taken when QEMU opened them (after reuse() these may differ from this worker's own
+        images; a file evicted or rebuilt at the same path since does not change them).
+
+        Raises:
+            ConfigError: IMAGE_DAMAGED: a digest is unknown (the image was missing at the
+                VM's start); nothing is saved
+        """
+        base_digest = vm.base_image_digest
+        packages_digest = vm.packages_image_digest
+        if base_digest is None or (vm.packages_image is not None and packages_digest is None):
+            raise ConfigError(
+                f"VM {vm.vm_id}: the digest of a guest image it runs on is unknown (the file was missing "
+                "when the VM started). It was not saved.",
+                code=ErrorCode.IMAGE_DAMAGED,
+                context={"base_image": str(vm.base_image), "packages_image": str(vm.packages_image)},
+                hint="Download or rebuild the guest images.",
+                instance_id=None,
+            )
         return HostFacts.model_validate(
             {**await self._machine_facts(), "base_image": base_digest, "packages_image": packages_digest}
         )

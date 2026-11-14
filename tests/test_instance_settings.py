@@ -4,8 +4,6 @@ guards, and what each worker must have (QEMU floor, host facts at load).
 The "s3" store reuses the S3 config (bucket, region, endpoint) under its own prefix.
 """
 
-import base64
-import secrets
 import stat
 import subprocess
 import sys
@@ -32,12 +30,19 @@ from exec_sandbox.platform_utils import HostArch, HostOS, child_env
 from exec_sandbox.scheduler import settings_from_config
 from exec_sandbox.settings import Settings
 from exec_sandbox.vm_types import AccelType
-from tests.instance_support import BLOCK, PYTHON, InstanceEnv, Saver, SparseImage, seed_instance
+from tests.instance_support import (
+    BLOCK,
+    NO_VM_TIMEOUT,
+    PYTHON,
+    InstanceEnv,
+    Saver,
+    SparseImage,
+    new_keyring,
+    seed_instance,
+)
 from tests.s3_faults import Edit, Request, S3Proxy
 
-
-def _key() -> str:
-    return base64.b64encode(secrets.token_bytes(32)).decode()
+pytestmark = NO_VM_TIMEOUT
 
 
 class TestS3Settings:
@@ -55,7 +60,7 @@ class TestS3Settings:
         assert (config.s3_snapshot_prefix, config.s3_instance_prefix) == ("snapshots/", "instances/")
 
     def test_environment_and_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        key = _key()
+        key = new_keyring()
         monkeypatch.setenv("EXEC_SANDBOX_S3_BUCKET", "from-env")
         monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", key)
         settings = Settings()
@@ -66,7 +71,7 @@ class TestS3Settings:
         assert Settings(s3_bucket="argument").s3_bucket == "argument"  # argument wins
 
     def test_keyring_never_reaches_child_processes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", _key())
+        monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_KEYRING", new_keyring())
         assert "EXEC_SANDBOX_INSTANCE_KEYRING" not in child_env()
 
 
@@ -146,12 +151,12 @@ class TestImportGuards:
             require_s3_instance_store()
 
     def test_l3_cache_names_the_extra(self) -> None:
-        """The S3 copy of the L2 disk cache needs aioboto3 (the s3 extra)."""
+        """The L3 snapshot cache (the S3 copy of the L2 disk cache) needs aioboto3 (the s3 extra)."""
         with (
             patch.dict(sys.modules, {"aioboto3": None}),
             pytest.raises(
                 ConfigError,
-                match=r"^S3 snapshot backup requires aioboto3\. Install with: pip install exec-sandbox\[s3\]$",
+                match=r"^The L3 snapshot cache \(s3_bucket\) needs the s3 extra\. Install with: pip install 'exec-sandbox\[s3\]'$",
                 check=lambda e: e.code is ErrorCode.EXTRA_MISSING,
             ),
         ):
@@ -218,7 +223,7 @@ class TestSchedulerStart:
 
     async def test_store_opened(self, scheduler_config: SchedulerConfig, moto_s3_server) -> None:
         config = self._moto_config(
-            scheduler_config, moto_s3_server, store="s3", keyring=_key(), bucket="test-snapshots"
+            scheduler_config, moto_s3_server, store="s3", keyring=new_keyring(), bucket="test-snapshots"
         )
         async with Scheduler(config) as s:
             assert [iid async for iid in s.list_instances()] == []  # on, and the fresh prefix is empty
@@ -226,7 +231,7 @@ class TestSchedulerStart:
     async def test_without_store_instances_are_off(self, scheduler_config: SchedulerConfig, moto_s3_server) -> None:
         """A keyring and a bucket alone do not turn saved instances on."""
         config = self._moto_config(
-            scheduler_config, moto_s3_server, store=None, keyring=_key(), bucket="test-snapshots"
+            scheduler_config, moto_s3_server, store=None, keyring=new_keyring(), bucket="test-snapshots"
         )
         async with Scheduler(config) as s:
             with pytest.raises(
@@ -250,7 +255,7 @@ class TestSchedulerStart:
             endpoint_url=s3_proxy.endpoint_url,
             prefix=s3_proxy.prefix,
             store="s3",
-            keyring=_key(),
+            keyring=new_keyring(),
             bucket=s3_proxy.bucket.name,
         )
         with pytest.raises(
@@ -269,12 +274,12 @@ class TestSchedulerStart:
                 **scheduler_config.model_dump(exclude_unset=True),
                 "instance_store": "local",
                 "instance_store_dir": str(root),
-                "instance_keyring": _key(),
+                "instance_keyring": new_keyring(),
             }
         )
         async with Scheduler(config) as s:
             assert [iid async for iid in s.list_instances()] == []
-        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(root.stat().st_mode) & 0o777 == 0o700
 
     async def test_unsafe_local_folder_fails_the_start(self, scheduler_config: SchedulerConfig, tmp_path: Path) -> None:
         root = tmp_path / "instances"
@@ -285,7 +290,7 @@ class TestSchedulerStart:
                 **scheduler_config.model_dump(exclude_unset=True),
                 "instance_store": "local",
                 "instance_store_dir": str(root),
-                "instance_keyring": _key(),
+                "instance_keyring": new_keyring(),
             }
         )
         with pytest.raises(
@@ -313,7 +318,7 @@ class TestSchedulerStart:
             scheduler_config,
             moto_s3_server,
             store=store,
-            keyring=_key() if keyring == "KEY" else keyring,
+            keyring=new_keyring() if keyring == "KEY" else keyring,
             bucket=bucket,
         )
         with pytest.raises(ConfigError, match=match, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as exc:
@@ -334,7 +339,7 @@ class TestWorkerChecks:
             instance_store="local",
             instance_store_dir=tmp_path / "instances",
             instance_asset_dir=tmp_path / "assets",
-            instance_keyring=_key(),
+            instance_keyring=new_keyring(),
         )
 
     @staticmethod
@@ -367,6 +372,22 @@ class TestWorkerChecks:
         assert not (tmp_path / "work").exists()  # refused before the folders and the store probe
         assert not (tmp_path / "assets").exists()
 
+    async def test_work_folder_in_memory_fails_the_open(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A save writes the VM's memory into the work folder: on tmpfs that is memory charged to
+        the VM, which then runs out of it (OOM-killed mid-save without swap)."""
+        self._qemu(monkeypatch, (11, 0, 0))
+        monkeypatch.setattr(
+            "exec_sandbox.instance.manager.memory_filesystem", lambda path: "tmpfs" if path == tmp_path else None
+        )
+        with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as exc:
+            async with InstanceManager.open(
+                self._settings(tmp_path), work_dir=tmp_path / "work", vm_manager=MagicMock()
+            ):
+                pass
+        assert "is on tmpfs" in str(exc.value)
+        assert exc.value.hint == "Set EXEC_SANDBOX_HOME_DISK_DIR (it holds this work folder) to a folder on disk."
+        assert not (tmp_path / "work").exists()
+
     async def test_qemu_at_the_floor_opens(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._qemu(monkeypatch, (11, 0, 0))  # the documented floor, as a literal
         async with InstanceManager.open(self._settings(tmp_path), work_dir=tmp_path / "work", vm_manager=MagicMock()):
@@ -377,28 +398,37 @@ class TestWorkerChecks:
         [
             pytest.param(
                 (
-                    ("aarch64", "hvf", None),
-                    (HostArch.AARCH64, AccelType.TCG, None),
-                    {"accelerator": "hvf"},
-                    {"accelerator": "tcg"},
+                    ("aarch64", "hvf", None, "host"),
+                    (HostArch.AARCH64, AccelType.TCG, None, "neoverse-v1,pauth=off"),
+                    {"accelerator": "hvf", "cpu_model": "host"},
+                    {"accelerator": "tcg", "cpu_model": "neoverse-v1,pauth=off"},
                 ),
                 id="accelerator",
             ),
             pytest.param(
                 (
-                    ("x86_64", "kvm", "GenuineIntel"),
-                    (HostArch.X86_64, AccelType.KVM, "AuthenticAMD"),
-                    {"cpu_vendor": "GenuineIntel"},
-                    {"cpu_vendor": "AuthenticAMD"},
+                    ("x86_64", "kvm", "GenuineIntel", "m,vendor=GenuineIntel"),
+                    (HostArch.X86_64, AccelType.KVM, "AuthenticAMD", "m,vendor=AuthenticAMD"),
+                    {"cpu_vendor": "GenuineIntel", "cpu_model": "m,vendor=GenuineIntel"},
+                    {"cpu_vendor": "AuthenticAMD", "cpu_model": "m,vendor=AuthenticAMD"},
                 ),
                 id="cpu-vendor",
             ),
             pytest.param(
                 (
-                    ("x86_64", "kvm", "GenuineIntel"),
-                    (HostArch.AARCH64, AccelType.KVM, None),
-                    {"arch": "x86_64", "cpu_vendor": "GenuineIntel"},
-                    {"arch": "aarch64", "cpu_vendor": "None"},
+                    ("x86_64", "kvm", "GenuineIntel", "m,+tsc-deadline,vendor=GenuineIntel"),
+                    (HostArch.X86_64, AccelType.KVM, "GenuineIntel", "m,vendor=GenuineIntel"),
+                    {"cpu_model": "m,+tsc-deadline,vendor=GenuineIntel"},
+                    {"cpu_model": "m,vendor=GenuineIntel"},
+                ),
+                id="cpu-model-tsc-deadline",
+            ),
+            pytest.param(
+                (
+                    ("x86_64", "kvm", "GenuineIntel", "m,vendor=GenuineIntel"),
+                    (HostArch.AARCH64, AccelType.KVM, None, "host"),
+                    {"arch": "x86_64", "cpu_vendor": "GenuineIntel", "cpu_model": "m,vendor=GenuineIntel"},
+                    {"arch": "aarch64", "cpu_vendor": "None", "cpu_model": "host"},
                 ),
                 id="arch",
             ),
@@ -410,23 +440,32 @@ class TestWorkerChecks:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         case: tuple[
-            tuple[str, str, str | None], tuple[HostArch, AccelType, str | None], dict[str, str], dict[str, str]
+            tuple[str, str, str | None, str],
+            tuple[HostArch, AccelType, str | None, str],
+            dict[str, str],
+            dict[str, str],
         ],
     ) -> None:
-        """(the head's arch, accelerator and cpu_vendor; what this host's probes find; the error's
-        `required` and `found`)."""
-        saved, (arch, accelerator, vendor), required, found = case
+        """(the head's arch, accelerator, cpu_vendor and cpu_model; what this host's probes find;
+        the error's `required` and `found`). cpu-model-tsc-deadline: same vendor, but the saving
+        host had TSC_DEADLINE (in the guest CPU model): QEMU would refuse it after the download."""
+        saved, (arch, accelerator, vendor, cpu_model), required, found = case
 
         async def detect_accel_type(*, force_emulation: bool) -> AccelType:
             return accelerator
 
+        async def guest_cpu_model(_arch: HostArch, _accel: AccelType) -> str:
+            return cpu_model
+
         monkeypatch.setattr("exec_sandbox.instance.manager.detect_host_arch", lambda: arch)
         monkeypatch.setattr("exec_sandbox.instance.manager.detect_accel_type", detect_accel_type)
         monkeypatch.setattr("exec_sandbox.instance.manager.detect_host_x86_vendor", lambda: vendor)
+        monkeypatch.setattr("exec_sandbox.instance.manager.guest_cpu_model", guest_cpu_model)
         host = HostFacts(
             arch=saved[0],
             accelerator=saved[1],
             cpu_vendor=saved[2],
+            cpu_model=saved[3],
             qemu_version="11.0.0",
             base_image="0" * 64,
             packages_image=None,
@@ -460,12 +499,17 @@ class TestWorkerChecks:
         async def detect_accel_type(*, force_emulation: bool) -> AccelType:
             return AccelType.HVF
 
+        async def guest_cpu_model(_arch: HostArch, _accel: AccelType) -> str:
+            return "host"
+
         monkeypatch.setattr("exec_sandbox.instance.manager.detect_host_arch", lambda: HostArch.AARCH64)
         monkeypatch.setattr("exec_sandbox.instance.manager.detect_accel_type", detect_accel_type)
+        monkeypatch.setattr("exec_sandbox.instance.manager.guest_cpu_model", guest_cpu_model)
         host = HostFacts(
             arch="aarch64",
             accelerator="hvf",
             cpu_vendor=None,
+            cpu_model="host",
             qemu_version="11.0.0",
             base_image="0" * 64,
             packages_image=None,

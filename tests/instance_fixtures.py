@@ -18,14 +18,12 @@ module (``# noqa: F401``); tests request them as `instance_world` and `primed_l1
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import random
-import secrets
 import shutil
 import socket
 import tempfile
@@ -47,11 +45,12 @@ from exec_sandbox import (
     Session,
     VmSpec,
 )
+from tests.instance_support import new_keyring
+from tests.s3_faults import Bucket
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
-BUCKET = "test-snapshots"
 STATE_DIR = "/home/user/state"
 """Files the probe digests (write_file paths are relative to /home/user)."""
 TICKER = ": tickmark; i=0; while :; do i=$((i+1)); echo $i >> /home/user/tick; sleep 0.1; done"
@@ -88,8 +87,8 @@ class InstanceWorld:
 
     base: SchedulerConfig
     endpoint_url: str
-    s3: Any
-    prefix: str
+    bucket: Bucket
+    """The moto bucket under this test's fresh prefix."""
     keyring: str
     home_root: Path
     """EXEC_SANDBOX_HOME_DISK_DIR: each VmManager's folder, with its instances/ work folder, is under it."""
@@ -97,40 +96,32 @@ class InstanceWorld:
     """EXEC_SANDBOX_INSTANCE_ASSET_DIR: guest images downloaded by digest."""
     tmp: Path
 
-    def config(
+    @contextlib.asynccontextmanager
+    async def scheduler(
         self, *, memory_snapshot_cache_dir: Path, warm_pool_size: int, disk_snapshot_cache_dir: Path | None
-    ) -> SchedulerConfig:
-        """The test config plus the store; disk_snapshot_cache_dir None keeps the machine's L2 cache."""
+    ) -> AsyncIterator[Scheduler]:
+        """A Scheduler on the test config plus the store; disk_snapshot_cache_dir None keeps the
+        machine's L2 cache."""
         fields: dict[str, Any] = {
             **self.base.model_dump(exclude_unset=True),
             "instance_store": "s3",
-            "s3_bucket": BUCKET,
+            "s3_bucket": self.bucket.name,
             "s3_endpoint_url": self.endpoint_url,
-            "s3_instance_prefix": self.prefix,
+            "s3_instance_prefix": self.bucket.prefix,
             "instance_keyring": self.keyring,
             "memory_snapshot_cache_dir": memory_snapshot_cache_dir,
             "warm_pool_size": warm_pool_size,
         }
         if disk_snapshot_cache_dir is not None:
             fields["disk_snapshot_cache_dir"] = disk_snapshot_cache_dir
-        return SchedulerConfig.model_validate(fields)
-
-    @contextlib.asynccontextmanager
-    async def scheduler(
-        self, *, memory_snapshot_cache_dir: Path, warm_pool_size: int, disk_snapshot_cache_dir: Path | None
-    ) -> AsyncIterator[Scheduler]:
-        config = self.config(
-            memory_snapshot_cache_dir=memory_snapshot_cache_dir,
-            warm_pool_size=warm_pool_size,
-            disk_snapshot_cache_dir=disk_snapshot_cache_dir,
-        )
-        async with Scheduler(config) as scheduler:
+        async with Scheduler(SchedulerConfig.model_validate(fields)) as scheduler:
             yield scheduler
 
     def private_dir(self, name: str) -> Path:
-        """A new empty folder of this test (a private L1 or L2 cache)."""
+        """A new empty folder of this test (a private L1 or L2 cache): 0700 whatever the umask,
+        as the library makes its own cache folders (it refuses one others can write)."""
         path = self.tmp / f"{name}-{uuid.uuid4().hex}"
-        path.mkdir(parents=True)
+        path.mkdir(mode=0o700, parents=True)
         return path
 
     def instance_folders(self, instance_id: str | None = None) -> list[Path]:
@@ -140,11 +131,7 @@ class InstanceWorld:
 
     def keys(self, sub: str) -> list[str]:
         """Every store key under prefix + sub, relative to the prefix."""
-        paginator = self.s3.get_paginator("list_objects_v2")
-        found: list[str] = []
-        for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{self.prefix}{sub}"):
-            found.extend(o["Key"][len(self.prefix) :] for o in page.get("Contents", []))
-        return sorted(found)
+        return self.bucket.listing(sub)
 
     def instance_keys(self, instance_id: str) -> set[str]:
         """Head and body object names of one instance ("head", "b/<commit>.<f|p>")."""
@@ -158,7 +145,7 @@ def instance_world_fixture(
 ) -> Iterator[InstanceWorld]:
     """Per test: moto bucket (in process), fresh prefix and keyring, home-disk root, asset dir."""
     endpoint_url, s3 = moto_s3_server
-    home_root = Path(tempfile.mkdtemp(prefix="hd-"))  # short and 0700 (HomeDiskDir checks the root)
+    home_root = Path(tempfile.mkdtemp(prefix="hd-"))  # short and 0700 (PrivateRunDir checks the root)
     asset_dir = tmp_path / "assets"
     monkeypatch.setenv("EXEC_SANDBOX_HOME_DISK_DIR", str(home_root))
     monkeypatch.setenv("EXEC_SANDBOX_INSTANCE_ASSET_DIR", str(asset_dir))
@@ -166,9 +153,8 @@ def instance_world_fixture(
         yield InstanceWorld(
             base=scheduler_config,
             endpoint_url=endpoint_url,
-            s3=s3,
-            prefix=f"inst-{uuid.uuid4().hex}/",
-            keyring=base64.b64encode(secrets.token_bytes(32)).decode(),
+            bucket=Bucket(s3),  # a fresh inst-<uuid>/ prefix
+            keyring=new_keyring(),
             home_root=home_root,
             asset_dir=asset_dir,
             tmp=tmp_path,
@@ -193,7 +179,7 @@ async def primed_l1_dir_fixture(images_dir: Path, tmp_path_factory: pytest.TempP
     try:
         await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
         if not ready.exists():
-            directory.mkdir(exist_ok=True)
+            directory.mkdir(mode=0o700, exist_ok=True)  # an L1 cache folder: private whatever the umask
             config = SchedulerConfig(
                 images_dir=images_dir,
                 auto_download_assets=False,

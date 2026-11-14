@@ -29,10 +29,12 @@ def new_id() -> str:
 
 
 def is_instance_id(value: str) -> bool:
+    """Whether `value` is a valid instance id (INSTANCE_ID_PATTERN)."""
     return _INSTANCE_ID_RE.fullmatch(value) is not None
 
 
 def is_commit_id(value: str) -> bool:
+    """Whether `value` is a valid commit id (COMMIT_ID_PATTERN)."""
     return _COMMIT_ID_RE.fullmatch(value) is not None
 
 

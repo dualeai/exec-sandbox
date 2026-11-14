@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict
 from exec_sandbox import __version__
 from exec_sandbox.exceptions import ConfigError, ErrorCode, InstanceGoneError, InvalidInputError, RouteError
 from exec_sandbox.instance import codec, head, ids, keyring, models, pack
-from tests.instance_support import head_header
+from tests.instance_support import head_header, new_keyring
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -39,10 +39,6 @@ _BODY = models.HeadBody.model_validate_json(json.dumps(_VECTORS["body"]))
 def _prefix_len(data: bytes) -> int:
     """Where the sealed body starts: after "EXSIHEAD" (8) | header length (u32, big endian) | header."""
     return 12 + int.from_bytes(data[8:12], "big")
-
-
-def _key_text() -> str:
-    return base64.b64encode(secrets.token_bytes(32)).decode()
 
 
 def _header(*, generation: int = 2, instance_id: str = _ID) -> models.HeadHeader:
@@ -71,14 +67,14 @@ def _sealed(
 
 class TestKeyring:
     def test_newest_first_and_ids_derived(self) -> None:
-        new, old = _key_text(), _key_text()
+        new, old = new_keyring(), new_keyring()
         ring = keyring.Keyring.parse(f" {new} ,\n{old}\n")
         assert [k.secret for k in ring.keys] == [base64.b64decode(new), base64.b64decode(old)]  # newest first
         assert all(re.fullmatch(r"[0-9a-f]{64}", k.id) for k in ring.keys)  # full HMAC-SHA256 (derivation: golden)
         assert ring.keys[0].id != ring.keys[1].id
 
     def test_secret_never_in_repr(self) -> None:
-        text = _key_text()
+        text = new_keyring()
         ring = keyring.Keyring.parse(text)
         assert text not in repr(ring)
         assert base64.b64decode(text).hex() not in repr(ring)
@@ -97,14 +93,14 @@ class TestKeyring:
         ],
     )
     def test_invalid_keyring(self, text: str, match: str) -> None:
-        text = text.format(k=_key_text(), k2=_key_text()) if "{" in text else text
+        text = text.format(k=new_keyring(), k2=new_keyring()) if "{" in text else text
         with pytest.raises(ConfigError, match=match, check=lambda e: e.code is ErrorCode.INSTANCE_CONFIG) as exc:
             keyring.Keyring.parse(text)
         assert exc.value.code == "INSTANCE_CONFIG"
         assert exc.value.action == "FIX_CONFIG"
 
     def test_missing_key_names_it(self) -> None:
-        ring = keyring.Keyring.parse(_key_text())
+        ring = keyring.Keyring.parse(new_keyring())
         with pytest.raises(
             ConfigError, match='uses key id "abc"', check=lambda e: e.code is ErrorCode.INSTANCE_KEY_MISSING
         ) as exc:
@@ -113,7 +109,7 @@ class TestKeyring:
         assert ring.latest.id in str(exc.value)
 
     def test_wrap_round_trip_and_tamper(self) -> None:
-        kek = keyring.Keyring.parse(_key_text()).latest
+        kek = keyring.Keyring.parse(new_keyring()).latest
         data_key = secrets.token_bytes(32)
         wrapped = keyring.wrap_data_key(kek, data_key)
         assert keyring.unwrap_data_key(kek, wrapped, instance_id=_ID) == data_key
@@ -224,7 +220,7 @@ class TestBlockCodec:
 
 
 class TestHead:
-    _RING = keyring.Keyring.parse(_key_text())
+    _RING = keyring.Keyring.parse(new_keyring())
 
     def test_round_trip(self) -> None:
         data_key = secrets.token_bytes(32)
@@ -296,7 +292,7 @@ class TestHead:
             check=lambda e: e.code is ErrorCode.INSTANCE_INTEGRITY,
         ):
             head.authenticate(other_key, self._RING, instance_id=_ID)
-        stranger = keyring.Keyring.parse(_key_text())
+        stranger = keyring.Keyring.parse(new_keyring())
         with pytest.raises(ConfigError, check=lambda e: e.code is ErrorCode.INSTANCE_KEY_MISSING):
             head.authenticate(_sealed(self._RING, data_key=secrets.token_bytes(32))[0], stranger, instance_id=_ID)
 
