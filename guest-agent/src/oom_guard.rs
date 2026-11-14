@@ -2,9 +2,13 @@
 //!
 //! A zram device can still advertise logical swap slots after its physical
 //! `mem_limit` is full. Under incompressible workloads, direct reclaim may then
-//! retry failed swap writes without reaching the kernel OOM killer. The guard
-//! watches PSI stall events, confirms the condition with zram counters,
-//! and retires every untrusted task in the disposable guest.
+//! retry failed swap writes without reaching the kernel OOM killer. Under
+//! compressible ones (zero-filled pages: a large bytearray) the swap slots run
+//! out while zram holds little: reclaim then thrashes on file pages, again
+//! without the OOM killer (a 500 MB bytearray in a 256 MB VM ran to its exec
+//! timeout). The guard watches PSI stall events, confirms either
+//! condition (zram counters, or swap slots nearly all in use), and retires
+//! every untrusted task in the disposable guest.
 //!
 //! The monitor's decision path performs no heap allocation: files are opened
 //! during setup and pressure counters are parsed from fixed buffers.
@@ -23,24 +27,32 @@ const DISKSIZE_PATH: &str = "/sys/block/zram0/disksize";
 // 500 ms window. A lower 20% threshold kills bounded workloads that are still
 // making legitimate swap-backed progress. `full` is insufficient here: PID1
 // or kernel work may remain runnable while the untrusted allocator is trapped
-// in direct reclaim. Zram counters are the mandatory second signal.
+// in direct reclaim. A second signal is mandatory: zram counters, or swap slots
+// nearly all in use.
 const PSI_TRIGGER: &[u8] = b"some 400000 500000\n";
 
 static RETIRE_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 /// Refuse new untrusted work once terminal VM retirement has been claimed.
+///
+/// Callers reply with this error: the host must learn at once that the VM
+/// takes no more work (a dropped connection makes it wait for its deadline).
 pub(crate) fn ensure_vm_usable() -> io::Result<()> {
     if retirement_required() {
-        Err(io::Error::other("VM retirement required"))
+        Err(io::Error::other(
+            "VM retired after exit code 137: it runs no more code",
+        ))
     } else {
         Ok(())
     }
 }
 
+/// Record that the VM takes no more work. The flag is never cleared.
 pub(crate) fn mark_vm_for_retirement() {
     RETIRE_REQUIRED.store(true, Ordering::Release);
 }
 
+/// True once the VM takes no more work.
 pub(crate) fn retirement_required() -> bool {
     RETIRE_REQUIRED.load(Ordering::Acquire)
 }
@@ -151,19 +163,21 @@ impl PreparedOomGuard {
                 if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                monitor_failed();
+                emergency_poweroff();
             }
             // Infinite poll timeout (-1): rc is never 0, only <0 or ready fds.
             // With events == POLLPRI, poll(2) masks revents to
             // {POLLPRI, POLLERR, POLLHUP, POLLNVAL}, so "PRI set and no error
             // bit" is exactly revents == POLLPRI.
             if poll_fd.revents != libc::POLLPRI {
-                monitor_failed();
+                emergency_poweroff();
             }
 
             let memory = read_memory_stats_into(&self.mm_stat, &mut mm_buf)
-                .unwrap_or_else(|_| monitor_failed());
-            if !capped_zram_pressure(memory) {
+                .unwrap_or_else(|_| emergency_poweroff());
+            if !capped_zram_pressure(memory)
+                && !swap_slots_exhausted(read_swap_slots().unwrap_or_else(|_| emergency_poweroff()))
+            {
                 continue;
             }
             mark_vm_for_retirement();
@@ -196,6 +210,28 @@ fn capped_zram_pressure(memory: ZramMemoryStats) -> bool {
     // the stall signal; this predicate confirms substantial physical occupancy.
     // Threshold: mem_limit - mem_limit/4 = ceil(0.75 * mem_limit).
     memory.mem_limit > 0 && memory.mem_used_total >= memory.mem_limit - memory.mem_limit / 4
+}
+
+/// Swap slots, total and free, in bytes (sysinfo(2): one system call, no allocation).
+fn read_swap_slots() -> io::Result<(u64, u64)> {
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(std::ptr::from_mut(&mut info)) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let unit = u64::from(info.mem_unit.max(1));
+    Ok((
+        info.totalswap.saturating_mul(unit),
+        info.freeswap.saturating_mul(unit),
+    ))
+}
+
+/// At least 99% of the swap slots in use. Compressible pages (zero-filled above
+/// all) take the slots at little zram cost, so mm_stat stays low while swap is
+/// full: the stuck runs had 0-160 kB of 95 MB free. With free slots, pages
+/// can still go out, and a stall may be legitimate swap-backed progress (an
+/// allocation of 130% of available RAM in a 256 MB VM uses about 60% of them).
+fn swap_slots_exhausted((total, free): (u64, u64)) -> bool {
+    total > 0 && free.saturating_mul(100) <= total
 }
 
 fn verify_zram_geometry_values(
@@ -232,7 +268,7 @@ fn verify_zram_geometry_values(
     })
 }
 
-/// Keep the monitor runnable when the only vCPU is dominated by direct reclaim.
+/// Keep the monitor runnable when direct reclaim takes the vCPU (one by default).
 /// Its bounded loop always blocks in poll, so elevated priority cannot create a
 /// busy loop. Locking current PID1 mappings prevents the agent or monitor stack
 /// from faulting through zram while the device itself rejects writes.
@@ -242,7 +278,7 @@ fn pin_monitor_thread() -> Result<(), (&'static str, i32)> {
     }
 
     // Highest non-real-time priority: enough to stay runnable under direct
-    // reclaim without risking RT starvation of the single vCPU. Linux nice
+    // reclaim without risking RT starvation of a single vCPU. Linux nice
     // values are per-thread, so this elevates only the bounded monitor thread.
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -20) } != 0 {
         return Err(("setpriority", last_errno()));
@@ -271,7 +307,10 @@ fn read_memory_stats(file: &File) -> io::Result<ZramMemoryStats> {
 fn read_single_u64(file: &File) -> io::Result<u64> {
     let mut buf = [0u8; 64];
     let n = read_fd_at_start(file, &mut buf)?;
-    parse_nth_u64(&buf[..n], 0)
+    std::str::from_utf8(&buf[..n])
+        .ok()
+        .and_then(|text| text.split_ascii_whitespace().next())
+        .and_then(|value| value.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid integer sysfs value"))
 }
 
@@ -310,24 +349,10 @@ fn parse_memory_stats(input: &[u8]) -> Option<ZramMemoryStats> {
     })
 }
 
-fn parse_nth_u64(input: &[u8], wanted: usize) -> Option<u64> {
-    // split_ascii_whitespace yields borrowed sub-slices (no allocation); u64
-    // FromStr does not allocate — the decision path stays allocation-free.
-    std::str::from_utf8(input)
-        .ok()?
-        .split_ascii_whitespace()
-        .nth(wanted)?
-        .parse()
-        .ok()
-}
-
-fn monitor_failed() -> ! {
-    emergency_poweroff();
-}
-
 /// A runtime monitor failure invalidates the capped-zram safety invariant.
-/// Power off immediately; if reboot(2) is unavailable, exiting PID1 leaves the
-/// host liveness timeout to destroy the unusable VM.
+/// Power off immediately. If reboot(2) fails, PID 1 exits: the kernel panics
+/// and reboots at once (CONFIG_PANIC_TIMEOUT=-1), and QEMU (`-no-reboot`)
+/// exits instead of rebooting.
 pub(crate) fn emergency_poweroff() -> ! {
     unsafe {
         libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
@@ -394,6 +419,21 @@ mod tests {
             ..below_odd
         };
         assert!(capped_zram_pressure(at_odd));
+    }
+
+    #[test]
+    fn swap_slots_count_as_exhausted_from_99_percent_in_use() {
+        assert!(!swap_slots_exhausted((0, 0))); // no swap: never
+        assert!(!swap_slots_exhausted((1000, 11)));
+        assert!(swap_slots_exhausted((1000, 10)));
+        assert!(swap_slots_exhausted((97_476_608, 163_840))); // a stuck run: 160 kB free
+        assert!(swap_slots_exhausted((1000, 0)));
+    }
+
+    #[test]
+    fn swap_slots_are_readable() {
+        let (total, free) = read_swap_slots().unwrap();
+        assert!(free <= total);
     }
 
     #[test]
