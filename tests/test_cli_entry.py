@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from exec_sandbox import __version__
+
 _BLOCK_AND_RUN = """
 import sys
 from importlib.abc import MetaPathFinder
@@ -57,7 +59,7 @@ def test_start_imports_neither_keyring_nor_cryptography(missing: str, tmp_path: 
     their import time (about 20 ms at every start)."""
     done = _sbx_without(missing, "--version", home=tmp_path)
     assert done.returncode == 0, done.stderr
-    assert done.stdout.startswith("exec-sandbox, version ")
+    assert done.stdout == f"exec-sandbox, version {__version__}\n"
 
 
 @pytest.mark.parametrize("missing", ["cryptography", "keyring"])
@@ -67,9 +69,14 @@ def test_os_keyring_step_names_the_missing_extra(missing: str, tmp_path: Path) -
     or data folder is used (nothing is made under the child's home)."""
     done = _sbx_without(missing, "instance", "list", home=tmp_path)
     assert done.returncode == 2, done.stderr
-    assert "EXTRA_MISSING (FIX_CONFIG)" in done.stderr
-    assert f"The exec-sandbox CLI needs {missing}: pip install 'exec-sandbox[cli]'" in done.stderr
-    assert "Traceback" not in done.stderr
+    assert done.stderr == (
+        "Error: EXTRA_MISSING (FIX_CONFIG)\n"
+        "\n"
+        f"  The exec-sandbox CLI needs {missing}: pip install 'exec-sandbox[cli]'\n"
+        "\n"
+        "  Suggestions:\n"
+        "    • Correct the settings, then run again.\n"
+    )
     assert list(tmp_path.iterdir()) == []
 
 
@@ -78,5 +85,5 @@ def test_other_missing_module_keeps_its_error(tmp_path: Path) -> None:
     install hint (exec_sandbox.cli itself stands in: the package imports, cli_main runs)."""
     done = _sbx_without("exec_sandbox.cli", "--version", home=tmp_path)
     assert done.returncode == 1
-    assert "ModuleNotFoundError: No module named 'exec_sandbox.cli'" in done.stderr
+    assert done.stderr.splitlines()[-1] == "ModuleNotFoundError: No module named 'exec_sandbox.cli'"
     assert "exec-sandbox[cli]" not in done.stderr

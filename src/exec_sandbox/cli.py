@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Generator
+    from collections.abc import Awaitable, Callable, Coroutine, Generator
 
     from exec_sandbox import Session
     from exec_sandbox.instance.manager import InstanceAdmin
@@ -71,23 +71,26 @@ from exec_sandbox.process_registry import force_kill_all, get_tracked_count
 from exec_sandbox.settings import Settings
 
 
-def _run_with_interrupt_handling(coro: Any) -> Any:
+def _run_with_interrupt_handling(coro: Coroutine[Any, Any, int]) -> int:
     """Run coroutine with proper Ctrl+C handling.
 
-    Does NOT use asyncio.run() because it overrides signal handlers. No child holds the
-    terminal: every spawn of the package sets stdin (/dev/null, or a pipe of its own;
-    test_every_spawn_site_sets_stdin), so no child changes its modes and Ctrl+C stays SIGINT.
+    An asyncio.Runner (the loop of asyncio.run(): at the end, the tasks left are cancelled
+    and awaited, the async generators closed and the default executor's jobs awaited) with
+    the SIGINT handler below: a Runner adds its own only over the default handler. No child
+    holds the terminal: every spawn of the package sets stdin (/dev/null, or a pipe of its
+    own; test_every_spawn_site_sets_stdin), so no child changes its modes and Ctrl+C stays SIGINT.
 
     - First Ctrl+C: Cancels main task, cleanup (__aexit__) runs
     - Second Ctrl+C: Force kill all child process groups immediately
     """
-    interrupt_count = [0]
+    interrupts = 0
     main_task: asyncio.Task[Any] | None = None
-    loop: asyncio.AbstractEventLoop | None = None
+    runner = asyncio.Runner()
 
     def handle_sigint(_signum: int, _frame: Any) -> None:
-        interrupt_count[0] += 1
-        if interrupt_count[0] > 1:
+        nonlocal interrupts
+        interrupts += 1
+        if interrupts > 1:
             count = get_tracked_count()
             if count > 0:
                 click.echo(f"\nForce killing {count} VM process(es)...", err=True)
@@ -96,37 +99,21 @@ def _run_with_interrupt_handling(coro: Any) -> Any:
         click.echo("\nInterrupted. Stopping the VMs (press Ctrl+C again to stop them at once)...", err=True)
         if main_task is not None and not main_task.done():
             main_task.cancel()
-        if loop is not None:
-            loop.call_soon_threadsafe(lambda: None)
+            runner.get_loop().call_soon_threadsafe(lambda: None)  # wake a select() with a long timeout
+
+    async def main() -> int:
+        nonlocal main_task
+        main_task = asyncio.current_task()
+        return await coro
 
     original_handler = signal.signal(signal.SIGINT, handle_sigint)
-
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            main_task = loop.create_task(coro)
-            return loop.run_until_complete(main_task)
-        except asyncio.CancelledError:
-            sys.exit(130)
-        finally:
-            _cleanup_event_loop(loop)
-    except KeyboardInterrupt:
+        with runner:
+            return runner.run(main())
+    except (asyncio.CancelledError, KeyboardInterrupt):
         sys.exit(130)
     finally:
         signal.signal(signal.SIGINT, original_handler)
-
-
-def _cleanup_event_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Clean up asyncio event loop, cancelling pending tasks."""
-    try:
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-    finally:
-        loop.close()
 
 
 # Exit codes following Unix conventions
@@ -135,12 +122,11 @@ EXIT_CLI_ERROR = 2
 EXIT_TIMEOUT = 124  # Matches `timeout` command
 EXIT_SANDBOX_ERROR = 125
 
-# File extension to language mapping
-EXTENSION_MAP: dict[str, str] = {
-    ".py": "python",
-    ".js": "javascript",
-    ".mjs": "javascript",
-    ".sh": "raw",
+EXTENSION_MAP: dict[str, Language] = {
+    ".py": Language.PYTHON,
+    ".js": Language.JAVASCRIPT,
+    ".mjs": Language.JAVASCRIPT,
+    ".sh": Language.RAW,
 }
 
 
@@ -153,24 +139,10 @@ class SourceInput:
     language: Language
 
 
-def detect_language(source: str | None) -> str | None:
-    """Auto-detect language from file extension.
-
-    Args:
-        source: File path or stdin marker ("-") or inline code
-
-    Returns:
-        Detected language name or None if cannot detect
-    """
-    if not source or source == "-":
-        return None
-
-    # Check if it's a file path
-    path = Path(source)
-    if path.suffix:
-        return EXTENSION_MAP.get(path.suffix.lower())
-
-    return None
+def detect_language(source: str) -> Language | None:
+    """The language of a source from its file extension (EXTENSION_MAP, any case), or None:
+    no extension (the stdin marker "-" has none) or another one."""
+    return EXTENSION_MAP.get(Path(source).suffix.lower())
 
 
 def parse_env_vars(env_vars: tuple[str, ...]) -> dict[str, str]:
@@ -223,7 +195,6 @@ def parse_port_mappings(port_specs: tuple[str, ...]) -> list[PortMapping]:
     for spec in port_specs:
         port_spec = spec  # Avoid overwriting loop variable
         try:
-            # Check for protocol suffix
             protocol = "tcp"
             if "/" in port_spec:
                 port_spec, protocol = port_spec.rsplit("/", 1)
@@ -233,7 +204,6 @@ def parse_port_mappings(port_specs: tuple[str, ...]) -> list[PortMapping]:
                         param_hint="'--expose'",
                     )
 
-            # Parse internal:external or just internal
             if ":" in port_spec:
                 parts = port_spec.split(":")
                 if len(parts) != 2:  # noqa: PLR2004
@@ -249,15 +219,14 @@ def parse_port_mappings(port_specs: tuple[str, ...]) -> list[PortMapping]:
                 internal = int(port_spec)
                 result.append(PortMapping(internal=internal, protocol=protocol))  # type: ignore[arg-type]
 
-        except ValueError as e:
-            if "int()" in str(e) or "invalid literal" in str(e):
-                raise click.BadParameter(
-                    f"Invalid port number in: '{spec}'. Ports must be integers.",
-                    param_hint="'--expose'",
-                ) from e
-            # Re-raise pydantic validation errors
+        except ValidationError as e:  # a ValueError: caught before the int() one
             raise click.BadParameter(
                 f"Invalid port mapping: '{spec}'. {e}",
+                param_hint="'--expose'",
+            ) from e
+        except ValueError as e:
+            raise click.BadParameter(
+                f"Invalid port number in: '{spec}'. Ports must be integers.",
                 param_hint="'--expose'",
             ) from e
 
@@ -340,13 +309,13 @@ def parse_download_spec(spec: str) -> tuple[str, str]:
     return (guest, local)
 
 
-def format_error(title: str, message: str, suggestions: list[str] | None = None) -> str:
+def format_error(title: str, message: str, *, suggestions: list[str]) -> str:
     """Format an error message following What → Why → Fix pattern.
 
     Args:
         title: Short error title
         message: Detailed explanation
-        suggestions: Optional list of suggestions to fix the issue
+        suggestions: How to fix the issue (empty: no suggestions block)
 
     Returns:
         Formatted error string
@@ -422,11 +391,6 @@ class MultiSourceResult(BaseModel):
         return _run_exit_code(self.run.result) if self.run else _error_exit_code(action=self.action, code=self.code)
 
 
-def format_result_json(run: OneShotRun) -> str:
-    """Format a one-shot run as JSON."""
-    return run.model_dump_json(indent=2)
-
-
 def format_multi_result_json(results: list[MultiSourceResult]) -> str:
     """Format multiple execution results as a JSON array."""
     return _MULTI_RESULTS.dump_json(results, indent=2).decode()
@@ -477,16 +441,9 @@ def _resolve_source(src: str, language_override: str | None) -> SourceInput:
     if not code.strip():
         raise click.UsageError(f"No code in source: {label}")
 
-    # Resolve language (override > auto-detect > python default)
-    resolved_language = language_override.lower() if language_override else detect_language(src) or "python"
-
-    # Convert to Language enum
-    try:
-        lang_enum = Language(resolved_language)
-    except ValueError as exc:
-        raise click.UsageError(f"Unknown language: {resolved_language}") from exc
-
-    return SourceInput(code=code, label=label, language=lang_enum)
+    # Override (a -l choice, lowercase from click) > file extension > python
+    language = Language(language_override or detect_language(src) or Language.PYTHON)
+    return SourceInput(code=code, label=label, language=language)
 
 
 def _display_multi_summary(total_passed: int, total_failed: int, total_sources: int, total_time_ms: int) -> None:
@@ -590,7 +547,9 @@ def _valid_settings() -> Generator[None]:
             f"    {'.'.join(map(str, err['loc'])) or e.title}: {err['msg']} (got {type(err['input']).__name__})"
             for err in e.errors(include_url=False)
         ]
-        message = format_error("Invalid settings", "Correct these EXEC_SANDBOX_* variables or options, then run again:")
+        message = format_error(
+            "Invalid settings", "Correct these EXEC_SANDBOX_* variables or options, then run again:", suggestions=[]
+        )
         click.echo("\n".join([message, *fields]), err=True)
         raise click.exceptions.Exit(EXIT_CLI_ERROR) from None
 
@@ -863,7 +822,7 @@ def _report_error(error: SandboxError, *, saved: InstanceRef | None) -> int:
         )
     else:
         suggestions.append(_ACTION_ADVICE[error.action].format(id=error.instance_id or "ID"))
-    click.echo(format_error(f"{error.code} ({error.action})", error.message, suggestions), err=True)
+    click.echo(format_error(f"{error.code} ({error.action})", error.message, suggestions=suggestions), err=True)
     return _error_exit_code(action=error.action, code=error.code)
 
 
@@ -972,9 +931,8 @@ async def run_code(
                 total_ms=round((time.perf_counter() - start) * 1000),
             )
 
-        # JSON output mode
         if json_output:
-            click.echo(format_result_json(run))
+            click.echo(run.model_dump_json(indent=2))
         codes = [_report_error(e, saved=saved) for e in failures]
         if codes:
             return codes[0]
@@ -1052,7 +1010,7 @@ async def run_multiple(
 
     try:
         async with Scheduler(config) as scheduler:
-            # Create tasks for all sources
+            # One VM per source; an error of a source is its result, the others keep running
             async def run_one(idx: int, src: SourceInput) -> MultiSourceResult:
                 try:
                     start = time.perf_counter()
@@ -1075,29 +1033,31 @@ async def run_multiple(
                         index=idx, source=src.label, run=None, error=e.message, code=e.code, action=e.action
                     )
 
-            tasks = [run_one(i, src) for i, src in enumerate(sources)]
+            tasks = [asyncio.create_task(run_one(i, src)) for i, src in enumerate(sources)]
+            try:
+                # Stream results as they complete
+                for next_done in asyncio.as_completed(tasks):
+                    result = await next_done
+                    results.append(result)
 
-            # Stream results as they complete
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                results.append(result)
+                    if result.run and result.run.result.exit_code == 0:
+                        total_passed += 1
+                    else:
+                        total_failed += 1
 
-                # Update counters
-                if result.run and result.run.result.exit_code == 0:
-                    total_passed += 1
-                else:
-                    total_failed += 1
-
-                # Display result if not JSON mode
-                if not json_output:
-                    _display_multi_result(result, len(sources), quiet, error=errors.get(result.index))
+                    if not json_output:
+                        _display_multi_result(result, len(sources), quiet, error=errors.get(result.index))
+            finally:
+                # Ctrl+C, or an error that is not a SandboxError: each source closes its VM before the scheduler stops
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         total_time_ms = int((time.perf_counter() - start_time) * 1000)
 
         # Sort results by index for consistent output
         results.sort(key=lambda r: r.index)
 
-        # Final output
         if json_output:
             click.echo(format_multi_result_json(results))
             for result in results:
@@ -1116,13 +1076,11 @@ def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool, *,
     """Display a single result from multi-source execution; `error`: why it has no run."""
     label = truncate_source(result.source)
 
-    # Header
     click.echo()
     click.echo(click.style(f"━━━ [{result.index + 1}/{total}] {label} ", bold=True) + "━" * max(0, 50 - len(label)))
 
     if result.run:
         run = result.run
-        # Show stdout/stderr
         if run.result.stdout:
             click.echo(run.result.stdout, nl=False)
             if not run.result.stdout.endswith("\n"):
@@ -1132,7 +1090,6 @@ def _display_multi_result(result: MultiSourceResult, total: int, quiet: bool, *,
             if not run.result.stderr.endswith("\n"):
                 click.echo(err=True)
 
-        # Show status
         if not quiet:
             if run.result.exit_code == 0:
                 click.echo(
@@ -1172,7 +1129,6 @@ def cli(ctx: click.Context) -> None:
 
     'sbx ARGS...' without a command name is 'sbx run ARGS...'.
     """
-    # If no subcommand provided and no arguments, show help
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
@@ -1335,10 +1291,8 @@ def run_command(
     """
     configure_logging(quiet=quiet, level=logging.DEBUG if debug else None)
 
-    # Merge inline codes with positional sources
     all_sources: list[str] = list(inline_codes) + list(sources)
 
-    # Handle stdin marker
     stdin_count = all_sources.count("-")
     if stdin_count > 1:
         raise click.UsageError("Stdin marker '-' can only be used once.")
@@ -1359,7 +1313,6 @@ def run_command(
     except click.BadParameter as exc:
         raise click.UsageError(str(exc)) from exc
 
-    # Build list of SourceInput objects
     resolved_sources = [_resolve_source(src, language) for src in all_sources]
 
     # File I/O requires exactly one source
@@ -1577,12 +1530,13 @@ def _display_prefetch_result(result: PrefetchResult, quiet: bool) -> None:
 # Entry Point
 # ============================================================================
 
-# Known subcommands and flags that should NOT trigger implicit 'run'
-_KNOWN_SUBCOMMANDS = {"instance", "prefetch", "run", "--help", "-h", "--version", "-V"}
+# Subcommands and flags that should NOT trigger implicit 'run'
+_KNOWN_SUBCOMMANDS = {*cli.commands, "--help", "-h", "--version", "-V"}
 
 
-def main() -> NoReturn:
-    """Entry point of `sbx`.
+def main() -> None:
+    """Entry point of `sbx`. It exits the process (click's standalone mode), also
+    after the help of a bare `sbx`.
 
     When the first argument is not a known subcommand or flag, 'run' goes
     before it:
@@ -1590,13 +1544,5 @@ def main() -> NoReturn:
         sbx 'print(1)'  ->  sbx run 'print(1)'
     """
     if len(sys.argv) > 1 and sys.argv[1] not in _KNOWN_SUBCOMMANDS:
-        # Implicit 'run' subcommand
         sys.argv.insert(1, "run")
     cli()
-    # cli() will sys.exit() via subcommands, but for bare 'sbx' (help display),
-    # we need to exit here
-    sys.exit(0)
-
-
-if __name__ == "__main__":
-    main()
