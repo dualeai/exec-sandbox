@@ -10,7 +10,7 @@ import threading
 
 import pytest
 
-from exec_sandbox.aio_utils import await_cancellation_safe, await_settled, run_to_end
+from exec_sandbox.aio_utils import await_cancellation_safe, await_settled, run_stoppable, run_to_end
 
 
 async def _wait_and_return(gate: asyncio.Event, value: str = "done") -> str:
@@ -172,3 +172,29 @@ class TestRunToEnd:
 
         asyncio.run(main())
         assert events == ["job ended", "owner cleanup"]
+
+
+class TestRunStoppable:
+    """run_stoppable: a cancel sets the job's stop event, waits for the job's end, then raises."""
+
+    async def test_cancel_stops_the_job_and_waits_for_it(self) -> None:
+        started = threading.Event()
+        ended: list[bool] = []
+        undone: list[str] = []
+
+        def job(stop: threading.Event) -> str:
+            started.set()
+            stop.wait(5)  # a safe point: returns at once once stop is set
+            ended.append(stop.is_set())
+            return "made"
+
+        task = asyncio.create_task(run_stoppable(job, undo=undone.append))
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert ended == [True]  # it saw the stop, and had ended before the cancel was raised
+        assert undone == ["made"]  # the result of a job that ended after its call was cancelled
+
+    async def test_result_without_a_cancel(self) -> None:
+        assert await run_stoppable(lambda _stop: 7, undo=None) == 7

@@ -1,6 +1,10 @@
 """Subprocess lifecycle utilities.
 
-- start_managed_process: launch a subprocess with standard piping and process registration
+- start_managed_process: launch a subprocess with standard piping and process registration;
+  with child_shell, a child that ends with this process, or that runs shell steps before
+  its command, with no Python preexec_fn (Popen can then vfork)
+- communicate_managed_process: run a short child to its end and collect its output
+- exec_failed_error: the ConfigError of a launch whose exec failed (exit status 126 or 127)
 - start_drain: the background task that drains stdout/stderr (prevents 64KB pipe deadlock)
 - wait_for_socket: poll for a Unix socket created by a child process after fork+exec
 """
@@ -8,56 +12,294 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Literal, overload
+import ctypes
+import errno
+import os
+import shutil
+import signal
+import stat
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, Literal, overload
 
 from exec_sandbox._logging import get_logger
 from exec_sandbox.aio_utils import await_settled
-from exec_sandbox.platform_utils import ProcessWrapper, child_env
+from exec_sandbox.exceptions import ConfigError, ErrorCode
+from exec_sandbox.platform_utils import HostOS, ProcessWrapper, child_env, detect_host_os
 from exec_sandbox.process_registry import register_process, unregister_process
 from exec_sandbox.resource_cleanup import cleanup_process
+from exec_sandbox.system_probes import probe_setpriv_pdeathsig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-    from pathlib import Path
+    from collections.abc import AsyncIterator, Callable, Sequence
 
 logger = get_logger(__name__)
+
+
+_SETPRIV: Final = ("setpriv", "--pdeathsig", "KILL", "--")
+"""Sets the parent-death signal, then execs the rest (util-linux 2.33+, probe_setpriv_pdeathsig)."""
+
+_PARENT_CHECK: Final = '[ "$PPID" = "$1" ] || exit 1'
+"""After setpriv's prctl call: a parent that ended before the call sent no signal, and the
+child has another parent now (child_shell step; "$1" is the pid of this process)."""
+
+
+def child_shell(cmd: Sequence[str], *, steps: Sequence[tuple[str, str]]) -> list[str]:
+    """`cmd` behind one /bin/sh that runs each step, then execs `cmd` in the same process.
+
+    A step is a shell statement and the one value that it reads as "$1". Values and the
+    arguments of `cmd` are positional parameters: no shell parses them. No step: `cmd`
+    itself. The shell runs the exec of `cmd`, so Popen cannot report its errors: a `cmd[0]`
+    that exec would not find, may not run or would refuse as no program raises here, as
+    Popen would. Other exec errors end the shell with 126 or 127 (exec_failed_error).
+
+    Raises:
+        FileNotFoundError: `cmd[0]` is not on the PATH of child_env()
+        PermissionError: `cmd[0]` is there, but not executable
+        OSError: ENOEXEC: `cmd[0]` is not a program (see _PROGRAM_STARTS)
+    """
+    if not steps:
+        return list(cmd)
+    _require_executable(cmd[0])
+    script = "".join(f"{statement}; shift; " for statement, _ in steps) + 'exec "$@"'
+    return ["/bin/sh", "-c", script, "sh", *(value for _, value in steps), *cmd]
+
+
+_PROGRAM_STARTS: Final = (
+    b"#!",
+    b"\x7fELF",
+    b"\xca\xfe\xba\xbe",  # universal Mach-O
+    b"\xfe\xed\xfa\xce",  # Mach-O, 32 and 64 bits, both byte orders
+    b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+)
+"""The first bytes of a file that the kernel execs: a script (#!), ELF (Linux), Mach-O and
+universal Mach-O (macOS). Popen reports ENOEXEC for any other file that no binfmt_misc
+entry claims (_binfmt_misc_claims), but a shell runs it as a shell script (POSIX): an
+empty file then "runs" with exit 0."""
+
+_BINFMT_MISC: Final = Path("/proc/sys/fs/binfmt_misc")
+"""The binfmt_misc entries of this kernel (Linux): the kernel also execs a file one of them
+claims, through its interpreter (a .pyc through Python, another CPU through qemu-user)."""
+
+_BINPRM_BUF_SIZE: Final = 256
+"""The first bytes of a file that the kernel reads to choose its format (binfmt_misc magic)."""
+
+
+def _require_executable(name: str) -> None:
+    """Raise the OSError of an exec of `name` that cannot start: ENOENT when no file has
+    the name (looked up as Popen does, on the PATH of child_env()), EACCES when no such
+    file is executable, ENOEXEC when the file is not a program that the kernel runs. A
+    runnable binary is looked up once per name and PATH for the process (exec_errno); a
+    failure is looked up again at the next launch, so a binary installed meanwhile starts
+    (one changed later is seen at the exec)."""
+    path = os.pathsep.join(os.get_exec_path(child_env()))
+    if (code := exec_errno(name, path)) is not None:
+        raise OSError(code, os.strerror(code), name)
+
+
+_runnable: set[tuple[str, str]] = set()
+"""The (name, PATH) pairs that exec_errno found runnable: not looked up again (tests clear it)."""
+
+
+def exec_errno(name: str, path: str) -> int | None:
+    """The errno of an exec of `name` on `path` (os.pathsep-joined) that cannot start, or None
+    (_require_executable). None is kept for the process (_runnable); an errno is not, so a
+    binary installed after a failed launch starts at the next one. A few stat calls
+    and a read of 256 bytes, as the exec itself makes; the binfmt_misc entries only for a file
+    of no known start. A file this user may run but not read (mode 0711) is left to the exec."""
+    if (name, path) in _runnable:
+        return None
+    code = _lookup_errno(name, path)
+    if code is None:
+        _runnable.add((name, path))
+    return code
+
+
+def _lookup_errno(name: str, path: str) -> int | None:
+    """exec_errno's lookup itself."""
+    found = shutil.which(name, path=path)
+    if found is None:
+        candidates = [Path(name)] if os.sep in name else [Path(folder) / name for folder in path.split(os.pathsep)]
+        return errno.EACCES if any(candidate.is_file() for candidate in candidates) else errno.ENOENT
+    try:
+        with Path(found).open("rb") as file:
+            start = file.read(_BINPRM_BUF_SIZE)
+    except OSError:
+        return None
+    if not start.startswith(_PROGRAM_STARTS) and not _binfmt_misc_claims(found, start):
+        return errno.ENOEXEC
+    return None
+
+
+def _binfmt_misc_claims(path: str, start: bytes) -> bool:
+    """Whether an enabled binfmt_misc entry claims the file at `path` that starts with
+    `start`, as the kernel matches them (fs/binfmt_misc.c): its extension (after the last
+    "." of the path), or its magic at its offset under its mask (the buffer the kernel
+    reads, zero-filled after the end of the file). False when binfmt_misc is off, not
+    mounted or unreadable (no Linux)."""
+    try:
+        if (_BINFMT_MISC / "status").read_text().strip() != "enabled":
+            return False
+        entries = [entry for entry in _BINFMT_MISC.iterdir() if entry.name not in ("status", "register")]
+    except OSError:
+        return False
+    buffer = start.ljust(_BINPRM_BUF_SIZE, b"\0")
+    raw_path = os.fsencode(path)
+    extension = raw_path[raw_path.rfind(b".") + 1 :] if b"." in raw_path else None
+    for entry in entries:
+        try:  # bytes: an interpreter path or an extension need not be UTF-8
+            status, *lines = entry.read_bytes().splitlines()
+        except (OSError, ValueError):
+            continue
+        fields = {key: value for key, _, value in (line.partition(b" ") for line in lines)}
+        if status != b"enabled":
+            continue
+        if b"extension" in fields:  # written as ".<extension>"
+            if extension is not None and fields[b"extension"] == b"." + extension:
+                return True
+            continue
+        try:
+            offset, magic = int(fields[b"offset"]), bytes.fromhex(fields[b"magic"].decode("ascii"))
+            mask = bytes.fromhex(fields[b"mask"].decode("ascii")) if b"mask" in fields else b"\xff" * len(magic)
+        except (KeyError, ValueError):
+            continue
+        window = buffer[offset : offset + len(magic)]
+        if len(window) == len(magic) and all((b ^ m) & k == 0 for b, m, k in zip(window, magic, mask, strict=True)):
+            return True
+    return False
+
+
+_EXEC_FAILED: Final = {
+    126: "a program of the launch cannot run: no exec bit or another CPU architecture",
+    127: "a program of the launch was not found, or its ELF interpreter is missing",
+}
+"""Exit status of a launch whose exec of its next program failed (POSIX sh, util-linux
+unshare and setpriv), and why. QEMU, gvproxy-wrapper and qemu-storage-daemon never exit
+with 126 or 127."""
+
+
+def exec_failed_error(
+    returncode: int | None, *, binary: str, detail: str | None, context: dict[str, Any], hint: str | None
+) -> ConfigError | None:
+    """The ConfigError (HOST_DEPENDENCY) of a launch that ended with 126 or 127, before or
+    instead of `binary`: an exec in it failed, as spawn_error gives for an exec that Popen
+    runs (the shell of child_shell runs the exec of its command, so Popen cannot report
+    it). It fails the same way on every retry. `detail` (the last line of its output) ends
+    the message. None for any other end."""
+    reason = None if returncode is None else _EXEC_FAILED.get(returncode)
+    if reason is None:
+        return None
+    return ConfigError(
+        f"Failed to start {binary}: exit status {returncode} ({reason})" + (f": {detail}" if detail else ""),
+        code=ErrorCode.HOST_DEPENDENCY,
+        context={**context, "binary": binary, "exit_code": returncode},
+        hint=hint,
+        instance_id=None,
+    )
+
+
+async def _launch_command(
+    cmd: Sequence[str], *, steps: Sequence[tuple[str, str]], end_with_this_process: bool
+) -> tuple[list[str], Callable[[], None] | None]:
+    """The command and preexec_fn that start_managed_process spawns: `cmd` after `steps`
+    (child_shell), and with `end_with_this_process` a child that the kernel SIGKILLs once the
+    thread that spawns it ends: the event loop's thread, so with the loop on the main thread,
+    this process (SIGKILL too).
+
+    `setpriv --pdeathsig KILL` sets the signal where it works (probe_setpriv_pdeathsig;
+    PR_SET_PDEATHSIG is kept across each exec, except of a setuid program such as sudo).
+    Then the shell checks that its parent is still this process: a parent that ended before
+    the prctl call sent no signal. No Python preexec_fn, so Popen can vfork: a fork copies
+    the page tables of this process on the event loop's thread (4 ms at 100 MB of RSS, 28 ms
+    at 2 GB; a vfork takes 0.3 ms). Else die_with_spawning_thread, which makes Popen fork,
+    where the OS has the signal (Linux before util-linux 2.33), or the steps only.
+
+    Raises:
+        OSError: `cmd[0]` would not start (child_shell)
+    """
+    if not end_with_this_process:
+        return child_shell(cmd, steps=steps), None
+    if await probe_setpriv_pdeathsig():
+        return [*_SETPRIV, *child_shell(cmd, steps=[(_PARENT_CHECK, str(os.getpid())), *steps])], None
+    return child_shell(cmd, steps=steps), die_with_spawning_thread()
+
+
+_PR_SET_PDEATHSIG: Final = 1
+"""prctl option (<linux/prctl.h>): the signal this process gets when its parent thread ends."""
+
+
+def die_with_spawning_thread() -> Callable[[], None] | None:
+    """On Linux, a preexec_fn that asks the kernel to SIGKILL the child once the thread that
+    spawns it ends (PR_SET_PDEATHSIG; kept across an exec, except of a setuid program such as
+    sudo). That thread runs the event loop: with the loop on the main thread, the child ends
+    with this process, SIGKILL included. None elsewhere (macOS has no such signal). The
+    fallback of _launch_command on a host without setpriv: a preexec_fn makes Popen
+    fork this process, not vfork."""
+    if detect_host_os() != HostOS.LINUX:
+        return None
+    prctl = ctypes.CDLL(None, use_errno=True).prctl  # looked up here: the child only calls it
+    args = (ctypes.c_int(_PR_SET_PDEATHSIG), ctypes.c_ulong(signal.SIGKILL), *(ctypes.c_ulong(0),) * 3)
+    parent = os.getpid()
+
+    def set_parent_death_signal() -> None:
+        prctl(*args)
+        if os.getppid() != parent:  # the parent ended before the call: no signal will come
+            os._exit(1)
+
+    return set_parent_death_signal
 
 
 async def start_managed_process(
     cmd: Sequence[str],
     *,
-    pass_fds: tuple[int, ...] = (),
-    preexec_fn: Callable[[], None] | None = None,
-    on_process_started: Callable[[ProcessWrapper], None] | None = None,
+    steps: Sequence[tuple[str, str]],
+    end_with_this_process: bool,
+    pass_fds: tuple[int, ...],
+    on_process_started: Callable[[ProcessWrapper], None] | None,
 ) -> ProcessWrapper:
     """Launch a subprocess with standard piping and process registration.
 
     Common boilerplate for all subprocesses (QEMU, gvproxy, QSD, qemu-img):
     - Wraps asyncio subprocess with ProcessWrapper for PID-reuse safety
     - Pipes stdout/stderr (prevents 64 KiB deadlock when paired with start_drain)
+    - Gives stdin /dev/null: the host's stdin never reaches a child (QEMU's console
+      chardev would read it into the guest and set it non-blocking). Its EOF is harmless:
+      virtconsole ignores chardev events, so the guest's console output still arrives
     - Registers in process_registry for emergency Ctrl+C kill (prevents orphans)
     - Creates new session (isolates signal delivery, enables killpg)
+    - Builds the launch (_launch_command): the `steps` run in one /bin/sh before the exec of
+      `cmd` (child_shell: a cgroup join), and with `end_with_this_process` the child ends with
+      this process (setpriv --pdeathsig, or the preexec_fn fallback)
 
     Callers handle their own error wrapping (ConfigError HOST_DEPENDENCY, TransientError GVPROXY_FAILED, etc.)
-    and domain-specific post-launch steps (cgroup attachment, socket wait, etc.).
+    and the steps after the launch (the line of a cgroup join, a socket wait, etc.).
 
     Args:
         cmd: Command and arguments.
+        steps: Shell statements and the value each reads as "$1", run before the exec of `cmd`
+            (Cgroup.join_step, Cgroup.join_or_stop_step).
+        end_with_this_process: The kernel ends the child with this process (Linux). Not for a
+            child that execs a setuid program (sudo drops the signal): its cgroup ends it.
         pass_fds: File descriptors to inherit (socket activation).
-        preexec_fn: Function called in child between fork and exec.
+        on_process_started: Called with the process as soon as it is spawned and
+            registered, before any cancellation can reach the caller (the caller then owns
+            its cleanup).
 
     Returns:
         ProcessWrapper instance with stdout/stderr pipes.
 
     Raises:
-        OSError: Process spawn failed.
+        OSError: Process spawn failed, or `cmd[0]` would not start (child_shell).
         FileNotFoundError: Binary not found.
     """
+    launch, preexec_fn = await _launch_command(cmd, steps=steps, end_with_this_process=end_with_this_process)
 
     async def spawn_and_publish() -> ProcessWrapper:
         proc = ProcessWrapper(
             await asyncio.create_subprocess_exec(
-                *cmd,
+                *launch,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -94,10 +336,15 @@ async def communicate_managed_process(
     *,
     process_name: str,
     context_id: str,
-    pass_fds: tuple[int, ...] = (),
-    preexec_fn: Callable[[], None] | None = None,
 ) -> tuple[int | None, bytes, bytes]:
-    """Run a transient child with cancellation-safe kill/reap/unregistration."""
+    """Run a transient child with cancellation-safe kill/reap/unregistration.
+
+    Returns:
+        (exit code, stdout, stderr) of the child
+
+    Raises:
+        OSError: the child did not start (start_managed_process)
+    """
 
     async def run_and_cleanup() -> tuple[int | None, bytes, bytes]:
         owned_process: ProcessWrapper | None = None
@@ -108,10 +355,7 @@ async def communicate_managed_process(
 
         try:
             proc = await start_managed_process(
-                cmd,
-                pass_fds=pass_fds,
-                preexec_fn=preexec_fn,
-                on_process_started=publish_process,
+                cmd, steps=(), end_with_this_process=False, pass_fds=(), on_process_started=publish_process
             )
             stdout, stderr = await proc.communicate()
             return proc.returncode, stdout, stderr
@@ -120,7 +364,7 @@ async def communicate_managed_process(
                 delay = 1.0
                 while True:
                     try:
-                        if await cleanup_process(owned_process, process_name, context_id):
+                        if await cleanup_process(owned_process, process_name, context_id, kill_first=False):
                             unregister_process(owned_process)
                             break
                     except asyncio.CancelledError:
@@ -181,6 +425,29 @@ def start_drain(
     return task
 
 
+async def _lines(stream: asyncio.StreamReader) -> AsyncIterator[bytes]:
+    """Each line of `stream` to EOF, newline included. A line longer than the reader's limit
+    (64 KiB) is dropped whole, not an end: a drain that ended there would leave the pipe to
+    fill and its writer blocked (QEMU's stderr is a blocking pipe: a thread that holds
+    QEMU's big lock and writes a warning would block, and QMP and SIGTERM with it; its
+    console drops bytes on a full pipe instead)."""
+    skipping = False  # in a line over the limit, up to its newline
+    while True:
+        try:
+            line = await stream.readuntil(b"\n")
+        except asyncio.IncompleteReadError as e:  # EOF: the last line has no newline
+            if e.partial and not skipping:
+                yield e.partial
+            return
+        except asyncio.LimitOverrunError as e:  # e.consumed bytes of the line, still buffered
+            await stream.readexactly(e.consumed)
+            skipping = True
+            continue
+        if not skipping:
+            yield line
+        skipping = False
+
+
 async def drain_subprocess_output(
     process: ProcessWrapper,
     *,
@@ -195,10 +462,8 @@ async def drain_subprocess_output(
     3. Process blocks waiting for read
     4. Sequential reader stuck on other pipe
 
-    Architecture (Nov 2025):
-    - Uses asyncio.TaskGroup for concurrent reading (Python 3.11+)
-    - Matches Tokio spawned task pattern in Rust (guest-agent/src/main.rs)
-    - Prevents pipe buffer exhaustion in long-running processes
+    One asyncio.TaskGroup task reads each pipe, so neither pipe fills while the
+    other is read.
 
     Args:
         process: ProcessWrapper instance with stdout/stderr pipes
@@ -206,36 +471,21 @@ async def drain_subprocess_output(
         stderr_handler: Callback for each stderr line
     """
 
-    # Concurrent reading with TaskGroup (Python 3.11+)
+    async def read(stream: asyncio.StreamReader, handler: Callable[[str], None]) -> None:
+        """Read `stream` until EOF."""
+        async for line in _lines(stream):
+            try:
+                decoded = line.decode().rstrip()
+                if decoded:
+                    handler(decoded)
+            except (UnicodeDecodeError, ValueError):
+                pass  # Ignore decode errors - non-UTF8 output is silently skipped
+
+    # Concurrent readers, one per pipe (prevent deadlock)
     async with asyncio.TaskGroup() as tg:
-
-        async def read_stdout() -> None:
-            """Read stdout until EOF."""
-            if process.stdout:
-                async for line in process.stdout:
-                    try:
-                        decoded = line.decode().rstrip()
-                        if decoded:
-                            stdout_handler(decoded)
-                    except (UnicodeDecodeError, ValueError):
-                        pass  # Ignore decode errors - non-UTF8 output is silently skipped
-
-        async def read_stderr() -> None:
-            """Read stderr until EOF."""
-            if process.stderr:
-                async for line in process.stderr:
-                    try:
-                        decoded = line.decode().rstrip()
-                        if decoded:
-                            stderr_handler(decoded)
-                    except (UnicodeDecodeError, ValueError):
-                        pass  # Ignore decode errors - non-UTF8 output is silently skipped
-
-        # Launch concurrent readers (prevent deadlock)
-        if process.stdout:
-            tg.create_task(read_stdout())
-        if process.stderr:
-            tg.create_task(read_stderr())
+        for stream, handler in ((process.stdout, stdout_handler), (process.stderr, stderr_handler)):
+            if stream:
+                tg.create_task(read(stream, handler))
 
 
 def log_task_exception(task: asyncio.Task[None]) -> None:
@@ -262,13 +512,16 @@ def log_task_exception(task: asyncio.Task[None]) -> None:
         )
 
 
+_SOCKET_POLL_SECONDS: Final = 0.002
+"""Pause between two checks of wait_for_socket."""
+
+
 @overload
 async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
-    poll_interval: float = ...,
-    abort_check: Callable[[], None] | None = ...,
+    abort_check: Callable[[], None] | None,
     keep_connection: Literal[True],
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]: ...
 
@@ -278,9 +531,8 @@ async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
-    poll_interval: float = ...,
-    abort_check: Callable[[], None] | None = ...,
-    keep_connection: Literal[False] = ...,
+    abort_check: Callable[[], None] | None,
+    keep_connection: Literal[False],
 ) -> None: ...
 
 
@@ -288,9 +540,8 @@ async def wait_for_socket(
     path: Path,
     *,
     timeout: float,
-    poll_interval: float = 0.002,
-    abort_check: Callable[[], None] | None = None,
-    keep_connection: bool = False,
+    abort_check: Callable[[], None] | None,
+    keep_connection: bool,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
     """Wait for a Unix socket to appear and accept connections.
 
@@ -305,7 +556,6 @@ async def wait_for_socket(
     Args:
         path: Path to the socket file.
         timeout: Maximum seconds to wait before raising TimeoutError.
-        poll_interval: Seconds between checks (default 2ms).
         abort_check: Optional callable invoked each poll iteration. Should raise
             to abort the wait early (e.g. when the spawning process has died).
         keep_connection: If True, return the connected (reader, writer) streams
@@ -318,13 +568,15 @@ async def wait_for_socket(
 
     Raises:
         TimeoutError: Socket did not appear or accept connections within *timeout* seconds.
+        ConfigError: HOST_DEPENDENCY: this process may not connect (EACCES, EPERM): the
+            socket belongs to another user (QEMU as qemu-vm) and this process lacks its group.
     """
     async with asyncio.timeout(timeout):
         # Phase 1: wait for socket file to exist
         while not path.exists():
             if abort_check is not None:
                 abort_check()
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(_SOCKET_POLL_SECONDS)
 
         # Phase 2: verify socket accepts connections
         while True:
@@ -338,4 +590,24 @@ async def wait_for_socket(
                 await w.wait_closed()
                 return None
             except (ConnectionRefusedError, ConnectionResetError):
-                await asyncio.sleep(poll_interval)
+                await asyncio.sleep(_SOCKET_POLL_SECONDS)
+            except PermissionError as e:  # no wait helps: the mode or the groups must change
+                raise socket_access_error(path, e) from e
+
+
+def socket_access_error(path: Path, error: PermissionError) -> ConfigError:
+    """The ConfigError (HOST_DEPENDENCY) of a socket this process may not connect to."""
+    context: dict[str, object] = {"socket": str(path), "errno": error.errno, "groups": sorted(os.getgroups())}
+    try:
+        st = path.stat()
+        context |= {"owner_uid": st.st_uid, "owner_gid": st.st_gid, "mode": oct(stat.S_IMODE(st.st_mode))}
+    except OSError:
+        pass
+    return ConfigError(
+        f"This process may not connect to {path}: {error.strerror}. A socket QEMU makes as qemu-vm needs "
+        "this process in its group (add the user to group qemu-vm and log in again, or run under `sg qemu-vm`)",
+        code=ErrorCode.HOST_DEPENDENCY,
+        context=context,
+        hint=None,
+        instance_id=None,
+    )

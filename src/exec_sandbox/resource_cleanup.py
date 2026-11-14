@@ -1,7 +1,8 @@
 """Resource cleanup utilities for VM lifecycle management.
 
 Defensive cleanup operations that log errors but don't fail.
-Used by VmManager for VM lifecycle management.
+Used by VmManager, DiskSnapshotManager (L2 builds), qemu-storage-daemon, gvproxy and
+subprocess_utils to end their child processes.
 """
 
 import asyncio
@@ -35,25 +36,26 @@ async def cleanup_process(
     context_id: str,
     term_timeout: float = 3.0,
     kill_timeout: float = 2.0,
+    *,
+    kill_first: bool,
 ) -> bool:
     """Force cleanup of subprocess (SIGTERM → SIGKILL).
 
-    Best practices (2024-2025 research):
-    - Always await process.wait() after terminate/kill to prevent zombies
-    - Use asyncio.create_task(proc.wait()) to reap in background if needed
-    - SIGTERM (graceful) → wait with timeout → SIGKILL (force)
-    - Handle ProcessLookupError for already-dead processes
-    - Never raise exceptions in cleanup (log instead)
-    - Check returncode before trying to kill
-    - Thread-safe: uses asyncio primitives only
+    - A process that already ended is reaped by a background task (no zombie)
+    - SIGTERM, wait up to term_timeout, then SIGKILL, wait up to kill_timeout; with
+      kill_first, SIGKILL at once (no clean exit needed)
+    - A process still alive after SIGKILL is reaped by a background task (up to 30 s)
+    - ProcessLookupError (the process ended meanwhile) counts as success
+    - Never raises an exception (logs it and returns False); a cancellation propagates
     - Uses ProcessWrapper for PID-reuse safety and async-only operations
 
     Args:
         proc: ProcessWrapper to kill (None safe - returns immediately)
-        name: Process name for logging (e.g., "gvproxy", "qemu", "unshare")
+        name: Process name for logging (e.g., "gvproxy", "QEMU", "qemu-storage-daemon")
         context_id: Context for logging (e.g., vm_id, tenant_id)
         term_timeout: Seconds to wait after SIGTERM before SIGKILL
         kill_timeout: Seconds to wait after SIGKILL before giving up
+        kill_first: SIGKILL with no SIGTERM before (a process whose clean exit keeps nothing)
 
     Returns:
         True if process cleaned successfully, False if issues occurred
@@ -74,22 +76,23 @@ async def cleanup_process(
             task.add_done_callback(_cleanup_zombie_task)
             return True
 
-        # Phase 1: SIGTERM (graceful shutdown) - async, non-blocking
-        logger.debug(f"Sending SIGTERM to {name}", extra={"context_id": context_id})
-        await proc.terminate()
+        if not kill_first:
+            # Phase 1: SIGTERM (graceful shutdown) - async, non-blocking
+            logger.debug(f"Sending SIGTERM to {name}", extra={"context_id": context_id})
+            await proc.terminate()
 
-        try:
-            await proc.wait_with_timeout(timeout=term_timeout)
-            logger.debug(
-                f"{name} stopped gracefully (SIGTERM)",
-                extra={"context_id": context_id, "returncode": proc.returncode},
-            )
-            return True
-        except TimeoutError:
-            logger.warning(
-                f"{name} didn't respond to SIGTERM, force killing",
-                extra={"context_id": context_id, "term_timeout": term_timeout},
-            )
+            try:
+                await proc.wait_with_timeout(timeout=term_timeout)
+                logger.debug(
+                    f"{name} stopped gracefully (SIGTERM)",
+                    extra={"context_id": context_id, "returncode": proc.returncode},
+                )
+                return True
+            except TimeoutError:
+                logger.warning(
+                    f"{name} didn't respond to SIGTERM, force killing",
+                    extra={"context_id": context_id, "term_timeout": term_timeout},
+                )
 
         # Phase 2: SIGKILL (force kill) - async, non-blocking
         logger.debug(f"Sending SIGKILL to {name}", extra={"context_id": context_id})
@@ -97,8 +100,8 @@ async def cleanup_process(
 
         try:
             await proc.wait_with_timeout(timeout=kill_timeout)
-            logger.warning(
-                f"{name} force killed (SIGKILL)",
+            (logger.debug if kill_first else logger.warning)(
+                f"{name} stopped (SIGKILL)" if kill_first else f"{name} force killed (SIGKILL)",
                 extra={"context_id": context_id, "returncode": proc.returncode},
             )
             return True
@@ -131,39 +134,3 @@ async def cleanup_process(
             exc_info=True,
         )
         return False
-
-
-async def cleanup_vm_processes(
-    qemu_proc: ProcessWrapper | None,
-    gvproxy_proc: ProcessWrapper | None,
-    *,
-    vm_id: str,
-    qemu_term_timeout: float = 5.0,
-    qemu_kill_timeout: float = 2.0,
-    gvproxy_term_timeout: float = 3.0,
-    gvproxy_kill_timeout: float = 2.0,
-) -> bool:
-    """Cleanup QEMU and gvproxy processes for a VM.
-
-    Terminates both processes in parallel using SIGTERM → SIGKILL pattern.
-    Used by QemuVM.destroy() and test cleanup.
-
-    Args:
-        qemu_proc: QEMU ProcessWrapper (None safe)
-        gvproxy_proc: gvproxy ProcessWrapper (None safe)
-        vm_id: VM identifier for logging
-        qemu_term_timeout: SIGTERM timeout for QEMU
-        qemu_kill_timeout: SIGKILL timeout for QEMU
-        gvproxy_term_timeout: SIGTERM timeout for gvproxy
-        gvproxy_kill_timeout: SIGKILL timeout for gvproxy
-
-    Returns:
-        True if all processes cleaned successfully, False if any issues occurred
-    """
-    results = await asyncio.gather(
-        cleanup_process(qemu_proc, "QEMU", vm_id, qemu_term_timeout, qemu_kill_timeout),
-        cleanup_process(gvproxy_proc, "gvproxy", vm_id, gvproxy_term_timeout, gvproxy_kill_timeout),
-        return_exceptions=True,
-    )
-    # Check if all succeeded (True) and no exceptions
-    return all(r is True for r in results)

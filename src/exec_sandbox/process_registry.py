@@ -1,7 +1,8 @@
 """Process registry for tracking child processes.
 
 Enables force-kill of all child processes on second Ctrl+C.
-Used by VmManager to register QEMU/gvproxy PIDs and by CLI for emergency cleanup.
+subprocess_utils.start_managed_process registers each child it starts (QEMU, gvproxy,
+qemu-storage-daemon, qemu-img); their cleanup unregisters them; the CLI kills the rest.
 
 Thread-safe: Uses a simple set with GIL protection (adequate for signal handlers).
 """
@@ -22,13 +23,13 @@ logger = get_logger(__name__)
 _process_groups: set[int] = set()
 
 
-def register_process(proc: "ProcessWrapper | None") -> None:
+def register_process(proc: "ProcessWrapper") -> None:
     """Register a process for tracking.
 
     Args:
-        proc: ProcessWrapper to track (None safe - returns immediately)
+        proc: ProcessWrapper to track (a process without a pid is skipped)
     """
-    if proc is None or proc.pid is None:
+    if proc.pid is None:
         return
     _process_groups.add(proc.pid)
     logger.debug("Registered process group", extra={"pid": proc.pid})

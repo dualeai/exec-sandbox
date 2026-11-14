@@ -8,6 +8,8 @@ replace the hand-rolled copies of that loop.
 """
 
 import asyncio
+import contextlib
+import threading
 from collections.abc import Awaitable, Callable
 
 
@@ -38,8 +40,8 @@ async def settle_and_report(task: asyncio.Task[object]) -> BaseException | None:
 
     A task cancelled from outside is treated as clean (returns ``None``): a
     cancelled rollback is not itself a failure to log. Caller cancellation is
-    absorbed — a wedged rollback must not be abortable — and re-raised by the
-    ``except`` block that owns the primary error.
+    absorbed (a rollback must run to its end); the caller's ``except`` block
+    then re-raises its primary error.
     """
     await await_settled(task)
     return None if task.cancelled() else task.exception()
@@ -70,3 +72,23 @@ async def run_to_end[T](call: Callable[[], T]) -> T:
     shutdown cancels every task, never this job, so the caller's cleanup runs after it.
     """
     return await await_cancellation_safe(asyncio.get_running_loop().run_in_executor(None, call))
+
+
+async def run_stoppable[T](job: Callable[[threading.Event], T], *, undo: Callable[[T], None] | None) -> T:
+    """Run `job(stop)` in a worker thread. A cancel sets `stop` (the job stops at its next
+    safe point and removes its own files), waits until the job ends, then raises: no job
+    runs on after its call, nor holds what its caller frees next (a lock, an fd). `undo`
+    gets the result of a job that ended after its call was cancelled. For a long job (a
+    copy of GBs) where run_to_end would make a cancel wait for all of it."""
+    stop = threading.Event()
+    future = asyncio.get_running_loop().run_in_executor(None, job, stop)
+    try:
+        return await asyncio.shield(future)  # shield marks a later job error as read
+    except asyncio.CancelledError:
+        stop.set()
+        while not future.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([future])
+        if undo is not None and not future.cancelled() and future.exception() is None:
+            undo(future.result())
+        raise

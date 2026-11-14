@@ -1,18 +1,21 @@
 """Unit tests for platform utilities.
 
-Tests ProcessWrapper and OS detection with real processes.
-No mocks - spawns actual processes.
+Tests OS and architecture detection, the per-user folders, and ProcessWrapper.
+ProcessWrapper tests spawn real processes; a stand-in replaces psutil, the host OS or
+the machine name only for a case that a real process or host cannot show.
 """
 
 import asyncio
 import os
-import platform
 import pwd
+import signal
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
 import pytest
 
 from exec_sandbox.platform_utils import (
@@ -45,42 +48,13 @@ from tests.conftest import (
 class TestDetectHostOS:
     """Tests for detect_host_os function."""
 
-    def test_detect_current_platform(self) -> None:
-        """detect_host_os returns valid HostOS for current platform."""
-        result = detect_host_os()
-        assert isinstance(result, HostOS)
-        assert result in (HostOS.LINUX, HostOS.MACOS, HostOS.UNKNOWN)
-
     def test_detect_matches_sys_platform(self) -> None:
-        """detect_host_os matches sys.platform."""
+        """detect_host_os (from psutil) matches sys.platform."""
         result = detect_host_os()
         if sys.platform == "darwin":
             assert result == HostOS.MACOS
         elif sys.platform.startswith("linux"):
             assert result == HostOS.LINUX
-
-    def test_detect_is_cached(self) -> None:
-        """detect_host_os is cached (same instance returned)."""
-        result1 = detect_host_os()
-        result2 = detect_host_os()
-        # Same enum value (cached via @cache)
-        assert result1 is result2
-
-
-class TestHostOSEnum:
-    """Tests for HostOS enum."""
-
-    def test_enum_values(self) -> None:
-        """HostOS has expected values."""
-        assert HostOS.LINUX is not None
-        assert HostOS.MACOS is not None
-        assert HostOS.UNKNOWN is not None
-
-    def test_enum_distinct(self) -> None:
-        """HostOS values are distinct."""
-        assert HostOS.LINUX != HostOS.MACOS
-        assert HostOS.LINUX != HostOS.UNKNOWN
-        assert HostOS.MACOS != HostOS.UNKNOWN
 
 
 # ============================================================================
@@ -91,52 +65,32 @@ class TestHostOSEnum:
 class TestDetectHostArch:
     """Tests for detect_host_arch function."""
 
-    def test_detect_current_architecture(self) -> None:
-        """detect_host_arch returns valid HostArch for current platform."""
-        result = detect_host_arch()
-        assert isinstance(result, HostArch)
-        assert result in (HostArch.X86_64, HostArch.AARCH64, HostArch.UNKNOWN)
+    @pytest.fixture(autouse=True)
+    def fresh_cache(self) -> Iterator[None]:
+        """detect_host_arch keeps its first answer: each test starts and ends with none kept."""
+        detect_host_arch.cache_clear()
+        yield
+        detect_host_arch.cache_clear()
 
-    def test_detect_matches_platform_machine(self) -> None:
-        """detect_host_arch matches platform.machine()."""
-        result = detect_host_arch()
-        machine = platform.machine().lower()
-        if machine in ("x86_64", "amd64"):
-            assert result == HostArch.X86_64
-        elif machine in ("arm64", "aarch64"):
-            assert result == HostArch.AARCH64
-
-    def test_detect_is_cached(self) -> None:
-        """detect_host_arch is cached (same instance returned)."""
-        result1 = detect_host_arch()
-        result2 = detect_host_arch()
-        # Same enum value (cached via @cache)
-        assert result1 is result2
-
-
-class TestHostArchEnum:
-    """Tests for HostArch enum."""
-
-    def test_enum_values(self) -> None:
-        """HostArch has expected values."""
-        assert HostArch.X86_64 is not None
-        assert HostArch.AARCH64 is not None
-        assert HostArch.UNKNOWN is not None
-
-    def test_enum_distinct(self) -> None:
-        """HostArch values are distinct."""
-        assert HostArch.X86_64 != HostArch.AARCH64
-        assert HostArch.X86_64 != HostArch.UNKNOWN
-        assert HostArch.AARCH64 != HostArch.UNKNOWN
+    @pytest.mark.parametrize(
+        ("machine", "expected"),
+        [
+            ("x86_64", HostArch.X86_64),
+            ("AMD64", HostArch.X86_64),  # Windows spelling, upper case
+            ("arm64", HostArch.AARCH64),  # macOS spelling
+            ("aarch64", HostArch.AARCH64),  # Linux spelling
+            ("riscv64", HostArch.UNKNOWN),
+            ("", HostArch.UNKNOWN),
+        ],
+    )
+    def test_machine_names(self, monkeypatch: pytest.MonkeyPatch, machine: str, expected: HostArch) -> None:
+        """Each spelling of platform.machine() gives its architecture."""
+        monkeypatch.setattr("exec_sandbox.platform_utils.platform.machine", lambda: machine)
+        assert detect_host_arch() is expected
 
 
 class TestGetOsName:
     """Tests for get_os_name helper function."""
-
-    def test_returns_string(self) -> None:
-        """get_os_name returns a string."""
-        result = get_os_name()
-        assert isinstance(result, str)
 
     @skip_unless_macos
     def test_returns_darwin_on_macos(self) -> None:
@@ -186,43 +140,43 @@ class TestUserDirCache:
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
         monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
-        assert get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox") == Path(expected)
-
-    def test_custom_app_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Respects custom app name."""
-        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
-        monkeypatch.setenv("HOME", "/home/u")
-        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
-        monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
-        assert get_user_dir(kind=UserDir.CACHE, app_name="my-app") == Path("/home/u/.cache/my-app")
+        assert get_user_dir(kind=UserDir.CACHE) == Path(expected)
 
     # --- Env var overrides ---
 
-    def test_exec_sandbox_cache_dir_override(self) -> None:
-        """EXEC_SANDBOX_CACHE_DIR overrides everything."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("/custom")
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param("/custom", "/custom", id="absolute"),
+            pytest.param("/path with spaces/cache", "/path with spaces/cache", id="spaces"),
+            pytest.param("/données/caché", "/données/caché", id="unicode"),
+            pytest.param("/custom/path/", "/custom/path", id="trailing-slash"),
+            pytest.param("relative/path", "relative/path", id="relative-as-is"),
+        ],
+    )
+    @pytest.mark.parametrize("host_os", [HostOS.MACOS, HostOS.LINUX])
+    def test_exec_sandbox_cache_dir_override(
+        self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS, value: str, expected: str
+    ) -> None:
+        """EXEC_SANDBOX_CACHE_DIR is the cache folder on every OS, also over XDG_CACHE_HOME."""
+        monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: host_os)
+        monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", value)
+        monkeypatch.setenv("XDG_CACHE_HOME", "/xdg")
+        assert get_user_dir(kind=UserDir.CACHE) == Path(expected)
 
     def test_xdg_cache_home_on_linux(self) -> None:
         """XDG_CACHE_HOME on Linux → /xdg/exec-sandbox."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg"}, clear=True):
-                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
+                result = get_user_dir(kind=UserDir.CACHE)
                 assert result == Path("/xdg/exec-sandbox")
 
     def test_xdg_cache_home_ignored_on_macos(self) -> None:
         """XDG_CACHE_HOME is ignored on macOS."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.MACOS):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "/xdg", "HOME": "/home/u"}, clear=True):
-                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
+                result = get_user_dir(kind=UserDir.CACHE)
                 assert result == Path("/home/u/Library/Caches/exec-sandbox")
-
-    def test_exec_sandbox_cache_dir_takes_priority_over_xdg(self) -> None:
-        """EXEC_SANDBOX_CACHE_DIR wins over XDG_CACHE_HOME."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/override", "XDG_CACHE_HOME": "/xdg"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("/override")
 
     # --- Edge cases ---
 
@@ -230,32 +184,8 @@ class TestUserDirCache:
         """Empty XDG_CACHE_HOME is falsy, falls through to ~/.cache default."""
         with patch("exec_sandbox.platform_utils.detect_host_os", return_value=HostOS.LINUX):
             with patch.dict("os.environ", {"XDG_CACHE_HOME": "", "HOME": "/home/u"}, clear=True):
-                result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
+                result = get_user_dir(kind=UserDir.CACHE)
                 assert result == Path("/home/u/.cache/exec-sandbox")
-
-    def test_path_with_spaces(self) -> None:
-        """Path with spaces is preserved."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/path with spaces/cache"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("/path with spaces/cache")
-
-    def test_path_with_unicode(self) -> None:
-        """Path with unicode characters is preserved."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/données/caché"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("/données/caché")
-
-    def test_trailing_slash_normalized(self) -> None:
-        """Path normalizes trailing slashes."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "/custom/path/"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("/custom/path")
-
-    def test_relative_env_path(self) -> None:
-        """Relative path from env is used as-is."""
-        with patch.dict("os.environ", {"EXEC_SANDBOX_CACHE_DIR": "relative/path"}):
-            result = get_user_dir(kind=UserDir.CACHE, app_name="exec-sandbox")
-            assert result == Path("relative/path")
 
 
 # ============================================================================
@@ -270,27 +200,27 @@ class TestUserDirData:
         monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.MACOS)
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.setenv("XDG_DATA_HOME", "/xdg")  # not used on macOS
-        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/Library/Application Support/app")
+        assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/Library/Application Support/exec-sandbox")
 
     def test_linux_absolute_xdg(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.setenv("XDG_DATA_HOME", "/xdg/data")
-        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/xdg/data/app")
+        assert get_user_dir(kind=UserDir.DATA) == Path("/xdg/data/exec-sandbox")
 
     @pytest.mark.parametrize("xdg", ["relative/data", "./data", ""])
     def test_linux_relative_or_empty_xdg_ignored(self, monkeypatch: pytest.MonkeyPatch, xdg: str) -> None:
         monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: HostOS.LINUX)
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.setenv("XDG_DATA_HOME", xdg)
-        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/.local/share/app")
+        assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/.local/share/exec-sandbox")
 
     @pytest.mark.parametrize("host_os", [HostOS.LINUX, HostOS.UNKNOWN])
     def test_without_xdg(self, monkeypatch: pytest.MonkeyPatch, host_os: HostOS) -> None:
         monkeypatch.setattr("exec_sandbox.platform_utils.detect_host_os", lambda: host_os)
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/.local/share/app")
+        assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/.local/share/exec-sandbox")
 
     def test_cache_override_not_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """EXEC_SANDBOX_CACHE_DIR moves caches, never data the library cannot make again."""
@@ -298,19 +228,23 @@ class TestUserDirData:
         monkeypatch.setenv("HOME", "/home/u")
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         monkeypatch.setenv("EXEC_SANDBOX_CACHE_DIR", "/cache")
-        assert get_user_dir(kind=UserDir.DATA, app_name="app") == Path("/home/u/.local/share/app")
-        assert get_user_dir(kind=UserDir.CACHE, app_name="app") == Path("/cache")
+        assert get_user_dir(kind=UserDir.DATA) == Path("/home/u/.local/share/exec-sandbox")
+        assert get_user_dir(kind=UserDir.CACHE) == Path("/cache")
 
     def test_cache_and_data_apart(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("EXEC_SANDBOX_CACHE_DIR", raising=False)
-        assert get_user_dir(kind=UserDir.DATA, app_name="app") != get_user_dir(kind=UserDir.CACHE, app_name="app")
+        assert get_user_dir(kind=UserDir.DATA) != get_user_dir(kind=UserDir.CACHE)
 
     @pytest.mark.parametrize(
         ("host_os", "data", "cache"),
         [
-            (HostOS.MACOS, "/accounts/me/Library/Application Support/x", "/accounts/me/Library/Caches/x"),
-            (HostOS.LINUX, "/accounts/me/.local/share/x", "/accounts/me/.cache/x"),
-            (HostOS.UNKNOWN, "/accounts/me/.local/share/x", "/accounts/me/.cache/x"),
+            (
+                HostOS.MACOS,
+                "/accounts/me/Library/Application Support/exec-sandbox",
+                "/accounts/me/Library/Caches/exec-sandbox",
+            ),
+            (HostOS.LINUX, "/accounts/me/.local/share/exec-sandbox", "/accounts/me/.cache/exec-sandbox"),
+            (HostOS.UNKNOWN, "/accounts/me/.local/share/exec-sandbox", "/accounts/me/.cache/exec-sandbox"),
         ],
         ids=["macos", "linux", "unknown"],
     )
@@ -331,8 +265,8 @@ class TestUserDirData:
         for name, value in [("HOME", "/env/home"), ("XDG_DATA_HOME", "/env/xdg-data"),
                             ("XDG_CACHE_HOME", "/env/xdg-cache"), ("EXEC_SANDBOX_CACHE_DIR", "/env/cache")]:  # fmt: skip
             monkeypatch.setenv(name, value)
-        assert get_account_dir(kind=UserDir.DATA, app_name="x") == Path(data)
-        assert get_account_dir(kind=UserDir.CACHE, app_name="x") == Path(cache)
+        assert get_account_dir(kind=UserDir.DATA) == Path(data)
+        assert get_account_dir(kind=UserDir.CACHE) == Path(cache)
 
 
 # ============================================================================
@@ -354,65 +288,73 @@ async def create_wrapped_process(cmd: list[str], **kwargs) -> ProcessWrapper:
 class TestProcessWrapperInit:
     """Tests for ProcessWrapper initialization."""
 
-    async def test_wrap_simple_process(self) -> None:
-        """ProcessWrapper wraps a simple process."""
-        proc = await create_wrapped_process(["echo", "hello"])
-        assert proc.pid is not None
-        assert proc.pid > 0
-        await proc.wait()
+    async def test_pid_names_the_spawned_process(self) -> None:
+        """pid and psutil_proc name the process that asyncio spawned."""
+        proc = await create_wrapped_process(["sleep", "10"])
+        try:
+            assert proc.pid is not None
+            assert psutil.Process(proc.pid).name() == "sleep"
+            assert proc.psutil_proc is not None
+            assert proc.psutil_proc.pid == proc.pid
+        finally:
+            await proc.kill()
+            await proc.wait()
 
-    async def test_psutil_proc_created(self) -> None:
-        """ProcessWrapper creates psutil.Process for monitoring."""
-        proc = await create_wrapped_process(["sleep", "0.1"])
-        # psutil_proc should be set for running process
-        assert proc.psutil_proc is not None
-        await proc.wait()
+    async def test_a_reaped_process_is_not_looked_up(self) -> None:
+        """Once asyncio reaped the child, its pid may belong to another process: no psutil lookup."""
+        raw = await asyncio.create_subprocess_exec("true")
+        await raw.wait()
 
-    async def test_wrap_finished_process(self) -> None:
-        """ProcessWrapper handles process that finishes quickly."""
-        proc = await create_wrapped_process(["true"])
-        await proc.wait()
-        # Should have a return code
-        assert proc.returncode == 0
+        with patch("exec_sandbox.platform_utils.psutil.Process", side_effect=AssertionError("looked up")) as lookup:
+            wrapper = ProcessWrapper(raw)
+
+        assert lookup.call_count == 0
+        assert wrapper.psutil_proc is None
+
+    async def test_a_missing_process_is_looked_up_once(self) -> None:
+        """NoSuchProcess never clears with time: one lookup, no sleep on the event loop."""
+        raw = await asyncio.create_subprocess_exec("sleep", "5")
+        try:
+            gone = psutil.NoSuchProcess(raw.pid)
+            with patch("exec_sandbox.platform_utils.psutil.Process", side_effect=gone) as lookup:
+                wrapper = ProcessWrapper(raw)
+
+            assert lookup.call_count == 1
+            assert wrapper.psutil_proc is None
+        finally:
+            raw.kill()
+            await raw.wait()
 
 
 class TestProcessWrapperProperties:
     """Tests for ProcessWrapper properties."""
 
-    async def test_pid_property(self) -> None:
-        """pid property returns process ID."""
-        proc = await create_wrapped_process(["echo", "test"])
-        assert isinstance(proc.pid, int)
-        assert proc.pid > 0
-        await proc.wait()
-
     async def test_returncode_none_while_running(self) -> None:
         """returncode is None while process is running."""
-        proc = await create_wrapped_process(["sleep", "0.5"])
-        # Check immediately - should still be running
-        assert proc.returncode is None
-        await proc.wait()
+        proc = await create_wrapped_process(["sleep", "10"])
+        try:
+            assert proc.returncode is None
+        finally:
+            await proc.kill()
+            await proc.wait()
 
-    async def test_returncode_after_exit(self) -> None:
-        """returncode is set after process exits."""
-        proc = await create_wrapped_process(["true"])
-        await proc.wait()
-        assert proc.returncode == 0
+    @pytest.mark.parametrize(
+        ("cmd", "code"),
+        [(["true"], 0), (["false"], 1), (["sh", "-c", "exit 42"], 42)],
+        ids=["zero", "one", "42"],
+    )
+    async def test_wait_returns_the_exit_code(self, cmd: list[str], code: int) -> None:
+        """wait() returns the exit code, and returncode keeps it."""
+        proc = await create_wrapped_process(cmd)
+        assert await proc.wait() == code
+        assert proc.returncode == code
 
-        proc = await create_wrapped_process(["false"])
-        await proc.wait()
-        assert proc.returncode == 1
-
-    async def test_stdout_property(self) -> None:
-        """stdout property returns stream."""
-        proc = await create_wrapped_process(["echo", "test"])
+    async def test_stdout_and_stderr_streams(self) -> None:
+        """stdout and stderr are the child's two pipes."""
+        proc = await create_wrapped_process(["sh", "-c", "echo out; echo err >&2"])
         assert proc.stdout is not None
-        await proc.wait()
-
-    async def test_stderr_property(self) -> None:
-        """stderr property returns stream."""
-        proc = await create_wrapped_process(["bash", "-c", "echo err >&2"])
         assert proc.stderr is not None
+        assert (await proc.stdout.read(), await proc.stderr.read()) == (b"out\n", b"err\n")
         await proc.wait()
 
 
@@ -421,156 +363,52 @@ class TestProcessWrapperIsRunning:
 
     async def test_is_running_true(self) -> None:
         """is_running returns True for running process."""
-        proc = await create_wrapped_process(["sleep", "1"])
-        result = await proc.is_running()
-        assert result is True
-        # Clean up
-        await proc.terminate()
-        await proc.wait()
+        proc = await create_wrapped_process(["sleep", "10"])
+        try:
+            assert await proc.is_running() is True
+        finally:
+            await proc.kill()
+            await proc.wait()
 
     async def test_is_running_false_after_exit(self) -> None:
         """is_running returns False after process exits."""
         proc = await create_wrapped_process(["true"])
         await proc.wait()
-        result = await proc.is_running()
-        assert result is False
+        assert await proc.is_running() is False
 
-    async def test_is_running_async(self) -> None:
-        """is_running doesn't block the event loop."""
+
+class TestProcessWrapperSignals:
+    """ProcessWrapper.terminate sends SIGTERM, kill sends SIGKILL; a process that ended gets
+    neither (ProcessLookupError)."""
+
+    @pytest.mark.parametrize(("method", "signum"), [("terminate", signal.SIGTERM), ("kill", signal.SIGKILL)])
+    async def test_signal_stops_a_running_process(self, method: str, signum: signal.Signals) -> None:
         proc = await create_wrapped_process(["sleep", "10"])
-
-        # Run is_running concurrently with other tasks
-        async def other_task() -> str:
-            await asyncio.sleep(0.01)
-            return "done"
-
-        results = await asyncio.gather(
-            proc.is_running(),
-            other_task(),
-        )
-
-        assert results[0] is True
-        assert results[1] == "done"
-
-        # Clean up
-        await proc.terminate()
-        await proc.wait()
-
-
-class TestProcessWrapperWait:
-    """Tests for ProcessWrapper.wait method."""
-
-    async def test_wait_success(self) -> None:
-        """wait returns exit code on success."""
-        proc = await create_wrapped_process(["true"])
-        code = await proc.wait()
-        assert code == 0
-
-    async def test_wait_failure(self) -> None:
-        """wait returns exit code on failure."""
-        proc = await create_wrapped_process(["false"])
-        code = await proc.wait()
-        assert code == 1
-
-    async def test_wait_custom_exit_code(self) -> None:
-        """wait returns custom exit code."""
-        proc = await create_wrapped_process(["bash", "-c", "exit 42"])
-        code = await proc.wait()
-        assert code == 42
-
-
-class TestProcessWrapperTerminate:
-    """Tests for ProcessWrapper.terminate method."""
-
-    async def test_terminate_running_process(self) -> None:
-        """terminate stops a running process."""
-        proc = await create_wrapped_process(["sleep", "10"])
-
-        # Verify it's running
-        assert await proc.is_running()
-
-        # Terminate
-        await proc.terminate()
-
-        # Wait for it to stop
-        await asyncio.sleep(0.1)
-        code = await proc.wait()
-
-        # SIGTERM typically results in -15 or 143
-        assert proc.returncode is not None
+        await getattr(proc, method)()
+        assert await proc.wait() == -signum
         assert not await proc.is_running()
 
-    async def test_terminate_already_finished(self) -> None:
-        """terminate on finished process raises ProcessLookupError."""
+    @pytest.mark.parametrize("method", ["terminate", "kill"])
+    async def test_signal_to_a_finished_process_raises(self, method: str) -> None:
         proc = await create_wrapped_process(["true"])
         await proc.wait()
 
-        # asyncio.subprocess raises ProcessLookupError for dead process
         with pytest.raises(ProcessLookupError):
-            await proc.terminate()
-        assert proc.returncode == 0
-
-
-class TestProcessWrapperKill:
-    """Tests for ProcessWrapper.kill method."""
-
-    async def test_kill_running_process(self) -> None:
-        """kill forcefully stops a running process."""
-        proc = await create_wrapped_process(["sleep", "10"])
-
-        assert await proc.is_running()
-
-        await proc.kill()
-        await proc.wait()
-
-        # SIGKILL results in -9 or 137
-        assert proc.returncode is not None
-        assert not await proc.is_running()
-
-    async def test_kill_already_finished(self) -> None:
-        """kill on finished process raises ProcessLookupError."""
-        proc = await create_wrapped_process(["true"])
-        await proc.wait()
-
-        # asyncio.subprocess raises ProcessLookupError for dead process
-        with pytest.raises(ProcessLookupError):
-            await proc.kill()
+            await getattr(proc, method)()
         assert proc.returncode == 0
 
 
 class TestProcessWrapperCommunicate:
     """Tests for ProcessWrapper.communicate method."""
 
-    async def test_communicate_captures_stdout(self) -> None:
-        """communicate returns stdout."""
-        proc = await create_wrapped_process(["echo", "hello"])
-        stdout, stderr = await proc.communicate()
-        assert b"hello" in stdout
-        assert stderr == b""
-
-    async def test_communicate_captures_stderr(self) -> None:
-        """communicate returns stderr."""
-        proc = await create_wrapped_process(["bash", "-c", "echo error >&2"])
-        stdout, stderr = await proc.communicate()
-        assert stdout == b""
-        assert b"error" in stderr
-
     async def test_communicate_captures_both(self) -> None:
-        """communicate returns both stdout and stderr."""
-        proc = await create_wrapped_process(["bash", "-c", "echo out; echo err >&2"])
-        stdout, stderr = await proc.communicate()
-        assert b"out" in stdout
-        assert b"err" in stderr
+        """communicate returns stdout and stderr apart."""
+        proc = await create_wrapped_process(["sh", "-c", "echo out; echo err >&2"])
+        assert await proc.communicate() == (b"out\n", b"err\n")
 
 
 class TestProcessWrapperWaitWithTimeout:
     """Tests for ProcessWrapper.wait_with_timeout method."""
-
-    async def test_wait_with_timeout_completes(self) -> None:
-        """wait_with_timeout returns when process completes."""
-        proc = await create_wrapped_process(["echo", "fast"])
-        code = await proc.wait_with_timeout(5.0)
-        assert code == 0
 
     async def test_wait_with_timeout_times_out(self) -> None:
         """wait_with_timeout raises TimeoutError on timeout."""
@@ -584,11 +422,10 @@ class TestProcessWrapperWaitWithTimeout:
         await proc.wait()
 
     async def test_wait_with_timeout_drains_pipes(self) -> None:
-        """wait_with_timeout drains stdout/stderr pipes."""
-        proc = await create_wrapped_process(["bash", "-c", "echo output; sleep 0.1; echo done"])
-
-        code = await proc.wait_with_timeout(5.0)
-        assert code == 0
+        """A child that writes more than a pipe holds (1 MB, no reader) exits: wait_with_timeout
+        reads the pipes. wait() alone would wait for the full timeout."""
+        proc = await create_wrapped_process(["sh", "-c", "head -c 1000000 /dev/zero; echo err >&2"])
+        assert await proc.wait_with_timeout(5.0) == 0
 
     async def test_wait_with_timeout_no_pipes(self) -> None:
         """wait_with_timeout works without pipes."""
@@ -636,7 +473,7 @@ class TestProcessWrapperWaitWithTimeout:
         assert sorted(lines) == ["err", "out"]  # the drain task got every line
 
     async def test_ended_drain_task_leaves_the_pipes_to_communicate(self) -> None:
-        """A drain task that ended (a line over the stream limit ends it) reads nothing more:
+        """A drain task that ended (an error of its handler ends it) reads nothing more:
         wait() alone would time out on a child blocked on its full stdout pipe."""
         proc = await create_wrapped_process(["sh", "-c", "head -c 1000000 /dev/zero"])
         ended = asyncio.create_task(asyncio.sleep(0))
